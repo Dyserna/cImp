@@ -16,6 +16,7 @@ mod logging;
 mod mcp_stdio;
 mod notifications;
 mod offload;
+mod plugins;
 mod preview;
 mod process_guard;
 mod processing;
@@ -703,7 +704,7 @@ fn main() {
             // announce their long-running completions into channel-armed
             // sessions. Only the send half travels; nothing holds the service
             // itself, so no Arc cycle.
-            let push_registry = {
+            let (push_registry, mcp_host) = {
                 let supervisor = crate::offload::OffloadSupervisor::new(
                     app.handle().clone(),
                     settings_for_offload.clone(),
@@ -802,7 +803,9 @@ fn main() {
                     });
                 }
                 // V30 Phase C: hand the push bus to the producers below.
-                service.push_registry()
+                // V38 Phase F: and the MCP host, for the audit runner's tier-2
+                // provider tools.
+                (service.push_registry(), service.mcp_host())
             };
 
             // V13 Phase A: the Workbench service (fs-batch broadcast today;
@@ -857,6 +860,11 @@ fn main() {
                         audit_root,
                         // V30 Phase C: announce GUI-initiated scan completions.
                         Some(push_registry.clone()),
+                        // V38 Phase F: the warm MCP host, for tier-2 provider
+                        // tools. The host and not the service — the runner needs
+                        // exactly one thing from that layer and holding the
+                        // service would be a cycle.
+                        Some(mcp_host.clone()),
                     );
                     // V26: publish the runner as the process global BEFORE
                     // `manage` moves it — this is how the offload worker's native
@@ -865,6 +873,26 @@ fn main() {
                     // the same runner.
                     crate::audit::set_global(audit_state.clone());
                     app.manage(audit_state);
+                }
+
+                // V38 Phase A: discover drop-in tool plugins from
+                // `<exe-dir>/plugins/`. Managed unconditionally (the settings
+                // section reads it either way) and published as the process
+                // global BEFORE `manage` moves the handle — the audit seam's
+                // reason, unchanged: Phase C/D's consumers run outside any
+                // Tauri command context and cannot reach a managed state.
+                //
+                // The scan itself is off the setup thread: it walks a directory
+                // and reads every file in it, and nothing on the startup path
+                // needs the result synchronously — the store starts empty and
+                // the settings pane reads whatever is there when it mounts.
+                {
+                    let plugin_store = crate::plugins::PluginStore::new();
+                    crate::plugins::set_global(plugin_store.clone());
+                    app.manage(plugin_store.clone());
+                    tauri::async_runtime::spawn_blocking(move || {
+                        plugin_store.rescan();
+                    });
                 }
 
                 // Build the launch project's graph in the background on startup
@@ -1135,9 +1163,14 @@ fn main() {
             audit::audit_cancel_scan,
             audit::audit_snapshot,
             audit::audit_refresh_census,
-            audit::audit_tools_global_config,
-            audit::audit_tools_save_global,
-            audit::audit_tools_load_global,
+            audit::audit_effective_roster,
+            // V38: tool-plugin discovery (read + Rescan) and the key the
+            // settings pane stores this project's path overrides under.
+            // Nothing here RUNS a plugin — the pipelines that consume one
+            // are Phase C/D.
+            plugins::plugins_snapshot,
+            plugins::plugins_rescan,
+            plugins::plugins_project_key,
         ])
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {

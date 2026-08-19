@@ -107,6 +107,19 @@ const MCP_HEALTH_CAP: usize = 200;
 /// `sandbox::record_skip` deduplicates by reason per session: a whole run of
 /// unsandboxed spawns produces one row, not thousands.
 const SANDBOX_CAP: usize = 60;
+/// V38 Phase A: tool-plugin discovery rows — a manifest that failed to load, an
+/// identity conflict, and the per-scan summary (see `crate::plugins::events`).
+///
+/// Its own window, chosen on purpose per #51 rather than left on the graph
+/// fallback. 100 because the volume is *structurally* small and bursty: rows are
+/// minted only at startup and on a manual Rescan — one per rejected file, plus
+/// one summary — so 100 is many app runs' worth for a healthy folder, while a
+/// user repeatedly editing a broken manifest and re-scanning (which is exactly
+/// when these rows are being read) still cannot push the earlier attempts out
+/// inside one sitting. Deliberately larger than [`SANDBOX_CAP`], which dedupes
+/// per session and so needs no depth, and far smaller than the per-call lanes,
+/// which this is not.
+const PLUGIN_CAP: usize = 100;
 /// V32: security denials (SSRF screen, fetch budgets, canary hits, taint-latch
 /// refusals, quarantines, detection flags). Retained **per screen**, not per
 /// kind — this is the window ONE screen's rows get.
@@ -150,6 +163,7 @@ const TOTAL_CAPACITY: usize = GRAPH_CAP
     + MCP_CAP
     + MCP_HEALTH_CAP
     + SANDBOX_CAP
+    + PLUGIN_CAP
     + INJECTION_FLAG_TOTAL_CAP;
 /// Appends between compactions once the ring is full. Compaction rewrites the
 /// whole file (and re-reads it first, to merge a child's lines), so this is the
@@ -234,6 +248,17 @@ pub enum ActivityKind {
     /// [`sandbox::record_skip`](crate::sandbox::record_skip) and
     /// [`sandbox::record_event`](crate::sandbox::record_event).
     Sandbox,
+    /// V38 Phase A: one tool-plugin discovery fact — a manifest that failed to
+    /// load (with its reason), an identity conflict naming both offending
+    /// files, or the per-scan summary. Recorded by
+    /// [`plugins::events::record_scan`](crate::plugins::events::record_scan).
+    ///
+    /// Its own kind (decision 12) rather than a source under an existing one:
+    /// these rows are about DEFINITIONS, not about anything that ran, and the
+    /// settings pane pairs each of them with an error state — the two surfaces
+    /// exist so a rejected plugin is visible both where it happened and where
+    /// it gets fixed.
+    Plugin,
 }
 
 impl ActivityKind {
@@ -247,6 +272,7 @@ impl ActivityKind {
             ActivityKind::McpHealth => "mcp_health",
             ActivityKind::InjectionFlag => "injection_flag",
             ActivityKind::Sandbox => "sandbox",
+            ActivityKind::Plugin => "plugin",
         }
     }
 }
@@ -277,6 +303,8 @@ fn kind_cap(kind: &str) -> usize {
         MCP_HEALTH_CAP
     } else if kind == ActivityKind::Sandbox.as_str() {
         SANDBOX_CAP
+    } else if kind == ActivityKind::Plugin.as_str() {
+        PLUGIN_CAP
     } else {
         GRAPH_CAP
     }
@@ -1395,6 +1423,49 @@ mod tests {
                 .find(|e| e.kind == "offload_server")
                 .map(|e| e.target.as_str()),
             Some(format!("boot {}", OFFLOAD_SERVER_CAP + 39).as_str())
+        );
+        let _ = fs::remove_file(&store.path);
+    }
+
+    /// V38 Phase A: the `plugin` lane, both directions.
+    ///
+    /// The row that matters here is the one saying a manifest was REJECTED —
+    /// it is minted once per scan and then never again until the user rescans,
+    /// while the graph and offload feeds around it write continuously. That is
+    /// the exact crowd-out shape #51 says to pick a lane for, so the assertion
+    /// is by CONTENT (did the rejection survive?), not by count.
+    #[test]
+    fn plugin_rows_keep_their_own_window() {
+        let store = temp_store("plugin-lane");
+        store.record(rec_kind(ActivityKind::Plugin, "rejected: acme@1.0.0"));
+        for i in 0..(GRAPH_CAP + 50) {
+            store.record(rec(&format!("g{i}")));
+        }
+        for i in 0..(OFFLOAD_CAP + 50) {
+            store.record(rec_kind(ActivityKind::Offload, &format!("run {i}")));
+        }
+        let snap = store.snapshot_since(0);
+        assert!(
+            kept(&snap, "rejected: acme@1.0.0"),
+            "a plugin rejection was evicted by the chatty feeds it shares no lane with"
+        );
+
+        // …and the lane is bounded: a user re-scanning a broken folder in a
+        // loop must not be able to grow the store without limit.
+        for i in 0..(PLUGIN_CAP + 40) {
+            store.record(rec_kind(ActivityKind::Plugin, &format!("scan {i}")));
+        }
+        let snap = store.snapshot_since(0);
+        assert_eq!(
+            snap.iter().filter(|e| e.kind == "plugin").count(),
+            PLUGIN_CAP
+        );
+        // Newest kept, oldest evicted.
+        assert_eq!(
+            snap.iter()
+                .find(|e| e.kind == "plugin")
+                .map(|e| e.target.as_str()),
+            Some(format!("scan {}", PLUGIN_CAP + 39).as_str())
         );
         let _ = fs::remove_file(&store.path);
     }

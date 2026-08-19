@@ -338,8 +338,13 @@ pub fn tools() -> Vec<Value> {
             specs.push(semantic_code_spec());
         }
     }
-    if !settings.checks.is_empty() {
-        specs.push(run_check_spec());
+    // V38 Phase D: the gate is the EFFECTIVE set — a project whose only checks
+    // come from an enabled plugin still gets `run_check`. Computed once and
+    // handed to the spec so the advertisement gate and the advertised enum
+    // cannot be built from two different reads.
+    let names = crate::checks::plugin::effective_check_names(&settings);
+    if !names.is_empty() {
+        specs.push(run_check_spec_from(&names));
     }
     lean_filter(specs, settings.graph.lean_tools)
         .into_iter()
@@ -388,7 +393,12 @@ pub struct SurfaceStats {
 ///   the advertised bytes without changing emptiness. Hashing the names (in
 ///   order) covers every input the spec reads — an empty list hashes to its own
 ///   distinct value, so this subsumes the old `has_checks` bool.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+///   **V38 (invariant 10): the names hashed are the EFFECTIVE ones**, plugin
+///   checks included. Hashing only `settings.checks` would have left the memo
+///   serving a stale surface across every plugin enable, path change and
+///   Rescan — the advertised bytes would move while the fingerprint stood
+///   still, which is the one failure this type exists to prevent.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, std::hash::Hash)]
 struct SurfaceFingerprint {
     graph_enabled: bool,
     semantic_search: bool,
@@ -409,16 +419,56 @@ impl SurfaceFingerprint {
     }
 }
 
-/// Hash the configured check names, in order — every input [`run_check_spec`]
+/// Hash the EFFECTIVE check names, in order — every input [`run_check_spec`]
 /// reads. Process-local memo key only, so `DefaultHasher`'s
 /// unstable-across-releases hash is fine; it never leaves this process.
 fn checks_sig(settings: &crate::settings::Settings) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    settings.checks.len().hash(&mut h);
-    for c in &settings.checks {
-        c.name.hash(&mut h);
+    let names = crate::checks::plugin::effective_check_names(settings);
+    names.len().hash(&mut h);
+    for name in &names {
+        name.hash(&mut h);
     }
+    h.finish()
+}
+
+/// V38 Phase F — the NATIVE tool surface's fingerprint, for the pulse gate.
+///
+/// # Why the pulse needs this at all
+///
+/// The `change` frame a consumer receives as `tools/list_changed` covers the
+/// whole of what a per-session child advertises, and until this phase only two
+/// thirds of that could move it: the proxied MCP surface ([`PulseSource::Host`])
+/// and the backend ready-set ([`PulseSource::Backend`]). The third — the tools
+/// this process serves itself, of which `run_check`'s `name` enum is the only
+/// project-dynamic part — had **never pulsed**. [`checks_sig`] existed, but it
+/// is a memo key for the statistics poll, not a notifier: enabling a plugin
+/// check, setting its path, editing `settings.checks` or rescanning the plugins
+/// folder all moved the advertised bytes while every live session went on
+/// showing the old enum until its next restart.
+///
+/// # It is the same fingerprint, hashed
+///
+/// Deliberately [`SurfaceFingerprint`] and not a parallel list of inputs: that
+/// type is already defined as "every setting that moves what [`tools`]
+/// advertises", and a second answer to the same question is the drift this file
+/// spends a long comment preventing. The hash exists only because the gate wants
+/// one comparable value per source.
+///
+/// # Per-process and per-cwd, and that is correct here
+///
+/// [`checks_sig`] resolves the effective check set against `current_dir()`, so
+/// this value describes the surface of the process that computes it. The gate
+/// runs in the APP, whose cwd is the launch directory — the same directory the
+/// registry's per-project paths are keyed by and the audit fan-out scans. A
+/// child process would compute its own answer for its own project, which is
+/// what it should advertise; it just never asks, because it does not own a
+/// pulse.
+pub fn native_surface_sig(settings: &crate::settings::Settings) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    SurfaceFingerprint::of(settings).hash(&mut h);
     h.finish()
 }
 
@@ -1522,10 +1572,21 @@ pub fn run_check_spec() -> GraphToolSpec {
     run_check_spec_for(&current_settings())
 }
 
-/// Pure half of [`run_check_spec`], so the project-scoped schema is testable
-/// without reaching through the global settings snapshot.
+/// [`run_check_spec`] for one settings snapshot, resolving the effective names
+/// itself. Kept because several callers (and every pre-V38 test) hold a
+/// `Settings` and nothing else.
 fn run_check_spec_for(settings: &crate::settings::Settings) -> GraphToolSpec {
-    let names: Vec<&str> = settings.checks.iter().map(|c| c.name.as_str()).collect();
+    run_check_spec_from(&crate::checks::plugin::effective_check_names(settings))
+}
+
+/// The genuinely pure half: names in, schema out.
+///
+/// V38 split this off `run_check_spec_for` because the effective set now costs
+/// a registry join, and [`tools`] needs both the names (to decide whether to
+/// advertise at all) and the spec. Two reads could disagree — a plugin enabled
+/// between them would advertise a `run_check` whose enum did not mention it.
+fn run_check_spec_from(names: &[String]) -> GraphToolSpec {
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
     let mut name_prop = serde_json::Map::new();
     name_prop.insert("type".into(), Value::String("string".into()));
     name_prop.insert(
@@ -1615,10 +1676,16 @@ async fn run_check_inner(
     settings: &crate::settings::Settings,
     args: &Value,
 ) -> Result<String, String> {
-    if settings.checks.is_empty() {
+    // V38 Phase D: the selectable set is `settings.checks` ∪ the enabled,
+    // path-configured `check`-kind plugin tools — resolved HERE, from the same
+    // `Settings` the advertised schema was built from, so the enum the caller
+    // read and the list this function searches are the same list.
+    let effective = crate::checks::plugin::effective_checks_live(settings, root);
+    if effective.is_empty() {
         return Ok(
             "run_check is not configured for this project — add entries to the top-level `checks` \
-             array in .cimp/config.json (each a { name, cmd, parser, timeout_secs })."
+             array in .cimp/config.json (each a { name, cmd, parser, timeout_secs }), or enable a \
+             plugin that contributes checks in Settings → Tool Plugins."
                 .to_string(),
         );
     }
@@ -1628,15 +1695,14 @@ async fn run_check_inner(
         .unwrap_or("")
         .trim();
     let names = || {
-        settings
-            .checks
+        effective
             .iter()
-            .map(|c| c.name.as_str())
+            .map(|c| c.def.name.as_str())
             .collect::<Vec<_>>()
             .join(", ")
     };
-    let def = if requested.is_empty() {
-        match settings.checks.as_slice() {
+    let selected = if requested.is_empty() {
+        match effective.as_slice() {
             [only] => only,
             // Informational, not a failure: the caller asked which checks exist
             // and gets the list. Returning `Err` here marked a well-formed
@@ -1647,13 +1713,13 @@ async fn run_check_inner(
                 return Ok(format!(
                     "run_check needs a `name` — this project has {} configured checks: {}. \
                      Re-call with one of those names.",
-                    settings.checks.len(),
+                    effective.len(),
                     names()
                 ))
             }
         }
     } else {
-        match settings.checks.iter().find(|c| c.name == requested) {
+        match effective.iter().find(|c| c.def.name == requested) {
             Some(c) => c,
             None => {
                 return Err(format!(
@@ -1663,6 +1729,21 @@ async fn run_check_inner(
             }
         }
     };
+    let def = &selected.def;
+    // A plugin check that is advertised but could not be rendered (a hostile
+    // overlay value, a manifest defect) fails HERE, with the reason. It stays in
+    // the enum on purpose — see `PluginCheck::error`: a capability the user
+    // enabled must not vanish without an explanation. The reason names the tool
+    // the way SETTINGS does (label + registry key), because the advertised
+    // `name` may have been disambiguated away from either.
+    if let Some(p) = selected.plugin.as_ref() {
+        if let Some(why) = p.error.as_deref() {
+            return Err(crate::checks::auto::spawn_failure_line(
+                &def.name,
+                &format!("{} (plugin tool `{}`): {why}", p.label, p.tool_key),
+            ));
+        }
+    }
     let changed_only = args
         .get("changed_only")
         .and_then(|v| v.as_bool())
@@ -1673,7 +1754,10 @@ async fn run_check_inner(
     // (MCP proxy, offload worker, IPC), so this is the one place the boundary
     // has to be resolved — decision 17's one switch, applied at the seam.
     let sandbox = crate::sandbox::SandboxCfg::from_settings(settings);
-    crate::checks::run(root, def, changed_only, &sandbox)
+    // V38: a plugin check brings its manifest's posture; a configured one gets
+    // `ToolPosture::default()`, which IS the pre-V38 behaviour.
+    let posture = selected.posture(crate::sandbox::SEAM_RUN_CHECK, root, &sandbox);
+    crate::checks::run_with_posture(root, def, changed_only, &sandbox, &posture)
         .await
         .map(|report| fmt_check_report(&report, max_rows))
         // V12 review: a check that fails to spawn/run must read as visibly
@@ -3028,6 +3112,62 @@ mod run_check_tests {
         assert_ne!(a, added);
         assert_ne!(a, none);
         assert_eq!(a, super::SurfaceFingerprint::of(&with(&["cargo"])));
+    }
+
+    /// A plugin-contributed name is advertised verbatim, `@` and `/` and all —
+    /// the disambiguated key `checks::plugin` mints when a short id is taken.
+    /// The schema is a project-scoped surface (the run_check note in the plan),
+    /// so a name this build has never seen is expected, not exceptional.
+    #[test]
+    fn the_spec_advertises_the_names_it_is_given_including_plugin_keys() {
+        let spec = super::run_check_spec_from(&[
+            "cargo".to_string(),
+            "acme@1.0.0/lint".to_string(),
+        ]);
+        assert_eq!(spec.parameters["required"], json!(["name"]));
+        assert_eq!(
+            spec.parameters["properties"]["name"]["enum"],
+            json!(["cargo", "acme@1.0.0/lint"])
+        );
+    }
+
+    /// **Invariant 10, as a test rather than a hope.** Three places decide what
+    /// `run_check` looks like — the advertisement gate in `tools`, the schema in
+    /// `run_check_spec_for`, and the memo key in `checks_sig` — and all three
+    /// must read the EFFECTIVE set. A plugin check is not injectable into a unit
+    /// test (it needs a scanned `plugins/` directory), so the wiring is pinned
+    /// where it can be: at the source. The behaviour those three share is
+    /// covered by `checks::plugin`'s own tests.
+    ///
+    /// Newline-agnostic on purpose — CI checks this tree out with CRLF.
+    #[test]
+    fn every_run_check_surface_reads_the_effective_set() {
+        let src = include_str!("mcp.rs");
+        let body_of = |sig: &str| -> String {
+            let start = src
+                .find(sig)
+                .unwrap_or_else(|| panic!("`{sig}` is gone — re-point this test"));
+            let rest = &src[start..];
+            let end = rest.find("\n}").unwrap_or(rest.len());
+            rest[..end].to_string()
+        };
+        for sig in ["fn checks_sig(", "pub fn tools()"] {
+            let body = body_of(sig);
+            assert!(
+                body.contains("effective_check_names"),
+                "`{sig}` must read the effective check set (settings.checks ∪ plugin checks), \
+                 or a plugin enable/rescan changes the advertised surface without moving the \
+                 fingerprint that gates it"
+            );
+        }
+        assert!(
+            body_of("fn run_check_spec_for(").contains("effective_check_names"),
+            "the advertised schema must enumerate the effective set"
+        );
+        assert!(
+            body_of("async fn run_check_inner(").contains("effective_checks_live"),
+            "dispatch must select from the same set the schema advertised"
+        );
     }
 
     #[tokio::test]

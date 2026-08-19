@@ -136,6 +136,19 @@ tools unaffected) + one error event in the `mcp` lane naming tool + server.
 Applies to `origin: external` servers only. Re-screen on reconnect (surface
 may change server-side).
 
+**E-1, delivered in V38 Phase F.** Screening at connect meant a detection
+config that changed AFTERWARDS did not reach a live surface — flagged tools
+stayed until something reconnected the server, and detection config is
+deliberately outside `host_config_sig` (making it part of the signature would
+reconnect every server on a rules-bundle update). `McpHost::rescreen` now
+re-runs the screen over each connected external server's live tool list and
+**drops newly-flagged tools in place, drop-only** — an un-flagged tool does not
+come back without a reconnect. Same `mcp`-lane `source:"screen"` row per drop,
+and a `PulseSource::Host` pulse when anything went. Two edges drive it: a
+settings save whose resolved `detection::Config` moved, and a rules-bundle
+reload (which changes no setting at all, so it publishes its own signal —
+`detection::subscribe_rules_reload`).
+
 ### C10 — Out of scope (stated to every agent)
 `audit/mcp.rs`'s surface (V38); per-tool toggles within a server (deferred
 until asked); hosting/supervising internal servers (#41); any new HTTP MCP

@@ -3,7 +3,20 @@
 // (`../settings/ipc`) since the Settings section owns it.
 
 import { invoke } from '@tauri-apps/api/core';
-import type { AuditCategory, AuditSnapshot } from './types';
+import type { AuditCategory, AuditSnapshot, AuditToolState } from './types';
+
+/// V38 Phase D: the tools a scan of `category` WOULD run right now — the
+/// configured built-in roster plus this project's enabled, path-configured
+/// plugin tools — as `idle` chips (a non-applicable plugin tool arrives already
+/// marked `skipped-not-applicable`, since only the backend can evaluate a
+/// manifest's gate).
+///
+/// The pre-scan chip list. Read-only and cheap: no census walk, no resolution,
+/// no spawn — the backend's registry join, which is the only place that join
+/// exists.
+export async function auditEffectiveRoster(category: AuditCategory): Promise<AuditToolState[]> {
+  return invoke('audit_effective_roster', { category });
+}
 
 /// Start a scan of the project root with the enabled + applicable + resolvable
 /// tools of `category` (`'security'` / `'quality'`), concurrently. Returns

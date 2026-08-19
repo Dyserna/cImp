@@ -377,6 +377,8 @@ fn grant_rows_with(
 pub fn grant_hints(harness: Harness) -> GrantHints {
     let exe = std::env::current_exe().ok();
     GrantHints {
+        // A harness is spawned by cImp, not declared by a manifest: inference.
+        runtime: super::RuntimeSelect::Infer,
         programs: Vec::new(),
         full_dirs: Vec::new(),
         rows: grant_rows_with(harness, &|k| std::env::var_os(k), exe.as_deref()),

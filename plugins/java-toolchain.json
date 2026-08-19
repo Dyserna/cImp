@@ -1,0 +1,92 @@
+{
+  "manifest_version": 1,
+  "name": "java-toolchain",
+  "version": "1.0.0",
+  "label": "Java build tools",
+  "description": "Maven and Gradle, each with a build check, a test check and the CLI itself. Both are defined; configure the one your project uses and leave the other inert, or configure both and let the caller pick.",
+  "categories": [
+    {
+      "id": "maven",
+      "label": "Maven",
+      "tools": ["maven-build", "maven-test", "mvn"]
+    },
+    {
+      "id": "gradle",
+      "label": "Gradle",
+      "tools": ["gradle-build", "gradle-test", "gradle"]
+    }
+  ],
+  "tools": [
+    {
+      "id": "maven-build",
+      "label": "Maven build",
+      "description": "Compiles the project in batch mode and reports the compiler errors Maven prints as [ERROR] path:[line,col] message.",
+      "kind": "check",
+      "applicability": { "markers": ["pom.xml"] },
+      "cmd": "mvn -B -q compile",
+      "parser": "regex-custom",
+      "pattern": "^\\[(?P<severity>ERROR|WARNING)\\] (?P<file>[^\\[]+):\\[(?P<line>\\d+),(?P<col>\\d+)\\] (?P<message>.+)$",
+      "timeout_secs": 900,
+      "runtime": "java",
+      "sandbox": "optional",
+      "parameters_allowed": true
+    },
+    {
+      "id": "maven-test",
+      "label": "Maven test",
+      "description": "Runs the tests and reports each failure from Surefire's [ERROR] Class.method:line message summary. Compile errors during the test phase print in the build shape instead — run the build check for those.",
+      "kind": "check",
+      "applicability": { "markers": ["pom.xml"] },
+      "cmd": "mvn -B test",
+      "parser": "regex-custom",
+      "pattern": "^\\[ERROR\\]\\s+(?P<file>[A-Za-z0-9_.$]+):(?P<line>\\d+)\\s+(?P<message>.+)$",
+      "timeout_secs": 1800,
+      "runtime": "java",
+      "sandbox": "optional",
+      "parameters_allowed": true
+    },
+    {
+      "id": "mvn",
+      "label": "mvn",
+      "description": "The Maven CLI itself, for a one-off goal (mvn -v, mvn dependency:tree) through run_command.",
+      "kind": "command",
+      "runtime": "java",
+      "sandbox": "optional"
+    },
+    {
+      "id": "gradle-build",
+      "label": "Gradle build",
+      "description": "Builds the project without running tests; Gradle passes javac's file:line: error: message diagnostics through unchanged.",
+      "kind": "check",
+      "applicability": { "markers": ["build.gradle"] },
+      "cmd": "gradle --console=plain build -x test",
+      "parser": "generic-gcc",
+      "timeout_secs": 900,
+      "runtime": "java",
+      "sandbox": "optional",
+      "parameters_allowed": true
+    },
+    {
+      "id": "gradle-test",
+      "label": "Gradle test",
+      "description": "Runs the tests and reports each failure at the source line Gradle prints beneath it (Exception at File.java:line).",
+      "kind": "check",
+      "applicability": { "markers": ["build.gradle"] },
+      "cmd": "gradle --console=plain test",
+      "parser": "regex-custom",
+      "pattern": "^\\s*(?P<message>[\\w.$]+) at (?P<file>[^\\s:]+):(?P<line>\\d+)\\s*$",
+      "timeout_secs": 1800,
+      "runtime": "java",
+      "sandbox": "optional",
+      "parameters_allowed": true
+    },
+    {
+      "id": "gradle",
+      "label": "gradle",
+      "description": "The Gradle CLI itself, for a one-off task (gradle -v, gradle tasks) through run_command.",
+      "kind": "command",
+      "runtime": "java",
+      "sandbox": "optional"
+    }
+  ]
+}

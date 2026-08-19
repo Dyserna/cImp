@@ -858,10 +858,12 @@ fn apply_incoming_settings(cur: &mut Settings, mut incoming: Settings) {
     // Keep the reserved feature tabs (Code Graph monitor / Workbench / ...)
     // present-iff-enabled in the persisted list.
     crate::settings::reconcile_reserved_tabs(cur);
-    // V25: keep `code_audit.tools` complete — a pre-V25 snapshot (three Security
-    // tools) gains the eleven Quality tools here, mirroring the load-path
-    // reconcile in `integrity_check`. Existing entries are untouched; idempotent.
-    crate::settings::reconcile_audit_tools(cur);
+    // V38 Phase E: there is nothing to reconcile for the audit roster any more.
+    // The fourteen built-in tools are an embedded manifest read at invocation
+    // time, so a settings file that predates one of them simply has no state for
+    // it and the registry supplies the manifest default — which is what made the
+    // old top-up (`reconcile_audit_tools`, appending missing built-ins to a
+    // persisted array) unnecessary rather than merely moved.
     // V21: when OpenCode local-llama auto-sync is on and the local server is
     // enabled, re-derive the provider snapshot if the primary Local command
     // changed (no-op otherwise), so the OpenCode tab tracks command edits.

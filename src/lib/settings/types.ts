@@ -865,6 +865,9 @@ export interface Settings {
   /// default; `enabled` gates the reserved Code Audit dashboard tab and the
   /// bottom-bar entry point.
   code_audit: CodeAuditSettings;
+  /// V38 Phase B: drop-in tool-plugin user state (schema v33). Additive — a
+  /// pre-v33 file loads with an empty container.
+  tool_plugins: ToolPluginsSettings;
 }
 
 /// One provider/model price row: USD per million tokens for the four billing
@@ -1198,6 +1201,9 @@ export type ParserKind =
   | 'go-test-json'
   | 'dotnet'
   | 'junit-xml'
+  | 'typos-jsonl'
+  | 'knip-json'
+  | 'machete-text'
   | 'regex-custom'
   | 'generic-gcc';
 
@@ -1494,60 +1500,25 @@ export interface ExternalToolsSettings {
   broot: string;
 }
 
-/// V23 Phase A / V25 Phase B: closed set of built-in audit tools (mirror of
-/// Rust `AuditToolId`). Wire format is kebab-case; an unknown id in a settings
-/// file is dropped backend-side (forward compat), never an error. The first
-/// three are the Security category; the rest are V25 Quality tools.
-export type AuditToolId =
-  | 'osv-scanner'
-  | 'gitleaks'
-  | 'semgrep'
-  | 'oxlint'
-  | 'golangci-lint'
-  | 'ruff'
-  | 'cppcheck'
-  | 'typos'
-  | 'eslint'
-  | 'pmd'
-  | 'dotnet-analyzers'
-  | 'knip'
-  | 'cargo-machete'
-  | 'semgrep-quality';
-
-/// V23 Phase A: one configured audit tool (mirror of Rust `AuditToolConfig`).
-/// `path` empty = resolve `ebin` → PATH; non-empty = used as the command
-/// verbatim. `extra_args` are appended after the adapter's fixed argv (a
-/// semgrep ruleset swap belongs in `ruleset`, not here).
-export interface AuditToolConfig {
-  id: AuditToolId;
-  enabled: boolean;
-  path: string;
-  extra_args: string[];
-  /// Ruleset override for the tools with a ruleset selector: the two semgrep
-  /// tools (`--config <slug>`) and PMD (`-R <ruleset>`). Empty uses the
-  /// adapter's built-in value; exists so an upstream-owned default breaking
-  /// (e.g. a slug vanishing from the semgrep registry) is a settings edit,
-  /// not a rebuild. Ignored by every other tool.
-  ruleset: string;
-  /// V25 Phase C: per-tool wall-clock timeout override in seconds. `null` (the
-  /// default) falls back to the global `CodeAuditSettings.timeout_secs`. A
-  /// build-style tool wants a longer budget than a linter — `dotnet-analyzers`
-  /// is the motivating case (≈1200 recommended).
-  timeout_secs: number | null;
-}
-
 /// V23 Phase A: Code Audit (aggregated security scanning) config (mirror of
 /// Rust `CodeAuditSettings`). Off by default; `enabled` gates the "Code audit"
 /// section inside the Tool Activity tab (its reserved tab was retired in
 /// schema v27) and the bottom-bar entry.
+///
+/// **There is no per-tool array here.** Schema v34 moved the fourteen built-in
+/// scanners onto the plugin framework: what each one is configured with —
+/// enabled, path, timeout, ruleset, extra arguments — lives in
+/// `ToolPluginsSettings` under the `cimp-audit@1` plugin key, beside whatever
+/// the user dropped in the plugins folder. What stays here is what is true of
+/// the FEATURE rather than of any one tool.
 export interface CodeAuditSettings {
   enabled: boolean;
-  tools: AuditToolConfig[];
   timeout_secs: number;
-  /// Keep the QUALITY tools' `enabled` flags following the project's language
-  /// census automatically (default true). Editing a quality checkbox flips
-  /// this to false (manual mode); the Settings section's "Auto-select for this
-  /// project" button turns it back on. Security tools are never touched.
+  /// Keep the built-in QUALITY tools' `enabled` flags following the project's
+  /// language census automatically (default true). Editing a quality checkbox
+  /// flips this to false (manual mode); the "Auto-select for this project"
+  /// button turns it back on. Security tools and user plugins are never
+  /// touched; the flags it writes live in `tool_plugins`.
   quality_auto_select: boolean;
   /// V26: advertise the `cimp-code-audit` MCP server (security_audit /
   /// quality_audit) to Claude Code tabs. ANDed with `enabled` at the injection
@@ -1561,6 +1532,52 @@ export interface CodeAuditSettings {
   /// true. A scan always runs in-process, so a remote worker only ever gets the
   /// free-text report.
   expose_offload: boolean;
+}
+
+/// V38 Phase B: user state for the drop-in tool plugins (mirror of Rust
+/// `ToolPluginsSettings`, schema v33). Keyed maps rather than typed fields —
+/// the set of plugins is whatever is in `<exe-dir>/plugins/`, so it is data,
+/// and a typed shape would need a settings migration per dropped file.
+///
+/// The three maps are three SCOPES:
+/// * `plugins` — enables, timeouts, variable values, extra parameters, keyed
+///   `name@version`. Only `variables` and `parameters` ride a project's
+///   `.cimp/config.json`; the rest is machine-global (amended decision 10).
+/// * `global_paths` — where each tool's binary lives on this machine, keyed
+///   `name@version/tool-id`.
+/// * `project_paths` — the same fact overridden per project: canonical project
+///   root → tool key → path. Still stored machine-globally.
+///
+/// Effective path = project entry ?? global entry ?? unset (a tool with no path
+/// is inert). Entries are never pruned when a plugin's file goes missing.
+export interface ToolPluginsSettings {
+  plugins: Record<string, PluginState>;
+  project_paths: Record<string, Record<string, string>>;
+  global_paths: Record<string, string>;
+}
+
+/// One plugin's user state (mirror of Rust `PluginState`). Disabling the plugin
+/// disables its tools as a unit WITHOUT clearing their own flags, so
+/// re-enabling restores the selection the user had.
+export interface PluginState {
+  enabled: boolean;
+  /// Keyed by the tool's manifest id (not the namespaced key — the plugin key
+  /// is the outer map's key).
+  tools: Record<string, ToolState>;
+}
+
+/// One tool's user state (mirror of Rust `ToolState`). **No `path`**: paths are
+/// machine-scope and live in `ToolPluginsSettings.global_paths` /
+/// `project_paths`.
+export interface ToolState {
+  enabled: boolean;
+  /// `null` = the manifest's value, then the consuming pipeline's default.
+  timeout_secs: number | null;
+  /// Appended after the tool's own argv; offered only when the manifest sets
+  /// `parameters_allowed`.
+  parameters: string[];
+  /// Values for the tool's declared variables, by declared name.
+  variables: Record<string, string>;
 }
 
 /// V23 Phase A: the `audit_detect_tool` IPC result (mirror of Rust
@@ -2424,26 +2441,10 @@ export function defaultSettings(): Settings {
       expose_claude: true,
       expose_opencode: true,
       expose_offload: true,
-      tools: [
-        // Security (V23).
-        { id: 'osv-scanner', enabled: true, path: '', extra_args: [], ruleset: '', timeout_secs: null },
-        { id: 'gitleaks', enabled: true, path: '', extra_args: [], ruleset: '', timeout_secs: null },
-        { id: 'semgrep', enabled: true, path: '', extra_args: [], ruleset: '', timeout_secs: null },
-        // Quality (V25) — enabled by default.
-        { id: 'oxlint', enabled: true, path: '', extra_args: [], ruleset: '', timeout_secs: null },
-        { id: 'golangci-lint', enabled: true, path: '', extra_args: [], ruleset: '', timeout_secs: null },
-        { id: 'ruff', enabled: true, path: '', extra_args: [], ruleset: '', timeout_secs: null },
-        { id: 'cppcheck', enabled: true, path: '', extra_args: [], ruleset: '', timeout_secs: null },
-        { id: 'typos', enabled: true, path: '', extra_args: [], ruleset: '', timeout_secs: null },
-        { id: 'eslint', enabled: true, path: '', extra_args: [], ruleset: '', timeout_secs: null },
-        { id: 'pmd', enabled: true, path: '', extra_args: [], ruleset: '', timeout_secs: null },
-        { id: 'knip', enabled: true, path: '', extra_args: [], ruleset: '', timeout_secs: null },
-        { id: 'cargo-machete', enabled: true, path: '', extra_args: [], ruleset: '', timeout_secs: null },
-        // Quality — default-disabled.
-        { id: 'dotnet-analyzers', enabled: false, path: '', extra_args: [], ruleset: '', timeout_secs: null },
-        { id: 'semgrep-quality', enabled: false, path: '', extra_args: [], ruleset: '', timeout_secs: null },
-      ],
       timeout_secs: 600,
     },
+    // Empty on a fresh install: plugins are files the user drops into
+    // `<exe-dir>/plugins/`, so there is nothing to seed.
+    tool_plugins: { plugins: {}, project_paths: {}, global_paths: {} },
   };
 }

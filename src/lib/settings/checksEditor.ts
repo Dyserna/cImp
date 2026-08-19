@@ -26,6 +26,9 @@ export const PARSER_LABELS: Record<ParserKind, string> = {
   dotnet: '.NET / MSBuild (dotnet build)',
   'junit-xml': 'JUnit XML report',
   sarif: 'SARIF 2.1',
+  'typos-jsonl': 'typos (--format json)',
+  'knip-json': 'knip (--reporter json)',
+  'machete-text': 'cargo-machete (text)',
   'regex-custom': 'Custom regex',
   'generic-gcc': 'Generic (file:line:col)',
 };

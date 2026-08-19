@@ -588,6 +588,14 @@ jobs:
           New-Item -ItemType Directory -Force -Path "$stageFull/bin/detection" | Out-Null
           Copy-Item -Recurse detection/* "$stageFull/bin/detection/"
 
+          # V38 starter tool-plugin pack. Read from <exe-dir>/plugins/ and only
+          # there (plugins::loader) — data files exactly like themes/detection,
+          # with no embedded fallback, so omitting them ships an app whose Tool
+          # Plugins pane is empty. Every tool is inert until the user fills in a
+          # binary path, so shipping them enables nothing by itself.
+          New-Item -ItemType Directory -Force -Path "$stageFull/bin/plugins" | Out-Null
+          Copy-Item -Recurse plugins/* "$stageFull/bin/plugins/"
+
           # Kokoro ONNX model and every voicepack, fetched from the
           # models-v1 release by the fetch step. Shipping all voices means
           # the user can switch via Settings -> Audio without re-downloading
@@ -674,6 +682,11 @@ jobs:
           # carrying no model weights, so the slim zip ships them too.
           New-Item -ItemType Directory -Force -Path "$stageSlim/bin/detection" | Out-Null
           Copy-Item -Recurse detection/* "$stageSlim/bin/detection/"
+
+          # V38 starter tool-plugin pack (see the full-variant note). Seven small
+          # JSON declarations; the slim zip ships them too.
+          New-Item -ItemType Directory -Force -Path "$stageSlim/bin/plugins" | Out-Null
+          Copy-Item -Recurse plugins/* "$stageSlim/bin/plugins/"
 
           Copy-Item LICENSE "$stageSlim/"
           Copy-Item NOTICE "$stageSlim/"

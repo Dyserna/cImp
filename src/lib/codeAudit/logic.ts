@@ -5,7 +5,6 @@
 // piece of logic that can be tested lives here (mirrors the `checksEditor.ts` /
 // `codeAudit.ts` split).
 
-import type { CodeAuditSettings } from '../settings/types';
 import type {
   AuditCategory,
   AuditCensus,
@@ -13,19 +12,28 @@ import type {
   AuditSeverity,
   AuditSnapshot,
   AuditToolId,
+  AuditToolRef,
   AuditToolState,
   AuditToolStatus,
 } from './types';
 
 // ── Tool → category / order / applicability ───────────────────────────────
 //
-// SINGLE frontend source of truth for the tool metadata the split UI needs,
-// mirroring the Rust adapter registry (`src-tauri/src/audit/adapters.rs`):
-//   - `Adapter.category` → `AUDIT_TOOL_CATEGORY`
-//   - `Adapter.applicability` → `AUDIT_TOOL_APPLICABILITY`
-//   - the default `code_audit.tools` order → `AUDIT_TOOL_ORDER`
-// The Rust↔TS category / status / wire tripwire in `audit/runner.rs` guards the
-// enums; these maps must be kept in lockstep with the registry by hand.
+// SINGLE frontend source of truth for the built-in tool metadata the split UI
+// needs, mirroring cImp's own embedded manifest
+// (`src-tauri/src/plugins/builtin/cimp-audit.json`):
+//   - a tool's `kind` → `AUDIT_TOOL_CATEGORY` (security ⇒ Security, audit ⇒ Quality)
+//   - its `applicability` → `AUDIT_TOOL_APPLICABILITY`
+//   - the manifest's tool order → `AUDIT_TOOL_ORDER`
+//   - `enabled_by_default: false` → `AUDIT_TOOL_DEFAULT_OFF`
+// `builtin_audit_tool_ids_are_mirrored_in_the_frontend_union` (Rust) reads that
+// manifest and checks every id appears in the union below; the maps themselves
+// are kept in lockstep by hand, which is why each is a small closed table with
+// its Rust counterpart named.
+//
+// These are for the PANEL, not for settings: a built-in scanner is configured in
+// the Tool Plugins pane like any other tool, and the roster a scan would run is
+// `audit_effective_roster`'s answer, not a re-derivation from these maps.
 
 /// Which tab each tool belongs to. Security = the V23 trio (Code Audit tab);
 /// Quality = the V25 linters (the Code Audit tab's Quality sub-tab).
@@ -47,8 +55,7 @@ export const AUDIT_TOOL_CATEGORY: Record<AuditToolId, AuditCategory> = {
 };
 
 /// Canonical display order across BOTH categories — security first, then the
-/// quality tools in settings-configured order (matches the default
-/// `code_audit.tools`). Drives the chip list, the sort tiebreak, and the merge
+/// quality tools, matching the embedded manifest's own tool order. Drives the chip list, the sort tiebreak, and the merge
 /// re-order; each tab renders only its own category's slice (`toolsInCategory`).
 export const AUDIT_TOOL_ORDER: readonly AuditToolId[] = [
   // Security (V23) — the Security sub-tab.
@@ -98,32 +105,38 @@ export const AUDIT_TOOL_APPLICABILITY: Record<
   'semgrep-quality': { extensions: [], markers: [] },
 };
 
-/// The quality tools whose FACTORY default is disabled (mirror of
-/// `default_audit_tools()` in Rust `settings/schema.rs` — `dotnet-analyzers`
-/// runs a real build, `semgrep-quality` downloads network rulesets). Quality
-/// auto-selection keeps these opt-in even when applicable.
+/// The quality tools whose FACTORY default is disabled (mirror of the
+/// `enabled_by_default: false` tools in the embedded manifest,
+/// `src-tauri/src/plugins/builtin/cimp-audit.json` — `dotnet-analyzers` runs a
+/// real build, `semgrep-quality` downloads network rulesets; pinned Rust-side
+/// by `the_heavyweight_tools_stay_opt_in`). Quality auto-selection keeps these
+/// opt-in even when applicable.
 export const AUDIT_TOOL_DEFAULT_OFF: ReadonlySet<AuditToolId> = new Set([
   'dotnet-analyzers',
   'semgrep-quality',
 ]);
 
-/// Recompute each QUALITY tool's `enabled` to its automatic value —
-/// factory-default-enabled AND applicable to `census` — returning a NEW tools
-/// array (input untouched; unchanged entries are reused by reference).
-/// Security tools are never in scope. Mirror of Rust
-/// `audit::runner::auto_select_quality`; the Settings button uses this for an
-/// instant client-side apply, the backend re-applies on every census refresh.
-/// Callers should skip an empty census (`censusIsEmpty`) — "no languages seen
-/// yet" must not deselect everything.
-export function autoSelectQuality<T extends { id: AuditToolId; enabled: boolean }>(
-  tools: readonly T[],
+/// Every built-in QUALITY tool paired with the `enabled` auto-selection wants
+/// for it: its factory default AND applicable to `census`. Security tools are
+/// never in scope, and neither is a user plugin's tool — auto-selection is a
+/// statement about the roster cImp ships and knows the shape of.
+///
+/// Mirror of Rust `audit::runner::auto_select_quality`; the Settings button
+/// uses it for an instant client-side apply, and the backend re-applies the
+/// same rule on every census refresh. Callers must skip an empty census
+/// (`censusIsEmpty`) — "no languages seen yet" must not deselect everything.
+///
+/// Returns the full desired state rather than a diff: the caller writes into a
+/// keyed settings container where "absent" already means "the manifest's
+/// default", so it needs to know what every tool should be, not only what
+/// changed.
+export function qualityAutoSelection(
   census: AuditCensus,
-): T[] {
-  return tools.map((t) => {
-    if (AUDIT_TOOL_CATEGORY[t.id] !== 'quality') return t;
-    const want = !AUDIT_TOOL_DEFAULT_OFF.has(t.id) && isToolApplicable(t.id, census);
-    return t.enabled === want ? t : { ...t, enabled: want };
-  });
+): { id: AuditToolId; enabled: boolean }[] {
+  return toolsInCategory('quality').map((id) => ({
+    id,
+    enabled: !AUDIT_TOOL_DEFAULT_OFF.has(id) && isToolApplicable(id, census),
+  }));
 }
 
 /// A census with neither extensions nor markers — the pre-first-scan state.
@@ -137,8 +150,16 @@ export function censusIsEmpty(census: AuditCensus): boolean {
 /// gate extension OR ANY gate marker was seen. Callers must special-case an
 /// empty census (`censusIsEmpty`) — with nothing seen a guarded tool reads as
 /// not-applicable, which for chip visibility means "unknown", not "hide".
-export function isToolApplicable(id: AuditToolId, census: AuditCensus): boolean {
-  const a = AUDIT_TOOL_APPLICABILITY[id];
+/// Whether a tool applies to a project with this census.
+///
+/// V38: an id this build has no applicability metadata for is a PLUGIN tool,
+/// whose gate lives in its manifest and is evaluated backend-side — the snapshot
+/// already says `skipped-not-applicable` when it did not apply. Answering
+/// "applicable" here is therefore not a guess but a deferral: the frontend
+/// hides nothing it was not told to hide.
+export function isToolApplicable(id: AuditToolRef, census: AuditCensus): boolean {
+  const a = AUDIT_TOOL_APPLICABILITY[id as AuditToolId];
+  if (!a) return true;
   if (a.extensions.length === 0 && a.markers.length === 0) return true;
   return (
     a.extensions.some((e) => census.extensions.includes(e)) ||
@@ -153,8 +174,12 @@ export const SEVERITY_RANK: Record<AuditSeverity, number> = { error: 3, warning:
 /// The three severities, most-severe first — for the threshold `<select>`.
 export const SEVERITIES: readonly AuditSeverity[] = ['error', 'warning', 'note'];
 
-function toolRank(id: AuditToolId): number {
-  const i = AUDIT_TOOL_ORDER.indexOf(id);
+/// Sort rank: the built-in order, then everything else (plugin tools) after it,
+/// stable in arrival order. Deliberately not alphabetical among plugins — the
+/// backend emits them in registry order (plugin key, then manifest order), which
+/// is the order the settings pane lists them in.
+function toolRank(id: AuditToolRef): number {
+  const i = (AUDIT_TOOL_ORDER as readonly string[]).indexOf(id);
   return i < 0 ? AUDIT_TOOL_ORDER.length : i;
 }
 
@@ -166,7 +191,7 @@ function toolRank(id: AuditToolId): number {
 export interface FindingRow {
   /// `${tool}#${indexWithinTool}` — stable, unique within a snapshot.
   id: string;
-  tool: AuditToolId;
+  tool: AuditToolRef;
   severity: AuditSeverity;
   /// SARIF rule id, or `null`.
   code: string | null;
@@ -210,7 +235,8 @@ export interface AuditFilters {
   /// Severity threshold — rows at or above this rank are shown.
   severity: AuditSeverity;
   /// Per-tool visibility. A tool absent from the map is treated as visible.
-  tools: Partial<Record<AuditToolId, boolean>>;
+  /// Keyed by the WIRE id, so a plugin tool's toggle works like any other's.
+  tools: Partial<Record<string, boolean>>;
   /// Case-insensitive substring over message / file / rule id / tool.
   text: string;
 }
@@ -221,7 +247,7 @@ export function defaultFilters(): AuditFilters {
   return { severity: 'note', tools: {}, text: '' };
 }
 
-function toolVisible(filters: AuditFilters, id: AuditToolId): boolean {
+function toolVisible(filters: AuditFilters, id: AuditToolRef): boolean {
   return filters.tools[id] !== false;
 }
 
@@ -374,46 +400,35 @@ export function formatCoverageLine(paths: readonly string[]): string {
   return paths.map((p) => `${p} ✓`).join(' · ');
 }
 
-// ── Pre-scan configured tool list ────────────────────────────────────────────
+// ── Pre-scan chips ─────────────────────────────────────────────────────────
 
-/// Before the first scan of `category` the backend snapshot has no tools of it;
-/// render that category's configured tool list from settings as idle chips (in
-/// canonical order, including disabled tools — spec). Once a scan of the
-/// category starts the backend's `tools` is authoritative and this is unused.
-export function configuredToolStates(
-  settings: CodeAuditSettings,
-  category: AuditCategory,
-): AuditToolState[] {
-  const byId = new Map<AuditToolId, boolean>();
-  for (const t of settings.tools) byId.set(t.id, t.enabled);
-  const out: AuditToolState[] = [];
-  for (const id of toolsInCategory(category)) {
-    if (!byId.has(id)) continue;
-    out.push({
-      id,
-      category,
-      status: 'idle',
-      findings: [],
-      duration_ms: 0,
-      error: null,
-      resolved: null,
-      scanned_artifacts: [],
-    });
-  }
-  return out;
-}
-
-/// The `category` tool states to render as chips: the snapshot's OWN
-/// (category-filtered) list once a scan of this category has produced one, else
-/// the configured fallback. A merged snapshot may carry both categories' tools
-/// (see `mergeAuditSnapshot`), so this always filters by category first.
+/// The `category` tool states to render as chips, in preference order:
+///
+/// 1. the snapshot's OWN (category-filtered) list, once a scan of this category
+///    has produced one — authoritative, it is what actually ran;
+/// 2. `roster`, the backend's `audit_effective_roster` answer — what a scan
+///    *would* run right now, built-ins **and** plugin tools.
+///
+/// There is no third fallback since V38 Phase E. There used to be
+/// `configuredToolStates`, a built-ins-only derivation from
+/// `settings.code_audit.tools`; that array is gone, and re-deriving the roster
+/// in the browser from the settings container would mean re-implementing the
+/// manifest ⋈ user-state ⋈ project join that `audit_effective_roster` exists to
+/// answer — which is exactly how two lists start disagreeing. Before the IPC
+/// answers the chip strip is empty for a moment, which is honest.
+///
+/// A merged snapshot may carry both categories' tools (see
+/// `mergeAuditSnapshot`), so this always filters by category first. `roster` is
+/// likewise filtered rather than trusted: the panel holds one category and a
+/// stale answer for the other one must not leak into it.
 export function chipToolStates(
   snapshot: AuditSnapshot,
-  settings: CodeAuditSettings,
   category: AuditCategory,
+  roster: readonly AuditToolState[] | null = null,
 ): AuditToolState[] {
   const own = snapshot.tools.filter((t) => t.category === category);
-  return own.length > 0 ? own : configuredToolStates(settings, category);
+  if (own.length > 0) return own;
+  return (roster ?? []).filter((t) => t.category === category);
 }
 
 /// The chip-visibility split for one tab. A tool is HIDDEN when it's
@@ -495,7 +510,7 @@ export function mergeAuditSnapshot(
   next: AuditSnapshot,
 ): AuditSnapshot {
   if (!prev) return { ...next, tools: orderToolStates(next.tools) };
-  const byId = new Map<AuditToolId, AuditToolState>();
+  const byId = new Map<AuditToolRef, AuditToolState>();
   for (const t of prev.tools) byId.set(t.id, t);
   for (const t of next.tools) byId.set(t.id, t);
   return {

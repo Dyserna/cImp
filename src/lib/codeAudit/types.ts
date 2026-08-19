@@ -5,14 +5,44 @@
 // `total_findings` is always the TRUE total; on `truncated` the view fetches
 // the full (uncapped) set via `audit_snapshot`.
 //
-// The settings-side audit types (`AuditToolId`, `AuditToolConfig`,
-// `CodeAuditSettings`, `AuditDetectResult`) live in `../settings/types` — Phase
-// A only mirrored the settings block, so the runtime snapshot/event/finding
-// types are new here.
+// `CodeAuditSettings` and `AuditDetectResult` live in `../settings/types`.
 
-import type { AuditToolId } from '../settings/types';
+/// The fourteen tool ids cImp ships knowing how to call.
+///
+/// **This union is presentation metadata, not settings.** Until V38 it mirrored
+/// a Rust `AuditToolId` enum; that enum is gone — the fourteen are embedded
+/// plugin manifests now, and their configuration lives in `tool_plugins` like
+/// any other tool's. What did NOT change is that these ids cross the audit wire
+/// (a chip's `id`, a finding's `tool`) and that this file keys its category,
+/// order and applicability maps off them, so the union has to stay in step with
+/// the manifest. `builtin_audit_tool_ids_are_mirrored_in_the_frontend_union`
+/// (Rust) reads the shipped manifest and checks every id appears here.
+export type AuditToolId =
+  | 'osv-scanner'
+  | 'gitleaks'
+  | 'semgrep'
+  | 'oxlint'
+  | 'golangci-lint'
+  | 'ruff'
+  | 'cppcheck'
+  | 'typos'
+  | 'eslint'
+  | 'pmd'
+  | 'dotnet-analyzers'
+  | 'knip'
+  | 'cargo-machete'
+  | 'semgrep-quality';
 
-export type { AuditToolId };
+/// V38: a tool id on the audit WIRE — a built-in `AuditToolId`, or a plugin
+/// tool's key (`name@version/tool-id`), which no closed union can enumerate
+/// because plugins are dropped in without a rebuild.
+///
+/// The two namespaces cannot collide (a plugin key always contains `@` and `/`;
+/// no built-in id does), so everything that keys off an id keeps working — it
+/// simply meets ids it does not recognize, and the rule everywhere is the same:
+/// a metadata lookup that misses falls back to what the WIRE says (the
+/// snapshot's own `category`, `status`), never to a guess.
+export type AuditToolRef = AuditToolId | (string & {});
 
 /// Wire severity from the Rust `checks::Severity` (serde lowercase). Ordered
 /// error > warning > note for the table's default sort (see `SEVERITY_RANK`).
@@ -56,7 +86,9 @@ export interface AuditDiag {
 /// One raw finding: a diag tagged with the tool that produced it (mirror of
 /// Rust `AuditFinding`).
 export interface AuditFinding {
-  tool: AuditToolId;
+  /// The tool that produced it — always the registry entry cImp SPAWNED, never
+  /// a name the tool printed inside its own output.
+  tool: AuditToolRef;
   diag: AuditDiag;
 }
 
@@ -64,7 +96,7 @@ export interface AuditFinding {
 /// `ToolState`). `error` is set for `failed`/`not-installed`; `resolved` is the
 /// resolved binary path (a Windows backslash string) once resolution succeeds.
 export interface AuditToolState {
-  id: AuditToolId;
+  id: AuditToolRef;
   /// V25 Phase C: the tool's category. Every state in one snapshot shares it
   /// (a scan runs one category); the split UI filters the shared snapshot by it.
   category: AuditCategory;

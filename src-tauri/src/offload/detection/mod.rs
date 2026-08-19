@@ -69,6 +69,8 @@ pub mod classifier;
 pub mod signature;
 pub mod updater;
 
+use std::sync::OnceLock;
+
 use serde_json::Value;
 use tracing::{debug, warn};
 
@@ -993,6 +995,37 @@ pub fn init() {
     }
 }
 
+/// V38 Phase F (V37's E-1) — the "a rules bundle became live" bus.
+///
+/// A settings save broadcasts a `Settings` and every watcher can compare what it
+/// cares about; a rules RELOAD changes nothing in settings at all, so there was
+/// no edge for anything downstream to see. The MCP host's connect-time tool
+/// screen is downstream of exactly that fact ([`McpHost::rescreen`]), which is
+/// why this exists.
+///
+/// Deliberately only the two "became live" call sites publish here — the
+/// Settings "Reload rules" action ([`reload`]) and the updater's activation
+/// ([`updater::live_reload`]). The startup compile is not one of them: nothing
+/// is connected yet, and a pulse into an empty pool is noise with a lock in it.
+static RULES_RELOADED: OnceLock<tokio::sync::broadcast::Sender<()>> = OnceLock::new();
+
+fn rules_reloaded_bus() -> &'static tokio::sync::broadcast::Sender<()> {
+    RULES_RELOADED.get_or_init(|| tokio::sync::broadcast::channel(4).0)
+}
+
+/// Subscribe to rules-bundle reloads. Lagging is not a loss of meaning here: the
+/// subscriber re-screens against the CURRENT rules whichever notification woke
+/// it, so N coalesced reloads and one reload ask for the same work.
+pub fn subscribe_rules_reload() -> tokio::sync::broadcast::Receiver<()> {
+    rules_reloaded_bus().subscribe()
+}
+
+/// Announce that the live rules set has been replaced. No-op when nobody is
+/// listening, which is every process that is not the app.
+pub(crate) fn note_rules_reloaded() {
+    let _ = rules_reloaded_bus().send(());
+}
+
 /// Recompile the rules from disk and return the fresh combined status. The
 /// Settings block's "Reload rules" affordance, and what the C3 updater calls
 /// after it swaps a validated bundle into place.
@@ -1001,6 +1034,9 @@ pub fn reload(settings: &Settings) -> DetectionStatus {
     // the "Reload rules" path, and the whole point of the button is that a file
     // the user just fixed stops being reported broken.
     let rules = signature::reload();
+    // E-1: a live MCP surface was screened against the rules that were loaded
+    // when each server connected. This is the edge that says those rules moved.
+    note_rules_reloaded();
     DetectionStatus {
         rules,
         classifier: classifier::status(),

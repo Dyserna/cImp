@@ -22,8 +22,20 @@
   import { revealTab } from './tabs/visibility';
   import { revealFileInGraph } from './graphReveal';
   import { loadViewString, saveViewString, loadViewSet, saveViewSet } from './viewSection';
-  import { auditStartScan, auditCancelScan, auditSnapshot, auditRefreshCensus } from './codeAudit/ipc';
-  import type { AuditCategory, AuditSeverity, AuditSnapshot, AuditToolId } from './codeAudit/types';
+  import {
+    auditStartScan,
+    auditCancelScan,
+    auditSnapshot,
+    auditRefreshCensus,
+    auditEffectiveRoster,
+  } from './codeAudit/ipc';
+  import type {
+    AuditCategory,
+    AuditSeverity,
+    AuditSnapshot,
+    AuditToolRef,
+    AuditToolState,
+  } from './codeAudit/types';
   import {
     SEVERITIES,
     categoryFindingsCount,
@@ -42,7 +54,6 @@
     sortFindings,
     toggleSelected,
     toolChip,
-    toolsInCategory,
     visibleFindings,
     type AuditFilters,
     type FindingRow,
@@ -59,7 +70,6 @@
   // Sub-tab heading — the enclosing view carries the "Code Audit" title.
   const heading = $derived(isSecurity ? 'Security' : 'Quality');
   const mdLabel = $derived(isSecurity ? 'Code audit (security)' : 'Code audit (quality)');
-  const categoryTools = $derived(toolsInCategory(category));
 
   function emptySnapshot(): AuditSnapshot {
     return {
@@ -75,6 +85,10 @@
 
   // ── Runtime state ───────────────────────────────────────────────────────
   let snapshot = $state<AuditSnapshot>(emptySnapshot());
+  // V38: the backend's answer to "what would a scan of this category run?" —
+  // built-ins AND plugin tools. `null` until the first `audit_effective_roster`
+  // returns; `chipToolStates` prefers a scan's own tools and falls back to this.
+  let roster = $state<AuditToolState[] | null>(null);
   let scanError = $state<string | null>(null);
   let copied = $state(false);
   let copyTimer: ReturnType<typeof setTimeout> | null = null;
@@ -83,18 +97,20 @@
   let activeCategory = $state<AuditCategory | null>(null);
 
   // ── Persisted UI state (filters) ──────────────────────────────────────────
-  // These seed one-time from the (static) `view` / `categoryTools`; the
-  // initial-value read is intentional.
+  // These seed one-time from the (static) `view`; the initial-value read is
+  // intentional.
   // svelte-ignore state_referenced_locally
   const savedSev = loadViewString(view, 'severity');
   let severity = $state<AuditSeverity>(
     savedSev && (SEVERITIES as readonly string[]).includes(savedSev) ? (savedSev as AuditSeverity) : 'note',
   );
   // svelte-ignore state_referenced_locally
-  let hiddenTools = $state<Set<AuditToolId>>(
-    new Set(loadViewSet(view, 'hidden-tools').filter((t): t is AuditToolId =>
-      (categoryTools as readonly string[]).includes(t),
-    )),
+  // V38: keyed by the WIRE id, so a plugin tool's toggle persists like a
+  // built-in's. The stored set is no longer filtered against the built-in
+  // roster — a plugin's key is not in it and would have been dropped on every
+  // reload — only against emptiness, which is what a corrupted entry looks like.
+  let hiddenTools = $state<Set<AuditToolRef>>(
+    new Set(loadViewSet(view, 'hidden-tools').filter((t) => t.trim() !== '')),
   );
   // svelte-ignore state_referenced_locally
   let text = $state<string>(loadViewString(view, 'text') ?? '');
@@ -112,9 +128,9 @@
     tools: Object.fromEntries([...hiddenTools].map((t) => [t, false])),
     text,
   });
-  // Chips: this category's states (snapshot-own or configured fallback), then
-  // split into visible / hidden-because-not-applicable.
-  const chipStates = $derived(chipToolStates(snapshot, $settings.code_audit, category));
+  // Chips: this category's states (the snapshot's own, else the backend's
+  // effective roster), then split into visible / hidden-because-not-applicable.
+  const chipStates = $derived(chipToolStates(snapshot, category, roster));
   const chipPartition = $derived(partitionChips(chipStates, snapshot.census));
   const toolToggleIds = $derived(chipPartition.visible.map((t) => t.id));
   // Scan-coverage is osv-scanner-only, and osv-scanner is Security-only (V23).
@@ -153,6 +169,28 @@
       }
     } catch {
       /* backend unavailable mid-teardown — keep what we have */
+    }
+    // V38: the PRE-SCAN roster (built-ins ∪ this project's runnable plugin
+    // tools). Pulled alongside every snapshot refresh, and deliberately AFTER
+    // the census one: the backend gates a plugin tool's chip on the census it
+    // has stored, so asking before `auditRefreshCensus` returns would answer
+    // against the previous walk. Cheap to re-ask (no walk, no resolution, no
+    // spawn) and it MUST be re-asked — enabling a plugin tool or setting its
+    // path happens in the Settings window, not here.
+    void pullRoster();
+  }
+
+  /// The effective roster for THIS panel's category, or `null` until the first
+  /// answer arrives. `chipToolStates` prefers a scan's own tool list and uses
+  /// this only when there is none; there is no third source since V38 Phase E
+  /// deleted the settings-derived built-ins list, so until this answers the
+  /// idle chip row is empty rather than a roster the backend never confirmed.
+  async function pullRoster(): Promise<void> {
+    try {
+      const next = await auditEffectiveRoster(category);
+      if (alive) roster = next;
+    } catch {
+      /* leave the previous answer in place — an empty row beats a wrong one */
     }
   }
 
@@ -216,7 +254,7 @@
     void pullFull();
   }
 
-  function toggleTool(id: AuditToolId): void {
+  function toggleTool(id: AuditToolRef): void {
     const next = new Set(hiddenTools);
     if (next.has(id)) next.delete(id);
     else next.add(id);

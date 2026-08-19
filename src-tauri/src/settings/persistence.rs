@@ -42,7 +42,7 @@ use serde_json::{Map, Value};
 use crate::error::{AppError, AppResult};
 use crate::settings::migration;
 use crate::settings::schema::{
-    default_ai_tab, default_audit_tools, default_events_tab, default_graph_monitor_tab,
+    default_ai_tab, default_events_tab, default_graph_monitor_tab,
     default_shell_1_tab, default_tool_activity_tab, default_workbench_tab, pricing_rows_since,
     starter_prompt_templates, AiTabId, HarnessVersions, LayoutNodePersisted, LlmPricingModel,
     McpCategory, McpServerConfig, PromptTemplate, RemoteBackendTemplate, ServerCommandTemplate,
@@ -184,11 +184,21 @@ pub fn load(default_shell: &ShellSpec, launch_cwd: &Path) -> LoadOutcome {
     //    read from the resolved location (canonical `.cimp/config.json`, or the
     //    legacy file if the move couldn't happen).
     migrate_legacy_overlay(launch_cwd);
-    let overlay_value = read_overlay(&overlay_read_path(launch_cwd), true).map(|mut v| {
+    let overlay_path = overlay_read_path(launch_cwd);
+    let overlay_value = read_overlay(&overlay_path, true).map(|mut v| {
         // Per-install fields never belong in an overlay (see
         // `OVERLAY_BANNED_KEYS`) — drop them before the merge so an overlay
         // contaminated by a pre-guard version can't shadow the global file.
         strip_overlay_banned(&mut v);
+        // V38: `tool_plugins` cannot be banned wholesale (two of its leaves are
+        // genuinely per-project), so it gets a structured strip — and unlike the
+        // key ban, this one SAYS SO. A hand-edited config that sets a binary
+        // path per repo is a reasonable thing to try and a silent no-op is how
+        // that becomes "cImp ignores my config" an hour later.
+        crate::plugins::events::record_overlay_strip(
+            &overlay_path.display().to_string(),
+            &strip_overlay_tool_plugins(&mut v),
+        );
         v
     });
 
@@ -199,7 +209,7 @@ pub fn load(default_shell: &ShellSpec, launch_cwd: &Path) -> LoadOutcome {
     //     Persisted below via the post-load `save`, which also rewrites the
     //     overlay in the stripped shape.
     let promoted = overlay_value.as_ref().is_some_and(|ov| {
-        let paths = promote_overlay_audit_paths(&mut global, ov);
+        let paths = promote_overlay_audit_config(&mut global, ov);
         let templates = promote_overlay_offload_templates(&mut global, ov);
         let registry = promote_overlay_mcp_registry(&mut global, ov);
         paths || templates || registry
@@ -222,7 +232,6 @@ pub fn load(default_shell: &ShellSpec, launch_cwd: &Path) -> LoadOutcome {
         // 3b. Paths and template libraries always come from the
         //     (post-promotion) global baseline — an overlay's copies are
         //     legacy data, not authority.
-        enforce_global_audit_paths(&mut merged, &global);
         enforce_global_offload_templates(&mut merged, &global);
         enforce_global_mcp_registry(&mut merged, &global);
     }
@@ -310,6 +319,20 @@ pub fn load_readonly(launch_cwd: &Path) -> Settings {
     };
     if let Some(mut overlay) = read_overlay(&overlay_read_path(launch_cwd), false) {
         strip_overlay_banned(&mut overlay);
+        // V38, and NOT optional here: the children this serves are the Phase C/D
+        // consumers that resolve a plugin tool's binary path and enable state,
+        // and they run INSIDE the sandbox boundary whose writable area holds
+        // this very file. No Events row — a lightweight subprocess has no lane
+        // to speak into, and the app's own `load` already reported it.
+        let _ = strip_overlay_tool_plugins(&mut overlay);
+        // V37 registry, same reason and the SAME asymmetry made explicit: `load`
+        // promotes an overlay's servers/categories into the global baseline and
+        // then enforces the global arrays over the merged view, so an overlay
+        // holds no registry authority there. This reader does neither, so it
+        // removes the keys outright — see the block comment above
+        // `promote_overlay_mcp_registry` for why removal and not
+        // `strip_mcp_registry`.
+        let _ = strip_overlay_mcp_registry(&mut overlay);
         deep_merge(&mut merged, overlay);
     }
     serde_json::from_value(merged).unwrap_or_default()
@@ -749,8 +772,10 @@ fn strip_overlay_banned(v: &mut Value) {
 /// `sandbox` is in [`OVERLAY_BANNED_KEYS`], so [`save`]'s diff can never carry
 /// it into a project overlay — which would leave a Settings-window edit with
 /// nowhere to land if this did not exist. Same pattern as
-/// [`sync_audit_paths_into`]: the pure half, so the caller decides whether the
-/// physical file is worth rewriting.
+/// [`sync_tool_plugin_state_into`]: the pure half, so the caller decides
+/// whether the physical file is worth rewriting. (It used to name
+/// `sync_audit_paths_into`, which V38 Phase E deleted along with the per-tool
+/// array it split.)
 ///
 /// Whole-block, not per-field: every field of `SandboxSettings` is the same
 /// scope (what the OS enforces on this machine), and a per-field copy would be
@@ -763,42 +788,67 @@ fn sync_sandbox_into(disk_global: &mut Settings, current: &Settings) -> bool {
     true
 }
 
-// ── Audit scanner paths: machine-scope splitting ─────────────────────────────
+// ── Legacy audit-tool config: one-time promotion into `tool_plugins` ─────────
 //
-// Scanner exe paths (`code_audit.tools[].path`) are MACHINE facts (where
-// gitleaks.exe lives on this box), but the `tools` array as a whole is
-// project-scoped (the `enabled` flags follow each project's census and the
-// user's per-project selection) and the generic `diff` replaces arrays
-// WHOLESALE — the two scopes share one array. Left alone, whichever project
-// the user configured a scanner from keeps the path hostage in ITS overlay
-// while every other project sees "" (the V26 field report: paths set up in
-// one repo, audits in a second repo resolved nothing). The splitting rules:
+// Before schema v33, the fourteen built-in scanners were configured through
+// `code_audit.tools`, a project-scoped array with one machine-scoped field
+// inside it (`path`), split apart here by a promote-on-load / write-through-on-
+// save pair. V38 moved the whole of that configuration into the `tool_plugins`
+// container, where the scope split is structural rather than enforced by these
+// functions — so the pair is gone and only the LEGACY DATA question is left.
 //
-//   * LOAD — a legacy overlay's non-empty paths are promoted into the global
-//     baseline's EMPTY slots once, then the merged view's paths are ALWAYS
-//     overwritten from the global baseline: overlays carry no path authority.
-//   * SAVE — the live paths are written through to the PHYSICAL global file
-//     (`sync_audit_paths_into` + `save_to`, the same bypass pattern as
-//     `write_global_prompt_templates`), and `path` is normalized to "" on
-//     both diff sides so no new overlay ever pins a copy.
+// That question is real and easy to miss: the v32 → v33 migration rewrites the
+// GLOBAL settings file, and **a project overlay is never schema-migrated** (see
+// `load`). A user who configured audit tools from inside a project has that
+// configuration in `.cimp/config.json` as a `code_audit.tools` array, which the
+// new schema simply does not have a field for — so without this it would be
+// silently dropped the first time they launched the new build. "The setting
+// moved, so I threw yours away" is a data-loss bug wearing an upgrade's costume.
 //
-// `load_readonly` is deliberately exempt: the MCP children it serves never
-// read `code_audit.tools` (scans run in the app, not the child).
+// So: promote what the overlay carries into the container's EMPTY slots, once,
+// and let the next save write the overlay out in its new shape (the diff is
+// recomputed whole, so the stale key disappears by itself). Idempotent — it only
+// ever fills a slot the container does not already have — which matters because
+// a project that is never saved would otherwise re-promote on every launch.
 
-/// The serde wire id (`osv-scanner`, `semgrep-quality`, …) of a typed tool id.
-fn audit_wire_id(id: crate::settings::schema::AuditToolId) -> String {
-    serde_json::to_value(id)
-        .ok()
-        .and_then(|v| v.as_str().map(str::to_string))
-        .unwrap_or_default()
+/// The v33 container key each legacy `code_audit.tools[].id` maps to.
+///
+/// A plain string join rather than a lookup: the ids were `AuditToolId`'s wire
+/// names and the built-in manifest reuses them verbatim, which is the property
+/// that makes the migration a rename of the STORAGE and not of the tools.
+fn legacy_tool_key(id: &str) -> String {
+    format!("{}/{id}", crate::plugins::builtin::AUDIT_PLUGIN_KEY)
 }
 
-/// LOAD step 1: promote a legacy overlay's non-empty scanner paths into the
-/// global baseline's empty slots (first project launched wins per slot; a
-/// non-empty global path is never overwritten). Returns true when `global`
-/// changed — the caller persists via the post-load `save`, which also
-/// rewrites the overlay in the stripped shape so promotion is one-time.
-fn promote_overlay_audit_paths(global: &mut Settings, overlay: &Value) -> bool {
+/// Is `id` a tool this build actually ships under the built-in audit plugin?
+///
+/// **Phase E gate, B-E2.** The legacy overlay is a JSON file a user (or an
+/// older build, or a hand edit) wrote, and nothing has ever validated the ids
+/// in it — the pre-v34 reader dropped an unknown one at deserialize time, and
+/// the v33 → v34 migration drops it explicitly. This is the third reader of
+/// the same array and it has to make the same call, because the two things it
+/// writes are worse than a dropped setting: a container slot for a tool that
+/// does not exist is husk state the settings pane cannot show or clear, and a
+/// `global_paths` entry is a MACHINE-WIDE path keyed on a name nothing will
+/// ever resolve — a fabricated id in one project's overlay minting machine
+/// state is a wider blast radius than the promotion is worth.
+///
+/// Reads the embedded set rather than a frozen list: unlike a migration step
+/// (which describes a file shape on a fixed date — ruling R4), this describes
+/// what THIS build can run, so it should move when the roster moves.
+fn legacy_id_is_shipped(id: &str) -> bool {
+    crate::plugins::builtin::plugin_set()
+        .plugins
+        .iter()
+        .filter(|p| p.key == crate::plugins::builtin::AUDIT_PLUGIN_KEY)
+        .any(|p| p.manifest.tools.iter().any(|t| t.id == id))
+}
+
+/// Promote a legacy overlay's `code_audit.tools` into the global baseline's
+/// `tool_plugins` container, filling only slots the container does not have.
+/// Returns true when `global` changed — the caller persists via the post-load
+/// `save`, which also rewrites the overlay in its new shape.
+fn promote_overlay_audit_config(global: &mut Settings, overlay: &Value) -> bool {
     let Some(entries) = overlay
         .get("code_audit")
         .and_then(|c| c.get("tools"))
@@ -808,96 +858,78 @@ fn promote_overlay_audit_paths(global: &mut Settings, overlay: &Value) -> bool {
     };
     let mut changed = false;
     for e in entries {
-        let (Some(id), Some(path)) = (
-            e.get("id").and_then(Value::as_str),
-            e.get("path").and_then(Value::as_str),
-        ) else {
+        let Some(id) = e.get("id").and_then(Value::as_str) else {
             continue;
         };
-        let path = path.trim();
-        if path.is_empty() {
+        // B-E2: an id this build does not ship buys nothing and costs husk
+        // state plus a machine-wide path — see `legacy_id_is_shipped`.
+        if !legacy_id_is_shipped(id) {
             continue;
         }
-        if let Some(t) = global
-            .code_audit
-            .tools
-            .iter_mut()
-            .find(|t| audit_wire_id(t.id) == id)
-        {
-            if t.path.trim().is_empty() {
-                t.path = path.to_string();
+        let tool_key = legacy_tool_key(id);
+
+        // The path is machine scope and always was: promote it into the
+        // machine-wide map, first project launched wins per slot.
+        if let Some(path) = e.get("path").and_then(Value::as_str) {
+            let path = path.trim();
+            if !path.is_empty() && !global.tool_plugins.global_paths.contains_key(&tool_key) {
+                global
+                    .tool_plugins
+                    .global_paths
+                    .insert(tool_key.clone(), path.to_string());
                 changed = true;
             }
         }
-    }
-    changed
-}
 
-/// LOAD step 2: overwrite the merged view's scanner paths from the
-/// (post-promotion) global baseline. Entries for ids the baseline doesn't
-/// know are left untouched (forward compat — the lenient deserializer drops
-/// them later anyway).
-fn enforce_global_audit_paths(merged: &mut Value, global: &Settings) {
-    let Some(entries) = merged
-        .get_mut("code_audit")
-        .and_then(|c| c.get_mut("tools"))
-        .and_then(Value::as_array_mut)
-    else {
-        return;
-    };
-    for e in entries {
-        let Some(id) = e.get("id").and_then(Value::as_str).map(str::to_string) else {
+        // Everything else lands as this tool's state — but only if the
+        // container has no state for it yet, so a value the user has since set
+        // through the new pane is never overwritten by a stale overlay.
+        let plugin = global
+            .tool_plugins
+            .plugins
+            .entry(crate::plugins::builtin::AUDIT_PLUGIN_KEY.to_string())
+            .or_default();
+        if plugin.tools.contains_key(id) {
             continue;
-        };
-        let Some(t) = global
-            .code_audit
-            .tools
-            .iter()
-            .find(|t| audit_wire_id(t.id) == id)
-        else {
-            continue;
-        };
-        if let Some(o) = e.as_object_mut() {
-            o.insert("path".to_string(), Value::String(t.path.clone()));
         }
-    }
-}
-
-/// SAVE step 1 (pure half of the write-through): copy the live scanner paths
-/// onto the on-disk global settings. Returns true when anything changed —
-/// the caller only rewrites the physical file then.
-fn sync_audit_paths_into(disk_global: &mut Settings, current: &Settings) -> bool {
-    let mut changed = false;
-    for t in &current.code_audit.tools {
-        if let Some(g) = disk_global
-            .code_audit
-            .tools
-            .iter_mut()
-            .find(|g| g.id == t.id)
-        {
-            if g.path != t.path {
-                g.path = t.path.clone();
-                changed = true;
+        let mut state = crate::settings::ToolState::default();
+        let mut carried = false;
+        if let Some(v) = e.get("enabled").and_then(Value::as_bool) {
+            state.enabled = v;
+            carried = true;
+        }
+        if let Some(v) = e.get("timeout_secs").and_then(Value::as_u64) {
+            state.timeout_secs = Some(v);
+            carried = true;
+        }
+        if let Some(a) = e.get("extra_args").and_then(Value::as_array) {
+            let args: Vec<String> = a
+                .iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect();
+            if !args.is_empty() {
+                state.parameters = args;
+                carried = true;
             }
         }
-    }
-    changed
-}
-
-/// SAVE step 2: normalize every scanner path to "" on a diff side so the
-/// overlay never carries one.
-fn strip_audit_tool_paths(v: &mut Value) {
-    if let Some(entries) = v
-        .get_mut("code_audit")
-        .and_then(|c| c.get_mut("tools"))
-        .and_then(Value::as_array_mut)
-    {
-        for e in entries {
-            if let Some(o) = e.as_object_mut() {
-                o.insert("path".to_string(), Value::String(String::new()));
+        // An EMPTY legacy ruleset meant "use the tool's built-in default",
+        // which in the container is the absence of a value rather than a
+        // stored blank — see `registry::effective_tools`.
+        if let Some(r) = e.get("ruleset").and_then(Value::as_str) {
+            if !r.trim().is_empty() {
+                state.variables.insert("ruleset".to_string(), r.to_string());
+                carried = true;
             }
         }
+        if carried {
+            plugin.tools.insert(id.to_string(), state);
+            changed = true;
+        }
     }
+    if changed {
+        tracing::info!("settings: promoted a legacy project overlay's audit tool config");
+    }
+    changed
 }
 
 // ── Offload backend template libraries: machine-scope splitting ──────────────
@@ -1003,31 +1035,222 @@ fn sync_offload_templates_into(disk_global: &mut Settings, current: &Settings) -
     changed
 }
 
-/// Read the audit tool config from the PHYSICAL global settings file,
-/// reconciled to the current tool set (a stale file gains missing tools at
-/// their defaults). Powers the Settings → Code Audit "Load from global"
-/// action and the per-tool global/local scope indicator.
-pub fn read_global_audit_tools() -> (Vec<crate::settings::schema::AuditToolConfig>, bool) {
-    let mut s = global_path()
-        .ok()
-        .map(|p| read_settings_or_default(&p))
-        .unwrap_or_default();
-    let _ = reconcile_audit_tools(&mut s);
-    (s.code_audit.tools, s.code_audit.quality_auto_select)
+// ── V38 tool plugins: scope splitting INSIDE one subtree ────────────────────
+//
+// `tool_plugins` is the first settings block whose two scopes are interleaved
+// rather than separable by key. Within it:
+//
+//   * `plugins.*.tools.*.variables` and `.parameters` are PROJECT scope. They
+//     are what a repo legitimately differs on — this project's ruleset, this
+//     project's extra `--exclude` — and they are the only fields a
+//     `.cimp/config.json` may carry.
+//   * everything else — `enabled` at either level, `timeout_secs`, and the two
+//     path maps — is MACHINE scope.
+//
+// The paths are machine scope for the reason the V26 field report taught (a
+// scanner configured in one repo, an audit run in another resolving nothing)
+// AND for the reason V33's `sandbox` ban taught, which is sharper: the overlay
+// file lives under the project root, the project root is granted full access to
+// every sandboxed child, and a confined tool that could write its own
+// `.cimp/config.json` could then point cImp at a different binary — or flip its
+// own `enabled` — on the next run. A boundary a confined process can widen is
+// not a boundary. `sandbox` could be banned wholesale ([`OVERLAY_BANNED_KEYS`]);
+// this block cannot, because two of its leaves genuinely belong to the project.
+// So the strip is STRUCTURED instead of a key removal, and it is an ALLOW-list:
+// anything not named survives nowhere, including keys a future version adds.
+//
+// Same two-sided arrangement as the audit paths:
+//   * LOAD  — strip the overlay before the merge, and say so once in the
+//             `plugin` Events lane when it actually carried something.
+//   * SAVE  — write the machine-scope halves through to the PHYSICAL global
+//             file, then strip both diff sides so no overlay pins a copy.
+//
+// `load_readonly` strips too, and that is NOT optional: the MCP children it
+// serves are exactly the Phase C/D consumers that will resolve a tool's binary
+// path, so an unstripped read there would reintroduce the hole at the one call
+// site that runs inside the boundary.
+
+/// The only leaves of `tool_plugins` a project overlay may carry.
+const OVERLAY_TOOL_PLUGIN_LEAVES: &[&str] = &["variables", "parameters"];
+
+/// Remove every machine-scope field under `tool_plugins`, returning the dotted
+/// names of what was dropped (empty ⇒ the overlay was already clean).
+///
+/// An allow-list walk, not a deny-list: an unrecognized key is dropped and
+/// named. A deny-list would let the next field added to the container ride the
+/// overlay by default, which is the wrong direction for a block whose default
+/// answer has to be "machine".
+///
+/// **Shape is part of the allow-list** (Phase B review, B-1). Every level of
+/// this subtree except the two leaves is a MAP, and a node that is not one is
+/// removed and reported rather than walked past. Walking past it was a hole
+/// with teeth: `"plugins": {"acme@1.0.0": 5}` survived the strip, `deep_merge`
+/// then scalar-overwrote the user's stored object with `5`, the lenient reader
+/// dropped the unreadable node, and the registry's "no state ⇒ the user has
+/// never touched this ⇒ enabled" default re-enabled a tool the user had
+/// switched OFF — from a file every sandboxed child can write. `null` is the
+/// same case: the merge deletes the subtree under it.
+///
+/// The one place a `null` is legitimate is a `variables`/`parameters` LEAF,
+/// where it is how [`diff`] spells "this project clears the machine's value" —
+/// so those two are handed through untouched, whatever they hold.
+fn strip_overlay_tool_plugins(v: &mut Value) -> Vec<String> {
+    let mut dropped: Vec<String> = Vec::new();
+    let Some(root) = v.as_object_mut() else {
+        return dropped;
+    };
+    let Some(tp) = root.get_mut("tool_plugins") else {
+        return dropped;
+    };
+    let Some(tp_obj) = tp.as_object_mut() else {
+        // Not an object at all: there is nothing here we could keep.
+        root.remove("tool_plugins");
+        dropped.push("tool_plugins".to_string());
+        return dropped;
+    };
+
+    for key in keys_other_than(tp_obj, &["plugins"]) {
+        tp_obj.remove(&key);
+        dropped.push(format!("tool_plugins.{key}"));
+    }
+    if remove_if_not_a_map(tp_obj, "plugins") {
+        dropped.push("tool_plugins.plugins".to_string());
+    }
+    if let Some(plugins) = tp_obj.get_mut("plugins").and_then(Value::as_object_mut) {
+        for key in non_map_keys(plugins) {
+            plugins.remove(&key);
+            dropped.push(format!("tool_plugins.plugins.{key}"));
+        }
+        for (plugin_key, state) in plugins.iter_mut() {
+            // Every survivor of `non_map_keys` is an object.
+            let Some(p) = state.as_object_mut() else {
+                continue;
+            };
+            for key in keys_other_than(p, &["tools"]) {
+                p.remove(&key);
+                dropped.push(format!("tool_plugins.plugins.{plugin_key}.{key}"));
+            }
+            if remove_if_not_a_map(p, "tools") {
+                dropped.push(format!("tool_plugins.plugins.{plugin_key}.tools"));
+            }
+            let Some(tools) = p.get_mut("tools").and_then(Value::as_object_mut) else {
+                continue;
+            };
+            for key in non_map_keys(tools) {
+                tools.remove(&key);
+                dropped.push(format!("tool_plugins.plugins.{plugin_key}.tools.{key}"));
+            }
+            for (tool_id, tstate) in tools.iter_mut() {
+                let Some(t) = tstate.as_object_mut() else {
+                    continue;
+                };
+                for key in keys_other_than(t, OVERLAY_TOOL_PLUGIN_LEAVES) {
+                    t.remove(&key);
+                    dropped.push(format!(
+                        "tool_plugins.plugins.{plugin_key}.tools.{tool_id}.{key}"
+                    ));
+                }
+            }
+        }
+    }
+    // A container reduced to `{}` (or `{"plugins": {}}`) contributes nothing to
+    // a merge and only noise to a diff; drop the husk.
+    let empty = tp_obj.is_empty()
+        || (tp_obj.len() == 1
+            && tp_obj
+                .get("plugins")
+                .and_then(Value::as_object)
+                .is_some_and(serde_json::Map::is_empty));
+    if empty {
+        root.remove("tool_plugins");
+    }
+    dropped
 }
 
-/// Write the live audit tool config (tools + `quality_auto_select`) through
-/// to the PHYSICAL global settings file (read-modify-write; every other
-/// field preserved — the `write_global_prompt_templates` pattern). Powers
-/// the "Save to global" action. The caller must also bring the in-memory
-/// baseline in line (`SettingsHandle::mutate_global`) so the next overlay
-/// diff drops the now-global config instead of keeping a project copy.
-pub fn write_global_audit_tools(current: &Settings) -> AppResult<()> {
-    let gpath = global_path()?;
-    let mut disk = read_settings_or_default(&gpath);
-    disk.code_audit.tools = current.code_audit.tools.clone();
-    disk.code_audit.quality_auto_select = current.code_audit.quality_auto_select;
-    save_to(&gpath, &disk)
+/// The keys of `obj` whose value is not a JSON object — the shape half of the
+/// allow-list, collected up front for the same borrow reason as
+/// [`keys_other_than`].
+fn non_map_keys(obj: &serde_json::Map<String, Value>) -> Vec<String> {
+    obj.iter()
+        .filter(|(_, v)| !v.is_object())
+        .map(|(k, _)| k.clone())
+        .collect()
+}
+
+/// Remove `key` from `obj` when it is present and is not a JSON object.
+/// Returns whether it removed anything, so the caller can name it in `dropped`.
+fn remove_if_not_a_map(obj: &mut serde_json::Map<String, Value>, key: &str) -> bool {
+    match obj.get(key) {
+        Some(v) if !v.is_object() => {
+            obj.remove(key);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// The keys of `obj` that are not in `keep`, collected up front so the caller
+/// can remove them without borrowing the map twice.
+fn keys_other_than(obj: &serde_json::Map<String, Value>, keep: &[&str]) -> Vec<String> {
+    obj.keys()
+        .filter(|k| !keep.contains(&k.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// SAVE write-through for the machine-scope halves of `tool_plugins`: copy the
+/// live enables, timeouts and path maps onto the on-disk global settings.
+/// Returns true when anything changed — the caller only rewrites the file then.
+///
+/// Field by field rather than whole-block (the one place this differs from
+/// [`sync_sandbox_into`]): the live value's `variables`/`parameters` are the
+/// PROJECT's, so copying the block wholesale would write one repo's overrides
+/// into the machine-wide file and hand them to every other project.
+///
+/// An entry the global file does not have yet is created, because that is what
+/// "machine scope" means for a plugin the user has only just configured — but
+/// nothing is ever removed here: a plugin whose file is temporarily missing must
+/// keep its state (see [`crate::settings::ToolPluginsSettings`]).
+fn sync_tool_plugin_state_into(disk_global: &mut Settings, current: &Settings) -> bool {
+    let mut changed = false;
+    let cur = &current.tool_plugins;
+    if disk_global.tool_plugins.global_paths != cur.global_paths {
+        disk_global.tool_plugins.global_paths = cur.global_paths.clone();
+        changed = true;
+    }
+    if disk_global.tool_plugins.project_paths != cur.project_paths {
+        disk_global.tool_plugins.project_paths = cur.project_paths.clone();
+        changed = true;
+    }
+    for (plugin_key, live) in &cur.plugins {
+        let disk = disk_global
+            .tool_plugins
+            .plugins
+            .entry(plugin_key.clone())
+            .or_insert_with(|| {
+                changed = true;
+                crate::settings::PluginState::default()
+            });
+        if disk.enabled != live.enabled {
+            disk.enabled = live.enabled;
+            changed = true;
+        }
+        for (tool_id, live_tool) in &live.tools {
+            let disk_tool = disk.tools.entry(tool_id.clone()).or_insert_with(|| {
+                changed = true;
+                crate::settings::ToolState::default()
+            });
+            if disk_tool.enabled != live_tool.enabled {
+                disk_tool.enabled = live_tool.enabled;
+                changed = true;
+            }
+            if disk_tool.timeout_secs != live_tool.timeout_secs {
+                disk_tool.timeout_secs = live_tool.timeout_secs;
+                changed = true;
+            }
+        }
+    }
+    changed
 }
 
 /// SAVE step 2: empty both template arrays on a diff side so the overlay
@@ -1081,9 +1304,31 @@ fn strip_offload_templates(v: &mut Value) {
 // `OffloadSettings::any_claude_mcp`), and per-project variation is
 // `mcp_activation`'s job.
 //
-// `load_readonly` stays exempt, like its two precedents: the MCP child reads
-// `mcp_servers` only to render a tool-count phrase in the `offload_task`
-// description, and the app's own `load` heals the overlay on first launch.
+// `load_readonly` is NOT exempt, and that is the one place this differs from
+// its two precedents (V38 merge review; the gap is pre-existing on develop and
+// was surfaced by the V37 -> V38 merge). `load` promotes and then ENFORCES, so
+// an overlay's registry never reaches the app's merged view. `load_readonly`
+// does neither, so until this fix a project `.cimp/config.json` carrying
+// `offload.mcp_servers` / `mcp_categories` / `mcp_activation` deep-merged
+// straight into every read-only consumer — the `cimp --offload-mcp` child and
+// `run_command`'s settings read. That is an ENABLE/ACTIVATION WIDENING toward
+// the offload child (an overlay-declared server joins the pool the child
+// describes, and its URL joins `outbound::EndpointAllowlist`, which is built
+// from `offload.mcp_servers`), reachable by anything that can write inside the
+// project root. It is not code execution and is not claimed as such.
+//
+// The fix is a KEY REMOVAL on the overlay value before the merge, deliberately
+// NOT `strip_mcp_registry`: that one is the SAVE-side diff normalizer and
+// INSERTS empty arrays, which under `deep_merge`'s replace-arrays-wholesale
+// rule would erase the global registry rather than ignore the overlay's.
+//
+// `mcp_activation` goes too, even though `load` legitimately keeps it
+// per-project: nothing behind `load_readonly` reads it. The child's registry
+// consumers are `tool_scope_summary` (a tool-count phrase built from
+// `mcp_servers`) and the SSRF endpoint allowlist; activation is resolved
+// in-app, by `offload::mcp_host::effective_enable` over the live `load`
+// snapshot. A per-project surface with no reader on this leg is a widening
+// vector with no upside.
 
 /// LOAD step 1: promote a legacy overlay's servers and categories into the
 /// global baseline, keyed by name (a name already present globally wins).
@@ -1168,6 +1413,30 @@ fn sync_mcp_registry_into(disk_global: &mut Settings, current: &Settings) -> boo
     changed
 }
 
+/// LOAD step, read-only readers only: **remove** the registry keys from an
+/// overlay value before it is merged.
+///
+/// Removal, not replacement. [`strip_mcp_registry`] is the save-side normalizer
+/// and writes `[]` into both keys; running it on an overlay would hand
+/// `deep_merge` an explicit empty array, and `deep_merge` replaces arrays
+/// wholesale — so the global registry would be ERASED for the child rather than
+/// merely un-widened. Two functions with one name-shape, two jobs; this is the
+/// load-side one.
+///
+/// Returns the keys that were actually present, for tests and for a caller that
+/// wants to say so. [`load_readonly`] discards it: a lightweight subprocess has
+/// no Events lane, and the app's own [`load`] already promotes and reports.
+fn strip_overlay_mcp_registry(v: &mut Value) -> Vec<String> {
+    const KEYS: [&str; 3] = ["mcp_servers", "mcp_categories", "mcp_activation"];
+    let Some(off) = v.get_mut("offload").and_then(Value::as_object_mut) else {
+        return Vec::new();
+    };
+    KEYS.iter()
+        .filter(|k| off.remove(**k).is_some())
+        .map(|k| format!("offload.{k}"))
+        .collect()
+}
+
 /// SAVE step 2: empty both registry arrays on a diff side so the overlay never
 /// carries them. `mcp_activation` is left alone — it is the per-project half.
 fn strip_mcp_registry(v: &mut Value) {
@@ -1184,7 +1453,7 @@ fn strip_mcp_registry(v: &mut Value) {
 pub fn save(settings: &Settings, launch_cwd: &Path, global: &Settings) -> AppResult<()> {
     let path = custom_path(launch_cwd);
 
-    // Scanner paths and the offload template libraries are machine-scope:
+    // The offload template libraries are machine-scope:
     // write them through to the PHYSICAL global file (read-modify-write,
     // every other field preserved — the `write_global_prompt_templates`
     // pattern) so every project sees them, then normalize both diff sides
@@ -1194,7 +1463,6 @@ pub fn save(settings: &Settings, launch_cwd: &Path, global: &Settings) -> AppRes
     if let Ok(gpath) = global_path() {
         if gpath.exists() {
             let mut disk = read_settings_or_default(&gpath);
-            let paths_changed = sync_audit_paths_into(&mut disk, settings);
             let templates_changed = sync_offload_templates_into(&mut disk, settings);
             // V37 F5: the MCP registry is global; only `mcp_activation` varies
             // per project.
@@ -1203,7 +1471,12 @@ pub fn save(settings: &Settings, launch_cwd: &Path, global: &Settings) -> AppRes
             // whose own writable area holds the overlay file), so the global
             // file is the ONLY place a sandbox edit can land.
             let sandbox_changed = sync_sandbox_into(&mut disk, settings);
-            if paths_changed || templates_changed || registry_changed || sandbox_changed {
+            // V38: the machine-scope halves of `tool_plugins` (enables,
+            // timeouts, both path maps). The overlay carries only the per-tool
+            // `variables`/`parameters`, so this is the only place the rest can
+            // land — see the block comment above `strip_overlay_tool_plugins`.
+            let plugins_changed = sync_tool_plugin_state_into(&mut disk, settings);
+            if templates_changed || registry_changed || sandbox_changed || plugins_changed {
                 if let Err(e) = save_to(&gpath, &disk) {
                     tracing::warn!(error = %e, "settings: machine-scope global write-through failed");
                 }
@@ -1217,10 +1490,15 @@ pub fn save(settings: &Settings, launch_cwd: &Path, global: &Settings) -> AppRes
         .map_err(|e| AppError::Settings(format!("serialize global: {e}")))?;
     strip_overlay_banned(&mut current);
     strip_overlay_banned(&mut baseline);
-    strip_audit_tool_paths(&mut current);
-    strip_audit_tool_paths(&mut baseline);
     strip_offload_templates(&mut current);
     strip_offload_templates(&mut baseline);
+    // Both sides, identically: what remains under `tool_plugins` on either side
+    // is only `variables`/`parameters`, so the diff can express a project's
+    // overrides and nothing else. Return values ignored — a strip of OUR OWN
+    // serialized value is not a user's hand edit, so there is nothing to warn
+    // about; the load path is where a warning belongs.
+    let _ = strip_overlay_tool_plugins(&mut current);
+    let _ = strip_overlay_tool_plugins(&mut baseline);
     strip_mcp_registry(&mut current);
     strip_mcp_registry(&mut baseline);
 
@@ -1780,36 +2058,6 @@ pub fn reconcile_reserved_tabs(settings: &mut Settings) -> bool {
     changed
 }
 
-/// V25: reconcile `code_audit.tools` with the built-in adapter set. A config
-/// persisted by v0.43/v0.44 (before the Quality tools existed) carries only the
-/// three Security entries; the lenient `tools` deserializer keeps a present
-/// array verbatim, so those installs would never gain the eleven Quality tools
-/// and the Quality sub-tab / Settings section would stay empty. This appends a
-/// default entry (per [`default_audit_tools`]: enabled except `dotnet-analyzers`
-/// and `semgrep-quality`) for every [`AuditToolId`] missing from the array,
-/// **preserving every existing entry verbatim and in its current order** —
-/// the user's `enabled`/`path`/`extra_args`/`timeout_secs` and any customization
-/// survive untouched. Stale/unknown ids were already dropped by the lenient
-/// deserializer, and that stays: this only ever *adds* the missing built-ins.
-/// Idempotent (a second call finds every id present and is a no-op). Runs on
-/// both the load path ([`integrity_check`]) and the live settings-update
-/// round-trip (`apply_incoming_settings`), exactly like
-/// [`reconcile_reserved_tabs`]. Returns `true` if anything was appended.
-pub fn reconcile_audit_tools(settings: &mut Settings) -> bool {
-    let tools = &mut settings.code_audit.tools;
-    let mut changed = false;
-    for def in default_audit_tools() {
-        if !tools.iter().any(|t| t.id == def.id) {
-            tools.push(def);
-            changed = true;
-        }
-    }
-    if changed {
-        tracing::info!("integrity: appended missing built-in code_audit tools");
-    }
-    changed
-}
-
 /// All three reserved AI tab ids. Used by the integrity check's "is this
 /// id one of our reserved AI builtins?" loops; a single source of truth
 /// keeps the `ai_builtins` membership check, the `use_local_provider`
@@ -1953,13 +2201,6 @@ pub fn integrity_check(settings: &mut Settings) -> bool {
         changed = true;
     }
 
-    // 4c. Reconcile `code_audit.tools` with the built-in adapter set so a
-    //     pre-V25 config (three Security tools only) gains the eleven Quality
-    //     tools on load. Existing entries are preserved verbatim; only missing
-    //     built-ins are appended. Idempotent.
-    if reconcile_audit_tools(settings) {
-        changed = true;
-    }
 
     // 5. Backend layout sanity. The frontend owns the deep integrity
     //    walk (orphan placement, empty-pane collapse) — it has the tree
@@ -2444,142 +2685,6 @@ mod tests {
         assert!(!RETIRED_TAB_IDS.contains(&EVENTS_TAB_ID));
         assert!(!RETIRED_TAB_IDS.contains(&TOOL_ACTIVITY_TAB_ID));
         assert!(!RETIRED_TAB_IDS.contains(&WORKBENCH_TAB_ID));
-    }
-
-    #[test]
-    fn reconcile_audit_tools_appends_missing_quality_tools() {
-        use crate::settings::schema::{AuditToolConfig, AuditToolId};
-        // A v0.43/v0.44 persisted config: only the three Security tools, one of
-        // them customized (disabled + custom path + extra args + timeout).
-        let mut s = base_test_settings();
-        s.code_audit.tools = vec![
-            AuditToolConfig {
-                id: AuditToolId::OsvScanner,
-                enabled: false,
-                path: r"C:\tools\osv.exe".to_string(),
-                extra_args: vec!["--offline".to_string()],
-                ruleset: String::new(),
-                timeout_secs: Some(42),
-            },
-            AuditToolConfig {
-                id: AuditToolId::Gitleaks,
-                enabled: true,
-                path: String::new(),
-                extra_args: vec![],
-                ruleset: String::new(),
-                timeout_secs: None,
-            },
-            AuditToolConfig {
-                id: AuditToolId::Semgrep,
-                enabled: true,
-                path: String::new(),
-                extra_args: vec![],
-                ruleset: String::new(),
-                timeout_secs: None,
-            },
-        ];
-
-        let changed = reconcile_audit_tools(&mut s);
-        assert!(changed);
-        let tools = &s.code_audit.tools;
-        assert_eq!(tools.len(), 14);
-
-        // The three Security entries are preserved verbatim, in order — the
-        // customized osv-scanner survives untouched.
-        assert_eq!(tools[0].id, AuditToolId::OsvScanner);
-        assert!(!tools[0].enabled);
-        assert_eq!(tools[0].path, r"C:\tools\osv.exe");
-        assert_eq!(tools[0].extra_args, vec!["--offline".to_string()]);
-        assert_eq!(tools[0].timeout_secs, Some(42));
-        assert_eq!(tools[1].id, AuditToolId::Gitleaks);
-        assert_eq!(tools[2].id, AuditToolId::Semgrep);
-
-        // The eleven Quality ids are appended with correct enabled defaults:
-        // enabled except dotnet-analyzers and semgrep-quality.
-        let by_id = |id| tools.iter().find(|t| t.id == id).unwrap();
-        for id in [
-            AuditToolId::Oxlint,
-            AuditToolId::GolangciLint,
-            AuditToolId::Ruff,
-            AuditToolId::Cppcheck,
-            AuditToolId::Typos,
-            AuditToolId::Eslint,
-            AuditToolId::Pmd,
-            AuditToolId::Knip,
-            AuditToolId::CargoMachete,
-        ] {
-            assert!(by_id(id).enabled, "{id:?} enabled by default");
-            assert!(by_id(id).path.is_empty(), "{id:?} no path override");
-            assert!(by_id(id).timeout_secs.is_none(), "{id:?} global timeout");
-        }
-        assert!(!by_id(AuditToolId::DotnetAnalyzers).enabled);
-        assert!(!by_id(AuditToolId::SemgrepQuality).enabled);
-    }
-
-    #[test]
-    fn reconcile_audit_tools_leaves_full_config_untouched() {
-        // A fresh install already carries all fourteen tools — nothing to add.
-        let mut s = base_test_settings();
-        let before = s.code_audit.tools.clone();
-        assert_eq!(before.len(), 14);
-        assert!(!reconcile_audit_tools(&mut s));
-        assert_eq!(s.code_audit.tools, before);
-    }
-
-    #[test]
-    fn reconcile_audit_tools_is_idempotent() {
-        use crate::settings::schema::{AuditToolConfig, AuditToolId};
-        let mut s = base_test_settings();
-        s.code_audit.tools = vec![AuditToolConfig {
-            id: AuditToolId::Gitleaks,
-            enabled: true,
-            path: String::new(),
-            extra_args: vec![],
-            ruleset: String::new(),
-            timeout_secs: None,
-        }];
-        assert!(reconcile_audit_tools(&mut s));
-        let after_first = s.code_audit.tools.clone();
-        assert_eq!(after_first.len(), 14);
-        // A second pass finds every id present and changes nothing.
-        assert!(!reconcile_audit_tools(&mut s));
-        assert_eq!(s.code_audit.tools, after_first);
-    }
-
-    #[test]
-    fn integrity_reconciles_pre_v25_audit_tools() {
-        use crate::settings::schema::{AuditToolConfig, AuditToolId};
-        // The load-path integrity pass performs the same reconcile, so an
-        // upgraded install gains the Quality tools on first load.
-        let mut s = base_test_settings();
-        s.code_audit.tools = vec![
-            AuditToolConfig {
-                id: AuditToolId::OsvScanner,
-                enabled: true,
-                path: String::new(),
-                extra_args: vec![],
-                ruleset: String::new(),
-                timeout_secs: None,
-            },
-            AuditToolConfig {
-                id: AuditToolId::Gitleaks,
-                enabled: true,
-                path: String::new(),
-                extra_args: vec![],
-                ruleset: String::new(),
-                timeout_secs: None,
-            },
-            AuditToolConfig {
-                id: AuditToolId::Semgrep,
-                enabled: true,
-                path: String::new(),
-                extra_args: vec![],
-                ruleset: String::new(),
-                timeout_secs: None,
-            },
-        ];
-        integrity_check(&mut s);
-        assert_eq!(s.code_audit.tools.len(), 14);
     }
 
     #[test]
@@ -3469,6 +3574,475 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// V38: `tool_plugins` splits INSIDE the block — `variables`/`parameters`
+    /// are the project's, everything else is the machine's. Unlike `sandbox`,
+    /// which can be banned by key, this needs a structured strip; unlike the
+    /// audit paths, the retained part is nested three levels down.
+    #[test]
+    fn a_project_overlay_carries_only_tool_plugin_variables_and_parameters() {
+        let mut hostile: Value = serde_json::json!({
+            "tool_plugins": {
+                "global_paths": { "acme@1.0.0/scan": "C:\\evil\\acme.exe" },
+                "project_paths": { "C:\\repo": { "acme@1.0.0/scan": "C:\\evil\\acme.exe" } },
+                "future_field": 1,
+                "plugins": {
+                    "acme@1.0.0": {
+                        "enabled": true,
+                        "unknown": 1,
+                        "tools": {
+                            "scan": {
+                                "enabled": true,
+                                "timeout_secs": 99999,
+                                "variables": { "ruleset": "p/ci" },
+                                "parameters": ["--exclude", "vendor"]
+                            }
+                        }
+                    }
+                }
+            },
+            "checks_allow_remote_worker": true
+        });
+        let dropped = strip_overlay_tool_plugins(&mut hostile);
+
+        assert_eq!(
+            hostile,
+            serde_json::json!({
+                "tool_plugins": { "plugins": { "acme@1.0.0": { "tools": { "scan": {
+                    "variables": { "ruleset": "p/ci" },
+                    "parameters": ["--exclude", "vendor"]
+                } } } } },
+                "checks_allow_remote_worker": true
+            }),
+            "only the two project-scope leaves may survive"
+        );
+        // Every machine-scope field is NAMED, so the Events row can say which.
+        for expected in [
+            "tool_plugins.global_paths",
+            "tool_plugins.project_paths",
+            "tool_plugins.future_field",
+            "tool_plugins.plugins.acme@1.0.0.enabled",
+            "tool_plugins.plugins.acme@1.0.0.unknown",
+            "tool_plugins.plugins.acme@1.0.0.tools.scan.enabled",
+            "tool_plugins.plugins.acme@1.0.0.tools.scan.timeout_secs",
+        ] {
+            assert!(
+                dropped.contains(&expected.to_string()),
+                "`{expected}` was dropped but not reported: {dropped:?}"
+            );
+        }
+        // An ALLOW-list, not a deny-list: a field this build has never heard of
+        // (`future_field`, `unknown`) does not get to ride the overlay by
+        // default. That is the direction a machine-scope block has to fail in.
+
+        // A clean overlay says nothing at all — no row, no noise.
+        let mut clean: Value = serde_json::json!({ "ui": { "theme": "tui" } });
+        assert!(strip_overlay_tool_plugins(&mut clean).is_empty());
+        assert_eq!(clean, serde_json::json!({ "ui": { "theme": "tui" } }));
+    }
+
+    /// **The two settings readers must strip the overlay the same way**
+    /// (V38 Phase D).
+    ///
+    /// `run_check` is answered from more than one PROCESS: the app (through
+    /// [`load`]) and the `cimp --offload-mcp` child (through [`load_readonly`]).
+    /// Both resolve the same effective check set through `checks::plugin`, and
+    /// a plugin check's command line is rendered from its declared variable
+    /// values — which ride the project overlay. If one reader applied a
+    /// different rule to `tool_plugins`, the same check would run with this
+    /// project's values on one leg and the machine's on the other, with nothing
+    /// anywhere to notice. They stay identical by calling ONE function; this
+    /// pins that they still do, at the only level a test can see it without a
+    /// real global settings file on disk.
+    ///
+    /// The same claim covers the V37 **MCP registry** (V38 merge review). The
+    /// two readers do not handle it identically and must not: `load` promotes
+    /// an overlay's servers/categories into the global baseline and then
+    /// enforces the global arrays over the merged view, healing the file on the
+    /// way; `load_readonly` has no side effects to heal with, so it removes the
+    /// keys. What is pinned here is that NEITHER reader simply merges them —
+    /// the state this test was written against, in which a project overlay's
+    /// `offload.mcp_servers` reached the `cimp --offload-mcp` child untouched.
+    ///
+    /// Newline-agnostic: CI checks this tree out with CRLF.
+    #[test]
+    fn both_settings_readers_strip_the_overlay_through_the_same_function() {
+        let src = include_str!("persistence.rs");
+        // (signature, what its body must name)
+        let required: [(&str, &[&str]); 2] = [
+            (
+                "pub fn load(",
+                &[
+                    "strip_overlay_tool_plugins",
+                    "promote_overlay_mcp_registry",
+                    "enforce_global_mcp_registry",
+                ],
+            ),
+            (
+                "pub fn load_readonly(",
+                &["strip_overlay_tool_plugins", "strip_overlay_mcp_registry"],
+            ),
+        ];
+        for (sig, needles) in required {
+            let start = src
+                .find(sig)
+                .unwrap_or_else(|| panic!("`{sig}` is gone — re-point this test"));
+            let body = &src[start..];
+            let end = body.find("\n}").unwrap_or(body.len());
+            let body = &body[..end];
+            for needle in needles {
+                assert!(
+                    body.contains(needle),
+                    "`{sig}` must name `{needle}`: the machine-scope blocks (`tool_plugins`, the \
+                     MCP registry) are never authority an overlay can carry, and a reader that \
+                     merged one of them straight through would answer differently from the other"
+                );
+            }
+        }
+        // The load-side removal must never be the SAVE-side normalizer: that
+        // one INSERTS `[]`, and `deep_merge` replaces arrays wholesale.
+        let start = src.find("pub fn load_readonly(").unwrap();
+        let body = &src[start..];
+        let end = body.find("\n}").unwrap_or(body.len());
+        assert!(
+            !body[..end].contains("strip_mcp_registry(&mut overlay)"),
+            "`load_readonly` must REMOVE the registry keys, not normalize them to `[]` — an \
+             empty array in the overlay would erase the global registry through the merge"
+        );
+    }
+
+    /// **A project overlay's MCP registry cannot reach a read-only snapshot**
+    /// (V38 merge review; the gap is pre-existing on develop).
+    ///
+    /// Driven through the real steps [`load_readonly`] performs on the values
+    /// it has — global to `Value`, strip the overlay, `deep_merge`,
+    /// deserialize — rather than through the function itself, which reads the
+    /// machine's real global settings path. Same shape as
+    /// `a_hostile_overlay_shape_cannot_re_enable_a_disabled_plugin_tool`, and
+    /// for the same reason: what is asserted is what a pipeline READS, not what
+    /// a helper returns.
+    #[test]
+    fn an_overlay_mcp_registry_cannot_reach_a_read_only_snapshot() {
+        let mut global = Settings::default();
+        global.offload.mcp_servers = vec![McpServerConfig {
+            name: "ddg".to_string(),
+            ..McpServerConfig::default()
+        }];
+        global.offload.mcp_categories = vec![McpCategory {
+            name: "research".to_string(),
+            ..McpCategory::default()
+        }];
+        let mut merged = serde_json::to_value(&global).unwrap();
+
+        // What anything running inside the project root can write.
+        let mut overlay: Value = serde_json::json!({
+            "offload": {
+                "mcp_servers": [{ "name": "attacker", "url": "http://127.0.0.1:9/" }],
+                "mcp_categories": [{ "name": "smuggled" }],
+                "mcp_activation": { "servers": { "ddg": false } },
+                // A legitimately per-project neighbour, to prove the removal is
+                // keyed and not a wholesale drop of the `offload` block.
+                "enabled": true
+            }
+        });
+        let removed = strip_overlay_mcp_registry(&mut overlay);
+        assert_eq!(
+            removed,
+            vec![
+                "offload.mcp_servers".to_string(),
+                "offload.mcp_categories".to_string(),
+                "offload.mcp_activation".to_string(),
+            ]
+        );
+        deep_merge(&mut merged, overlay);
+        let out: Settings = serde_json::from_value(merged).unwrap();
+
+        let names: Vec<&str> = out
+            .offload
+            .mcp_servers
+            .iter()
+            .map(|m| m.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["ddg"],
+            "an overlay-declared server must not join the pool the offload child describes, \
+             nor the SSRF endpoint allowlist built from this array"
+        );
+        let cats: Vec<&str> = out
+            .offload
+            .mcp_categories
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(cats, vec!["research"]);
+        assert!(
+            out.offload.mcp_activation.servers.is_empty(),
+            "activation is resolved in-app; nothing behind this reader reads it, so an overlay \
+             may not set it here either"
+        );
+        assert!(
+            out.offload.enabled,
+            "a non-registry `offload` key still merges"
+        );
+    }
+
+    /// The trap the fix was ordered around: reusing the SAVE-side normalizer on
+    /// an overlay would not un-widen the registry, it would ERASE it — because
+    /// `deep_merge` replaces arrays wholesale, and `strip_mcp_registry` inserts
+    /// `[]` rather than removing the key.
+    #[test]
+    fn the_save_side_normalizer_would_erase_the_global_registry_on_the_load_side() {
+        let mut global = Settings::default();
+        global.offload.mcp_servers = vec![McpServerConfig {
+            name: "ddg".to_string(),
+            ..McpServerConfig::default()
+        }];
+        let mut merged = serde_json::to_value(&global).unwrap();
+        let mut overlay: Value = serde_json::json!({
+            "offload": { "mcp_servers": [{ "name": "attacker" }] }
+        });
+        strip_mcp_registry(&mut overlay); // the WRONG function on this side
+        deep_merge(&mut merged, overlay);
+        let out: Settings = serde_json::from_value(merged).unwrap();
+        assert!(
+            out.offload.mcp_servers.is_empty(),
+            "this is why `load_readonly` removes the keys instead: normalizing them to `[]` \
+             hands the merge an explicit empty array and the machine's registry is gone"
+        );
+    }
+
+    /// Phase B review, **B-1**: the strip's allow-list covers SHAPE, and the
+    /// claim is not about the strip function — it is about what a hostile
+    /// `.cimp/config.json` can do to the answers a pipeline reads.
+    ///
+    /// So this drives the real three steps `load` performs (global → value,
+    /// strip the overlay, `deep_merge`, deserialize) and then asks the
+    /// **registry** — the one join every Phase C/D consumer goes through —
+    /// whether a tool the user disabled came back on, or whether a timeout the
+    /// user set moved. A non-object or `null` at any of the four map levels
+    /// used to survive the strip, get scalar-merged over the stored object, be
+    /// dropped by the lenient reader, and land the registry on its
+    /// never-configured default, which is ENABLED.
+    #[test]
+    fn a_hostile_overlay_shape_cannot_re_enable_a_disabled_plugin_tool() {
+        use crate::plugins::{loader::scan_dir, manifest::Provenance, registry};
+        use crate::settings::{PluginState, ToolState};
+        use std::collections::BTreeMap;
+
+        let dir = std::env::temp_dir().join(format!("cimp_tp_hostile_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("acme.json"),
+            r#"{
+              "manifest_version": 1,
+              "name": "acme",
+              "version": "1.0.0",
+              "categories": [{ "id": "sec", "label": "Security", "tools": ["scan"] }],
+              "tools": [{ "id": "scan", "label": "Acme Scan", "kind": "security", "argv": ["{root}"] }]
+            }"#,
+        )
+        .unwrap();
+        let set = scan_dir(&dir, Provenance::User);
+        assert!(set.errors.is_empty(), "{:?}", set.errors);
+
+        // The machine's answer: this tool is OFF, with a path and a timeout the
+        // user chose. Everything a hostile overlay would want to change.
+        let mut global = Settings::default();
+        global.tool_plugins.global_paths.insert(
+            "acme@1.0.0/scan".to_string(),
+            "C:\\bin\\acme.exe".to_string(),
+        );
+        global.tool_plugins.plugins.insert(
+            "acme@1.0.0".to_string(),
+            PluginState {
+                enabled: true,
+                tools: BTreeMap::from([(
+                    "scan".to_string(),
+                    ToolState {
+                        enabled: false,
+                        timeout_secs: Some(60),
+                        ..ToolState::default()
+                    },
+                )]),
+            },
+        );
+
+        // One hostile overlay per level, each the shape that used to walk past
+        // the strip: a scalar and a null at the plugins-map, the plugin-state,
+        // the tools-map and the tool-state levels.
+        let hostiles: [(&str, Value); 8] = [
+            ("plugins-map scalar", serde_json::json!({"plugins": 5})),
+            ("plugins-map null", serde_json::json!({"plugins": null})),
+            (
+                "plugin-state scalar",
+                serde_json::json!({"plugins": {"acme@1.0.0": 5}}),
+            ),
+            (
+                "plugin-state null",
+                serde_json::json!({"plugins": {"acme@1.0.0": null}}),
+            ),
+            (
+                "tools-map scalar",
+                serde_json::json!({"plugins": {"acme@1.0.0": {"tools": 5}}}),
+            ),
+            (
+                "tools-map null",
+                serde_json::json!({"plugins": {"acme@1.0.0": {"tools": null}}}),
+            ),
+            (
+                "tool-state scalar",
+                serde_json::json!({"plugins": {"acme@1.0.0": {"tools": {"scan": 5}}}}),
+            ),
+            (
+                "tool-state null",
+                serde_json::json!({"plugins": {"acme@1.0.0": {"tools": {"scan": null}}}}),
+            ),
+        ];
+
+        for (what, tool_plugins) in hostiles {
+            let mut overlay = serde_json::json!({ "tool_plugins": tool_plugins });
+            let dropped = strip_overlay_tool_plugins(&mut overlay);
+            assert!(
+                !dropped.is_empty(),
+                "{what}: a malformed node must be REPORTED, not silently tolerated"
+            );
+
+            let mut merged = serde_json::to_value(&global).unwrap();
+            deep_merge(&mut merged, overlay);
+            let loaded: Settings = serde_json::from_value(merged).unwrap();
+
+            let tools = registry::effective_tools(&set, &loaded.tool_plugins, None);
+            let scan = tools
+                .iter()
+                .find(|t| t.tool_key == "acme@1.0.0/scan")
+                .unwrap_or_else(|| panic!("{what}: the tool vanished from the registry"));
+            assert!(
+                !scan.enabled && !scan.runnable(),
+                "{what}: the overlay re-enabled a tool the user switched off"
+            );
+            assert_eq!(
+                scan.timeout_secs,
+                Some(60),
+                "{what}: the overlay moved a machine-scope timeout"
+            );
+            assert_eq!(
+                scan.path.as_deref(),
+                Some("C:\\bin\\acme.exe"),
+                "{what}: the overlay moved a machine-scope path"
+            );
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The other half: a Settings-window edit to a machine-scope field made
+    /// from inside a customized project still lands somewhere — the physical
+    /// global file — because the overlay refuses to carry it.
+    #[test]
+    fn tool_plugin_machine_scope_writes_through_to_the_global_file() {
+        use crate::settings::{PluginState, ToolState};
+        use std::collections::BTreeMap;
+
+        let mut live = Settings::default();
+        live.tool_plugins.global_paths.insert(
+            "acme@1.0.0/scan".to_string(),
+            "C:\\bin\\acme.exe".to_string(),
+        );
+        live.tool_plugins.project_paths.insert(
+            "C:\\repo".to_string(),
+            BTreeMap::from([("acme@1.0.0/scan".to_string(), "D:\\alt.exe".to_string())]),
+        );
+        live.tool_plugins.plugins.insert(
+            "acme@1.0.0".to_string(),
+            PluginState {
+                enabled: false,
+                tools: BTreeMap::from([(
+                    "scan".to_string(),
+                    ToolState {
+                        enabled: false,
+                        timeout_secs: Some(900),
+                        // PROJECT scope — must NOT reach the global file, or one
+                        // repo's overrides become every repo's defaults.
+                        parameters: vec!["--exclude".into(), "vendor".into()],
+                        variables: BTreeMap::from([("ruleset".into(), "p/ci".into())]),
+                    },
+                )]),
+            },
+        );
+
+        let mut disk = Settings::default();
+        assert!(sync_tool_plugin_state_into(&mut disk, &live));
+        assert_eq!(disk.tool_plugins.global_paths, live.tool_plugins.global_paths);
+        assert_eq!(disk.tool_plugins.project_paths, live.tool_plugins.project_paths);
+        let on_disk = &disk.tool_plugins.plugins["acme@1.0.0"];
+        assert!(!on_disk.enabled);
+        assert!(!on_disk.tools["scan"].enabled);
+        assert_eq!(on_disk.tools["scan"].timeout_secs, Some(900));
+        assert!(
+            on_disk.tools["scan"].parameters.is_empty()
+                && on_disk.tools["scan"].variables.is_empty(),
+            "project-scope leaves must not be written through to the machine file"
+        );
+        assert!(
+            !sync_tool_plugin_state_into(&mut disk, &live),
+            "a no-op edit must not rewrite the global file"
+        );
+    }
+
+    /// End to end through `save`: the overlay a real save writes carries the
+    /// project's variables and none of the machine's facts.
+    #[test]
+    fn save_keeps_tool_plugin_paths_out_of_the_overlay() {
+        use crate::settings::{PluginState, ToolState};
+        use std::collections::BTreeMap;
+
+        let _shell = fake_default_shell();
+        let mut global = Settings::default();
+        integrity_check(&mut global);
+
+        let dir = std::env::temp_dir().join(format!("cimp_tp_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+
+        let mut customized = global.clone();
+        customized.tool_plugins.global_paths.insert(
+            "acme@1.0.0/scan".to_string(),
+            "C:\\bin\\acme.exe".to_string(),
+        );
+        customized.tool_plugins.plugins.insert(
+            "acme@1.0.0".to_string(),
+            PluginState {
+                enabled: false,
+                tools: BTreeMap::from([(
+                    "scan".to_string(),
+                    ToolState {
+                        enabled: true,
+                        timeout_secs: Some(300),
+                        parameters: vec!["--fast".into()],
+                        variables: BTreeMap::from([("ruleset".into(), "p/ci".into())]),
+                    },
+                )]),
+            },
+        );
+        save(&customized, &dir, &global).unwrap();
+
+        let text = fs::read_to_string(dir.join(".cimp").join("config.json")).unwrap();
+        let val: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            val,
+            serde_json::json!({
+                "tool_plugins": { "plugins": { "acme@1.0.0": { "tools": { "scan": {
+                    "variables": { "ruleset": "p/ci" },
+                    "parameters": ["--fast"]
+                } } } } }
+            }),
+            "overlay: {text}"
+        );
+        assert!(!text.contains("acme.exe"), "overlay: {text}");
+        assert!(!text.contains("timeout_secs"), "overlay: {text}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn save_writes_overlay_inside_cimp_dir() {
         // The per-folder overlay must land at `<cwd>/.cimp/config.json`, not
@@ -3855,142 +4429,101 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    // ── Audit scanner paths: machine-scope splitting ──────────────────────────
+    // ── Legacy audit-tool config: one-time promotion ──────────────────────
 
-    use crate::settings::schema::AuditToolId;
-
-    fn set_tool_path(s: &mut Settings, id: AuditToolId, p: &str) {
-        s.code_audit
-            .tools
-            .iter_mut()
-            .find(|t| t.id == id)
-            .expect("tool seeded by default")
-            .path = p.to_string();
-    }
-
-    fn get_tool_path(s: &Settings, id: AuditToolId) -> String {
-        s.code_audit
-            .tools
-            .iter()
-            .find(|t| t.id == id)
-            .expect("tool seeded by default")
-            .path
-            .clone()
-    }
-
+    /// The v33 promotion, and the two rules that make it safe to run on every
+    /// launch: it fills only EMPTY slots, and a container the user has already
+    /// touched wins over a stale overlay.
     #[test]
-    fn audit_path_promotion_fills_only_empty_global_slots() {
+    fn legacy_audit_config_promotes_into_empty_container_slots_only() {
         let mut global = base_test_settings();
-        set_tool_path(&mut global, AuditToolId::Semgrep, "C:\\global\\semgrep.exe");
+        // Already configured through the new pane: must survive untouched.
+        global.tool_plugins.global_paths.insert(
+            "cimp-audit@1/semgrep".to_string(),
+            "C:\\global\\semgrep.exe".to_string(),
+        );
         let overlay = serde_json::json!({
             "code_audit": { "tools": [
-                { "id": "gitleaks", "path": "P:\\ebin\\gitleaks.exe" },
-                { "id": "semgrep", "path": "D:\\stale\\semgrep.exe" },
-                { "id": "ruff", "path": "   " },
-            ]}
+                {
+                    "id": "gitleaks",
+                    "enabled": false,
+                    "path": "P:\\ebin\\gitleaks.exe",
+                    "extra_args": ["--redact"],
+                    "timeout_secs": 900
+                },
+                { "id": "semgrep", "path": "P:\\stale\\semgrep.exe", "ruleset": "p/ci" },
+                { "id": "pmd", "path": "   ", "ruleset": "   " }
+            ] }
         });
 
-        assert!(promote_overlay_audit_paths(&mut global, &overlay));
-        // Empty global slot: filled from the legacy overlay.
-        assert_eq!(
-            get_tool_path(&global, AuditToolId::Gitleaks),
-            "P:\\ebin\\gitleaks.exe"
-        );
-        // Non-empty global slot: the overlay copy never overwrites it.
-        assert_eq!(
-            get_tool_path(&global, AuditToolId::Semgrep),
-            "C:\\global\\semgrep.exe"
-        );
-        // Whitespace-only overlay path: not a promotion.
-        assert_eq!(get_tool_path(&global, AuditToolId::Ruff), "");
+        assert!(promote_overlay_audit_config(&mut global, &overlay));
 
-        // Idempotent: a second pass changes nothing.
-        assert!(!promote_overlay_audit_paths(&mut global, &overlay));
+        // The path the container did not have is promoted; the one it had is not.
+        assert_eq!(
+            global.tool_plugins.global_paths.get("cimp-audit@1/gitleaks"),
+            Some(&"P:\\ebin\\gitleaks.exe".to_string())
+        );
+        assert_eq!(
+            global.tool_plugins.global_paths.get("cimp-audit@1/semgrep"),
+            Some(&"C:\\global\\semgrep.exe".to_string()),
+            "an already-configured machine path must not be overwritten by a stale overlay"
+        );
+
+        let tools = &global.tool_plugins.plugins["cimp-audit@1"].tools;
+        let gitleaks = &tools["gitleaks"];
+        assert!(!gitleaks.enabled);
+        assert_eq!(gitleaks.timeout_secs, Some(900));
+        assert_eq!(gitleaks.parameters, vec!["--redact".to_string()]);
+        assert_eq!(tools["semgrep"].variables["ruleset"], "p/ci");
+        // A blank ruleset meant "use the tool's own default", which is the
+        // ABSENCE of a value in the container — storing "" would render
+        // `-R ""` on the next scan with no way back.
+        assert!(!tools.contains_key("pmd"), "a blank-only entry carries nothing");
+
+        // Idempotent: a second pass over the same overlay changes nothing, so a
+        // project that is never saved does not re-promote on every launch.
+        assert!(!promote_overlay_audit_config(&mut global, &overlay));
     }
 
+    /// **Phase E gate, B-E2.** A legacy overlay is an unvalidated file: a hand
+    /// edit, a tool a later build removed, or a hostile `.cimp/config.json` can
+    /// name an id this build does not ship. The promotion must drop it, because
+    /// the two things it would otherwise write are worse than a lost setting —
+    /// a container slot no pane can show or clear, and a MACHINE-WIDE path
+    /// keyed on a name nothing resolves, minted from one project's file.
     #[test]
-    fn merged_audit_paths_come_from_global_not_overlay() {
+    fn a_legacy_overlay_cannot_promote_an_id_this_build_does_not_ship() {
         let mut global = base_test_settings();
-        set_tool_path(&mut global, AuditToolId::Gitleaks, "P:\\ebin\\gitleaks.exe");
+        let overlay = serde_json::json!({
+            "code_audit": { "tools": [
+                { "id": "not-a-tool", "enabled": true, "path": "P:/evil/x.exe" },
+                { "id": "cargo-audit", "enabled": false, "timeout_secs": 900 },
+                { "id": "gitleaks", "enabled": false }
+            ] }
+        });
 
-        // Simulate the deep-merge outcome: the overlay's tools array replaced
-        // the global's wholesale, with empty/stale path copies.
-        let mut merged = serde_json::to_value(&global).unwrap();
-        let tools = merged["code_audit"]["tools"].as_array_mut().unwrap();
-        for t in tools.iter_mut() {
-            t["path"] = serde_json::json!("");
-        }
+        // The one real id still promotes — the filter is a filter, not a veto.
+        assert!(promote_overlay_audit_config(&mut global, &overlay));
+        let tools = &global.tool_plugins.plugins["cimp-audit@1"].tools;
+        assert!(!tools["gitleaks"].enabled);
 
-        enforce_global_audit_paths(&mut merged, &global);
-        let settings: Settings = serde_json::from_value(merged).unwrap();
-        assert_eq!(
-            get_tool_path(&settings, AuditToolId::Gitleaks),
-            "P:\\ebin\\gitleaks.exe",
-            "the merged view must take paths from the global baseline"
+        assert!(!tools.contains_key("not-a-tool"));
+        assert!(!tools.contains_key("cargo-audit"), "a tool V23 removed");
+        assert!(
+            global.tool_plugins.global_paths.is_empty(),
+            "a fabricated id must not mint a machine-wide path: {:?}",
+            global.tool_plugins.global_paths
         );
     }
 
+    /// An overlay with no legacy block at all is not a promotion.
     #[test]
-    fn overlay_diff_never_carries_audit_paths() {
-        // A settings state that differs from global ONLY in a scanner path
-        // must produce NO overlay at all once both sides are stripped — the
-        // path lands in the global file via the save() write-through instead.
-        let global = base_test_settings();
-        let mut current = global.clone();
-        set_tool_path(
-            &mut current,
-            AuditToolId::Gitleaks,
-            "P:\\ebin\\gitleaks.exe",
-        );
-
-        let mut cur_v = serde_json::to_value(&current).unwrap();
-        let mut base_v = serde_json::to_value(&global).unwrap();
-        strip_audit_tool_paths(&mut cur_v);
-        strip_audit_tool_paths(&mut base_v);
-        assert!(
-            diff(&cur_v, &base_v).is_none(),
-            "a path-only change must not create an overlay"
-        );
-
-        // A real per-project difference (an `enabled` flip) still diffs — and
-        // the emitted tools array carries only stripped paths.
-        let mut current2 = current.clone();
-        current2
-            .code_audit
-            .tools
-            .iter_mut()
-            .find(|t| t.id == AuditToolId::Gitleaks)
-            .unwrap()
-            .enabled = false;
-        let mut cur2_v = serde_json::to_value(&current2).unwrap();
-        strip_audit_tool_paths(&mut cur2_v);
-        let delta = diff(&cur2_v, &base_v).expect("enabled flip must diff");
-        let tools = delta["code_audit"]["tools"].as_array().unwrap();
-        assert!(
-            tools.iter().all(|t| t["path"].as_str() == Some("")),
-            "overlay tools entries must carry no path copies: {delta}"
-        );
-    }
-
-    #[test]
-    fn sync_audit_paths_into_disk_global_reports_changes() {
-        let mut disk = base_test_settings();
-        let mut live = base_test_settings();
-        set_tool_path(&mut live, AuditToolId::Semgrep, "C:\\py\\semgrep.exe");
-
-        assert!(sync_audit_paths_into(&mut disk, &live));
-        assert_eq!(
-            get_tool_path(&disk, AuditToolId::Semgrep),
-            "C:\\py\\semgrep.exe"
-        );
-        // Unchanged on a second sync — the physical file isn't rewritten.
-        assert!(!sync_audit_paths_into(&mut disk, &live));
-
-        // Clearing a path in the live settings clears the global slot too
-        // (the Clear button means "forget the configured path everywhere").
-        set_tool_path(&mut live, AuditToolId::Semgrep, "");
-        assert!(sync_audit_paths_into(&mut disk, &live));
-        assert_eq!(get_tool_path(&disk, AuditToolId::Semgrep), "");
+    fn a_modern_overlay_promotes_nothing() {
+        let mut global = base_test_settings();
+        let overlay = serde_json::json!({ "ui": { "theme": "tui" } });
+        assert!(!promote_overlay_audit_config(&mut global, &overlay));
+        assert!(global.tool_plugins.plugins.is_empty());
+        assert!(global.tool_plugins.global_paths.is_empty());
     }
 
     fn cmd_template(name: &str, command: &str) -> ServerCommandTemplate {

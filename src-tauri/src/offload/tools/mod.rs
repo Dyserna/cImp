@@ -189,10 +189,18 @@ impl ToolCtx {
 /// `run_check` (V21 F6) additionally requires the project to have configured
 /// `checks` — read live here, gated identically to the MCP surface
 /// (`graph/mcp.rs`), so a fresh project sees no `run_check` on either side.
+///
+/// V38 Phase D: "configured" means the EFFECTIVE set, plugin `check`-kind tools
+/// included, through the same `checks::plugin` join the MCP surface uses. Two
+/// gates reading two different definitions of "has checks" would advertise the
+/// tool on one leg and not the other for exactly the projects V38 exists to
+/// serve — the ones whose checks come from a plugin rather than from an array
+/// the user hand-wrote.
 pub fn enabled_defs(toggles: &OffloadToolToggles) -> Vec<ToolDef> {
     let checks_configured = {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        !crate::settings::load_readonly(&cwd).checks.is_empty()
+        !crate::checks::plugin::effective_check_names(&crate::settings::load_readonly(&cwd))
+            .is_empty()
     };
     enabled_defs_inner(toggles, checks_configured)
 }

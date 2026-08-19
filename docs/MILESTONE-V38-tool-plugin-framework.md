@@ -1,6 +1,9 @@
 # V38 — Unified Tool Registry + Plugin Framework
 
-**Status:** SPEC — not yet coded (2026-08-18). GitHub: #77 (investigation +
+**Status:** CODE-COMPLETE (2026-08-19) — phases A–G, the V37 merge, the starter
+plugin pack, and Phase F all landed on `feat/v38-tool-plugin-framework` and passed
+adversarial review; gated on live-verify only. Contract spec: `docs/TOOL-PLUGINS.md`.
+Follow-ups: #81 (machine-scope enables), #82 (junit-xml/TRX directory ingestion). GitHub: #77 (investigation +
 full decision log in dated comments; the closing comment there is an 11-point
 index of the locked decisions this doc distills; from now on this doc is the
 design authority).
@@ -12,7 +15,8 @@ propagation, and screening).
 ## Motivation
 
 Every tool cImp can run is hardcoded twice over: the audit/security roster is
-15 `static Adapter` consts (`src-tauri/src/audit/adapters.rs`) with a
+14 `static Adapter` consts (`src-tauri/src/audit/adapters.rs` — the design said
+15; the implementation survey counted them) with a
 hand-written parser each (`audit/parsers.rs`), per-tool settings baked into
 the versioned schema (`settings/schema.rs`, `src/lib/settings/codeAudit.ts`),
 and the MCP surface fanned out over that fixed roster (`audit/mcp.rs`). Adding
@@ -137,6 +141,11 @@ folder, requiring no rebuild, ever.
 
 ## The capability contract spec (deliverable, blocking)
 
+**DELIVERED (Phase G, 2026-08-19): [TOOL-PLUGINS.md](TOOL-PLUGINS.md).** It is
+the plugin-author-facing contract; `plugins::spec` parses its marked blocks and
+pins them against the constants and tables they describe, so the document cannot
+silently stop describing the build.
+
 A rigorous, plugin-author-facing spec — the `docs/CHP.md` pattern:
 authoritative, versioned (manifest schema version validated at load),
 **drift-tested**. For each capability kind it states:
@@ -160,11 +169,12 @@ authoritative, versioned (manifest schema version validated at load),
 The category layer appears in this spec only to state that it carries none of
 the above.
 
-### PROPOSAL (2026-08-19, not yet approved) — the sandbox fields of the manifest
+### APPROVED (2026-08-19) — the sandbox fields of the manifest
 
 Raised by the V33 live battery, which measured what actually happens when a
-real tool runs inside the OS sandbox. **Not a locked decision; approve, amend
-or drop.** Detail and evidence: `MILESTONE-V33-sandboxing.md`'s rc.9
+real tool runs inside the OS sandbox. **Approved 2026-08-19: all three fields
+(`runtime`, `sandbox`, `extra_grants`) are locked into the Phase A manifest
+schema.** Detail and evidence: `MILESTONE-V33-sandboxing.md`'s rc.9
 corrections block and #72.
 
 **The finding that motivates it.** Of the 14 built-in audit tools, 7 are
@@ -185,8 +195,14 @@ soon as third parties write tools (people write scanners in Python and Node).
    boolean:** that shape carries no actionable information (it never says
    *which* runtime), it can contradict a sibling field, and it mis-classifies a
    real third case — a project-local tool (eslint, knip resolving from
-   `node_modules/.bin`) is runtime-dependent yet needs no grant at all, because
+   `node_modules/.bin`) is runtime-dependent yet needs almost no grant, because
    its payload already lives inside the project root the sandbox grants.
+   *(Corrected 2026-08-19 against what Phase E shipped, per the E-gate's
+   code-over-doc ruling 3: eslint and knip declare `runtime: node`, not
+   `runtime: none`. The payload is inside the root, but the `.bin` entry is a
+   shim that re-enters the Node install tree — declaring `none` breaks them
+   under the sandbox. The third case is real and the field still expresses it;
+   what it buys is a SMALLER grant set, not the absence of one.)*
 2. **`sandbox: required | optional | unsupported`** — a DIFFERENT question:
    not what the tool needs, but what cImp does when it cannot provide it.
    `unsupported` runs the tool outside the boundary as an informed user choice
@@ -225,16 +241,23 @@ a code-execution primitive: repoint a tool's `path` and cImp runs it. V33 hit
 the identical hole (a project overlay could switch the sandbox off, or name
 `~/.ssh` as an extra grant) and closed it by making the whole `sandbox` block
 overlay-banned and machine-global, with a write-through so the settings still
-save. **Recommendation: binary paths, and any field that widens the boundary,
-must be global/machine scope only — never overlay-settable.** Variable values
-and CLI parameters can stay project-scoped. Cheaper to decide now than to
-retrofit after authors depend on per-project paths.
+save. **DECIDED 2026-08-19 (amends decision 10): binary paths, and any field
+that widens the boundary, are never overlay-settable.** Per-project binary
+paths survive, but via a **machine-global per-project map** (keyed by project
+root, stored alongside the global settings — outside every sandbox grant), so
+a compromised repo cannot write them. `.cimp/config.json` carries variable
+values and CLI parameters only; a `path` (or other banned field) appearing in
+the overlay is ignored with a loud warning event, and a write-through keeps
+project-scoped path edits saving to the machine-global map (the V33 `sandbox`
+block treatment). Live-verify 5 stands unchanged — two projects, two paths —
+the storage location moves, not the capability.
 
 ## Registry semantics
 
 - Registry entry = plugin-declared tool + user state: executable path
-  (global, project-overridable), enabled (plugin / category / tool levels),
-  declared variable + CLI parameter values (global, project-overridable).
+  (global, per-project via the machine-global per-project map — never the
+  overlay), enabled (plugin / category / tool levels), declared variable +
+  CLI parameter values (global, project-overridable via the overlay).
 - `command`-kind entries **feed `run_command`**: the registry entry (explicit
   path + enabled) becomes the allowlist entry and path resolution —
   superseding a separate allowlist for registered tools.
@@ -277,11 +300,33 @@ retrofit after authors depend on per-project paths.
   invariants pinned by tests.
 - **D — Check + command kinds**: check defs feed `run_check`; command entries
   feed `run_command` allowlist/path resolution.
-- **E — Built-in migration**: the 15 adapters become shipped built-in
-  plugins; `audit/parsers.rs` retired; `adapters.rs` reduced to the loader's
-  built-in set. Baselines re-pinned.
-- **F — MCP tier (after V37)**: tier-2 providers returning SARIF over
-  `tools/call`, managed under V37.
+- **E — Built-in migration** *(done)*: the **14** adapters (not 15 — the
+  survey corrected the count) became one shipped built-in plugin,
+  `cimp-audit@1`, read through the same loader and validator a dropped-in file
+  goes through. `AuditToolId`, `AuditToolConfig`, `default_audit_tools`, the
+  `Adapter` table and `audit/parsers.rs` are gone; `adapters.rs` keeps only what
+  is not per-tool configuration (`Category`, `Transport`, `classify_exit`), and
+  `AuditParser` moved beside the kind-aware resolution that produces it. Schema
+  v33 → v34 moves `code_audit.tools` into `tool_plugins` in the same commit that
+  switches the reader. Four built-in-only manifest fields carry what the tier
+  needs and a scanned file may not have (`ingest`, `command`,
+  `project_local_bin`, `dir_argv`), each refused on the scanned path by the
+  loader's provenance stamp; two general fields are new (`description`,
+  `enabled_by_default`). Live-verify 7 is a committed byte-match golden rather
+  than a fixture-repo run.
+- **F — MCP tier** *(done)*: an `audit`/`security` tool may declare
+  `provider: {server, tool}` instead of the spawn vocabulary; cImp issues one
+  `tools/call` through V37's host path — so the disabled-server refusal, the
+  outbound screen and the `mcp`-lane row are V37's, unchanged — and the result
+  text goes through the SAME SARIF ingest gate, attribution and caps as a
+  spawned tool. The spawn fields, the sandbox posture and the two built-in-only
+  relaxations are all refused on a provider tool: nothing runs on this machine,
+  so the trust the user extends is in the SERVER rather than in an executable
+  they chose. Contract: [TOOL-PLUGINS.md § 4.5](TOOL-PLUGINS.md). The phase also
+  carried two ordered items that are not tier-2: V37's deferred **E-1** (a
+  detection-config or rules-bundle change re-screens the LIVE MCP surface,
+  drop-only) and **`PulseSource::Native`** (a check-surface change — configured
+  or plugin-contributed — now emits one debounced `tools/list_changed`).
 - **G — Capability contract spec**: the CHP-pattern doc + drift tests
   (blocking for "milestone done", per decision — written alongside C/D, not
   after).
@@ -301,5 +346,13 @@ retrofit after authors depend on per-project paths.
    spawns its own project's binary (verify via spawn ledger rows).
 6. `command`-kind plugin (git) → run_command resolves the registered path,
    allowlist honored, sandbox row minted as for any spawn.
-7. Built-in migration regression: post-Phase-E, umbrella reports byte-match
-   the pre-migration reports on a fixture repo (parser unification proven).
+7. Built-in migration regression: **automated and committed** rather than a
+   manual recipe. `audit::golden` renders every built-in tool's argv under
+   three substitution shapes, the finalized verdict of six canned runs each
+   (findings / clean-and-silent / findings-exit-with-no-output / tool error /
+   timeout / spawn failure) and both umbrella reports, and compares them byte
+   for byte against a fixture captured BEFORE the migration. The gitleaks
+   empty-report-is-clean case and cppcheck's exit-0-with-findings contract are
+   in it by name, because those are the two semantics a naive move onto the
+   strict SARIF ingest gate would break. Regeneration is env-var gated and
+   panics when it fires.

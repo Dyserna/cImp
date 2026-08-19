@@ -706,13 +706,105 @@ impl OffloadService {
         {
             let host = service.host.clone();
             let out = service.change_tx.clone();
+            // V38 Phase F: the native surface's fingerprint, read live from the
+            // same settings handle every other consumer reads. The gate seeds
+            // itself from this (off the launch thread — see `run_pulse_gate`).
+            let for_sig = service.settings.clone();
+            let native_sig: NativeSig =
+                Arc::new(move || crate::graph::native_surface_sig(&for_sig.current()));
             tauri::async_runtime::spawn(run_pulse_gate(
                 host,
                 out,
                 pulse_rx,
                 PULSE_DEBOUNCE,
                 McpSurfaceFingerprint::empty(),
+                native_sig,
             ));
+        }
+
+        // V38 Phase F: the NATIVE surface's producer. Every settings save asks
+        // for a pulse and the gate decides — the same division of labour
+        // `reconcile` and the host fingerprint have, and the reason neither
+        // producer has to know what "moved" means. A save is the only edge for
+        // `settings.checks` and for every registry-relevant `tool_plugins` field
+        // (enables, paths, variables); a plugin RESCAN is not a save, and asks
+        // through `signal_native_change` instead.
+        {
+            let pulses = service.pulse_tx.clone();
+            let mut rx = service.settings.subscribe();
+            tauri::async_runtime::spawn(async move {
+                // Lagged means frames were dropped, and one of them may have
+                // been the edge: ask anyway, and let the fingerprint say. Only
+                // `Closed` — the settings handle is gone — ends the task.
+                while let Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) =
+                    rx.recv().await
+                {
+                    let _ = pulses.send(PulseSource::Native);
+                }
+            });
+        }
+
+        // V38 Phase F (V37's E-1): the detection-change watcher. The connect-time
+        // tool screen runs once per connection, so without this a rules-bundle
+        // update or a detection toggle leaves a live surface screened against
+        // the rules of whenever each server happened to connect.
+        //
+        // TWO edges, because the fact arrives two ways: a settings save (the
+        // toggles) and a rules reload (the bundle, which changes no setting at
+        // all). Only a settings save is compared — the config either moved or it
+        // did not — while a reload is taken at face value, since "the rules are
+        // different now" is exactly what it means and cImp does not hash them.
+        {
+            let this = service.clone();
+            let mut settings_rx = service.settings.subscribe();
+            let mut rules_rx = super::detection::subscribe_rules_reload();
+            let mut last = super::detection::Config::from_settings(
+                &service.settings.current(),
+                crate::settings::injection::Scope::AppWide,
+            );
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    let changed = tokio::select! {
+                        s = settings_rx.recv() => match s {
+                            Ok(s) => {
+                                let now = super::detection::Config::from_settings(
+                                    &s,
+                                    crate::settings::injection::Scope::AppWide,
+                                );
+                                let moved = now != last;
+                                last = now;
+                                moved
+                            }
+                            // A LAGGED receiver dropped frames, and one of them
+                            // can be the very edge this task exists for — the
+                            // standard broadcast pattern in this file: treat it
+                            // as "changed, re-check" against the authoritative
+                            // current settings rather than skipping past it.
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                                let now = super::detection::Config::from_settings(
+                                    &this.settings.current(),
+                                    crate::settings::injection::Scope::AppWide,
+                                );
+                                let moved = now != last;
+                                last = now;
+                                moved
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        },
+                        r = rules_rx.recv() => match r {
+                            // Lagged is the same answer as Ok here: N coalesced
+                            // reloads and one reload ask for the same work,
+                            // because the screen reads the CURRENT rules either
+                            // way.
+                            Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => true,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        },
+                    };
+                    if changed {
+                        this.rescreen_mcp_surface().await;
+                    }
+                }
+            });
         }
 
         // Relay MCP-host change pulses (reconcile added/dropped a connection, a
@@ -750,6 +842,18 @@ impl OffloadService {
         let _ = self.pulse_tx.send(PulseSource::Backend);
     }
 
+    /// V38 Phase F — ask for a pulse on behalf of the NATIVE tool surface.
+    ///
+    /// For the producers a settings save does not cover: a plugin **rescan**
+    /// replaces the loaded manifest set without writing a byte of settings, and
+    /// it can add, remove or rename every `check`-kind tool `run_check`
+    /// advertises. Like every other producer this only ASKS — the gate compares
+    /// the native fingerprint and stays silent when a rescan found the same
+    /// plugins it had.
+    pub fn signal_native_change(&self) {
+        let _ = self.pulse_tx.send(PulseSource::Native);
+    }
+
     // ── V30 Phase B: session push (see the `PushRegistry` section above) ──
 
     /// Register a `/events` subscriber. Called by
@@ -776,6 +880,17 @@ impl OffloadService {
     /// services need exactly the send half, and holding the whole service would
     /// make the Arc graph circular (the service reaches the graph service via
     /// its tools). The registry itself holds no back-reference to anything.
+    /// The warm MCP host.
+    ///
+    /// V38 Phase F: the audit runner takes this (and nothing else of the offload
+    /// layer) so a **tier-2 provider** tool can be dispatched under V37's
+    /// enforcement. Handing out the host rather than the service is what keeps
+    /// it a one-way edge — the host holds no reference back, so there is no
+    /// cycle and no way for the audit side to reach the run queue.
+    pub fn mcp_host(&self) -> Arc<McpHost> {
+        self.host.clone()
+    }
+
     pub fn push_registry(&self) -> Arc<PushRegistry> {
         self.pushes.clone()
     }
@@ -911,6 +1026,23 @@ impl OffloadService {
         *self.last_host_sig.lock().unwrap() = Some(sig);
     }
 
+    /// V38 Phase F (V37's E-1) — re-screen the live MCP surface against the
+    /// CURRENT detection config, drop-only, and pulse if anything went.
+    ///
+    /// The pulse source is [`PulseSource::Host`] and that is exact: a withheld
+    /// tool is a change to what every consumer is advertised, so the host's own
+    /// surface fingerprint is the right thing to judge it by — and it will
+    /// judge a real drop as a move, because the drop is one.
+    pub async fn rescreen_mcp_surface(&self) {
+        let cfg = super::detection::Config::from_settings(
+            &self.settings.current(),
+            crate::settings::injection::Scope::AppWide,
+        );
+        if self.host.rescreen(cfg).await {
+            let _ = self.pulse_tx.send(PulseSource::Host);
+        }
+    }
+
     /// Aggregate service status for the Settings readout: the honest global
     /// in-flight count and per-MCP-server health.
     pub async fn status(&self) -> ServiceStatus {
@@ -935,7 +1067,13 @@ impl OffloadService {
             // this route. An unexpected `offload` query value therefore can't
             // arrive in practice — fall back to the Claude set (the conservative,
             // claude_access-guarded default) rather than leaking the offload set.
-            Consumer::Claude | Consumer::Offload => self.host.tool_defs_for_claude().await,
+            //
+            // V38 Phase F: `Audit` lands here for the same reason and never in
+            // practice — the audit fan-out advertises nothing and calls a name
+            // its manifest already fixed, so it has no `tools/list` at all.
+            Consumer::Claude | Consumer::Offload | Consumer::Audit => {
+                self.host.tool_defs_for_claude().await
+            }
         };
         defs.into_iter()
             .map(|d| {
@@ -1019,7 +1157,11 @@ impl OffloadService {
         // this proxy; fall back to the Claude-guarded set.
         let consumer = match consumer {
             Consumer::Opencode => Consumer::Opencode,
-            Consumer::Claude | Consumer::Offload => Consumer::Claude,
+            // V38 Phase F: `Audit` cannot reach this route either — the fan-out
+            // calls the host directly, in-process. Folded onto the Claude-guarded
+            // default with the worker, so a stray query value can never widen a
+            // grant by naming a consumer this proxy does not serve.
+            Consumer::Claude | Consumer::Offload | Consumer::Audit => Consumer::Claude,
         };
         let snap = self.settings.current();
         let agent = crate::graph::source_for_consumer(consumer.source());
@@ -2362,6 +2504,19 @@ enum PulseSource {
     /// comparison before it asks. Never suppressed here; suppressing it would
     /// silently undo `spawn_health_watch`'s documented purpose.
     Backend,
+    /// V38 Phase F: the NATIVE tool surface — what this process advertises
+    /// itself, of which `run_check`'s `name` enum is the project-dynamic part.
+    /// Moved by a `settings.checks` edit, a plugin enable or path, and a plugin
+    /// rescan.
+    ///
+    /// Suppressed like `Host` and by its OWN fingerprint
+    /// ([`graph::mcp::native_surface_sig`](crate::graph::native_surface_sig)),
+    /// never by the host's. The two answer different questions and disagree
+    /// constantly: connecting an MCP server moves the host surface and not this
+    /// one, and enabling a plugin check moves this one and not the host's.
+    /// Letting either fingerprint judge the other's pulse would drop exactly the
+    /// changes it cannot see.
+    Native,
 }
 
 /// How long the gate collects pulses before deciding. The UI batches a category
@@ -2370,6 +2525,25 @@ enum PulseSource {
 /// so a single user action legitimately produces a burst. Tests supply their
 /// own window and assert ONE pulse per action; nothing depends on this value.
 const PULSE_DEBOUNCE: Duration = Duration::from_millis(300);
+
+/// How the pulse gate asks what the native surface hashes to right now.
+///
+/// Boxed rather than a generic parameter so the gate stays one function with
+/// one body — it is spawned exactly once in production and once per test, and a
+/// monomorphized copy per caller would buy nothing.
+type NativeSig = Arc<dyn Fn() -> u64 + Send + Sync>;
+
+/// Run a [`NativeSig`] off the async runtime's workers.
+///
+/// It reads the effective check set, which resolves the plugin registry and
+/// takes a census walk of the project — cached and bounded, but filesystem work
+/// all the same, and the gate is a long-lived task on a shared runtime. `None`
+/// means the measurement did not happen, which the caller treats as "assume it
+/// moved" rather than as "assume it did not".
+async fn native_measure(sig: &NativeSig) -> Option<u64> {
+    let sig = sig.clone();
+    tokio::task::spawn_blocking(move || sig()).await.ok()
+}
 
 /// The ONE place a `change` pulse is decided: debounce, then suppress.
 ///
@@ -2390,11 +2564,26 @@ async fn run_pulse_gate(
     mut rx: mpsc::UnboundedReceiver<PulseSource>,
     window: Duration,
     seed: McpSurfaceFingerprint,
+    // V38 Phase F: how to ask what the NATIVE surface currently hashes to. A
+    // closure rather than a `SettingsHandle` because it is the only thing the
+    // gate needs from that whole layer, and because it is what lets a test move
+    // the native surface without a settings file (the `McpHost` half is already
+    // fakeable).
+    native_sig: NativeSig,
 ) {
     let mut last = seed;
+    // Seeded HERE rather than by the caller, and on the blocking pool: the
+    // fingerprint reads the effective check set, which resolves the plugin
+    // registry and takes a (cached, bounded) census walk of the project. That is
+    // filesystem work, and computing it at construction would put it on the
+    // Tauri setup thread — the launch path — for a value nothing needs until the
+    // first save. Seeded eagerly all the same, so a save that changes nothing is
+    // silent instead of emitting one spurious pulse per run.
+    let mut last_native = native_measure(&native_sig).await.unwrap_or_default();
     while let Some(first) = rx.recv().await {
         let mut from_host = first == PulseSource::Host;
         let mut unconditional = first == PulseSource::Backend;
+        let mut from_native = first == PulseSource::Native;
         // Collect everything that arrives inside the window. The deadline runs
         // from the FIRST pulse, so a steady stream cannot postpone the emit
         // indefinitely.
@@ -2406,6 +2595,7 @@ async fn run_pulse_gate(
                 more = rx.recv() => match more {
                     Some(PulseSource::Host) => from_host = true,
                     Some(PulseSource::Backend) => unconditional = true,
+                    Some(PulseSource::Native) => from_native = true,
                     // Every producer is gone: decide on what we have, then the
                     // outer loop sees the same `None` and the task ends.
                     None => break,
@@ -2418,6 +2608,24 @@ async fn run_pulse_gate(
             if fingerprint != last {
                 last = fingerprint;
                 emit = true;
+            }
+        }
+        // Its own fingerprint, and unconditionally evaluated: a burst carrying
+        // both sources must update BOTH baselines, or the one that was skipped
+        // would fire spuriously on the next pulse of its kind.
+        if from_native {
+            match native_measure(&native_sig).await {
+                Some(sig) => {
+                    if sig != last_native {
+                        last_native = sig;
+                        emit = true;
+                    }
+                }
+                // The measurement itself failed (the blocking task panicked).
+                // Emit: a pulse nobody needed costs one `tools/list_changed`,
+                // and a surface change nobody hears about costs a session its
+                // whole tool list until it restarts.
+                None => emit = true,
             }
         }
         if emit {
@@ -2815,14 +3023,31 @@ mod tests {
         mpsc::UnboundedSender<PulseSource>,
         broadcast::Receiver<()>,
     ) {
+        // A native surface that never moves: these tests are about the host
+        // half, and a fingerprint that drifted under them would make a Host
+        // assertion pass for a Native reason.
+        spawn_gate_with(host, Arc::new(AtomicU64::new(0)))
+    }
+
+    /// The gate, with a native fingerprint the test can move. Returns the same
+    /// pair; bump the `AtomicU64` to make the native surface "change".
+    fn spawn_gate_with(
+        host: Arc<McpHost>,
+        native: Arc<AtomicU64>,
+    ) -> (
+        mpsc::UnboundedSender<PulseSource>,
+        broadcast::Receiver<()>,
+    ) {
         let (tx, rx) = mpsc::unbounded_channel();
         let (out, out_rx) = broadcast::channel(64);
+        let sig: NativeSig = Arc::new(move || native.load(Ordering::Relaxed));
         tokio::spawn(run_pulse_gate(
             host,
             out,
             rx,
             TEST_WINDOW,
             McpSurfaceFingerprint::empty(),
+            sig,
         ));
         (tx, out_rx)
     }
@@ -2896,5 +3121,89 @@ mod tests {
         tx.send(PulseSource::Host).unwrap();
         settle().await;
         assert_eq!(pulses(&mut out), 1);
+    }
+
+    /// V38 Phase F — the NATIVE source: one pulse per action that moves the
+    /// native surface, and none for one that does not.
+    ///
+    /// This is the gap the V37→V38 merge review surfaced: check-surface changes
+    /// (configured AND plugin-contributed) had never pulsed at all, because
+    /// `checks_sig` is a memo key and not a notifier. The producers ask on every
+    /// settings save and on every plugin rescan; the fingerprint is what makes
+    /// asking cheap.
+    #[tokio::test]
+    async fn pulse_gate_emits_once_for_a_native_change_and_never_for_a_no_op() {
+        let native = Arc::new(AtomicU64::new(7));
+        let (tx, mut out) = spawn_gate_with(McpHost::new(), native.clone());
+
+        // A save that changed nothing the surface reads: the producer still
+        // asks (it does not know), and the gate says no.
+        for _ in 0..4 {
+            tx.send(PulseSource::Native).unwrap();
+        }
+        settle().await;
+        assert_eq!(pulses(&mut out), 0, "a no-op save must not pulse");
+
+        // Now a plugin check's enable flips. One action, however many pulses
+        // its producers send.
+        native.store(8, Ordering::Relaxed);
+        for _ in 0..6 {
+            tx.send(PulseSource::Native).unwrap();
+        }
+        settle().await;
+        assert_eq!(pulses(&mut out), 1, "one action, one pulse");
+
+        // …and the new surface is the baseline.
+        tx.send(PulseSource::Native).unwrap();
+        settle().await;
+        assert_eq!(pulses(&mut out), 0);
+    }
+
+    /// The two suppressions are independent, in both directions.
+    ///
+    /// The merge gate's binding note: a native change must never be suppressed
+    /// BY the host fingerprint. The converse matters just as much — the host
+    /// pool and the native surface move for unrelated reasons, and a gate that
+    /// let either judge the other would silently drop exactly the changes that
+    /// fingerprint cannot see.
+    #[tokio::test]
+    async fn the_host_and_native_fingerprints_never_judge_each_others_pulses() {
+        let native = Arc::new(AtomicU64::new(1));
+        let host = McpHost::new();
+        let (tx, mut out) = spawn_gate_with(host.clone(), native.clone());
+        // The gate seeds its native baseline off the blocking pool, so wait for
+        // that to have happened before moving the value out from under it — a
+        // seed that read the NEW value would make the first assertion below
+        // fail for a reason that has nothing to do with what it tests.
+        tx.send(PulseSource::Native).unwrap();
+        settle().await;
+        assert_eq!(pulses(&mut out), 0, "seeded, and nothing has moved yet");
+
+        // The native surface moves while the host's has not: the host
+        // fingerprint is unchanged (and would suppress), the native one is not.
+        native.store(2, Ordering::Relaxed);
+        tx.send(PulseSource::Native).unwrap();
+        settle().await;
+        assert_eq!(pulses(&mut out), 1, "the host's stillness must not veto this");
+
+        // The host surface moves while the native one has not.
+        host.insert_fake_server("alpha", true, true, true, "alpha__x")
+            .await;
+        tx.send(PulseSource::Host).unwrap();
+        settle().await;
+        assert_eq!(pulses(&mut out), 1, "the native surface's stillness must not veto this");
+
+        // A burst carrying BOTH sources with only one of them moved is still one
+        // pulse — and, importantly, the un-moved source's baseline is refreshed
+        // too, so it does not fire spuriously next time.
+        native.store(3, Ordering::Relaxed);
+        tx.send(PulseSource::Host).unwrap();
+        tx.send(PulseSource::Native).unwrap();
+        settle().await;
+        assert_eq!(pulses(&mut out), 1);
+        tx.send(PulseSource::Host).unwrap();
+        tx.send(PulseSource::Native).unwrap();
+        settle().await;
+        assert_eq!(pulses(&mut out), 0, "both baselines moved with the pulse");
     }
 }

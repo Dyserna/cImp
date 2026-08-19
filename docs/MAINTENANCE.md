@@ -1330,11 +1330,19 @@ in the **Quality** sub-tab:
 
 **Upgrade checks:**
 
-16. Take a pre-V25 config (`code_audit.tools` with only the three security ids —
-    e.g. a v0.43/v0.44 `settings.json`), launch → the Quality sub-tab and the
-    Settings Quality group are populated with all eleven tools on first load (the
-    reconcile), and any customized security entry (disabled / custom path / extra
-    args / timeout) is preserved verbatim.
+16. Take a pre-V38 config (schema ≤ 32, with a `code_audit.tools` array — e.g. a
+    v0.43/v0.44 `settings.json` carrying only the three security ids, or a
+    fully-configured v0.52 one), launch → the v33 → v34 migration moves it into
+    `tool_plugins` under `cimp-audit@1`. Check in Settings → Tool Plugins that
+    every customization survived (disabled / custom path / extra arguments /
+    timeout / ruleset), that the tools the old file never mentioned are present
+    at their declared defaults (all eleven quality tools listed, with
+    `dotnet-analyzers` and `semgrep-quality` off), and that the rewritten
+    `settings.json` no longer carries `code_audit.tools`. If the tools were
+    configured from inside a project, its `.cimp/config.json` still has the old
+    array — overlays are never schema-migrated — and the load-path promotion is
+    what carries it across: verify the project's paths and enables are there too,
+    and that the overlay is rewritten without the stale key on the next save.
 17. Take a v0.45.0 config that has the old separate `code-quality` tab entry in
     `tabs` (schema 22), launch → the migration cascade prunes it (and, since
     schema 27, the `code-audit` entry too): ONE Code audit view with Security |

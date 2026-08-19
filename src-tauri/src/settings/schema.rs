@@ -160,7 +160,7 @@ pub const SHELL_BROOT_TAB_ID: &str = "shell-broot";
 /// Files that pre-date V1.10 lack the field entirely; the cascade still
 /// uses the `looks_v1_X` predicates for those, falling through to a final
 /// step that stamps the field with the current value.
-pub const CURRENT_SCHEMA_VERSION: u8 = 32;
+pub const CURRENT_SCHEMA_VERSION: u8 = 34;
 
 fn current_schema_version() -> u8 {
     CURRENT_SCHEMA_VERSION
@@ -440,6 +440,17 @@ pub struct Settings {
     /// and the three default tools present. No schema-version bump.
     #[serde(default)]
     pub code_audit: CodeAuditSettings,
+    /// V38 Phase B: user state for the drop-in **tool plugins** — which of a
+    /// manifest's tools are enabled, what their declared variables are set to,
+    /// and where their binaries live on this machine. Schema v33 (additive: the
+    /// container materializes empty, nothing moved into it).
+    ///
+    /// Keyed maps rather than typed fields, on purpose: the set of plugins is
+    /// whatever is in `<exe-dir>/plugins/` today, so a typed shape would need a
+    /// settings migration every time a user dropped a file in a folder. See
+    /// [`ToolPluginsSettings`] for how the three maps divide by SCOPE.
+    #[serde(default, deserialize_with = "deserialize_lenient_tool_plugins")]
+    pub tool_plugins: ToolPluginsSettings,
 }
 
 impl Default for Settings {
@@ -489,6 +500,239 @@ impl Default for Settings {
             llm_pricing: default_llm_pricing(),
             harness_versions: HarnessVersions::default(),
             code_audit: CodeAuditSettings::default(),
+            tool_plugins: ToolPluginsSettings::default(),
+        }
+    }
+}
+
+/// V38 Phase B: the **tool plugin** user-state container (schema v33).
+///
+/// One stable, keyed-map block so plugin churn never migrates the schema: a
+/// plugin is a file a user drops into `<exe-dir>/plugins/`, so the set of keys
+/// is data, not shape. Adding a plugin adds a map entry; deleting its file
+/// leaves the entry alone (see below).
+///
+/// # The three maps are three SCOPES, and that is the whole design
+///
+/// * [`Self::plugins`] — enables, timeouts, declared-variable values and extra
+///   parameters, keyed `name@version`. Of these only `variables` and
+///   `parameters` may ride a project's `.cimp/config.json`; enables and
+///   timeouts are machine-global (amended decision 10). The overlay strip in
+///   `settings::persistence` enforces that structurally rather than by
+///   documentation.
+/// * [`Self::global_paths`] — "where does this tool's binary live on this
+///   machine", keyed `name@version/tool-id`. A path is a machine fact, never a
+///   project preference, and the V26 field report (scanner paths configured in
+///   one repo, audits run in another resolving nothing) is what that rule is
+///   made of.
+/// * [`Self::project_paths`] — the same fact, overridden **per project**, keyed
+///   by the canonical project root and then by tool key. Still machine-global
+///   storage: a per-project *override* is not the same thing as a per-project
+///   *file*, and putting it in the overlay would put a binary path inside the
+///   sandbox boundary a confined child can write to (V33's `sandbox` ban, same
+///   reasoning).
+///
+/// Effective path = `project_paths[root][tool_key]` ?? `global_paths[tool_key]`
+/// ?? unset; a tool with no path is inert (nothing to run). The resolution
+/// lives in `plugins::registry`, which is the one place that answers it.
+///
+/// # Entries outlive their plugins, deliberately
+///
+/// Nothing prunes a key whose manifest is not currently loaded. A plugin file
+/// removed for an afternoon — or a plugin folder on a machine that has not
+/// synced yet — must not silently discard the user's configuration for it, and
+/// "the tool disappeared, so I threw away your settings" is a data-loss bug
+/// wearing a tidiness costume. The settings pane renders what the loader found;
+/// the state for everything else simply waits.
+#[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct ToolPluginsSettings {
+    /// Per-plugin state, keyed `name@version` (`loader::LoadedPlugin::key`).
+    pub plugins: BTreeMap<String, PluginState>,
+    /// Per-project binary paths: canonical project root → tool key → path.
+    /// Machine-global storage of a per-project override; see the type docs.
+    pub project_paths: BTreeMap<String, BTreeMap<String, String>>,
+    /// Machine-wide binary paths, keyed `name@version/tool-id`
+    /// (`loader::LoadedPlugin::tool_key`). The fallback when the current
+    /// project names none.
+    pub global_paths: BTreeMap<String, String>,
+}
+
+/// One plugin's user state.
+///
+/// `BTreeMap` rather than `HashMap` throughout the container: the settings file
+/// is diffed textually against a baseline to produce the project overlay, so a
+/// map that serialized in a different order on each save would manufacture a
+/// diff out of nothing.
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(default)]
+pub struct PluginState {
+    /// Master switch for every tool this plugin declares. Disabling it disables
+    /// them **as a unit** without touching their own `enabled` flags, so
+    /// re-enabling the plugin restores exactly the selection the user had
+    /// (decision 9).
+    pub enabled: bool,
+    /// Per-tool state, keyed by the tool's manifest id (NOT the namespaced tool
+    /// key — the plugin key is already the outer map's key).
+    pub tools: BTreeMap<String, ToolState>,
+}
+
+impl Default for PluginState {
+    fn default() -> Self {
+        Self {
+            // A plugin the user installed is on. The consent that matters is
+            // dropping the file in; a second, invisible "and now switch it on"
+            // step would only teach people to click past it.
+            enabled: true,
+            tools: BTreeMap::new(),
+        }
+    }
+}
+
+/// One tool's user state. **No path field**: paths are machine-scope and live
+/// in [`ToolPluginsSettings::global_paths`] / `project_paths` — the split that
+/// keeps a project overlay from pinning a copy of a machine fact.
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(default)]
+pub struct ToolState {
+    pub enabled: bool,
+    /// Wall-clock override in seconds; `None` = the manifest's value, then the
+    /// consuming pipeline's default.
+    pub timeout_secs: Option<u64>,
+    /// Extra CLI arguments appended after the tool's own argv — the successor
+    /// to the pre-v34 `code_audit.tools[].extra_args`, offered only for a tool
+    /// whose manifest sets `parameters_allowed`.
+    pub parameters: Vec<String>,
+    /// Values for the tool's **declared** variables, by declared name. A name
+    /// the manifest does not declare is inert (the registry only substitutes
+    /// declared ones) but is kept: it is most likely a plugin mid-upgrade.
+    pub variables: BTreeMap<String, String>,
+}
+
+impl Default for ToolState {
+    fn default() -> Self {
+        Self {
+            // Same reasoning as `PluginState::enabled`, one level down: a tool
+            // the plugin author shipped is on unless the user says otherwise.
+            // The gate that actually decides whether it RUNS is the path — no
+            // path, nothing to spawn — so "enabled by default" is not "runs by
+            // default".
+            enabled: true,
+            timeout_secs: None,
+            parameters: Vec::new(),
+            variables: BTreeMap::new(),
+        }
+    }
+}
+
+/// Deserialize [`ToolPluginsSettings`] tolerantly, dropping entries rather than
+/// failing the whole `Settings` parse.
+///
+/// **This is not defensive decoration — it is required by how overlays work.**
+/// `settings::persistence::diff` writes an explicit JSON `null` for every key
+/// the baseline has and the current value does not, so that the reverse merge
+/// can reconstruct a *deletion*. Every other field in `Settings` is a struct
+/// field or an array, and structs always serialize every key, so that null
+/// never arises for them. This container is the first one keyed by DATA (plugin
+/// keys, tool ids, variable names), so a user who clears one variable in a
+/// project produces `{"variables": {"ruleset": null}}` in that project's
+/// overlay — and a strict `BTreeMap<String, String>` would refuse it, taking
+/// the *entire* settings file down to "typed parse failed; using global" (the
+/// same failure mode `deserialize_lenient_layout` exists to prevent, arriving
+/// through a different door).
+///
+/// So: a null entry means "deleted", which is exactly what the diff meant by
+/// it, and is honoured by dropping the key. A malformed entry is dropped with a
+/// warning for the same reason the audit-tool list drops unknown ids — one bad
+/// plugin's state must not cost the user everything else in the file.
+fn deserialize_lenient_tool_plugins<'de, D>(d: D) -> Result<ToolPluginsSettings, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = serde_json::Value::deserialize(d)?;
+    if raw.is_null() {
+        return Ok(ToolPluginsSettings::default());
+    }
+    let serde_json::Value::Object(map) = raw else {
+        tracing::warn!("settings: tool_plugins was not an object; ignoring");
+        return Ok(ToolPluginsSettings::default());
+    };
+
+    // Read field by field rather than through `from_value`: nulls can appear at
+    // EVERY level here (plugin key, tool id, variable name), so one strict
+    // `from_value` anywhere in the tree would discard a whole subtree over a
+    // single deleted leaf. `tool_plugins_round_trips_through_the_lenient_reader`
+    // is what keeps this walk honest when a field is added to either struct.
+    let mut out = ToolPluginsSettings::default();
+    for (key, state) in object_entries(map.get("plugins"), "tool_plugins.plugins") {
+        let Some(pobj) = state.as_object() else {
+            tracing::warn!("settings: tool-plugin state for `{key}` was not an object; ignoring");
+            continue;
+        };
+        let mut p = PluginState::default();
+        if let Some(b) = pobj.get("enabled").and_then(serde_json::Value::as_bool) {
+            p.enabled = b;
+        }
+        for (tool_id, tv) in object_entries(pobj.get("tools"), "tools") {
+            let Some(tobj) = tv.as_object() else {
+                tracing::warn!(
+                    "settings: tool state for `{key}/{tool_id}` was not an object; ignoring"
+                );
+                continue;
+            };
+            let mut t = ToolState::default();
+            if let Some(b) = tobj.get("enabled").and_then(serde_json::Value::as_bool) {
+                t.enabled = b;
+            }
+            // Absent, null and non-numeric all mean "no override" — the same
+            // state, so they take the same branch rather than three.
+            t.timeout_secs = tobj.get("timeout_secs").and_then(serde_json::Value::as_u64);
+            if let Some(a) = tobj.get("parameters").and_then(serde_json::Value::as_array) {
+                t.parameters = a
+                    .iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect();
+            }
+            for (name, val) in object_entries(tobj.get("variables"), "variables") {
+                if let Some(s) = val.as_str() {
+                    t.variables.insert(name, s.to_string());
+                }
+            }
+            p.tools.insert(tool_id, t);
+        }
+        out.plugins.insert(key, p);
+    }
+    for (root, entry) in object_entries(map.get("project_paths"), "tool_plugins.project_paths") {
+        let mut paths = BTreeMap::new();
+        for (tool_key, val) in object_entries(Some(&entry), "project paths") {
+            if let Some(s) = val.as_str() {
+                paths.insert(tool_key, s.to_string());
+            }
+        }
+        out.project_paths.insert(root, paths);
+    }
+    for (tool_key, entry) in object_entries(map.get("global_paths"), "tool_plugins.global_paths") {
+        if let Some(s) = entry.as_str() {
+            out.global_paths.insert(tool_key, s.to_string());
+        }
+    }
+    Ok(out)
+}
+
+/// The non-null entries of a JSON object field, in key order. A null value is a
+/// deletion (see [`deserialize_lenient_tool_plugins`]); a non-object field is
+/// nothing we can read.
+fn object_entries(v: Option<&serde_json::Value>, what: &str) -> Vec<(String, serde_json::Value)> {
+    match v {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(serde_json::Value::Object(o)) => o
+            .iter()
+            .filter(|(_, val)| !val.is_null())
+            .map(|(k, val)| (k.clone(), val.clone()))
+            .collect(),
+        Some(_) => {
+            tracing::warn!("settings: {what} was not an object; ignoring");
+            Vec::new()
         }
     }
 }
@@ -1336,150 +1580,6 @@ pub struct ExternalToolsSettings {
     pub broot: String,
 }
 
-/// V23 Phase A / V25 Phase B: closed set of built-in audit tools. Wire names
-/// are kebab-case (`osv-scanner`, `golangci-lint`, `dotnet-analyzers`, …).
-/// Closed — not free-form — because each id binds to a built-in adapter
-/// ([`crate::audit::adapters`]); an unknown id in a settings file is *dropped*
-/// (see [`deserialize_lenient_audit_tools`]), never an error, which keeps
-/// forward-compat if a future version removes a tool.
-///
-/// The V23 trio (`osv-scanner`/`gitleaks`/`semgrep`) is the Security category;
-/// V25 adds eleven Quality-category ids (ten linters + a separate
-/// `semgrep-quality` so quality rulesets never pollute the Security section).
-#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq, Hash)]
-#[serde(rename_all = "kebab-case")]
-pub enum AuditToolId {
-    /// Google osv-scanner — dependency CVEs + known-malicious packages.
-    OsvScanner,
-    /// gitleaks — secrets in the working tree + git history.
-    Gitleaks,
-    /// semgrep — SAST (requires Python; Windows support is beta).
-    Semgrep,
-    /// oxlint — Rust-based JS/TS linter (SARIF, zero-config).
-    Oxlint,
-    /// golangci-lint — Go meta-linter (SARIF via v2 `--output.*` flags).
-    GolangciLint,
-    /// ruff — Rust-based Python linter (SARIF).
-    Ruff,
-    /// cppcheck — C/C++ static analysis (SARIF to a report file, ≥ 2.16).
-    Cppcheck,
-    /// typos — source spell checker (JSONL; the only tool valuable everywhere).
-    Typos,
-    /// ESLint — JS/TS linter, resolved project-local-first (JSON reporter).
-    Eslint,
-    /// PMD — Java static analysis (SARIF; `pmd.bat` on Windows, needs a JRE).
-    Pmd,
-    /// Roslyn analyzers via `dotnet build` (SARIF report file). Runs a real
-    /// build, so default-disabled.
-    DotnetAnalyzers,
-    /// knip — unused files/exports/dependencies for JS/TS (JSON reporter),
-    /// resolved project-local-first like ESLint.
-    Knip,
-    /// cargo-machete — unused Rust dependencies (text output).
-    CargoMachete,
-    /// semgrep with a quality ruleset (`p/r2c-best-practices`). Separate id from the
-    /// Security `semgrep`; default-disabled (registry configs need network).
-    SemgrepQuality,
-}
-
-impl AuditToolId {
-    /// The bare command name resolved via `pty::resolve` (ebin → PATH) when the
-    /// per-tool `path` override is empty. Matches the wire id for most tools;
-    /// `dotnet-analyzers` invokes `dotnet` and `semgrep-quality` reuses the
-    /// `semgrep` binary.
-    pub fn command_name(&self) -> &'static str {
-        match self {
-            AuditToolId::OsvScanner => "osv-scanner",
-            AuditToolId::Gitleaks => "gitleaks",
-            AuditToolId::Semgrep => "semgrep",
-            AuditToolId::Oxlint => "oxlint",
-            AuditToolId::GolangciLint => "golangci-lint",
-            AuditToolId::Ruff => "ruff",
-            AuditToolId::Cppcheck => "cppcheck",
-            AuditToolId::Typos => "typos",
-            AuditToolId::Eslint => "eslint",
-            AuditToolId::Pmd => "pmd",
-            // Roslyn analyzers run through the .NET SDK driver.
-            AuditToolId::DotnetAnalyzers => "dotnet",
-            AuditToolId::Knip => "knip",
-            AuditToolId::CargoMachete => "cargo-machete",
-            // Same binary as the Security `semgrep`, different ruleset.
-            AuditToolId::SemgrepQuality => "semgrep",
-        }
-    }
-}
-
-/// V23 Phase A: one configured audit tool. `id` selects the built-in adapter
-/// (Phase B). `path`, when non-empty, is used as the launch command verbatim —
-/// overriding the normal `ebin/` → PATH resolution (the `ExternalToolsSettings`
-/// contract); empty (the default) means "resolve normally". `extra_args` are
-/// appended after the adapter's fixed argv (e.g. an `--exclude` filter; a
-/// semgrep ruleset swap belongs in `ruleset`, not here — see that field).
-/// `id` is required on the wire — a missing/unknown id makes the whole entry
-/// fail to deserialize, which the tolerant `tools` deserializer then drops.
-#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
-pub struct AuditToolConfig {
-    pub id: AuditToolId,
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    #[serde(default)]
-    pub path: String,
-    #[serde(default)]
-    pub extra_args: Vec<String>,
-    /// Ruleset override for a tool whose adapter carries an `Arg::Ruleset`
-    /// token: the two semgrep tools (`--config <slug>`) and PMD
-    /// (`-R <ruleset>`). Empty (the default) uses the adapter's built-in
-    /// value (`auto` / `p/r2c-best-practices` / `rulesets/java/quickstart.xml`).
-    /// Exists because these defaults are upstream-owned and can break without
-    /// notice (semgrep's `p/best-practices` 404'd 2026-07) — the recovery is
-    /// then a settings edit, not a rebuild. Ignored by every other tool.
-    /// `extra_args` can't serve this purpose: semgrep *merges* repeated
-    /// `--config` flags, so an appended slug can't replace a dead baked-in one.
-    #[serde(default)]
-    pub ruleset: String,
-    /// V25 Phase C: per-tool wall-clock timeout override in seconds. `None` (the
-    /// default) falls back to the global [`CodeAuditSettings::timeout_secs`]. A
-    /// tool that runs a real build wants a longer budget than a linter —
-    /// `dotnet-analyzers` (restores packages + compiles) is the motivating case;
-    /// a value around **1200** is recommended for it. Additive `#[serde(default)]`
-    /// so old settings files round-trip with `None` (global timeout).
-    #[serde(default)]
-    pub timeout_secs: Option<u64>,
-}
-
-impl AuditToolConfig {
-    /// A tool entry with defaults: enabled, no path override (resolve normally),
-    /// no extra args, global timeout.
-    fn new(id: AuditToolId) -> Self {
-        Self {
-            id,
-            enabled: true,
-            path: String::new(),
-            extra_args: Vec::new(),
-            ruleset: String::new(),
-            timeout_secs: None,
-        }
-    }
-
-    /// Same as [`new`](Self::new) but `enabled: false` — the default-disabled
-    /// tools (`dotnet-analyzers` runs a real build; `semgrep-quality` needs
-    /// network to fetch its ruleset).
-    fn disabled(id: AuditToolId) -> Self {
-        Self {
-            id,
-            enabled: false,
-            path: String::new(),
-            extra_args: Vec::new(),
-            ruleset: String::new(),
-            timeout_secs: None,
-        }
-    }
-}
-
-fn default_true() -> bool {
-    true
-}
-
 /// V23 Phase A: Code Audit (aggregated security scanning) config. cImp runs
 /// external security scanners against the project root and aggregates their
 /// SARIF output into one findings table (Phase B/C). Off by default
@@ -1498,23 +1598,25 @@ pub struct CodeAuditSettings {
     /// (its reserved tab was retired in schema v27), no scanning, no
     /// bottom-bar entry.
     pub enabled: bool,
-    /// The configured audit tools (v1 default: osv-scanner, gitleaks, semgrep).
-    /// An entry whose `id` isn't a known [`AuditToolId`] is dropped with a warn
-    /// (forward compat); see [`deserialize_lenient_audit_tools`].
-    #[serde(deserialize_with = "deserialize_lenient_audit_tools")]
-    pub tools: Vec<AuditToolConfig>,
     /// Per-tool wall-clock timeout in seconds. A tool that exceeds it is killed
     /// and reported `failed` (Phase B); the other tools are unaffected.
     pub timeout_secs: u64,
-    /// Keep the QUALITY tools' `enabled` flags following the project's language
-    /// census automatically: whenever a census is (re)taken — scan start, tab
-    /// open, Settings open — each quality tool is selected iff it's factory-
-    /// default-enabled AND applicable to the project (see
-    /// `audit::runner::auto_select_quality`; the default-disabled heavyweights
-    /// `dotnet-analyzers`/`semgrep-quality` stay opt-in). On by default; any
-    /// manual quality-checkbox edit in Settings flips this to `false` (manual
-    /// mode) so user choices stick, and the Settings section's "Auto-select for
-    /// this project" button turns it back on. Security tools are never touched.
+    /// Keep the built-in QUALITY tools' `enabled` flags following the project's
+    /// language census automatically: whenever a census is (re)taken — scan
+    /// start, tab open, Settings open — each is selected iff its manifest says
+    /// it is on by default AND it applies to the project (see
+    /// `audit::runner::auto_select_quality`; the heavyweights
+    /// `dotnet-analyzers`/`semgrep-quality` declare `enabled_by_default: false`
+    /// and so stay opt-in). On by default; any manual quality-checkbox edit
+    /// flips this to `false` (manual mode) so user choices stick, and the
+    /// "Auto-select for this project" button turns it back on. Security tools
+    /// are never touched, and neither is a user plugin's tool — auto-selection
+    /// is a statement about the roster cImp ships and knows the shape of.
+    ///
+    /// Since schema v34 the flags it writes live in
+    /// [`ToolPluginsSettings::plugins`], under the built-in audit plugin's key.
+    /// This switch stays here because it is a property of the Code Audit
+    /// FEATURE rather than of any one tool.
     pub quality_auto_select: bool,
     /// V26: advertise the `cimp-code-audit` MCP server to Claude Code tabs.
     /// When on (default), `tabs::config::build_pre_args` inserts the server
@@ -1546,7 +1648,6 @@ impl Default for CodeAuditSettings {
     fn default() -> Self {
         Self {
             enabled: false,
-            tools: default_audit_tools(),
             timeout_secs: 600,
             quality_auto_select: true,
             // Exposure defaults on for all three consumers: the master
@@ -1570,66 +1671,6 @@ impl CodeAuditSettings {
     pub fn mcp_exposed(&self) -> bool {
         self.enabled && (self.expose_claude || self.expose_opencode)
     }
-}
-
-/// The built-in audit tools seeded on a fresh install: the V23 Security trio
-/// plus the V25 Quality set. All resolve ebin → PATH (empty `path`). Every tool
-/// is `enabled` except `dotnet-analyzers` (runs a real build) and
-/// `semgrep-quality` (needs network for its ruleset). Seeded via serde/`Default`
-/// so a fresh install lists them all; a file that carries the `tools` key (even
-/// as `[]`) keeps exactly what it has — no schema-version bump (V23 precedent),
-/// so an existing config that already persisted the trio simply doesn't gain
-/// the Quality ids until re-seeded, which the applicability gate makes harmless.
-pub(crate) fn default_audit_tools() -> Vec<AuditToolConfig> {
-    vec![
-        // Security (V23).
-        AuditToolConfig::new(AuditToolId::OsvScanner),
-        AuditToolConfig::new(AuditToolId::Gitleaks),
-        AuditToolConfig::new(AuditToolId::Semgrep),
-        // Quality (V25) — enabled by default.
-        AuditToolConfig::new(AuditToolId::Oxlint),
-        AuditToolConfig::new(AuditToolId::GolangciLint),
-        AuditToolConfig::new(AuditToolId::Ruff),
-        AuditToolConfig::new(AuditToolId::Cppcheck),
-        AuditToolConfig::new(AuditToolId::Typos),
-        AuditToolConfig::new(AuditToolId::Eslint),
-        AuditToolConfig::new(AuditToolId::Pmd),
-        AuditToolConfig::new(AuditToolId::Knip),
-        AuditToolConfig::new(AuditToolId::CargoMachete),
-        // Quality — default-disabled.
-        AuditToolConfig::disabled(AuditToolId::DotnetAnalyzers),
-        AuditToolConfig::disabled(AuditToolId::SemgrepQuality),
-    ]
-}
-
-/// Tolerant deserializer for `CodeAuditSettings::tools`. An entry whose `id`
-/// isn't a known [`AuditToolId`] — a tool removed in a future version, or a
-/// typo — is dropped with a warn rather than failing the whole settings load;
-/// this is the forward-compat half of the closed-adapter contract. Mirrors the
-/// `deserialize_lenient_presets` pattern. A non-array value degrades to an
-/// empty list (the struct-level `Default` still supplies the three tools only
-/// when the `tools` key is entirely absent).
-fn deserialize_lenient_audit_tools<'de, D>(d: D) -> Result<Vec<AuditToolConfig>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let raw = serde_json::Value::deserialize(d)?;
-    let serde_json::Value::Array(items) = raw else {
-        if !raw.is_null() {
-            tracing::warn!("settings: code_audit.tools was not an array; ignoring");
-        }
-        return Ok(Vec::new());
-    };
-    let mut out = Vec::with_capacity(items.len());
-    for item in items {
-        match serde_json::from_value::<AuditToolConfig>(item) {
-            Ok(c) => out.push(c),
-            Err(e) => {
-                tracing::warn!(error = %e, "settings: unknown/malformed code_audit tool dropped")
-            }
-        }
-    }
-    Ok(out)
 }
 
 /// V8-01: local task-offload configuration. cImp runs a user-supplied
@@ -5538,78 +5579,54 @@ mod tests {
     /// file (`src-tauri/src/settings/`), up to the repo root.
     const AUDIT_TS_TYPES: &str = include_str!("../../../src/lib/settings/types.ts");
 
-    /// Every [`AuditToolId`] variant. The exhaustive `match` is the Rust-side
-    /// half of the tripwire: adding a variant without extending this list is a
-    /// compile error, so it can't reach `cargo test` unnoticed.
-    fn all_audit_tool_ids() -> Vec<AuditToolId> {
-        let all = vec![
-            AuditToolId::OsvScanner,
-            AuditToolId::Gitleaks,
-            AuditToolId::Semgrep,
-            AuditToolId::Oxlint,
-            AuditToolId::GolangciLint,
-            AuditToolId::Ruff,
-            AuditToolId::Cppcheck,
-            AuditToolId::Typos,
-            AuditToolId::Eslint,
-            AuditToolId::Pmd,
-            AuditToolId::DotnetAnalyzers,
-            AuditToolId::Knip,
-            AuditToolId::CargoMachete,
-            AuditToolId::SemgrepQuality,
-        ];
-        fn _assert_exhaustive(id: AuditToolId) {
-            match id {
-                AuditToolId::OsvScanner
-                | AuditToolId::Gitleaks
-                | AuditToolId::Semgrep
-                | AuditToolId::Oxlint
-                | AuditToolId::GolangciLint
-                | AuditToolId::Ruff
-                | AuditToolId::Cppcheck
-                | AuditToolId::Typos
-                | AuditToolId::Eslint
-                | AuditToolId::Pmd
-                | AuditToolId::DotnetAnalyzers
-                | AuditToolId::Knip
-                | AuditToolId::CargoMachete
-                | AuditToolId::SemgrepQuality => {}
-            }
-        }
-        all
+    /// The fourteen audit-tool wire ids the FRONTEND still keys off, and the
+    /// mirror that keeps them true.
+    ///
+    /// V38 Phase E deleted `AuditToolId`: the fourteen built-in tools are
+    /// embedded plugin manifests now, so their ids are strings read from JSON
+    /// rather than an enum. The mirror did not go away with it, because the ids
+    /// still cross the wire — the Code Audit panel's category, order and
+    /// applicability maps are all keyed by them, and a rename in the manifest
+    /// with no matching rename in `src/lib/codeAudit/types.ts` would show up as
+    /// a chip that never lights.
+    ///
+    /// So the authority moved from the enum to the manifest, and the tripwire
+    /// moved with it: the list below is READ from the embedded manifest rather
+    /// than restated, so it cannot drift from what actually ships.
+    fn builtin_audit_tool_ids() -> Vec<String> {
+        let set = crate::plugins::builtin::plugin_set();
+        set.plugins
+            .iter()
+            .flat_map(|p| p.manifest.tools.iter())
+            .map(|t| t.id.clone())
+            .collect()
     }
 
     #[test]
-    fn audit_tool_id_wire_names_mirrored_in_types_ts() {
-        for id in all_audit_tool_ids() {
-            let wire = serde_json::to_value(id)
-                .expect("AuditToolId serializes")
-                .as_str()
-                .expect("AuditToolId serializes to a string")
-                .to_string();
+    fn builtin_audit_tool_ids_are_mirrored_in_the_frontend_union() {
+        const CODE_AUDIT_TS: &str = include_str!("../../../src/lib/codeAudit/types.ts");
+        let ids = builtin_audit_tool_ids();
+        assert_eq!(ids.len(), 14, "the built-in audit roster is fourteen tools");
+        for id in ids {
             assert!(
-                AUDIT_TS_TYPES.contains(&format!("'{wire}'")),
-                "AuditToolId `{id:?}` (wire `{wire}`) is missing from the TS `AuditToolId` \
-                 union in src/lib/settings/types.ts — add it to keep the mirror in sync",
+                CODE_AUDIT_TS.contains(&format!("'{id}'")),
+                "built-in audit tool `{id}` is missing from the TS `AuditToolId` union in \
+                 src/lib/codeAudit/types.ts — the panel keys its category, order and \
+                 applicability maps off that union, so an id it does not know renders as a \
+                 chip that never lights"
             );
         }
     }
 
     #[test]
     fn code_audit_field_names_mirrored_in_types_ts() {
-        // Serialize a fully-populated CodeAuditSettings + AuditToolConfig and
-        // assert each JSON key appears in types.ts, so any field added on the
-        // Rust side must also land in the TS interfaces.
+        // Serialize a fully-populated CodeAuditSettings and assert each JSON key
+        // appears in types.ts, so any field added on the Rust side must also
+        // land in the TS interface. The per-tool array is gone (schema v34):
+        // what a tool is configured with lives in `tool_plugins` now, and its
+        // own mirror is `tool_plugins_field_names_mirrored_in_types_ts`.
         let s = CodeAuditSettings {
             enabled: true,
-            tools: vec![AuditToolConfig {
-                id: AuditToolId::Semgrep,
-                enabled: true,
-                path: "C:/tools/semgrep.exe".into(),
-                extra_args: vec!["--config".into(), "auto".into()],
-                ruleset: "p/ci".into(),
-                timeout_secs: Some(1200),
-            }],
             timeout_secs: 600,
             quality_auto_select: true,
             expose_claude: true,
@@ -5624,20 +5641,19 @@ mod tests {
                  interface in src/lib/settings/types.ts",
             );
         }
-        let tool = serde_json::to_value(&s.tools[0]).expect("AuditToolConfig serializes");
-        for key in tool.as_object().expect("object").keys() {
-            assert!(
-                AUDIT_TS_TYPES.contains(&format!("{key}:")),
-                "AuditToolConfig field `{key}` is missing from the TS `AuditToolConfig` \
-                 interface in src/lib/settings/types.ts",
-            );
-        }
+        // …and the field that LEFT must be gone from the mirror too, or the
+        // frontend would keep reading an array the backend no longer writes.
+        assert!(
+            !AUDIT_TS_TYPES.contains("tools: AuditToolConfig[]"),
+            "src/lib/settings/types.ts still declares `code_audit.tools`, which schema v34 \
+             moved into `tool_plugins`"
+        );
     }
 
     #[test]
     fn code_audit_defaults_present_when_block_absent() {
         // An old settings file with no `code_audit` key round-trips to the
-        // feature-disabled defaults with the Security trio + Quality set present.
+        // feature-disabled defaults.
         let s: Settings = serde_json::from_value(json!({})).expect("empty settings deserialize");
         assert!(!s.code_audit.enabled);
         assert_eq!(s.code_audit.timeout_secs, 600);
@@ -5651,40 +5667,34 @@ mod tests {
         assert!(s.code_audit.expose_claude);
         assert!(s.code_audit.expose_opencode);
         assert!(s.code_audit.expose_offload);
-        let ids: Vec<AuditToolId> = s.code_audit.tools.iter().map(|t| t.id).collect();
-        assert_eq!(
-            ids,
-            vec![
-                AuditToolId::OsvScanner,
-                AuditToolId::Gitleaks,
-                AuditToolId::Semgrep,
-                AuditToolId::Oxlint,
-                AuditToolId::GolangciLint,
-                AuditToolId::Ruff,
-                AuditToolId::Cppcheck,
-                AuditToolId::Typos,
-                AuditToolId::Eslint,
-                AuditToolId::Pmd,
-                AuditToolId::Knip,
-                AuditToolId::CargoMachete,
-                AuditToolId::DotnetAnalyzers,
-                AuditToolId::SemgrepQuality,
+        // The roster no longer needs seeding into settings at all: it IS the
+        // embedded manifest, and an untouched container means "every tool at
+        // its declared default". That is what makes a fresh install and an
+        // upgraded one agree without a seeding step to keep in step.
+        assert!(s.tool_plugins.plugins.is_empty());
+    }
+
+    /// A v23-era `code_audit` block still deserializes, and the per-tool array
+    /// it carries is simply not a field any more — the v33 → v34 migration is
+    /// what moves it, and a file that skipped the migration must not fail to
+    /// load over a key it no longer has a home for.
+    #[test]
+    fn a_legacy_code_audit_block_still_loads_and_ignores_its_tool_array() {
+        let ca: CodeAuditSettings = serde_json::from_value(json!({
+            "enabled": true,
+            "timeout_secs": 120,
+            "quality_auto_select": false,
+            "tools": [
+                { "id": "gitleaks", "enabled": true, "path": "", "extra_args": [] },
+                { "id": "semgrep", "enabled": false, "path": "sg.exe", "extra_args": [] }
             ]
-        );
-        // Every tool resolves normally (empty path); all enabled except the two
-        // default-disabled ones.
-        assert!(s.code_audit.tools.iter().all(|t| t.path.is_empty()));
-        let disabled: Vec<AuditToolId> = s
-            .code_audit
-            .tools
-            .iter()
-            .filter(|t| !t.enabled)
-            .map(|t| t.id)
-            .collect();
-        assert_eq!(
-            disabled,
-            vec![AuditToolId::DotnetAnalyzers, AuditToolId::SemgrepQuality]
-        );
+        }))
+        .expect("a v23-era code_audit block still deserializes");
+        assert!(ca.enabled);
+        assert_eq!(ca.timeout_secs, 120);
+        assert!(!ca.quality_auto_select);
+        // …and the additive V26 flags still fill in.
+        assert!(ca.expose_claude);
     }
 
     #[test]
@@ -5727,52 +5737,6 @@ mod tests {
         assert!(!o.session_push);
         // Default-constructed settings agree (the toggle ships off).
         assert!(!OffloadSettings::default().session_push);
-    }
-
-    #[test]
-    fn code_audit_unknown_tool_id_dropped_keeping_known() {
-        // A future/typo'd tool id is dropped; the recognized entries survive.
-        let ca: CodeAuditSettings = serde_json::from_value(json!({
-            "enabled": true,
-            "timeout_secs": 120,
-            "tools": [
-                { "id": "gitleaks", "enabled": true, "path": "", "extra_args": [] },
-                { "id": "guarddog", "enabled": true, "path": "", "extra_args": [] },
-                { "id": "semgrep", "enabled": false, "path": "sg.exe", "extra_args": ["--config", "auto"] }
-            ]
-        }))
-        .expect("code_audit with an unknown tool still deserializes");
-        assert!(ca.enabled);
-        assert_eq!(ca.timeout_secs, 120);
-        let ids: Vec<AuditToolId> = ca.tools.iter().map(|t| t.id).collect();
-        assert_eq!(ids, vec![AuditToolId::Gitleaks, AuditToolId::Semgrep]);
-        // Field values on the surviving entries are preserved.
-        let semgrep = ca
-            .tools
-            .iter()
-            .find(|t| t.id == AuditToolId::Semgrep)
-            .unwrap();
-        assert!(!semgrep.enabled);
-        assert_eq!(semgrep.path, "sg.exe");
-        assert_eq!(
-            semgrep.extra_args,
-            vec!["--config".to_string(), "auto".to_string()]
-        );
-    }
-
-    #[test]
-    fn code_audit_missing_optional_tool_fields_default() {
-        // A tool entry with only `id` gets enabled=true + empty path/args.
-        let ca: CodeAuditSettings = serde_json::from_value(json!({
-            "tools": [ { "id": "osv-scanner" } ]
-        }))
-        .expect("terse tool entry deserializes");
-        assert_eq!(ca.tools.len(), 1);
-        assert!(ca.tools[0].enabled);
-        assert!(ca.tools[0].path.is_empty());
-        assert!(ca.tools[0].extra_args.is_empty());
-        // V25: the per-tool timeout override defaults to None (global timeout).
-        assert!(ca.tools[0].timeout_secs.is_none());
     }
 
     #[test]
@@ -6500,5 +6464,157 @@ mod tests {
         let s = Settings::default();
         assert!(!s.templates_seeded);
         assert!(s.prompt_templates.is_empty());
+    }
+
+    // ── V38 Phase B — the `tool_plugins` container ────────────────────────
+
+    /// A fully-populated container survives serialize → deserialize unchanged.
+    ///
+    /// This is what keeps [`deserialize_lenient_tool_plugins`] honest: it reads
+    /// the tree field by field (it has to — nulls appear at every level), so a
+    /// field added to `PluginState`/`ToolState` and not to the walk would load
+    /// as its default and silently discard the user's setting. That failure has
+    /// no other symptom, which is exactly why it needs a test.
+    #[test]
+    fn tool_plugins_round_trips_through_the_lenient_reader() {
+        let mut tools = BTreeMap::new();
+        tools.insert(
+            "scan".to_string(),
+            ToolState {
+                enabled: false,
+                timeout_secs: Some(900),
+                parameters: vec!["--exclude".into(), "vendor".into()],
+                variables: BTreeMap::from([("ruleset".to_string(), "p/ci".to_string())]),
+            },
+        );
+        let cfg = ToolPluginsSettings {
+            plugins: BTreeMap::from([(
+                "acme@1.0.0".to_string(),
+                PluginState {
+                    enabled: false,
+                    tools,
+                },
+            )]),
+            project_paths: BTreeMap::from([(
+                "C:\\repo".to_string(),
+                BTreeMap::from([("acme@1.0.0/scan".to_string(), "C:\\bin\\acme.exe".to_string())]),
+            )]),
+            global_paths: BTreeMap::from([(
+                "acme@1.0.0/scan".to_string(),
+                "D:\\tools\\acme.exe".to_string(),
+            )]),
+        };
+        let s = Settings {
+            tool_plugins: cfg.clone(),
+            ..Settings::default()
+        };
+        let round: Settings =
+            serde_json::from_value(serde_json::to_value(&s).expect("serialize")).expect("parse");
+        assert_eq!(round.tool_plugins, cfg);
+    }
+
+    /// The overlay diff writes an explicit `null` for a key the baseline has and
+    /// the current value does not — that is how it expresses a DELETION. Every
+    /// other `Settings` field is a struct or an array, where the case cannot
+    /// arise; this container is keyed by data, so it must read a null as the
+    /// deletion it is instead of failing the whole file's parse.
+    #[test]
+    fn a_null_entry_is_a_deletion_not_a_parse_failure() {
+        let v = json!({
+            "schema_version": CURRENT_SCHEMA_VERSION,
+            "tool_plugins": {
+                "plugins": {
+                    "gone@1.0.0": null,
+                    "acme@1.0.0": {
+                        "enabled": true,
+                        "tools": {
+                            "dropped": null,
+                            "scan": { "enabled": true, "variables": { "cleared": null, "kept": "v" } }
+                        }
+                    }
+                },
+                "global_paths": { "acme@1.0.0/scan": "C:\\bin\\acme.exe", "gone@1.0.0/x": null }
+            }
+        });
+        let s: Settings = serde_json::from_value(v).expect("a null entry must not fail the parse");
+        let tp = &s.tool_plugins;
+        assert_eq!(tp.plugins.keys().collect::<Vec<_>>(), vec!["acme@1.0.0"]);
+        let acme = &tp.plugins["acme@1.0.0"];
+        assert_eq!(acme.tools.keys().collect::<Vec<_>>(), vec!["scan"]);
+        assert_eq!(
+            acme.tools["scan"].variables,
+            BTreeMap::from([("kept".to_string(), "v".to_string())])
+        );
+        assert_eq!(tp.global_paths.keys().collect::<Vec<_>>(), vec!["acme@1.0.0/scan"]);
+    }
+
+    /// One malformed plugin's state must not cost the user everything else in
+    /// the file — the `deserialize_lenient_audit_tools` rule, one container over.
+    #[test]
+    fn a_malformed_entry_is_dropped_rather_than_taking_the_file_down() {
+        let v = json!({
+            "schema_version": CURRENT_SCHEMA_VERSION,
+            "tool_plugins": { "plugins": { "bad@1.0.0": "not an object", "ok@1.0.0": {} } }
+        });
+        let s: Settings = serde_json::from_value(v).expect("parse");
+        assert_eq!(s.tool_plugins.plugins.keys().collect::<Vec<_>>(), vec!["ok@1.0.0"]);
+        // …and the surviving entry gets the defaults, which are ON.
+        assert!(s.tool_plugins.plugins["ok@1.0.0"].enabled);
+    }
+
+    /// Both `enabled` flags default to true, at both levels — an installed
+    /// plugin is on, and the gate that decides whether a tool RUNS is its path.
+    #[test]
+    fn tool_plugin_state_defaults_to_enabled() {
+        let v = json!({ "plugins": { "a@1": { "tools": { "t": {} } } } });
+        let cfg: ToolPluginsSettings = serde_json::from_value(v).expect("parse");
+        assert!(cfg.plugins["a@1"].enabled);
+        assert!(cfg.plugins["a@1"].tools["t"].enabled);
+        assert_eq!(cfg.plugins["a@1"].tools["t"].timeout_secs, None);
+    }
+
+    /// The Rust↔TS mirror, the `check_def_field_names_mirrored_in_types_ts`
+    /// convention: every wire key of the container must exist in the TS
+    /// interfaces, so a field added on one side cannot quietly skip the other.
+    #[test]
+    fn tool_plugins_field_names_mirrored_in_types_ts() {
+        const TS_TYPES: &str = include_str!("../../../src/lib/settings/types.ts");
+        let mut tools = BTreeMap::new();
+        tools.insert("t".to_string(), ToolState::default());
+        let cfg = ToolPluginsSettings {
+            plugins: BTreeMap::from([("a@1".to_string(), PluginState { enabled: true, tools })]),
+            project_paths: BTreeMap::from([("root".to_string(), BTreeMap::new())]),
+            global_paths: BTreeMap::new(),
+        };
+        let value = serde_json::to_value(&cfg).expect("serializes");
+        let mut keys: Vec<String> = value
+            .as_object()
+            .expect("an object")
+            .keys()
+            .cloned()
+            .collect();
+        for k in value["plugins"]["a@1"].as_object().expect("plugin state").keys() {
+            keys.push(k.clone());
+        }
+        for k in value["plugins"]["a@1"]["tools"]["t"]
+            .as_object()
+            .expect("tool state")
+            .keys()
+        {
+            keys.push(k.clone());
+        }
+        for key in keys {
+            assert!(
+                TS_TYPES.contains(&format!("{key}:")),
+                "`tool_plugins` wire field `{key}` is missing from src/lib/settings/types.ts \
+                 (ToolPluginsSettings / PluginState / ToolState) — add it to keep the mirror \
+                 in sync",
+            );
+        }
+        // The container itself must be reachable from the Settings interface.
+        assert!(
+            TS_TYPES.contains("tool_plugins: ToolPluginsSettings;"),
+            "src/lib/settings/types.ts must carry `tool_plugins` on `Settings`"
+        );
     }
 }

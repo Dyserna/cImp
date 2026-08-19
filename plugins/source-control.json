@@ -1,0 +1,32 @@
+{
+  "manifest_version": 1,
+  "name": "source-control",
+  "version": "1.0.0",
+  "label": "Source control",
+  "description": "git and svn as run_command tools. A registered tool runs the exact file you point at rather than whatever the PATH resolves, which is the point on a machine with more than one install.",
+  "categories": [
+    {
+      "id": "source-control",
+      "label": "Source control",
+      "tools": ["git", "svn"]
+    }
+  ],
+  "tools": [
+    {
+      "id": "git",
+      "label": "git",
+      "description": "The git CLI, for status, log and diff probes through run_command.",
+      "kind": "command",
+      "runtime": "none",
+      "sandbox": "optional"
+    },
+    {
+      "id": "svn",
+      "label": "svn",
+      "description": "The Subversion CLI, for status and info probes in a working copy through run_command.",
+      "kind": "command",
+      "runtime": "none",
+      "sandbox": "optional"
+    }
+  ]
+}

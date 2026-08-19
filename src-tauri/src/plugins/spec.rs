@@ -632,3 +632,48 @@ fn audit_manifest_with(extra: &str) -> String {
         }}"#
     )
 }
+
+/// § 3.6's marker vocabulary is the census's, exactly.
+///
+/// The list is CLOSED by design — a manifest names a token cImp owns rather than
+/// a glob it invents — so a doc that grew a token the walk cannot see would be
+/// promising a gate that never fires, and one that lost a token would hide a
+/// gate that does. Both directions, like every other set block here.
+#[test]
+fn the_doc_lists_the_census_marker_vocabulary() {
+    let code: BTreeSet<String> = crate::audit::census::MARKERS
+        .iter()
+        .map(|m| (*m).to_string())
+        .collect();
+    same_set(
+        "markers",
+        &code,
+        "`audit::census::MARKERS` is the authority; `marker_for` must be able to emit every \
+         token in it, and § 3.6 is what an author reads before writing `applicability`",
+    );
+}
+
+/// § 9's packaging row: the `plugins` directory is still what the build and the
+/// release workflow ship.
+///
+/// This is a NAME drift test, not a behaviour one. Everything else in this
+/// module pins a doc claim to a constant; this pins two build files to the
+/// directory the whole document is about, because renaming it there is a change
+/// nothing else in the test suite would notice — the starter pack would simply
+/// stop arriving next to the exe, and every tool in it would read as "the user
+/// installed no plugins".
+#[test]
+fn the_build_and_the_release_workflow_still_ship_the_plugins_directory() {
+    const BUILD_RS: &str = include_str!("../../build.rs");
+    const RELEASE_YML: &str = include_str!("../../../.github/workflows/release.yml");
+    assert!(
+        BUILD_RS.contains("plugins"),
+        "build.rs no longer names the `plugins` asset directory — the starter pack would stop \
+         being copied next to the exe and every tool in it would silently vanish"
+    );
+    assert!(
+        RELEASE_YML.contains("plugins"),
+        ".github/workflows/release.yml no longer names the `plugins` directory — a release zip \
+         without it ships a cImp whose starter pack does not exist"
+    );
+}

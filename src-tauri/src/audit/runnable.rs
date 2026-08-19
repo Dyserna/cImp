@@ -221,17 +221,15 @@ impl RunnableAudit {
         }))
     }
 
-    /// The same test [`super::adapters::Adapter::applicable`] applies: no gate
-    /// = always applicable, else ANY listed extension OR ANY listed marker.
-    /// One rule, two populations — a plugin tool must not be able to be gated
-    /// differently from a built-in one.
+    /// Whether this tool's manifest gate admits the project.
+    ///
+    /// Delegates to [`Census::admits`], which since V38 Phase F is the ONE
+    /// statement of the rule: `checks::plugin` gates its `check`-kind
+    /// population with the same function, and a tool that was applicable under
+    /// an umbrella but not under `run_check` (or the reverse) would be one
+    /// manifest field meaning two things.
     pub fn applicable(&self, census: &Census) -> bool {
-        let a = &self.applicability;
-        if a.extensions.is_empty() && a.markers.is_empty() {
-            return true;
-        }
-        a.extensions.iter().any(|e| census.has_extension(e))
-            || a.markers.iter().any(|m| census.has_marker(m))
+        census.admits(&self.applicability)
     }
 
     /// The full argv: the substituted template, then the user's parameters

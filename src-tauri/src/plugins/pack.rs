@@ -181,7 +181,20 @@ fn every_check_kind_tool_renders_a_valid_checkdef() {
     assert!(check_tools >= 12, "the pack's check population shrank unexpectedly ({check_tools})");
 
     let root = pack_dir();
-    let effective = crate::checks::plugin::effective_checks(&settings, &set, None, &root);
+    // A census that reports EVERY marker the pack gates on, so this test judges
+    // rendering rather than applicability (which has its own test below). The
+    // pack directory itself has no `pom.xml`; without this the Maven, Gradle,
+    // Cargo, Go, npm and .NET checks would all be gated out and the test would
+    // pass by measuring nothing.
+    let all_markers = crate::audit::census::Census::from_block(
+        &[],
+        &crate::audit::census::MARKERS
+            .iter()
+            .map(|m| (*m).to_string())
+            .collect::<Vec<_>>(),
+    );
+    let effective =
+        crate::checks::plugin::effective_checks(&settings, &set, None, &root, &all_markers);
     let rendered: Vec<_> = effective.iter().filter(|c| c.plugin.is_some()).collect();
     assert_eq!(
         rendered.len(),
@@ -232,5 +245,68 @@ fn every_check_kind_tool_renders_a_valid_checkdef() {
                 );
             }
         }
+    }
+}
+
+/// V38 Phase F — the pack's project-shape gates actually bite.
+///
+/// The contract doc's worked example is "`pom.xml` → maven, `build.gradle` →
+/// gradle", and until this phase `applicability` validated on a `check`-kind
+/// tool and nothing read it. This asserts the promise end to end against the
+/// SHIPPED manifests: a Maven-shaped project advertises the Maven checks and
+/// not the Gradle ones, and the reverse.
+#[test]
+fn a_projects_shape_decides_which_of_the_packs_checks_exist() {
+    let set = pack();
+    let mut settings = Settings::default();
+    let program = if cfg!(windows) {
+        "C:\\tools\\pack-probe.exe"
+    } else {
+        "/usr/bin/pack-probe"
+    };
+    for p in &set.plugins {
+        for t in &p.manifest.tools {
+            settings
+                .tool_plugins
+                .global_paths
+                .insert(p.tool_key(&t.id), program.to_string());
+        }
+    }
+    let root = pack_dir();
+    let names = |markers: &[&str]| -> Vec<String> {
+        let census = crate::audit::census::Census::from_block(
+            &[],
+            &markers.iter().map(|m| (*m).to_string()).collect::<Vec<_>>(),
+        );
+        crate::checks::plugin::effective_checks(&settings, &set, None, &root, &census)
+            .into_iter()
+            .filter(|c| c.plugin.is_some())
+            .map(|c| c.def.name)
+            .collect()
+    };
+
+    let maven = names(&["pom.xml"]);
+    assert!(maven.iter().any(|n| n == "maven-build"));
+    assert!(maven.iter().any(|n| n == "maven-test"));
+    assert!(
+        !maven.iter().any(|n| n.starts_with("gradle")),
+        "a Maven project must not advertise the Gradle checks: {maven:?}"
+    );
+
+    let gradle = names(&["build.gradle"]);
+    assert!(gradle.iter().any(|n| n == "gradle-build"));
+    assert!(
+        !gradle.iter().any(|n| n.starts_with("maven")),
+        "a Gradle project must not advertise the Maven checks: {gradle:?}"
+    );
+
+    // An ungated check (pytest declares no `applicability` — Python has no
+    // census token) is present in both, which is what "no gate = always
+    // applicable" has to mean for the rule to be safe to adopt.
+    for shape in [&maven, &gradle] {
+        assert!(
+            shape.iter().any(|n| n == "pytest"),
+            "an ungated check must survive every project shape: {shape:?}"
+        );
     }
 }

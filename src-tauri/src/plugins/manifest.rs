@@ -1336,6 +1336,38 @@ fn validate_tool(t: &ToolManifest, provenance: Provenance) -> Result<(), Validat
                      into, so the settings pane would render an input that goes nowhere",
                 ));
             }
+            // V38 Phase F, the same tightening two fields further. Both were
+            // found by the plugin-pack pass: they validated and nothing on this
+            // kind read them.
+            //
+            // * `parameters_allowed` - `run_command` takes its arguments from
+            //   the CALLER (the model), so a stored "extra CLI parameters" value
+            //   has no argv to be appended to. The settings pane would render an
+            //   input whose contents never reach a command line.
+            // * `applicability` - a project-shape gate filters a POPULATION. The
+            //   audit umbrellas filter their fan-out and `run_check` filters its
+            //   advertised set; `run_command` has neither - it resolves one named
+            //   tool on demand. A gate here would be a promise ("this tool only
+            //   exists in a Maven project") that nothing keeps.
+            //
+            // `parameters_allowed` is refused only when TRUE: it is a plain
+            // `bool`, so an explicit `false` cannot be told apart from an absent
+            // field, and refusing the pair would refuse manifests that say
+            // exactly what this rule wants them to say.
+            if t.parameters_allowed {
+                return Err(unread(
+                    "parameters_allowed",
+                    "`run_command` takes its arguments from the caller, so there is no argv \
+                     for a stored parameter list to be appended to",
+                ));
+            }
+            if !t.applicability.extensions.is_empty() || !t.applicability.markers.is_empty() {
+                return Err(unread(
+                    "applicability",
+                    "a project-shape gate filters a population, and `run_command` has none \
+                     — it resolves one named tool on demand rather than fanning out over a set",
+                ));
+            }
             if !t.argv.is_empty() {
                 return Err(wrong("argv", "audit/security"));
             }
@@ -1892,9 +1924,18 @@ mod tests {
             "\"kind\": \"command\", \"parser\": \"sarif\"",
         );
         assert!(matches!(err(&json), ValidationError::KindField(_)));
+
+        // An explicit `parameters_allowed: false` on a command tool is NOT a
+        // refusal: the field is a plain `bool`, so it is indistinguishable from
+        // an absent one, and the shipped starter pack writes exactly that.
+        let json = command_json().replace(
+            "\"kind\": \"command\"",
+            "\"kind\": \"command\", \"parameters_allowed\": false",
+        );
+        assert!(parse(&json, Provenance::User).is_ok());
     }
 
-    /// The three fields a `command`-kind tool may not declare, one negative
+    /// The five fields a `command`-kind tool may not declare, one negative
     /// test apiece — because "nothing reads it" is a different mistake for each
     /// and the message has to name the right one.
     ///
@@ -1910,6 +1951,12 @@ mod tests {
             (
                 "variables",
                 r#""variables": [{"name": "ruleset", "label": "Ruleset"}]"#,
+            ),
+            // V38 Phase F: the last two, found by the plugin-pack pass.
+            ("parameters_allowed", r#""parameters_allowed": true"#),
+            (
+                "applicability",
+                r#""applicability": {"markers": ["pom.xml"]}"#,
             ),
         ] {
             let json = command_json().replace(
@@ -1946,6 +1993,20 @@ mod tests {
             (
                 "check env",
                 check_json().replace(r#""id": "t","#, r#""id": "t", "env": [["CI", "1"]],"#),
+            ),
+            (
+                "check applicability",
+                check_json().replace(
+                    r#""id": "t","#,
+                    r#""id": "t", "applicability": {"markers": ["pom.xml"]},"#,
+                ),
+            ),
+            // (an audit tool's `applicability` needs no case here: `audit_json`
+            // itself declares one, so every other test in this module already
+            // proves the field loads on that kind.)
+            (
+                "check parameters_allowed",
+                check_json().replace(r#""id": "t","#, r#""id": "t", "parameters_allowed": true,"#),
             ),
         ] {
             assert!(

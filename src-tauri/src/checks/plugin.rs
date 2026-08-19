@@ -43,6 +43,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use super::CheckDef;
+use crate::audit::census::{self, Census};
 use crate::plugins::loader::PluginSet;
 use crate::plugins::manifest::{ManifestParser, SandboxReq, ToolKind};
 use crate::plugins::posture::ToolPosture;
@@ -143,11 +144,30 @@ pub struct PluginCheck {
 /// * `run_root` is where the check will actually execute — the value `{root}`
 ///   renders to. The two are the same everywhere except a `run_check` call whose
 ///   graph root is an ancestor of the cwd.
+/// * `census` is the project shape `run_root` was walked for, and it is what
+///   makes a manifest's `applicability` a GATE here rather than a decoration.
+///
+/// # Why applicability gates the ADVERTISED set and not only the run
+///
+/// V38 Phase F closed the framework gap the plugin-pack pass found: the field
+/// validated and nothing read it on this kind. It is applied at exactly one
+/// point — this function — which is both the advertised name list
+/// ([`effective_check_names`]) and the dispatched one, so a name a model can see
+/// is always a name that would run. Gating only the run would have advertised
+/// `maven-test` in a Gradle project and answered the call with a refusal, which
+/// is a worse answer than not offering it.
+///
+/// The consequence, stated rather than hidden: the advertised `run_check` schema
+/// is now project-SHAPE dependent as well as project-CONFIG dependent. Adding a
+/// `pom.xml` moves the surface, and nothing watches the filesystem for that — the
+/// census ages out in ≤60s and the next advertisement picks it up. That is the
+/// same eventual consistency the audit chips have had since V25.
 pub fn effective_checks(
     settings: &Settings,
     set: &PluginSet,
     registry_root: Option<&Path>,
     run_root: &Path,
+    census: &Census,
 ) -> Vec<EffectiveCheck> {
     let mut out: Vec<EffectiveCheck> = settings
         .checks
@@ -160,6 +180,12 @@ pub fn effective_checks(
 
     for tool in registry::runnable_tools(set, &settings.tool_plugins, registry_root) {
         if tool.kind() != ToolKind::Check {
+            continue;
+        }
+        // The manifest's project-shape gate, applied through the SAME function
+        // the audit fan-out applies (`Census::admits`) — one rule, so a tool
+        // cannot be applicable under an umbrella and inapplicable here.
+        if !census.admits(&tool.manifest.applicability) {
             continue;
         }
         let taken: Vec<&str> = out.iter().map(|c| c.def.name.as_str()).collect();
@@ -182,6 +208,13 @@ pub fn effective_checks_live(settings: &Settings, run_root: &Path) -> Vec<Effect
         &crate::plugins::snapshot_or_scan(),
         cwd.as_deref(),
         run_root,
+        // The CACHED census (≤60 s TTL, bounded walk): in the app this is the
+        // very walk the audit runner already paid for on the same root, and in
+        // an `--offload-mcp` child it is one bounded walk per minute per root —
+        // the same order of cost as the once-per-process plugin scan directly
+        // above it. Taking a fresh one per advertisement would put a filesystem
+        // walk on `tools/list`.
+        &census::cached(run_root),
     )
 }
 
@@ -488,7 +521,7 @@ mod tests {
             .parameters = vec!["--quiet".into(), "src dir".into()];
 
         let root = PathBuf::from("C:\\proj");
-        let checks = effective_checks(&s, &set, None, &root);
+        let checks = effective_checks(&s, &set, None, &root, &Census::default());
         let lint = find(&checks, "lint");
         assert_eq!(
             lint.def.cmd,
@@ -511,7 +544,7 @@ mod tests {
     fn an_unconfigured_plugin_contributes_no_checks() {
         let (set, dir) = fixture("types");
         let s = Settings::default();
-        assert!(effective_checks(&s, &set, None, Path::new("C:\\proj")).is_empty());
+        assert!(effective_checks(&s, &set, None, Path::new("C:\\proj"), &Census::default()).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -528,7 +561,7 @@ mod tests {
         });
         configured(&mut s, "lint", "C:\\tools\\acmelint.exe");
 
-        let checks = effective_checks(&s, &set, None, Path::new("C:\\proj"));
+        let checks = effective_checks(&s, &set, None, Path::new("C:\\proj"), &Census::default());
         assert_eq!(checks.len(), 2);
         assert!(
             find(&checks, "lint").plugin.is_none(),
@@ -579,7 +612,7 @@ mod tests {
             .global_paths
             .insert("other@2.0.0/lint".to_string(), "C:\\tools\\other.exe".into());
 
-        let checks = effective_checks(&s, &set, None, Path::new("C:\\proj"));
+        let checks = effective_checks(&s, &set, None, Path::new("C:\\proj"), &Census::default());
         assert_eq!(checks.len(), 2);
         // First in registry order keeps the short id; the second qualifies.
         assert_eq!(checks[0].def.name, "lint");
@@ -607,7 +640,7 @@ mod tests {
                 .variables
                 .insert("profile".to_string(), hostile.to_string());
 
-            let checks = effective_checks(&s, &set, None, Path::new("C:\\proj"));
+            let checks = effective_checks(&s, &set, None, Path::new("C:\\proj"), &Census::default());
             let lint = find(&checks, "lint");
             let err = lint
                 .plugin
@@ -643,7 +676,7 @@ mod tests {
             .parameters = vec!["--x; rm -rf /".into()];
 
         let lint = find(
-            &effective_checks(&s, &set, None, Path::new("C:\\proj")),
+            &effective_checks(&s, &set, None, Path::new("C:\\proj"), &Census::default()),
             "lint",
         )
         .clone();
@@ -669,7 +702,7 @@ mod tests {
             .insert("profile".to_string(), "C:\\rules\\*.yml".to_string());
 
         let lint = find(
-            &effective_checks(&s, &set, None, Path::new("C:\\proj")),
+            &effective_checks(&s, &set, None, Path::new("C:\\proj"), &Census::default()),
             "lint",
         )
         .clone();
@@ -749,5 +782,131 @@ mod tests {
         // substitute into, and says so instead of running the wrong thing.
         assert!(inject_program("FOO=1 tool", "C:\\tool.exe").is_err());
         assert!(inject_program("", "C:\\tool.exe").is_err());
+    }
+}
+
+#[cfg(test)]
+mod applicability_tests {
+    use super::*;
+    use crate::plugins::loader::scan_dir;
+    use crate::plugins::manifest::Provenance;
+    use crate::settings::{PluginState, ToolState};
+    use std::path::PathBuf;
+
+    /// Two check tools gated on different project shapes, plus one ungated —
+    /// the § 8 worked example, written as a manifest.
+    fn gated_fixture() -> (PluginSet, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("cimp-checkgate-{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(
+            dir.join("acme.json"),
+            r#"{
+              "manifest_version": 1,
+              "name": "acme",
+              "version": "1.0.0",
+              "categories": [{ "id": "c", "label": "C", "tools": ["mvn-build", "gr-build", "any"] }],
+              "tools": [
+                { "id": "mvn-build", "label": "Maven", "kind": "check", "cmd": "mvn compile",
+                  "applicability": { "markers": ["pom.xml"] } },
+                { "id": "gr-build", "label": "Gradle", "kind": "check", "cmd": "gradle build",
+                  "applicability": { "markers": ["build.gradle"] } },
+                { "id": "any", "label": "Anywhere", "kind": "check", "cmd": "anytool" }
+              ]
+            }"#,
+        )
+        .expect("write manifest");
+        let set = scan_dir(&dir, Provenance::User);
+        assert!(set.errors.is_empty(), "{:?}", set.errors);
+        (set, dir)
+    }
+
+    fn all_configured() -> Settings {
+        let mut cfg = Settings::default();
+        let mut tools = BTreeMap::new();
+        for id in ["mvn-build", "gr-build", "any"] {
+            tools.insert(id.to_string(), ToolState::default());
+            cfg.tool_plugins
+                .global_paths
+                .insert(format!("acme@1.0.0/{id}"), "C:\\tools\\t.exe".to_string());
+        }
+        cfg.tool_plugins.plugins.insert(
+            "acme@1.0.0".to_string(),
+            PluginState {
+                enabled: true,
+                tools,
+            },
+        );
+        cfg
+    }
+
+    fn names(set: &PluginSet, cfg: &Settings, markers: &[&str]) -> Vec<String> {
+        let census = crate::audit::census::Census::from_block(
+            &[],
+            &markers.iter().map(|m| (*m).to_string()).collect::<Vec<_>>(),
+        );
+        effective_checks(cfg, set, None, &PathBuf::from("C:\\proj"), &census)
+            .into_iter()
+            .filter(|c| c.plugin.is_some())
+            .map(|c| c.def.name)
+            .collect()
+    }
+
+    /// V38 Phase F — `applicability` is a GATE on `check`-kind tools, not a
+    /// decoration. Before this phase the field validated and nothing read it,
+    /// which made the contract doc's "`pom.xml` → maven" promise untrue.
+    ///
+    /// Both directions and the ungated case, because "no gate = always
+    /// applicable" is the half that makes adopting the rule safe.
+    #[test]
+    fn a_gated_check_is_advertised_only_where_its_marker_is() {
+        let (set, dir) = gated_fixture();
+        let cfg = all_configured();
+
+        let maven = names(&set, &cfg, &["pom.xml"]);
+        assert!(maven.contains(&"mvn-build".to_string()), "{maven:?}");
+        assert!(!maven.contains(&"gr-build".to_string()), "{maven:?}");
+        assert!(maven.contains(&"any".to_string()), "{maven:?}");
+
+        let gradle = names(&set, &cfg, &["build.gradle"]);
+        assert!(gradle.contains(&"gr-build".to_string()), "{gradle:?}");
+        assert!(!gradle.contains(&"mvn-build".to_string()), "{gradle:?}");
+
+        // Neither marker: only the ungated tool survives. A census that saw
+        // nothing is not a licence to advertise everything.
+        let neither = names(&set, &cfg, &[]);
+        assert_eq!(neither, vec!["any".to_string()], "{neither:?}");
+
+        // Both: the two gated tools coexist and the harness picks — decision 6,
+        // "cImp does not arbitrate".
+        let both = names(&set, &cfg, &["pom.xml", "build.gradle"]);
+        assert_eq!(both.len(), 3, "{both:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// One rule, two populations. The audit fan-out asks `Census::admits` and so
+    /// does this pipeline, so a manifest gate cannot mean one thing under an
+    /// umbrella and another under `run_check`.
+    #[test]
+    fn the_gate_is_the_same_function_the_audit_fanout_uses() {
+        use crate::plugins::manifest::Applicability;
+        let census = crate::audit::census::Census::from_block(
+            &[],
+            &["pom.xml".to_string()],
+        );
+        let gate = Applicability {
+            extensions: Vec::new(),
+            markers: vec!["pom.xml".to_string()],
+        };
+        assert!(census.admits(&gate));
+        assert!(
+            census.admits(&Applicability::default()),
+            "no gate = always applicable"
+        );
+        assert!(!census.admits(&Applicability {
+            extensions: Vec::new(),
+            markers: vec!["build.gradle".to_string()],
+        }));
     }
 }

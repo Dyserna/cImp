@@ -17,6 +17,7 @@
       "label": "go build",
       "description": "Compiles the selected packages and reports the compiler's file:line: message diagnostics.",
       "kind": "check",
+      "applicability": { "markers": ["go.mod"] },
       "cmd": "go build {var:packages}",
       "parser": "go",
       "variables": [
@@ -36,6 +37,7 @@
       "label": "go vet",
       "description": "Runs the vet analysers over the selected packages; its findings share the compiler's diagnostic format.",
       "kind": "check",
+      "applicability": { "markers": ["go.mod"] },
       "cmd": "go vet {var:packages}",
       "parser": "go",
       "variables": [
@@ -55,6 +57,7 @@
       "label": "go test",
       "description": "Runs the selected packages' tests with -json and reports each failure from that event stream.",
       "kind": "check",
+      "applicability": { "markers": ["go.mod"] },
       "cmd": "go test -json {var:packages}",
       "parser": "go-test-json",
       "variables": [

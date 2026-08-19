@@ -131,7 +131,7 @@ Tool level, every kind:
 | `runtime` | which sandbox runtime profile applies (§ 6.2) |
 | `sandbox` | what cImp does when it cannot confine this tool (§ 6.1) |
 | `extra_grants[]` | absolute paths to grant beyond the profile (§ 6.3) |
-| `parameters_allowed` | whether the settings pane offers a free-form "extra CLI parameters" field |
+| `parameters_allowed` | whether the settings pane offers a free-form "extra CLI parameters" field (`audit`, `security`, `check`) |
 
 Kind-specific fields, refused when they appear on the wrong kind:
 
@@ -140,7 +140,7 @@ Kind-specific fields, refused when they appear on the wrong kind:
 | `argv[]` | `audit`, `security` | the argv template (§ 3.2) |
 | `transport` | `audit`, `security` | `stdout` or `report_file` |
 | `findings_exit_codes[]` | `audit`, `security` | non-zero exits that still mean "ran fine, here are findings" |
-| `applicability{extensions,markers}` | `audit`, `security` | project-shape gate; both empty = always applicable |
+| `applicability{extensions,markers}` | `audit`, `security`, `check` | project-shape gate (§ 3.6); both empty = always applicable |
 | `cmd` | `check` | the command line template (§ 4.2) |
 | `cwd` | `check` | run here instead of the project root; relative, confined |
 | `report_file` | `check` | parse this file after the run instead of stdout; relative, confined |
@@ -152,14 +152,19 @@ Kind-specific fields, refused when they appear on the wrong kind:
 
 A `command`-kind tool is **identity only**: the path and the enable come from
 user state, and the arguments come from the caller. It therefore refuses
-`timeout_secs`, `env` and `variables` at load, by the same cross-check that
-refuses `argv` on a `check`. Nothing on that kind would read them —
-`run_command` runs every tool under one fixed budget because it is advertised to
-a model as a short read-only probe, it composes its child environment from
-cImp's allowlist plus the applicable `CommandPolicy`, and it has no template to
-substitute a variable into. Refusing is reversible and consuming is not: a
-manifest written against a field that silently did nothing would change
-behaviour the day it started working.
+`timeout_secs`, `env`, `variables`, `parameters_allowed` and `applicability` at
+load, by the same cross-check that refuses `argv` on a `check`. Nothing on that
+kind would read them — `run_command` runs every tool under one fixed budget
+because it is advertised to a model as a short read-only probe, it composes its
+child environment from cImp's allowlist plus the applicable `CommandPolicy`, it
+has no template to substitute a variable into, it takes its arguments from the
+caller rather than from stored state, and it resolves ONE named tool on demand
+rather than fanning out over a population a project-shape gate could filter.
+Refusing is reversible and consuming is not: a manifest written against a field
+that silently did nothing would change behaviour the day it started working.
+(`parameters_allowed` is a plain boolean, so only `true` can be refused — an
+explicit `false` says exactly what this rule wants and cannot be told apart from
+an absent field.)
 
 ### 2.4 Limits
 
@@ -326,6 +331,57 @@ re-checked against the real root at spawn.
 
 A `report_file` transport's `{report}` path is chosen by cImp, in a directory
 cImp owns, and granted read-write to the sandboxed child for the duration.
+
+### 3.6 `applicability` — the project-shape gate
+
+`applicability` decides whether a tool exists **for this project at all**. Both
+lists empty (the default) = no gate. Otherwise the tool applies when ANY listed
+extension OR ANY listed marker was seen — an OR across both lists, never an AND.
+
+It is honoured on `audit`, `security` **and** `check` kinds, by one function
+(`Census::admits`), so a gate cannot mean one thing under an umbrella and
+another under `run_check`:
+
+| kind | what the gate removes |
+|---|---|
+| `audit`, `security` | the tool is not spawned in the fan-out; the report shows it as `skipped-not-applicable` rather than dropping it silently |
+| `check` | the check is not advertised to `run_check` and cannot be dispatched — the advertised name list and the runnable one are the same list |
+| `command` | refused at load: `run_command` resolves one named tool on demand and has no population to filter |
+
+**`extensions`** are lowercase and dot-less (`java`, `cs`, `py`) and match any
+file seen in the walk. **`markers`** are not filenames — they are tokens from a
+CLOSED vocabulary cImp owns, so a manifest can only ask about project shapes the
+census was built to see. A marker outside this list never matches (it is not an
+error; it simply never fires):
+
+<!-- drift:markers -->
+```text
+go.mod
+Cargo.toml
+package.json
+*.sln
+*.csproj
+eslint.config
+.eslintrc
+pom.xml
+build.gradle
+```
+
+`*.sln` and `*.csproj` are families (any file with that extension), `eslint.config`
+covers the flat-config spellings and `.eslintrc` its dotted variants, and
+`build.gradle` covers `build.gradle.kts` — one project shape, one token.
+
+The census walk is bounded and `.gitignore`-aware, and it is **cached for up to
+60 seconds per root**. Truncation and staleness can only ever HIDE a tool, never
+invent one: adding a `pom.xml` to a project shows up on the next walk rather than
+instantly, and nothing watches the filesystem to pulse a `tools/list_changed` for
+it.
+
+The gate is not a substitute for the enable and the path. A tool with no
+configured binary is inert whatever its `applicability` says, and that
+complementary mechanism — **path-unset-is-the-gate** — is what disambiguates a
+tool whose project shape has no marker token (a Python project, say). Both are
+available; the gate is automatic and the path is deliberate.
 
 ---
 
@@ -811,10 +867,17 @@ any category.
   a worktree, and are not exercised by the Settings "Test" button. Adding a
   capability to a project must not silently add work to every save.
 * **The harness chooses among tools; cImp does not arbitrate.** Configuration governs
-  *availability* (per-tool toggles, the category toggle as the group operation);
-  applicability gates disambiguate most real projects automatically (`pom.xml` →
-  maven, `build.gradle` → gradle); where a project is genuinely ambiguous, the
-  harness picks — which is exactly where judgement belongs.
+  *availability* through two complementary mechanisms, and neither is cImp
+  forming an opinion about your project:
+  * the **enable and the path** — a tool with no configured binary is inert, so
+    configuring maven and leaving gradle unset is a complete answer on its own;
+  * the **applicability gate** (§ 3.6) — `pom.xml` → maven, `build.gradle` →
+    gradle, on `audit`/`security`/`check` kinds alike, over the closed marker
+    vocabulary § 3.6 lists. `command`-kind tools have no gate, by refusal.
+
+  Where a project is genuinely ambiguous — both markers present, both tools
+  configured — both are offered and the harness picks, which is exactly where
+  judgement belongs.
 * **The security floor stays.** Plugins add to the built-in security tools and
   can never replace or displace them.
 * **No shadowing.** A plugin id can never claim a built-in id; the two namespaces
@@ -853,6 +916,8 @@ the code:
 | `drift:reserved-fields` | that a scanned manifest carrying any of them is refused, and that the built-in-only ones load when the loader stamped `builtin` |
 | `drift:identity-charset` | `manifest::valid_id` / `valid_version`, both verdicts on both fields |
 | `drift:builtin-roster` | the tool keys of cImp's own embedded manifests |
+| `drift:markers` | `audit::census::MARKERS`, the closed applicability vocabulary |
+| `drift:packaging` | that `build.rs` and `.github/workflows/release.yml` both still ship the `plugins` directory |
 
 Format rules for those blocks: an HTML comment `<!-- drift:NAME -->` immediately
 followed by a fenced block; lines beginning with `#` are comments; blank lines are

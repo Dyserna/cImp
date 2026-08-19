@@ -45,6 +45,14 @@ pub const MARKERS: &[&str] = &[
     "*.csproj",
     "eslint.config",
     ".eslintrc",
+    // V38 Phase F: the two build files the plugin contract's own worked example
+    // names. `applicability` became a real gate for `check`-kind tools in this
+    // phase, and the promise § 8 was corrected to make — "`pom.xml` → maven,
+    // `build.gradle` → gradle" — is only true if the census can SEE those files.
+    // A closed vocabulary is the point (a manifest names a token cImp owns, not
+    // a glob it invents), so making the example expressible means adding to it.
+    "pom.xml",
+    "build.gradle",
 ];
 
 /// The result of a census walk: the lowercase extensions and the [`MARKERS`]
@@ -90,6 +98,29 @@ impl Census {
         self.markers.contains(marker)
     }
 
+    /// **The** applicability rule: no gate = always applicable, else ANY listed
+    /// extension OR ANY listed marker.
+    ///
+    /// V38 Phase F extracted it here from `audit::runnable::RunnableAudit`,
+    /// which had been its only reader, because it stopped being an audit-only
+    /// question: `check`-kind plugin tools are gated by the same manifest field
+    /// through `checks::plugin::effective_checks`, and a second copy of the rule
+    /// would let a tool be applicable under one umbrella and not under the
+    /// pipeline next door. One rule, three populations (built-in audit tools,
+    /// plugin audit tools, plugin checks) — a plugin tool must not be gateable
+    /// differently from a built-in one.
+    ///
+    /// The vocabulary is closed on purpose (see [`MARKERS`]): a manifest names a
+    /// token cImp owns rather than a glob it invents, so an author cannot make
+    /// the census walk look for something it was never taught to see.
+    pub fn admits(&self, a: &crate::plugins::manifest::Applicability) -> bool {
+        if a.extensions.is_empty() && a.markers.is_empty() {
+            return true;
+        }
+        a.extensions.iter().any(|e| self.has_extension(e))
+            || a.markers.iter().any(|m| self.has_marker(m))
+    }
+
     /// The seen extensions, sorted — the chip-visibility payload (Phase C).
     pub fn extensions(&self) -> Vec<String> {
         let mut v: Vec<String> = self.extensions.iter().cloned().collect();
@@ -113,6 +144,11 @@ fn marker_for(name: &str) -> Option<&'static str> {
         "go.mod" => Some("go.mod"),
         "cargo.toml" => Some("Cargo.toml"),
         "package.json" => Some("package.json"),
+        "pom.xml" => Some("pom.xml"),
+        // Groovy and Kotlin DSL collapse to ONE token, the `*.sln` family's
+        // rule: a plugin author gating on "this is a Gradle project" must not
+        // have to know which of the two spellings the project chose.
+        "build.gradle" | "build.gradle.kts" => Some("build.gradle"),
         _ => {
             if lower.ends_with(".sln") {
                 Some("*.sln")
@@ -286,13 +322,21 @@ mod tests {
             "x.csproj",
             "eslint.config.js",
             ".eslintrc",
+            "pom.xml",
+            "build.gradle",
+            "build.gradle.kts",
         ] {
             let tok = marker_for(name).unwrap_or_else(|| panic!("{name} should classify"));
             assert!(MARKERS.contains(&tok), "token {tok:?} missing from MARKERS");
         }
         assert_eq!(
+            marker_for("build.gradle.kts"),
+            Some("build.gradle"),
+            "the Kotlin DSL is the same project shape as the Groovy one"
+        );
+        assert_eq!(
             MARKERS.len(),
-            7,
+            9,
             "MARKERS and marker_for must stay in lockstep"
         );
     }

@@ -290,9 +290,20 @@ the storage location moves, not the capability.
   invariants pinned by tests.
 - **D — Check + command kinds**: check defs feed `run_check`; command entries
   feed `run_command` allowlist/path resolution.
-- **E — Built-in migration**: the 15 adapters become shipped built-in
-  plugins; `audit/parsers.rs` retired; `adapters.rs` reduced to the loader's
-  built-in set. Baselines re-pinned.
+- **E — Built-in migration** *(done)*: the **14** adapters (not 15 — the
+  survey corrected the count) became one shipped built-in plugin,
+  `cimp-audit@1`, read through the same loader and validator a dropped-in file
+  goes through. `AuditToolId`, `AuditToolConfig`, `default_audit_tools`, the
+  `Adapter` table and `audit/parsers.rs` are gone; `adapters.rs` keeps only what
+  is not per-tool configuration (`Category`, `Transport`, `classify_exit`), and
+  `AuditParser` moved beside the kind-aware resolution that produces it. Schema
+  v32 → v33 moves `code_audit.tools` into `tool_plugins` in the same commit that
+  switches the reader. Four built-in-only manifest fields carry what the tier
+  needs and a scanned file may not have (`ingest`, `command`,
+  `project_local_bin`, `dir_argv`), each refused on the scanned path by the
+  loader's provenance stamp; two general fields are new (`description`,
+  `enabled_by_default`). Live-verify 7 is a committed byte-match golden rather
+  than a fixture-repo run.
 - **F — MCP tier (after V37)**: tier-2 providers returning SARIF over
   `tools/call`, managed under V37.
 - **G — Capability contract spec**: the CHP-pattern doc + drift tests
@@ -314,5 +325,13 @@ the storage location moves, not the capability.
    spawns its own project's binary (verify via spawn ledger rows).
 6. `command`-kind plugin (git) → run_command resolves the registered path,
    allowlist honored, sandbox row minted as for any spawn.
-7. Built-in migration regression: post-Phase-E, umbrella reports byte-match
-   the pre-migration reports on a fixture repo (parser unification proven).
+7. Built-in migration regression: **automated and committed** rather than a
+   manual recipe. `audit::golden` renders every built-in tool's argv under
+   three substitution shapes, the finalized verdict of six canned runs each
+   (findings / clean-and-silent / findings-exit-with-no-output / tool error /
+   timeout / spawn failure) and both umbrella reports, and compares them byte
+   for byte against a fixture captured BEFORE the migration. The gitleaks
+   empty-report-is-clean case and cppcheck's exit-0-with-findings contract are
+   in it by name, because those are the two semantics a naive move onto the
+   strict SARIF ingest gate would break. Regeneration is env-var gated and
+   panics when it fires.

@@ -3921,6 +3921,95 @@ mod tests {
         );
     }
 
+    /// **The upgrade path, end to end, on a file that predates the container
+    /// entirely.**
+    ///
+    /// The unit test above drives one step over a hand-built `Value`. This runs
+    /// the whole cascade the way a launch does — every detector, every
+    /// transform, in order — over a v29-era file whose audit tools are
+    /// configured, and then DESERIALIZES the result into `Settings`. That last
+    /// part is the half a `Value`-level test cannot reach: a step can produce a
+    /// shape that looks right and still not parse into the typed container the
+    /// registry reads, and the user would meet that as "my scanners forgot
+    /// everything" rather than as a failing test.
+    #[test]
+    fn an_old_file_with_configured_audit_tools_cascades_into_the_container() {
+        let shell = fake_default_shell();
+        let mut v = json!({
+            "schema_version": 29,
+            "offload": {},
+            "tabs": [],
+            "code_audit": {
+                "enabled": true,
+                "timeout_secs": 1800,
+                "quality_auto_select": false,
+                "tools": [
+                    {
+                        "id": "semgrep",
+                        "enabled": false,
+                        "path": "C:\\py\\Scripts\\semgrep.exe",
+                        "extra_args": ["--exclude", "vendor"],
+                        "ruleset": "p/ci",
+                        "timeout_secs": 1200
+                    },
+                    { "id": "typos", "enabled": true, "path": "", "extra_args": [] }
+                ]
+            }
+        });
+        for step in MIGRATION_STEPS {
+            if (step.detect)(&v) {
+                (step.transform)(&mut v, &shell);
+            }
+        }
+        assert_eq!(
+            v["schema_version"],
+            json!(crate::settings::schema::CURRENT_SCHEMA_VERSION)
+        );
+
+        let s: crate::settings::Settings =
+            serde_json::from_value(v).expect("the migrated file must deserialize");
+
+        // The umbrella settings survived the move.
+        assert!(s.code_audit.enabled);
+        assert_eq!(s.code_audit.timeout_secs, 1800);
+        assert!(!s.code_audit.quality_auto_select);
+
+        // …and every per-tool value landed where the registry looks for it.
+        let plugin = &s.tool_plugins.plugins[crate::plugins::builtin::AUDIT_PLUGIN_KEY];
+        assert!(plugin.enabled);
+        let semgrep = &plugin.tools["semgrep"];
+        assert!(!semgrep.enabled);
+        assert_eq!(semgrep.timeout_secs, Some(1200));
+        assert_eq!(semgrep.parameters, vec!["--exclude", "vendor"]);
+        assert_eq!(semgrep.variables["ruleset"], "p/ci");
+        assert!(plugin.tools["typos"].enabled);
+        assert_eq!(
+            s.tool_plugins.global_paths["cimp-audit@1/semgrep"],
+            "C:\\py\\Scripts\\semgrep.exe"
+        );
+
+        // The migrated state is what the REGISTRY answers with — the join, not
+        // just the storage. This is the assertion that would have caught a key
+        // the container holds and the registry never looks under.
+        let tools = crate::plugins::registry::effective_tools(
+            &crate::plugins::builtin::plugin_set(),
+            &s.tool_plugins,
+            None,
+        );
+        let find = |id: &str| tools.iter().find(|t| t.tool_id == id).expect("built-in tool");
+        let semgrep = find("semgrep");
+        assert!(!semgrep.enabled, "the user had it switched off");
+        assert_eq!(semgrep.path.as_deref(), Some("C:\\py\\Scripts\\semgrep.exe"));
+        assert_eq!(semgrep.timeout_secs, Some(1200));
+        assert_eq!(semgrep.variables["ruleset"], "p/ci");
+        assert_eq!(semgrep.parameters, vec!["--exclude", "vendor"]);
+        // A tool the file never mentioned keeps its manifest defaults, which is
+        // how a fresh install and an upgraded one end up agreeing.
+        let gitleaks = find("gitleaks");
+        assert!(gitleaks.enabled && gitleaks.path.is_none());
+        assert!(!find("dotnet-analyzers").enabled, "still opt-in");
+    }
+
     /// Altitude tripwire: if `schema::LOCAL_DATA_TOOLS` ever gains a member,
     /// migrating a settings file whose cloud backend carries the historical
     /// five-item "web/docs only" exclusion must still yield an exclusion list

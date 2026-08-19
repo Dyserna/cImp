@@ -31,8 +31,7 @@ use crate::settings::SettingsHandle;
 
 use super::adapters::{self, Category, ExitClass, Transport};
 use super::census;
-use super::parsers::AuditParser;
-use super::runnable::{RunnableAudit, ToolKey};
+use super::runnable::{AuditParser, RunnableAudit, ToolKey};
 
 /// Tauri event emitted on every per-tool transition, carrying a (findings-
 /// capped) [`AuditSnapshot`]. Phase C subscribes to this.
@@ -2615,7 +2614,7 @@ mod tests {
     }
 
     /// eslint exits 0 when it has warnings-only, yet its JSON still carries them.
-    /// The [`AuditParser::EslintJson`](super::parsers::AuditParser) decoder runs
+    /// The [`AuditParser::EslintJson`](super::runnable::AuditParser) decoder runs
     /// on the clean-exit output, so those warnings surface as `done`-with-
     /// findings rather than a false clean bill.
     #[test]

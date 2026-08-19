@@ -18,7 +18,6 @@ pub mod census;
 #[cfg(test)]
 mod golden;
 pub mod mcp;
-pub mod parsers;
 pub mod runnable;
 pub mod runner;
 

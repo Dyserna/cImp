@@ -842,11 +842,23 @@ impl OffloadService {
         // Skip the reconcile (and its connect attempts) when the desired host
         // config is unchanged since the last one — the common case on the
         // per-run hot path and the 12s health watch.
-        let sig = host_config_sig(&snap.mcp_servers, &roots);
+        let sig = host_config_sig(
+            &snap.mcp_servers,
+            &snap.mcp_categories,
+            &snap.mcp_activation,
+            &roots,
+        );
         if self.last_host_sig.lock().unwrap().as_deref() == Some(sig.as_str()) {
             return;
         }
-        self.host.reconcile(&snap.mcp_servers, &roots).await;
+        self.host
+            .reconcile(
+                &snap.mcp_servers,
+                &snap.mcp_categories,
+                &snap.mcp_activation,
+                &roots,
+            )
+            .await;
         *self.last_host_sig.lock().unwrap() = Some(sig);
     }
 

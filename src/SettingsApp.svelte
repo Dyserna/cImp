@@ -1073,6 +1073,10 @@
           offload_access: true,
           opencode_access: false,
           auth_token: '',
+          // V37 C2: a hand-added row is an external endpoint, and it exists.
+          // The management UI (Phase D) owns the toggles from here.
+          origin: 'external',
+          enabled: true,
         },
       ];
     });

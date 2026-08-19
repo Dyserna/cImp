@@ -321,6 +321,11 @@ const MIGRATION_STEPS: &[MigrationStep] = &[
         detect: looks_v30,
         transform: migrate_v30_to_v31_step,
     },
+    MigrationStep {
+        from_version: "v31",
+        detect: looks_v31,
+        transform: migrate_v31_to_v32_step,
+    },
 ];
 
 // --- Uniform-signature wrappers -------------------------------------------
@@ -2445,10 +2450,62 @@ fn migrate_v30_to_v31(value: &mut Value) {
     let Some(root) = value.as_object_mut() else {
         return;
     };
-    // Final cascade step ⇒ stamp CURRENT (31).
+    // Stamps a *literal* 31 (not `CURRENT_SCHEMA_VERSION`): the v31 → v32 step
+    // runs next in the same cascade pass and gates on `schema_version == 31`.
     root.insert(
         "schema_version".to_string(),
         Value::Number(serde_json::Number::from(31u8)),
+    );
+}
+
+fn looks_v31(value: &Value) -> bool {
+    value
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .is_some_and(|v| v == 31)
+}
+
+fn migrate_v31_to_v32_step(value: &mut Value, _shell: &ShellSpec) {
+    migrate_v31_to_v32(value)
+}
+
+/// V31 → V32: pure version stamp for the V37 MCP registry fields.
+///
+/// V37 Phase A (contract C2) adds four additive fields, every one of which
+/// deserializes from an absent key to the value that reproduces pre-V37
+/// behaviour exactly:
+///
+/// * `offload.mcp_servers[].enabled` → `true` (the server exists),
+/// * `offload.mcp_servers[].origin` → `external` (unknown provenance is
+///   untrusted — the safe direction, and metadata-only in V37),
+/// * `offload.mcp_categories` → `[]` (no categories),
+/// * `offload.mcp_activation` → `{categories:{}, servers:{}}` (no overrides).
+///
+/// **The C2 invariant this step exists to protect**: the *effective tool
+/// surface* of every existing config is unchanged after migration. It holds
+/// because the effective-enable predicate
+/// (`offload::mcp_host::effective_enable`) reduces to the server's own
+/// `enabled` when no category contains it — and after this step no category
+/// contains anything, because there are no categories. So there is **no data
+/// transform to do**; the schema tests
+/// `mcp_server_config_defaults_origin_and_enabled` and
+/// `offload_settings_default_registry_is_empty` pin the defaults this relies on.
+///
+/// It is stamped anyway, following the v23 → v24, v28 → v29 and v30 → v31
+/// precedent for additive-only changes: the marker is what a later step gates
+/// on, and what tells a future reader whether a file could carry a category
+/// list at all.
+///
+/// Idempotent: a second pass finds `schema_version == 32` so `looks_v31` is
+/// false.
+fn migrate_v31_to_v32(value: &mut Value) {
+    let Some(root) = value.as_object_mut() else {
+        return;
+    };
+    // Final cascade step ⇒ stamp CURRENT (32).
+    root.insert(
+        "schema_version".to_string(),
+        Value::Number(serde_json::Number::from(32u8)),
     );
 }
 
@@ -3440,6 +3497,80 @@ mod tests {
         let once = v.clone();
         migrate_v30_to_v31(&mut v);
         assert_eq!(v, once);
+    }
+
+    /// V37 Phase A's step is a pure stamp: it must advance the marker and touch
+    /// **nothing else**. The C2 invariant — an existing config's effective tool
+    /// surface is unchanged — is carried entirely by serde defaults, so any
+    /// data written here would be a bug.
+    #[test]
+    fn v31_to_v32_only_stamps_the_version() {
+        let mut v = json!({
+            "schema_version": 31,
+            "offload": {
+                "mcp_servers": [
+                    { "name": "ddg", "url": "http://172.21.1.11:17201/mcp", "claude_access": true },
+                    { "name": "git", "command": "uvx", "args": ["mcp-server-git"] },
+                ],
+            },
+        });
+        let before = v.clone();
+        migrate_v31_to_v32(&mut v);
+        assert_eq!(v["schema_version"], json!(32));
+        assert!(!looks_v31(&v));
+        // No registry keys are written: the defaults do the work.
+        assert!(v["offload"].get("mcp_categories").is_none());
+        assert!(v["offload"].get("mcp_activation").is_none());
+        assert!(v["offload"]["mcp_servers"][0].get("enabled").is_none());
+        assert!(v["offload"]["mcp_servers"][0].get("origin").is_none());
+        // Everything but the marker is byte-identical.
+        let mut stripped = v.clone();
+        stripped["schema_version"] = json!(31);
+        assert_eq!(stripped, before);
+        // Idempotent.
+        let once = v.clone();
+        migrate_v31_to_v32(&mut v);
+        assert_eq!(v, once);
+    }
+
+    /// The C2 invariant itself, end to end: a v31 file run through the cascade
+    /// deserializes to a `Settings` whose every MCP server is effectively
+    /// enabled — same surface as before the upgrade, with no categories and no
+    /// activation overrides.
+    #[test]
+    fn v31_to_v32_leaves_the_effective_mcp_surface_unchanged() {
+        let shell = fake_default_shell();
+        let mut v = json!({
+            "schema_version": 31,
+            "tabs": [],
+            "offload": {
+                "mcp_servers": [
+                    { "name": "ddg", "url": "http://x/mcp", "claude_access": true },
+                    { "name": "git", "command": "uvx", "offload_access": false },
+                ],
+            },
+        });
+        for step in MIGRATION_STEPS {
+            if (step.detect)(&v) {
+                (step.transform)(&mut v, &shell);
+            }
+        }
+        let s: crate::settings::Settings = serde_json::from_value(v).unwrap();
+        assert!(s.offload.mcp_categories.is_empty());
+        assert!(s.offload.mcp_activation.categories.is_empty());
+        assert!(s.offload.mcp_activation.servers.is_empty());
+        for m in &s.offload.mcp_servers {
+            assert!(m.enabled, "{} lost its surface", m.name);
+            assert_eq!(m.origin, crate::settings::McpOrigin::External);
+            assert!(crate::offload::mcp_host::server_enabled(
+                m,
+                &s.offload.mcp_categories,
+                &s.offload.mcp_activation,
+            ));
+        }
+        // The pre-existing access flags are untouched by the step.
+        assert!(s.offload.mcp_servers[0].claude_access);
+        assert!(!s.offload.mcp_servers[1].offload_access);
     }
 
     /// The cascade's last step must land exactly on `CURRENT_SCHEMA_VERSION` —

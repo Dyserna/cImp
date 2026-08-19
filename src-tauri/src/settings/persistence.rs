@@ -2769,6 +2769,61 @@ mod tests {
         assert_eq!(base, serde_json::json!({ "tabs": [9] }));
     }
 
+    /// V37 contract C2, the reason `McpActivation` is a `BTreeMap` and not a
+    /// `Vec`. A project overlay carries only the keys it overrides; every other
+    /// project-level entry in the global file must survive the merge. Written
+    /// against `deep_merge` directly because that is the function the shape
+    /// argument is about — swap either activation half to an array and this
+    /// test fails exactly the way production would.
+    #[test]
+    fn overlay_activation_merges_per_key() {
+        let mut base = serde_json::json!({
+            "offload": {
+                "mcp_activation": {
+                    "servers": { "ddg": true, "git": false },
+                    "categories": { "research": true },
+                },
+                "mcp_servers": [{ "name": "ddg" }],
+            },
+        });
+        let overlay = serde_json::json!({
+            "offload": { "mcp_activation": { "servers": { "x": false } } },
+        });
+        deep_merge(&mut base, overlay);
+        assert_eq!(
+            base["offload"]["mcp_activation"]["servers"],
+            serde_json::json!({ "ddg": true, "git": false, "x": false }),
+            "an overlay entry must ADD to the map, not replace it"
+        );
+        // The untouched half and the global-only server list are unaffected.
+        assert_eq!(
+            base["offload"]["mcp_activation"]["categories"],
+            serde_json::json!({ "research": true })
+        );
+        assert_eq!(
+            base["offload"]["mcp_servers"],
+            serde_json::json!([{ "name": "ddg" }])
+        );
+
+        // An overlay may also FLIP an existing key (that is the override), and
+        // it may override a category without disturbing the server half.
+        let overlay2 = serde_json::json!({
+            "offload": { "mcp_activation": {
+                "servers": { "ddg": false },
+                "categories": { "research": false },
+            } },
+        });
+        deep_merge(&mut base, overlay2);
+        assert_eq!(
+            base["offload"]["mcp_activation"]["servers"],
+            serde_json::json!({ "ddg": false, "git": false, "x": false })
+        );
+        assert_eq!(
+            base["offload"]["mcp_activation"]["categories"],
+            serde_json::json!({ "research": false })
+        );
+    }
+
     #[test]
     fn diff_identical_returns_none() {
         let v = serde_json::json!({ "a": 1, "b": [1, 2] });

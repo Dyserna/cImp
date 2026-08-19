@@ -31,10 +31,162 @@ use tokio::process::{Child, ChildStdin};
 use tokio::sync::{broadcast, oneshot, Mutex as TokioMutex, RwLock};
 use tracing::{debug, info, warn};
 
-use crate::settings::McpServerConfig;
+use crate::settings::{McpActivation, McpCategory, McpServerConfig};
 
 use super::openai::ToolDef;
 use super::outbound;
+
+/// V37 contract C4 — the stable substring every disabled-server refusal
+/// carries, so a consumer (or a test, or a live-verify) can recognize the class
+/// without matching cImp's prose. The two level tails below say *which* toggle
+/// did it, and they are the same bytes [`EnableVerdict::refusal`] composes the
+/// message from — a marker only ever asserted about, never used to build the
+/// string it names, is a marker free to drift.
+pub const REFUSAL_DISABLED: &str = "is disabled (";
+/// Tail of the CATEGORY-level refusal (contract C4), after the category name.
+pub const REFUSAL_DISABLED_BY_CATEGORY: &str = " is off)";
+/// Tail of the SERVER-level refusal (contract C4).
+pub const REFUSAL_DISABLED_BY_SERVER: &str = "server toggle)";
+
+/// V37 contract C3 — the verdict of the ONE effective-enable predicate.
+///
+/// Not a `bool`, because contract C4's refusal must name the *level* that did
+/// it: "you turned this server off" and "the category it sits in is off" are
+/// different user mistakes with different fixes, and a `bool` would force the
+/// dispatch path to re-derive the reason with a second, drifting copy of the
+/// rule.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EnableVerdict {
+    /// Effectively enabled: advertise, connect, dispatch.
+    Enabled,
+    /// The server's own toggle is off — globally, or by a project overlay
+    /// entry in `activation.servers`.
+    ServerOff,
+    /// The server's own toggle is on, but every category containing it is off.
+    /// Carries the FIRST containing category in registry order, purely for the
+    /// refusal wording — with several off categories any of them is a true
+    /// answer, and registry order makes the choice deterministic.
+    CategoriesOff(String),
+}
+
+impl EnableVerdict {
+    /// Whether this verdict means "the server exists right now".
+    pub fn is_enabled(&self) -> bool {
+        matches!(self, EnableVerdict::Enabled)
+    }
+
+    /// The contract-C4 refusal text for a call that reached a disabled server.
+    /// `Enabled` has no refusal and yields `None`.
+    fn refusal(&self, server: &str) -> Option<String> {
+        match self {
+            EnableVerdict::Enabled => None,
+            EnableVerdict::ServerOff => Some(format!(
+                "server `{server}` {REFUSAL_DISABLED}{REFUSAL_DISABLED_BY_SERVER}"
+            )),
+            EnableVerdict::CategoriesOff(cat) => Some(format!(
+                "server `{server}` {REFUSAL_DISABLED}category `{cat}`{REFUSAL_DISABLED_BY_CATEGORY}"
+            )),
+        }
+    }
+}
+
+/// V37 contract C3 — **the** effective-enable predicate. One function, one
+/// owner; both advertisement ([`McpHost::tool_defs_filtered`]) and dispatch
+/// ([`McpHost::call_for_consumer`]) read this and nothing else, so the two can
+/// never disagree about whether a server exists.
+///
+/// ```text
+/// enabled(server) :=
+///   (server.enabled, overridden by activation.servers[name] if present)
+///   AND ( no category contains the server
+///         OR at least one containing category is effectively enabled,
+///            where a category's effective state = category.enabled
+///            overridden by activation.categories[name] if present )
+/// ```
+///
+/// Two rules earn their keep:
+///
+/// * **Uncategorized servers ride the server toggle alone.** This is what makes
+///   the C2 migration invariant hold: a pre-v32 file has no categories, so
+///   every server's verdict is exactly its (defaulted-`true`) own toggle.
+/// * **One enabled category is enough.** Categories are an OR, not an AND — a
+///   server the user filed under both "research" and "web" stays available
+///   while either group is on. A server whose categories are *all* off is off
+///   even with its own toggle on.
+///
+/// # The activation maps are already effective
+///
+/// By the time settings reach the host, `persistence`'s `deep_merge` has folded
+/// the project overlay into the `Settings` snapshot. So `activation` here is the
+/// *composed* result, not "the overlay" — this function must never read an
+/// overlay file, and `Some(v)` in either map simply wins over the global flag
+/// while absence inherits it.
+pub fn effective_enable(
+    server: &McpServerConfig,
+    categories: &[McpCategory],
+    activation: &McpActivation,
+) -> EnableVerdict {
+    let server_on = activation
+        .servers
+        .get(&server.name)
+        .copied()
+        .unwrap_or(server.enabled);
+    if !server_on {
+        return EnableVerdict::ServerOff;
+    }
+    let mut first_containing: Option<&str> = None;
+    for c in categories
+        .iter()
+        .filter(|c| c.servers.iter().any(|s| s == &server.name))
+    {
+        let on = activation
+            .categories
+            .get(&c.name)
+            .copied()
+            .unwrap_or(c.enabled);
+        if on {
+            return EnableVerdict::Enabled;
+        }
+        if first_containing.is_none() {
+            first_containing = Some(c.name.as_str());
+        }
+    }
+    match first_containing {
+        // At least one category contains it and none of them is on.
+        Some(name) => EnableVerdict::CategoriesOff(name.to_string()),
+        // Uncategorized: the server toggle (already checked) is the whole rule.
+        None => EnableVerdict::Enabled,
+    }
+}
+
+/// Boolean shorthand over [`effective_enable`] for the callers that only need
+/// the yes/no (reconcile's desired-set filter, the signature).
+pub fn server_enabled(
+    server: &McpServerConfig,
+    categories: &[McpCategory],
+    activation: &McpActivation,
+) -> bool {
+    effective_enable(server, categories, activation).is_enabled()
+}
+
+/// A configured server that the C3 predicate turned OFF, retained by the host
+/// across reconciles.
+///
+/// Contract C4 needs this: a disabled server is treated as **absent for
+/// connection purposes** (never connected, torn down if it was), so the routing
+/// table — which is built from live connections' advertised tools — knows
+/// nothing about it. Without this list, a stale call to a just-disabled server
+/// would come back as "no server offers that tool", i.e. *disabled* would be
+/// indistinguishable from *never existed*, and the user would have no way to
+/// learn that a toggle they flipped is the cause.
+#[derive(Clone, Debug)]
+pub struct DisabledServer {
+    /// [`McpServerConfig::name`] — the id (contract C1) and the namespace
+    /// prefix of every tool this server would have advertised.
+    pub name: String,
+    /// Which level turned it off, for the refusal wording.
+    pub verdict: EnableVerdict,
+}
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
 const CLIENT_NAME: &str = "cimp-offload-host";
@@ -763,6 +915,13 @@ impl McpServer {
 /// change notifier the offload service relays as `tools/list_changed`.
 pub struct McpHost {
     servers: RwLock<Vec<Arc<McpServer>>>,
+    /// V37 C4: the configured-but-disabled servers from the last
+    /// [`reconcile`](McpHost::reconcile) — see [`DisabledServer`] for why the
+    /// host keeps knowing about a server it deliberately does not connect.
+    ///
+    /// Lock order: `disabled` before `servers` wherever both are held, so the
+    /// read paths can never invert against reconcile's writes.
+    disabled: RwLock<Vec<DisabledServer>>,
     allowed_roots: RwLock<Vec<PathBuf>>,
     change_tx: broadcast::Sender<()>,
 }
@@ -772,6 +931,7 @@ impl McpHost {
         let (change_tx, _) = broadcast::channel(16);
         Arc::new(Self {
             servers: RwLock::new(Vec::new()),
+            disabled: RwLock::new(Vec::new()),
             allowed_roots: RwLock::new(Vec::new()),
             change_tx,
         })
@@ -791,17 +951,52 @@ impl McpHost {
     /// edited servers, drop disabled/removed ones, and leave unchanged
     /// healthy servers untouched (the cheap warm path). Connects concurrently
     /// so one slow `npx` server doesn't serialize the others.
-    pub async fn reconcile(&self, configs: &[McpServerConfig], allowed_roots: &[PathBuf]) {
+    ///
+    /// V37 contract C3: `categories` + `activation` are the registry context the
+    /// effective-enable predicate needs. A server the predicate turns off is
+    /// treated as **absent** here — never connected, and torn down if it was
+    /// connected when the toggle flipped — while its name and the reason are
+    /// remembered in [`Self::disabled`] so dispatch can tell *disabled* from
+    /// *unknown* (contract C4).
+    ///
+    /// `activation` is already the project-composed map (see
+    /// [`effective_enable`]); this function never reads an overlay file.
+    pub async fn reconcile(
+        &self,
+        configs: &[McpServerConfig],
+        categories: &[McpCategory],
+        activation: &McpActivation,
+        allowed_roots: &[PathBuf],
+    ) {
         *self.allowed_roots.write().await = allowed_roots.to_vec();
+
+        // Record the disabled set BEFORE any teardown, so there is no window in
+        // which a call to a just-disabled server sees neither a connection nor
+        // a disabled entry and gets the misleading "unknown tool" refusal.
+        // A row with no name yet (just added in the editor) is not "disabled",
+        // it is incomplete — it never appears here.
+        *self.disabled.write().await = configs
+            .iter()
+            .filter(|c| !c.name.trim().is_empty())
+            .filter_map(|c| {
+                let verdict = effective_enable(c, categories, activation);
+                (!verdict.is_enabled()).then(|| DisabledServer {
+                    name: c.name.clone(),
+                    verdict,
+                })
+            })
+            .collect();
 
         let desired: Vec<&McpServerConfig> = configs
             .iter()
             // Skip rows with no endpoint yet (just added in the editor, no
             // command or url typed) — connecting one would route to stdio with
-            // an empty command and surface a confusing `resolve ``` error.
+            // an empty command and surface a confusing resolve error.
             .filter(|c| {
-                // Connect if any consumer wants it; all off ⇒ fully disabled.
+                // Connect if any consumer wants it; all off => fully disabled.
                 (c.claude_access || c.offload_access || c.opencode_access)
+                    // V37 C3: and the registry says it exists at all.
+                    && server_enabled(c, categories, activation)
                     && !c.name.trim().is_empty()
                     && (!c.command.trim().is_empty() || !c.url.trim().is_empty())
             })
@@ -867,16 +1062,50 @@ impl McpHost {
     }
 
     /// Healthy servers' namespaced tool defs, filtered to one consumer's
-    /// access flag.
+    /// access flag — and, since V37 (contract C3), to the effective-enable
+    /// predicate's verdict.
+    ///
+    /// The second filter is belt-and-braces on the warm path: reconcile already
+    /// refuses to connect a disabled server, so in a settled host the disabled
+    /// set and the connection set are disjoint. It matters in the window
+    /// between a toggle landing in [`Self::disabled`] and the teardown
+    /// completing — advertisement is a courtesy (contract C4), but a courtesy
+    /// that lies for a few milliseconds costs a model one refused call.
     async fn tool_defs_filtered(&self, consumer: Consumer) -> Vec<ToolDef> {
+        let disabled = self.disabled.read().await;
         let servers = self.servers.read().await;
         let mut out = Vec::new();
         for s in servers.iter() {
-            if consumer.wants(s) {
+            if consumer.wants(s) && !disabled.iter().any(|d| d.name == s.name) {
                 out.extend(s.tool_defs());
             }
         }
         out
+    }
+
+    /// V37 C4: the disabled server that would own `namespaced`, if any.
+    ///
+    /// Matched by NAMESPACE PREFIX, which is the one place this file deviates
+    /// from its own route-by-ownership rule (`call`) — and it has to: a
+    /// disabled server has no connection, therefore no advertised tool list to
+    /// match exactly against. The longest matching name wins, so a
+    /// `git`/`git__extra` pair resolves deterministically to the more specific
+    /// one. The blast radius of a wrong pick is bounded to the *wording* of a
+    /// refusal that is happening either way: only disabled names are candidates,
+    /// and an unknown tool matches none of them and falls through to the
+    /// existing "not available to X" error — which is what keeps *disabled*
+    /// distinguishable from *never existed*.
+    async fn disabled_owner(&self, namespaced: &str) -> Option<(String, EnableVerdict)> {
+        let disabled = self.disabled.read().await;
+        disabled
+            .iter()
+            .filter(|d| {
+                namespaced.len() > d.name.len() + 2
+                    && namespaced.starts_with(&d.name)
+                    && namespaced[d.name.len()..].starts_with("__")
+            })
+            .max_by_key(|d| d.name.len())
+            .map(|d| (d.name.clone(), d.verdict.clone()))
     }
 
     /// Offload-worker tool defs (servers with `offload_access`), for merging
@@ -901,12 +1130,33 @@ impl McpHost {
     /// Route a namespaced `<server>__<tool>` call to its owning server, but
     /// only if that server is exposed to `consumer` — a proxied agent must
     /// never reach a server it isn't granted.
+    ///
+    /// # V37 contract C4 — enforcement is here
+    ///
+    /// Advertisement is a courtesy; THIS is the boundary. Propagation to a live
+    /// agent is eventually consistent (Claude sees a new surface next turn,
+    /// OpenCode on its own refresh), so a call against a stale surface is
+    /// normal, not exceptional — and it must come back saying *which toggle*
+    /// made the tool vanish, not "no such tool". The disabled check therefore
+    /// runs BEFORE the `owns` check: `owns` is computed from live connections,
+    /// which a disabled server by definition has none of.
+    ///
+    /// In-flight calls are never killed by a toggle — a call already inside
+    /// [`Self::call`] runs to completion. The new state applies from the next
+    /// call, which is the only point at which it is observable anyway.
     async fn call_for_consumer(
         &self,
         consumer: Consumer,
         namespaced: &str,
         args: Value,
     ) -> Result<String, HostError> {
+        if let Some((name, verdict)) = self.disabled_owner(namespaced).await {
+            // `refusal` yields `None` only for `Enabled`, which
+            // `disabled_owner` never returns.
+            if let Some(msg) = verdict.refusal(&name) {
+                return Err(HostError::cimp(msg));
+            }
+        }
         let owns = {
             let servers = self.servers.read().await;
             servers
@@ -1161,8 +1411,19 @@ fn config_sig(c: &McpServerConfig) -> String {
     // for the process lifetime on every `McpServer`. `token_fp`'s rationale in
     // `service.rs` is the same one — the signature only ever needs to detect
     // *change*.
+    // V37: `enabled` and `origin` join the list.
+    //
+    // `enabled` because it decides membership of reconcile's DESIRED set: a
+    // server toggled off must leave the pool, and the only thing that makes
+    // `warm_host` call `reconcile` at all is `host_config_sig` moving.
+    //
+    // `origin` because V37 Phase E screens tool DESCRIPTIONS on `external`
+    // servers only, once per connect. If flipping a server to `external` did
+    // not re-key the signature, its already-warm connection would keep serving
+    // an unscreened surface for the app's lifetime — the same shape of bug the
+    // `auth_token` note above records.
     format!(
-        "{}|{}|{:?}|{}|{}|{}|{:?}|{}",
+        "{}|{}|{:?}|{}|{}|{}|{:?}|{}|{}|{:?}",
         c.command,
         c.url,
         c.args,
@@ -1170,7 +1431,9 @@ fn config_sig(c: &McpServerConfig) -> String {
         c.offload_access,
         c.opencode_access,
         env,
-        token_fp(&c.auth_token)
+        token_fp(&c.auth_token),
+        c.enabled,
+        c.origin
     )
 }
 
@@ -1189,15 +1452,37 @@ fn token_fp(token: &str) -> u64 {
 /// roots). `warm_host` compares this against the last reconcile so an
 /// unchanged config skips the work — and the `host_reconcile_lock` hold —
 /// on the per-run hot path.
-pub fn host_config_sig(configs: &[McpServerConfig], roots: &[PathBuf]) -> String {
+pub fn host_config_sig(
+    configs: &[McpServerConfig],
+    categories: &[McpCategory],
+    activation: &McpActivation,
+    roots: &[PathBuf],
+) -> String {
     let mut servers: Vec<String> = configs
         .iter()
         .map(|c| format!("{}={}", c.name, config_sig(c)))
         .collect();
     servers.sort();
+    // V37: the registry context is part of the DESIRED host config, because the
+    // C3 predicate reads it. A category's membership or its `enabled` flipping
+    // changes which servers should be connected without any server row moving,
+    // so without this the toggle would be a no-op until something else happened
+    // to re-key the signature.
+    let mut cats: Vec<String> = categories
+        .iter()
+        .map(|c| {
+            let mut members: Vec<&str> = c.servers.iter().map(String::as_str).collect();
+            members.sort_unstable();
+            format!("{}={}:{:?}", c.name, c.enabled, members)
+        })
+        .collect();
+    cats.sort();
+    // Both activation halves are `BTreeMap`s, so their `Debug` is already in a
+    // stable key order — no sort needed, and none must be added later either.
+    let act = format!("{:?}/{:?}", activation.categories, activation.servers);
     let mut roots: Vec<String> = roots.iter().map(|r| r.display().to_string()).collect();
     roots.sort();
-    format!("{servers:?}|roots:{roots:?}")
+    format!("{servers:?}|cats:{cats:?}|act:{act}|roots:{roots:?}")
 }
 
 /// Connect (or fail-soft) one server from its config. A failure yields an
@@ -2476,19 +2761,113 @@ mod tests {
             ..Default::default()
         };
         let roots = vec![PathBuf::from("/work")];
-        let s1 = host_config_sig(std::slice::from_ref(&a), &roots);
+        let none: Vec<McpCategory> = Vec::new();
+        let act = McpActivation::default();
+        let s1 = host_config_sig(std::slice::from_ref(&a), &none, &act, &roots);
         // Stable for identical input (the warm_host skip relies on this).
-        assert_eq!(s1, host_config_sig(std::slice::from_ref(&a), &roots));
+        assert_eq!(
+            s1,
+            host_config_sig(std::slice::from_ref(&a), &none, &act, &roots)
+        );
         // Changes when a server field changes (access toggle, url, …).
         let b = McpServerConfig {
             offload_access: false,
             ..a.clone()
         };
-        assert_ne!(s1, host_config_sig(std::slice::from_ref(&b), &roots));
+        assert_ne!(
+            s1,
+            host_config_sig(std::slice::from_ref(&b), &none, &act, &roots)
+        );
         // Changes when the allowed roots change.
         assert_ne!(
             s1,
-            host_config_sig(std::slice::from_ref(&a), &[PathBuf::from("/other")])
+            host_config_sig(
+                std::slice::from_ref(&a),
+                &none,
+                &act,
+                &[PathBuf::from("/other")]
+            )
+        );
+    }
+
+    /// V37 contract C3/C5: `warm_host` only calls `reconcile` when
+    /// `host_config_sig` moves, so every registry input that changes the
+    /// DESIRED set must be in it. Three inputs are new in v32 and none of them
+    /// touches a server row: the server's own `enabled`, a category's
+    /// membership or `enabled`, and an activation entry. A missing one is a
+    /// toggle that silently does nothing until an unrelated edit re-keys the
+    /// signature.
+    #[test]
+    fn host_config_sig_moves_on_every_registry_change() {
+        let srv = McpServerConfig {
+            name: "ddg".into(),
+            url: "http://x/mcp".into(),
+            offload_access: true,
+            ..Default::default()
+        };
+        let roots = vec![PathBuf::from("/work")];
+        let none: Vec<McpCategory> = Vec::new();
+        let act = McpActivation::default();
+        let base = host_config_sig(std::slice::from_ref(&srv), &none, &act, &roots);
+
+        // a) the server's own toggle.
+        let off = McpServerConfig {
+            enabled: false,
+            ..srv.clone()
+        };
+        assert_ne!(
+            base,
+            host_config_sig(std::slice::from_ref(&off), &none, &act, &roots)
+        );
+
+        // b) a category appears, then loses the member, then flips enabled.
+        let cat = |members: &[&str], enabled: bool| {
+            vec![McpCategory {
+                name: "research".into(),
+                servers: members.iter().map(|s| (*s).to_string()).collect(),
+                enabled,
+            }]
+        };
+        let with_cat = host_config_sig(
+            std::slice::from_ref(&srv),
+            &cat(&["ddg"], true),
+            &act,
+            &roots,
+        );
+        assert_ne!(base, with_cat);
+        assert_ne!(
+            with_cat,
+            host_config_sig(std::slice::from_ref(&srv), &cat(&[], true), &act, &roots),
+            "membership change must move the signature"
+        );
+        assert_ne!(
+            with_cat,
+            host_config_sig(
+                std::slice::from_ref(&srv),
+                &cat(&["ddg"], false),
+                &act,
+                &roots
+            ),
+            "category enabled flip must move the signature"
+        );
+
+        // c) an activation entry at either level.
+        let mut server_override = McpActivation::default();
+        server_override.servers.insert("ddg".into(), false);
+        assert_ne!(
+            base,
+            host_config_sig(std::slice::from_ref(&srv), &none, &server_override, &roots)
+        );
+        let mut cat_override = McpActivation::default();
+        cat_override.categories.insert("research".into(), false);
+        assert_ne!(
+            with_cat,
+            host_config_sig(
+                std::slice::from_ref(&srv),
+                &cat(&["ddg"], true),
+                &cat_override,
+                &roots
+            )
         );
     }
 
@@ -2506,7 +2885,14 @@ mod tests {
             ..Default::default()
         };
         let roots = vec![PathBuf::from("/work")];
-        let sig = |c: &McpServerConfig| host_config_sig(std::slice::from_ref(c), &roots);
+        let sig = |c: &McpServerConfig| {
+            host_config_sig(
+                std::slice::from_ref(c),
+                &[],
+                &McpActivation::default(),
+                &roots,
+            )
+        };
 
         let first = McpServerConfig {
             auth_token: "sk-first".into(),
@@ -2526,5 +2912,315 @@ mod tests {
         // The signature carries a fingerprint, never the secret itself — it is
         // held per-server for the process lifetime.
         assert!(!sig(&first).contains("sk-first"), "{}", sig(&first));
+    }
+
+    // --- V37 Phase A: registry, activation, enforcement --------------------
+
+    fn cfg(name: &str, enabled: bool) -> McpServerConfig {
+        McpServerConfig {
+            name: name.into(),
+            url: "http://x/mcp".into(),
+            offload_access: true,
+            enabled,
+            ..Default::default()
+        }
+    }
+
+    fn category(name: &str, enabled: bool, servers: &[&str]) -> McpCategory {
+        McpCategory {
+            name: name.into(),
+            servers: servers.iter().map(|s| (*s).to_string()).collect(),
+            enabled,
+        }
+    }
+
+    fn activation(cats: &[(&str, bool)], servers: &[(&str, bool)]) -> McpActivation {
+        let mut a = McpActivation::default();
+        for (k, v) in cats {
+            a.categories.insert((*k).to_string(), *v);
+        }
+        for (k, v) in servers {
+            a.servers.insert((*k).to_string(), *v);
+        }
+        a
+    }
+
+    /// The contract-C3 truth table, in full. This predicate is the single owner
+    /// of "does this server exist right now" for BOTH advertisement and
+    /// dispatch, so every row here is a behaviour two call sites share.
+    #[test]
+    fn effective_enable_truth_table() {
+        let no_cats: Vec<McpCategory> = Vec::new();
+        let neutral = McpActivation::default();
+
+        // Uncategorized: the server toggle is the whole rule.
+        assert_eq!(
+            effective_enable(&cfg("ddg", true), &no_cats, &neutral),
+            EnableVerdict::Enabled
+        );
+        assert_eq!(
+            effective_enable(&cfg("ddg", false), &no_cats, &neutral),
+            EnableVerdict::ServerOff
+        );
+
+        // One category, server toggle on.
+        let on = vec![category("research", true, &["ddg"])];
+        let off = vec![category("research", false, &["ddg"])];
+        assert_eq!(
+            effective_enable(&cfg("ddg", true), &on, &neutral),
+            EnableVerdict::Enabled
+        );
+        assert_eq!(
+            effective_enable(&cfg("ddg", true), &off, &neutral),
+            EnableVerdict::CategoriesOff("research".into())
+        );
+        // The server toggle wins outright: an ON category cannot resurrect it,
+        // and the verdict names the SERVER level, not the category.
+        assert_eq!(
+            effective_enable(&cfg("ddg", false), &on, &neutral),
+            EnableVerdict::ServerOff
+        );
+
+        // A category that does not contain the server is irrelevant.
+        let elsewhere = vec![category("web", false, &["fetch"])];
+        assert_eq!(
+            effective_enable(&cfg("ddg", true), &elsewhere, &neutral),
+            EnableVerdict::Enabled
+        );
+
+        // Multi-category: categories OR, they do not AND.
+        let one_on = vec![
+            category("research", false, &["ddg"]),
+            category("web", true, &["ddg"]),
+        ];
+        assert_eq!(
+            effective_enable(&cfg("ddg", true), &one_on, &neutral),
+            EnableVerdict::Enabled
+        );
+        let all_off = vec![
+            category("research", false, &["ddg"]),
+            category("web", false, &["ddg"]),
+        ];
+        assert_eq!(
+            effective_enable(&cfg("ddg", true), &all_off, &neutral),
+            // The FIRST containing category in registry order, deterministically.
+            EnableVerdict::CategoriesOff("research".into())
+        );
+    }
+
+    /// The overlay half of C3, in both directions and at both levels. The maps
+    /// reaching this function are already project-composed, so an entry is an
+    /// override of the global flag — never a copy of it.
+    #[test]
+    fn activation_overrides_both_levels_in_both_directions() {
+        let no_cats: Vec<McpCategory> = Vec::new();
+
+        // Server level: overlay turns a globally-ON server off …
+        assert_eq!(
+            effective_enable(
+                &cfg("ddg", true),
+                &no_cats,
+                &activation(&[], &[("ddg", false)])
+            ),
+            EnableVerdict::ServerOff
+        );
+        // … and a globally-OFF server on.
+        assert_eq!(
+            effective_enable(
+                &cfg("ddg", false),
+                &no_cats,
+                &activation(&[], &[("ddg", true)])
+            ),
+            EnableVerdict::Enabled
+        );
+
+        // Category level: overlay turns a globally-ON category off …
+        let on = vec![category("research", true, &["ddg"])];
+        assert_eq!(
+            effective_enable(
+                &cfg("ddg", true),
+                &on,
+                &activation(&[("research", false)], &[])
+            ),
+            EnableVerdict::CategoriesOff("research".into())
+        );
+        // … and a globally-OFF category on.
+        let off = vec![category("research", false, &["ddg"])];
+        assert_eq!(
+            effective_enable(
+                &cfg("ddg", true),
+                &off,
+                &activation(&[("research", true)], &[])
+            ),
+            EnableVerdict::Enabled
+        );
+
+        // An entry naming something that does not exist is inert, not fatal —
+        // a renamed server/category leaves stale overlay keys behind (C1).
+        assert_eq!(
+            effective_enable(
+                &cfg("ddg", true),
+                &on,
+                &activation(&[("gone", false)], &[("also-gone", false)])
+            ),
+            EnableVerdict::Enabled
+        );
+    }
+
+    /// V37 C3: a disabled server is not advertised to ANY consumer. This is the
+    /// courtesy half; `call_for_consumer` below is the enforcement half.
+    #[tokio::test]
+    async fn tool_defs_exclude_disabled_servers() {
+        let host = McpHost::new();
+        host.servers.write().await.extend([
+            Arc::new(fake_server("alpha", true, true, true, "alpha__x")),
+            Arc::new(fake_server("beta", true, true, true, "beta__y")),
+        ]);
+        // `beta` is off at the category level.
+        *host.disabled.write().await = vec![DisabledServer {
+            name: "beta".into(),
+            verdict: EnableVerdict::CategoriesOff("research".into()),
+        }];
+
+        for defs in [
+            host.tool_defs_for_claude().await,
+            host.tool_defs_for_offload().await,
+            host.tool_defs_for_opencode().await,
+        ] {
+            assert_eq!(defs.len(), 1, "got: {defs:?}");
+            assert_eq!(defs[0].function.name, "alpha__x");
+        }
+    }
+
+    /// V37 contract C4. The refusal must name the disabled state AND the level,
+    /// because "you turned the server off" and "the category it is in is off"
+    /// are different fixes — and it must stay distinguishable from the
+    /// unknown-tool refusal, which is what tells the user whether a toggle is
+    /// even the cause.
+    #[tokio::test]
+    async fn call_for_consumer_refuses_disabled_servers_by_level() {
+        let host = McpHost::new();
+        // `alpha` stays live so the unknown-tool path is still reachable.
+        host.servers
+            .write()
+            .await
+            .push(Arc::new(fake_server("alpha", true, true, true, "alpha__x")));
+        *host.disabled.write().await = vec![
+            DisabledServer {
+                name: "beta".into(),
+                verdict: EnableVerdict::ServerOff,
+            },
+            DisabledServer {
+                name: "gamma".into(),
+                verdict: EnableVerdict::CategoriesOff("research".into()),
+            },
+        ];
+
+        let err = host
+            .call_for_consumer(Consumer::Claude, "beta__y", json!({}))
+            .await
+            .unwrap_err();
+        let d = err.diagnostic();
+        assert!(d.contains(REFUSAL_DISABLED), "got: {d}");
+        assert!(d.contains(REFUSAL_DISABLED_BY_SERVER), "got: {d}");
+        assert!(d.contains("beta"), "got: {d}");
+        // #48 M-17: a cImp-composed refusal has no remote half.
+        assert_eq!(err.remote(), None);
+
+        let err = host
+            .call_for_consumer(Consumer::Opencode, "gamma__z", json!({}))
+            .await
+            .unwrap_err();
+        let d = err.diagnostic();
+        assert!(d.contains(REFUSAL_DISABLED), "got: {d}");
+        assert!(d.contains(REFUSAL_DISABLED_BY_CATEGORY), "got: {d}");
+        assert!(d.contains("research"), "got: {d}");
+        assert!(!d.contains(REFUSAL_DISABLED_BY_SERVER), "got: {d}");
+
+        // Disabled != unknown: a tool from no configured server at all keeps
+        // the pre-V37 wording, with no claim about a toggle.
+        let err = host
+            .call_for_consumer(Consumer::Claude, "nowhere__t", json!({}))
+            .await
+            .unwrap_err();
+        let d = err.diagnostic();
+        assert!(d.contains("not available to Claude"), "got: {d}");
+        assert!(!d.contains(REFUSAL_DISABLED), "got: {d}");
+
+        // An enabled, granted server is unaffected by the new check. (It fails
+        // later, on the absent connection — the point is only that the disabled
+        // refusal did not fire.)
+        let err = host
+            .call_for_consumer(Consumer::Claude, "alpha__x", json!({}))
+            .await
+            .unwrap_err();
+        assert!(!err.diagnostic().contains(REFUSAL_DISABLED));
+    }
+
+    /// The prefix match `disabled_owner` uses is the one deviation from this
+    /// file's route-by-ownership rule (a disabled server has no tool list to
+    /// match against), so it must be deterministic: longest name wins, and a
+    /// name that is only a prefix of a DIFFERENT server's namespace does not
+    /// steal the refusal.
+    #[tokio::test]
+    async fn disabled_owner_prefers_the_longest_namespace_match() {
+        let host = McpHost::new();
+        *host.disabled.write().await = vec![
+            DisabledServer {
+                name: "git".into(),
+                verdict: EnableVerdict::ServerOff,
+            },
+            DisabledServer {
+                name: "git__extra".into(),
+                verdict: EnableVerdict::CategoriesOff("vcs".into()),
+            },
+        ];
+        assert_eq!(
+            host.disabled_owner("git__extra__log").await.unwrap().0,
+            "git__extra"
+        );
+        assert_eq!(host.disabled_owner("git__log").await.unwrap().0, "git");
+        // The separator is required: `github__x` is not `git`'s.
+        assert!(host.disabled_owner("github__x").await.is_none());
+        // A bare server name with no tool half owns nothing.
+        assert!(host.disabled_owner("git").await.is_none());
+        assert!(host.disabled_owner("git__").await.is_none());
+    }
+
+    /// V37 C3: reconcile must treat a disabled server as ABSENT — never
+    /// connected — while still recording it, so dispatch keeps the level
+    /// information. (No endpoint is reachable in a unit test, so this asserts
+    /// the bookkeeping, which is the part with the contract on it.)
+    #[tokio::test]
+    async fn reconcile_records_disabled_servers_and_never_connects_them() {
+        let host = McpHost::new();
+        let servers = vec![
+            cfg("ddg", true),
+            cfg("beta", false),
+            cfg("gamma", true),
+            // A half-typed row: no name yet. Not "disabled" — incomplete.
+            McpServerConfig {
+                name: "  ".into(),
+                ..cfg("", false)
+            },
+        ];
+        let cats = vec![category("research", false, &["gamma"])];
+        host.reconcile(&servers, &cats, &McpActivation::default(), &[])
+            .await;
+
+        let disabled = host.disabled.read().await;
+        assert_eq!(disabled.len(), 2, "got: {disabled:?}");
+        assert_eq!(disabled[0].name, "beta");
+        assert_eq!(disabled[0].verdict, EnableVerdict::ServerOff);
+        assert_eq!(disabled[1].name, "gamma");
+        assert_eq!(
+            disabled[1].verdict,
+            EnableVerdict::CategoriesOff("research".into())
+        );
+        drop(disabled);
+
+        // Nothing disabled ended up in the pool.
+        let pool = host.servers.read().await;
+        assert!(pool.iter().all(|s| s.name != "beta" && s.name != "gamma"));
     }
 }

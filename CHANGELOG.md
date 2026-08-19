@@ -51,6 +51,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Windows directory are refused with an Events row, while the remaining grants
   still apply.
 
+## [0.53.0-rc.2] — 2026-08-19
+
+### Added
+
+- **Registered command tools are callable from the AI tabs.** `command`-kind
+  plugin entries (git, cargo, npm, …) surface to Claude Code and OpenCode
+  sessions as one `run_command` MCP tool: a `tool` enum of the entries you
+  enabled and pointed at a binary, arguments as an argv vector (no shell —
+  no pipes, redirection or chaining), always at the project root, under the
+  same sandbox seam as the offload worker's runs. Two switches in Settings →
+  Tool Plugins control exposure per harness (default on; re-checked on every
+  call, so turning one off bites already-running tabs). The tool stays hidden
+  until a command tool is actually runnable; OpenCode tabs need a restart to
+  see surface changes (it caches the tool list at connect).
+- **Detect finds tools for you.** The Detect button in Tool Plugins now
+  derives the tool's command name (a check's program, a command tool's id)
+  and searches the `ebin` folder then PATH; a hit on an empty path box is
+  stored as the tool's machine-wide path, along with same-plugin siblings
+  that run the same binary — one Detect on `cargo build` fills all four
+  cargo rows. Run-time trust is unchanged: an unconfigured user-plugin tool
+  still never runs, and built-in scanners keep their live ebin/PATH lookup
+  instead of being pinned. Failure messages now say which of the three
+  failures actually happened.
+- **Plugin checks run where their project marker is.** A check gated on a
+  marker (`Cargo.toml`, `pom.xml`, …) that matches only in a subdirectory now
+  runs in that directory instead of failing at the project root (a manifest's
+  own `cwd` still wins; nested-workspace fan-out remains one-check-one-dir).
+- **Failed checks explain themselves.** A `run_check` run that exits nonzero
+  with zero parseable diagnostics now carries the tail of the tool's raw
+  output instead of a bare "No diagnostics".
+
+### Changed
+
+- The Tool Plugins pane reads like the rest of Settings: the plugin list is a
+  sidebar-styled category list with a separator against the detail pane, and
+  plugin versions show only beside the enable checkbox (returning to the list
+  only when two loaded plugins share a name).
+
 ## [0.53.0-rc.1] — 2026-08-19
 
 ### Added

@@ -133,6 +133,25 @@ pub struct PluginSet {
 /// out of here is something the caller puts in front of the user.
 fn load_file(path: &Path, provenance: Provenance) -> Result<LoadedPlugin, PluginError> {
     let display = path.display().to_string();
+    // Size BEFORE the read: `plugins/` is a directory anything running as the
+    // user can write into, and the startup scan reads every `.json` in it — so
+    // one enormous file would otherwise be an out-of-memory launch rather than
+    // a rejected plugin. `manifest::parse` re-checks the text it is handed
+    // (that is the contract, and it covers Phase E's embedded manifests); this
+    // is the resource guard. Both name the same `MAX_MANIFEST_BYTES`.
+    //
+    // A metadata failure is deliberately NOT a verdict — fall through and let
+    // the read below report the real I/O error.
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.len() > manifest::MAX_MANIFEST_BYTES {
+            return Err(PluginError {
+                kind: PluginErrorKind::Invalid,
+                paths: vec![display],
+                key: None,
+                reason: ValidationError::Size { bytes: meta.len() }.to_string(),
+            });
+        }
+    }
     let text = std::fs::read_to_string(path).map_err(|e| PluginError {
         kind: PluginErrorKind::Io,
         paths: vec![display.clone()],
@@ -146,27 +165,18 @@ fn load_file(path: &Path, provenance: Provenance) -> Result<LoadedPlugin, Plugin
             key: m.key(),
             manifest: m,
         }),
-        Err(e) => {
-            // A syntax failure has no trustworthy identity, so we do not guess
-            // one — `key: None` is the honest answer and the settings pane
-            // shows the file name instead.
-            let key = match &e {
-                ValidationError::Syntax(_) => None,
-                _ => serde_json::from_str::<serde_json::Value>(&text)
-                    .ok()
-                    .and_then(|v| {
-                        let n = v.get("name")?.as_str()?.to_string();
-                        let ver = v.get("version")?.as_str()?.to_string();
-                        Some(format!("{n}@{ver}"))
-                    }),
-            };
-            Err(PluginError {
-                kind: PluginErrorKind::Invalid,
-                paths: vec![display],
-                key,
-                reason: e.to_string(),
-            })
-        }
+        // The identity travels WITH the failure ([`manifest::ParseFailure`]): a
+        // file that failed validation has already been deserialized once, so
+        // re-parsing its text to fish the name back out would be a second full
+        // parse of input we just refused. A file that never parsed carries
+        // `None` and the settings pane shows its file name — the honest answer
+        // rather than a guessed identity in the audit trail.
+        Err(f) => Err(PluginError {
+            kind: PluginErrorKind::Invalid,
+            paths: vec![display],
+            key: f.key,
+            reason: f.error.to_string(),
+        }),
     }
 }
 
@@ -473,6 +483,37 @@ mod tests {
         assert!(set.plugins.is_empty());
         assert_eq!(set.errors.len(), 1);
         assert!(set.errors[0].reason.contains("reserved"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The resource half of the size cap: an oversized file is refused from its
+    /// directory entry, before a byte of it is read into memory. `plugins/` is
+    /// writable by anything running as the user and the scan reads every
+    /// `.json` in it, so "read it, then decide" is an out-of-memory launch.
+    #[test]
+    fn an_oversized_manifest_is_refused_without_being_read() {
+        let dir = temp_dir("huge");
+        let body = format!(
+            "{}{}",
+            manifest_text("huge", "1.0.0", "t"),
+            " ".repeat(manifest::MAX_MANIFEST_BYTES as usize)
+        );
+        write(&dir, "huge.json", &body);
+        // A good neighbour still loads: one bad file never costs the others.
+        write(&dir, "ok.json", &manifest_text("fine", "1.0.0", "t"));
+
+        let set = scan_dir(&dir, Provenance::User);
+        assert_eq!(
+            set.plugins.iter().map(|p| p.key.as_str()).collect::<Vec<_>>(),
+            vec!["fine@1.0.0"]
+        );
+        assert_eq!(set.errors.len(), 1, "{:?}", set.errors);
+        assert_eq!(set.errors[0].kind, PluginErrorKind::Invalid);
+        assert!(
+            set.errors[0].reason.contains(&body.len().to_string()),
+            "the refusal must name the size: {}",
+            set.errors[0].reason
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

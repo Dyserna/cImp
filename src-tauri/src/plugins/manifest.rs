@@ -56,6 +56,38 @@ pub const MANIFEST_VERSION: u32 = 1;
 /// present itself as one of ours in the settings list.
 pub const RESERVED_NAME_PREFIX: &str = "cimp-";
 
+/// Largest manifest this build will read, in bytes.
+///
+/// A manifest is a short declaration — the roomiest plausible one (every built-in
+/// adapter re-expressed in one file) is a few tens of kilobytes — so a megabyte
+/// is two orders of magnitude of headroom and still bounds what a dropped file
+/// can cost. Without a cap, `plugins/` is a directory anything running as the
+/// user can write into and the startup scan `read_to_string`s every `.json` in
+/// it: one enormous file turns launch into an OOM. Enforced in BOTH places that
+/// can see a size — [`crate::plugins::loader`] checks the directory entry's
+/// length *before* reading (that is the resource guard), and [`parse`] checks
+/// the text it was handed (that is the contract, and it covers the embedded
+/// built-in path too).
+pub const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
+
+/// Longest identity or display string a manifest may carry, in characters.
+///
+/// Ids, versions and labels are rendered in a settings list, joined into
+/// `name@version/tool-id` keys, and stamped into Events rows; a 50 KB "label"
+/// is not a name, it is a payload, and every consumer downstream would have to
+/// decide how to truncate it. One hundred characters is far past any honest
+/// name and short enough that no renderer has to think about it.
+pub const MAX_NAME_CHARS: usize = 100;
+
+/// The widest per-tool timeout a manifest may request, in seconds (24 hours).
+///
+/// The floor is 1: `timeout_secs: 0` reads as "no timeout" to a human and as
+/// "kill it immediately" to a scheduler, so it is refused rather than assigned
+/// one of those meanings. The ceiling exists because the value becomes a
+/// wall-clock budget a pipeline waits on — a typo'd `86400000` would park a
+/// scan for three years, and "the manifest said so" is not a reason to.
+pub const MAX_TIMEOUT_SECS: u64 = 86_400;
+
 /// Where a manifest came from — **stamped by the loader**, never read from the
 /// file.
 ///
@@ -468,9 +500,15 @@ impl PluginManifest {
 pub enum ValidationError {
     /// The file did not parse as JSON, or a field had the wrong type.
     Syntax(String),
+    /// The file is larger than [`MAX_MANIFEST_BYTES`]. Named in bytes, because
+    /// "too big" without a number leaves the author guessing by how much.
+    Size { bytes: u64 },
     /// `manifest_version` is not [`MANIFEST_VERSION`].
     Version { found: u32 },
-    /// `name`/`version`/`id`/`label` missing, empty, or outside the id charset.
+    /// `timeout_secs` is 0 or above [`MAX_TIMEOUT_SECS`].
+    Timeout { tool: String, found: u64 },
+    /// `name`/`version`/`id`/`label` missing, empty, too long
+    /// ([`MAX_NAME_CHARS`]), duplicated, or outside the id charset.
     Identity(String),
     /// A user plugin claimed [`RESERVED_NAME_PREFIX`].
     ReservedName(String),
@@ -501,6 +539,18 @@ impl std::fmt::Display for ValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ValidationError::Syntax(m) => write!(f, "not a valid manifest: {m}"),
+            ValidationError::Size { bytes } => write!(
+                f,
+                "the manifest is {bytes} bytes, over the {MAX_MANIFEST_BYTES}-byte limit — a \
+                 plugin definition is a short declaration, so a file this large is either not a \
+                 manifest or not one this build should read"
+            ),
+            ValidationError::Timeout { tool, found } => write!(
+                f,
+                "tool `{tool}`: `timeout_secs` {found} is out of range (1..={MAX_TIMEOUT_SECS}) \
+                 — 0 would mean both `no limit` and `kill it at once` depending on who read it, \
+                 and anything past a day is a typo the pipeline would wait out"
+            ),
             ValidationError::Version { found } => write!(
                 f,
                 "`manifest_version` {found} is not supported by this build (expected \
@@ -547,6 +597,24 @@ fn valid_version(s: &str) -> bool {
     !s.is_empty()
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+'))
+}
+
+/// The length gate every identity and display string passes, in **characters**
+/// rather than bytes so a manifest written in a non-Latin script is measured by
+/// what a reader sees rather than by its UTF-8 weight.
+///
+/// A separate check from [`valid_id`]/[`valid_version`] on purpose: "not a
+/// token" and "a token 4000 characters long" are different mistakes, and one
+/// message that covered both would explain neither. `what` names the field so
+/// the author knows which of a dozen strings to shorten.
+fn length_checked(what: &str, value: &str) -> Result<(), ValidationError> {
+    let len = value.chars().count();
+    if len > MAX_NAME_CHARS {
+        return Err(ValidationError::Identity(format!(
+            "{what} is {len} characters, over the {MAX_NAME_CHARS}-character limit"
+        )));
+    }
+    Ok(())
 }
 
 /// An env var name: non-empty, no `=`, no NUL, no whitespace.
@@ -645,11 +713,28 @@ pub fn validate(m: &PluginManifest, provenance: Provenance) -> Result<(), Valida
             m.name
         )));
     }
+    length_checked("`name`", &m.name)?;
     if !valid_version(&m.version) {
         return Err(ValidationError::Identity(format!(
             "`version` must be a non-empty [A-Za-z0-9._+-] token (found `{}`)",
             m.version
         )));
+    }
+    length_checked("`version`", &m.version)?;
+    // The plugin label is OPTIONAL (it falls back to `name`), but an empty one
+    // is not the same as an absent one: absent means "use the name", present
+    // and blank means the settings list renders a nameless row the user cannot
+    // identify. Tool and category labels are already refused when blank; this
+    // closes the one level that was not.
+    if let Some(label) = &m.label {
+        if label.trim().is_empty() {
+            return Err(ValidationError::Identity(
+                "plugin `label` is present but empty — omit it to fall back to `name`, or give \
+                 it one; a blank label renders an unidentifiable row"
+                    .to_string(),
+            ));
+        }
+        length_checked("plugin `label`", label)?;
     }
     if provenance == Provenance::User && m.name.starts_with(RESERVED_NAME_PREFIX) {
         return Err(ValidationError::ReservedName(m.name.clone()));
@@ -677,12 +762,14 @@ pub fn validate(m: &PluginManifest, provenance: Provenance) -> Result<(), Valida
                 t.id
             )));
         }
+        length_checked(&format!("tool id `{}`", t.id), &t.id)?;
         if t.label.trim().is_empty() {
             return Err(ValidationError::Identity(format!(
                 "tool `{}` has an empty `label`",
                 t.id
             )));
         }
+        length_checked(&format!("tool `{}`'s `label`", t.id), &t.label)?;
         validate_tool(t, provenance)?;
     }
 
@@ -705,12 +792,14 @@ pub fn validate(m: &PluginManifest, provenance: Provenance) -> Result<(), Valida
                 c.id
             )));
         }
+        length_checked(&format!("category id `{}`", c.id), &c.id)?;
         if c.label.trim().is_empty() {
             return Err(ValidationError::Category(format!(
                 "category `{}` has an empty `label`",
                 c.id
             )));
         }
+        length_checked(&format!("category `{}`'s `label`", c.id), &c.label)?;
         for tid in &c.tools {
             if !seen_tools.contains(tid.as_str()) {
                 return Err(ValidationError::Category(format!(
@@ -773,12 +862,49 @@ fn validate_tool(t: &ToolManifest, provenance: Provenance) -> Result<(), Validat
         }
     }
 
-    let declared_vars: BTreeSet<&str> = t.variables.iter().map(|v| v.name.as_str()).collect();
+    // A timeout is a wall-clock budget a pipeline waits out, so both ends are
+    // bounded — see [`MAX_TIMEOUT_SECS`] for why 0 is refused rather than
+    // interpreted.
+    if let Some(secs) = t.timeout_secs {
+        if secs == 0 || secs > MAX_TIMEOUT_SECS {
+            return Err(ValidationError::Timeout {
+                tool: t.id.clone(),
+                found: secs,
+            });
+        }
+    }
+
+    // Built by INSERTION, not `collect`: a set collected from the list silently
+    // swallows a duplicate `name`, and the author of `[{ruleset, default "a"},
+    // {ruleset, default "b"}]` gets one field in the settings pane with one of
+    // the two defaults, chosen by list order — a value they never wrote and
+    // cannot see is wrong. Two declarations of one variable is a mistake with
+    // no correct reading, so it is refused.
+    let mut declared_vars: BTreeSet<&str> = BTreeSet::new();
     for v in &t.variables {
         if !valid_id(&v.name) {
             return Err(ValidationError::Identity(format!(
                 "tool `{}` declares variable `{}`, which is not a [A-Za-z0-9_-] token",
                 t.id, v.name
+            )));
+        }
+        length_checked(&format!("tool `{}`'s variable `{}`", t.id, v.name), &v.name)?;
+        if v.label.trim().is_empty() {
+            return Err(ValidationError::Identity(format!(
+                "tool `{}`'s variable `{}` has an empty `label` — it is what the settings pane \
+                 puts beside the input",
+                t.id, v.name
+            )));
+        }
+        length_checked(
+            &format!("tool `{}`'s variable `{}` label", t.id, v.name),
+            &v.label,
+        )?;
+        if !declared_vars.insert(v.name.as_str()) {
+            return Err(ValidationError::Identity(format!(
+                "tool `{}` declares the variable `{}` twice — one input cannot carry two \
+                 declarations, and `{{var:{}}}` could not say which it meant",
+                t.id, v.name, v.name
             )));
         }
     }
@@ -995,12 +1121,53 @@ fn validate_tool(t: &ToolManifest, provenance: Provenance) -> Result<(), Validat
     Ok(())
 }
 
+/// Why one manifest did not load, **with the identity it managed to state**.
+///
+/// The identity is carried out of here rather than recovered by the caller: a
+/// file that failed *validation* has already been deserialized once, so its
+/// `name`/`version` are sitting right there, and re-parsing the whole text as a
+/// `Value` to fish them back out is a second full parse of the exact input we
+/// just decided not to trust. A file that failed to PARSE has no trustworthy
+/// identity at all and gets `None` — the settings pane then shows the file
+/// name, which is the honest answer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParseFailure {
+    pub error: ValidationError,
+    /// `name@version`, when the file got far enough to have one.
+    pub key: Option<String>,
+}
+
+/// Displays as the reason alone. The identity is a separate column everywhere
+/// it is shown (the settings row's title, the Events row's `source`), so
+/// folding it into the sentence would print it twice.
+impl std::fmt::Display for ParseFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
 /// Parse + validate one manifest's bytes. The single entry point the loader
 /// uses, so "parsed" and "validated" cannot come apart.
-pub fn parse(text: &str, provenance: Provenance) -> Result<PluginManifest, ValidationError> {
-    let m: PluginManifest =
-        serde_json::from_str(text).map_err(|e| ValidationError::Syntax(e.to_string()))?;
-    validate(&m, provenance)?;
+pub fn parse(text: &str, provenance: Provenance) -> Result<PluginManifest, ParseFailure> {
+    // The contract half of the size cap (the loader enforces the resource half
+    // before it reads a byte). Here so the embedded built-in path Phase E adds
+    // passes the same boundary as a scanned file — one validator, one limit.
+    if text.len() as u64 > MAX_MANIFEST_BYTES {
+        return Err(ParseFailure {
+            error: ValidationError::Size {
+                bytes: text.len() as u64,
+            },
+            key: None,
+        });
+    }
+    let m: PluginManifest = serde_json::from_str(text).map_err(|e| ParseFailure {
+        error: ValidationError::Syntax(e.to_string()),
+        key: None,
+    })?;
+    validate(&m, provenance).map_err(|error| ParseFailure {
+        error,
+        key: Some(m.key()),
+    })?;
     Ok(m)
 }
 
@@ -1055,7 +1222,9 @@ mod tests {
     }
 
     fn err(json: &str) -> ValidationError {
-        parse(json, Provenance::User).expect_err("manifest should have been rejected")
+        parse(json, Provenance::User)
+            .expect_err("manifest should have been rejected")
+            .error
     }
 
     #[test]
@@ -1205,7 +1374,10 @@ mod tests {
         // Even on the embedded path: provenance is the loader's, always.
         assert!(matches!(
             parse(&plugin_level, Provenance::Builtin),
-            Err(ValidationError::BuiltinField(_))
+            Err(ParseFailure {
+                error: ValidationError::BuiltinField(_),
+                ..
+            })
         ));
     }
 
@@ -1235,6 +1407,143 @@ mod tests {
                 "{to} should have been refused"
             );
         }
+    }
+
+    /// A timeout is a wall-clock budget something waits out, so both ends are
+    /// bounded — and 0 is refused rather than silently meaning one of the two
+    /// opposite things a reader would take it for.
+    #[test]
+    fn a_timeout_outside_the_supported_range_is_refused() {
+        for bad in [0u64, MAX_TIMEOUT_SECS + 1, u64::MAX] {
+            let json = command_json().replace(
+                "\"kind\": \"command\"",
+                &format!("\"kind\": \"command\", \"timeout_secs\": {bad}"),
+            );
+            match err(&json) {
+                ValidationError::Timeout { tool, found } => {
+                    assert_eq!(tool, "git");
+                    assert_eq!(found, bad);
+                }
+                other => panic!("expected a timeout error for {bad}, got {other:?}"),
+            }
+        }
+        for ok in [1u64, 600, MAX_TIMEOUT_SECS] {
+            let json = command_json().replace(
+                "\"kind\": \"command\"",
+                &format!("\"kind\": \"command\", \"timeout_secs\": {ok}"),
+            );
+            parse(&json, Provenance::User).unwrap_or_else(|e| panic!("{ok}s rejected: {e:?}"));
+        }
+    }
+
+    /// The size cap is a *contract*, not only the loader's resource guard: the
+    /// same limit has to hold on the embedded built-in path Phase E adds, which
+    /// never touches a file at all.
+    #[test]
+    fn a_manifest_over_the_size_cap_is_refused_by_bytes() {
+        // Well-formed and enormous: the refusal must be about the size, not
+        // about the shape, or the message would send the author hunting a
+        // syntax error that isn't there.
+        let padding = "x".repeat(MAX_MANIFEST_BYTES as usize);
+        let json = audit_json().replace(
+            "\"version\": \"1.0.0\"",
+            &format!("\"version\": \"1.0.0\", \"description\": \"{padding}\""),
+        );
+        match err(&json) {
+            ValidationError::Size { bytes } => {
+                assert!(bytes > MAX_MANIFEST_BYTES);
+                let msg = ValidationError::Size { bytes }.to_string();
+                assert!(msg.contains(&bytes.to_string()), "{msg}");
+            }
+            other => panic!("expected a size error, got {other:?}"),
+        }
+    }
+
+    /// Every identity and display string is bounded. A 4000-character "label"
+    /// is a payload wearing a name's clothes, and every renderer downstream
+    /// would have to invent its own truncation.
+    #[test]
+    fn an_over_long_identity_or_label_is_refused() {
+        let long = "a".repeat(MAX_NAME_CHARS + 1);
+        let cases = [
+            audit_json().replace("\"name\": \"acme\"", &format!("\"name\": \"{long}\"")),
+            audit_json().replace("\"version\": \"1.0.0\"", &format!("\"version\": \"{long}\"")),
+            audit_json().replace("\"id\": \"sec\"", &format!("\"id\": \"{long}\"")),
+            audit_json().replace("\"label\": \"Security\"", &format!("\"label\": \"{long}\"")),
+            audit_json().replace("\"id\": \"scan\"", &format!("\"id\": \"{long}\"")),
+            audit_json().replace("\"label\": \"Acme Scan\"", &format!("\"label\": \"{long}\"")),
+            audit_json().replace(
+                "\"name\": \"acme\",",
+                &format!("\"name\": \"acme\", \"label\": \"{long}\","),
+            ),
+        ];
+        for (i, json) in cases.iter().enumerate() {
+            let e = err(json);
+            assert!(
+                matches!(e, ValidationError::Identity(_) | ValidationError::Category(_)),
+                "case {i}: expected a length refusal, got {e:?}"
+            );
+            assert!(
+                e.to_string().contains("characters"),
+                "case {i}: the message must say what is wrong: {e}"
+            );
+        }
+        // The boundary itself is allowed — the cap is a limit, not an off-by-one.
+        let at_limit = "a".repeat(MAX_NAME_CHARS);
+        let json = audit_json().replace("\"label\": \"Acme Scan\"", &format!("\"label\": \"{at_limit}\""));
+        parse(&json, Provenance::User).expect("exactly at the limit is fine");
+    }
+
+    /// `C:foo` is **drive-relative** — "foo, under whatever the current
+    /// directory on drive C happens to be" — so granting it would hand a
+    /// sandboxed child a directory chosen by per-drive process state.
+    #[test]
+    fn a_drive_relative_grant_is_not_an_absolute_path() {
+        for bad in ["C:foo", "C:", "c:tools\\\\acme"] {
+            let json = audit_json().replace(
+                "\"id\": \"scan\",",
+                &format!("\"id\": \"scan\", \"extra_grants\": [\"{bad}\"],"),
+            );
+            assert!(
+                matches!(err(&json), ValidationError::Grant(_)),
+                "`{bad}` is drive-relative and must not pass as an absolute grant"
+            );
+        }
+    }
+
+    /// Two declarations of one variable have no correct reading: the settings
+    /// pane renders one input, and which default it carries would be decided by
+    /// list order — a value the author never wrote.
+    #[test]
+    fn a_variable_declared_twice_is_refused_not_collapsed() {
+        let json = audit_json().replace(
+            "\"variables\": [{ \"name\": \"ruleset\", \"label\": \"Ruleset\", \"default\": \"p/default\" }]",
+            "\"variables\": [{ \"name\": \"ruleset\", \"label\": \"A\", \"default\": \"a\" }, \
+             { \"name\": \"ruleset\", \"label\": \"B\", \"default\": \"b\" }]",
+        );
+        match err(&json) {
+            ValidationError::Identity(m) => assert!(m.contains("twice"), "{m}"),
+            other => panic!("expected a duplicate-variable refusal, got {other:?}"),
+        }
+    }
+
+    /// A present-but-blank plugin label is not the same as an absent one:
+    /// absent falls back to `name`, blank renders a row nobody can identify.
+    /// "Empty is not absent", at the one level that still allowed it.
+    #[test]
+    fn a_present_but_empty_plugin_label_is_refused_while_an_absent_one_is_fine() {
+        for blank in ["", "   "] {
+            let json = audit_json().replace(
+                "\"name\": \"acme\",",
+                &format!("\"name\": \"acme\", \"label\": \"{blank}\","),
+            );
+            match err(&json) {
+                ValidationError::Identity(m) => assert!(m.contains("label"), "{m}"),
+                other => panic!("expected an empty-label refusal, got {other:?}"),
+            }
+        }
+        // Absent is the normal case and stays valid.
+        parse(&audit_json(), Provenance::User).expect("no label at all is fine");
     }
 
     /// **Lockstep with `checks`.** The manifest and `CheckDef::validate` must

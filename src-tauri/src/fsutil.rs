@@ -111,6 +111,15 @@ pub fn norm_dir_key_path(dir: &Path) -> PathBuf {
 /// * `plugins::manifest` validates a manifest, which is authored once and read
 ///   on **every** platform: a file refused on Linux must not load on Windows
 ///   and fail later at run time. One artifact, one verdict.
+///
+/// A drive-letter form must carry a **separator after the colon**: `C:foo` is
+/// *drive-relative* — "foo, relative to whatever the current directory on
+/// drive C happens to be" — and `C:` alone names a drive, not a location.
+/// Neither is a rooted path, so neither counts as absolute here, and a plugin
+/// requesting `C:foo` as an `extra_grant` is refused rather than granted a
+/// directory that depends on per-drive process state. (They are still not
+/// *relative to the project root* either, but that is the `..`/confinement
+/// rule's business; this predicate answers one question.)
 pub fn looks_absolute(s: &str) -> bool {
     let b = s.as_bytes();
     let Some(&first) = b.first() else {
@@ -120,8 +129,8 @@ pub fn looks_absolute(s: &str) -> bool {
     if first == b'/' || first == b'\\' {
         return true;
     }
-    // `X:` drive prefix, with or without a following separator.
-    b.len() >= 2 && first.is_ascii_alphabetic() && b[1] == b':'
+    // `X:\` or `X:/` — the separator is required; see the doc comment.
+    b.len() >= 3 && first.is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/')
 }
 
 /// Directory names a *broad* recursive scan should never descend into: build
@@ -265,6 +274,16 @@ mod tests {
         }
         for rel in ["", "src", "src/main.rs", "target\\report.xml", "./out", ".."] {
             assert!(!looks_absolute(rel), "`{rel}` must read as relative");
+        }
+        // Drive-RELATIVE, which is neither: `C:foo` means "foo, under whatever
+        // the current directory on drive C happens to be", and `C:` names a
+        // drive rather than a location. Treating either as absolute would let a
+        // plugin request a grant whose target is per-drive process state.
+        for drive_rel in ["C:", "C:foo", "c:tools\\acme"] {
+            assert!(
+                !looks_absolute(drive_rel),
+                "`{drive_rel}` is drive-relative, not absolute"
+            );
         }
     }
 

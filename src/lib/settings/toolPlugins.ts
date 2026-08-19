@@ -147,6 +147,11 @@ export interface ToolRow {
   variables: ToolVariableRow[];
   /// The read-only "this tool asks for:" lines — see `permissionSummary`.
   permissions: string[];
+  /// The tool's sandbox declaration. Rendered nowhere on its own; it decides
+  /// whether the permission list starts OPEN (see `permissionsOpen`), because
+  /// anything other than `required` is the alarming ask and must not be the
+  /// one that arrives collapsed.
+  sandbox: PluginSandboxReq;
 }
 
 export type CategoryToggleState = 'on' | 'off' | 'mixed';
@@ -249,6 +254,20 @@ export function permissionSummary(tool: PluginToolManifest): string[] {
   return out;
 }
 
+/// Whether a tool's "this tool asks for…" list renders expanded.
+///
+/// Two triggers, and the second is the one the Phase B review added (D-1): a
+/// list with more than one line is worth opening, AND any sandbox declaration
+/// other than `required` is worth opening on its own — `unsupported` (runs
+/// outside the boundary) is the single most alarming thing a manifest can ask
+/// for, and as a one-line summary it used to arrive collapsed.
+export function permissionsOpen(tool: {
+  permissions: string[];
+  sandbox: PluginSandboxReq;
+}): boolean {
+  return tool.permissions.length > 1 || tool.sandbox !== 'required';
+}
+
 /// A category's toggle state, derived from its members. `mixed` renders
 /// indeterminate; an empty category (which validation forbids) reads as off
 /// rather than as a checked box describing nothing.
@@ -293,6 +312,7 @@ export function pluginRows(set: PluginSet, settings: Settings, projectKey: strin
             value: ts?.variables?.[v.name] ?? '',
           })),
           permissions: permissionSummary(t),
+          sandbox: t.sandbox,
         });
       }
       return { id: c.id, label: c.label, tools, state: categoryState(tools) };

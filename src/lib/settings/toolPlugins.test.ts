@@ -6,6 +6,7 @@ import {
   categoryState,
   errorRows,
   permissionSummary,
+  permissionsOpen,
   pluginRows,
   revertToGlobalPath,
   setCategoryEnabled,
@@ -234,6 +235,22 @@ describe('permissionSummary', () => {
     expect(permissionSummary(tool())).toEqual([
       'to run inside the OS sandbox (it refuses to run unconfined)',
     ]);
+  });
+});
+
+describe('permissionsOpen', () => {
+  test('a single line stays collapsed only when the tool declares `required`', () => {
+    expect(permissionsOpen({ permissions: ['one'], sandbox: 'required' })).toBe(false);
+    // D-1: the most alarming ask is a ONE-line summary, so length alone left
+    // it collapsed — the declaration has to open it on its own.
+    expect(permissionsOpen({ permissions: ['one'], sandbox: 'unsupported' })).toBe(true);
+    expect(permissionsOpen({ permissions: ['one'], sandbox: 'optional' })).toBe(true);
+    expect(permissionsOpen({ permissions: ['one', 'two'], sandbox: 'required' })).toBe(true);
+  });
+
+  test('a rendered row carries the declaration the heuristic reads', () => {
+    const row = pluginRows(set(), fresh(), PROJECT)[0].categories[0].tools[0];
+    expect(row.sandbox).toBe('required');
   });
 });
 

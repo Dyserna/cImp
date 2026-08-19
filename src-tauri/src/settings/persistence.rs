@@ -1088,6 +1088,20 @@ const OVERLAY_TOOL_PLUGIN_LEAVES: &[&str] = &["variables", "parameters"];
 /// named. A deny-list would let the next field added to the container ride the
 /// overlay by default, which is the wrong direction for a block whose default
 /// answer has to be "machine".
+///
+/// **Shape is part of the allow-list** (Phase B review, B-1). Every level of
+/// this subtree except the two leaves is a MAP, and a node that is not one is
+/// removed and reported rather than walked past. Walking past it was a hole
+/// with teeth: `"plugins": {"acme@1.0.0": 5}` survived the strip, `deep_merge`
+/// then scalar-overwrote the user's stored object with `5`, the lenient reader
+/// dropped the unreadable node, and the registry's "no state ⇒ the user has
+/// never touched this ⇒ enabled" default re-enabled a tool the user had
+/// switched OFF — from a file every sandboxed child can write. `null` is the
+/// same case: the merge deletes the subtree under it.
+///
+/// The one place a `null` is legitimate is a `variables`/`parameters` LEAF,
+/// where it is how [`diff`] spells "this project clears the machine's value" —
+/// so those two are handed through untouched, whatever they hold.
 fn strip_overlay_tool_plugins(v: &mut Value) -> Vec<String> {
     let mut dropped: Vec<String> = Vec::new();
     let Some(root) = v.as_object_mut() else {
@@ -1107,8 +1121,16 @@ fn strip_overlay_tool_plugins(v: &mut Value) -> Vec<String> {
         tp_obj.remove(&key);
         dropped.push(format!("tool_plugins.{key}"));
     }
+    if remove_if_not_a_map(tp_obj, "plugins") {
+        dropped.push("tool_plugins.plugins".to_string());
+    }
     if let Some(plugins) = tp_obj.get_mut("plugins").and_then(Value::as_object_mut) {
+        for key in non_map_keys(plugins) {
+            plugins.remove(&key);
+            dropped.push(format!("tool_plugins.plugins.{key}"));
+        }
         for (plugin_key, state) in plugins.iter_mut() {
+            // Every survivor of `non_map_keys` is an object.
             let Some(p) = state.as_object_mut() else {
                 continue;
             };
@@ -1116,9 +1138,16 @@ fn strip_overlay_tool_plugins(v: &mut Value) -> Vec<String> {
                 p.remove(&key);
                 dropped.push(format!("tool_plugins.plugins.{plugin_key}.{key}"));
             }
+            if remove_if_not_a_map(p, "tools") {
+                dropped.push(format!("tool_plugins.plugins.{plugin_key}.tools"));
+            }
             let Some(tools) = p.get_mut("tools").and_then(Value::as_object_mut) else {
                 continue;
             };
+            for key in non_map_keys(tools) {
+                tools.remove(&key);
+                dropped.push(format!("tool_plugins.plugins.{plugin_key}.tools.{key}"));
+            }
             for (tool_id, tstate) in tools.iter_mut() {
                 let Some(t) = tstate.as_object_mut() else {
                     continue;
@@ -1144,6 +1173,28 @@ fn strip_overlay_tool_plugins(v: &mut Value) -> Vec<String> {
         root.remove("tool_plugins");
     }
     dropped
+}
+
+/// The keys of `obj` whose value is not a JSON object — the shape half of the
+/// allow-list, collected up front for the same borrow reason as
+/// [`keys_other_than`].
+fn non_map_keys(obj: &serde_json::Map<String, Value>) -> Vec<String> {
+    obj.iter()
+        .filter(|(_, v)| !v.is_object())
+        .map(|(k, _)| k.clone())
+        .collect()
+}
+
+/// Remove `key` from `obj` when it is present and is not a JSON object.
+/// Returns whether it removed anything, so the caller can name it in `dropped`.
+fn remove_if_not_a_map(obj: &mut serde_json::Map<String, Value>, key: &str) -> bool {
+    match obj.get(key) {
+        Some(v) if !v.is_object() => {
+            obj.remove(key);
+            true
+        }
+        _ => false,
+    }
 }
 
 /// The keys of `obj` that are not in `keep`, collected up front so the caller
@@ -3533,6 +3584,130 @@ mod tests {
         let mut clean: Value = serde_json::json!({ "ui": { "theme": "tui" } });
         assert!(strip_overlay_tool_plugins(&mut clean).is_empty());
         assert_eq!(clean, serde_json::json!({ "ui": { "theme": "tui" } }));
+    }
+
+    /// Phase B review, **B-1**: the strip's allow-list covers SHAPE, and the
+    /// claim is not about the strip function — it is about what a hostile
+    /// `.cimp/config.json` can do to the answers a pipeline reads.
+    ///
+    /// So this drives the real three steps `load` performs (global → value,
+    /// strip the overlay, `deep_merge`, deserialize) and then asks the
+    /// **registry** — the one join every Phase C/D consumer goes through —
+    /// whether a tool the user disabled came back on, or whether a timeout the
+    /// user set moved. A non-object or `null` at any of the four map levels
+    /// used to survive the strip, get scalar-merged over the stored object, be
+    /// dropped by the lenient reader, and land the registry on its
+    /// never-configured default, which is ENABLED.
+    #[test]
+    fn a_hostile_overlay_shape_cannot_re_enable_a_disabled_plugin_tool() {
+        use crate::plugins::{loader::scan_dir, manifest::Provenance, registry};
+        use crate::settings::{PluginState, ToolState};
+        use std::collections::BTreeMap;
+
+        let dir = std::env::temp_dir().join(format!("cimp_tp_hostile_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("acme.json"),
+            r#"{
+              "manifest_version": 1,
+              "name": "acme",
+              "version": "1.0.0",
+              "categories": [{ "id": "sec", "label": "Security", "tools": ["scan"] }],
+              "tools": [{ "id": "scan", "label": "Acme Scan", "kind": "security", "argv": ["{root}"] }]
+            }"#,
+        )
+        .unwrap();
+        let set = scan_dir(&dir, Provenance::User);
+        assert!(set.errors.is_empty(), "{:?}", set.errors);
+
+        // The machine's answer: this tool is OFF, with a path and a timeout the
+        // user chose. Everything a hostile overlay would want to change.
+        let mut global = Settings::default();
+        global.tool_plugins.global_paths.insert(
+            "acme@1.0.0/scan".to_string(),
+            "C:\\bin\\acme.exe".to_string(),
+        );
+        global.tool_plugins.plugins.insert(
+            "acme@1.0.0".to_string(),
+            PluginState {
+                enabled: true,
+                tools: BTreeMap::from([(
+                    "scan".to_string(),
+                    ToolState {
+                        enabled: false,
+                        timeout_secs: Some(60),
+                        ..ToolState::default()
+                    },
+                )]),
+            },
+        );
+
+        // One hostile overlay per level, each the shape that used to walk past
+        // the strip: a scalar and a null at the plugins-map, the plugin-state,
+        // the tools-map and the tool-state levels.
+        let hostiles: [(&str, Value); 8] = [
+            ("plugins-map scalar", serde_json::json!({"plugins": 5})),
+            ("plugins-map null", serde_json::json!({"plugins": null})),
+            (
+                "plugin-state scalar",
+                serde_json::json!({"plugins": {"acme@1.0.0": 5}}),
+            ),
+            (
+                "plugin-state null",
+                serde_json::json!({"plugins": {"acme@1.0.0": null}}),
+            ),
+            (
+                "tools-map scalar",
+                serde_json::json!({"plugins": {"acme@1.0.0": {"tools": 5}}}),
+            ),
+            (
+                "tools-map null",
+                serde_json::json!({"plugins": {"acme@1.0.0": {"tools": null}}}),
+            ),
+            (
+                "tool-state scalar",
+                serde_json::json!({"plugins": {"acme@1.0.0": {"tools": {"scan": 5}}}}),
+            ),
+            (
+                "tool-state null",
+                serde_json::json!({"plugins": {"acme@1.0.0": {"tools": {"scan": null}}}}),
+            ),
+        ];
+
+        for (what, tool_plugins) in hostiles {
+            let mut overlay = serde_json::json!({ "tool_plugins": tool_plugins });
+            let dropped = strip_overlay_tool_plugins(&mut overlay);
+            assert!(
+                !dropped.is_empty(),
+                "{what}: a malformed node must be REPORTED, not silently tolerated"
+            );
+
+            let mut merged = serde_json::to_value(&global).unwrap();
+            deep_merge(&mut merged, overlay);
+            let loaded: Settings = serde_json::from_value(merged).unwrap();
+
+            let tools = registry::effective_tools(&set, &loaded.tool_plugins, None);
+            let scan = tools
+                .iter()
+                .find(|t| t.tool_key == "acme@1.0.0/scan")
+                .unwrap_or_else(|| panic!("{what}: the tool vanished from the registry"));
+            assert!(
+                !scan.enabled && !scan.runnable(),
+                "{what}: the overlay re-enabled a tool the user switched off"
+            );
+            assert_eq!(
+                scan.timeout_secs,
+                Some(60),
+                "{what}: the overlay moved a machine-scope timeout"
+            );
+            assert_eq!(
+                scan.path.as_deref(),
+                Some("C:\\bin\\acme.exe"),
+                "{what}: the overlay moved a machine-scope path"
+            );
+        }
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// The other half: a Settings-window edit to a machine-scope field made

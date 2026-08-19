@@ -116,6 +116,7 @@
   } from './lib/settings/codeAudit';
   import {
     errorRows,
+    permissionsOpen,
     pluginRows,
     revertToGlobalPath,
     setCategoryEnabled,
@@ -7163,7 +7164,7 @@
               <!-- The phone-app pattern: what this tool ASKS for, in one place,
                    beside the switch that grants it. Read-only — the screening
                    that can refuse a grant happens at spawn time. -->
-              <details class="plugin-perms" open={tool.permissions.length > 1}>
+              <details class="plugin-perms" open={permissionsOpen(tool)}>
                 <summary>This tool asks for…</summary>
                 <ul>
                   {#each tool.permissions as line (line)}

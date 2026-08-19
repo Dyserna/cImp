@@ -640,3 +640,29 @@ describe('rowStatus — sandbox', () => {
     expect(new Set(words).size).toBe(words.length);
   });
 });
+
+// Every RowStatus word must have pixels. The chip's class IS the status word
+// (`<span class="schip {status}">` in StatusChip.svelte), so a status missing
+// from that component's scoped <style> renders as the bare base chip — which
+// is how "a server went down" and "a server came back" briefly drew identically
+// (the V37 close-out review found `unhealthy`/`recovered` styleless: the
+// F-V37-1 defect class, one layer down). STATUS_TITLE's Record type is the
+// tooltip-completeness guard; this is its CSS twin. Raw-source mechanism per
+// settingsPointers.test.ts: Vite's glob, not node:fs.
+const STATUS_CHIP_SOURCE = import.meta.glob('/src/lib/StatusChip.svelte', {
+  query: '?raw',
+  import: 'default',
+  eager: true,
+}) as Record<string, string>;
+
+describe('StatusChip covers every RowStatus', () => {
+  it('has a .schip.<status> rule for each STATUS_TITLE key', () => {
+    const css = Object.values(STATUS_CHIP_SOURCE)[0] ?? '';
+    expect(css.length).toBeGreaterThan(0);
+    for (const status of Object.keys(STATUS_TITLE)) {
+      expect(css, `StatusChip.svelte has no .schip.${status} rule`).toMatch(
+        new RegExp(String.raw`\.schip\.${status}\b`),
+      );
+    }
+  });
+});

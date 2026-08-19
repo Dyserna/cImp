@@ -30,8 +30,12 @@
   //   • quiet — `ok`, `update`: ordinary traffic.
   //   • plain warning text — `signal`, `failed` keep the treatments the two
   //     feeds already gave them.
-  //   • UNDERLINED danger-soft — `down`, `boundary`: a real failure whose cause
-  //     is in the row, not a block we performed. Never the filled red.
+  //   • UNDERLINED danger-soft — `down`, `boundary`, `unhealthy`: a real
+  //     failure whose cause is in the row, not a block we performed. Never the
+  //     filled red.
+  //   • plain success, full strength — `recovered`: the answer to an
+  //     `unhealthy` row. Unlike `ready`'s quiet green, it exists to close an
+  //     alarm and must be as findable as the error it answers.
   //   • STRUCK-THROUGH danger OUTLINE — `withheld`: a tool removed from the
   //     advertised surface. Danger, because this is the one place in cImp where
   //     detection actually takes something away, and the chip must not
@@ -180,9 +184,19 @@
     color: var(--text-tertiary, #9aa0aa);
     opacity: 0.8;
   }
-  .schip.down {
+  .schip.down,
+  .schip.unhealthy {
     color: var(--text-danger-soft, #ffb0c0);
     text-decoration: underline dotted;
     text-underline-offset: 2px;
+  }
+
+  /* V37 C6: `unhealthy` shares `down`'s treatment on purpose — the two words
+     never appear in the same lane, and both mean "a real failure whose cause
+     is in the row", never `denied`'s red. `recovered` answers an `unhealthy`
+     row: success green at FULL strength, unlike `ready`'s quiet 0.7, because
+     its whole job is to close an alarm. */
+  .schip.recovered {
+    color: var(--text-success, #3fb950);
   }
 </style>

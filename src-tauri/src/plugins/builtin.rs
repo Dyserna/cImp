@@ -224,6 +224,86 @@ mod tests {
         assert_eq!(off, vec!["dotnet-analyzers", "semgrep-quality"]);
     }
 
+    /// **D-4 tripwire (maintenance run 2026-08-04) — the advisory-database
+    /// source must not silently disappear.**
+    ///
+    /// V23 dropped `cargo-audit` on purpose ("redundant — RustSec exports to
+    /// OSV in real time"), leaving `osv-scanner` as the roster's *only* tool
+    /// that queries a vulnerability database. That substitution is only safe
+    /// because osv.dev is a strict superset of RustSec: it also ingests GitHub
+    /// advisories. The superset is load-bearing, not incidental —
+    /// CVE-2026-42184 (tauri <= 2.11.0, origin confusion -> local IPC) is absent
+    /// from RustSec but present in osv.dev's `crates.io` ecosystem as
+    /// GHSA-7gmj-67g7-phm9, so a RustSec-only pipeline would have missed a real
+    /// Tauri CVE while osv-scanner flags it.
+    ///
+    /// Consequence of losing this tool: a Security scan keeps succeeding and
+    /// still prints "No findings", because nothing else in the roster looks at
+    /// dependencies at all. Fail here instead of shipping that silence.
+    ///
+    /// **Re-pointed at the embedded manifest (V38 Phase E gate, C-E1).** The
+    /// original lived in `audit/adapters.rs` and read the `Adapter` table plus
+    /// `default_audit_tools()`; both are gone, and the claim moved with the
+    /// facts rather than dying with their old home. Every assertion below is
+    /// the same one, asked of the JSON that now decides it.
+    #[test]
+    fn osv_dev_remains_the_dependency_advisory_source() {
+        let s = set();
+        let p = &s.plugins[0];
+        let osv = p
+            .manifest
+            .tools
+            .iter()
+            .find(|t| t.id == "osv-scanner")
+            .expect("osv-scanner must be in the shipped roster");
+
+        // It must run under `security_audit`, ungated by the census — a Rust
+        // repo, a lone `package-lock.json`, or a polyglot tree all need it.
+        assert_eq!(osv.kind, ToolKind::Security);
+        assert!(
+            osv.applicability.extensions.is_empty() && osv.applicability.markers.is_empty(),
+            "osv-scanner must stay ungated (no extension/marker gate): {:?}",
+            osv.applicability
+        );
+        // (An empty gate IS "always applicable" — that rule lives in
+        // `RunnableAudit::applicable` and is pinned by
+        // `applicability_matches_the_builtin_rule` in `audit/runnable.rs`.)
+
+        // And it must reach osv.dev: no baked-in flag may cut the lookup down
+        // to a local/offline database. A user can still opt into `--offline`
+        // via their own `parameters`; the built-in argv may not choose it for
+        // them. Both argv shapes are checked — `dir_argv` is the non-git form.
+        for argv in [&osv.argv, &osv.dir_argv] {
+            for flag in ["--offline", "--offline-vulnerabilities", "--no-resolve"] {
+                assert!(
+                    !argv.iter().any(|s| s == flag),
+                    "built-in osv-scanner argv must not carry {flag}: {argv:?}"
+                );
+            }
+        }
+
+        // Seeded enabled on a fresh install — a default-disabled advisory
+        // source is the same blind spot with an extra click in front of it.
+        // Since V38 nothing seeds a tools array; `enabled_by_default` is what
+        // a machine with no stored state resolves to.
+        assert!(
+            osv.enabled_by_default,
+            "osv-scanner must be enabled by default"
+        );
+
+        // No other roster tool queries an advisory DB, so this one is the whole
+        // of the app's dependency-CVE coverage. If a second source is ever
+        // added (cargo-audit, trivy, grype), relax this to "at least one".
+        assert_eq!(
+            p.manifest
+                .tools
+                .iter()
+                .filter(|t| t.kind == ToolKind::Security && t.id == "osv-scanner")
+                .count(),
+            1
+        );
+    }
+
     /// A user plugin may not claim the reserved prefix, and the loader stamps
     /// provenance rather than reading it — so the same bytes, scanned, are a
     /// user plugin and are refused. Pinned here because it is the property the

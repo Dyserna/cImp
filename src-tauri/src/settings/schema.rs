@@ -3781,33 +3781,41 @@ impl OffloadSettings {
 
     /// Whether at least one MCP server is exposed to Claude Code.
     ///
-    /// # V37 D-1: this reads `claude_access` and deliberately NOT `enabled`
+    /// # V37 D-1, amended by Phase F: NOTHING here is spawn-baked any more
     ///
-    /// The two flags answer different questions. `*_access` is a STRUCTURAL
-    /// grant — it decides whether this harness's child is spawned with the
-    /// proxy wired in at all, which is baked at spawn time and cannot be
-    /// changed for a live tab. `enabled` (with `mcp_categories` /
-    /// `mcp_activation`, via `offload::mcp_host::effective_enable`) is LIVE
-    /// activation state, re-evaluated on every reconcile and every dispatch.
+    /// **The new record.** The `cimp-offload` proxy child is written into EVERY
+    /// AI tab's harness config unconditionally (`harness::claude::overlay` /
+    /// `harness::opencode::config`), so neither `*_access` nor `enabled` decides
+    /// whether a tab has a proxy — every tab has one, and both flags are
+    /// re-read live: `*_access` picks the per-consumer surface at
+    /// `POST /mcp/list` time, `enabled` (with `mcp_categories` /
+    /// `mcp_activation`, via `offload::mcp_host::effective_enable`) is
+    /// re-evaluated on every reconcile and every dispatch. Flipping either one
+    /// reaches a running tab through the contract-C5 pulse. This predicate and
+    /// its two neighbours survive for HOST-LIFECYCLE and advertisement
+    /// decisions only; they no longer gate any injection.
     ///
-    /// Gating this on `enabled` would break contract C5 in the exact case C5
-    /// exists for: with every server disabled at spawn time, the tab would come
-    /// up with no proxy, and re-enabling a server later could not reach it — the
-    /// user would have to restart the tab, which is the restart-tab semantics
-    /// V37 is removing. It would also cost contract C4 its last-server case: with
-    /// no proxy, a stale call gets "unknown tool" from the child instead of the
-    /// disabled refusal that names which toggle did it.
+    /// **The original warning, kept because its reasoning is what got us here.**
+    /// D-1 said: do not add an `enabled` term, because with every server
+    /// disabled at spawn time the tab would come up with no proxy and
+    /// re-enabling later could not reach it. That hazard was real, and Phase F
+    /// found the same hole one level up — `*_access` had it too, for a tab
+    /// spawned with zero grants. The fix was not a better predicate but removing
+    /// the spawn-time decision entirely. So the warning is now MOOT FOR
+    /// INJECTION (there is no injection gate left to poison) and still live for
+    /// [`Self::mcp_host_needed`]: a host that shut itself down because
+    /// everything was toggled off would have nothing left to turn back on.
     ///
-    /// So: spawn broadly, enforce at dispatch. Do not "optimize" this by adding
-    /// an `enabled` term.
+    /// Spawn broadly — now maximally broadly — and enforce at dispatch.
     pub fn any_claude_mcp(&self) -> bool {
         self.mcp_servers.iter().any(|m| m.claude_access)
     }
 
     /// V19: whether at least one MCP server is exposed to OpenCode.
     ///
-    /// V37 D-1: reads `opencode_access` and NOT `enabled`, for the reasons
-    /// spelled out on [`Self::any_claude_mcp`].
+    /// V37 D-1 (as amended by Phase F): reads `opencode_access` and NOT
+    /// `enabled`, and gates no injection at all, for the reasons spelled out on
+    /// [`Self::any_claude_mcp`].
     pub fn any_opencode_mcp(&self) -> bool {
         self.mcp_servers.iter().any(|m| m.opencode_access)
     }
@@ -3826,7 +3834,17 @@ impl OffloadSettings {
     /// the host that owns `effective_enable`, holds the disabled set behind
     /// contract C4's refusal, and is the thing a re-enable has to reconcile
     /// into. A host that shut itself down because everything was toggled off
-    /// would have nothing left to turn back on.
+    /// would have nothing left to turn back on. **This is the one place D-1's
+    /// warning is still live** — Phase F retired its injection half, not this.
+    ///
+    /// V37 Phase F: this predicate must stay NARROW even though the proxy child
+    /// is now unconditional. The child is not a reason to hold a pool of
+    /// connections open: with no server exposed to anyone it asks
+    /// `POST /mcp/list` and gets an empty array from a torn-down host — which
+    /// is the correct answer, not a degraded one (`tool_defs_for_*` return
+    /// nothing when the pool is empty, and the child's own graph/offload tools
+    /// are unaffected). The first grant flips this predicate, `warm_host`
+    /// reconciles, and the pulse reaches the tab that was already listening.
     pub fn mcp_host_needed(&self) -> bool {
         self.enabled || self.any_claude_mcp() || self.any_opencode_mcp()
     }

@@ -41,6 +41,33 @@ tab spawned during a disabled period (defeating C5) and would replace the C4
 disabled-refusal with "unknown tool" in the last-server-disabled edge. The
 defense lives as doc-comments on all three functions.
 
+**D-1 AMENDED by Phase F (2026-08-19, user-approved scope addition).** The
+same hazard was found one level up: `*_access` had it too. A tab spawned with
+zero grants got no `cimp-offload` child at all, so there was no
+`tools/listChanged` relay for the C5 pulse to travel on and a later grant still
+needed a fresh tab — hit live by the user. The fix is not a better predicate but
+the removal of the spawn-time decision: **the proxy child is now unconditional in
+every AI tab** (`harness/claude/overlay.rs`, `harness/opencode/config.rs`), and
+`advertises_offload_to_{claude,opencode}` are deleted. Consequences: both
+`spawn_inject_sig` `"mcp"` slots lost their offload element and `"channels"` lost
+its conjunct, so an MCP access flip no longer nags open tabs to restart; the
+spawn-baked injection-hygiene paragraph lost its advertise gate (a live-changing
+input may not gate a baked artifact) and now rides every AI tab under the
+consumer-hygiene switch alone; and `events_relay` announces
+`tools/list_changed` on every (re)connect, so a child that spawned before the
+loopback existed refreshes when a grant brings it up. The three functions survive
+for host-lifecycle decisions only — D-1's "do not add an `enabled` term" warning
+is now MOOT FOR INJECTION and still live for `mcp_host_needed`.
+
+**Residual (accepted, reported):** on a bare install — offload, graph, Code Audit
+and every grant off — the FIRST grant flips `Settings::loopback_needed()`
+false→true, which really does change what a fresh Claude tab writes (the
+Notification / PermissionDenied / Stop / SubagentStop shims appear), so the
+restart hint fires once on that one edge. The MCP tools themselves still reach
+the running tab. Pinned by
+`spawn_inject_sig_tracks_spawn_time_settings`, which allows exactly `notify_hooks`
+to move there and nothing else.
+
 ## Whole-run review (post-E)
 
 All seven seams PASS: pulse chain (no producer bypasses `run_pulse_gate`;

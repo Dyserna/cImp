@@ -1516,6 +1516,32 @@ async fn events_relay(stdout: Arc<TokioMutex<tokio::io::Stdout>>) {
                     .send()
                     .await
                 {
+                    // V37 Phase F: announce a possibly-changed tool list as the
+                    // FIRST act of every (re)connection.
+                    //
+                    // This relay is the only channel a `change` frame travels
+                    // on, so any pulse emitted while it was disconnected is
+                    // gone. That used to be a narrow window; Phase F made it a
+                    // routine one, because the proxy child is now injected into
+                    // every AI tab — including tabs that spawn while the app's
+                    // loopback is not running at all (offload, graph, Code Audit
+                    // and every MCP grant off ⇒ `Settings::loopback_needed()` is
+                    // false, so there is nothing to subscribe to). The very act
+                    // that starts the loopback — granting a server — also emits
+                    // the pulse, ~300ms later via the C5 debounce, while this
+                    // task is still inside its 2s backoff. Without this line the
+                    // first grant on a cold install would still need a tab
+                    // restart, which is precisely the defect Phase F exists to
+                    // remove.
+                    //
+                    // Correct in general, not just for that case: after any gap
+                    // this child cannot know whether the surface moved, and
+                    // `tools/list_changed` is idempotent — the client answers
+                    // with one `tools/list`, which is exactly the question it
+                    // should be asking. Ordering is safe: `await_initialize`
+                    // above parks this task until the handshake reply is on the
+                    // wire.
+                    emit_list_changed(&stdout).await;
                     // Parse the SSE byte stream frame by frame. The parser owns
                     // the chunk-boundary problem end to end (TCP can split
                     // anywhere, including mid-line and mid-frame), which the
@@ -2521,6 +2547,50 @@ mod tests {
             events_query(None, "opencode", false),
             "?consumer=opencode&channels=0"
         );
+    }
+
+    /// **V37 Phase F: every reconnect announces a possibly-changed tool list.**
+    ///
+    /// The relay is the only channel a `change` frame travels on, so a pulse
+    /// emitted while it was disconnected is gone — and Phase F made that a
+    /// routine case, not a rare one: the proxy child now rides tabs that spawn
+    /// while the app's loopback is not running at all, and the very act that
+    /// starts the loopback (granting an MCP server) emits its pulse while this
+    /// task is still inside its 2s backoff. Without the announcement, the first
+    /// grant on a cold install would still need a tab restart.
+    ///
+    /// Pinned by reading this file because the behaviour has no other observable
+    /// surface: `events_relay` is one `loop` around a live HTTP stream, with no
+    /// seam a unit test can drive. Substring checks are single-line on purpose
+    /// (the tree is CRLF locally and LF on the Linux runner).
+    #[test]
+    fn the_events_relay_announces_a_changed_tool_list_on_every_connect() {
+        let src = include_str!("mcp.rs");
+        let relay = src
+            .split("async fn events_relay(")
+            .nth(1)
+            .expect("events_relay exists");
+        // Not scoped further on purpose: each needle's FIRST occurrence after
+        // the `fn` header is the real one, so the ordering assertions hold
+        // without a body delimiter that would have to know about line endings.
+        let body = relay;
+        let announce = body
+            .find("emit_list_changed(&stdout).await;")
+            .expect("the relay must announce a possibly-changed list on connect");
+        let parse = body
+            .find("parser.feed(&chunk)")
+            .expect("the relay parses SSE frames");
+        assert!(
+            announce < parse,
+            "the announcement must precede the frame loop — a pulse that arrived \
+             while this child was disconnected is never replayed"
+        );
+        // Ordering against the handshake is the other half of the safety
+        // argument: nothing may be written before the `initialize` reply.
+        let park = body
+            .find("await_initialize().await;")
+            .expect("the relay parks until the handshake reply is on the wire");
+        assert!(park < announce, "the announcement must follow await_initialize");
     }
 
     /// The handshake fact the relay subscribes with is recorded once and never

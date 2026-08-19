@@ -289,15 +289,16 @@
   <small class="hint top">
     Add an HTTP MCP endpoint by name + URL. cImp's warm MCP host aggregates the
     read-class tools from these servers and keeps the connections warm;
-    write/destructive tools are filtered out. Changes apply live to the warm host
-    and the offload worker: <strong>OpenCode</strong> refreshes its tool list in
-    the same session, <strong>Claude Code</strong> picks the new surface up on its
-    next turn, and restarting the tab (Tabs → Restart) remains the fallback if
-    one still shows a stale list. A call that reaches a disabled server is
-    refused with a message naming which toggle did it, so a stale tool list can
-    never quietly do the thing you turned off. Advanced stdio servers
-    (command/args/env) remain editable in <code>settings.json</code> under
-    <code>offload.mcp_servers</code>.
+    write/destructive tools are filtered out. <strong>Every switch on this page
+    — the category and server toggles, and the per-harness access boxes —
+    applies to tabs you already have open.</strong> <strong>OpenCode</strong>
+    refreshes its tool list in the same session, <strong>Claude Code</strong>
+    picks the new surface up on its next turn, and restarting the tab
+    (Tabs → Restart) is only a fallback if one still shows a stale list. A call
+    that reaches a disabled server is refused with a message naming which toggle
+    did it, so a stale tool list can never quietly do the thing you turned off.
+    Advanced stdio servers (command/args/env) remain editable in
+    <code>settings.json</code> under <code>offload.mcp_servers</code>.
   </small>
   {#each groups as group, gi (gi)}
     {#if group.category !== null || group.rows.length > 0 || groups.length === 1}
@@ -450,8 +451,14 @@
             <!-- Exposure, NOT enablement: `*_access` says who may see this
                  server, `enabled` says whether it exists. They are deliberately
                  orthogonal and the access boxes do not follow the toggles — a
-                 decision record, not an oversight. Unchanged from the pre-V37
-                 editor, including one save + one reload per box. -->
+                 decision record, not an oversight. One save + one reload per
+                 box, as before.
+
+                 V37 Phase F: these boxes are no longer spawn-baked. The
+                 `cimp-offload` proxy child rides every AI tab whether or not
+                 anything is granted, so a box ticked here reaches a tab that is
+                 already open — which is why the hint below says so instead of
+                 telling the user to open a fresh one. -->
             <div class="mcp-enable-row">
               <label class="mcp-enable" title="Expose this server's tools to Claude Code">
                 <input
@@ -481,6 +488,10 @@
                 <span>OpenCode</span>
               </label>
             </div>
+            <small class="hint mcp-access-note">
+              Applies to open tabs: OpenCode refreshes in the same session,
+              Claude Code on its next turn.
+            </small>
           </div>
         {/each}
       </div>
@@ -638,6 +649,13 @@
     align-items: flex-end;
     gap: 0.5rem;
   }
+  .mcp-access-note {
+    /* Sits directly under the access boxes it explains, indented with them so
+       it reads as part of that row rather than as a new subsection. */
+    display: block;
+    margin-top: 0.15rem;
+  }
+
   .mcp-enable-row,
   .mcp-chips {
     display: flex;

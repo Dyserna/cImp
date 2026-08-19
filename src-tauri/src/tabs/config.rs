@@ -448,22 +448,37 @@ pub(crate) fn tab_consumer(cfg: &AiToolTabConfig) -> &'static str {
     }
 }
 
-/// The four "is this MCP server advertised to this consumer" gates, factored
-/// out so the injection sites below and the restart-hint edge detector in
-/// `ipc::commands::settings_update` can never drift apart. Servers are
-/// injected only at TAB SPAWN (`--mcp-config` / `OPENCODE_CONFIG_CONTENT`),
-/// so a running AI tab keeps its old server set until restarted — any edit
-/// that flips one of these must surface a restart hint.
-pub(crate) fn advertises_offload_to_claude(s: &Settings) -> bool {
-    s.offload.enabled || s.graph.enabled || s.offload.any_claude_mcp()
-}
-
+/// The two "is the Code Audit MCP server advertised to this consumer" gates,
+/// factored out so the injection sites below and the restart-hint edge detector
+/// in `ipc::commands::settings_update` can never drift apart. The audit child is
+/// injected only at TAB SPAWN (`--mcp-config` / `OPENCODE_CONFIG_CONTENT`), so a
+/// running AI tab keeps its old server set until restarted — any edit that flips
+/// one of these must surface a restart hint.
+///
+/// # V37 Phase F — the offload pair is gone, and that is the point
+///
+/// There used to be FOUR gates here. `advertises_offload_to_claude` /
+/// `advertises_offload_to_opencode` (`offload.enabled ∨ graph.enabled ∨
+/// any_{claude,opencode}_mcp()`) decided whether the `cimp-offload` proxy child
+/// was written into a tab's harness config. **It is now unconditional for AI
+/// tabs**, so the predicates had no callers left and were deleted rather than
+/// left as a constant-true trap for the next reader.
+///
+/// The reason is the V37 no-restart story: a tab spawned while all three
+/// disjuncts were false had no stdio child at all, hence no `tools/listChanged`
+/// relay, hence no way for a later MCP access grant to reach the running
+/// session — the one case contract C5's propagation could not serve. Injecting
+/// the child always costs an idle process per AI tab and buys live propagation
+/// for every toggle. The child's `tools/list` is assembled at call time, so a
+/// tab with nothing enabled advertises an EMPTY list.
+///
+/// The knock-on effects, all of them, are: the two `spawn_inject_sig` `"mcp"`
+/// slots lost their offload element (an MCP access flip no longer nags every tab
+/// to restart), the `"channels"` entry lost its `advertises_offload_to_claude`
+/// conjunct, and [`injection_hygiene_applies`] lost the advertise gate under its
+/// feature switch.
 pub(crate) fn advertises_audit_to_claude(s: &Settings) -> bool {
     s.code_audit.enabled && s.code_audit.expose_claude
-}
-
-pub(crate) fn advertises_offload_to_opencode(s: &Settings) -> bool {
-    s.offload.enabled || s.graph.enabled || s.offload.any_opencode_mcp()
 }
 
 pub(crate) fn advertises_audit_to_opencode(s: &Settings) -> bool {
@@ -557,9 +572,12 @@ pub(crate) fn spawn_inject_sig(s: &Settings) -> [serde_json::Value; 2] {
     // `--append-system-prompt` and OpenCode's managed instructions file).
     //
     // V32 Phase D's injection-hygiene paragraph has no entry of its own on
-    // purpose: its gate IS `advertises_offload_to_{claude,opencode}`, already
-    // the first element of each consumer's `"mcp"` array below, so a flip that
-    // adds or removes the paragraph always moves this signature. A future
+    // purpose, and V37 Phase F changed WHICH entry covers it. Its gate used to
+    // be `advertises_offload_to_{claude,opencode}` (the old first element of
+    // each `"mcp"` array below); it is now `consumer_hygiene_for` alone, whose
+    // L1/L2/L3 cells all ride `injection::spawn_sig` — carried by the
+    // `"injection"` entry at the bottom of each consumer object. So a flip that
+    // adds or removes the paragraph still always moves this signature. A future
     // addendum with an independent gate does need its own slot here.
     let guidance = serde_json::json!([
         s.offload.enabled && s.offload.inject_guidance,
@@ -607,7 +625,15 @@ pub(crate) fn spawn_inject_sig(s: &Settings) -> [serde_json::Value; 2] {
         s.sandbox.extra_grant_dirs,
     ]);
     let claude = serde_json::json!({
-        "mcp": [advertises_offload_to_claude(s), advertises_audit_to_claude(s)],
+        // V37 Phase F: ONE element, not two. The `cimp-offload` entry is now
+        // written into every AI tab's harness config unconditionally, so the
+        // element that used to carry `advertises_offload_to_claude` was a
+        // constant — and worse, a constant assembled from `any_claude_mcp()`,
+        // which is exactly the live-propagating input this phase removed from
+        // the spawn-baked set. Keeping it would have nagged the user to restart
+        // every tab for an MCP access flip that now takes effect where they are
+        // standing. The audit child IS still gated, so its element stays.
+        "mcp": [advertises_audit_to_claude(s)],
         "guidance": guidance.clone(),
         "sandbox": sandbox.clone(),
         "statusline": s.statusline.enabled,
@@ -673,12 +699,15 @@ pub(crate) fn spawn_inject_sig(s: &Settings) -> [serde_json::Value; 2] {
         // without it, toggling `session_push` mid-session leaves every running
         // tab silently unregistered (or registered) with no restart hint.
         //
-        // The EFFECTIVE value, not the raw toggle: neither flag is emitted
-        // unless the `cimp-offload` server is injected at all
-        // (`build_pre_args`), so with offload+graph+Claude-exposed MCP all off a
-        // `session_push` flip changes no argv and must not nag every tab to
-        // restart for nothing.
-        "channels": s.offload.session_push && advertises_offload_to_claude(s),
+        // The EFFECTIVE value, which since V37 Phase F IS the raw toggle: the
+        // `cimp-offload` server is injected into every AI tab, so a
+        // `session_push` flip always changes argv (both the client
+        // `--dangerously-load-development-channels server:cimp-offload` pair and
+        // the child's own `--channel-push`). The old second conjunct
+        // (`advertises_offload_to_claude`) existed to avoid nagging when no
+        // server was injected; there is no such case any more, and leaving it
+        // would have smuggled `any_claude_mcp()` back into the spawn-baked set.
+        "channels": s.offload.session_push,
         // V32 Phase F (locked decision 14) + Phase G (locked decision 16): the
         // native-web visibility mode AND the consumer-hygiene switch, both
         // spawn-baked, both resolved PER TAB through the three-level hierarchy.
@@ -698,7 +727,8 @@ pub(crate) fn spawn_inject_sig(s: &Settings) -> [serde_json::Value; 2] {
         "injection": crate::settings::injection::spawn_sig(s, InjConsumer::Claude),
     });
     let opencode = serde_json::json!({
-        "mcp": [advertises_offload_to_opencode(s), advertises_audit_to_opencode(s)],
+        // V37 Phase F: ONE element — see the Claude half above.
+        "mcp": [advertises_audit_to_opencode(s)],
         "guidance": guidance,
         "sandbox": sandbox,
         // `write_opencode_plugin` inputs: plugin presence + its baked
@@ -760,14 +790,9 @@ pub(crate) fn compose_capability_guidance(cfg: &AiToolTabConfig, settings: &Sett
     // how every tool result below it must be read, so it should be in context
     // before the tools are described.
     //
-    // Gated on the `cimp-offload` server actually being advertised to THIS
-    // consumer, which is precisely the condition under which spotlight-wrapped
-    // EXTERNAL content, `injection warning` headers and
-    // `REFUSED (security boundary)` errors can reach the session at all. With
-    // every cImp tool surface off, cImp injects no tools, so a paragraph about
-    // cImp's markers would be noise about vocabulary the session will never
-    // meet — and forcing a non-empty addendum would make every tab carry an
-    // `--append-system-prompt` it has no use for.
+    // Gated on the consumer-hygiene feature switch and nothing else — see
+    // [`injection_hygiene_applies`] for why V37 Phase F removed the
+    // "is anything advertised" half.
     if injection_hygiene_applies(cfg, settings) {
         addendum.push_str(&injection_hygiene_guidance());
     }
@@ -809,34 +834,41 @@ pub(crate) fn compose_capability_guidance(cfg: &AiToolTabConfig, settings: &Sett
 }
 
 /// V32 Phase D: does the untrusted-content contract apply to a tab launched
-/// from `cfg`? True exactly when the `cimp-offload` proxy is advertised to that
-/// tab's consumer — the one route by which spotlight-enveloped EXTERNAL
-/// results, detector warning headers and taint-latch refusals reach a session.
+/// from `cfg`? The paragraph teaches the session the vocabulary of
+/// spotlight-enveloped EXTERNAL results, detector warning headers and
+/// taint-latch refusals — everything that arrives through the `cimp-offload`
+/// proxy.
 ///
-/// Consumer-specific because the two advertise gates are: the offload/graph
-/// toggles are shared, but each consumer has its own "expose MCP servers" set
-/// (`any_claude_mcp` / `any_opencode_mcp`), and a Claude-only server must not
-/// make an OpenCode tab claim a vocabulary it never sees. Non-Claude commands
-/// are treated as OpenCode, matching how `build_pre_args` (Claude-only) and
-/// `build_opencode_config` (everything else) already split.
+/// V32 Phase G: consumer hygiene is one of the eleven switchable controls (ten
+/// until Phase H added `opencode_native_gate`; count corrected 2026-08-08, #48),
+/// and the paragraph is spawn-baked, so its L2 and L3 both ride
+/// `spawn_inject_sig` through `injection::spawn_sig`. That switch is now the
+/// WHOLE predicate.
 ///
-/// V32 Phase G adds the feature gate above that: consumer hygiene is one of the
-/// eleven switchable controls (ten until Phase H added `opencode_native_gate`;
-/// count corrected 2026-08-08, #48), and the paragraph is spawn-baked, so its L2 and L3
-/// both ride `spawn_inject_sig`. The advertise gate stays *underneath* the
-/// switch — with no cImp tool surface there is no marker vocabulary to teach,
-/// whatever the switch says.
+/// # V37 Phase F removed the advertise gate underneath the switch
+///
+/// It used to also require `advertises_offload_to_{claude,opencode}` — "with no
+/// cImp tool surface there is no marker vocabulary to teach". Phase F makes that
+/// reasoning unsound in the direction that matters: the proxy child is now in
+/// EVERY AI tab and its surface changes LIVE, so a tab launched with zero grants
+/// can be handed a fetched page's bytes ten minutes later. This paragraph is
+/// spawn-baked; a live-changing input can no longer gate it without leaving a
+/// window in which EXTERNAL content reaches a session that was never taught how
+/// to read it. Teaching it always is the fail-safe direction, and it is what the
+/// switch's OTHER half already does — `build_opencode_config` writes the pinned
+/// `permission` block on `consumer_hygiene_for` alone, with no advertise gate.
+///
+/// The cost, stated: a user with every cImp feature off now gets one paragraph
+/// of `--append-system-prompt` (or one managed instructions file) per AI tab.
+/// Turning the consumer-hygiene control off is the escape hatch, exactly as it
+/// is for the permission pins.
+///
+/// Still consumer-specific, because `consumer_hygiene_for` resolves per tab and
+/// per agent. Non-Claude commands are treated as OpenCode, matching how
+/// `build_pre_args` (Claude-only) and `build_opencode_config` (everything else)
+/// already split.
 fn injection_hygiene_applies(cfg: &AiToolTabConfig, settings: &Settings) -> bool {
-    let agent = tab_consumer(cfg);
-    let claude = agent == "claude";
-    if !consumer_hygiene_for(settings, agent, &cfg.id) {
-        return false;
-    }
-    if claude {
-        advertises_offload_to_claude(settings)
-    } else {
-        advertises_offload_to_opencode(settings)
-    }
+    consumer_hygiene_for(settings, tab_consumer(cfg), &cfg.id)
 }
 
 /// V12 Phase E: the `## cImp project facts` launch-time addendum — PINNED
@@ -2994,11 +3026,12 @@ mod tests {
         assert!(text.len() < 1200, "too long to ride every session: {}", text.len());
     }
 
-    /// It rides both consumers' launch injections whenever the `cimp-offload`
-    /// proxy is advertised to that consumer — the exact condition under which
-    /// enveloped EXTERNAL content can reach the session. It is FIRST, before
-    /// the capability nudges, because it governs how their tool results are to
-    /// be read.
+    /// It rides both consumers' launch injections whenever the consumer-hygiene
+    /// control is on for that tab — which, since V37 Phase F, is the whole gate
+    /// (the `cimp-offload` proxy is in every AI tab and its surface changes
+    /// live, so a spawn-baked paragraph can no longer be gated on what happens
+    /// to be advertised at spawn). It is FIRST, before the capability nudges,
+    /// because it governs how their tool results are to be read.
     #[test]
     fn injection_hygiene_leads_the_addendum_for_both_consumers() {
         let mut settings = Settings::default();
@@ -3022,20 +3055,49 @@ mod tests {
         assert!(args[i + 1].contains("UNTRUSTED-DATA"), "{:?}", args[i + 1]);
     }
 
-    /// With every cImp tool surface off, no `cimp-offload` server is injected,
-    /// so no enveloped content, warning header or boundary refusal can ever
-    /// reach the session — and the paragraph must not force an
-    /// `--append-system-prompt` onto a tab that has no cImp tools at all.
+    /// **V37 Phase F flipped this test.** It used to assert that a tab with every
+    /// cImp tool surface off carried no hygiene paragraph, on the reasoning that
+    /// no enveloped content could ever reach it. That reasoning died with the
+    /// conditional child: the proxy is in every AI tab now and a grant flipped
+    /// mid-session reaches the running one, so a tab launched with nothing on
+    /// can be handed a fetched page's bytes without ever being taught the
+    /// vocabulary. The paragraph is spawn-baked — there is no second chance to
+    /// add it — so it now rides EVERY tab, and the escape hatch is the
+    /// consumer-hygiene control itself (asserted below).
     #[test]
-    fn injection_hygiene_is_absent_when_no_cimp_tools_are_advertised() {
+    fn injection_hygiene_rides_a_tab_with_no_cimp_tools_at_all() {
         let settings = Settings::default(); // offload/graph/audit all off
-        assert!(!advertises_offload_to_claude(&settings));
-        assert!(!advertises_offload_to_opencode(&settings));
+        for cfg in [claude_cfg(), opencode_cfg()] {
+            assert_eq!(
+                compose_capability_guidance(&cfg, &settings),
+                injection_hygiene_guidance(),
+                "{}: the contract paragraph, and nothing else, with every feature off",
+                cfg.command
+            );
+        }
+        let args = build_pre_args(&claude_cfg(), &settings, "claude", Some(&hook_endpoint()));
+        let i = args
+            .iter()
+            .position(|a| a == "--append-system-prompt")
+            .expect("the contract paragraph is carried even with every feature off");
+        assert!(args[i + 1].contains("UNTRUSTED-DATA"), "{:?}", args[i + 1]);
+    }
+
+    /// The escape hatch is still the escape hatch: switching consumer hygiene
+    /// off leaves a feature-less tab with no addendum at all, so Phase F did not
+    /// quietly make the paragraph unavoidable.
+    #[test]
+    fn injection_hygiene_off_still_means_no_addendum() {
+        let mut settings = Settings::default();
+        settings.set_l2_for_test(
+            crate::settings::injection::Feature::ConsumerHygiene,
+            false,
+        );
         for cfg in [claude_cfg(), opencode_cfg()] {
             assert_eq!(
                 compose_capability_guidance(&cfg, &settings),
                 "",
-                "{}: no tools ⇒ no addendum",
+                "{}: hygiene off + no features ⇒ no addendum",
                 cfg.command
             );
         }
@@ -3212,11 +3274,119 @@ mod tests {
         assert!(args[i + 1].contains("graph_find_symbol"));
     }
 
+    /// **V37 Phase F, the phase's own contract.** With ZERO MCP grants, offload
+    /// disabled and the graph disabled — the exact install where the old gate
+    /// injected nothing — both harnesses' configs carry the `cimp-offload`
+    /// entry, and a Shell tab still carries nothing at all.
+    ///
+    /// This is what makes an access flip propagate live: the entry IS the stdio
+    /// child, the child IS the `/events` subscriber, and a tab without one has
+    /// no channel for the contract-C5 pulse to arrive on.
     #[test]
-    fn no_offload_injection_when_disabled() {
+    fn the_proxy_child_rides_ai_tabs_with_zero_grants_and_no_shell_tab() {
+        let settings = Settings::default();
+        assert!(!settings.offload.enabled);
+        assert!(!settings.graph.enabled);
+        assert!(settings.offload.mcp_servers.is_empty());
+        assert!(!settings.offload.any_claude_mcp());
+        assert!(!settings.offload.any_opencode_mcp());
+
+        // Claude.
+        let args = build_pre_args(&claude_cfg(), &settings, "claude", Some(&hook_endpoint()));
+        let i = args.iter().position(|a| a == "--mcp-config").expect("overlay");
+        let claude: serde_json::Value = serde_json::from_str(&args[i + 1]).unwrap();
+        assert_eq!(
+            claude["mcpServers"]["cimp-offload"]["args"][0],
+            "--offload-mcp"
+        );
+        // OpenCode — same child, `type: local`, its own consumer discriminator.
+        let oc = build_opencode_config(&opencode_cfg(), &settings, "opencode");
+        assert_eq!(oc["mcp"]["cimp-offload"]["type"], "local");
+        assert_eq!(oc["mcp"]["cimp-offload"]["command"][1], "--offload-mcp");
+        assert_eq!(oc["mcp"]["cimp-offload"]["command"][3], "opencode");
+
+        // A Shell tab is not an agent seam (V33 decision B1, and the same
+        // reasoning here): it gets no pre-args and no generated config, so it
+        // can never carry the proxy child.
+        let mut s = Settings::default();
+        s.tabs.push(TabConfig::Shell(crate::settings::ShellTabConfig {
+            id: "shell-1".into(),
+            name: "Shell".into(),
+            command: if cfg!(windows) { "cmd" } else { "sh" }.into(),
+            ..Default::default()
+        }));
+        let dir = std::env::temp_dir();
+        if let Ok(spec) = build_launch_spec(TabId::Shell("shell-1".into()), &s, &dir, &[]) {
+            assert!(
+                spec.pre_args.is_empty(),
+                "a Shell tab must get no injected MCP config: {:?}",
+                spec.pre_args
+            );
+            assert!(
+                !spec.env.contains_key("OPENCODE_CONFIG_CONTENT"),
+                "a Shell tab must get no generated OpenCode config"
+            );
+        }
+    }
+
+    /// Granting, revoking and DEACTIVATING an MCP server changes nothing a tab
+    /// bakes in — the companion to the `spawn_inject_sig` assertions, at the
+    /// artifact level rather than the signature level.
+    #[test]
+    fn mcp_toggles_change_no_spawn_time_artifact() {
+        let mut base = Settings::default();
+        base.graph.enabled = true; // loopback already needed — isolate the MCP axis
+        base.offload.mcp_servers = vec![crate::settings::McpServerConfig {
+            name: "ddg".to_string(),
+            ..Default::default()
+        }];
+        let claude_before = build_pre_args(&claude_cfg(), &base, "claude", Some(&hook_endpoint()));
+        let oc_before = build_opencode_config(&opencode_cfg(), &base, "opencode");
+        for mutate in [
+            |m: &mut crate::settings::McpServerConfig| m.claude_access = true,
+            |m: &mut crate::settings::McpServerConfig| m.opencode_access = true,
+            |m: &mut crate::settings::McpServerConfig| m.offload_access = true,
+            |m: &mut crate::settings::McpServerConfig| m.enabled = false,
+        ] {
+            let mut after = base.clone();
+            mutate(&mut after.offload.mcp_servers[0]);
+            assert_eq!(
+                build_pre_args(&claude_cfg(), &after, "claude", Some(&hook_endpoint())),
+                claude_before,
+                "an MCP toggle must not change Claude's spawn artifact"
+            );
+            assert_eq!(
+                build_opencode_config(&opencode_cfg(), &after, "opencode"),
+                oc_before,
+                "an MCP toggle must not change OpenCode's spawn artifact"
+            );
+        }
+    }
+
+    /// **V37 Phase F flipped this test.** It used to assert that a Claude tab
+    /// with offload and graph off got no `--mcp-config` at all. The
+    /// `cimp-offload` child is now injected into every AI tab — that is the
+    /// whole phase — so the assertion that survives is about the CHILD'S
+    /// SURFACE, not the overlay's presence: the entry is there, carrying only
+    /// `--offload-mcp --tab <id>`, and what it advertises is decided live.
+    #[test]
+    fn offload_child_is_injected_even_with_every_feature_disabled() {
         let settings = Settings::default(); // offload + graph off by default
         let args = build_pre_args(&claude_cfg(), &settings, "claude", Some(&hook_endpoint()));
-        assert!(!args.iter().any(|a| a == "--mcp-config"));
+        let i = args
+            .iter()
+            .position(|a| a == "--mcp-config")
+            .expect("V37 Phase F: the proxy child rides every AI tab");
+        let cfg: serde_json::Value = serde_json::from_str(&args[i + 1]).unwrap();
+        assert_eq!(
+            cfg["mcpServers"]["cimp-offload"]["args"],
+            serde_json::json!(["--offload-mcp", "--tab", "claude"]),
+            "nothing enabled ⇒ the bare child argv"
+        );
+        assert!(
+            cfg["mcpServers"]["cimp-code-audit"].is_null(),
+            "the audit child is still gated — Phase F changed one server, not two"
+        );
     }
 
     #[test]
@@ -3281,37 +3451,46 @@ mod tests {
             cfg["mcpServers"]["cimp-code-audit"]["args"][0],
             "--code-audit-mcp"
         );
-        // Offload rides a different gate that is off here — it must NOT appear.
-        assert!(
-            cfg["mcpServers"]["cimp-offload"].is_null(),
-            "cimp-offload must be absent when its gate is off"
+        // V37 Phase F: the offload child no longer rides a gate at all, so it
+        // is present here too. The audit server does NOT stand alone any more;
+        // what this test still pins is that Code Audit's own gate puts ITS entry
+        // in the same overlay.
+        assert_eq!(
+            cfg["mcpServers"]["cimp-offload"]["args"][0],
+            "--offload-mcp",
+            "V37 Phase F: the proxy child rides every AI tab"
         );
     }
 
     #[test]
     fn code_audit_server_absent_when_feature_disabled() {
         // The master switch off ⇒ no audit server even though `expose_claude`
-        // defaults true; with offload + graph also off, `--mcp-config` is
-        // omitted entirely (behavior unchanged from before V26).
+        // defaults true. V37 Phase F: the overlay itself is still emitted (the
+        // unconditional proxy child lives in it), so the assertion is about the
+        // audit KEY, not about `--mcp-config`.
         let mut settings = Settings::default();
         settings.code_audit.enabled = false;
         assert!(settings.code_audit.expose_claude, "default is opted-in");
         let args = build_pre_args(&claude_cfg(), &settings, "claude", Some(&hook_endpoint()));
-        assert!(!args.iter().any(|a| a == "--mcp-config"));
+        let i = args.iter().position(|a| a == "--mcp-config").unwrap();
+        let cfg: serde_json::Value = serde_json::from_str(&args[i + 1]).unwrap();
+        assert!(cfg["mcpServers"]["cimp-code-audit"].is_null());
     }
 
     #[test]
     fn code_audit_server_absent_when_expose_claude_off() {
         // Feature on but the Claude consumer opted out ⇒ the audit server is not
-        // advertised to Claude. With offload + graph off there is nothing else
-        // to inject, so `--mcp-config` is omitted.
+        // advertised to Claude. V37 Phase F: the overlay still carries the
+        // unconditional proxy child, so this asserts the audit key's absence.
         let mut settings = Settings::default();
         settings.code_audit.enabled = true;
         settings.code_audit.expose_claude = false;
         let args = build_pre_args(&claude_cfg(), &settings, "claude", Some(&hook_endpoint()));
+        let i = args.iter().position(|a| a == "--mcp-config").unwrap();
+        let cfg: serde_json::Value = serde_json::from_str(&args[i + 1]).unwrap();
         assert!(
-            !args.iter().any(|a| a == "--mcp-config"),
-            "no server should be injected when the only enabled feature is opted out"
+            cfg["mcpServers"]["cimp-code-audit"].is_null(),
+            "the audit server must not be injected when its consumer opted out"
         );
     }
 
@@ -3338,11 +3517,23 @@ mod tests {
 
     #[test]
     fn every_advertised_mcp_server_gets_a_loopback() {
-        // Tripwire for the V26 gap: any settings combo that injects an MCP
-        // server (Claude `--mcp-config` or the OpenCode `mcp` block) MUST also
-        // flip `Settings::loopback_needed()` — the injected children proxy
-        // every call over the loopback, so advertising without serving strands
-        // them all with "cImp is not running" while the app is visibly up.
+        // Tripwire for the V26 gap: any settings combo that advertises a
+        // NON-EMPTY MCP tool surface MUST also flip
+        // `Settings::loopback_needed()` — the injected children proxy every call
+        // over the loopback, so advertising without serving strands them with
+        // "cImp is not running" while the app is visibly up.
+        //
+        // **V37 Phase F narrowed the antecedent from "injects a server" to
+        // "advertises a tool", and that is not a weakening.** The `cimp-offload`
+        // entry is now written into every AI tab, so "injects a server" is a
+        // tautology; what the child then LISTS is assembled at call time from
+        // the same three inputs `loopback_needed()` is built out of — offload
+        // tools gated on `offload.enabled`, `graph::mcp_tools()` on the graph
+        // feature, and the proxied surface fetched from `POST /mcp/list`, which
+        // returns nothing when there is no loopback to ask. So an all-off tab
+        // advertises an EMPTY list and has nothing to strand, while every combo
+        // that can produce a tool is still asserted below. The Code Audit child
+        // is unchanged: gated, and tool-bearing the moment it exists.
         //
         // H2 (2026-08-05 review) widened it to HOOK SHIMS: every shim in the
         // `--settings` overlay reaches the app the same way (`post_loopback`),
@@ -3361,14 +3552,37 @@ mod tests {
             settings.graph.enabled = graph;
             settings.code_audit.enabled = audit;
             let claude_args = build_pre_args(&claude_cfg(), &settings, "claude", Some(&hook_endpoint()));
-            let claude_advertises = claude_args.iter().any(|a| a == "--mcp-config");
-            let opencode_advertises = build_opencode_config(&opencode_cfg(), &settings, "opencode")
+            let claude_mcp: serde_json::Value = claude_args
+                .iter()
+                .position(|a| a == "--mcp-config")
+                .map(|i| serde_json::from_str(&claude_args[i + 1]).unwrap())
+                .unwrap_or(serde_json::Value::Null);
+            let opencode_mcp = build_opencode_config(&opencode_cfg(), &settings, "opencode")
                 .get("mcp")
-                .is_some();
-            if claude_advertises || opencode_advertises {
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            // Phase F's own invariant, asserted here because this is the sweep
+            // that walks every feature axis: the proxy child rides BOTH
+            // harnesses' configs for every combo, all-off included.
+            assert!(
+                !claude_mcp["mcpServers"]["cimp-offload"].is_null()
+                    && !opencode_mcp["cimp-offload"].is_null(),
+                "the proxy child must ride every AI tab: \
+                 offload={offload} graph={graph} audit={audit}"
+            );
+            // A tool-bearing advertisement: the audit child (tools by
+            // construction), or an offload child whose live surface can be
+            // non-empty.
+            let audit_advertised = !claude_mcp["mcpServers"]["cimp-code-audit"].is_null()
+                || !opencode_mcp["cimp-code-audit"].is_null();
+            let offload_surface = settings.offload.enabled
+                || settings.graph.enabled
+                || settings.offload.any_claude_mcp()
+                || settings.offload.any_opencode_mcp();
+            if audit_advertised || offload_surface {
                 assert!(
                     settings.loopback_needed(),
-                    "advertised an MCP server without a loopback: \
+                    "advertised an MCP tool without a loopback: \
                      offload={offload} graph={graph} audit={audit}"
                 );
             }
@@ -5687,12 +5901,33 @@ console.log("OK: the swap reached neither the gate nor the beacon");
     }
 
     #[test]
-    fn opencode_config_no_mcp_when_all_off() {
+    /// **V37 Phase F flipped this test.** The `mcp` block used to be omitted
+    /// entirely when nothing was in play; the proxy child now rides every
+    /// OpenCode tab, so what is pinned is its EXACT argv — the block exists and
+    /// carries exactly one entry, the bare child.
+    fn opencode_config_carries_the_proxy_child_when_all_off() {
         let settings = Settings::default(); // offload + graph off, no servers
         let cfg = build_opencode_config(&opencode_cfg(), &settings, "opencode");
+        let mcp = cfg.get("mcp").expect("V37 Phase F: the proxy child always rides");
+        assert_eq!(mcp["cimp-offload"]["type"], "local");
+        let argv: Vec<&str> = mcp["cimp-offload"]["command"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(
+            &argv[1..],
+            ["--offload-mcp", "--consumer", "opencode", "--tab", "opencode"]
+        );
         assert!(
-            cfg.get("mcp").is_none(),
-            "no mcp block when nothing is in play"
+            mcp.get("cimp-code-audit").is_none(),
+            "the audit child is still gated"
+        );
+        assert_eq!(
+            mcp.as_object().map(|m| m.len()),
+            Some(1),
+            "one entry, not two"
         );
     }
 
@@ -5735,24 +5970,27 @@ console.log("OK: the swap reached neither the gate nor the beacon");
                 "opencode"
             ]
         );
-        // Offload gate is off ⇒ its entry must be absent.
-        assert!(
-            cfg["mcp"]["cimp-offload"].is_null(),
-            "cimp-offload absent when its gate is off"
+        // V37 Phase F: the offload child has no gate any more, so it is here
+        // too — the audit entry shares the block instead of standing alone.
+        assert_eq!(
+            cfg["mcp"]["cimp-offload"]["type"],
+            "local",
+            "V37 Phase F: the proxy child rides every AI tab"
         );
     }
 
     #[test]
     fn opencode_config_no_code_audit_when_expose_opencode_off() {
-        // Feature on but the OpenCode consumer opted out ⇒ no audit entry, and
-        // with offload + graph off the whole `mcp` block is omitted.
+        // Feature on but the OpenCode consumer opted out ⇒ no audit entry.
+        // V37 Phase F: the block itself survives, carrying the proxy child, so
+        // this asserts the audit KEY rather than the block's absence.
         let mut settings = Settings::default();
         settings.code_audit.enabled = true;
         settings.code_audit.expose_opencode = false;
         let cfg = build_opencode_config(&opencode_cfg(), &settings, "opencode");
         assert!(
-            cfg.get("mcp").is_none(),
-            "no mcp block when the only enabled feature is opted out of OpenCode"
+            cfg["mcp"].get("cimp-code-audit").is_none(),
+            "no audit entry when the only enabled feature is opted out of OpenCode"
         );
     }
 
@@ -5770,9 +6008,18 @@ console.log("OK: the swap reached neither the gate nor the beacon");
 
     #[test]
     fn opencode_config_no_instructions_when_no_guidance() {
-        // V20: default settings (offload + graph off) ⇒ no guidance ⇒ no
-        // instructions key, regardless of the (now-vestigial) tts_injection.
-        let settings = Settings::default();
+        // V20: no guidance ⇒ no instructions key, regardless of the
+        // (now-vestigial) tts_injection.
+        //
+        // V37 Phase F: default settings are no longer a no-guidance case — the
+        // injection-hygiene contract paragraph rides every tab now (see
+        // `injection_hygiene_applies`), so the empty case is "hygiene off, every
+        // feature off", which is what this asserts.
+        let mut settings = Settings::default();
+        settings.set_l2_for_test(
+            crate::settings::injection::Feature::ConsumerHygiene,
+            false,
+        );
         let config = build_opencode_config(&opencode_cfg(), &settings, "opencode");
         assert!(
             config.get("instructions").is_none(),
@@ -6185,19 +6432,97 @@ console.log("OK: the swap reached neither the gate nor the beacon");
             "channels are Claude-only — OpenCode has no MCP inbound path"
         );
 
-        // …but only when it can actually change argv. With nothing that would
-        // inject the `cimp-offload` server, neither flag is emitted, so the
-        // toggle must NOT raise a restart hint (review LOW: spurious nags).
+        // …and since V37 Phase F it ALWAYS can change argv: the `cimp-offload`
+        // server is injected into every AI tab, so there is no longer a
+        // "nothing to register against" case to suppress the hint for. This
+        // block used to assert the opposite (`bare` ⇒ no sig movement); it is
+        // flipped, not deleted, so the reversal is on the record.
         let mut bare = Settings::default();
         bare.offload.enabled = false;
         bare.graph.enabled = false;
         let bare_base = spawn_inject_sig(&bare);
         bare.offload.session_push = true;
-        assert_eq!(
+        assert_ne!(
             spawn_inject_sig(&bare)[0],
             bare_base[0],
-            "no cimp-offload server ⇒ session_push changes no argv ⇒ no restart hint"
+            "the proxy child always exists ⇒ session_push always changes argv"
         );
+
+        // ── V37 Phase F: MCP toggles are no longer spawn-baked ──────────
+        //
+        // The point of the phase. An access grant used to move BOTH consumers'
+        // signatures through `advertises_offload_to_*`, nagging every open tab
+        // to restart for a change that now takes effect where the user is
+        // standing. Both cases are swept, because they fail differently:
+        //
+        //   * `graph on` — the loopback is already needed, so a grant must move
+        //     NOTHING. This is the assertion a partial revert of Phase F trips.
+        //   * `bare install` — the FIRST grant flips `loopback_needed()`
+        //     false→true, and that genuinely changes what a fresh Claude tab
+        //     writes (the Notification / PermissionDenied / Stop / SubagentStop
+        //     shims appear). So the hint still fires once, honestly, and this
+        //     test pins the residual precisely: `notify_hooks` is the ONLY key
+        //     allowed to move, and only on that edge. Everything else — the
+        //     `"mcp"` slots, `"guidance"`, `"channels"`, the OpenCode half —
+        //     must be identical.
+        //
+        // The MCP tools themselves reach the running tab either way; the hint on
+        // that one edge is about the hook shims, not about them.
+        for (label, mut base, may_move_notify) in [
+            ("bare install", Settings::default(), true),
+            (
+                "loopback already needed",
+                {
+                    let mut s = Settings::default();
+                    s.graph.enabled = true;
+                    s
+                },
+                false,
+            ),
+        ] {
+            base.offload.mcp_servers = vec![crate::settings::McpServerConfig {
+                name: "ddg".to_string(),
+                ..Default::default()
+            }];
+            let before = spawn_inject_sig(&base);
+            let mut flips: Vec<Settings> = Vec::new();
+            for grant in [
+                |m: &mut crate::settings::McpServerConfig| m.claude_access = true,
+                |m: &mut crate::settings::McpServerConfig| m.opencode_access = true,
+                |m: &mut crate::settings::McpServerConfig| m.offload_access = true,
+            ] {
+                let mut after = base.clone();
+                grant(&mut after.offload.mcp_servers[0]);
+                flips.push(after);
+            }
+            // DEACTIVATING one is contract C3's live half and touches no
+            // spawn-time input at all — not even `loopback_needed()`.
+            let mut disabled = base.clone();
+            disabled.offload.mcp_servers[0].enabled = false;
+            let deactivation = flips.len();
+            flips.push(disabled);
+
+            for (n, after) in flips.iter().enumerate() {
+                let sig = spawn_inject_sig(after);
+                if n == deactivation || !may_move_notify {
+                    assert_eq!(
+                        sig, before,
+                        "{label}: an MCP toggle must not raise a restart hint — it \
+                         propagates live through the proxy child (flip {n})"
+                    );
+                    continue;
+                }
+                // Every key but `notify_hooks` must be untouched — compared by
+                // overwriting that one key, so a NEW moving key fails here.
+                let mut normalized = sig.clone();
+                normalized[0]["notify_hooks"] = before[0]["notify_hooks"].clone();
+                assert_eq!(
+                    normalized, before,
+                    "{label}: only `notify_hooks` may move on the first grant \
+                     (flip {n}) — got {sig:?}"
+                );
+            }
+        }
 
         // V33 Phase B: the tab sandbox. The most literally spawn-baked setting
         // there is — an OS boundary exists around a process from
@@ -6435,17 +6760,24 @@ console.log("OK: the swap reached neither the gate nor the beacon");
         // OpenCode (and any non-Claude command) gets no pre-args at all.
         assert!(build_pre_args(&opencode_cfg(), &s, "opencode", Some(&hook_endpoint())).is_empty());
 
-        // session_push without ANY reason to inject the `cimp-offload` server
-        // (offload, graph, and Claude-exposed MCP all off) must emit no flag —
-        // registering a channel for a server that is never defined is noise.
+        // **V37 Phase F flipped the last case.** It used to assert that
+        // `session_push` with offload, graph and every Claude-exposed MCP server
+        // off emitted no flag, because the `cimp-offload` server would not be
+        // defined and registering a channel against an undefined server is
+        // noise. The server is now always defined, so the registration is always
+        // meaningful and the gate is `session_push` alone.
         let mut bare = Settings::default();
         bare.offload.session_push = true;
         bare.offload.enabled = false;
         bare.graph.enabled = false;
         let none = build_pre_args(&cfg, &bare, "claude", Some(&hook_endpoint()));
-        assert!(
-            !none.iter().any(|a| a == CHANNEL_REGISTRATION_FLAG),
-            "no cimp-offload server injected ⇒ no channel registration"
+        let j = none
+            .iter()
+            .position(|a| a == CHANNEL_REGISTRATION_FLAG)
+            .expect("V37 Phase F: the proxy child exists, so the channel registers");
+        assert_eq!(
+            none.get(j + 1).map(String::as_str),
+            Some(CHANNEL_REGISTRATION_TARGET)
         );
     }
 }

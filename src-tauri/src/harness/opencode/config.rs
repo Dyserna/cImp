@@ -23,8 +23,8 @@ use std::path::Path;
 use crate::settings::injection::NativeWebMode as NativeWebVisibility;
 use crate::settings::{AiToolTabConfig, Settings};
 use crate::tabs::config::{
-    advertises_audit_to_opencode, advertises_offload_to_opencode, compose_capability_guidance,
-    consumer_hygiene_for, native_web_for,
+    advertises_audit_to_opencode, compose_capability_guidance, consumer_hygiene_for,
+    native_web_for,
 };
 
 /// Deterministic path of the managed OpenCode instructions file for `cfg`.
@@ -474,24 +474,30 @@ pub(crate) fn build_opencode_config(
         );
     }
 
-    // Build the `mcp` object from up to two stdio children, each under its own
-    // gate (mirrors the two-server `--mcp-config` map in `build_pre_args`):
+    // Build the `mcp` object from up to two stdio children (mirrors the
+    // two-server `--mcp-config` map in `build_pre_args`):
     //   - `cimp-offload` carries `offload_task`, the `graph_*` tools, and any
-    //     OpenCode-exposed MCP server — injected whenever ANY of those is in
-    //     play.
+    //     OpenCode-exposed MCP server — **V37 Phase F: UNCONDITIONAL**.
     //   - V26 `cimp-code-audit` carries `security_audit` / `quality_audit` —
     //     injected when Code Audit is enabled AND `expose_opencode` is on.
-    // The `mcp` key is emitted only if at least one server made the cut, so an
-    // all-gates-off config omits it exactly as before.
+    // The `mcp` key is emitted only if at least one server made the cut — which,
+    // since Phase F, is every OpenCode tab whose exe path resolves.
     if let Ok(exe) = std::env::current_exe() {
         let exe = exe.to_string_lossy().to_string();
         let mut mcp = serde_json::Map::new();
-        if advertises_offload_to_opencode(settings) {
+        {
+            // V37 Phase F: unconditional, for the reasons written out in full on
+            // the Claude side (`harness::claude::overlay::build_pre_args`) —
+            // OpenCode reaches this same child over stdio, so it inherits the
+            // whole argument. Without a child there is no `tools/listChanged`
+            // relay, and OpenCode's same-session refresh (the one live-verify
+            // that made the V37 no-restart story true) has nothing to refresh.
+            //
+            // V28: see the Claude-side `--tab` note in `build_pre_args`.
             mcp.insert(
                 "cimp-offload".to_string(),
                 serde_json::json!({
                     "type": "local",
-                    // V28: see the Claude-side `--tab` note in `build_pre_args`.
                     "command": [exe, "--offload-mcp", "--consumer", "opencode", "--tab", tab]
                 }),
             );

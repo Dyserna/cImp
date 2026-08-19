@@ -311,8 +311,19 @@ the storage location moves, not the capability.
   loader's provenance stamp; two general fields are new (`description`,
   `enabled_by_default`). Live-verify 7 is a committed byte-match golden rather
   than a fixture-repo run.
-- **F — MCP tier (after V37)**: tier-2 providers returning SARIF over
-  `tools/call`, managed under V37.
+- **F — MCP tier** *(done)*: an `audit`/`security` tool may declare
+  `provider: {server, tool}` instead of the spawn vocabulary; cImp issues one
+  `tools/call` through V37's host path — so the disabled-server refusal, the
+  outbound screen and the `mcp`-lane row are V37's, unchanged — and the result
+  text goes through the SAME SARIF ingest gate, attribution and caps as a
+  spawned tool. The spawn fields, the sandbox posture and the two built-in-only
+  relaxations are all refused on a provider tool: nothing runs on this machine,
+  so the trust the user extends is in the SERVER rather than in an executable
+  they chose. Contract: [TOOL-PLUGINS.md § 4.5](TOOL-PLUGINS.md). The phase also
+  carried two ordered items that are not tier-2: V37's deferred **E-1** (a
+  detection-config or rules-bundle change re-screens the LIVE MCP surface,
+  drop-only) and **`PulseSource::Native`** (a check-surface change — configured
+  or plugin-contributed — now emits one debounced `tools/list_changed`).
 - **G — Capability contract spec**: the CHP-pattern doc + drift tests
   (blocking for "milestone done", per decision — written alongside C/D, not
   after).

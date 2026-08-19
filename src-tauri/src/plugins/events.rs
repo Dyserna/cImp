@@ -46,6 +46,9 @@ pub const RESCAN: &str = "rescan";
 /// V38 Phase B: a project's `.cimp/config.json` carried machine-scope
 /// tool-plugin fields, and they were ignored on load.
 pub const OVERLAY: &str = "overlay";
+/// V38 Phase G: a registered `command`-kind tool could not supersede the
+/// `command_allowlist` because it has no binary path configured.
+pub const SKIPPED: &str = "skipped";
 
 /// How much of a reason fits in the `target` column before the rest is left to
 /// the detail popup. Reasons are written to be read (they name files and say
@@ -133,6 +136,56 @@ pub fn record_scan(set: &PluginSet) {
     for r in scan_rows(set) {
         crate::activity::record_bg(r);
     }
+}
+
+/// The row for a registered `command`-kind tool that was passed over because it
+/// has no binary path, while `run_command` ran the same program name through
+/// the `command_allowlist` and PATH instead (V38 Phase D review, A-D1).
+///
+/// **The interesting half is that the run SUCCEEDED.** A refusal explains
+/// itself in its own error text; this case does not — the model got its output,
+/// and the only thing that went wrong is that the binary the user meant to
+/// register was not the binary that ran. Without this row the supersession the
+/// user configured evaporates wordlessly, which is the same class of silence
+/// the `plugin` lane exists to break.
+///
+/// `ok: false` for the same reason the rejection rows carry it: nothing failed,
+/// but the configuration did not do what it looks like it does.
+pub fn command_skipped_row(tool_key: &str, label: &str, command: &str) -> ActivityRecord {
+    let reason = format!(
+        "`{command}` ran through the command allowlist (resolved on PATH) because the \
+         registered tool `{label}` has no binary path configured — a registered tool only \
+         supersedes the allowlist once you point it at a file. Set its path in \
+         Settings -> Tool Plugins."
+    );
+    row(
+        tool_key.to_string(),
+        SKIPPED,
+        headline(&reason),
+        false,
+        0,
+        reason,
+    )
+}
+
+/// Record [`command_skipped_row`] **once per (tool, command) per process**.
+///
+/// `run_command` is model-driven and repeats freely, so a row per call would
+/// crowd this lane out of its own retention window with one fact restated. The
+/// dedup key is the pair rather than the tool alone: two allowlisted names
+/// shadowing the same inert tool are two distinct configuration mistakes.
+/// (`sandbox::record_skip`'s rule, and its `Mutex<Option<HashSet>>` shape.)
+pub fn record_command_skipped(tool_key: &str, label: &str, command: &str) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static EMITTED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+    if let Ok(mut guard) = EMITTED.lock() {
+        let set = guard.get_or_insert_with(HashSet::new);
+        if !set.insert(format!("{tool_key}|{}", command.to_ascii_lowercase())) {
+            return;
+        }
+    }
+    crate::activity::record_bg(command_skipped_row(tool_key, label, command));
 }
 
 /// The row for machine-scope tool-plugin fields found in a project overlay and

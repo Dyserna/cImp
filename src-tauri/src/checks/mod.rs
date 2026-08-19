@@ -1111,7 +1111,7 @@ fn shell_command(cmd: &str) -> tokio::process::Command {
     #[cfg(windows)]
     {
         let mut c = tokio::process::Command::new("cmd");
-        c.raw_arg("/C").raw_arg(cmd);
+        c.raw_arg(windows_shell_tail(cmd));
         c
     }
     #[cfg(not(windows))]
@@ -1120,6 +1120,46 @@ fn shell_command(cmd: &str) -> tokio::process::Command {
         c.arg("-c").arg(cmd);
         c
     }
+}
+
+/// The `cmd.exe` tail that runs `cmd` as a COMMAND LINE rather than as a
+/// program name: `/S /C "<cmd>"`.
+///
+/// # Why `/S`, and why the outer quotes (V38 Phase D review, B-D1)
+///
+/// `cmd /C <string>` does not treat its tail as opaque. When the string starts
+/// with a quote, `cmd.exe` applies its documented special case: it keeps the
+/// quotes only if there are **exactly two** of them, no special characters
+/// between them, and the quoted text names an existing executable — otherwise
+/// it strips the FIRST and LAST quote character of the whole tail and runs the
+/// wreckage. So a perfectly ordinary rendered line
+///
+/// ```text
+/// "C:\Tools\my linter.exe" --rules "C:\proj\rules"
+/// ```
+///
+/// becomes `C:\Tools\my linter.exe" --rules "C:\proj\rules` — a program name
+/// that does not exist. Any line with a quoted head **and** a quoted argument
+/// hits this, which is exactly the shape V38's plugin checks render
+/// ([`plugin::inject_program`] always quotes the configured binary, and a
+/// `{root}`/`{var:…}` argument with a space is quoted by the manifest author).
+///
+/// `/S` replaces that heuristic with a rule: strip the first and last character
+/// if both are quotes, run everything between them verbatim. Wrapping the whole
+/// command line in one pair of quotes therefore delivers it byte-exact, whatever
+/// it contains — trailing backslashes included, because the strip is positional
+/// rather than escape-aware.
+///
+/// **Both spawn paths go through here**, and that is the point: the plain path
+/// ([`shell_command`]) and the sandboxed one ([`sandboxed_raw_tail`]) compose
+/// the same tail from the same rule, so a check cannot run under one and break
+/// under the other. The sandboxed path's own rewrite (a bare program head plus
+/// a led `PATH`) is a *different* fix for a different cause — the AppContainer
+/// cannot resolve a drive-qualified program — and is applied to the command line
+/// BEFORE it is wrapped here.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_shell_tail(cmd: &str) -> String {
+    format!("/S /C \"{cmd}\"")
 }
 
 /// The shell [`shell_command`] spawns, as an ABSOLUTE path.
@@ -1322,13 +1362,17 @@ pub(crate) fn split_first_shell_token(cmd: &str) -> Option<(String, usize)> {
 /// legitimately runs a `build.cmd` out of the project root, and only on the
 /// sandboxed path.
 ///
-/// When the program could not be resolved at all, this returns today's tail
-/// unchanged (`/C <cmd>` verbatim, no `PATH` prefix) — there is nothing to
+/// When the program could not be resolved at all, the command line is passed
+/// through unchanged (no head rewrite, no `PATH` prefix) — there is nothing to
 /// prepend and nothing to rename, and a check that then fails to start surfaces
 /// as a loud row exactly as before.
+///
+/// Whatever this decides, the result is wrapped by [`windows_shell_tail`], so
+/// the tail this returns is `/S /C "<command line>"` and the plain path's is the
+/// same function over the same command line.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn sandboxed_raw_tail(cmd: &str, resolved: Option<&Path>) -> (String, Option<PathBuf>) {
-    let unchanged = || (format!("/C {cmd}"), None);
+    let unchanged = || (windows_shell_tail(cmd), None);
     let Some(resolved) = resolved else {
         return unchanged();
     };
@@ -1352,7 +1396,7 @@ fn sandboxed_raw_tail(cmd: &str, resolved: Option<&Path>) -> (String, Option<Pat
         // BARE — already resolved through PATH, which works inside the
         // container. Lead PATH with the granted directory and leave the
         // spelling alone (rewriting it would shadow a `cmd.exe` builtin).
-        return (format!("/C {cmd}"), Some(dir));
+        return (windows_shell_tail(cmd), Some(dir));
     }
     if !has_drive {
         // A DRIVE-LESS path (`.\gradlew`, `\Windows\System32\where.exe`) — the
@@ -1372,7 +1416,10 @@ fn sandboxed_raw_tail(cmd: &str, resolved: Option<&Path>) -> (String, Option<Pat
     } else {
         name.into_owned()
     };
-    (format!("/C {head}{}", &cmd[rest..]), Some(dir))
+    (
+        windows_shell_tail(&format!("{head}{}", &cmd[rest..])),
+        Some(dir),
+    )
 }
 
 /// The child's `PATH` with `dir` in FRONT of whatever it already held.
@@ -1420,10 +1467,10 @@ async fn spawn_capture_sandboxed(
     sandbox: &crate::sandbox::SandboxCfg,
 ) -> AppResult<(Option<i32>, String, String, bool)> {
     let shell = shell_program();
-    // `/C <cmd>` goes in as a RAW tail, not as a quoted argument — `cmd.exe`
-    // parses its tail with its own rules, exactly as `shell_command`'s
-    // `raw_arg` doc explains. Quoting it would double-escape a check command
-    // that contains its own quotes, and the two paths must agree.
+    // The `/S /C "<cmd>"` tail goes in RAW, not as a quoted argument —
+    // `cmd.exe` parses its tail with its own rules, exactly as
+    // `windows_shell_tail` explains, and the plain path composes the identical
+    // string through the identical function.
     //
     // The tail and the `PATH` prefix come from the SAME resolved program the
     // grant was inferred from — see [`sandboxed_raw_tail`] for the measured
@@ -1742,7 +1789,11 @@ mod tests {
     fn a_sandboxed_check_resolves_its_program_through_a_led_path() {
         let resolved = PathBuf::from("/home/me/.cargo/bin/cargo");
         let (tail, dir) = sandboxed_raw_tail("cargo test --bin cimp", Some(&resolved));
-        assert_eq!(tail, "/C cargo test --bin cimp", "a bare token is untouched");
+        assert_eq!(
+            tail,
+            "/S /C \"cargo test --bin cimp\"",
+            "a bare token is untouched, and the tail carries the shared /S /C wrapping"
+        );
         assert_eq!(dir.as_deref(), Some(Path::new("/home/me/.cargo/bin")));
 
         // A DRIVE-LESS path is left completely alone — measured working inside
@@ -1750,28 +1801,31 @@ mod tests {
         let resolved = PathBuf::from("/opt/my tools/tsc.cmd");
         assert_eq!(
             sandboxed_raw_tail("\"/opt/my tools/tsc.cmd\" --noEmit", Some(&resolved)),
-            ("/C \"/opt/my tools/tsc.cmd\" --noEmit".to_string(), None)
+            (
+                "/S /C \"\"/opt/my tools/tsc.cmd\" --noEmit\"".to_string(),
+                None
+            )
         );
         assert_eq!(
             sandboxed_raw_tail(".\\gradlew build", Some(Path::new("/proj/gradlew.bat"))),
-            ("/C .\\gradlew build".to_string(), None)
+            ("/S /C \".\\gradlew build\"".to_string(), None)
         );
 
         // No resolution ⇒ today's behaviour, byte for byte, and nothing to lead
         // PATH with.
         assert_eq!(
             sandboxed_raw_tail("cargo test", None),
-            ("/C cargo test".to_string(), None)
+            ("/S /C \"cargo test\"".to_string(), None)
         );
         // A program with no directory of its own is not something to prepend.
         assert_eq!(
             sandboxed_raw_tail("cargo test", Some(Path::new("cargo"))),
-            ("/C cargo test".to_string(), None)
+            ("/S /C \"cargo test\"".to_string(), None)
         );
         // A line that names no plain program (a pipeline, an env prefix) is
         // left exactly as the operator wrote it.
         let (tail, _) = sandboxed_raw_tail("(cargo test)", Some(&PathBuf::from("/a/b/cargo")));
-        assert_eq!(tail, "/C (cargo test)");
+        assert_eq!(tail, "/S /C \"(cargo test)\"");
     }
 
     /// The Windows half of the same rule, with the drive designator that is the
@@ -1783,13 +1837,13 @@ mod tests {
         let resolved = PathBuf::from(r"C:\Program Files\nodejs\npm.cmd");
         let (tail, dir) =
             sandboxed_raw_tail(r#""C:\Program Files\nodejs\npm.cmd" run test"#, Some(&resolved));
-        assert_eq!(tail, "/C npm.cmd run test");
+        assert_eq!(tail, "/S /C \"npm.cmd run test\"");
         assert_eq!(dir.as_deref(), Some(Path::new(r"C:\Program Files\nodejs")));
         // The measured failure: a drive designator anywhere in the PROGRAM
         // position makes `cmd` open the volume root, which no AppContainer can
         // read. Nothing of the sort may survive.
         let program = tail
-            .trim_start_matches("/C ")
+            .trim_start_matches("/S /C \"")
             .split_whitespace()
             .next()
             .unwrap();
@@ -1802,7 +1856,7 @@ mod tests {
             r"C:tool.exe --x",
             Some(Path::new(r"C:\Users\me\bin\tool.exe")),
         );
-        assert_eq!(tail, "/C tool.exe --x");
+        assert_eq!(tail, "/S /C \"tool.exe --x\"");
 
         // A program file name with a space in it still survives `cmd`'s own
         // tokenization.
@@ -1810,7 +1864,7 @@ mod tests {
             r#""C:\t\my tool.exe" -x"#,
             Some(Path::new(r"C:\t\my tool.exe")),
         );
-        assert_eq!(tail, "/C \"my tool.exe\" -x");
+        assert_eq!(tail, "/S /C \"\"my tool.exe\" -x\"");
 
         // ARGUMENTS are untouched — only program resolution walks the volume
         // root, so a check that passes an absolute output path keeps it.
@@ -1818,7 +1872,10 @@ mod tests {
             r"cargo test -- --out C:\tmp\r.json",
             Some(Path::new(r"C:\Users\me\.cargo\bin\cargo.exe")),
         );
-        assert_eq!(tail, r"/C cargo test -- --out C:\tmp\r.json");
+        assert_eq!(
+            tail,
+            "/S /C \"cargo test -- --out C:\\tmp\\r.json\""
+        );
 
         // …and a drive-less rooted path stays exactly as written on Windows too.
         assert_eq!(
@@ -1826,7 +1883,10 @@ mod tests {
                 r"\Windows\System32\where.exe cargo",
                 Some(Path::new(r"C:\Windows\System32\where.exe"))
             ),
-            (r"/C \Windows\System32\where.exe cargo".to_string(), None)
+            (
+                "/S /C \"\\Windows\\System32\\where.exe cargo\"".to_string(),
+                None
+            )
         );
     }
 
@@ -2389,6 +2449,75 @@ mod tests {
         assert!(
             stdout.contains("cimp_env=sentinel42"),
             "env not forced onto child; stdout: {stdout:?}"
+        );
+    }
+
+    /// **B-D1 — a quote-heavy command line survives the shell wrapper.**
+    ///
+    /// A real spawn, because this is a bug no unit assertion could have found:
+    /// the string was composed correctly and `cmd.exe` destroyed it on the way
+    /// in (see [`windows_shell_tail`]). The line below is the exact shape a
+    /// plugin check renders — a QUOTED program head (`plugin::inject_program`
+    /// always quotes the configured binary) plus a QUOTED argument — which is
+    /// four quote characters, one more than `cmd /C`'s two-quote special case
+    /// tolerates. Under the pre-fix `/C <cmd>` this fails on Windows with a
+    /// program name that does not exist; under `/S /C "<cmd>"` it runs.
+    ///
+    /// Deliberately UNsandboxed, like its env-forcing sibling: the claim is
+    /// about the shell wrapper, and routing it through the AppContainer would
+    /// ACL-stamp real directories as a side effect of running the suite.
+    ///
+    /// The assertion is on a substring of stdout, so it is indifferent to the
+    /// platform's line endings and to whether the shell echoes the quotes.
+    #[tokio::test]
+    async fn a_quote_heavy_command_line_reaches_the_shell_intact() {
+        #[cfg(windows)]
+        let cmd = {
+            let comspec = std::env::var("ComSpec")
+                .unwrap_or_else(|_| "C:\\Windows\\System32\\cmd.exe".to_string());
+            format!("\"{comspec}\" /c echo cimp_sentinel_ok \"a b\"")
+        };
+        #[cfg(not(windows))]
+        let cmd = "\"/bin/sh\" -c \"echo cimp_sentinel_ok 'a b'\"".to_string();
+        // Four quote characters is the whole point of the fixture.
+        assert_eq!(cmd.matches('\"').count(), 4, "{cmd}");
+
+        let tmp = std::env::temp_dir();
+        let (code, stdout, stderr, timed_out) = spawn_capture(
+            &tmp,
+            &tmp,
+            "quote-heavy",
+            &cmd,
+            &[],
+            30,
+            &crate::sandbox::SandboxCfg::disabled(),
+            &crate::plugins::posture::ToolPosture::default(),
+        )
+        .await
+        .expect("spawn");
+        assert!(!timed_out, "timed out: {cmd}");
+        assert_eq!(code, Some(0), "stdout: {stdout:?} stderr: {stderr:?}");
+        assert!(
+            stdout.contains("cimp_sentinel_ok"),
+            "the shell did not receive the command line intact; cmd: {cmd:?} stdout: \
+             {stdout:?} stderr: {stderr:?}"
+        );
+    }
+
+    /// The wrapper itself: one pair of outer quotes and `/S`, whatever the
+    /// command line contains. `/S` makes the strip positional, so the payload
+    /// arrives byte-exact — trailing backslash and all.
+    #[test]
+    fn the_shell_tail_wraps_the_whole_command_line() {
+        assert_eq!(windows_shell_tail("cargo test"), "/S /C \"cargo test\"");
+        assert_eq!(
+            windows_shell_tail("\"a b\" --x \"c d\""),
+            "/S /C \"\"a b\" --x \"c d\"\""
+        );
+        // A trailing backslash is not an escape once `/S` strips positionally.
+        assert_eq!(
+            windows_shell_tail("prog --out C:\\tmp\\"),
+            "/S /C \"prog --out C:\\tmp\\\""
         );
     }
 

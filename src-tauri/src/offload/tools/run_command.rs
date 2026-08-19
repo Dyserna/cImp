@@ -105,23 +105,74 @@ pub fn def() -> ToolDef {
 ///
 /// `cwd` keys the per-project binary-path map, exactly as the audit fan-out and
 /// the check seam do.
-fn registered_commands(cwd: &Path) -> Vec<EffectiveTool> {
+fn registered_commands(cwd: &Path) -> RegisteredCommands {
     let settings = crate::settings::load_readonly(cwd);
-    crate::plugins::registry::runnable_tools(
+    let all = crate::plugins::registry::effective_tools(
         &crate::plugins::snapshot_or_scan(),
         &settings.tool_plugins,
         Some(cwd),
-    )
-    .into_iter()
-    .filter(|t| t.kind() == ToolKind::Command)
-    .collect()
+    );
+    let mut out = RegisteredCommands::default();
+    for tool in all {
+        if tool.kind() != ToolKind::Command || !tool.enabled {
+            continue;
+        }
+        if tool.path.is_some() {
+            out.runnable.push(tool);
+        } else {
+            out.pathless.push(tool);
+        }
+    }
+    out
+}
+
+/// This project's `command`-kind registry entries, split by the one thing that
+/// decides whether they can run.
+///
+/// The pathless half exists because of what it costs to drop it (V38 Phase D
+/// review, A-D1): a tool the user enabled and can SEE in Settings was invisible
+/// here — absent from the refusal's "allowed" text, and, if its stem happened to
+/// be in `command_allowlist` too, silently replaced by whatever PATH resolves
+/// that name to. Both are the same defect: cImp knowing something the operator
+/// would want to know and not saying it. Nothing about admission changes —
+/// a tool with no path still cannot run, because cImp never picks a plugin's
+/// binary (decision 7).
+#[derive(Debug, Default)]
+struct RegisteredCommands {
+    /// Enabled AND path-configured: these supersede the allowlist.
+    runnable: Vec<EffectiveTool>,
+    /// Enabled but with no binary path anywhere — inert, and worth naming.
+    pathless: Vec<EffectiveTool>,
+}
+
+impl RegisteredCommands {
+    /// The clause every refusal appends when inert tools exist: they are NOT
+    /// part of "allowed", because they cannot run — saying otherwise would send
+    /// a caller to retry a name that will fail again.
+    fn pathless_note(&self) -> String {
+        if self.pathless.is_empty() {
+            return String::new();
+        }
+        let names: Vec<&str> = self.pathless.iter().map(|t| t.tool_id.as_str()).collect();
+        format!(
+            ". The plugin command tool(s) {} are enabled but have no binary path \
+             configured, so they cannot run — set their paths in Settings -> Tool \
+             Plugins",
+            names.join(", ")
+        )
+    }
 }
 
 /// How a requested program earned the right to run, and which file it is.
 #[derive(Debug)]
 enum Resolution {
     /// A `command_allowlist` entry: resolved through PATH.
-    Allowlist,
+    ///
+    /// `Some(tool)` when a registered plugin tool of this same name exists but
+    /// has no path configured — the allowlist is what admitted this call, and
+    /// the supersession the user configured did NOT happen. Carried so the run
+    /// can say so rather than let it evaporate (A-D1).
+    Allowlist(Option<Box<EffectiveTool>>),
     /// A registered `command`-kind plugin tool: the configured path IS the
     /// resolution (decision 7 — cImp never picks a plugin's binary).
     Registered(Box<EffectiveTool>),
@@ -144,6 +195,14 @@ fn registered_match<'a>(command: &str, registered: &'a [EffectiveTool]) -> Optio
         .find(|t| t.tool_id.eq_ignore_ascii_case(&stem) || t.tool_id.eq_ignore_ascii_case(command))
 }
 
+/// The enabled-but-pathless registry entry a requested program names, if any.
+///
+/// Same matching rule as [`registered_match`] — one vocabulary, so a tool does
+/// not answer to one spelling while it is runnable and another once it is not.
+fn pathless_match<'a>(command: &str, pathless: &'a [EffectiveTool]) -> Option<&'a EffectiveTool> {
+    registered_match(command, pathless)
+}
+
 /// The admission decision, pure so every branch of it is assertable.
 ///
 /// Order matters: the registry is consulted FIRST, because a registered entry
@@ -154,15 +213,23 @@ fn registered_match<'a>(command: &str, registered: &'a [EffectiveTool]) -> Optio
 fn admit(
     command: &str,
     allowlist: &[String],
-    registered: &[EffectiveTool],
+    registered: &RegisteredCommands,
 ) -> Result<Resolution, String> {
     // "Disabled" now means BOTH surfaces are empty. An allowlist-less project
     // with a registered command tool is configured, not disabled — the registry
-    // entry IS the allowlist entry.
-    if allowlist.is_empty() && registered.is_empty() {
-        return Err("run_command is disabled — no commands are allowlisted and no plugin \
-                    command tools are registered"
-            .into());
+    // entry IS the allowlist entry. An enabled-but-pathless tool does not make
+    // the seam configured (nothing can run), but it is the difference between
+    // "you configured nothing" and "you configured a tool and stopped one step
+    // short", so it is named rather than folded into the same sentence.
+    if allowlist.is_empty()
+        && registered.runnable.is_empty()
+        && pathless_match(command, &registered.pathless).is_none()
+    {
+        return Err(format!(
+            "run_command is disabled — no commands are allowlisted and no plugin command \
+             tools are runnable{}",
+            registered.pathless_note()
+        ));
     }
     if !is_bare_command(command) {
         return Err(format!(
@@ -170,20 +237,38 @@ fn admit(
              programs resolved through PATH may run"
         ));
     }
-    if let Some(tool) = registered_match(command, registered) {
+    if let Some(tool) = registered_match(command, &registered.runnable) {
         return Ok(Resolution::Registered(Box::new(tool.clone())));
     }
+    let inert = pathless_match(command, &registered.pathless);
     if !is_allowed(command, allowlist) {
-        // Name both surfaces, because "not allowlisted" alone reads as a wrong
-        // answer to a caller looking at a plugin tool it can see in Settings.
+        // The specific answer first: this exact name IS a registered tool, and
+        // the one thing missing is the path only the user can supply.
+        if let Some(tool) = inert {
+            return Err(format!(
+                "`{command}` is the plugin command tool `{}` ({}), which is enabled but has no \
+                 binary path configured — cImp never picks a plugin's binary for you, so \
+                 nothing can run. Set its path in Settings -> Tool Plugins.",
+                tool.manifest.label, tool.tool_key
+            ));
+        }
+        // Otherwise name both surfaces, because "not allowlisted" alone reads as
+        // a wrong answer to a caller looking at a plugin tool it can see in
+        // Settings.
         let mut allowed: Vec<String> = allowlist.to_vec();
-        allowed.extend(registered.iter().map(|t| t.tool_id.clone()));
+        allowed.extend(registered.runnable.iter().map(|t| t.tool_id.clone()));
         return Err(format!(
-            "`{command}` is not allowlisted (allowed: {})",
-            allowed.join(", ")
+            "`{command}` is not allowlisted (allowed: {}){}",
+            allowed.join(", "),
+            registered.pathless_note()
         ));
     }
-    Ok(Resolution::Allowlist)
+    // Admitted by the allowlist — and if a registered tool of this name exists
+    // without a path, the supersession the user configured did not happen. The
+    // call proceeds (the allowlist is a deliberate user act too, and refusing it
+    // would break a project that allowlisted the program long before the plugin
+    // arrived), but it does not proceed silently: the caller records it.
+    Ok(Resolution::Allowlist(inert.cloned().map(Box::new)))
 }
 
 /// Match the requested program against the allowlist by its file-stem
@@ -370,6 +455,16 @@ pub async fn execute(args: serde_json::Value, ctx: &ToolCtx) -> Result<String, S
         .ok_or_else(|| "run_command has no allowed root to execute in".to_string())?;
     let registered = registered_commands(&cwd);
     let resolution = admit(&args.command, &ctx.command_allowlist, &registered)?;
+    // A-D1: the allowlist admitted a name a registered tool also claims, and
+    // that tool sat out for want of a path. The run is legitimate; the silence
+    // was not.
+    if let Resolution::Allowlist(Some(skipped)) = &resolution {
+        crate::plugins::events::record_command_skipped(
+            &skipped.tool_key,
+            &skipped.manifest.label,
+            &args.command,
+        );
+    }
     // Per-program security policy. The allowlist is the real boundary
     // (operators must only allowlist genuinely read-only programs), but some
     // allowlisted tools expose global flags/subcommands that turn them into
@@ -390,7 +485,7 @@ pub async fn execute(args: serde_json::Value, ctx: &ToolCtx) -> Result<String, S
         // Resolve through PATH so we spawn the operator's `git`, never a binary
         // the model pointed us at (path components are already rejected above,
         // but this also pins the result against a PATH/CWD-resolution surprise).
-        Resolution::Allowlist => crate::pty::resolve_command(&args.command)
+        Resolution::Allowlist(_) => crate::pty::resolve_command(&args.command)
             .map_err(|_| format!("`{}` was not found on PATH", args.command))?,
         // Decision 7: the user supplied this path, and cImp runs THAT file. No
         // PATH search — the whole point of registering a tool is that the
@@ -416,7 +511,7 @@ pub async fn execute(args: serde_json::Value, ctx: &ToolCtx) -> Result<String, S
     // one (infer, degrade loudly, widen nothing) for an allowlisted program,
     // which declares nothing.
     let posture = match &resolution {
-        Resolution::Allowlist => ToolPosture::default(),
+        Resolution::Allowlist(_) => ToolPosture::default(),
         Resolution::Registered(tool) => ToolPosture::resolve(
             crate::sandbox::SEAM_RUN_COMMAND,
             &cwd,
@@ -1017,7 +1112,7 @@ mod tests {
     /// One plugin with a `command` tool, resolved through the real loader and
     /// registry so these assertions run against the same join the live seam
     /// uses — not against a hand-built struct that could drift from it.
-    fn registered_fixture(path: &str) -> (Vec<EffectiveTool>, std::path::PathBuf) {
+    fn registered_fixture(path: &str) -> (RegisteredCommands, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("cimp-runcmd-{}", uuid::Uuid::new_v4()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
@@ -1037,11 +1132,28 @@ mod tests {
         let mut cfg = crate::settings::ToolPluginsSettings::default();
         cfg.global_paths
             .insert("acme@1.0.0/svn".to_string(), path.to_string());
-        let tools = crate::plugins::registry::runnable_tools(&set, &cfg, None)
-            .into_iter()
-            .filter(|t| t.kind() == ToolKind::Command)
-            .collect();
-        (tools, dir)
+        let mut out = RegisteredCommands::default();
+        for tool in crate::plugins::registry::effective_tools(&set, &cfg, None) {
+            if tool.kind() != ToolKind::Command || !tool.enabled {
+                continue;
+            }
+            if tool.path.is_some() {
+                out.runnable.push(tool);
+            } else {
+                out.pathless.push(tool);
+            }
+        }
+        (out, dir)
+    }
+
+    /// The same plugin with NO path configured — the A-D1 population: enabled,
+    /// visible in Settings, and unable to run.
+    fn pathless_fixture() -> (RegisteredCommands, std::path::PathBuf) {
+        let (mut cmds, dir) = registered_fixture("");
+        assert!(cmds.runnable.is_empty(), "an empty path is not a path");
+        assert_eq!(cmds.pathless.len(), 1);
+        cmds.runnable.clear();
+        (cmds, dir)
     }
 
     /// The design authority's rule: **a registered entry IS the allowlist entry
@@ -1055,7 +1167,7 @@ mod tests {
                 assert_eq!(t.tool_key, "acme@1.0.0/svn");
                 assert_eq!(t.path.as_deref(), Some("C:\\tools\\svn.exe"));
             }
-            Resolution::Allowlist => panic!("must resolve through the registry, not PATH"),
+            Resolution::Allowlist(_) => panic!("must resolve through the registry, not PATH"),
         }
         // …and the case-insensitive spelling matches too, like the allowlist's.
         assert!(matches!(
@@ -1073,7 +1185,7 @@ mod tests {
         let allow = vec!["git".to_string()];
         assert!(matches!(
             admit("git", &allow, &registered),
-            Ok(Resolution::Allowlist)
+            Ok(Resolution::Allowlist(None))
         ));
         let err = admit("rm", &allow, &registered).expect_err("still denied");
         assert!(err.contains("not allowlisted"), "{err}");
@@ -1088,13 +1200,76 @@ mod tests {
     /// configured, not disabled.
     #[test]
     fn disabled_means_no_allowlist_and_no_registered_commands() {
-        let err = admit("git", &[], &[]).expect_err("nothing configured ⇒ disabled");
+        let err = admit("git", &[], &RegisteredCommands::default())
+            .expect_err("nothing configured ⇒ disabled");
         assert!(err.contains("disabled"), "{err}");
         assert!(err.contains("plugin command tools"), "{err}");
 
         let (registered, dir) = registered_fixture("C:\\tools\\svn.exe");
         let err = admit("git", &[], &registered).expect_err("git is still not allowed");
         assert!(!err.contains("disabled"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A-D1 — an enabled-but-pathless tool is never invisible.**
+    ///
+    /// Three surfaces, one fact. Naming the tool is the whole fix: the tool is
+    /// in Settings, the user believes it is configured, and every message here
+    /// used to describe a world in which it did not exist.
+    #[test]
+    fn an_enabled_but_pathless_registered_tool_is_named() {
+        let (cmds, dir) = pathless_fixture();
+
+        // 1. Asking for it by name says exactly what is missing, and where.
+        let err = admit("svn", &[], &cmds).expect_err("no path ⇒ cannot run");
+        assert!(err.contains("acme@1.0.0/svn"), "{err}");
+        assert!(err.contains("no binary path"), "{err}");
+        assert!(err.contains("Tool Plugins"), "{err}");
+
+        // 2. The "nothing is configured" refusal does not pretend it is absent.
+        assert!(err.contains("Subversion"), "{err}");
+        let disabled = admit("git", &[], &cmds).expect_err("nothing runnable");
+        assert!(disabled.contains("disabled"), "{disabled}");
+        assert!(disabled.contains("svn"), "{disabled}");
+
+        // 3. …and neither does a refusal aimed at some other program.
+        let allow = vec!["git".to_string()];
+        let other = admit("rm", &allow, &cmds).expect_err("still denied");
+        assert!(other.contains("not allowlisted"), "{other}");
+        assert!(other.contains("svn"), "{other}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The allowlist FALLBACK case: the same name is allowlisted, so the call
+    /// is admitted through PATH — the pre-V38 behaviour, deliberately kept
+    /// (allowlisting is a user act too, and a project that allowlisted the
+    /// program before the plugin arrived must not break). What changes is that
+    /// the resolution carries the tool it stepped over, so `execute` can record
+    /// it instead of the supersession evaporating wordlessly.
+    #[test]
+    fn an_allowlist_fallback_carries_the_tool_it_stepped_over() {
+        let (cmds, dir) = pathless_fixture();
+        let allow = vec!["svn".to_string()];
+        match admit("svn", &allow, &cmds).expect("the allowlist still admits it") {
+            Resolution::Allowlist(Some(t)) => assert_eq!(t.tool_key, "acme@1.0.0/svn"),
+            other => panic!("the skipped tool must travel with the resolution: {other:?}"),
+        }
+        // A configured tool of a DIFFERENT name is not "stepped over".
+        let allow = vec!["git".to_string()];
+        assert!(matches!(
+            admit("git", &allow, &cmds),
+            Ok(Resolution::Allowlist(None))
+        ));
+        // And the row that case records names both halves of the swap.
+        let row = crate::plugins::events::command_skipped_row(
+            "acme@1.0.0/svn",
+            "Subversion",
+            "svn",
+        );
+        assert_eq!(row.entry.source, "acme@1.0.0/svn");
+        assert!(row.response.contains("Subversion"), "{}", row.response);
+        assert!(row.response.contains("allowlist"), "{}", row.response);
+        assert!(!row.entry.ok);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

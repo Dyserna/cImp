@@ -19,13 +19,21 @@ import type {
 
 // ── Tool → category / order / applicability ───────────────────────────────
 //
-// SINGLE frontend source of truth for the tool metadata the split UI needs,
-// mirroring the Rust adapter registry (`src-tauri/src/audit/adapters.rs`):
-//   - `Adapter.category` → `AUDIT_TOOL_CATEGORY`
-//   - `Adapter.applicability` → `AUDIT_TOOL_APPLICABILITY`
-//   - the default `code_audit.tools` order → `AUDIT_TOOL_ORDER`
-// The Rust↔TS category / status / wire tripwire in `audit/runner.rs` guards the
-// enums; these maps must be kept in lockstep with the registry by hand.
+// SINGLE frontend source of truth for the built-in tool metadata the split UI
+// needs, mirroring cImp's own embedded manifest
+// (`src-tauri/src/plugins/builtin/cimp-audit.json`):
+//   - a tool's `kind` → `AUDIT_TOOL_CATEGORY` (security ⇒ Security, audit ⇒ Quality)
+//   - its `applicability` → `AUDIT_TOOL_APPLICABILITY`
+//   - the manifest's tool order → `AUDIT_TOOL_ORDER`
+//   - `enabled_by_default: false` → `AUDIT_TOOL_DEFAULT_OFF`
+// `builtin_audit_tool_ids_are_mirrored_in_the_frontend_union` (Rust) reads that
+// manifest and checks every id appears in the union below; the maps themselves
+// are kept in lockstep by hand, which is why each is a small closed table with
+// its Rust counterpart named.
+//
+// These are for the PANEL, not for settings: a built-in scanner is configured in
+// the Tool Plugins pane like any other tool, and the roster a scan would run is
+// `audit_effective_roster`'s answer, not a re-derivation from these maps.
 
 /// Which tab each tool belongs to. Security = the V23 trio (Code Audit tab);
 /// Quality = the V25 linters (the Code Audit tab's Quality sub-tab).
@@ -47,8 +55,7 @@ export const AUDIT_TOOL_CATEGORY: Record<AuditToolId, AuditCategory> = {
 };
 
 /// Canonical display order across BOTH categories — security first, then the
-/// quality tools in settings-configured order (matches the default
-/// `code_audit.tools`). Drives the chip list, the sort tiebreak, and the merge
+/// quality tools, matching the embedded manifest's own tool order. Drives the chip list, the sort tiebreak, and the merge
 /// re-order; each tab renders only its own category's slice (`toolsInCategory`).
 export const AUDIT_TOOL_ORDER: readonly AuditToolId[] = [
   // Security (V23) — the Security sub-tab.

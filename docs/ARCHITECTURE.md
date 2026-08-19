@@ -838,11 +838,19 @@ diagnostic parsing; the one audit-only extra is the scan-coverage line, a second
 best-effort pass (`runner::parse_scanned_artifacts`) over osv-scanner's raw SARIF
 `runs[].artifacts` that deliberately does *not* extend the shared parser.
 
-**Adapters are exit-code-inverted vs `run_check`.** For all three tools `0` =
-clean, `1` = findings present (a SUCCESS), anything else = a genuine tool error —
-`adapters::Adapter::classify_exit` owns this, and it's the one place V22's
-checks model (non-zero = failure) doesn't fit. Adding GuardDog/Trivy later is a
-new `Adapter` row + `AuditToolId` variant, not new control flow.
+**Audit tools are exit-code-inverted vs `run_check`.** `0` = clean, a code in
+the tool's declared `findings_exit_codes` = findings present (a SUCCESS),
+anything else = a genuine tool error — `adapters::classify_exit` owns this, and
+it's the one place V22's checks model (non-zero = failure) doesn't fit.
+
+**Since V38 the fourteen tools are DATA, not code.** They live in
+`src-tauri/src/plugins/builtin/cimp-audit.json`, an embedded manifest read
+through the same loader, validator, registry and runner a dropped-in plugin
+goes through (`docs/TOOL-PLUGINS.md`). `AuditToolId`, `AuditToolConfig` and the
+`static Adapter` table are gone; `audit/adapters.rs` keeps only what is not
+per-tool configuration (`Category`, `Transport`, `classify_exit`). Adding a
+scanner is now a manifest entry — no rebuild for a user's own, and no new
+control flow for one of ours.
 
 **Offline degrades — and the failed chip must say why.** osv-scanner queries the
 OSV API / deps.dev and semgrep downloads its rules on first run, so an offline
@@ -859,15 +867,16 @@ pass is where real output gets substituted — see `MAINTENANCE.md` § Code Audi
 
 ## Code Quality — Language-Gated Linters (V25)
 
-**Builds directly on V23, no new schema and nothing bundled.** The eleven
-quality tools are additional `Adapter` rows + `AuditToolId` variants in the same
-registry (`src-tauri/src/audit/adapters.rs`), sharing V23's runner, ebin → PATH →
-override resolution, and SARIF-through-`checks::parsers` pipeline. `CodeAuditSettings`
-stays additive (`#[serde(default)]`); the four non-SARIF tools add four small
-audit-local parsers (`audit/parsers.rs`: `TyposJsonl`, `EslintJson`, `KnipJson`,
-`MacheteText`), fixture-tested from `src-tauri/testdata/audit/`. The one genuinely
-new mechanism is the **census** (`audit/census.rs`) — a bounded, ignore-respecting
-walk (20 000 entries / 2 s, cached ~60 s) that decides which tools apply.
+**Builds directly on V23 and nothing is bundled.** The eleven quality tools are
+eleven more entries in the same definition as V23's trio — since V38 that is the
+embedded `cimp-audit` manifest — sharing one runner, one ebin → PATH → override
+resolution, and one `checks::parsers` decoding path. The four non-SARIF tools
+name a findings decoder (`typos-jsonl`, `eslint-json`, `knip-json`,
+`machete-text`); those decoders live in `checks::parsers` like every other one,
+reached through the findings-namespace `AuditParser` in `audit/runnable.rs`.
+The one genuinely new mechanism is the **census** (`audit/census.rs`) — a
+bounded, ignore-respecting walk (20 000 entries / 2 s, cached ~60 s) that decides
+which tools apply.
 
 **Flags/exit-codes were web-verified at implementation and deviate from the spec
 in two places — trust the code, not the spec.** (1) **cppcheck** writes its report
@@ -902,14 +911,17 @@ plain Shell id and never reaches the runtime.
 
 **Quality auto-selection (`code_audit.quality_auto_select`, default on).** Each
 QUALITY tool's `enabled` checkbox follows the census automatically:
-factory-default-enabled AND applicable (`audit::runner::auto_select_quality` —
-the default-disabled heavyweights dotnet-analyzers/semgrep-quality stay opt-in;
-security tools untouched). Applied at every scan start and by the
+its manifest's `enabled_by_default` AND applicable
+(`audit::runner::auto_select_quality` — dotnet-analyzers and semgrep-quality
+declare `enabled_by_default: false` and so stay opt-in; security tools and user
+plugins are never touched). Applied at every scan start and by the
 `audit_refresh_census` IPC (tab mount + Settings open take a real census, ≤60s
-cache, so gating/hints/selection work before the first scan). A manual quality
-checkbox edit flips the setting to manual mode; the **Auto-select for this
-project** button (Settings → Quality tools, shown in manual mode) re-applies and
-re-enables auto. Frontend mirror: `autoSelectQuality` in `codeAudit/logic.ts`.
+cache, so gating/hints/selection work before the first scan). Since schema v33
+the flags it writes live in `tool_plugins`, under the built-in audit plugin's
+key. A manual quality checkbox edit (Settings → Tool Plugins) flips the setting
+to manual mode; the **Auto-select for this project** button (Settings → Code
+Audit, shown in manual mode) re-applies and re-enables auto. Frontend mirror:
+`qualityAutoSelection` in `codeAudit/logic.ts`.
 
 The per-tool install/scan walkthrough is in `MAINTENANCE.md` § Live-verify
 recipes.

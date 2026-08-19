@@ -48,8 +48,10 @@ use crate::settings::CommandPolicy;
 
 use super::ToolCtx;
 
-const TIMEOUT: Duration = Duration::from_secs(120);
-const MAX_OUTPUT_BYTES: usize = 32 * 1024;
+// `pub(crate)` so `plugins::spec` can pin it against docs/TOOL-PLUGINS.md.
+pub(crate) const TIMEOUT: Duration = Duration::from_secs(120);
+// `pub(crate)` so `plugins::spec` can pin it against docs/TOOL-PLUGINS.md.
+pub(crate) const MAX_OUTPUT_BYTES: usize = 32 * 1024;
 
 /// The caller-side backstop on `spawn_and_capture` for THIS seam's fixed
 /// [`TIMEOUT`] (2026-08-18 incident). The rule, the slack and the reasoning are

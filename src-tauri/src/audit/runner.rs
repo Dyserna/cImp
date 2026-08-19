@@ -39,12 +39,14 @@ pub const AUDIT_STATUS_EVENT: &str = "audit-status";
 
 /// Per-tool captured-output cap. SARIF for a large scan is sizable but bounded;
 /// 16 MiB is generous headroom without letting a runaway tool exhaust memory.
-const MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+// `pub(crate)` so `plugins::spec` can pin it against docs/TOOL-PLUGINS.md.
+pub(crate) const MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 
 /// The event payload caps each tool's findings at this many; past it, the
 /// event sets [`AuditSnapshot::truncated`] and the frontend pulls the full set
 /// via `audit_snapshot`. The full snapshot IPC is never capped.
-const EVENT_FINDINGS_PER_TOOL_CAP: usize = 500;
+// `pub(crate)` so `plugins::spec` can pin it against docs/TOOL-PLUGINS.md.
+pub(crate) const EVENT_FINDINGS_PER_TOOL_CAP: usize = 500;
 
 /// One tool's lifecycle within a scan. Serialized kebab-case, so the wire
 /// strings are exactly `idle | running | done | failed | not-installed |

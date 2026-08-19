@@ -47,9 +47,9 @@ pub struct CheckDef {
     pub cmd: String,
     /// How to parse its output into diagnostics.
     pub parser: ParserKind,
-    /// Hard timeout in seconds. [`run`] floors this at 10s regardless of a
-    /// smaller configured value — a check that can't even attempt in 10s
-    /// isn't meaningfully bounded.
+    /// Hard timeout in seconds. [`run`] floors this at [`MIN_TIMEOUT_SECS`]
+    /// regardless of a smaller configured value — a check that can't even
+    /// attempt in that long isn't meaningfully bounded.
     pub timeout_secs: u64,
     /// V22 Phase B: run `cmd` in this directory instead of the project root — a
     /// path RELATIVE to the root, confined strictly beneath it (absolute or
@@ -371,6 +371,16 @@ pub async fn test_check(
     }
 }
 
+/// The floor [`run`] applies to every check's configured timeout, plugin
+/// checks included.
+///
+/// A check that cannot even *attempt* its work in this long is not meaningfully
+/// bounded by its own number, so a manifest or a settings file carrying a
+/// smaller value is a misconfiguration rather than an instruction. Named rather
+/// than inlined so `docs/TOOL-PLUGINS.md` can state it and `plugins::spec` can
+/// pin the statement.
+pub(crate) const MIN_TIMEOUT_SECS: u64 = 10;
+
 /// Cap on sample locations kept per [`DiagGroup`].
 const MAX_SITES: usize = 5;
 
@@ -448,7 +458,7 @@ pub async fn run_with_posture(
         )));
     }
     let started = Instant::now();
-    let timeout_secs = def.timeout_secs.max(10);
+    let timeout_secs = def.timeout_secs.max(MIN_TIMEOUT_SECS);
 
     // Effective cwd: the confined `def.cwd` under the project root (nested
     // manifests / monorepos), else the root itself. Kept in `root`-joined

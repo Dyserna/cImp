@@ -137,6 +137,11 @@ folder, requiring no rebuild, ever.
 
 ## The capability contract spec (deliverable, blocking)
 
+**DELIVERED (Phase G, 2026-08-19): [TOOL-PLUGINS.md](TOOL-PLUGINS.md).** It is
+the plugin-author-facing contract; `plugins::spec` parses its marked blocks and
+pins them against the constants and tables they describe, so the document cannot
+silently stop describing the build.
+
 A rigorous, plugin-author-facing spec — the `docs/CHP.md` pattern:
 authoritative, versioned (manifest schema version validated at load),
 **drift-tested**. For each capability kind it states:

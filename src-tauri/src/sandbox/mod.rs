@@ -1415,13 +1415,13 @@ fn sandbox_required_refusal_body(subject: &str, why: &str) -> String {
 /// [`child_env::CHILD_ENV`] use: the reviewer of a diff that adds a row sees
 /// the pattern and the justification together, and a row with no reason does
 /// not compile.
-struct GrantRefusalRule {
+pub(crate) struct GrantRefusalRule {
     /// The TRAILING path components that identify the directory. Compared
     /// lowercased on both platforms — a broader match than Linux's
     /// case-sensitive filesystem strictly needs, which is the safe direction
     /// for a deny rule.
-    suffix: &'static [&'static str],
-    why: &'static str,
+    pub(crate) suffix: &'static [&'static str],
+    pub(crate) why: &'static str,
 }
 
 /// The credential stores no reviewed grant row may name.
@@ -1431,7 +1431,8 @@ struct GrantRefusalRule {
 /// volume root, a user-profile root, the Windows install directory) are what
 /// stop the wholesale cases, and these rows cover the specific directories a
 /// plausible-looking "just grant my toolchain" entry would otherwise reach.
-const GRANT_REFUSAL_RULES: &[GrantRefusalRule] = &[
+// `pub(crate)` so `plugins::spec` can pin it against docs/TOOL-PLUGINS.md.
+pub(crate) const GRANT_REFUSAL_RULES: &[GrantRefusalRule] = &[
     GrantRefusalRule {
         suffix: &[".ssh"],
         why: "an SSH key store — private keys, agent config and known-hosts",

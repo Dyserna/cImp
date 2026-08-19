@@ -36,6 +36,15 @@ pub mod posture;
 /// TypeScript because it needs the *unresolved* halves too (which of the two
 /// flags a tool is off by).
 pub mod registry;
+/// The doc⇄code drift tests for `docs/TOOL-PLUGINS.md`.
+///
+/// Test-only by construction: the document is the contract a plugin author
+/// reads, and this module is what stops it from quietly ceasing to describe the
+/// build — the `harness::chp` idiom (`include_str!` the doc, compare it to the
+/// code it claims to describe), applied to a spec whose claims live in eight
+/// modules rather than one.
+#[cfg(test)]
+mod spec;
 
 use std::sync::{Arc, OnceLock};
 

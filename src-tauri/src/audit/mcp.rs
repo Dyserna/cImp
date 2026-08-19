@@ -52,7 +52,8 @@ const SERVER_NAME: &str = "cimp-code-audit";
 /// surface thousands of lints; past this the report is truncated with an
 /// explicit note stating the true totals (whichever of this and
 /// [`MAX_RESULT_BYTES`] hits first).
-const MAX_FINDINGS: usize = 300;
+// `pub(crate)` so `plugins::spec` can pin it against docs/TOOL-PLUGINS.md.
+pub(crate) const MAX_FINDINGS: usize = 300;
 
 /// Byte budget for the whole result text (~64 KB). MCP results ride the model's
 /// context window, so a huge audit must not blow it out; the truncation note
@@ -69,7 +70,8 @@ const MAX_FINDINGS: usize = 300;
 /// here: 64 KB is at or below both `signature::SCAN_PREFIX_BYTES` (256 KiB) and
 /// `classifier::MAX_INPUT_BYTES` (64 KiB), so no byte of an audit report is
 /// dropped before screening. The window-cap half can still fire (#48/M-5).
-const MAX_RESULT_BYTES: usize = 64 * 1024;
+// `pub(crate)` so `plugins::spec` can pin it against docs/TOOL-PLUGINS.md.
+pub(crate) const MAX_RESULT_BYTES: usize = 64 * 1024;
 
 // ── Shared tool surface ────────────────────────────────────────────────────
 

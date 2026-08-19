@@ -77,7 +77,8 @@ use crate::settings::Settings;
 /// Everything else is allowed, including spaces, backslashes and glob
 /// characters — a Windows path is a legitimate value, and a glob only changes
 /// which files a tool reads, inside a root it can already read.
-const SHELL_UNSAFE: &[char] = &[
+// `pub(crate)` so `plugins::spec` can pin it against docs/TOOL-PLUGINS.md.
+pub(crate) const SHELL_UNSAFE: &[char] = &[
     '&', '|', ';', '<', '>', '(', ')', '`', '$', '"', '\'', '^', '%', '!',
 ];
 

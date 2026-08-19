@@ -1201,6 +1201,9 @@ export type ParserKind =
   | 'go-test-json'
   | 'dotnet'
   | 'junit-xml'
+  | 'typos-jsonl'
+  | 'knip-json'
+  | 'machete-text'
   | 'regex-custom'
   | 'generic-gcc';
 

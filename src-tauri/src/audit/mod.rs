@@ -14,6 +14,7 @@ pub mod adapters;
 pub mod census;
 pub mod mcp;
 pub mod parsers;
+pub mod runnable;
 pub mod runner;
 
 use std::path::{Path, PathBuf};

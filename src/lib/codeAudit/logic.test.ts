@@ -644,6 +644,67 @@ describe('scanLock (cross-tab one-scan-at-a-time)', () => {
   });
 });
 
+describe('V38: plugin tool ids on the audit wire', () => {
+  // A plugin tool's key — the namespace no closed union can enumerate. It
+  // always carries `@` and `/`, which is why it can never be mistaken for a
+  // built-in id.
+  const PLUGIN_KEY = 'acme@1.0.0/scan';
+  const PLUGIN = tool({
+    id: PLUGIN_KEY,
+    status: 'done',
+    duration_ms: 7,
+    findings: [
+      {
+        tool: PLUGIN_KEY,
+        diag: {
+          severity: 'error',
+          code: 'ACME001',
+          message: 'acme finding',
+          file: 'src/x.ts',
+          line: 9,
+          col: null,
+        },
+      },
+    ],
+  });
+
+  test('an unknown id flattens, filters and sorts after the built-ins', () => {
+    const snap = snapshot({ tools: [GITLEAKS, PLUGIN], total_findings: 2 });
+    const rows = sortFindings(flattenFindings(snap, 'security'));
+    expect(rows.map((r) => r.tool)).toEqual(['gitleaks', PLUGIN_KEY]);
+    expect(rows[1].id).toBe(`${PLUGIN_KEY}#0`);
+
+    // Its own toggle works like any other tool's.
+    const filters = { ...defaultFilters(), tools: { [PLUGIN_KEY]: false } };
+    expect(filterFindings(rows, filters).map((r) => r.tool)).toEqual(['gitleaks']);
+  });
+
+  test('a known census never hides a tool this build has no metadata for', () => {
+    // The backend owns a plugin tool's applicability gate and reports
+    // `skipped-not-applicable` when it did not apply, so the frontend must not
+    // hide one it simply does not recognize.
+    const census = { extensions: ['rs'], markers: ['Cargo.toml'] };
+    expect(isToolApplicable(PLUGIN_KEY, census)).toBe(true);
+    const { visible, hiddenCount } = partitionChips([PLUGIN], census);
+    expect(visible.map((t) => t.id)).toEqual([PLUGIN_KEY]);
+    expect(hiddenCount).toBe(0);
+
+    // …and the backend's OWN verdict is still honored.
+    const gated = { ...PLUGIN, status: 'skipped-not-applicable' as const };
+    expect(partitionChips([gated], census).hiddenCount).toBe(1);
+  });
+
+  test('the event-merge reducer keeps plugin tools keyed by their own id', () => {
+    const prev = snapshot({ tools: [GITLEAKS], total_findings: 1 });
+    const next = snapshot({ tools: [PLUGIN], total_findings: 1 });
+    const merged = mergeAuditSnapshot(prev, next);
+    expect(merged.tools.map((t) => t.id)).toEqual(['gitleaks', PLUGIN_KEY]);
+    // A second event for the same plugin tool replaces it rather than doubling.
+    const again = mergeAuditSnapshot(merged, snapshot({ tools: [PLUGIN] }));
+    expect(again.tools.filter((t) => t.id === PLUGIN_KEY)).toHaveLength(1);
+  });
+});
+
 describe('formatFindingsMarkdown label', () => {
   test('quality label swaps the heading', () => {
     const md = formatFindingsMarkdown({

@@ -14,6 +14,17 @@ import type { AuditToolId } from '../settings/types';
 
 export type { AuditToolId };
 
+/// V38: a tool id on the audit WIRE — a built-in `AuditToolId`, or a plugin
+/// tool's key (`name@version/tool-id`), which no closed union can enumerate
+/// because plugins are dropped in without a rebuild.
+///
+/// The two namespaces cannot collide (a plugin key always contains `@` and `/`;
+/// no built-in id does), so everything that keys off an id keeps working — it
+/// simply meets ids it does not recognize, and the rule everywhere is the same:
+/// a metadata lookup that misses falls back to what the WIRE says (the
+/// snapshot's own `category`, `status`), never to a guess.
+export type AuditToolRef = AuditToolId | (string & {});
+
 /// Wire severity from the Rust `checks::Severity` (serde lowercase). Ordered
 /// error > warning > note for the table's default sort (see `SEVERITY_RANK`).
 export type AuditSeverity = 'error' | 'warning' | 'note';
@@ -56,7 +67,9 @@ export interface AuditDiag {
 /// One raw finding: a diag tagged with the tool that produced it (mirror of
 /// Rust `AuditFinding`).
 export interface AuditFinding {
-  tool: AuditToolId;
+  /// The tool that produced it — always the registry entry cImp SPAWNED, never
+  /// a name the tool printed inside its own output.
+  tool: AuditToolRef;
   diag: AuditDiag;
 }
 
@@ -64,7 +77,7 @@ export interface AuditFinding {
 /// `ToolState`). `error` is set for `failed`/`not-installed`; `resolved` is the
 /// resolved binary path (a Windows backslash string) once resolution succeeds.
 export interface AuditToolState {
-  id: AuditToolId;
+  id: AuditToolRef;
   /// V25 Phase C: the tool's category. Every state in one snapshot shares it
   /// (a scan runs one category); the split UI filters the shared snapshot by it.
   category: AuditCategory;

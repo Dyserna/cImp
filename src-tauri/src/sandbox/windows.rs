@@ -766,7 +766,16 @@ fn prepare_blocking(
         env: &lookup,
         is_dir: &is_dir,
     };
-    let mut grant_program = |program: &Path, why: &str| -> Result<(), String> {
+    // `select` is the RUNTIME question, which is the caller's to answer: V33
+    // infers it from the resolved program, and V38's plugin manifests may
+    // DECLARE it (a runtime cImp has never met cannot be inferred). Inference
+    // still runs at the seam as a cross-check — see
+    // [`super::inferred_runtime_ids`] — so a declaration that disagrees is a
+    // row, not a silent substitution.
+    let mut grant_program = |program: &Path,
+                             why: &str,
+                             select: &super::RuntimeSelect|
+     -> Result<(), String> {
         if let Some(install) = program.parent() {
             if grant_dir(install, container.as_psid(), RX)? {
                 granted.push(if why.is_empty() {
@@ -776,7 +785,7 @@ fn prepare_blocking(
                 });
             }
         }
-        for m in super::runtime_needs(program, &machine) {
+        for m in super::runtime_matches(select, program, &machine) {
             for g in &m.needs.grants {
                 if grant_dir(&g.dir, container.as_psid(), RX)? {
                     granted.push(format!(
@@ -799,7 +808,7 @@ fn prepare_blocking(
         }
         Ok(())
     };
-    grant_program(program, "")?;
+    grant_program(program, "", &hints.runtime)?;
     // Grant inference for a seam whose spawned program is not the program that
     // does the work: `run_check` spawns `cmd.exe` (which needs no grant — it
     // lives under `System32`, where Windows already gives ALL APPLICATION
@@ -810,7 +819,9 @@ fn prepare_blocking(
     // that then cannot start surfaces as a DENIAL row rather than a silent
     // unsandboxed retry.
     for extra in &hints.programs {
-        grant_program(extra, "inferred from the check command")?;
+        // Inference, always: these paths were inferred from a command line and
+        // nobody declared anything about them.
+        grant_program(extra, "inferred from the check command", &super::RuntimeSelect::Infer)?;
     }
     // Write grants the seam asked for — cImp-owned scratch a tool is handed an
     // absolute path into (today: the audit runner's SARIF report directory).

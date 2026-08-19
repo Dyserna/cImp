@@ -3,13 +3,13 @@
 //!
 //! Design authority: `docs/MILESTONE-V38-tool-plugin-framework.md`.
 //!
-//! **Through Phase B this module still runs nothing.** Manifests are found,
-//! parsed, validated, identified, made visible, and (Phase B) joined with the
-//! user's configuration — but no pipeline spawns one yet. That is deliberate and
-//! is what makes each phase shippable alone: a plugin dropped in `plugins/`
-//! appears, its errors are loud, its settings persist, and the surface a model
-//! sees is byte-for-byte unchanged (decision 5). The pipelines that spawn
-//! anything are Phase C/D.
+//! **Phase C is where a plugin first RUNS.** Manifests are found, parsed,
+//! validated, identified, made visible (A), joined with the user's configuration
+//! (B), and — for the `audit`/`security` kinds — fanned out under the two
+//! umbrellas beside the built-in scanners (C). `check` and `command` kinds are
+//! still inert until Phase D. The surface a model sees stays byte-for-byte
+//! unchanged throughout (decision 5): what plugins change is what the fan-out
+//! runs, never the tool schema.
 //!
 //! Layout:
 //! * [`manifest`] — the versioned schema and its validation (the parse boundary).
@@ -24,13 +24,13 @@ pub mod loader;
 pub mod manifest;
 /// The manifest ⋈ user-state ⋈ project join.
 ///
-/// `allow(dead_code)` for exactly one phase: Phase B ships the join and its
-/// tests, and the pipelines that consume it (the audit fan-out, `run_check`'s
-/// effective set, `run_command`'s allowlist) are Phase C/D — which is when this
-/// attribute comes off. The settings pane deliberately does NOT go through here:
-/// it renders the same facts from the snapshot DTO in TypeScript because it
-/// needs the *unresolved* halves too (which of the two flags a tool is off by).
-#[allow(dead_code)]
+/// Phase C is the first consumer: the audit fan-out reads `runnable_tools` for
+/// the umbrella it is about to run (`run_check`'s effective set and
+/// `run_command`'s allowlist follow in Phase D), so Phase B's "until its
+/// pipelines exist" `allow(dead_code)` is gone. The settings pane deliberately
+/// does NOT go through here: it renders the same facts from the snapshot DTO in
+/// TypeScript because it needs the *unresolved* halves too (which of the two
+/// flags a tool is off by).
 pub mod registry;
 
 use std::sync::{Arc, OnceLock};

@@ -1,25 +1,26 @@
-//! V25 Phase B — the **audit-local parser dispatch**.
+//! V25 Phase B — the **audit-local parser dispatch**, now a shim.
 //!
-//! Most quality tools emit SARIF, which the runner already parses via the
-//! shared [`crate::checks::parsers`] pipeline. The four tools that don't
-//! (`typos` JSONL, ESLint/knip JSON, `cargo-machete` text) get a small,
-//! fixture-tested parser here. Every parser is *lenient* — a line/record it
-//! can't read is skipped, never an error (the `checks::parsers` posture) — and
-//! clamps severities into the real `error | warning | note` set (V23 decision).
-//! Paths are relativized against the scan `root` so a quality finding spells its
-//! file exactly like a SARIF finding does.
+//! V38 Phase C emptied this file of decoders. Every [`AuditParser`] arm
+//! delegates to [`crate::checks::parsers::parse`], because decision 3 wants ONE
+//! parse boundary and the plugin population reaches it by `ParserKind` name:
+//! two dispatch tables over the same decoders would be two places to register
+//! the next one, and only one of them would get it.
 //!
-//! The dispatch ([`AuditParser::parse`]) is Phase B's deliverable; the Phase C
-//! runner selects a tool's [`AuditParser`] from its adapter and feeds it the
-//! tool's stdout (or report-file contents for a [`super::adapters::Transport::
-//! ReportFile`] tool). Until then the entry point is exercised only by tests.
+//! What survives here is the findings-side *namespace* (G2): on an
+//! audit/security-kind tool a `parser` value names a findings decoder, and this
+//! enum is that namespace. It is still the type each `static Adapter` carries,
+//! so it retires with the adapter table itself in Phase E — the built-ins are
+//! deliberately NOT migrated off it here (R4).
+//!
+//! The two behaviours that are this layer's own and not the checks layer's are
+//! kept visible in [`AuditParser::parse`]: the audit pipeline presents
+//! project-relative paths, so the eslint arm relativizes what the shared
+//! decoder leaves absolute.
 
 use std::path::Path;
 
-use serde::Deserialize;
-
 use crate::checks::parsers::relativize;
-use crate::checks::{Diag, ParserKind, Severity};
+use crate::checks::{Diag, ParserKind};
 
 /// Which decoder turns a quality tool's captured output into [`Diag`]s. Carried
 /// on each [`super::adapters::Adapter`]; the runner dispatches through
@@ -65,268 +66,26 @@ impl AuditParser {
                 }
                 diags
             }
-            AuditParser::TyposJsonl => parse_typos_jsonl(output, root),
-            AuditParser::KnipJson => parse_knip_json(output, root),
-            AuditParser::MacheteText => parse_machete_text(output, root),
+            // Folded into `ParserKind` by R2 — the wire names `typos-jsonl`,
+            // `knip-json` and `machete-text` name the same decoders a plugin
+            // manifest (and, from Phase E, a built-in one) selects.
+            AuditParser::TyposJsonl => {
+                crate::checks::parsers::parse(ParserKind::TyposJsonl, output, "", root, None)
+            }
+            AuditParser::KnipJson => {
+                crate::checks::parsers::parse(ParserKind::KnipJson, output, "", root, None)
+            }
+            AuditParser::MacheteText => {
+                crate::checks::parsers::parse(ParserKind::MacheteText, output, "", root, None)
+            }
         }
     }
-}
-
-// ── typos --format json (TyposJsonl) ───────────────────────────────────────
-//
-// Web-verified 2026-07 against crate-ci/typos `crates/typos-cli/src/report.rs`
-// + `crates/typos/src/dict.rs`: the reporter emits one JSON object per line
-// with an internally-tagged `"type"` discriminator (snake_case). A misspelling
-// is `"type": "typo"`, carrying a flattened `FileContext` (`path` + 1-based
-// `line_num`), a 0-based `byte_offset`, the `typo` string, and `corrections`.
-// `corrections` is `typos::Status` serialized `#[serde(untagged)]`: the
-// `Corrections(Vec<String>)` variant becomes a JSON array of suggestion strings,
-// while the unit `Valid`/`Invalid` variants become JSON `null` (a typo with no
-// known correction) — hence `Option<Vec<String>>`. typos exits `2` when it
-// finds typos (verified), which the adapter classifies as a findings code.
-
-#[derive(Deserialize)]
-struct TyposRecord {
-    #[serde(rename = "type", default)]
-    kind: String,
-    #[serde(default)]
-    path: String,
-    /// 1-based line number (flattened from `FileContext`); absent for a
-    /// path/filename typo → 0.
-    #[serde(default)]
-    line_num: u32,
-    /// 0-based byte offset within the line.
-    #[serde(default)]
-    byte_offset: u32,
-    #[serde(default)]
-    typo: String,
-    /// `null` (no suggestion) or an array of corrections.
-    #[serde(default)]
-    corrections: Option<Vec<String>>,
-}
-
-fn parse_typos_jsonl(output: &str, root: &Path) -> Vec<Diag> {
-    let mut out = Vec::new();
-    for line in output.lines() {
-        let line = line.trim();
-        if !line.starts_with('{') {
-            continue;
-        }
-        let Ok(rec) = serde_json::from_str::<TyposRecord>(line) else {
-            continue;
-        };
-        if rec.kind != "typo" || rec.typo.is_empty() {
-            continue;
-        }
-        let message = match rec.corrections.as_ref().filter(|c| !c.is_empty()) {
-            Some(c) => format!("`{}` should be `{}`", rec.typo, c.join("` or `")),
-            None => format!("`{}` is misspelled", rec.typo),
-        };
-        out.push(Diag {
-            severity: Severity::Note,
-            code: Some("typo".to_string()),
-            message,
-            file: relativize(root, &rec.path),
-            line: rec.line_num,
-            // typos reports a 0-based byte offset, not a column; surface it as a
-            // 1-based positional hint (byte-accurate; approximate for multi-byte
-            // characters, which typos itself doesn't disambiguate).
-            col: Some(rec.byte_offset + 1),
-        });
-    }
-    out
-}
-
-// ── knip --reporter json (KnipJson) ────────────────────────────────────────
-//
-// Web-verified 2026-07 against webpro-nl/knip `packages/knip/src/reporters/
-// json.ts`: the reporter writes ONE JSON document `{ "issues": [entry, …] }` to
-// stdout, each `entry` grouping one file's issues. `entry.file` is already
-// relative to knip's cwd. Issue buckets are arrays of `{ name, line?, col?,
-// … }`: `files` (the file itself is unused), `exports`, `types`, `dependencies`,
-// `devDependencies`, `unlisted`, `unresolved`. knip exits `1` when it reports
-// issues (verified). We surface unused files, exports/types, and the dependency
-// buckets — all `warning`.
-
-#[derive(Deserialize)]
-struct KnipReport {
-    #[serde(default)]
-    issues: Vec<KnipEntry>,
-}
-
-#[derive(Deserialize, Default)]
-struct KnipEntry {
-    #[serde(default)]
-    file: String,
-    #[serde(default)]
-    files: Vec<KnipItem>,
-    #[serde(default)]
-    exports: Vec<KnipItem>,
-    #[serde(default)]
-    types: Vec<KnipItem>,
-    #[serde(default)]
-    dependencies: Vec<KnipItem>,
-    #[serde(default, rename = "devDependencies")]
-    dev_dependencies: Vec<KnipItem>,
-    #[serde(default)]
-    unlisted: Vec<KnipItem>,
-    #[serde(default)]
-    unresolved: Vec<KnipItem>,
-}
-
-#[derive(Deserialize, Default)]
-struct KnipItem {
-    #[serde(default)]
-    name: String,
-    #[serde(default)]
-    line: u32,
-    #[serde(default)]
-    col: Option<u32>,
-}
-
-fn parse_knip_json(output: &str, root: &Path) -> Vec<Diag> {
-    let doc = output.trim_start_matches('\u{feff}').trim();
-    let Ok(report) = serde_json::from_str::<KnipReport>(doc) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    for entry in &report.issues {
-        let file = relativize(root, &entry.file);
-        // The whole file is unused (its `files` bucket is non-empty).
-        if !entry.files.is_empty() {
-            out.push(knip_diag(
-                &file,
-                "unused-file",
-                "unused file".to_string(),
-                0,
-                None,
-            ));
-        }
-        for it in &entry.exports {
-            out.push(knip_item_diag(&file, "unused-export", "unused export", it));
-        }
-        for it in &entry.types {
-            out.push(knip_item_diag(&file, "unused-type", "unused type", it));
-        }
-        for it in &entry.dependencies {
-            out.push(knip_item_diag(
-                &file,
-                "unused-dependency",
-                "unused dependency",
-                it,
-            ));
-        }
-        for it in &entry.dev_dependencies {
-            out.push(knip_item_diag(
-                &file,
-                "unused-dependency",
-                "unused devDependency",
-                it,
-            ));
-        }
-        for it in &entry.unlisted {
-            out.push(knip_item_diag(
-                &file,
-                "unlisted-dependency",
-                "unlisted dependency",
-                it,
-            ));
-        }
-        for it in &entry.unresolved {
-            out.push(knip_item_diag(&file, "unresolved", "unresolved import", it));
-        }
-    }
-    out
-}
-
-/// A knip finding for a whole-file issue (no symbol).
-fn knip_diag(file: &str, code: &str, message: String, line: u32, col: Option<u32>) -> Diag {
-    Diag {
-        severity: Severity::Warning,
-        code: Some(code.to_string()),
-        message,
-        file: file.to_string(),
-        line,
-        col,
-    }
-}
-
-/// A knip finding for a named item (`unused export `foo``), anchored to its
-/// file and (when known) line/col.
-fn knip_item_diag(file: &str, code: &str, label: &str, it: &KnipItem) -> Diag {
-    let message = if it.name.is_empty() {
-        label.to_string()
-    } else {
-        format!("{label} `{}`", it.name)
-    };
-    knip_diag(file, code, message, it.line, it.col)
-}
-
-// ── cargo-machete text (MacheteText) ───────────────────────────────────────
-//
-// Web-verified 2026-07 against bnjbvr/cargo-machete `src/main.rs`: on finding
-// unused dependencies it prints to STDOUT a header
-//   `cargo-machete found the following unused dependencies in <location>:`
-// followed by one tab-indented crate name per line (`\t<dep>`). `<location>` is
-// the crate directory / manifest. cargo-machete exits `1` when it finds unused
-// dependencies, `2` on error (verified). The spec assumed a per-line
-// `<crate> — unused dependency in <path>` shape; the real format is this
-// header-then-indented-list, which this parser follows.
-
-fn parse_machete_text(output: &str, root: &Path) -> Vec<Diag> {
-    const HEADER_PREFIX: &str = "cargo-machete found the following unused dependencies in ";
-    let mut out = Vec::new();
-    // The Cargo.toml the current header's crates are anchored to.
-    let mut anchor: Option<String> = None;
-    for line in output.lines() {
-        if let Some(rest) = line.trim().strip_prefix(HEADER_PREFIX) {
-            let location = rest.trim_end().trim_end_matches(':').trim();
-            anchor = Some(machete_manifest(root, location));
-            continue;
-        }
-        // Crate names are tab/space-indented under the most recent header.
-        let is_indented = line.starts_with('\t') || line.starts_with("    ");
-        if !is_indented {
-            continue;
-        }
-        let krate = line.trim();
-        if krate.is_empty() {
-            continue;
-        }
-        let Some(file) = anchor.clone() else { continue };
-        out.push(Diag {
-            severity: Severity::Warning,
-            code: Some("unused-dependency".to_string()),
-            message: format!("`{krate}` — unused dependency"),
-            file,
-            line: 0,
-            col: None,
-        });
-    }
-    out
-}
-
-/// Resolve cargo-machete's header `<location>` to the project-relative
-/// `Cargo.toml` its crates live in: use it verbatim when it already points at a
-/// manifest, else join `Cargo.toml`. Relativized against the scan root.
-fn machete_manifest(root: &Path, location: &str) -> String {
-    let normalized = location.replace('\\', "/");
-    let rel = if normalized.to_ascii_lowercase().ends_with("cargo.toml") {
-        relativize(root, &normalized)
-    } else {
-        let dir = relativize(root, normalized.trim_end_matches('/'));
-        if dir.is_empty() {
-            "Cargo.toml".to_string()
-        } else {
-            format!("{}/Cargo.toml", dir.trim_end_matches('/'))
-        }
-    };
-    rel
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::checks::Severity;
     use std::path::PathBuf;
 
     fn root() -> PathBuf {

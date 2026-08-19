@@ -1067,19 +1067,81 @@ pub fn runtime_needs(program: &Path, m: &Machine) -> Vec<RuntimeMatch> {
     let Some(p) = Program::at(program) else {
         return Vec::new();
     };
+    let detected: Vec<&'static RuntimeProfile> = RUNTIME_PROFILES
+        .iter()
+        .filter(|profile| profile.detect.iter().any(|d| d.matches(&p)))
+        .collect();
+    screened_needs(&detected, &p, m)
+}
+
+/// Which runtime profiles **detection** fires for, by id — the raw answer,
+/// before any screening drops a refused grant.
+///
+/// V38 Phase C's declaration/inference cross-check reads this: a manifest that
+/// declares `runtime: node` for a program detection sees as `python` is drift
+/// worth a row, and the comparison has to be about what fired, not about what
+/// survived the screen (a profile whose every grant was refused still fired).
+#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
+pub fn inferred_runtime_ids(program: &Path, m: &Machine) -> Vec<&'static str> {
+    let _ = m;
+    let Some(p) = Program::at(program) else {
+        return Vec::new();
+    };
+    RUNTIME_PROFILES
+        .iter()
+        .filter(|profile| profile.detect.iter().any(|d| d.matches(&p)))
+        .map(|profile| profile.id)
+        .collect()
+}
+
+/// Which runtime profiles apply to one spawn — inference, a DECLARED profile,
+/// or none at all (V38 Phase C's manifest `runtime` field).
+///
+/// `Profile` takes the row's `id` rather than a path for the reason the
+/// manifest field is a closed enum at all: the value selects from a table cImp
+/// owns, so the worst a lying manifest achieves is a grant the user can see
+/// named at enable time. An id no row carries selects nothing — a manifest from
+/// a newer cImp asks for a runtime this build has no rules for, and inventing
+/// one would be worse than the gap.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn runtime_matches(select: &RuntimeSelect, program: &Path, m: &Machine) -> Vec<RuntimeMatch> {
+    match select {
+        RuntimeSelect::Infer => runtime_needs(program, m),
+        RuntimeSelect::None => Vec::new(),
+        RuntimeSelect::Profile(id) => {
+            let Some(p) = Program::at(program) else {
+                return Vec::new();
+            };
+            let declared: Vec<&'static RuntimeProfile> = RUNTIME_PROFILES
+                .iter()
+                .filter(|profile| profile.id == *id)
+                .collect();
+            screened_needs(&declared, &p, m)
+        }
+    }
+}
+
+/// The screen every profile's needs pass, whichever way the profile was chosen.
+///
+/// Split out of [`runtime_needs`] so a DECLARED profile cannot take a shorter
+/// path to a grant than an inferred one: the manifest is attacker-controlled
+/// input and its declaration selects a row, never a rule.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn screened_needs(
+    profiles: &[&'static RuntimeProfile],
+    p: &Program,
+    m: &Machine,
+) -> Vec<RuntimeMatch> {
     let home = m.home();
     let system_root = m.system_root();
     let mut out: Vec<RuntimeMatch> = Vec::new();
     let mut seen: Vec<PathBuf> = Vec::new();
-    for profile in RUNTIME_PROFILES {
-        if !profile.detect.iter().any(|d| d.matches(&p)) {
-            continue;
-        }
+    for profile in profiles {
         let RuntimeNeeds {
             grants,
             env,
             mut gaps,
-        } = (profile.needs)(&p, m);
+        } = (profile.needs)(p, m);
         let mut kept = Vec::new();
         let mut refused: Vec<PathBuf> = Vec::new();
         for g in grants {
@@ -1195,6 +1257,120 @@ pub fn record_runtime_gap(seam: &str, root: &Path, runtime: &str, what: &str, wh
              needs inside the sandbox that was NOT provided: {why}. The child still runs, still \
              sandboxed — this row is here so that if it exits without a word, the reason is \
              already written down."
+        ),
+        false,
+    );
+}
+
+/// Record that a manifest DECLARED a runtime that inference disagrees with.
+///
+/// The doc's cross-check, as a row rather than as a tie-break: cImp runs with
+/// the declaration (a plugin author knows what their tool is, and inference
+/// cannot know a runtime it has never heard of) and says so, because a stale
+/// declaration is drift and drift that nothing reports is drift nobody fixes.
+///
+/// It lands in the **sandbox** lane, not the plugin one, on purpose. The plugin
+/// lane is a LOAD lane — manifests that would not parse, identities that
+/// collide, a rescan's summary — and this is not a fact about the file; it is a
+/// fact about one spawn, whose seam tag (`audit:<tool>`) is what a reader
+/// correlates it with. Every other row explaining which grants a child got is
+/// here, and splitting the same question across two lanes is how the second one
+/// stops being read.
+///
+/// Once per (seam, runtime pair) per session — [`record_runtime_gap`]'s reason:
+/// it is re-derived on every spawn.
+#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
+pub fn record_runtime_mismatch(
+    seam: &str,
+    root: &Path,
+    subject: &str,
+    declared: &str,
+    inferred: &[&str],
+) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static EMITTED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+    let seen = inferred.join(", ");
+    if let Ok(mut guard) = EMITTED.lock() {
+        let set = guard.get_or_insert_with(HashSet::new);
+        if !first_time(set, format!("{seam}|{declared}|{seen}|{}", subject_key(subject))) {
+            return;
+        }
+    }
+    record_event(
+        seam,
+        root,
+        "runtime-mismatch",
+        state_target("runtime mismatch", subject),
+        format!(
+            "the manifest declares the `{declared}` runtime; detection recognizes `{seen}` behind              this program. cImp ran with the DECLARED profile — a declaration is the author's              statement and inference cannot know a runtime it has never met — but the two              disagreeing is drift: either the manifest names the wrong runtime, or the tool's              layout changed under it. If the tool then fails to start, this is the first row to              read."
+        ),
+        false,
+    );
+}
+
+/// Record that a tool ran OUTSIDE the boundary because its manifest declares
+/// `sandbox: unsupported`.
+///
+/// Its own row rather than [`record_skip`]'s, because the two states are not
+/// the same: a skip says cImp could not provide the boundary, this says the
+/// tool asked not to be inside one and the user granted that by enabling it
+/// (the permission summary shows the ask at enable time). The verb stays
+/// `unsandboxed` so the feed's existing chip is correct — what changed is the
+/// *reason*, which is what the target text carries.
+///
+/// Once per (seam, subject) per session: a standing fact about a configured
+/// tool, not an event.
+#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
+pub fn record_declared_unsandboxed(seam: &str, root: &Path, subject: &str) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static EMITTED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+    if let Ok(mut guard) = EMITTED.lock() {
+        let set = guard.get_or_insert_with(HashSet::new);
+        if !first_time(set, format!("{seam}|{}", subject_key(subject))) {
+            return;
+        }
+    }
+    record_event(
+        seam,
+        root,
+        "unsandboxed",
+        state_target("declared unsupported", subject),
+        format!(
+            "{subject} ran OUTSIDE the OS sandbox because its plugin manifest declares              `sandbox: unsupported` — the boundary was not attempted, whether or not it was              available. That declaration is shown as a permission where the tool is enabled;              disabling the tool is the way to withdraw it."
+        ),
+        false,
+    );
+}
+
+/// Record that a tool was NOT RUN because its manifest declares
+/// `sandbox: required` and the boundary could not be provided.
+///
+/// The refusal is the point: `required` is a manifest saying "never run me
+/// unprotected", and the honest answer to a missing boundary is a failed tool
+/// with a reason, not a quiet unsandboxed run. Deduped per (seam, reason)
+/// because the cause is a standing condition (the switch is off, a prerequisite
+/// is missing) — the per-run surface is the tool's own error, which is not
+/// deduped.
+#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
+pub fn record_sandbox_required_refusal(seam: &str, root: &Path, subject: &str, why: &str) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static EMITTED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+    if let Ok(mut guard) = EMITTED.lock() {
+        let set = guard.get_or_insert_with(HashSet::new);
+        if !first_time(set, format!("{seam}|{why}|{}", subject_key(subject))) {
+            return;
+        }
+    }
+    record_event(
+        seam,
+        root,
+        "refused",
+        state_target("refused (sandbox required)", subject),
+        format!(
+            "{subject} was NOT run: its plugin manifest declares `sandbox: required`, and the OS              boundary could not be provided here — {why}. Running it anyway would have delivered              findings from a tool the manifest says must never run unprotected, which is a worse              outcome than this tool being missing from the report."
         ),
         false,
     );
@@ -1451,6 +1627,33 @@ pub struct GrantHints {
     /// paths, where the reviewer's question is "why is `~/.claude` readable?"
     /// and the answer has to live beside the path.
     pub rows: Vec<GrantRow>,
+    /// V38: which runtime profile the SPAWNED PROGRAM's grants come from.
+    ///
+    /// Applies to `program` only, never to [`programs`](Self::programs): those
+    /// are paths cImp inferred from a command line and nobody declared anything
+    /// about them, so they keep inference. Defaults to [`RuntimeSelect::Infer`],
+    /// which is what every pre-V38 seam does.
+    pub runtime: RuntimeSelect,
+}
+
+/// Which [`RUNTIME_PROFILES`] rows a spawn's grants come from.
+///
+/// The runtime half of V38's manifest sandbox fields, as a type the sandbox
+/// layer owns: a seam that has nothing to declare passes the default and keeps
+/// today's inference exactly.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum RuntimeSelect {
+    /// Infer from the resolved program — V33's behaviour, and every built-in
+    /// seam's.
+    #[default]
+    Infer,
+    /// A named profile, from a table cImp owns. Inference still runs as a
+    /// CROSS-CHECK at the calling seam (see [`inferred_runtime_ids`]); it does
+    /// not decide.
+    Profile(&'static str),
+    /// "This is a single static binary": its own directory is the whole grant,
+    /// and no profile applies even if one would have detected.
+    None,
 }
 
 /// How wide one [`GrantRow`] opens the boundary.
@@ -2540,6 +2743,58 @@ mod tests {
         n.env.iter().find(|v| v.name == name).map(|v| &v.value)
     }
 
+
+    /// **V38: a DECLARED runtime selects a row detection would not have fired,
+    /// and takes the same screen.**
+    ///
+    /// The case the manifest field exists for: a scanner installed somewhere no
+    /// convention recognizes (`C:\tools\acme\acme.exe` is a Python program, and
+    /// nothing about that path says so). Inference sees nothing; the
+    /// declaration selects the `python` row; the grants it produces are the
+    /// row's own, screened exactly as an inferred one would be.
+    #[test]
+    fn a_declared_runtime_selects_a_profile_inference_would_have_missed() {
+        let env = env_of(&[("USERPROFILE", "C:/Users/me")]);
+        let is_dir = dirs_exist(&["C:/tools/acme"]);
+        let m = Machine {
+            env: &env,
+            is_dir: &is_dir,
+        };
+        let program = Path::new("C:/tools/acme/acme.exe");
+
+        // Inference: nothing. A path convention is all it has, and there is none.
+        assert!(inferred_runtime_ids(program, &m).is_empty());
+        assert!(runtime_matches(&RuntimeSelect::Infer, program, &m).is_empty());
+
+        // The declaration fires the row, whose scratch redirections apply even
+        // where no install tree was found.
+        let got = runtime_matches(&RuntimeSelect::Profile("python"), program, &m);
+        assert_eq!(runtime_ids(&got), vec!["python"]);
+
+        // `none` is the positive statement "single static binary": no row, ever,
+        // even for a program inference WOULD have matched.
+        let stub = Path::new("C:/Users/me/AppData/Local/Programs/Python/Scripts/acme.exe");
+        assert_eq!(inferred_runtime_ids(stub, &m), vec!["python"]);
+        assert!(runtime_matches(&RuntimeSelect::None, stub, &m).is_empty());
+
+        // An id no row carries selects nothing — a manifest from a newer cImp
+        // asking for a runtime this build has no rules for gets the gap, never
+        // an invented grant.
+        assert!(runtime_matches(&RuntimeSelect::Profile("cobol"), stub, &m).is_empty());
+    }
+
+    /// Every id the manifest's `runtime` enum can name is a real row in this
+    /// table — the two vocabularies are the same one, checked from the sandbox
+    /// side as well as from the manifest side.
+    #[test]
+    fn every_runtime_select_id_names_a_profile() {
+        for id in ["python", "node", "java", "dotnet", "go", "rust"] {
+            assert!(
+                RUNTIME_PROFILES.iter().any(|p| p.id == id),
+                "`{id}` is selectable by a manifest but names no profile"
+            );
+        }
+    }
     /// **The rustup convention, ported into the table unchanged.**
     ///
     /// Measured 2026-08-18: a sandboxed `cargo` with only `…\.cargo\bin`

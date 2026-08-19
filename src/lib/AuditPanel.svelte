@@ -23,7 +23,12 @@
   import { revealFileInGraph } from './graphReveal';
   import { loadViewString, saveViewString, loadViewSet, saveViewSet } from './viewSection';
   import { auditStartScan, auditCancelScan, auditSnapshot, auditRefreshCensus } from './codeAudit/ipc';
-  import type { AuditCategory, AuditSeverity, AuditSnapshot, AuditToolId } from './codeAudit/types';
+  import type {
+    AuditCategory,
+    AuditSeverity,
+    AuditSnapshot,
+    AuditToolRef,
+  } from './codeAudit/types';
   import {
     SEVERITIES,
     categoryFindingsCount,
@@ -42,7 +47,6 @@
     sortFindings,
     toggleSelected,
     toolChip,
-    toolsInCategory,
     visibleFindings,
     type AuditFilters,
     type FindingRow,
@@ -59,7 +63,6 @@
   // Sub-tab heading — the enclosing view carries the "Code Audit" title.
   const heading = $derived(isSecurity ? 'Security' : 'Quality');
   const mdLabel = $derived(isSecurity ? 'Code audit (security)' : 'Code audit (quality)');
-  const categoryTools = $derived(toolsInCategory(category));
 
   function emptySnapshot(): AuditSnapshot {
     return {
@@ -83,18 +86,20 @@
   let activeCategory = $state<AuditCategory | null>(null);
 
   // ── Persisted UI state (filters) ──────────────────────────────────────────
-  // These seed one-time from the (static) `view` / `categoryTools`; the
-  // initial-value read is intentional.
+  // These seed one-time from the (static) `view`; the initial-value read is
+  // intentional.
   // svelte-ignore state_referenced_locally
   const savedSev = loadViewString(view, 'severity');
   let severity = $state<AuditSeverity>(
     savedSev && (SEVERITIES as readonly string[]).includes(savedSev) ? (savedSev as AuditSeverity) : 'note',
   );
   // svelte-ignore state_referenced_locally
-  let hiddenTools = $state<Set<AuditToolId>>(
-    new Set(loadViewSet(view, 'hidden-tools').filter((t): t is AuditToolId =>
-      (categoryTools as readonly string[]).includes(t),
-    )),
+  // V38: keyed by the WIRE id, so a plugin tool's toggle persists like a
+  // built-in's. The stored set is no longer filtered against the built-in
+  // roster — a plugin's key is not in it and would have been dropped on every
+  // reload — only against emptiness, which is what a corrupted entry looks like.
+  let hiddenTools = $state<Set<AuditToolRef>>(
+    new Set(loadViewSet(view, 'hidden-tools').filter((t) => t.trim() !== '')),
   );
   // svelte-ignore state_referenced_locally
   let text = $state<string>(loadViewString(view, 'text') ?? '');
@@ -216,7 +221,7 @@
     void pullFull();
   }
 
-  function toggleTool(id: AuditToolId): void {
+  function toggleTool(id: AuditToolRef): void {
     const next = new Set(hiddenTools);
     if (next.has(id)) next.delete(id);
     else next.add(id);

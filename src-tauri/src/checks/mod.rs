@@ -185,6 +185,15 @@ pub enum ParserKind {
     /// JUnit XML test report (Surefire/Gradle/pytest/PHPUnit/...), normally
     /// read via `report_file`.
     JunitXml,
+    /// `typos --format json` — one JSON object per line (V38: folded in from
+    /// the audit-era table; wire `typos-jsonl`).
+    TyposJsonl,
+    /// `knip --reporter json` — one document, `{ issues: [...] }` (V38: folded
+    /// in; wire `knip-json`).
+    KnipJson,
+    /// `cargo-machete` text output — a header plus indented crate names (V38:
+    /// folded in; wire `machete-text`).
+    MacheteText,
     /// The universal escape hatch: a user-supplied regex with named groups
     /// (`file`, `line`, optional `col`/`severity`, `message`) applied per line.
     /// Uses [`CheckDef::pattern`].
@@ -823,6 +832,9 @@ async fn spawn_capture(
             crate::sandbox::SEAM_RUN_CHECK,
             &shell,
             &crate::sandbox::GrantHints {
+                // A check's runtime is inferred from the program the command
+                // names — a `CheckDef` declares nothing about it.
+                runtime: crate::sandbox::RuntimeSelect::Infer,
                 programs: inferred,
                 // A check writes into the project root (already granted) or into
                 // its redirected TEMP on the mapped drive; nothing outside.
@@ -2040,6 +2052,9 @@ mod tests {
             ParserKind::GoTestJson,
             ParserKind::Dotnet,
             ParserKind::JunitXml,
+            ParserKind::TyposJsonl,
+            ParserKind::KnipJson,
+            ParserKind::MacheteText,
             ParserKind::RegexCustom,
             ParserKind::GenericGcc,
         ];
@@ -2056,6 +2071,9 @@ mod tests {
                 | ParserKind::GoTestJson
                 | ParserKind::Dotnet
                 | ParserKind::JunitXml
+                | ParserKind::TyposJsonl
+                | ParserKind::KnipJson
+                | ParserKind::MacheteText
                 | ParserKind::RegexCustom
                 | ParserKind::GenericGcc => {}
             }

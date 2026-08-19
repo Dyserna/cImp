@@ -230,12 +230,25 @@ impl Adapter {
     }
 
     /// Classify a completed child's exit code (`None` = killed / no code).
+    #[cfg(test)]
     pub fn classify_exit(&self, code: Option<i32>) -> ExitClass {
-        match code {
-            Some(0) => ExitClass::Clean,
-            Some(c) if self.findings_exit_codes.contains(&c) => ExitClass::Findings,
-            _ => ExitClass::Error,
-        }
+        classify_exit(code, self.findings_exit_codes)
+    }
+}
+
+/// Classify a completed child's exit code against the codes that mean
+/// "findings, not failure" (`None` = killed / no code).
+///
+/// A free function since V38, because the plugin population carries the same
+/// semantics as a `Vec<i32>` from a manifest rather than as a `&'static [i32]`
+/// on an `Adapter` — and the audit runner must apply ONE rule to both. It lives
+/// here because this is the module whose docs explain why audit tools invert
+/// `run_check`'s "non-zero means broken".
+pub fn classify_exit(code: Option<i32>, findings_exit_codes: &[i32]) -> ExitClass {
+    match code {
+        Some(0) => ExitClass::Clean,
+        Some(c) if findings_exit_codes.contains(&c) => ExitClass::Findings,
+        _ => ExitClass::Error,
     }
 }
 

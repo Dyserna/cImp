@@ -910,6 +910,7 @@ mod tests {
             programs: vec![PathBuf::from("/home/me/.cargo/bin/cargo")],
             full_dirs: vec![PathBuf::from("/proj/.cimp/reports")],
             rows: Vec::new(),
+            runtime: super::super::RuntimeSelect::Infer,
         };
         let grants = ladder(&cfg, &hints);
 

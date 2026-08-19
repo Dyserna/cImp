@@ -37,13 +37,13 @@ use serde_json::{json, Value};
 use tokio::sync::Mutex as TokioMutex;
 
 use super::adapters::Category;
+use super::runnable::ToolKey;
 use super::runner::{AuditSnapshot, AuditState, ToolStatus};
 use crate::checks::Severity;
 use crate::mcp_stdio::tool_error;
 use crate::offload::loopback::{
     forget_resolved_discovery, parse_result_line, proxy_base_for, ChildIdentity,
 };
-use crate::settings::AuditToolId;
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
 const SERVER_NAME: &str = "cimp-code-audit";
@@ -181,7 +181,7 @@ pub fn format_result(snapshot: &AuditSnapshot, category: Category) -> String {
     // (each tool's findings keep emit order within a band), and no ordering
     // work is spent on the thousands of entries a pathological repo can
     // surface past the render cap.
-    let mut buckets: [Vec<(&AuditToolId, &crate::checks::Diag)>; 3] = Default::default();
+    let mut buckets: [Vec<(&ToolKey, &crate::checks::Diag)>; 3] = Default::default();
     for t in &tools {
         for f in &t.findings {
             buckets[severity_rank(f.diag.severity) as usize].push((&f.tool, &f.diag));
@@ -192,8 +192,8 @@ pub fn format_result(snapshot: &AuditSnapshot, category: Category) -> String {
 
     // Each tool's wire id, derived once (a serde round-trip) rather than once
     // per rendered finding.
-    let id_strs: HashMap<AuditToolId, String> =
-        tools.iter().map(|t| (t.id, tool_id_str(&t.id))).collect();
+    let id_strs: HashMap<&ToolKey, String> =
+        tools.iter().map(|t| (&t.id, t.id.wire())).collect();
 
     let mut out = String::new();
 
@@ -236,7 +236,7 @@ pub fn format_result(snapshot: &AuditSnapshot, category: Category) -> String {
             let wire = id_strs
                 .get(*tool)
                 .cloned()
-                .unwrap_or_else(|| tool_id_str(tool));
+                .unwrap_or_else(|| tool.wire());
             let line = format_finding(&wire, d);
             // Cap on count OR bytes, whichever first — stop *before*
             // overshooting the byte budget so the note itself still fits.
@@ -291,16 +291,6 @@ fn status_line(t: &super::runner::ToolState) -> String {
         ToolStatus::Idle => "disabled".to_string(),
         ToolStatus::Running => "running".to_string(),
     }
-}
-
-/// The tool's kebab **wire** id (`osv-scanner`, `semgrep-quality`, …) — distinct
-/// from its binary `command_name` (two tools share `semgrep` / `dotnet`), so this
-/// derives it from the serde representation to keep findings unambiguous.
-fn tool_id_str(id: &AuditToolId) -> String {
-    serde_json::to_value(id)
-        .ok()
-        .and_then(|v| v.as_str().map(str::to_string))
-        .unwrap_or_else(|| id.command_name().to_string())
 }
 
 /// Errors first, then warnings, then notes.
@@ -794,6 +784,7 @@ async fn run_via_loopback(category: Category) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::AuditToolId;
     use crate::audit::runner::{AuditFinding, ToolState};
     use crate::checks::{Diag, Severity};
 
@@ -841,6 +832,71 @@ mod tests {
         }
     }
 
+
+    // ── V38 Phase C: plugin tools in the report ────────────────────────────
+
+    /// A plugin tool's findings render like any other tool's, under the key
+    /// that RAN — and the shared report budget applies to them unchanged,
+    /// because they ride the same formatter.
+    #[test]
+    fn a_plugin_tools_findings_ride_the_same_report_and_the_same_caps() {
+        let key = ToolKey::Plugin("acme@1.0.0/scan".to_string());
+        let findings: Vec<AuditFinding> = (0..(MAX_FINDINGS + 50))
+            .map(|i| AuditFinding {
+                tool: key.clone(),
+                diag: Diag {
+                    severity: Severity::Error,
+                    code: Some("ACME001".into()),
+                    message: "boom".into(),
+                    file: "f.rs".into(),
+                    line: i as u32,
+                    col: None,
+                },
+            })
+            .collect();
+        let total = findings.len();
+        let t = ToolState {
+            id: key.clone(),
+            category: Category::Security,
+            status: ToolStatus::Done,
+            findings,
+            duration_ms: 10,
+            error: None,
+            resolved: None,
+            scanned_artifacts: Vec::new(),
+        };
+        let out = format_result(&snapshot(vec![t]), Category::Security);
+
+        // Attribution: the plugin key, in the status line and in the findings.
+        assert!(out.contains("acme@1.0.0/scan — done"), "{out}");
+        assert!(out.contains("[acme@1.0.0/scan/ACME001]"), "{out}");
+        // The 300-finding / 64 KB budget is the SAME budget.
+        assert!(out.contains("truncated"), "{out}");
+        assert!(out.contains(&format!("of {total} findings")), "{out}");
+        assert!(out.len() <= MAX_RESULT_BYTES + 200, "over budget: {}", out.len());
+    }
+
+    /// **Invariant 1, restated for V38.** The umbrella descriptions are static
+    /// text: no plugin roster reaches them, so installing a plugin cannot make
+    /// the model-visible surface change (and cannot emit `list_changed` noise).
+    ///
+    /// Asserted two ways, because "static" is the property that matters: the
+    /// descriptors are identical across calls, and they carry no plugin-key
+    /// punctuation — a rendered roster would have to.
+    #[test]
+    fn umbrella_descriptions_are_static_and_never_carry_a_roster() {
+        let a = tool_descriptors();
+        let b = tool_descriptors();
+        assert_eq!(a, b, "the descriptors are not a function of any live state");
+        for t in a {
+            let desc = t["description"].as_str().unwrap();
+            assert!(
+                !desc.contains('@') && !desc.contains("plugin"),
+                "a plugin roster leaked into a model-visible description: {desc}"
+            );
+        }
+    }
+
     // ── format_result ──────────────────────────────────────────────────────
 
     fn finding(
@@ -852,7 +908,7 @@ mod tests {
         msg: &str,
     ) -> AuditFinding {
         AuditFinding {
-            tool,
+            tool: tool.into(),
             diag: Diag {
                 severity: sev,
                 code: Some(code.to_string()),
@@ -873,7 +929,7 @@ mod tests {
         error: Option<&str>,
     ) -> ToolState {
         ToolState {
-            id,
+            id: id.into(),
             category,
             status,
             findings,

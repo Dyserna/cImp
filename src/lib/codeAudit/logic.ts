@@ -13,6 +13,7 @@ import type {
   AuditSeverity,
   AuditSnapshot,
   AuditToolId,
+  AuditToolRef,
   AuditToolState,
   AuditToolStatus,
 } from './types';
@@ -137,8 +138,16 @@ export function censusIsEmpty(census: AuditCensus): boolean {
 /// gate extension OR ANY gate marker was seen. Callers must special-case an
 /// empty census (`censusIsEmpty`) — with nothing seen a guarded tool reads as
 /// not-applicable, which for chip visibility means "unknown", not "hide".
-export function isToolApplicable(id: AuditToolId, census: AuditCensus): boolean {
-  const a = AUDIT_TOOL_APPLICABILITY[id];
+/// Whether a tool applies to a project with this census.
+///
+/// V38: an id this build has no applicability metadata for is a PLUGIN tool,
+/// whose gate lives in its manifest and is evaluated backend-side — the snapshot
+/// already says `skipped-not-applicable` when it did not apply. Answering
+/// "applicable" here is therefore not a guess but a deferral: the frontend
+/// hides nothing it was not told to hide.
+export function isToolApplicable(id: AuditToolRef, census: AuditCensus): boolean {
+  const a = AUDIT_TOOL_APPLICABILITY[id as AuditToolId];
+  if (!a) return true;
   if (a.extensions.length === 0 && a.markers.length === 0) return true;
   return (
     a.extensions.some((e) => census.extensions.includes(e)) ||
@@ -153,8 +162,12 @@ export const SEVERITY_RANK: Record<AuditSeverity, number> = { error: 3, warning:
 /// The three severities, most-severe first — for the threshold `<select>`.
 export const SEVERITIES: readonly AuditSeverity[] = ['error', 'warning', 'note'];
 
-function toolRank(id: AuditToolId): number {
-  const i = AUDIT_TOOL_ORDER.indexOf(id);
+/// Sort rank: the built-in order, then everything else (plugin tools) after it,
+/// stable in arrival order. Deliberately not alphabetical among plugins — the
+/// backend emits them in registry order (plugin key, then manifest order), which
+/// is the order the settings pane lists them in.
+function toolRank(id: AuditToolRef): number {
+  const i = (AUDIT_TOOL_ORDER as readonly string[]).indexOf(id);
   return i < 0 ? AUDIT_TOOL_ORDER.length : i;
 }
 
@@ -166,7 +179,7 @@ function toolRank(id: AuditToolId): number {
 export interface FindingRow {
   /// `${tool}#${indexWithinTool}` — stable, unique within a snapshot.
   id: string;
-  tool: AuditToolId;
+  tool: AuditToolRef;
   severity: AuditSeverity;
   /// SARIF rule id, or `null`.
   code: string | null;
@@ -210,7 +223,8 @@ export interface AuditFilters {
   /// Severity threshold — rows at or above this rank are shown.
   severity: AuditSeverity;
   /// Per-tool visibility. A tool absent from the map is treated as visible.
-  tools: Partial<Record<AuditToolId, boolean>>;
+  /// Keyed by the WIRE id, so a plugin tool's toggle works like any other's.
+  tools: Partial<Record<string, boolean>>;
   /// Case-insensitive substring over message / file / rule id / tool.
   text: string;
 }
@@ -221,7 +235,7 @@ export function defaultFilters(): AuditFilters {
   return { severity: 'note', tools: {}, text: '' };
 }
 
-function toolVisible(filters: AuditFilters, id: AuditToolId): boolean {
+function toolVisible(filters: AuditFilters, id: AuditToolRef): boolean {
   return filters.tools[id] !== false;
 }
 
@@ -495,7 +509,7 @@ export function mergeAuditSnapshot(
   next: AuditSnapshot,
 ): AuditSnapshot {
   if (!prev) return { ...next, tools: orderToolStates(next.tools) };
-  const byId = new Map<AuditToolId, AuditToolState>();
+  const byId = new Map<AuditToolRef, AuditToolState>();
   for (const t of prev.tools) byId.set(t.id, t);
   for (const t of next.tools) byId.set(t.id, t);
   return {

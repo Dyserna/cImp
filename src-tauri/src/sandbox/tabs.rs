@@ -278,6 +278,8 @@ fn grant_rows_with(harness: Harness, env: &dyn Fn(&str) -> Option<OsString>) -> 
 /// [`grant_rows_with`] against the real process environment.
 pub fn grant_hints(harness: Harness) -> GrantHints {
     GrantHints {
+        // A harness is spawned by cImp, not declared by a manifest: inference.
+        runtime: super::RuntimeSelect::Infer,
         programs: Vec::new(),
         full_dirs: Vec::new(),
         rows: grant_rows_with(harness, &|k| std::env::var_os(k)),

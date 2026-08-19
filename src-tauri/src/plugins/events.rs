@@ -11,7 +11,7 @@
 //! * `source` — the manifest **file name** for a per-file row (two joined by
 //!   `+` for a conflict): the file is the thing the user opens to fix this.
 //!   [`SCAN_SOURCE`] for the summary row, whose subject is the folder.
-//! * `tool` — the verb: [`REJECTED`], [`CONFLICT`], [`RESCAN`].
+//! * `tool` — the verb: [`REJECTED`], [`CONFLICT`], [`RESCAN`], [`OVERLAY`].
 //! * `target` — the human-readable *why*: the rejection reason, or
 //!   `loaded N · rejected M` for the summary.
 //! * `chars` — always 0. A plugin row has no payload, and printing "0 chars"
@@ -43,6 +43,9 @@ pub const SCAN_SOURCE: &str = "plugins";
 pub const REJECTED: &str = "rejected";
 pub const CONFLICT: &str = "conflict";
 pub const RESCAN: &str = "rescan";
+/// V38 Phase B: a project's `.cimp/config.json` carried machine-scope
+/// tool-plugin fields, and they were ignored on load.
+pub const OVERLAY: &str = "overlay";
 
 /// How much of a reason fits in the `target` column before the rest is left to
 /// the detail popup. Reasons are written to be read (they name files and say
@@ -132,6 +135,52 @@ pub fn record_scan(set: &PluginSet) {
     }
 }
 
+/// The row for machine-scope tool-plugin fields found in a project overlay and
+/// dropped (`settings::persistence`'s structured strip).
+///
+/// **ONE row per load, listing every offending field** — not one row per field.
+/// A hand-edited (or stale) `.cimp/config.json` typically carries a whole block
+/// at once, and a row per key would bury the fact that they were all ignored
+/// under the noise of saying so eight times. The names go in `target` up to the
+/// headline width, and all of them in the detail.
+///
+/// `ok: false` because this IS a discrepancy the user should resolve: the file
+/// says something cImp will not honour, so what they see in that file is not
+/// what the machine does.
+pub fn overlay_strip_row(overlay_path: &str, dropped: &[String]) -> ActivityRecord {
+    let target = format!(
+        "ignored {} machine-scope field{} in the project config: {}",
+        dropped.len(),
+        if dropped.len() == 1 { "" } else { "s" },
+        dropped.join(", ")
+    );
+    let detail = format!(
+        "{overlay_path}\n\n{}\n\nBinary paths, enables and timeouts for tool plugins are \
+         machine scope: they describe this machine, and a project's config file lives inside \
+         the sandbox boundary a confined tool can write to. Only declared variable \
+         values and extra parameters ride a project's config; set the rest in \
+         Settings → Tool Plugins.",
+        dropped.join("\n")
+    );
+    row(
+        SCAN_SOURCE.to_string(),
+        OVERLAY,
+        headline(&target),
+        false,
+        0,
+        detail,
+    )
+}
+
+/// Mint [`overlay_strip_row`] — no-op when the overlay carried nothing to drop,
+/// so a clean project never speaks.
+pub fn record_overlay_strip(overlay_path: &str, dropped: &[String]) {
+    if dropped.is_empty() {
+        return;
+    }
+    crate::activity::record_bg(overlay_strip_row(overlay_path, dropped));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,6 +244,34 @@ mod tests {
             assert_eq!(r.entry.chars, 0, "a plugin row carries no payload");
             assert!(r.request.is_empty());
         }
+    }
+
+    /// V38 Phase B: ONE row per load naming every ignored field, and it is not
+    /// green — a config file that says something cImp will not honour is a
+    /// discrepancy, not a normal event. Silence for a clean project.
+    #[test]
+    fn an_overlay_strip_is_one_row_naming_every_dropped_field() {
+        let dropped = vec![
+            "tool_plugins.global_paths".to_string(),
+            "tool_plugins.plugins.acme@1.0.0.tools.scan.enabled".to_string(),
+        ];
+        let r = overlay_strip_row("C:\\repo\\.cimp\\config.json", &dropped);
+        assert_eq!(r.entry.tool, OVERLAY);
+        assert!(!r.entry.ok);
+        assert!(r.entry.target.contains("2 machine-scope fields"), "{}", r.entry.target);
+        for name in &dropped {
+            assert!(
+                r.entry.target.contains(name) || r.response.contains(name),
+                "`{name}` was dropped but the row never says so"
+            );
+        }
+        // The detail names the file to edit and where the setting really lives.
+        assert!(r.response.contains("C:\\repo\\.cimp\\config.json"), "{}", r.response);
+        assert!(r.response.contains("Settings"), "{}", r.response);
+        // Singular reads as singular — a row that says "1 fields" is a row
+        // nobody trusts to have counted.
+        let one = overlay_strip_row("x", &["tool_plugins.global_paths".to_string()]);
+        assert!(one.entry.target.contains("1 machine-scope field in"), "{}", one.entry.target);
     }
 
     /// A rejection is never green, and the reason must reach the popup intact

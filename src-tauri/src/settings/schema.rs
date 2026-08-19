@@ -3,7 +3,7 @@
 //! get defaults, unknown fields are ignored. v1.2 schema; the v1 → v2 and
 //! v1.1 → v1.2 migrations live in `migration.rs` and run once on first load.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -160,7 +160,7 @@ pub const SHELL_BROOT_TAB_ID: &str = "shell-broot";
 /// Files that pre-date V1.10 lack the field entirely; the cascade still
 /// uses the `looks_v1_X` predicates for those, falling through to a final
 /// step that stamps the field with the current value.
-pub const CURRENT_SCHEMA_VERSION: u8 = 31;
+pub const CURRENT_SCHEMA_VERSION: u8 = 32;
 
 fn current_schema_version() -> u8 {
     CURRENT_SCHEMA_VERSION
@@ -440,6 +440,17 @@ pub struct Settings {
     /// and the three default tools present. No schema-version bump.
     #[serde(default)]
     pub code_audit: CodeAuditSettings,
+    /// V38 Phase B: user state for the drop-in **tool plugins** — which of a
+    /// manifest's tools are enabled, what their declared variables are set to,
+    /// and where their binaries live on this machine. Schema v32 (additive: the
+    /// container materializes empty, nothing moved into it).
+    ///
+    /// Keyed maps rather than typed fields, on purpose: the set of plugins is
+    /// whatever is in `<exe-dir>/plugins/` today, so a typed shape would need a
+    /// settings migration every time a user dropped a file in a folder. See
+    /// [`ToolPluginsSettings`] for how the three maps divide by SCOPE.
+    #[serde(default, deserialize_with = "deserialize_lenient_tool_plugins")]
+    pub tool_plugins: ToolPluginsSettings,
 }
 
 impl Default for Settings {
@@ -489,6 +500,239 @@ impl Default for Settings {
             llm_pricing: default_llm_pricing(),
             harness_versions: HarnessVersions::default(),
             code_audit: CodeAuditSettings::default(),
+            tool_plugins: ToolPluginsSettings::default(),
+        }
+    }
+}
+
+/// V38 Phase B: the **tool plugin** user-state container (schema v32).
+///
+/// One stable, keyed-map block so plugin churn never migrates the schema: a
+/// plugin is a file a user drops into `<exe-dir>/plugins/`, so the set of keys
+/// is data, not shape. Adding a plugin adds a map entry; deleting its file
+/// leaves the entry alone (see below).
+///
+/// # The three maps are three SCOPES, and that is the whole design
+///
+/// * [`Self::plugins`] — enables, timeouts, declared-variable values and extra
+///   parameters, keyed `name@version`. Of these only `variables` and
+///   `parameters` may ride a project's `.cimp/config.json`; enables and
+///   timeouts are machine-global (amended decision 10). The overlay strip in
+///   `settings::persistence` enforces that structurally rather than by
+///   documentation.
+/// * [`Self::global_paths`] — "where does this tool's binary live on this
+///   machine", keyed `name@version/tool-id`. A path is a machine fact, never a
+///   project preference, and the V26 field report (scanner paths configured in
+///   one repo, audits run in another resolving nothing) is what that rule is
+///   made of.
+/// * [`Self::project_paths`] — the same fact, overridden **per project**, keyed
+///   by the canonical project root and then by tool key. Still machine-global
+///   storage: a per-project *override* is not the same thing as a per-project
+///   *file*, and putting it in the overlay would put a binary path inside the
+///   sandbox boundary a confined child can write to (V33's `sandbox` ban, same
+///   reasoning).
+///
+/// Effective path = `project_paths[root][tool_key]` ?? `global_paths[tool_key]`
+/// ?? unset; a tool with no path is inert (nothing to run). The resolution
+/// lives in `plugins::registry`, which is the one place that answers it.
+///
+/// # Entries outlive their plugins, deliberately
+///
+/// Nothing prunes a key whose manifest is not currently loaded. A plugin file
+/// removed for an afternoon — or a plugin folder on a machine that has not
+/// synced yet — must not silently discard the user's configuration for it, and
+/// "the tool disappeared, so I threw away your settings" is a data-loss bug
+/// wearing a tidiness costume. The settings pane renders what the loader found;
+/// the state for everything else simply waits.
+#[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct ToolPluginsSettings {
+    /// Per-plugin state, keyed `name@version` (`loader::LoadedPlugin::key`).
+    pub plugins: BTreeMap<String, PluginState>,
+    /// Per-project binary paths: canonical project root → tool key → path.
+    /// Machine-global storage of a per-project override; see the type docs.
+    pub project_paths: BTreeMap<String, BTreeMap<String, String>>,
+    /// Machine-wide binary paths, keyed `name@version/tool-id`
+    /// (`loader::LoadedPlugin::tool_key`). The fallback when the current
+    /// project names none.
+    pub global_paths: BTreeMap<String, String>,
+}
+
+/// One plugin's user state.
+///
+/// `BTreeMap` rather than `HashMap` throughout the container: the settings file
+/// is diffed textually against a baseline to produce the project overlay, so a
+/// map that serialized in a different order on each save would manufacture a
+/// diff out of nothing.
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(default)]
+pub struct PluginState {
+    /// Master switch for every tool this plugin declares. Disabling it disables
+    /// them **as a unit** without touching their own `enabled` flags, so
+    /// re-enabling the plugin restores exactly the selection the user had
+    /// (decision 9).
+    pub enabled: bool,
+    /// Per-tool state, keyed by the tool's manifest id (NOT the namespaced tool
+    /// key — the plugin key is already the outer map's key).
+    pub tools: BTreeMap<String, ToolState>,
+}
+
+impl Default for PluginState {
+    fn default() -> Self {
+        Self {
+            // A plugin the user installed is on. The consent that matters is
+            // dropping the file in; a second, invisible "and now switch it on"
+            // step would only teach people to click past it.
+            enabled: true,
+            tools: BTreeMap::new(),
+        }
+    }
+}
+
+/// One tool's user state. **No path field**: paths are machine-scope and live
+/// in [`ToolPluginsSettings::global_paths`] / `project_paths` — the split that
+/// keeps a project overlay from pinning a copy of a machine fact.
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(default)]
+pub struct ToolState {
+    pub enabled: bool,
+    /// Wall-clock override in seconds; `None` = the manifest's value, then the
+    /// consuming pipeline's default.
+    pub timeout_secs: Option<u64>,
+    /// Extra CLI arguments appended after the tool's own argv — the successor
+    /// to `AuditToolConfig::extra_args`, offered only for a tool whose manifest
+    /// sets `parameters_allowed`.
+    pub parameters: Vec<String>,
+    /// Values for the tool's **declared** variables, by declared name. A name
+    /// the manifest does not declare is inert (the registry only substitutes
+    /// declared ones) but is kept: it is most likely a plugin mid-upgrade.
+    pub variables: BTreeMap<String, String>,
+}
+
+impl Default for ToolState {
+    fn default() -> Self {
+        Self {
+            // Same reasoning as `PluginState::enabled`, one level down: a tool
+            // the plugin author shipped is on unless the user says otherwise.
+            // The gate that actually decides whether it RUNS is the path — no
+            // path, nothing to spawn — so "enabled by default" is not "runs by
+            // default".
+            enabled: true,
+            timeout_secs: None,
+            parameters: Vec::new(),
+            variables: BTreeMap::new(),
+        }
+    }
+}
+
+/// Deserialize [`ToolPluginsSettings`] tolerantly, dropping entries rather than
+/// failing the whole `Settings` parse.
+///
+/// **This is not defensive decoration — it is required by how overlays work.**
+/// `settings::persistence::diff` writes an explicit JSON `null` for every key
+/// the baseline has and the current value does not, so that the reverse merge
+/// can reconstruct a *deletion*. Every other field in `Settings` is a struct
+/// field or an array, and structs always serialize every key, so that null
+/// never arises for them. This container is the first one keyed by DATA (plugin
+/// keys, tool ids, variable names), so a user who clears one variable in a
+/// project produces `{"variables": {"ruleset": null}}` in that project's
+/// overlay — and a strict `BTreeMap<String, String>` would refuse it, taking
+/// the *entire* settings file down to "typed parse failed; using global" (the
+/// same failure mode `deserialize_lenient_layout` exists to prevent, arriving
+/// through a different door).
+///
+/// So: a null entry means "deleted", which is exactly what the diff meant by
+/// it, and is honoured by dropping the key. A malformed entry is dropped with a
+/// warning for the same reason the audit-tool list drops unknown ids — one bad
+/// plugin's state must not cost the user everything else in the file.
+fn deserialize_lenient_tool_plugins<'de, D>(d: D) -> Result<ToolPluginsSettings, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = serde_json::Value::deserialize(d)?;
+    if raw.is_null() {
+        return Ok(ToolPluginsSettings::default());
+    }
+    let serde_json::Value::Object(map) = raw else {
+        tracing::warn!("settings: tool_plugins was not an object; ignoring");
+        return Ok(ToolPluginsSettings::default());
+    };
+
+    // Read field by field rather than through `from_value`: nulls can appear at
+    // EVERY level here (plugin key, tool id, variable name), so one strict
+    // `from_value` anywhere in the tree would discard a whole subtree over a
+    // single deleted leaf. `tool_plugins_round_trips_through_the_lenient_reader`
+    // is what keeps this walk honest when a field is added to either struct.
+    let mut out = ToolPluginsSettings::default();
+    for (key, state) in object_entries(map.get("plugins"), "tool_plugins.plugins") {
+        let Some(pobj) = state.as_object() else {
+            tracing::warn!("settings: tool-plugin state for `{key}` was not an object; ignoring");
+            continue;
+        };
+        let mut p = PluginState::default();
+        if let Some(b) = pobj.get("enabled").and_then(serde_json::Value::as_bool) {
+            p.enabled = b;
+        }
+        for (tool_id, tv) in object_entries(pobj.get("tools"), "tools") {
+            let Some(tobj) = tv.as_object() else {
+                tracing::warn!(
+                    "settings: tool state for `{key}/{tool_id}` was not an object; ignoring"
+                );
+                continue;
+            };
+            let mut t = ToolState::default();
+            if let Some(b) = tobj.get("enabled").and_then(serde_json::Value::as_bool) {
+                t.enabled = b;
+            }
+            // Absent, null and non-numeric all mean "no override" — the same
+            // state, so they take the same branch rather than three.
+            t.timeout_secs = tobj.get("timeout_secs").and_then(serde_json::Value::as_u64);
+            if let Some(a) = tobj.get("parameters").and_then(serde_json::Value::as_array) {
+                t.parameters = a
+                    .iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect();
+            }
+            for (name, val) in object_entries(tobj.get("variables"), "variables") {
+                if let Some(s) = val.as_str() {
+                    t.variables.insert(name, s.to_string());
+                }
+            }
+            p.tools.insert(tool_id, t);
+        }
+        out.plugins.insert(key, p);
+    }
+    for (root, entry) in object_entries(map.get("project_paths"), "tool_plugins.project_paths") {
+        let mut paths = BTreeMap::new();
+        for (tool_key, val) in object_entries(Some(&entry), "project paths") {
+            if let Some(s) = val.as_str() {
+                paths.insert(tool_key, s.to_string());
+            }
+        }
+        out.project_paths.insert(root, paths);
+    }
+    for (tool_key, entry) in object_entries(map.get("global_paths"), "tool_plugins.global_paths") {
+        if let Some(s) = entry.as_str() {
+            out.global_paths.insert(tool_key, s.to_string());
+        }
+    }
+    Ok(out)
+}
+
+/// The non-null entries of a JSON object field, in key order. A null value is a
+/// deletion (see [`deserialize_lenient_tool_plugins`]); a non-object field is
+/// nothing we can read.
+fn object_entries(v: Option<&serde_json::Value>, what: &str) -> Vec<(String, serde_json::Value)> {
+    match v {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(serde_json::Value::Object(o)) => o
+            .iter()
+            .filter(|(_, val)| !val.is_null())
+            .map(|(k, val)| (k.clone(), val.clone()))
+            .collect(),
+        Some(_) => {
+            tracing::warn!("settings: {what} was not an object; ignoring");
+            Vec::new()
         }
     }
 }
@@ -6208,5 +6452,157 @@ mod tests {
         let s = Settings::default();
         assert!(!s.templates_seeded);
         assert!(s.prompt_templates.is_empty());
+    }
+
+    // ── V38 Phase B — the `tool_plugins` container ────────────────────────
+
+    /// A fully-populated container survives serialize → deserialize unchanged.
+    ///
+    /// This is what keeps [`deserialize_lenient_tool_plugins`] honest: it reads
+    /// the tree field by field (it has to — nulls appear at every level), so a
+    /// field added to `PluginState`/`ToolState` and not to the walk would load
+    /// as its default and silently discard the user's setting. That failure has
+    /// no other symptom, which is exactly why it needs a test.
+    #[test]
+    fn tool_plugins_round_trips_through_the_lenient_reader() {
+        let mut tools = BTreeMap::new();
+        tools.insert(
+            "scan".to_string(),
+            ToolState {
+                enabled: false,
+                timeout_secs: Some(900),
+                parameters: vec!["--exclude".into(), "vendor".into()],
+                variables: BTreeMap::from([("ruleset".to_string(), "p/ci".to_string())]),
+            },
+        );
+        let cfg = ToolPluginsSettings {
+            plugins: BTreeMap::from([(
+                "acme@1.0.0".to_string(),
+                PluginState {
+                    enabled: false,
+                    tools,
+                },
+            )]),
+            project_paths: BTreeMap::from([(
+                "C:\\repo".to_string(),
+                BTreeMap::from([("acme@1.0.0/scan".to_string(), "C:\\bin\\acme.exe".to_string())]),
+            )]),
+            global_paths: BTreeMap::from([(
+                "acme@1.0.0/scan".to_string(),
+                "D:\\tools\\acme.exe".to_string(),
+            )]),
+        };
+        let s = Settings {
+            tool_plugins: cfg.clone(),
+            ..Settings::default()
+        };
+        let round: Settings =
+            serde_json::from_value(serde_json::to_value(&s).expect("serialize")).expect("parse");
+        assert_eq!(round.tool_plugins, cfg);
+    }
+
+    /// The overlay diff writes an explicit `null` for a key the baseline has and
+    /// the current value does not — that is how it expresses a DELETION. Every
+    /// other `Settings` field is a struct or an array, where the case cannot
+    /// arise; this container is keyed by data, so it must read a null as the
+    /// deletion it is instead of failing the whole file's parse.
+    #[test]
+    fn a_null_entry_is_a_deletion_not_a_parse_failure() {
+        let v = json!({
+            "schema_version": CURRENT_SCHEMA_VERSION,
+            "tool_plugins": {
+                "plugins": {
+                    "gone@1.0.0": null,
+                    "acme@1.0.0": {
+                        "enabled": true,
+                        "tools": {
+                            "dropped": null,
+                            "scan": { "enabled": true, "variables": { "cleared": null, "kept": "v" } }
+                        }
+                    }
+                },
+                "global_paths": { "acme@1.0.0/scan": "C:\\bin\\acme.exe", "gone@1.0.0/x": null }
+            }
+        });
+        let s: Settings = serde_json::from_value(v).expect("a null entry must not fail the parse");
+        let tp = &s.tool_plugins;
+        assert_eq!(tp.plugins.keys().collect::<Vec<_>>(), vec!["acme@1.0.0"]);
+        let acme = &tp.plugins["acme@1.0.0"];
+        assert_eq!(acme.tools.keys().collect::<Vec<_>>(), vec!["scan"]);
+        assert_eq!(
+            acme.tools["scan"].variables,
+            BTreeMap::from([("kept".to_string(), "v".to_string())])
+        );
+        assert_eq!(tp.global_paths.keys().collect::<Vec<_>>(), vec!["acme@1.0.0/scan"]);
+    }
+
+    /// One malformed plugin's state must not cost the user everything else in
+    /// the file — the `deserialize_lenient_audit_tools` rule, one container over.
+    #[test]
+    fn a_malformed_entry_is_dropped_rather_than_taking_the_file_down() {
+        let v = json!({
+            "schema_version": CURRENT_SCHEMA_VERSION,
+            "tool_plugins": { "plugins": { "bad@1.0.0": "not an object", "ok@1.0.0": {} } }
+        });
+        let s: Settings = serde_json::from_value(v).expect("parse");
+        assert_eq!(s.tool_plugins.plugins.keys().collect::<Vec<_>>(), vec!["ok@1.0.0"]);
+        // …and the surviving entry gets the defaults, which are ON.
+        assert!(s.tool_plugins.plugins["ok@1.0.0"].enabled);
+    }
+
+    /// Both `enabled` flags default to true, at both levels — an installed
+    /// plugin is on, and the gate that decides whether a tool RUNS is its path.
+    #[test]
+    fn tool_plugin_state_defaults_to_enabled() {
+        let v = json!({ "plugins": { "a@1": { "tools": { "t": {} } } } });
+        let cfg: ToolPluginsSettings = serde_json::from_value(v).expect("parse");
+        assert!(cfg.plugins["a@1"].enabled);
+        assert!(cfg.plugins["a@1"].tools["t"].enabled);
+        assert_eq!(cfg.plugins["a@1"].tools["t"].timeout_secs, None);
+    }
+
+    /// The Rust↔TS mirror, the `check_def_field_names_mirrored_in_types_ts`
+    /// convention: every wire key of the container must exist in the TS
+    /// interfaces, so a field added on one side cannot quietly skip the other.
+    #[test]
+    fn tool_plugins_field_names_mirrored_in_types_ts() {
+        const TS_TYPES: &str = include_str!("../../../src/lib/settings/types.ts");
+        let mut tools = BTreeMap::new();
+        tools.insert("t".to_string(), ToolState::default());
+        let cfg = ToolPluginsSettings {
+            plugins: BTreeMap::from([("a@1".to_string(), PluginState { enabled: true, tools })]),
+            project_paths: BTreeMap::from([("root".to_string(), BTreeMap::new())]),
+            global_paths: BTreeMap::new(),
+        };
+        let value = serde_json::to_value(&cfg).expect("serializes");
+        let mut keys: Vec<String> = value
+            .as_object()
+            .expect("an object")
+            .keys()
+            .cloned()
+            .collect();
+        for k in value["plugins"]["a@1"].as_object().expect("plugin state").keys() {
+            keys.push(k.clone());
+        }
+        for k in value["plugins"]["a@1"]["tools"]["t"]
+            .as_object()
+            .expect("tool state")
+            .keys()
+        {
+            keys.push(k.clone());
+        }
+        for key in keys {
+            assert!(
+                TS_TYPES.contains(&format!("{key}:")),
+                "`tool_plugins` wire field `{key}` is missing from src/lib/settings/types.ts \
+                 (ToolPluginsSettings / PluginState / ToolState) — add it to keep the mirror \
+                 in sync",
+            );
+        }
+        // The container itself must be reachable from the Settings interface.
+        assert!(
+            TS_TYPES.contains("tool_plugins: ToolPluginsSettings;"),
+            "src/lib/settings/types.ts must carry `tool_plugins` on `Settings`"
+        );
     }
 }

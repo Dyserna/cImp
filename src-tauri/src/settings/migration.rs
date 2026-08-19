@@ -321,6 +321,11 @@ const MIGRATION_STEPS: &[MigrationStep] = &[
         detect: looks_v30,
         transform: migrate_v30_to_v31_step,
     },
+    MigrationStep {
+        from_version: "v31",
+        detect: looks_v31,
+        transform: migrate_v31_to_v32_step,
+    },
 ];
 
 // --- Uniform-signature wrappers -------------------------------------------
@@ -2445,10 +2450,57 @@ fn migrate_v30_to_v31(value: &mut Value) {
     let Some(root) = value.as_object_mut() else {
         return;
     };
-    // Final cascade step ⇒ stamp CURRENT (31).
+    // Stamps a *literal* 31 (not `CURRENT_SCHEMA_VERSION`): the v31 → v32 step
+    // runs next in the same cascade pass and gates on `schema_version == 31`.
     root.insert(
         "schema_version".to_string(),
         Value::Number(serde_json::Number::from(31u8)),
+    );
+}
+
+fn looks_v31(value: &Value) -> bool {
+    value
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .is_some_and(|v| v == 31)
+}
+
+fn migrate_v31_to_v32_step(value: &mut Value, _shell: &ShellSpec) {
+    migrate_v31_to_v32(value)
+}
+
+/// V31 → V32: pure version stamp for the V38 `tool_plugins` container.
+///
+/// **Nothing moves.** V38 Phase B adds one additive
+/// [`ToolPluginsSettings`](crate::settings::schema::ToolPluginsSettings) block
+/// carrying `#[serde(default)]`, so an existing v31 file deserializes with an
+/// empty container and behaves byte-for-byte as before — there is no data to
+/// transform, and every consumer of an empty container sees "no plugins
+/// configured", which is the truth on a machine that has never had one.
+///
+/// It is stamped anyway, following the v23 → v24 / v28 → v29 / v30 → v31
+/// precedent for additive-only changes, and for one reason of its own: this is
+/// the version boundary the LATER move gates on. Phase E migrates
+/// `code_audit.tools` into this container in the same commit that switches the
+/// reader, as a v32 → v33 step — and that step needs a version to detect. An
+/// unversioned addition would leave it testing for the presence of keys the
+/// user may legitimately not have.
+///
+/// Deliberately NOT touching `code_audit`: every intermediate tree has to stay
+/// releasable (the user cuts RCs from it), and a container that exists but is
+/// not yet read by anything is releasable, while a half-moved `code_audit` is
+/// not.
+///
+/// Idempotent: a second pass finds `schema_version == 32` so `looks_v31` is
+/// false.
+fn migrate_v31_to_v32(value: &mut Value) {
+    let Some(root) = value.as_object_mut() else {
+        return;
+    };
+    // Final cascade step ⇒ stamp CURRENT (32).
+    root.insert(
+        "schema_version".to_string(),
+        Value::Number(serde_json::Number::from(32u8)),
     );
 }
 
@@ -3440,6 +3492,47 @@ mod tests {
         let once = v.clone();
         migrate_v30_to_v31(&mut v);
         assert_eq!(v, once);
+    }
+
+    /// V31 → V32 moves nothing: the V38 `tool_plugins` container is additive and
+    /// `#[serde(default)]`, so an existing file is byte-identical apart from the
+    /// marker. Phase E's v32 → v33 step is the one that moves `code_audit.tools`,
+    /// and it gates on the version this stamps.
+    #[test]
+    fn v31_to_v32_only_stamps_the_version() {
+        let mut v = json!({
+            "schema_version": 31,
+            "code_audit": {
+                "enabled": true,
+                "tools": [{ "id": "gitleaks", "enabled": true, "path": "C:\\bin\\gitleaks.exe" }],
+            },
+            "checks": [{ "name": "cargo", "cmd": "cargo check", "parser": "cargo-json" }],
+        });
+        let before = v.clone();
+        migrate_v31_to_v32(&mut v);
+        assert_eq!(v["schema_version"], json!(32));
+        assert!(!looks_v31(&v));
+        // Everything but the marker is byte-identical — `code_audit` in
+        // particular is untouched (Phase E owns that move).
+        let mut stripped = v.clone();
+        stripped["schema_version"] = json!(31);
+        assert_eq!(stripped, before);
+        // Idempotent.
+        let once = v.clone();
+        migrate_v31_to_v32(&mut v);
+        assert_eq!(v, once);
+    }
+
+    /// A v31 file loads with an empty container rather than failing — the
+    /// "additive" claim, tested against the typed shape rather than trusted.
+    #[test]
+    fn a_v31_file_deserializes_with_an_empty_tool_plugins_container() {
+        let v = json!({ "schema_version": 31 });
+        let s: crate::settings::Settings =
+            serde_json::from_value(v).expect("a v31 file must still deserialize");
+        assert!(s.tool_plugins.plugins.is_empty());
+        assert!(s.tool_plugins.global_paths.is_empty());
+        assert!(s.tool_plugins.project_paths.is_empty());
     }
 
     /// The cascade's last step must land exactly on `CURRENT_SCHEMA_VERSION` —

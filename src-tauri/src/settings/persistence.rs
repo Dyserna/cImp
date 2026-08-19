@@ -183,11 +183,21 @@ pub fn load(default_shell: &ShellSpec, launch_cwd: &Path) -> LoadOutcome {
     //    read from the resolved location (canonical `.cimp/config.json`, or the
     //    legacy file if the move couldn't happen).
     migrate_legacy_overlay(launch_cwd);
-    let overlay_value = read_overlay(&overlay_read_path(launch_cwd), true).map(|mut v| {
+    let overlay_path = overlay_read_path(launch_cwd);
+    let overlay_value = read_overlay(&overlay_path, true).map(|mut v| {
         // Per-install fields never belong in an overlay (see
         // `OVERLAY_BANNED_KEYS`) — drop them before the merge so an overlay
         // contaminated by a pre-guard version can't shadow the global file.
         strip_overlay_banned(&mut v);
+        // V38: `tool_plugins` cannot be banned wholesale (two of its leaves are
+        // genuinely per-project), so it gets a structured strip — and unlike the
+        // key ban, this one SAYS SO. A hand-edited config that sets a binary
+        // path per repo is a reasonable thing to try and a silent no-op is how
+        // that becomes "cImp ignores my config" an hour later.
+        crate::plugins::events::record_overlay_strip(
+            &overlay_path.display().to_string(),
+            &strip_overlay_tool_plugins(&mut v),
+        );
         v
     });
 
@@ -307,6 +317,12 @@ pub fn load_readonly(launch_cwd: &Path) -> Settings {
     };
     if let Some(mut overlay) = read_overlay(&overlay_read_path(launch_cwd), false) {
         strip_overlay_banned(&mut overlay);
+        // V38, and NOT optional here: the children this serves are the Phase C/D
+        // consumers that resolve a plugin tool's binary path and enable state,
+        // and they run INSIDE the sandbox boundary whose writable area holds
+        // this very file. No Events row — a lightweight subprocess has no lane
+        // to speak into, and the app's own `load` already reported it.
+        let _ = strip_overlay_tool_plugins(&mut overlay);
         deep_merge(&mut merged, overlay);
     }
     serde_json::from_value(merged).unwrap_or_default()
@@ -1027,6 +1043,173 @@ pub fn write_global_audit_tools(current: &Settings) -> AppResult<()> {
     save_to(&gpath, &disk)
 }
 
+// ── V38 tool plugins: scope splitting INSIDE one subtree ────────────────────
+//
+// `tool_plugins` is the first settings block whose two scopes are interleaved
+// rather than separable by key. Within it:
+//
+//   * `plugins.*.tools.*.variables` and `.parameters` are PROJECT scope. They
+//     are what a repo legitimately differs on — this project's ruleset, this
+//     project's extra `--exclude` — and they are the only fields a
+//     `.cimp/config.json` may carry.
+//   * everything else — `enabled` at either level, `timeout_secs`, and the two
+//     path maps — is MACHINE scope.
+//
+// The paths are machine scope for the reason the V26 field report taught (a
+// scanner configured in one repo, an audit run in another resolving nothing)
+// AND for the reason V33's `sandbox` ban taught, which is sharper: the overlay
+// file lives under the project root, the project root is granted full access to
+// every sandboxed child, and a confined tool that could write its own
+// `.cimp/config.json` could then point cImp at a different binary — or flip its
+// own `enabled` — on the next run. A boundary a confined process can widen is
+// not a boundary. `sandbox` could be banned wholesale ([`OVERLAY_BANNED_KEYS`]);
+// this block cannot, because two of its leaves genuinely belong to the project.
+// So the strip is STRUCTURED instead of a key removal, and it is an ALLOW-list:
+// anything not named survives nowhere, including keys a future version adds.
+//
+// Same two-sided arrangement as the audit paths:
+//   * LOAD  — strip the overlay before the merge, and say so once in the
+//             `plugin` Events lane when it actually carried something.
+//   * SAVE  — write the machine-scope halves through to the PHYSICAL global
+//             file, then strip both diff sides so no overlay pins a copy.
+//
+// `load_readonly` strips too, and that is NOT optional: the MCP children it
+// serves are exactly the Phase C/D consumers that will resolve a tool's binary
+// path, so an unstripped read there would reintroduce the hole at the one call
+// site that runs inside the boundary.
+
+/// The only leaves of `tool_plugins` a project overlay may carry.
+const OVERLAY_TOOL_PLUGIN_LEAVES: &[&str] = &["variables", "parameters"];
+
+/// Remove every machine-scope field under `tool_plugins`, returning the dotted
+/// names of what was dropped (empty ⇒ the overlay was already clean).
+///
+/// An allow-list walk, not a deny-list: an unrecognized key is dropped and
+/// named. A deny-list would let the next field added to the container ride the
+/// overlay by default, which is the wrong direction for a block whose default
+/// answer has to be "machine".
+fn strip_overlay_tool_plugins(v: &mut Value) -> Vec<String> {
+    let mut dropped: Vec<String> = Vec::new();
+    let Some(root) = v.as_object_mut() else {
+        return dropped;
+    };
+    let Some(tp) = root.get_mut("tool_plugins") else {
+        return dropped;
+    };
+    let Some(tp_obj) = tp.as_object_mut() else {
+        // Not an object at all: there is nothing here we could keep.
+        root.remove("tool_plugins");
+        dropped.push("tool_plugins".to_string());
+        return dropped;
+    };
+
+    for key in keys_other_than(tp_obj, &["plugins"]) {
+        tp_obj.remove(&key);
+        dropped.push(format!("tool_plugins.{key}"));
+    }
+    if let Some(plugins) = tp_obj.get_mut("plugins").and_then(Value::as_object_mut) {
+        for (plugin_key, state) in plugins.iter_mut() {
+            let Some(p) = state.as_object_mut() else {
+                continue;
+            };
+            for key in keys_other_than(p, &["tools"]) {
+                p.remove(&key);
+                dropped.push(format!("tool_plugins.plugins.{plugin_key}.{key}"));
+            }
+            let Some(tools) = p.get_mut("tools").and_then(Value::as_object_mut) else {
+                continue;
+            };
+            for (tool_id, tstate) in tools.iter_mut() {
+                let Some(t) = tstate.as_object_mut() else {
+                    continue;
+                };
+                for key in keys_other_than(t, OVERLAY_TOOL_PLUGIN_LEAVES) {
+                    t.remove(&key);
+                    dropped.push(format!(
+                        "tool_plugins.plugins.{plugin_key}.tools.{tool_id}.{key}"
+                    ));
+                }
+            }
+        }
+    }
+    // A container reduced to `{}` (or `{"plugins": {}}`) contributes nothing to
+    // a merge and only noise to a diff; drop the husk.
+    let empty = tp_obj.is_empty()
+        || (tp_obj.len() == 1
+            && tp_obj
+                .get("plugins")
+                .and_then(Value::as_object)
+                .is_some_and(serde_json::Map::is_empty));
+    if empty {
+        root.remove("tool_plugins");
+    }
+    dropped
+}
+
+/// The keys of `obj` that are not in `keep`, collected up front so the caller
+/// can remove them without borrowing the map twice.
+fn keys_other_than(obj: &serde_json::Map<String, Value>, keep: &[&str]) -> Vec<String> {
+    obj.keys()
+        .filter(|k| !keep.contains(&k.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// SAVE write-through for the machine-scope halves of `tool_plugins`: copy the
+/// live enables, timeouts and path maps onto the on-disk global settings.
+/// Returns true when anything changed — the caller only rewrites the file then.
+///
+/// Field by field rather than whole-block (the one place this differs from
+/// [`sync_sandbox_into`]): the live value's `variables`/`parameters` are the
+/// PROJECT's, so copying the block wholesale would write one repo's overrides
+/// into the machine-wide file and hand them to every other project.
+///
+/// An entry the global file does not have yet is created, because that is what
+/// "machine scope" means for a plugin the user has only just configured — but
+/// nothing is ever removed here: a plugin whose file is temporarily missing must
+/// keep its state (see [`crate::settings::ToolPluginsSettings`]).
+fn sync_tool_plugin_state_into(disk_global: &mut Settings, current: &Settings) -> bool {
+    let mut changed = false;
+    let cur = &current.tool_plugins;
+    if disk_global.tool_plugins.global_paths != cur.global_paths {
+        disk_global.tool_plugins.global_paths = cur.global_paths.clone();
+        changed = true;
+    }
+    if disk_global.tool_plugins.project_paths != cur.project_paths {
+        disk_global.tool_plugins.project_paths = cur.project_paths.clone();
+        changed = true;
+    }
+    for (plugin_key, live) in &cur.plugins {
+        let disk = disk_global
+            .tool_plugins
+            .plugins
+            .entry(plugin_key.clone())
+            .or_insert_with(|| {
+                changed = true;
+                crate::settings::PluginState::default()
+            });
+        if disk.enabled != live.enabled {
+            disk.enabled = live.enabled;
+            changed = true;
+        }
+        for (tool_id, live_tool) in &live.tools {
+            let disk_tool = disk.tools.entry(tool_id.clone()).or_insert_with(|| {
+                changed = true;
+                crate::settings::ToolState::default()
+            });
+            if disk_tool.enabled != live_tool.enabled {
+                disk_tool.enabled = live_tool.enabled;
+                changed = true;
+            }
+            if disk_tool.timeout_secs != live_tool.timeout_secs {
+                disk_tool.timeout_secs = live_tool.timeout_secs;
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
 /// SAVE step 2: empty both template arrays on a diff side so the overlay
 /// never carries them.
 fn strip_offload_templates(v: &mut Value) {
@@ -1065,7 +1248,12 @@ pub fn save(settings: &Settings, launch_cwd: &Path, global: &Settings) -> AppRes
             // whose own writable area holds the overlay file), so the global
             // file is the ONLY place a sandbox edit can land.
             let sandbox_changed = sync_sandbox_into(&mut disk, settings);
-            if paths_changed || templates_changed || sandbox_changed {
+            // V38: the machine-scope halves of `tool_plugins` (enables,
+            // timeouts, both path maps). The overlay carries only the per-tool
+            // `variables`/`parameters`, so this is the only place the rest can
+            // land — see the block comment above `strip_overlay_tool_plugins`.
+            let plugins_changed = sync_tool_plugin_state_into(&mut disk, settings);
+            if paths_changed || templates_changed || sandbox_changed || plugins_changed {
                 if let Err(e) = save_to(&gpath, &disk) {
                     tracing::warn!(error = %e, "settings: machine-scope global write-through failed");
                 }
@@ -1083,6 +1271,13 @@ pub fn save(settings: &Settings, launch_cwd: &Path, global: &Settings) -> AppRes
     strip_audit_tool_paths(&mut baseline);
     strip_offload_templates(&mut current);
     strip_offload_templates(&mut baseline);
+    // Both sides, identically: what remains under `tool_plugins` on either side
+    // is only `variables`/`parameters`, so the diff can express a project's
+    // overrides and nothing else. Return values ignored — a strip of OUR OWN
+    // serialized value is not a user's hand edit, so there is nothing to warn
+    // about; the load path is where a warning belongs.
+    let _ = strip_overlay_tool_plugins(&mut current);
+    let _ = strip_overlay_tool_plugins(&mut baseline);
 
     match diff(&current, &baseline) {
         Some(delta) => {
@@ -3270,6 +3465,180 @@ mod tests {
             !sync_sandbox_into(&mut disk, &customized),
             "a no-op edit must not rewrite the global file"
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// V38: `tool_plugins` splits INSIDE the block — `variables`/`parameters`
+    /// are the project's, everything else is the machine's. Unlike `sandbox`,
+    /// which can be banned by key, this needs a structured strip; unlike the
+    /// audit paths, the retained part is nested three levels down.
+    #[test]
+    fn a_project_overlay_carries_only_tool_plugin_variables_and_parameters() {
+        let mut hostile: Value = serde_json::json!({
+            "tool_plugins": {
+                "global_paths": { "acme@1.0.0/scan": "C:\\evil\\acme.exe" },
+                "project_paths": { "C:\\repo": { "acme@1.0.0/scan": "C:\\evil\\acme.exe" } },
+                "future_field": 1,
+                "plugins": {
+                    "acme@1.0.0": {
+                        "enabled": true,
+                        "unknown": 1,
+                        "tools": {
+                            "scan": {
+                                "enabled": true,
+                                "timeout_secs": 99999,
+                                "variables": { "ruleset": "p/ci" },
+                                "parameters": ["--exclude", "vendor"]
+                            }
+                        }
+                    }
+                }
+            },
+            "checks_allow_remote_worker": true
+        });
+        let dropped = strip_overlay_tool_plugins(&mut hostile);
+
+        assert_eq!(
+            hostile,
+            serde_json::json!({
+                "tool_plugins": { "plugins": { "acme@1.0.0": { "tools": { "scan": {
+                    "variables": { "ruleset": "p/ci" },
+                    "parameters": ["--exclude", "vendor"]
+                } } } } },
+                "checks_allow_remote_worker": true
+            }),
+            "only the two project-scope leaves may survive"
+        );
+        // Every machine-scope field is NAMED, so the Events row can say which.
+        for expected in [
+            "tool_plugins.global_paths",
+            "tool_plugins.project_paths",
+            "tool_plugins.future_field",
+            "tool_plugins.plugins.acme@1.0.0.enabled",
+            "tool_plugins.plugins.acme@1.0.0.unknown",
+            "tool_plugins.plugins.acme@1.0.0.tools.scan.enabled",
+            "tool_plugins.plugins.acme@1.0.0.tools.scan.timeout_secs",
+        ] {
+            assert!(
+                dropped.contains(&expected.to_string()),
+                "`{expected}` was dropped but not reported: {dropped:?}"
+            );
+        }
+        // An ALLOW-list, not a deny-list: a field this build has never heard of
+        // (`future_field`, `unknown`) does not get to ride the overlay by
+        // default. That is the direction a machine-scope block has to fail in.
+
+        // A clean overlay says nothing at all — no row, no noise.
+        let mut clean: Value = serde_json::json!({ "ui": { "theme": "tui" } });
+        assert!(strip_overlay_tool_plugins(&mut clean).is_empty());
+        assert_eq!(clean, serde_json::json!({ "ui": { "theme": "tui" } }));
+    }
+
+    /// The other half: a Settings-window edit to a machine-scope field made
+    /// from inside a customized project still lands somewhere — the physical
+    /// global file — because the overlay refuses to carry it.
+    #[test]
+    fn tool_plugin_machine_scope_writes_through_to_the_global_file() {
+        use crate::settings::{PluginState, ToolState};
+        use std::collections::BTreeMap;
+
+        let mut live = Settings::default();
+        live.tool_plugins.global_paths.insert(
+            "acme@1.0.0/scan".to_string(),
+            "C:\\bin\\acme.exe".to_string(),
+        );
+        live.tool_plugins.project_paths.insert(
+            "C:\\repo".to_string(),
+            BTreeMap::from([("acme@1.0.0/scan".to_string(), "D:\\alt.exe".to_string())]),
+        );
+        live.tool_plugins.plugins.insert(
+            "acme@1.0.0".to_string(),
+            PluginState {
+                enabled: false,
+                tools: BTreeMap::from([(
+                    "scan".to_string(),
+                    ToolState {
+                        enabled: false,
+                        timeout_secs: Some(900),
+                        // PROJECT scope — must NOT reach the global file, or one
+                        // repo's overrides become every repo's defaults.
+                        parameters: vec!["--exclude".into(), "vendor".into()],
+                        variables: BTreeMap::from([("ruleset".into(), "p/ci".into())]),
+                    },
+                )]),
+            },
+        );
+
+        let mut disk = Settings::default();
+        assert!(sync_tool_plugin_state_into(&mut disk, &live));
+        assert_eq!(disk.tool_plugins.global_paths, live.tool_plugins.global_paths);
+        assert_eq!(disk.tool_plugins.project_paths, live.tool_plugins.project_paths);
+        let on_disk = &disk.tool_plugins.plugins["acme@1.0.0"];
+        assert!(!on_disk.enabled);
+        assert!(!on_disk.tools["scan"].enabled);
+        assert_eq!(on_disk.tools["scan"].timeout_secs, Some(900));
+        assert!(
+            on_disk.tools["scan"].parameters.is_empty()
+                && on_disk.tools["scan"].variables.is_empty(),
+            "project-scope leaves must not be written through to the machine file"
+        );
+        assert!(
+            !sync_tool_plugin_state_into(&mut disk, &live),
+            "a no-op edit must not rewrite the global file"
+        );
+    }
+
+    /// End to end through `save`: the overlay a real save writes carries the
+    /// project's variables and none of the machine's facts.
+    #[test]
+    fn save_keeps_tool_plugin_paths_out_of_the_overlay() {
+        use crate::settings::{PluginState, ToolState};
+        use std::collections::BTreeMap;
+
+        let _shell = fake_default_shell();
+        let mut global = Settings::default();
+        integrity_check(&mut global);
+
+        let dir = std::env::temp_dir().join(format!("cimp_tp_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+
+        let mut customized = global.clone();
+        customized.tool_plugins.global_paths.insert(
+            "acme@1.0.0/scan".to_string(),
+            "C:\\bin\\acme.exe".to_string(),
+        );
+        customized.tool_plugins.plugins.insert(
+            "acme@1.0.0".to_string(),
+            PluginState {
+                enabled: false,
+                tools: BTreeMap::from([(
+                    "scan".to_string(),
+                    ToolState {
+                        enabled: true,
+                        timeout_secs: Some(300),
+                        parameters: vec!["--fast".into()],
+                        variables: BTreeMap::from([("ruleset".into(), "p/ci".into())]),
+                    },
+                )]),
+            },
+        );
+        save(&customized, &dir, &global).unwrap();
+
+        let text = fs::read_to_string(dir.join(".cimp").join("config.json")).unwrap();
+        let val: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            val,
+            serde_json::json!({
+                "tool_plugins": { "plugins": { "acme@1.0.0": { "tools": { "scan": {
+                    "variables": { "ruleset": "p/ci" },
+                    "parameters": ["--fast"]
+                } } } } }
+            }),
+            "overlay: {text}"
+        );
+        assert!(!text.contains("acme.exe"), "overlay: {text}");
+        assert!(!text.contains("timeout_secs"), "overlay: {text}");
 
         let _ = fs::remove_dir_all(&dir);
     }

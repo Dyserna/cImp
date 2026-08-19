@@ -9,6 +9,7 @@ import type {
   Settings,
 } from './types';
 import type { TabId } from '../tabs/types';
+import type { PluginSet } from './toolPlugins';
 
 export async function settingsGet(): Promise<Settings> {
   return invoke('settings_get');
@@ -147,4 +148,25 @@ export async function auditToolsSaveGlobal(): Promise<AuditGlobalToolConfig> {
 /// config, removing the project's own copy. Returns the adopted config.
 export async function auditToolsLoadGlobal(): Promise<AuditGlobalToolConfig> {
   return invoke('audit_tools_load_global');
+}
+
+/// V38 Phase B: the current plugin set — what loaded from `<exe-dir>/plugins/`
+/// and what did not. A READ of the state the startup scan (or the last Rescan)
+/// produced, so opening Settings is never a disk walk.
+export async function pluginsSnapshot(): Promise<PluginSet> {
+  return invoke('plugins_snapshot');
+}
+
+/// Re-scan the plugins folder and return the new set. Mints the scan's `plugin`
+/// Events rows backend-side, so a rejection shows up in the feed as well as in
+/// the settings list.
+export async function pluginsRescan(): Promise<PluginSet> {
+  return invoke('plugins_rescan');
+}
+
+/// The key this project's per-tool binary path overrides are stored under.
+/// Canonicalizing a path touches the disk, so the backend owns the rule and the
+/// window asks for the answer — see `plugins::registry::project_key`.
+export async function pluginsProjectKey(): Promise<string> {
+  return invoke('plugins_project_key');
 }

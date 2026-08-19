@@ -95,6 +95,18 @@ impl SettingsHandle {
         self.tx.subscribe()
     }
 
+    /// The directory cImp was launched in — the app's notion of "this project",
+    /// and the same value the overlay path and every save already use.
+    ///
+    /// V38 needs it as a *key*: per-project tool-plugin binary paths are stored
+    /// machine-globally under the canonical project root, so the Settings window
+    /// has to be able to name the project it is editing. This hands out the raw
+    /// path rather than the key, so the canonicalization rule stays in exactly
+    /// one place (`plugins::registry::project_key`).
+    pub fn launch_cwd(&self) -> PathBuf {
+        self.launch_cwd.as_ref().clone()
+    }
+
     /// Replace the full settings struct, broadcast, and request a debounced save.
     ///
     /// Prefer [`Self::mutate`] for any read-modify-write: `current()` + `set()`

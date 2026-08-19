@@ -1159,11 +1159,13 @@ fn main() {
             audit::audit_tools_global_config,
             audit::audit_tools_save_global,
             audit::audit_tools_load_global,
-            // V38 Phase A: tool-plugin discovery (read + Rescan). Nothing
-            // here RUNS a plugin — the registry and the pipelines that
-            // consume one are Phase B/C/D.
+            // V38: tool-plugin discovery (read + Rescan) and the key the
+            // settings pane stores this project's path overrides under.
+            // Nothing here RUNS a plugin — the pipelines that consume one
+            // are Phase C/D.
             plugins::plugins_snapshot,
             plugins::plugins_rescan,
+            plugins::plugins_project_key,
         ])
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {

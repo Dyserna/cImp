@@ -865,6 +865,9 @@ export interface Settings {
   /// default; `enabled` gates the reserved Code Audit dashboard tab and the
   /// bottom-bar entry point.
   code_audit: CodeAuditSettings;
+  /// V38 Phase B: drop-in tool-plugin user state (schema v32). Additive — a
+  /// pre-v32 file loads with an empty container.
+  tool_plugins: ToolPluginsSettings;
 }
 
 /// One provider/model price row: USD per million tokens for the four billing
@@ -1561,6 +1564,52 @@ export interface CodeAuditSettings {
   /// true. A scan always runs in-process, so a remote worker only ever gets the
   /// free-text report.
   expose_offload: boolean;
+}
+
+/// V38 Phase B: user state for the drop-in tool plugins (mirror of Rust
+/// `ToolPluginsSettings`, schema v32). Keyed maps rather than typed fields —
+/// the set of plugins is whatever is in `<exe-dir>/plugins/`, so it is data,
+/// and a typed shape would need a settings migration per dropped file.
+///
+/// The three maps are three SCOPES:
+/// * `plugins` — enables, timeouts, variable values, extra parameters, keyed
+///   `name@version`. Only `variables` and `parameters` ride a project's
+///   `.cimp/config.json`; the rest is machine-global (amended decision 10).
+/// * `global_paths` — where each tool's binary lives on this machine, keyed
+///   `name@version/tool-id`.
+/// * `project_paths` — the same fact overridden per project: canonical project
+///   root → tool key → path. Still stored machine-globally.
+///
+/// Effective path = project entry ?? global entry ?? unset (a tool with no path
+/// is inert). Entries are never pruned when a plugin's file goes missing.
+export interface ToolPluginsSettings {
+  plugins: Record<string, PluginState>;
+  project_paths: Record<string, Record<string, string>>;
+  global_paths: Record<string, string>;
+}
+
+/// One plugin's user state (mirror of Rust `PluginState`). Disabling the plugin
+/// disables its tools as a unit WITHOUT clearing their own flags, so
+/// re-enabling restores the selection the user had.
+export interface PluginState {
+  enabled: boolean;
+  /// Keyed by the tool's manifest id (not the namespaced key — the plugin key
+  /// is the outer map's key).
+  tools: Record<string, ToolState>;
+}
+
+/// One tool's user state (mirror of Rust `ToolState`). **No `path`**: paths are
+/// machine-scope and live in `ToolPluginsSettings.global_paths` /
+/// `project_paths`.
+export interface ToolState {
+  enabled: boolean;
+  /// `null` = the manifest's value, then the consuming pipeline's default.
+  timeout_secs: number | null;
+  /// Appended after the tool's own argv; offered only when the manifest sets
+  /// `parameters_allowed`.
+  parameters: string[];
+  /// Values for the tool's declared variables, by declared name.
+  variables: Record<string, string>;
 }
 
 /// V23 Phase A: the `audit_detect_tool` IPC result (mirror of Rust
@@ -2376,5 +2425,8 @@ export function defaultSettings(): Settings {
       ],
       timeout_secs: 600,
     },
+    // Empty on a fresh install: plugins are files the user drops into
+    // `<exe-dir>/plugins/`, so there is nothing to seed.
+    tool_plugins: { plugins: {}, project_paths: {}, global_paths: {} },
   };
 }

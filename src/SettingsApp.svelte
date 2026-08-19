@@ -19,6 +19,9 @@
     listVoices,
     llmPricingGet,
     llmPricingSet,
+    pluginsProjectKey,
+    pluginsRescan,
+    pluginsSnapshot,
     requestTabRestart,
     type AuditGlobalToolConfig,
   } from './lib/settings/ipc';
@@ -111,6 +114,22 @@
     toolNotApplicable,
     type AuditToolRow,
   } from './lib/settings/codeAudit';
+  import {
+    errorRows,
+    pluginRows,
+    revertToGlobalPath,
+    setCategoryEnabled,
+    setGlobalPath,
+    setPluginEnabled,
+    setProjectPath,
+    setToolEnabled,
+    setToolParameters,
+    setToolTimeout,
+    setToolVariable,
+    type PluginRow,
+    type PluginSet,
+    type ToolRow,
+  } from './lib/settings/toolPlugins';
   import { auditRefreshCensus } from './lib/codeAudit/ipc';
   import {
     AUDIT_TOOL_CATEGORY,
@@ -1320,6 +1339,7 @@
     | 'graph'
     | 'checks'
     | 'code-audit'
+    | 'tool-plugins'
     | 'pricing'
     | 'workbench'
     | 'harness'
@@ -1357,6 +1377,12 @@
     { id: 'graph', label: 'Code Intelligence' },
     { id: 'checks', label: 'Checks' },
     { id: 'code-audit', label: 'Code Audit' },
+    // V38: adjacent to Code Audit because it is the same job one level up —
+    // Code Audit configures the fourteen scanners cImp ships knowing about,
+    // this configures the ones a user dropped into `plugins/`. Anyone looking
+    // for "where do I point cImp at a tool" looks at one of the two, so they
+    // sit together rather than one being filed under Advanced.
+    { id: 'tool-plugins', label: 'Tool Plugins' },
     { id: 'pricing', label: 'LLM pricing' },
     { id: 'workbench', label: 'Workbench' },
     // V35 Phase G, following the same rule Sandboxing was created under (V33
@@ -1503,6 +1529,13 @@
     if (disposed) return;
     startBackendStatusPolling();
     void refreshAuditGlobalConfig();
+    void refreshPlugins();
+    pluginsProjectKey()
+      .then((k) => (pluginProjectKey = k))
+      // A missing key is not fatal: every per-project path control gates on
+      // it, so the pane degrades to machine-wide paths only rather than
+      // writing overrides under an empty key that nothing would ever read.
+      .catch((e) => console.warn('plugins_project_key failed', e));
     snapshot = structuredClone(get(settings));
     for (const t of AI_TABS) captureBaseline(t);
     injectionAppBaseline = injectionAppShape(snapshot);
@@ -2137,6 +2170,64 @@
       }
       s.code_audit.quality_auto_select = false;
     });
+  }
+
+
+  // ── V38 Tool Plugins ───────────────────────────────────────────────────
+  // The section is master-detail over `plugins_snapshot`: the loader's set is
+  // read ONCE on mount (it is a read of already-scanned state, never a disk
+  // walk) and refreshed only by the explicit Rescan. Rows and every write are
+  // in `lib/settings/toolPlugins.ts` — this component decides nothing.
+  let pluginSet = $state<PluginSet | null>(null);
+  // The key this project's per-tool path overrides are stored under. Asked of
+  // the backend rather than derived here: canonicalizing a path touches the
+  // disk, and a second spelling rule would silently stop matching the first.
+  let pluginProjectKey = $state('');
+  let pluginSelected = $state<string | null>(null);
+  let pluginRescanning = $state(false);
+  let pluginLoadError = $state<string | null>(null);
+
+  async function refreshPlugins(rescan = false): Promise<void> {
+    pluginLoadError = null;
+    if (rescan) pluginRescanning = true;
+    try {
+      pluginSet = rescan ? await pluginsRescan() : await pluginsSnapshot();
+    } catch (e) {
+      pluginLoadError = `Could not read the plugins folder: ${e}`;
+    } finally {
+      pluginRescanning = false;
+    }
+  }
+
+  const pluginList = $derived<PluginRow[]>(
+    pluginSet && snapshot ? pluginRows(pluginSet, snapshot, pluginProjectKey) : [],
+  );
+  const pluginErrors = $derived(pluginSet ? errorRows(pluginSet) : []);
+  // Keep the selection valid across a Rescan that removed the selected plugin,
+  // and land on the first one so the pane is never a blank right-hand side.
+  const pluginActive = $derived<PluginRow | null>(
+    pluginList.find((p) => p.key === pluginSelected) ?? pluginList[0] ?? null,
+  );
+
+  function patchPlugin(updater: (s: Settings) => void): void {
+    patch(updater);
+  }
+
+  /// A number input that means "no override" when blank. Shared by the timeout
+  /// field so an unparseable keystroke reverts to inherit rather than to 0.
+  function optionalSeconds(raw: string): number | null {
+    const v = Number(raw.trim());
+    return raw.trim() !== '' && Number.isFinite(v) && v >= 1 ? Math.floor(v) : null;
+  }
+
+  async function pickToolBinary(toolKey: string, scope: 'global' | 'project'): Promise<void> {
+    const p = await pickFile('Executable', ['exe', 'cmd', 'bat', 'com']);
+    if (!p) return;
+    patchPlugin((s) =>
+      scope === 'global'
+        ? setGlobalPath(s, toolKey, p)
+        : setProjectPath(s, pluginProjectKey, toolKey, p),
+    );
   }
 
   function imagePicker(state: keyof Settings['avatar']['images']) {
@@ -7033,6 +7124,358 @@
           {/each}
           {/if}
         </section>
+      {:else if activeSection === 'tool-plugins'}
+        <section>
+          <h2>Tool Plugins</h2>
+          <small class="hint top">
+            Drop-in tool definitions. A plugin is one JSON file in the
+            <code>plugins\</code> folder beside cImp describing tools it can run
+            — no rebuild, and <strong>no binaries</strong>: the plugin says how
+            to call a tool, you say where that tool lives. A tool with no path
+            is inert. Enables, timeouts and paths are machine-wide (they
+            describe this computer); the per-project path override and the
+            declared variables are per project.
+          </small>
+
+          {#snippet toolPluginRow(plugin: PluginRow, tool: ToolRow)}
+            <div class="audit-tool">
+              <label class="checkbox">
+                <input
+                  type="checkbox"
+                  checked={tool.enabled}
+                  onchange={(e) =>
+                    patchPlugin((s) =>
+                      setToolEnabled(
+                        s,
+                        plugin.key,
+                        tool.id,
+                        (e.currentTarget as HTMLInputElement).checked,
+                      ),
+                    )}
+                />
+                <span class="audit-name">{tool.label}</span>
+                <span class="audit-role">{tool.kind}</span>
+                <span class="audit-scope" class:local={tool.path.scope === 'project'}>
+                  {tool.path.scope === 'unset' ? 'no path' : tool.path.scope}
+                </span>
+              </label>
+
+              <!-- The phone-app pattern: what this tool ASKS for, in one place,
+                   beside the switch that grants it. Read-only — the screening
+                   that can refuse a grant happens at spawn time. -->
+              <details class="plugin-perms" open={tool.permissions.length > 1}>
+                <summary>This tool asks for…</summary>
+                <ul>
+                  {#each tool.permissions as line (line)}
+                    <li>{line}</li>
+                  {/each}
+                </ul>
+              </details>
+
+              {#if !plugin.enabled}
+                <small class="hint audit-na">off — the plugin is disabled</small>
+              {:else if tool.path.effective === ''}
+                <small class="hint audit-na">
+                  no path set, so this tool does not run
+                </small>
+              {/if}
+
+              <small class="hint plugin-field">Path on this machine</small>
+              <div class="input-with-action">
+                <input
+                  type="text"
+                  placeholder="(not set — the tool will not run)"
+                  value={tool.path.global}
+                  oninput={(e) =>
+                    patchPlugin((s) =>
+                      setGlobalPath(
+                        s,
+                        tool.toolKey,
+                        (e.currentTarget as HTMLInputElement).value,
+                      ),
+                    )}
+                />
+                <button
+                  type="button"
+                  class="secondary"
+                  onclick={() => void pickToolBinary(tool.toolKey, 'global')}
+                >
+                  Browse…
+                </button>
+                <button
+                  type="button"
+                  class="secondary"
+                  onclick={() => patchPlugin((s) => setGlobalPath(s, tool.toolKey, ''))}
+                >
+                  Clear
+                </button>
+              </div>
+
+              {#if pluginProjectKey}
+                <small class="hint plugin-field">
+                  This project
+                  {tool.path.project === null ? '(inherited)' : '(overridden)'}
+                </small>
+                <div class="input-with-action">
+                  <input
+                    type="text"
+                    placeholder="(use the machine-wide path above)"
+                    value={tool.path.project ?? ''}
+                    oninput={(e) =>
+                      patchPlugin((s) =>
+                        setProjectPath(
+                          s,
+                          pluginProjectKey,
+                          tool.toolKey,
+                          (e.currentTarget as HTMLInputElement).value,
+                        ),
+                      )}
+                  />
+                  <button
+                    type="button"
+                    class="secondary"
+                    onclick={() => void pickToolBinary(tool.toolKey, 'project')}
+                  >
+                    Browse…
+                  </button>
+                  <button
+                    type="button"
+                    class="secondary"
+                    disabled={tool.path.project === null}
+                    onclick={() =>
+                      patchPlugin((s) =>
+                        revertToGlobalPath(s, pluginProjectKey, tool.toolKey),
+                      )}
+                  >
+                    Use machine-wide
+                  </button>
+                </div>
+              {/if}
+
+              {#each tool.variables as variable (variable.name)}
+                <label class="audit-timeout">
+                  <span>{variable.label}</span>
+                  <input
+                    class="plugin-var"
+                    type="text"
+                    placeholder={variable.fallback ?? '(no default — set a value)'}
+                    value={variable.value}
+                    oninput={(e) =>
+                      patchPlugin((s) =>
+                        setToolVariable(
+                          s,
+                          plugin.key,
+                          tool.id,
+                          variable.name,
+                          (e.currentTarget as HTMLInputElement).value,
+                        ),
+                      )}
+                  />
+                </label>
+              {/each}
+
+              <label class="audit-timeout">
+                <span>Timeout override (seconds — blank uses the plugin's)</span>
+                <input
+                  type="number"
+                  min="1"
+                  placeholder="(plugin default)"
+                  value={tool.timeoutSecs ?? ''}
+                  oninput={(e) =>
+                    patchPlugin((s) =>
+                      setToolTimeout(
+                        s,
+                        plugin.key,
+                        tool.id,
+                        optionalSeconds((e.currentTarget as HTMLInputElement).value),
+                      ),
+                    )}
+                />
+              </label>
+
+              {#if tool.parametersAllowed}
+                <small class="hint">
+                  Extra arguments (appended after the tool's own):
+                </small>
+                {#each tool.parameters as parameter, i (i)}
+                  <div class="input-with-action">
+                    <input
+                      type="text"
+                      value={parameter}
+                      oninput={(e) =>
+                        patchPlugin((s) =>
+                          setToolParameters(
+                            s,
+                            plugin.key,
+                            tool.id,
+                            tool.parameters.map((p, j) =>
+                              j === i ? (e.currentTarget as HTMLInputElement).value : p,
+                            ),
+                          ),
+                        )}
+                    />
+                    <button
+                      type="button"
+                      class="secondary"
+                      onclick={() =>
+                        patchPlugin((s) =>
+                          setToolParameters(
+                            s,
+                            plugin.key,
+                            tool.id,
+                            tool.parameters.filter((_, j) => j !== i),
+                          ),
+                        )}
+                    >
+                      Remove
+                    </button>
+                  </div>
+                {/each}
+                <div class="button-row">
+                  <button
+                    type="button"
+                    class="secondary"
+                    onclick={() =>
+                      patchPlugin((s) =>
+                        setToolParameters(s, plugin.key, tool.id, [...tool.parameters, '']),
+                      )}
+                  >
+                    Add argument
+                  </button>
+                </div>
+              {/if}
+            </div>
+          {/snippet}
+
+          <div class="button-row">
+            <button
+              type="button"
+              class="secondary"
+              disabled={pluginRescanning}
+              onclick={() => void refreshPlugins(true)}
+            >
+              {pluginRescanning ? 'Rescanning…' : 'Rescan'}
+            </button>
+            {#if pluginSet?.dir}
+              <code class="plugin-dir">{pluginSet.dir}</code>
+            {/if}
+          </div>
+          {#if pluginLoadError}
+            <small class="hint audit-detect bad">{pluginLoadError}</small>
+          {/if}
+
+          {#if pluginErrors.length > 0}
+            <h3>Not loaded</h3>
+            <small class="hint">
+              These files are in the folder and were refused. Each one is also a
+              row in the Events tab, with the same reason.
+            </small>
+            {#each pluginErrors as e (e.paths.join('|'))}
+              <div class="plugin-error">
+                <div class="plugin-error-head">
+                  <span class="audit-name">{e.label}</span>
+                  <span class="audit-scope local">{e.kind}</span>
+                </div>
+                <small class="hint audit-detect bad">{e.reason}</small>
+                {#each e.paths as p (p)}
+                  <code class="plugin-dir">{p}</code>
+                {/each}
+              </div>
+            {/each}
+          {/if}
+
+          {#if pluginList.length === 0}
+            <p class="hint">
+              No plugins loaded yet. Put a manifest in
+              <code class="plugin-dir">{pluginSet?.dir ?? 'the plugins folder beside cimp.exe'}</code>
+              and press Rescan.
+            </p>
+          {:else}
+            <div class="plugin-split">
+              <ul class="plugin-list">
+                {#each pluginList as p (p.key)}
+                  <li>
+                    <button
+                      type="button"
+                      class="plugin-list-entry"
+                      class:active={pluginActive?.key === p.key}
+                      onclick={() => (pluginSelected = p.key)}
+                    >
+                      <span class="audit-name">{p.label}</span>
+                      <span class="plugin-sub">
+                        {p.toolCount}
+                        {p.toolCount === 1 ? 'tool' : 'tools'}{p.enabled ? '' : ' · off'}
+                      </span>
+                    </button>
+                  </li>
+                {/each}
+              </ul>
+
+              <div class="plugin-detail">
+                {#if pluginActive}
+                  {@const plugin = pluginActive}
+                  <label class="checkbox">
+                    <input
+                      type="checkbox"
+                      checked={plugin.enabled}
+                      onchange={(e) =>
+                        patchPlugin((s) =>
+                          setPluginEnabled(
+                            s,
+                            plugin.key,
+                            (e.currentTarget as HTMLInputElement).checked,
+                          ),
+                        )}
+                    />
+                    <span class="audit-name">{plugin.label}</span>
+                  </label>
+                  {#if plugin.description}
+                    <small class="hint">{plugin.description}</small>
+                  {/if}
+                  <code class="plugin-dir">{plugin.manifestPath}</code>
+                  {#if !plugin.enabled}
+                    <small class="hint audit-na">
+                      Every tool below is off while the plugin is. Their own
+                      checkboxes keep what you set, so switching the plugin back
+                      on restores this selection.
+                    </small>
+                  {/if}
+
+                  {#each plugin.categories as category (category.id)}
+                    <div class="plugin-category">
+                      <label class="checkbox">
+                        <input
+                          type="checkbox"
+                          checked={category.state === 'on'}
+                          indeterminate={category.state === 'mixed'}
+                          onchange={(e) =>
+                            patchPlugin((s) =>
+                              setCategoryEnabled(
+                                s,
+                                plugin.key,
+                                category,
+                                (e.currentTarget as HTMLInputElement).checked,
+                              ),
+                            )}
+                        />
+                        <span class="audit-name">{category.label}</span>
+                        <span class="audit-role">
+                          {category.tools.filter((t) => t.enabled).length}/{category.tools.length}
+                          on
+                        </span>
+                      </label>
+
+                      {#each category.tools as tool (tool.toolKey)}
+                        {@render toolPluginRow(plugin, tool)}
+                      {/each}
+                    </div>
+                  {/each}
+                {/if}
+              </div>
+            </div>
+          {/if}
+
+        </section>
       {:else if activeSection === 'pricing'}
         <section>
           <h2>LLM pricing</h2>
@@ -8707,6 +9150,87 @@
   }
   .input-with-action > button {
     flex-shrink: 0;
+  }
+  /* V38: Tool Plugins master-detail. */
+  .plugin-split {
+    display: flex;
+    gap: var(--space-3);
+    align-items: flex-start;
+    margin-top: var(--space-3);
+  }
+  .plugin-list {
+    flex: 0 0 14rem;
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .plugin-list-entry {
+    width: 100%;
+    text-align: left;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    background: none;
+    border: 1px solid transparent;
+    border-radius: 3px;
+    padding: var(--space-2);
+    color: inherit;
+    cursor: pointer;
+  }
+  .plugin-list-entry:hover {
+    border-color: var(--border-subtle);
+  }
+  .plugin-list-entry.active {
+    border-color: var(--accent, #d77757);
+  }
+  .plugin-list-entry .plugin-sub {
+    font-size: var(--font-size-xs);
+    color: var(--text-tertiary);
+  }
+  .plugin-detail {
+    flex: 1;
+    min-width: 0;
+  }
+  .plugin-category {
+    margin-top: var(--space-3);
+  }
+  .plugin-error {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    padding: var(--space-3) 0;
+    border-top: 1px solid var(--border-default, rgba(128, 128, 128, 0.25));
+  }
+  .plugin-error-head {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+  }
+  code.plugin-dir {
+    font-size: var(--font-size-xs);
+    color: var(--text-tertiary);
+    word-break: break-all;
+  }
+  .plugin-perms {
+    font-size: 0.85em;
+    opacity: 0.85;
+  }
+  .plugin-perms summary {
+    cursor: pointer;
+  }
+  .plugin-perms ul {
+    margin: var(--space-2) 0 0;
+    padding-left: 1.2rem;
+  }
+  .audit-timeout input.plugin-var {
+    width: 14rem;
+  }
+  small.hint.plugin-field {
+    margin: var(--space-2) 0 0;
+    font-size: 0.85em;
   }
   .file-row {
     display: flex;

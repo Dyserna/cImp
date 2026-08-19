@@ -3,22 +3,35 @@
 //!
 //! Design authority: `docs/MILESTONE-V38-tool-plugin-framework.md`.
 //!
-//! **Phase A (this module today) is discovery only.** Manifests are found,
-//! parsed, validated, identified and made visible — and nothing runs them. That
-//! is deliberate and is what makes Phase A shippable alone: a plugin dropped in
-//! `plugins/` appears, its errors are loud, and the surface a model sees is
-//! byte-for-byte unchanged (decision 5). The registry that merges manifests with
-//! user state is Phase B; the pipelines that spawn anything are Phase C/D.
+//! **Through Phase B this module still runs nothing.** Manifests are found,
+//! parsed, validated, identified, made visible, and (Phase B) joined with the
+//! user's configuration — but no pipeline spawns one yet. That is deliberate and
+//! is what makes each phase shippable alone: a plugin dropped in `plugins/`
+//! appears, its errors are loud, its settings persist, and the surface a model
+//! sees is byte-for-byte unchanged (decision 5). The pipelines that spawn
+//! anything are Phase C/D.
 //!
 //! Layout:
 //! * [`manifest`] — the versioned schema and its validation (the parse boundary).
 //! * [`loader`] — folder scan, identity rules, and the app-managed
 //!   [`PluginStore`].
 //! * [`events`] — the `plugin` Events lane's row builders.
+//! * [`registry`] — Phase B's join of manifests, user state and the open
+//!   project into the one answer a pipeline needs.
 
 pub mod events;
 pub mod loader;
 pub mod manifest;
+/// The manifest ⋈ user-state ⋈ project join.
+///
+/// `allow(dead_code)` for exactly one phase: Phase B ships the join and its
+/// tests, and the pipelines that consume it (the audit fan-out, `run_check`'s
+/// effective set, `run_command`'s allowlist) are Phase C/D — which is when this
+/// attribute comes off. The settings pane deliberately does NOT go through here:
+/// it renders the same facts from the snapshot DTO in TypeScript because it
+/// needs the *unresolved* halves too (which of the two flags a tool is off by).
+#[allow(dead_code)]
+pub mod registry;
 
 use std::sync::{Arc, OnceLock};
 
@@ -67,6 +80,19 @@ pub fn global() -> Option<Arc<PluginStore>> {
 #[tauri::command]
 pub fn plugins_snapshot(state: State<'_, Arc<PluginStore>>) -> Arc<PluginSet> {
     state.snapshot()
+}
+
+/// The key this launch's project stores its per-tool binary paths under
+/// (`ToolPluginsSettings::project_paths`).
+///
+/// The Settings window edits a machine-global map keyed by project, so it has
+/// to be able to name the project it is editing — and it must name it the same
+/// way every consumer will look it up, which is why this goes through
+/// [`registry::project_key`] rather than the frontend joining a path itself.
+/// Canonicalization touches the disk, so it belongs on this side of the wire.
+#[tauri::command]
+pub fn plugins_project_key(state: State<'_, crate::AppState>) -> String {
+    registry::project_key(&state.settings.launch_cwd())
 }
 
 /// Rescan `<exe-dir>/plugins/` and return the new set — the manual **Rescan**

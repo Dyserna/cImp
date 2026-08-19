@@ -1170,6 +1170,24 @@ enum ProxyMiss {
     /// nothing may gate on it: see `graph::mcp::headless_refusal`, which gates on
     /// `--tab` instead.
     Transport,
+    /// The connection was ESTABLISHED and then the child's own client-side cap
+    /// elapsed before the app finished answering.
+    ///
+    /// This is the opposite fact from [`Transport`](Self::Transport): the app
+    /// was listening, it accepted the call, and it is — as far as this child
+    /// knows — still working on it. Until this variant existed a slow answer
+    /// was mapped to `Transport` and therefore reached
+    /// `graph::mcp::headless_refusal`, which told the caller **"cImp is not
+    /// reachable"** about an app that was running fine and about a check that
+    /// completed successfully seconds later. Every such refusal landed at
+    /// exactly the client cap (+30 000 ms) while the app's own activity row for
+    /// the same call was `ok=true`.
+    ///
+    /// It does **not** fall back — see [`declined`](Self::declined). Re-running
+    /// a long `run_check`/`run_command` on the headless path would start a
+    /// SECOND execution of work that is still running, which is worse than
+    /// saying nothing.
+    SlowCall,
     /// The app answered with a non-2xx status. It is RUNNING and it declined:
     /// 401 is a stale bearer token, 5xx is a fault inside the warm path.
     ///
@@ -1192,6 +1210,7 @@ impl ProxyMiss {
             ProxyMiss::NoInstance => "no-instance",
             ProxyMiss::ClientBuild => "client-build",
             ProxyMiss::Transport => "transport",
+            ProxyMiss::SlowCall => "slow-call",
             ProxyMiss::HttpStatus(_) => "http-status",
             ProxyMiss::Unparseable => "unparseable-response",
         }
@@ -1210,7 +1229,13 @@ impl ProxyMiss {
     /// `--tab` rule M-8 settled the containment consequence is already gone; this
     /// closes the diagnostic dishonesty.
     ///
-    /// Exhaustive on purpose: a sixth reason cannot join the set without a
+    /// [`SlowCall`](Self::SlowCall) joins them on a neighbouring property: the
+    /// app did not finish answering, but it DID accept the call, so the honest
+    /// report is "outcome unknown here" — never "cImp is not reachable", which
+    /// is what the headless fallback says, and never a silent second execution
+    /// of work that is still running.
+    ///
+    /// Exhaustive on purpose: a further reason cannot join the set without a
     /// deliberate answer to "does the app's own verdict exist for this one".
     fn declined(&self) -> Option<String> {
         match self {
@@ -1223,6 +1248,18 @@ impl ProxyMiss {
                  inside cImp's own warm path. Say so in your answer and retry — this is a \
                  transient condition, not a permanent boundary."
             )),
+            ProxyMiss::SlowCall => Some(
+                "NO RESULT YET: this call took longer than the proxy's client-side cap, so this \
+                 tool gave up waiting for the answer. cImp itself IS running — it accepted the \
+                 call — and the operation may still be completing inside the app right now. The \
+                 call was deliberately NOT re-run without cImp: re-running it on the fallback \
+                 path would start a SECOND execution of work that is still in flight. Do not \
+                 report cImp as unreachable and do not report the operation as failed — its \
+                 outcome is simply unknown here. Check the resulting state directly (files, the \
+                 app's own activity/output), or re-run this call once the operation would have \
+                 finished."
+                    .to_string(),
+            ),
             ProxyMiss::Unparseable => Some(
                 "NOT RUN: cImp answered this call with a success status but a body that was not \
                  JSON, so something between cImp and this tool is rewriting responses. The call \
@@ -1250,6 +1287,19 @@ impl ProxyMiss {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         if !seen.insert(key.clone()) {
+            return;
+        }
+        if matches!(self, ProxyMiss::SlowCall) {
+            // Distinct wording: this one is NOT "the app declined". The app
+            // accepted the call and is presumed still working on it; the child
+            // simply stopped waiting.
+            eprintln!(
+                "cimp-offload: a graph/context call exceeded this child's client-side timeout \
+                 ({key}) — cImp accepted the call and may still be completing it. The caller was \
+                 told the outcome is unknown, NOT that cImp is unreachable, and the call was not \
+                 re-run on the headless fallback (which would double-execute work still in \
+                 flight)."
+            );
             return;
         }
         if self.declined().is_some() {
@@ -1291,6 +1341,7 @@ mod proxy_miss_tests {
             ProxyMiss::NoInstance,
             ProxyMiss::ClientBuild,
             ProxyMiss::Transport,
+            ProxyMiss::SlowCall,
             ProxyMiss::HttpStatus(500),
             ProxyMiss::Unparseable,
         ];
@@ -1300,6 +1351,7 @@ mod proxy_miss_tests {
                 ProxyMiss::NoInstance
                 | ProxyMiss::ClientBuild
                 | ProxyMiss::Transport
+                | ProxyMiss::SlowCall
                 | ProxyMiss::HttpStatus(_)
                 | ProxyMiss::Unparseable => (),
             };
@@ -1313,6 +1365,9 @@ mod proxy_miss_tests {
         assert_ne!(ProxyMiss::NoInstance, ProxyMiss::HttpStatus(500));
         assert_ne!(ProxyMiss::HttpStatus(401), ProxyMiss::HttpStatus(500));
         assert_ne!(ProxyMiss::Transport, ProxyMiss::NoInstance);
+        // "the app never answered" vs "the app is still answering" are the two
+        // the slow-check defect conflated.
+        assert_ne!(ProxyMiss::Transport, ProxyMiss::SlowCall);
     }
 
     /// Locked decision 30, part two (#48 F-11): the app's own verdict is never
@@ -1355,6 +1410,156 @@ mod proxy_miss_tests {
         let four_oh_one = ProxyMiss::HttpStatus(401).declined().expect("declined");
         assert!(four_oh_one.contains("restarting the tab"), "{four_oh_one}");
     }
+
+    /// The slow-check defect, pinned at the boundary string.
+    ///
+    /// A `run_check` running `cargo build` (40–66 s here) blew the flat 30 s
+    /// client cap, mapped to `Transport`, took the headless fallback and told
+    /// the caller **"cImp is not reachable"** — while the app's own row for the
+    /// same call was `ok=true`. Two properties keep that from coming back:
+    /// `SlowCall` must not fall back (so `headless_refusal` never sees it), and
+    /// its message must not claim the app is down or the work is dead.
+    #[test]
+    fn a_slow_call_is_reported_as_unknown_not_as_unreachable() {
+        let text = ProxyMiss::SlowCall
+            .declined()
+            .expect("a slow call must NOT reach the headless fallback");
+        // (a) the cap was the child's, (b) cImp is running and may still be
+        // working, (c) what the caller can do instead.
+        assert!(text.contains("client-side cap"), "{text}");
+        assert!(text.contains("cImp itself IS running"), "{text}");
+        assert!(text.contains("may still be completing"), "{text}");
+        assert!(text.contains("re-run this call"), "{text}");
+        // The lie the defect produced: `HEADLESS_CAPABILITY_UNAVAILABLE`'s
+        // "cImp is not reachable". This string says the opposite, on purpose.
+        assert!(!text.contains("not reachable"), "{text}");
+        assert!(text.contains("Do not report cImp as unreachable"), "{text}");
+        // Content-free: no path, no command, no tool output echoed back.
+        assert_eq!(text, ProxyMiss::SlowCall.declined().expect("stable"));
+        // And it is distinct from every other boundary string.
+        for other in [
+            ProxyMiss::HttpStatus(401),
+            ProxyMiss::HttpStatus(500),
+            ProxyMiss::Unparseable,
+        ] {
+            assert_ne!(other.declined().expect("declined"), text);
+        }
+    }
+}
+
+#[cfg(test)]
+mod proxy_timeout_tests {
+    use super::{
+        proxy_call_timeout, PROXY_CALL_TIMEOUT, PROXY_CONNECT_TIMEOUT,
+        PROXY_LOCAL_CAPABILITY_TIMEOUT,
+    };
+
+    /// The tools that EXECUTE get the backstop cap; the tools that READ keep the
+    /// wedge detector.
+    ///
+    /// `run_check`/`run_command` were the whole defect: a flat 30 s cap is below
+    /// the runtime of literally every compile-shaped check in this repo
+    /// (cargo-build 40–66 s, cargo-clippy ~49 s, cargo-test minutes).
+    #[test]
+    fn local_capability_tools_get_the_long_cap() {
+        for executes in ["run_check", "run_command", "security_audit", "quality_audit"] {
+            assert_eq!(
+                proxy_call_timeout(executes),
+                PROXY_LOCAL_CAPABILITY_TIMEOUT,
+                "{executes} executes work and must not be abandoned at 30 s"
+            );
+        }
+        // Everything outside that class keeps the wedge detector — TRUSTED
+        // symbol/edge queries, the PERSISTENT-WRITE memory tool, and the
+        // unknown⇒EXTERNAL default. (Note the class, not the name prefix, is the
+        // rule: several `graph_*` readers ARE LocalCapability, and they get the
+        // long cap too, which costs nothing because they answer in
+        // milliseconds.)
+        for reads in ["graph_callers", "graph_impact", "context_note", "unknown"] {
+            assert_eq!(proxy_call_timeout(reads), PROXY_CALL_TIMEOUT, "{reads}");
+        }
+        assert_eq!(
+            proxy_call_timeout("graph_repo_map"),
+            PROXY_LOCAL_CAPABILITY_TIMEOUT
+        );
+    }
+
+    /// The connect cap stays short and independent of the overall cap: "nothing
+    /// is listening" must still fail fast into the headless fallback even for a
+    /// tool whose overall cap is half an hour.
+    #[test]
+    fn the_connect_cap_is_short_for_every_class() {
+        assert!(PROXY_CONNECT_TIMEOUT < PROXY_CALL_TIMEOUT);
+        assert!(PROXY_CONNECT_TIMEOUT.as_secs() <= 2);
+        assert!(PROXY_LOCAL_CAPABILITY_TIMEOUT > PROXY_CALL_TIMEOUT);
+    }
+}
+
+/// How long the child waits for the TCP connect to the app's loopback
+/// endpoint. This is the "is anything listening" probe and nothing else —
+/// loopback connects complete in milliseconds, so 2 s is already generous and a
+/// dead port still fails fast into [`ProxyMiss::Transport`] → the headless
+/// fallback.
+const PROXY_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Overall client-side cap for an ordinary `/graph_run` call (graph queries,
+/// context/memory tools): they are index reads and answer in well under a
+/// second, so 30 s is a wedge detector.
+const PROXY_CALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Overall client-side cap for a
+/// [`ToolClass::LocalCapability`](crate::offload::toolclass::ToolClass::LocalCapability)
+/// `/graph_run` call — `run_check`, `run_command`, the audits.
+///
+/// # Why this is huge rather than "generous"
+///
+/// These tools EXECUTE things: a `cargo build` takes 40–66 s here, `cargo
+/// clippy` ~49 s, `cargo test` minutes. Under the old flat 30 s cap the child
+/// abandoned the request mid-flight, mapped the timeout to
+/// [`ProxyMiss::Transport`] and fell back to
+/// `graph::mcp::headless_refusal`, which answered **"cImp is not reachable"** —
+/// about a running app, for a check that finished successfully seconds later
+/// (every such refusal landed at exactly +30 000 ms).
+///
+/// The right bound for "how long may this run" is NOT here. The app bounds
+/// every check/command execution server-side with its own per-run timeout, and
+/// that bound is the one users configure and the one that produces a real
+/// result. This cap exists only as a backstop against a wedged connection that
+/// never produces a response at all, so it is set far above any legitimate
+/// server-side bound (30 min) instead of competing with it. Anything under that
+/// ceiling now surfaces as [`ProxyMiss::SlowCall`], which does not lie about
+/// reachability and does not re-execute the work.
+const PROXY_LOCAL_CAPABILITY_TIMEOUT: Duration = Duration::from_secs(1800);
+
+/// Which overall cap a `/graph_run` call gets, from the tool's class.
+///
+/// Split out of [`proxy_graph_outcome`] so the rule is testable without a
+/// listening app: the tools that EXECUTE (`ToolClass::LocalCapability`) get the
+/// backstop cap, everything else keeps the wedge detector.
+fn proxy_call_timeout(name: &str) -> Duration {
+    match crate::offload::toolclass::classify(name) {
+        crate::offload::toolclass::ToolClass::LocalCapability => PROXY_LOCAL_CAPABILITY_TIMEOUT,
+        _ => PROXY_CALL_TIMEOUT,
+    }
+}
+
+/// Which [`ProxyMiss`] a `reqwest` send/body error means.
+///
+/// The distinction the fix turns on: a CONNECT-phase failure is the app not
+/// answering at all (→ [`ProxyMiss::Transport`] → headless fallback, unchanged,
+/// this is the case the fallback exists for), while a timeout AFTER the
+/// connection was established is a slow answer from a running app (→
+/// [`ProxyMiss::SlowCall`], which does not fall back and does not claim
+/// unreachability). Anything else (connection reset, body decode fault) keeps
+/// the pre-existing mapping supplied by the caller.
+fn proxy_send_miss(err: &reqwest::Error) -> ProxyMiss {
+    if err.is_connect() {
+        return ProxyMiss::Transport;
+    }
+    if err.is_timeout() {
+        return ProxyMiss::SlowCall;
+    }
+    ProxyMiss::Transport
 }
 
 /// The five-outcome half of [`proxy_graph`]. `Ok` is the app's answer (which may
@@ -1366,8 +1571,13 @@ async fn proxy_graph_outcome(params: &Value) -> Result<Result<Value, (i64, Strin
     let cwd = std::env::current_dir()
         .ok()
         .map(|p| p.to_string_lossy().into_owned());
+    // Two caps, not one. The connect cap answers "is the app listening" (fast,
+    // loopback); the overall cap is class-dependent, because a `run_check` that
+    // compiles this repo legitimately runs for minutes and used to be abandoned
+    // at a flat 30 s and then reported as "cImp is not reachable".
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
+        .connect_timeout(PROXY_CONNECT_TIMEOUT)
+        .timeout(proxy_call_timeout(name))
         .build()
         .map_err(|_| ProxyMiss::ClientBuild)?;
     // V28: `tab` identifies which session's memory scope this call belongs to.
@@ -1385,12 +1595,24 @@ async fn proxy_graph_outcome(params: &Value) -> Result<Result<Value, (i64, Strin
         .json(&body)
         .send()
         .await
-        .map_err(|_| ProxyMiss::Transport)?;
+        .map_err(|e| proxy_send_miss(&e))?;
     let status = resp.status();
     if !status.is_success() {
         return Err(ProxyMiss::HttpStatus(status.as_u16()));
     }
-    let v: Value = resp.json().await.map_err(|_| ProxyMiss::Unparseable)?;
+    // Body read: a timeout here is the same fact as a timeout on `send` — the
+    // app accepted the call and the cap elapsed while it was still answering —
+    // and `reqwest` tells us so cheaply via `is_timeout()`, so it maps to
+    // `SlowCall` rather than to `Unparseable` ("something is rewriting
+    // responses"), which would be an alarming and wrong diagnosis. Every other
+    // body fault stays `Unparseable`.
+    let v: Value = resp.json().await.map_err(|e| {
+        if e.is_timeout() {
+            ProxyMiss::SlowCall
+        } else {
+            ProxyMiss::Unparseable
+        }
+    })?;
     let ok = v.get("ok").and_then(|b| b.as_bool()).unwrap_or(false);
     if ok {
         let text = v.get("text").and_then(|t| t.as_str()).unwrap_or_default();

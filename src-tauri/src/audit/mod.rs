@@ -3,9 +3,9 @@
 //! Phase A ships only tool *detection*: [`audit_detect_tool`] resolves a
 //! configured audit tool via [`crate::pty::resolve_command`] (honoring the
 //! per-tool `path` override in [`crate::settings::AuditToolConfig`]) and probes
-//! `<tool> --version`. The result is display-only — the Settings "Detect" button
-//! shows it inline and never writes it back into the stored `path` field, so the
-//! config stays "resolve normally" unless the user browses to an exe.
+//! `<tool> --version`. The result is a report: this command writes no settings.
+//! (The Settings pane may store what it found — that is the pane's write, made
+//! on the user's click, exactly as a Browse… would be.)
 //!
 //! Phase B extends this module with the full concurrent runner, per-tool SARIF
 //! adapters, and the `audit-status` progress events.
@@ -61,9 +61,9 @@ pub fn global() -> Option<Arc<AuditState>> {
 /// "not found / unresponsive". Short — this backs an interactive button.
 const DETECT_TIMEOUT: Duration = Duration::from_secs(8);
 
-/// V23 Phase A: result of a Detect probe. Display-only — the frontend renders it
-/// inline (`✓ <version> — <path>` / the error) and NEVER writes it back into the
-/// tool's `path` field.
+/// V23 Phase A: result of a Detect probe. The frontend renders it inline
+/// (`✓ <version> — <path>` / the error); producing it changes nothing here, and
+/// whether the found path is then stored is the Settings pane's decision.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct AuditDetectResult {
     /// Whether the tool resolved AND its `--version` probe ran successfully.
@@ -79,10 +79,30 @@ pub struct AuditDetectResult {
 }
 
 /// Resolve one registered tool honoring its configured `path` and probe
-/// `<tool> --version`. Read-only and side-effect-free w.r.t. settings — the
-/// Detect button shows the result inline but never mutates the stored path.
-/// Always returns `Ok`: a not-found tool is a normal result (`found = false`),
-/// not an error.
+/// `<tool> --version`. Read-only and side-effect-free w.r.t. settings — this
+/// command never mutates the stored path. Always returns `Ok`: a not-found tool
+/// is a normal result (`found = false`), not an error.
+///
+/// # What it searches for, and why that is not the run-time rule
+///
+/// With an empty `path` the probe searches `ebin` → `PATH` for the name
+/// [`crate::plugins::registry::probe_command_name`] derives — for EVERY tool,
+/// including a user plugin's. That is wider than
+/// `EffectiveTool::resolves_by_name`, which stays exactly as it was: run time
+/// still requires a stored path for a user plugin (decision 7/10), and nothing
+/// about a Detect click makes a path-less tool runnable.
+///
+/// The two differ because they answer different questions. Run time asks "may
+/// cImp spawn a binary the user never pointed it at?" — no. Detect asks "is
+/// this tool on this machine?", pressed by the user, about one tool, with the
+/// answer shown to them. Gating the second on the first made Detect report "not
+/// found on PATH or ebin" for every starter-pack tool without ever looking,
+/// which was untrue as well as useless.
+///
+/// The write half lives in the Settings pane on purpose: the probe reports, and
+/// the found path becomes configuration through the same UI act that a Browse…
+/// would have been. Keeping this command settings-read-only is what lets it be
+/// called freely without a click ever silently changing what a scan launches.
 ///
 /// `tool_key` is the registry key (`cimp-audit@1/gitleaks`, or a user plugin's
 /// `name@version/tool-id`), and `path` is the LIVE value from the Settings
@@ -126,10 +146,7 @@ pub async fn audit_detect_tool(
     let override_path = path.or_else(|| tool.path.clone()).unwrap_or_default();
     Ok(detect_tool(
         &override_path,
-        tool.resolves_by_name()
-            .then(|| tool.manifest.command.clone())
-            .flatten()
-            .as_deref(),
+        tool.probe_name().as_deref(),
         tool.manifest.project_local_bin.as_deref(),
         Some(&root),
     )
@@ -139,8 +156,11 @@ pub async fn audit_detect_tool(
 /// Resolve a tool's binary to an on-disk path, for the DETECT probe.
 ///
 /// Deliberately the same ladder `audit::runner::resolve_runnable` walks — a ✓
-/// from Detect that disagreed with what a scan launches would be worse than no
-/// button at all:
+/// from Detect that pointed at a different binary than a scan launches would be
+/// worse than no button at all. (The one place the two now differ is step 3 for
+/// a USER plugin: Detect searches a derived name that run time will not, and
+/// the pane answers that by STORING what it found, so the tool a scan resolves
+/// afterwards is the exact path the probe reported.)
 ///
 /// 1. **Configured `path`** (non-empty) — used verbatim (the V23 contract): a
 ///    deliberate "use exactly this binary" that project-local resolution must
@@ -148,11 +168,17 @@ pub async fn audit_detect_tool(
 /// 2. **Project-local `node_modules/.bin`** — for a tool whose manifest names a
 ///    shim (eslint, knip), the project's own install beats a global one. Only
 ///    when there is no configured path and a `root` is known.
-/// 3. **`ebin` → `PATH`** on the manifest's bare command name.
+/// 3. **`ebin` → `PATH`** on the bare command name the caller derived.
 ///
-/// `command` is `None` for a user plugin, which has no name cImp may resolve
-/// (decision 10) — so an unconfigured one resolves nowhere, which is the honest
-/// answer rather than a guess.
+/// `command` is whatever [`crate::plugins::registry::probe_command_name`]
+/// could derive — for a built-in that is its manifest's `command`, and for a
+/// user plugin it is a name read off the definition (a check's program, a
+/// command tool's id) **for this probe only**. Decision 10 is unchanged where it
+/// bites: RUN time still refuses to guess a binary for a user plugin, so an
+/// unconfigured one is still inert in every pipeline. What this ladder produces
+/// is an answer shown to the user, which becomes configuration only when they
+/// store it. `None` (nothing derivable) resolves nowhere — the honest answer
+/// rather than a guess.
 fn resolve_audit_binary(
     override_path: &str,
     command: Option<&str>,
@@ -221,13 +247,23 @@ async fn detect_tool(
     let resolved = match resolve_audit_binary(override_path, command, project_local_bin, root) {
         Ok(p) => p,
         Err(_) => {
-            // Same distinction the scan runner makes: an empty override that
-            // resolves nowhere is "not installed"; a non-empty override that
-            // fails is a broken configured path.
-            let error = if override_path.trim().is_empty() {
-                "not found on PATH or ebin".to_string()
-            } else {
+            // Three genuinely different failures, and a message for each —
+            // saying "not found on PATH or ebin" when no search ever ran is the
+            // bug this arm was rewritten to fix.
+            let error = if !override_path.trim().is_empty() {
+                // A configured path that resolves nowhere is a misconfiguration,
+                // and naming the offending value is the whole of the fix.
                 format!("configured path not found: {}", override_path.trim())
+            } else if let Some(name) = command {
+                // A name search DID run and came back empty: say which name, so
+                // the user can check that spelling against their own PATH.
+                format!("`{name}` not found on PATH or ebin")
+            } else {
+                // Nothing to search for (a findings tool whose manifest names no
+                // binary). Telling the user it is "not on PATH" would be a
+                // finding cImp never made; the honest answer is that this tool
+                // has to be pointed at something.
+                "no path set — type a path or use Browse…".to_string()
             };
             return AuditDetectResult {
                 found: false,
@@ -434,6 +470,41 @@ mod tests {
             Some("configured path not found: cimp-definitely-not-a-real-tool-xyz")
         );
         assert!(r.version.is_none());
+    }
+
+    /// The two EMPTY-override failures are different facts and say so. Before
+    /// this split, a tool with nothing to search for was reported as "not found
+    /// on PATH or ebin" — a search result cImp had never obtained.
+    #[tokio::test]
+    async fn detect_without_a_path_distinguishes_no_name_from_a_failed_search() {
+        // A name WAS searched for: the message names it, so the user can check
+        // that spelling against their own PATH.
+        let r = detect_tool("", Some("cimp-not-a-real-binary-xyz"), None, None).await;
+        assert!(!r.found);
+        assert!(r.path.is_none());
+        assert_eq!(
+            r.error.as_deref(),
+            Some("`cimp-not-a-real-binary-xyz` not found on PATH or ebin")
+        );
+
+        // Nothing to search for — the honest answer is that this tool has to be
+        // pointed at something, not that it is missing from PATH.
+        let r = detect_tool("", None, None, None).await;
+        assert!(!r.found);
+        assert_eq!(
+            r.error.as_deref(),
+            Some("no path set — type a path or use Browse…")
+        );
+    }
+
+    /// The probe resolves a bare NAME through `ebin` → `PATH`, which is what
+    /// makes Detect useful for a user plugin's tool: `cargo build` derives
+    /// `cargo`, and the ladder finds the same binary a Browse… would have.
+    #[tokio::test]
+    async fn detect_resolves_a_bare_name_through_the_path_ladder() {
+        let r = detect_tool("", Some("cargo"), None, None).await;
+        assert!(r.found, "cargo is on PATH in the test env: {r:?}");
+        assert!(r.path.is_some() && r.version.is_some(), "{r:?}");
     }
 
     /// A binary that spawns but exits non-zero on `--version` (wrong exe, or a

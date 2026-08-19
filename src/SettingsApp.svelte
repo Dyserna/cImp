@@ -117,6 +117,7 @@
     setToolParameters,
     setToolTimeout,
     setToolVariable,
+    siblingAutoFillTargets,
     type PluginRow,
     type PluginSet,
     type ToolRow,
@@ -1979,8 +1980,9 @@
 
   // Per-tool Detect probe result, keyed by TOOL KEY (`cimp-audit@1/gitleaks`,
   // or a user plugin's `name@version/tool-id`). `'probing'` while the IPC is in
-  // flight. Display-only — the probe never writes back into the tool's path, so
-  // the stored config stays "resolve normally" unless the user browses.
+  // flight. The IPC itself writes no settings; when it answers a click on an
+  // EMPTY path box, this component stores what it found — see
+  // `detectPluginTool`.
   let auditDetect = $state<Record<string, AuditDetectResult | 'probing' | undefined>>({});
 
   // The latest scan's language census, read from the runner so the
@@ -2016,13 +2018,43 @@
     }
   }
 
-  async function detectPluginTool(toolKey: string, path: string): Promise<void> {
+  /// Detect: probe one tool, and — when the box was empty — SELECT what was
+  /// found, for this tool and for the siblings of the same plugin that resolve
+  /// to the same binary.
+  ///
+  /// Pressing Detect on an empty box is a question with one useful answer
+  /// ("here it is, and it is now yours"): reporting a path the user then has to
+  /// retype is the button doing nine tenths of the work and stopping. The write
+  /// is deliberately HERE rather than in the IPC — `audit_detect_tool` is
+  /// settings-read-only, so a probe can never change what a scan launches on its
+  /// own; this is the user's click storing a path exactly as a Browse… would.
+  ///
+  /// A non-empty box is left alone: the probe was then asking about a path the
+  /// user chose, and confirming it is not a reason to rewrite it.
+  async function detectPluginTool(plugin: PluginRow, tool: ToolRow): Promise<void> {
+    const toolKey = tool.toolKey;
+    const path = tool.path.effective;
+    // Read off the rows as they are NOW, before the await: the probe answers
+    // milliseconds later against a settings snapshot that may have moved, and
+    // "the rows the user was looking at when they clicked" is the honest
+    // population to fill.
+    const siblings = path.trim() === '' ? siblingAutoFillTargets(plugin, tool) : [];
     auditDetect = { ...auditDetect, [toolKey]: 'probing' };
     try {
       // Probe the LIVE editing value, not the persisted setting — a just-typed
       // path would otherwise race the fire-and-forget applySettings push.
       const r = await auditDetectTool(toolKey, path);
       auditDetect = { ...auditDetect, [toolKey]: r };
+      if (path.trim() === '' && r.found && r.path) {
+        const found = r.path;
+        patchPlugin((s) => {
+          setGlobalPath(s, toolKey, found);
+          // One binary, several rows: `cargo build`, `cargo test`, `cargo
+          // clippy` and `cargo` are four tools and one executable, and making
+          // the user press Detect on each is the button stopping short.
+          for (const sibling of siblings) setGlobalPath(s, sibling.toolKey, found);
+        });
+      }
     } catch (e) {
       auditDetect = {
         ...auditDetect,
@@ -6783,8 +6815,7 @@
                   <button
                     type="button"
                     class="secondary"
-                    onclick={() =>
-                      void detectPluginTool(tool.toolKey, tool.path.effective)}
+                    onclick={() => void detectPluginTool(plugin, tool)}
                   >
                     Detect
                   </button>

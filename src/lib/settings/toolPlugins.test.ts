@@ -8,6 +8,7 @@ import {
   permissionSummary,
   permissionsOpen,
   pluginRows,
+  probeCommandName,
   revertToGlobalPath,
   setCategoryEnabled,
   setGlobalPath,
@@ -15,9 +16,10 @@ import {
   setProjectPath,
   setToolEnabled,
   setToolVariable,
+  siblingAutoFillTargets,
   toolPath,
 } from './toolPlugins';
-import type { PluginSet, PluginToolManifest } from './toolPlugins';
+import type { PluginSet, PluginToolManifest, ProbeNameInput } from './toolPlugins';
 
 const PROJECT = 'C:\\repo';
 
@@ -334,5 +336,216 @@ describe('stored state outlives its plugin', () => {
     // …and it is still there when the plugin comes back.
     expect(s.tool_plugins.plugins['gone@9.9.9'].tools['x'].enabled).toBe(false);
     expect(s.tool_plugins.global_paths['gone@9.9.9/x']).toBe('C:\\bin\\gone.exe');
+  });
+});
+
+// ── The Detect probe ────────────────────────────────────────────────────────
+
+function probeInput(over: Partial<ProbeNameInput> = {}): ProbeNameInput {
+  return { id: 'x', kind: 'command', cmd: null, command: null, resolvesByName: false, ...over };
+}
+
+/// One plugin shaped like the shipped `rust-toolchain` pack: three checks and a
+/// command tool, all of them one executable, plus rows that must NOT be filled.
+function toolchain(): PluginSet {
+  return {
+    plugins: [
+      {
+        path: 'C:\\cimp\\plugins\\rust-toolchain.json',
+        provenance: 'user',
+        key: 'rust-toolchain@1.0.0',
+        manifest: {
+          manifest_version: 1,
+          name: 'rust-toolchain',
+          version: '1.0.0',
+          label: 'Rust toolchain',
+          description: null,
+          categories: [
+            {
+              id: 'cargo',
+              label: 'Cargo',
+              tools: ['cargo-build', 'cargo-test', 'cargo', 'cargo-pinned', 'rustfmt', 'remote'],
+            },
+          ],
+          tools: [
+            tool({
+              id: 'cargo-build',
+              label: 'cargo build',
+              kind: 'check',
+              argv: [],
+              cmd: 'cargo build --message-format=json',
+            }),
+            tool({
+              id: 'cargo-test',
+              label: 'cargo test',
+              kind: 'check',
+              argv: [],
+              cmd: 'cargo test',
+            }),
+            tool({ id: 'cargo', label: 'cargo', kind: 'command', argv: [] }),
+            // Same binary, but the user already pointed this one somewhere.
+            tool({
+              id: 'cargo-pinned',
+              label: 'cargo (pinned)',
+              kind: 'check',
+              argv: [],
+              cmd: 'cargo fmt',
+            }),
+            // A different program entirely.
+            tool({
+              id: 'rustfmt',
+              label: 'rustfmt',
+              kind: 'check',
+              argv: [],
+              cmd: 'rustfmt --check',
+            }),
+            // Tier 2: nothing is spawned for it, so a stored path would describe
+            // nothing. (Validation would refuse this exact combination in a real
+            // manifest; the filter exists because the row type allows it.)
+            tool({
+              id: 'remote',
+              label: 'Remote cargo',
+              kind: 'command',
+              argv: [],
+              provider: { server: 'acme', tool: 'cargo' },
+            }),
+          ],
+        },
+      },
+      // A SECOND plugin naming the same binary: one Detect click must not reach
+      // across plugins, because the plugin is the unit its author reasoned about.
+      {
+        path: 'C:\\cimp\\plugins\\other.json',
+        provenance: 'user',
+        key: 'other@1.0.0',
+        manifest: {
+          manifest_version: 1,
+          name: 'other',
+          version: '1.0.0',
+          label: 'Other',
+          description: null,
+          categories: [{ id: 'c', label: 'C', tools: ['cargo'] }],
+          tools: [tool({ id: 'cargo', label: 'cargo', kind: 'command', argv: [] })],
+        },
+      },
+    ],
+    errors: [],
+    dir: 'C:\\cimp\\plugins',
+    scanned_at_ms: 1,
+    scan_ms: 2,
+  };
+}
+
+describe('probeCommandName', () => {
+  test("a built-in's declared command wins over what the kind rules would derive", () => {
+    expect(
+      probeCommandName(
+        probeInput({
+          id: 'gitleaks-x',
+          kind: 'security',
+          command: 'gitleaks',
+          resolvesByName: true,
+        }),
+      ),
+    ).toBe('gitleaks');
+    // `resolvesByName` is "built-in AND a declared command"; without it the kind
+    // rules decide, and a security tool has no name to derive.
+    expect(
+      probeCommandName(probeInput({ id: 'gitleaks-x', kind: 'security', command: 'gitleaks' })),
+    ).toBe(null);
+  });
+
+  test('a check probes the first token of its command line', () => {
+    expect(
+      probeCommandName(probeInput({ kind: 'check', cmd: 'cargo build --message-format=json' })),
+    ).toBe('cargo');
+    expect(probeCommandName(probeInput({ kind: 'check', cmd: '  npm   run lint ' }))).toBe('npm');
+    expect(probeCommandName(probeInput({ kind: 'check', cmd: 'git' }))).toBe('git');
+    // Nothing to split ⇒ nothing to guess.
+    expect(probeCommandName(probeInput({ kind: 'check', cmd: null }))).toBe(null);
+    expect(probeCommandName(probeInput({ kind: 'check', cmd: '   ' }))).toBe(null);
+  });
+
+  test('a command-kind tool probes its id, and a findings tool derives nothing', () => {
+    expect(probeCommandName(probeInput({ id: 'git', kind: 'command' }))).toBe('git');
+    for (const kind of ['audit', 'security'] as const) {
+      expect(probeCommandName(probeInput({ id: 'semgrep', kind }))).toBe(null);
+    }
+  });
+
+  test('the guard refuses anything that is not a bare name', () => {
+    for (const hostile of [
+      '..\\evil.exe',
+      '../evil.exe',
+      'C:\\Windows\\System32\\calc.exe',
+      '/usr/bin/id',
+      'a/b',
+      'a\\b',
+      '..',
+    ]) {
+      // Through the id (rule 3)…
+      expect(probeCommandName(probeInput({ id: hostile, kind: 'command' }))).toBe(null);
+      // …and through the cmd's first token (rule 2). A manifest is untrusted
+      // input, and a probe aimed at a path of its choosing would make Detect an
+      // execution primitive rather than a lookup.
+      expect(probeCommandName(probeInput({ kind: 'check', cmd: hostile + ' --version' }))).toBe(
+        null,
+      );
+    }
+    // An id that is empty or only whitespace is not a name either. (The `cmd`
+    // arm of this case is the `null`/`'   '` pair above: a blank command line
+    // has no first token at all.)
+    for (const blank of ['', '   ']) {
+      expect(probeCommandName(probeInput({ id: blank, kind: 'command' }))).toBe(null);
+    }
+    // A built-in `command` that fails the guard yields nothing rather than
+    // falling back to the id.
+    expect(
+      probeCommandName(
+        probeInput({
+          id: 'cargo',
+          kind: 'command',
+          command: '..\\evil.exe',
+          resolvesByName: true,
+        }),
+      ),
+    ).toBe(null);
+  });
+});
+
+describe('siblingAutoFillTargets', () => {
+  test('one hit fills every path-less row of the same plugin that resolves to the same binary', () => {
+    const s = fresh();
+    setGlobalPath(s, 'rust-toolchain@1.0.0/cargo-pinned', 'D:\\pinned\\cargo.exe');
+    const plugin = pluginRows(toolchain(), s, PROJECT)[0];
+    const tools = plugin.categories[0].tools;
+    const clicked = tools.find((t) => t.id === 'cargo-build')!;
+
+    const keys = siblingAutoFillTargets(plugin, clicked).map((t) => t.toolKey);
+    expect(keys).toEqual(['rust-toolchain@1.0.0/cargo-test', 'rust-toolchain@1.0.0/cargo']);
+    // The clicked row is the caller's own business (it is filled directly), a
+    // row with a path is a decision this must not overwrite, `rustfmt` is a
+    // different program, the provider row spawns nothing, and the OTHER
+    // plugin's `cargo` is out of scope.
+    expect(keys).not.toContain(clicked.toolKey);
+    expect(keys).not.toContain('rust-toolchain@1.0.0/cargo-pinned');
+    expect(keys).not.toContain('rust-toolchain@1.0.0/rustfmt');
+    expect(keys).not.toContain('rust-toolchain@1.0.0/remote');
+    expect(keys.every((k) => k.startsWith('rust-toolchain@1.0.0/'))).toBe(true);
+  });
+
+  test('a tool with no derivable name fills nothing', () => {
+    const plugin = pluginRows(set(), fresh(), PROJECT)[0];
+    const scan = plugin.categories[0].tools.find((t) => t.id === 'scan')!;
+    expect(probeCommandName(scan)).toBe(null);
+    expect(siblingAutoFillTargets(plugin, scan)).toEqual([]);
+  });
+
+  test('a rendered row carries what the derivation reads', () => {
+    const plugin = pluginRows(toolchain(), fresh(), PROJECT)[0];
+    const build = plugin.categories[0].tools[0];
+    expect(build.cmd).toBe('cargo build --message-format=json');
+    expect(build.command).toBe(null);
+    expect(probeCommandName(build)).toBe('cargo');
   });
 });

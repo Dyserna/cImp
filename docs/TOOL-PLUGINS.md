@@ -687,6 +687,16 @@ survives while the storage location does not sit inside the sandbox.
     definition a stranger wrote; it was never an argument for making fourteen
     shipped scanners stop working. The gate is the loader's provenance stamp, not
     the `cimp-` name.
+  * **Detect is a lookup, not a resolution rule.** Pressing **Detect** beside an
+    empty path box searches `ebin` and then your `PATH` for the name the manifest
+    implies — a built-in's `command`, a check's program (the first word of its
+    `cmd`), or a `command`-kind tool's id — and, when it finds one, stores that
+    path for the tool and for every path-less tool of the SAME plugin that
+    resolves to the same binary. Only bare names are ever searched: anything
+    carrying `/`, `\`, `:` or `..` is refused, so a manifest cannot aim the probe
+    at a file of its choosing. This changes nothing about what runs — a tool with
+    no stored path is still inert — because the path is stored by your click,
+    exactly as if you had browsed to it.
 * **Runnable** = enabled AND path set. Two separate questions, kept separate, so
   "why is my enabled tool not running?" has an answer.
 * **Variables** = declared defaults, overlaid by your values, **for declared

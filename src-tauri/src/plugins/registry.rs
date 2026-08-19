@@ -141,6 +141,84 @@ impl EffectiveTool {
     pub fn resolves_by_name(&self) -> bool {
         self.provenance == Provenance::Builtin && self.manifest.command.is_some()
     }
+
+    /// The bare command NAME the Settings **Detect probe** searches `ebin` →
+    /// `PATH` for, or `None` when nothing safe can be derived. See
+    /// [`probe_command_name`] for the rules and for why this is not
+    /// [`Self::resolves_by_name`].
+    pub fn probe_name(&self) -> Option<String> {
+        probe_command_name(&self.manifest, self.provenance)
+    }
+}
+
+/// The bare command name a **Detect probe** may look for on this machine, for
+/// any tool — built-in or dropped in a folder — or `None` when the manifest
+/// gives us nothing a name search could honestly use.
+///
+/// # Why this is not `resolves_by_name`
+///
+/// The two answer different questions, and V38 shipped with only the first.
+/// [`EffectiveTool::resolves_by_name`] is a RUN-TIME trust rule: may cImp spawn
+/// this tool with no stored path? For a user plugin the answer stays **no**
+/// (decision 7/10) — nothing here changes what a check or `run_command`
+/// launches, and a path-less user tool is still inert.
+///
+/// This one is a UI question: the user pressed Detect with an empty box, and
+/// the only useful thing that button can do is *look*. Gating the look on the
+/// run-time rule made Detect answer "not found on PATH or ebin" for every
+/// starter-pack tool without ever searching PATH — an answer that was both
+/// useless and untrue. Searching costs nothing and grants nothing: the result
+/// is displayed, and it becomes a configured path only when the *user's* click
+/// stores one, which is the same consent a Browse… would have given.
+///
+/// # The rules, in order
+///
+/// 1. A **built-in** whose manifest names a `command` — the pre-V38 behaviour,
+///    and the only one that also governs run time.
+/// 2. A **check**-kind tool — the first whitespace-separated token of its
+///    `cmd`, which is by construction the program the check line runs
+///    (`cargo build --message-format=json` → `cargo`).
+/// 3. A **command**-kind tool — its `id`. The kind exists to expose one CLI
+///    through `run_command`, and the id is the name that CLI is known by
+///    (`git`, `npm`, `dotnet`); the shipped pack is written that way throughout.
+/// 4. Anything else — `None`. An audit/security tool's argv is a template with
+///    no program in it (decision 7 keeps the executable out of the manifest),
+///    so there is no name to guess and guessing the id would probe some
+///    unrelated binary that happened to share it.
+///
+/// # The guard
+///
+/// Whatever the rules produce must be a **bare name**: non-empty after trim and
+/// free of `/`, `\`, `:` and `..`. A manifest is attacker-controlled input
+/// (`plugins::manifest`'s premise), and `id`/`cmd` are NOT screened the way
+/// `command` is — `command` is refused outright in a scanned file, so a hostile
+/// author's only route here is rule 2 or 3. Without the guard a `cmd` of
+/// `..\..\Users\me\evil.exe --x` would aim the probe at an arbitrary file and
+/// turn a Detect click into an execution primitive. With it, resolution can only
+/// go through the existing `ebin` → `PATH` ladder, which searches directories
+/// cImp and the user already trust. Refused rather than sanitized: a name we had
+/// to rewrite is not the name the author wrote, and "which binary ran" is not a
+/// question to answer by guessing.
+pub fn probe_command_name(manifest: &ToolManifest, provenance: Provenance) -> Option<String> {
+    let candidate = match (provenance, manifest.command.as_deref()) {
+        (Provenance::Builtin, Some(command)) => command,
+        _ => match manifest.kind {
+            ToolKind::Check => manifest.cmd.as_deref()?.split_whitespace().next()?,
+            ToolKind::Command => manifest.id.as_str(),
+            ToolKind::Audit | ToolKind::Security => return None,
+        },
+    };
+    bare_name(candidate)
+}
+
+/// The guard half of [`probe_command_name`], split out so the rule reads as one
+/// line at its single call site: a name, or nothing.
+fn bare_name(candidate: &str) -> Option<String> {
+    let name = candidate.trim();
+    if name.is_empty() || name.contains(['/', '\\', ':']) || name.contains("..") {
+        return None;
+    }
+    Some(name.to_string())
 }
 
 /// The key a project's path overrides are stored under.
@@ -512,5 +590,133 @@ mod tests {
             "stored parameters must not become argv on a tool that never allowed them"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A tool manifest straight from JSON, deliberately WITHOUT running
+    /// [`super::super::manifest::validate`]: the guard's whole job is to hold
+    /// for shapes the validator would have refused, and a fixture that could
+    /// only carry validated values would never exercise it.
+    fn tool_json(json: &str) -> ToolManifest {
+        serde_json::from_str(json).expect("tool manifest")
+    }
+
+    /// Rule 1: a built-in's declared `command` is the name, and it wins over
+    /// what the kind rules would have derived — it is the field whose entire
+    /// purpose is naming the binary.
+    #[test]
+    fn a_builtin_command_is_the_probe_name() {
+        let t = tool_json(
+            r#"{ "id": "gitleaks-x", "label": "Gitleaks", "kind": "security",
+                 "argv": ["{root}"], "command": "gitleaks" }"#,
+        );
+        assert_eq!(
+            probe_command_name(&t, Provenance::Builtin).as_deref(),
+            Some("gitleaks")
+        );
+        // …and the gate is PROVENANCE, not the presence of the field: a scanned
+        // file may not carry `command` at all (the loader refuses it), so the
+        // user arm falls through to the kind rules — which give nothing for a
+        // security tool.
+        assert_eq!(probe_command_name(&t, Provenance::User), None);
+    }
+
+    /// Rule 2: a check's `cmd` is a command LINE, and its first token is the
+    /// program — the same split the check runner makes.
+    #[test]
+    fn a_check_probes_the_first_token_of_its_cmd() {
+        for (cmd, want) in [
+            ("cargo build --message-format=json", Some("cargo")),
+            ("  npm   run lint  ", Some("npm")),
+            ("git", Some("git")),
+        ] {
+            let t = tool_json(&format!(
+                r#"{{ "id": "c", "label": "C", "kind": "check", "cmd": {} }}"#,
+                serde_json::Value::String(cmd.to_string())
+            ));
+            assert_eq!(
+                probe_command_name(&t, Provenance::User).as_deref(),
+                want,
+                "cmd `{cmd}`"
+            );
+        }
+        // No `cmd` at all ⇒ nothing to split, and nothing to guess.
+        let t = tool_json(r#"{ "id": "c", "label": "C", "kind": "check" }"#);
+        assert_eq!(probe_command_name(&t, Provenance::User), None);
+    }
+
+    /// Rule 3: a command-kind tool's id IS the CLI's name — that is what the
+    /// kind is for, and the shipped pack (`git`, `cargo`, `npm`, `dotnet`, …)
+    /// is written that way throughout.
+    #[test]
+    fn a_command_tool_probes_its_id() {
+        let t = tool_json(r#"{ "id": "git", "label": "git", "kind": "command" }"#);
+        assert_eq!(
+            probe_command_name(&t, Provenance::User).as_deref(),
+            Some("git")
+        );
+    }
+
+    /// Rule 4: an audit/security tool's argv is a template with no program in
+    /// it (decision 7 keeps the executable out of the manifest), so there is
+    /// nothing to search for — and probing its id would run some unrelated
+    /// binary that happened to share the name.
+    #[test]
+    fn a_user_findings_tool_derives_no_name() {
+        for kind in ["audit", "security"] {
+            let t = tool_json(&format!(
+                r#"{{ "id": "semgrep", "label": "S", "kind": "{kind}", "argv": ["{{root}}"] }}"#
+            ));
+            assert_eq!(probe_command_name(&t, Provenance::User), None, "{kind}");
+        }
+    }
+
+    /// The guard: whatever the rules produce must be a BARE NAME, so a hostile
+    /// manifest cannot aim the probe at a file of its choosing. Resolution goes
+    /// only through the `ebin` → `PATH` ladder.
+    #[test]
+    fn the_guard_refuses_anything_that_is_not_a_bare_name() {
+        for hostile in [
+            "..\\evil.exe",
+            "../evil.exe",
+            "C:\\Windows\\System32\\calc.exe",
+            "/usr/bin/id",
+            "a/b",
+            "a\\b",
+            "..",
+        ] {
+            // Through rule 3 (the id), which a scanned file controls freely…
+            let mut t = tool_json(r#"{ "id": "x", "label": "X", "kind": "command" }"#);
+            t.id = hostile.to_string();
+            assert_eq!(
+                probe_command_name(&t, Provenance::User),
+                None,
+                "id `{hostile}`"
+            );
+
+            // …and through rule 2 (the cmd's first token).
+            let mut c = tool_json(r#"{ "id": "x", "label": "X", "kind": "check" }"#);
+            c.cmd = Some(format!("{hostile} --version"));
+            assert_eq!(
+                probe_command_name(&c, Provenance::User),
+                None,
+                "cmd `{hostile}`"
+            );
+        }
+
+        // An id that is empty or only whitespace is not a name either. (The
+        // `cmd` arm of this case is a blank command line, which has no first
+        // token at all — see the check test.)
+        for blank in ["", "   "] {
+            let mut t = tool_json(r#"{ "id": "x", "label": "X", "kind": "command" }"#);
+            t.id = blank.to_string();
+            assert_eq!(probe_command_name(&t, Provenance::User), None, "id `{blank}`");
+        }
+
+        // A built-in `command` that fails the guard yields NOTHING rather than
+        // falling back to the id: the author named a binary, and silently
+        // probing a different one would be a worse answer than none.
+        let mut b = tool_json(r#"{ "id": "cargo", "label": "C", "kind": "command" }"#);
+        b.command = Some("..\\evil.exe".to_string());
+        assert_eq!(probe_command_name(&b, Provenance::Builtin), None);
     }
 }

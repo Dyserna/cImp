@@ -184,7 +184,17 @@ export interface ToolRow {
   /// a built-in whose manifest names a command. It changes what the empty path
   /// box MEANS ("resolve normally" against "this tool does not run"), which is
   /// the difference between a working default and an invisible one.
+  ///
+  /// A RUN-TIME rule, and deliberately not the Detect probe's — see
+  /// [`probeCommandName`].
   resolvesByName: boolean;
+  /// The check-kind command LINE, verbatim from the manifest. Carried on the row
+  /// so [`probeCommandName`] can read the program out of it without the pane
+  /// holding a second handle on the manifest.
+  cmd: string | null;
+  /// The bare command name a BUILT-IN declares. `null` for every user plugin —
+  /// the loader refuses the field in a scanned file.
+  command: string | null;
   /// V38 Phase F: set for a TIER-2 tool. The pane renders the server it calls
   /// where a tier-1 tool renders its two path boxes — a provider tool has no
   /// binary, so an empty path input beside it would be an instruction the user
@@ -376,6 +386,8 @@ export function pluginRows(set: PluginSet, settings: Settings, projectKey: strin
           permissions: permissionSummary(t),
           sandbox: t.sandbox,
           resolvesByName: p.provenance === 'builtin' && !!t.command,
+          cmd: t.cmd ?? null,
+          command: t.command ?? null,
           provider: t.provider ?? null,
         });
       }
@@ -407,6 +419,88 @@ export function errorRows(set: PluginSet): PluginErrorRow[] {
 function fileName(p: string): string {
   const parts = p.split(/[\\/]/);
   return parts[parts.length - 1] || p;
+}
+
+// ── The Detect probe: what to look for, and what a hit fills in ─────────────
+
+/// The shape [`probeCommandName`] needs — a [`ToolRow`] satisfies it, and so
+/// does a test's literal, which is the point of not taking the whole row.
+export interface ProbeNameInput {
+  id: string;
+  kind: PluginToolKind;
+  cmd: string | null;
+  command: string | null;
+  resolvesByName: boolean;
+}
+
+/// The bare command name the Detect button searches `ebin` → `PATH` for, or
+/// `null` when the manifest gives us nothing a search could honestly use.
+///
+/// **A mirror of Rust's `plugins::registry::probe_command_name`, rule for rule
+/// and guard for guard.** The backend derives its own copy for the probe; this
+/// one exists so the pane can tell WHICH OTHER tools a single hit also answers
+/// for (see [`siblingAutoFillTargets`]) without a round trip per row. If one of
+/// the two ever changes, the other is wrong.
+///
+/// 1. A **built-in** whose manifest names a `command` (`resolvesByName` is
+///    exactly "built-in provenance AND a declared command").
+/// 2. A **check** — the first whitespace-separated token of its `cmd`, which is
+///    the program the check line runs.
+/// 3. A **command**-kind tool — its `id`, which is the name the CLI it exposes
+///    is known by.
+/// 4. Anything else — `null`. An audit/security tool's argv carries no program
+///    (the executable is never in a manifest), so there is nothing to search
+///    for and the id would name some unrelated binary.
+///
+/// Everything is then put through [`bareName`]: a manifest is untrusted input,
+/// and a probe that could be aimed at `..\evil.exe` would make Detect an
+/// execution primitive rather than a lookup.
+export function probeCommandName(tool: ProbeNameInput): string | null {
+  if (tool.resolvesByName && tool.command) return bareName(tool.command);
+  if (tool.kind === 'check') return bareName((tool.cmd ?? '').trim().split(/\s+/)[0] ?? '');
+  if (tool.kind === 'command') return bareName(tool.id);
+  return null;
+}
+
+/// A bare command NAME, or `null`: non-empty after trim, and free of `/`, `\`,
+/// `:` and `..`. Refused rather than sanitized — a name we had to rewrite is not
+/// the name the author wrote.
+function bareName(candidate: string): string | null {
+  const name = candidate.trim();
+  if (name === '' || /[/\\:]/.test(name) || name.includes('..')) return null;
+  return name;
+}
+
+/// The OTHER tools of the same plugin that one Detect hit also answers for:
+/// same derived probe name, no binary of their own yet, and something cImp
+/// would actually spawn.
+///
+/// A plugin is usually one CLI in several dresses — `cargo build`, `cargo test`,
+/// `cargo clippy` and `cargo` are four rows and one executable — so filling only
+/// the row that was clicked would leave the user pressing Detect three more
+/// times to store the identical string. The three filters are each a case where
+/// doing so would be wrong:
+///
+/// * **Same plugin only.** Two plugins may name a tool `python` and mean
+///   different interpreters; the plugin is the unit its author reasoned about.
+/// * **Provider (tier-2) rows are skipped.** Nothing is spawned for them, so a
+///   stored path would be configuration that describes nothing.
+/// * **Only blank paths.** A tool the user already pointed somewhere is a
+///   decision, and a Detect click on a sibling is not consent to overwrite it.
+export function siblingAutoFillTargets(plugin: PluginRow, tool: ToolRow): ToolRow[] {
+  const name = probeCommandName(tool);
+  if (name === null) return [];
+  const out: ToolRow[] = [];
+  for (const category of plugin.categories) {
+    for (const other of category.tools) {
+      if (other.toolKey === tool.toolKey) continue;
+      if (other.provider) continue;
+      if (other.path.effective.trim() !== '') continue;
+      if (probeCommandName(other) !== name) continue;
+      out.push(other);
+    }
+  }
+  return out;
 }
 
 // ── Writes into the settings container ──────────────────────────────────────

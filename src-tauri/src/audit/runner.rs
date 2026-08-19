@@ -498,20 +498,6 @@ impl AuditState {
             cfg
         };
 
-        // Only this category's tools; the other category belongs to the other
-        // sub-tab.
-        let in_category: Vec<&AuditToolConfig> = cfg
-            .tools
-            .iter()
-            .filter(|t| adapters::adapter(t.id).category == category)
-            .collect();
-        if !in_category.iter().any(|t| t.enabled) {
-            return Err(format!(
-                "no {} audit tools are enabled",
-                category_label(category)
-            ));
-        }
-
         // The chips (one per this-category tool) and the enabled+applicable
         // subset to launch — pure, so the filter is unit-tested directly.
         let (mut chips, to_run) = plan_scan(&cfg.tools, category, &census);
@@ -530,6 +516,24 @@ impl AuditState {
         //   miss every project override.
         let (plugin_chips, plugin_runs) =
             plan_plugin_scan(&plugin_tools(&tool_plugins, &root), category, &census);
+
+        // "Nothing to run" now spans BOTH populations. Before V38 the built-in
+        // roster was the whole roster, so its enabled-count answered the
+        // question; a plugin-only category (this milestone's "add language X in
+        // one drop") would otherwise be rejected with "no tools are enabled"
+        // while the user is looking at an enabled, path-configured tool. The
+        // wording is unchanged, because from the user's side the fact is the
+        // same one.
+        let in_category = cfg
+            .tools
+            .iter()
+            .filter(|t| adapters::adapter(t.id).category == category);
+        if !in_category.clone().any(|t| t.enabled) && plugin_chips.is_empty() {
+            return Err(format!(
+                "no {} audit tools are enabled",
+                category_label(category)
+            ));
+        }
         chips.extend(plugin_chips);
 
         let (root, cancel, global_timeout) = {

@@ -219,9 +219,21 @@ export interface PluginRow {
   /// cImp's own, stamped by the loader. Rendered as a badge, and the reason the
   /// pane never offers to delete the file: there is no file.
   builtin: boolean;
-  /// `name (version)` — decision 9's display form. Two versions of one plugin
-  /// coexist, so the version is part of the name, not a detail.
+  /// The plugin's own name, WITHOUT its version — what the manifest's `label`
+  /// says, or its `name` when it declares no label.
+  ///
+  /// Decision 9 ("two versions of one plugin coexist, so the version is part of
+  /// the identity") used to be served by baking `name (version)` into this one
+  /// string, which made every list read like a changelog. The decision is now
+  /// split across the two places it is actually needed: the detail pane always
+  /// shows [`version`] beside the label, and the LIST appends it only for the
+  /// rows that would otherwise be indistinguishable — see
+  /// [`pluginDisplayLabels`]. Nothing is lost, and the common case (one version
+  /// of each plugin) stops paying for the rare one.
   label: string;
+  /// The manifest's version, verbatim. Kept as its own field so the two
+  /// renderings above can decide independently how much of it to show.
+  version: string;
   manifestPath: string;
   description: string | null;
   enabled: boolean;
@@ -397,7 +409,8 @@ export function pluginRows(set: PluginSet, settings: Settings, projectKey: strin
     return {
       key: p.key,
       builtin: p.provenance === 'builtin',
-      label: `${p.manifest.label ?? p.manifest.name} (${p.manifest.version})`,
+      label: p.manifest.label ?? p.manifest.name,
+      version: p.manifest.version,
       manifestPath: p.path,
       description: p.manifest.description,
       enabled: pluginEnabled,
@@ -405,6 +418,40 @@ export function pluginRows(set: PluginSet, settings: Settings, projectKey: strin
       toolCount: categories.reduce((n, c) => n + c.tools.length, 0),
     };
   });
+}
+
+/// The minimum [`pluginDisplayLabels`] reads. A [`PluginRow`] satisfies it, and
+/// so does a test's literal — the helper is about three strings, not about rows.
+export interface PluginLabelInput {
+  key: string;
+  label: string;
+  version: string;
+}
+
+/// What the plugin LIST prints for each row, keyed by plugin key: the bare
+/// label, or `label (version)` when another loaded plugin would print the same
+/// bare label.
+///
+/// This is decision 9's collision case and nothing more. The version is part of
+/// a plugin's identity only when it is the thing telling two entries apart; a
+/// list where every row carries a version it does not need is a list where the
+/// user reads a version number to find a name. So the version is spent exactly
+/// where it buys something — and it is spent on ALL colliding rows, including
+/// the one that would still have been unambiguous, because "cargo-tools" beside
+/// "cargo-tools (2.0.0)" reads as two different kinds of thing rather than as
+/// two versions of one.
+///
+/// Collisions are compared on the bare label, not the key: the key is unique by
+/// construction (`name@version`), so it can never collide and would answer the
+/// wrong question.
+export function pluginDisplayLabels(rows: PluginLabelInput[]): Map<string, string> {
+  const seen = new Map<string, number>();
+  for (const r of rows) seen.set(r.label, (seen.get(r.label) ?? 0) + 1);
+  const out = new Map<string, string>();
+  for (const r of rows) {
+    out.set(r.key, (seen.get(r.label) ?? 0) > 1 ? `${r.label} (${r.version})` : r.label);
+  }
+  return out;
 }
 
 export function errorRows(set: PluginSet): PluginErrorRow[] {
@@ -471,20 +518,43 @@ function bareName(candidate: string): string | null {
   return name;
 }
 
+/// Whether a Detect hit may be STORED as this tool's path at all — asked of the
+/// clicked row by the pane's handler, and of every candidate sibling below.
+///
+/// Two rows must never be pinned, and for the same underlying reason: for them,
+/// a stored path is a worse description of reality than no path.
+///
+/// * **A tool that resolves by name** (a built-in whose manifest declares a
+///   `command`) already finds its binary through `ebin` then `PATH` on every
+///   run — that is its documented behaviour, and its empty box says so ("use
+///   the ebin folder / PATH"). Writing the probe's hit into it would silently
+///   convert a live lookup into a pin, so the next drop-in update of the binary
+///   in `ebin` would be found by the probe and ignored by the runtime. The
+///   probe result is still SHOWN either way; what is refused is only the write.
+/// * **A provider (tier-2) row** spawns nothing at all, so a path stored for it
+///   would be configuration that describes nothing.
+export function shouldAutoFill(tool: {
+  resolvesByName: boolean;
+  provider: PluginProviderRef | null;
+}): boolean {
+  return !tool.resolvesByName && !tool.provider;
+}
+
 /// The OTHER tools of the same plugin that one Detect hit also answers for:
 /// same derived probe name, no binary of their own yet, and something cImp
-/// would actually spawn.
+/// would actually pin a path for.
 ///
 /// A plugin is usually one CLI in several dresses — `cargo build`, `cargo test`,
 /// `cargo clippy` and `cargo` are four rows and one executable — so filling only
 /// the row that was clicked would leave the user pressing Detect three more
-/// times to store the identical string. The three filters are each a case where
-/// doing so would be wrong:
+/// times to store the identical string. The filters are each a case where doing
+/// so would be wrong:
 ///
 /// * **Same plugin only.** Two plugins may name a tool `python` and mean
 ///   different interpreters; the plugin is the unit its author reasoned about.
-/// * **Provider (tier-2) rows are skipped.** Nothing is spawned for them, so a
-///   stored path would be configuration that describes nothing.
+/// * **Only rows [`shouldAutoFill`] admits** — no provider rows, and no
+///   built-in that resolves through `ebin`/`PATH`, which a pinned path would
+///   freeze at today's binary.
 /// * **Only blank paths.** A tool the user already pointed somewhere is a
 ///   decision, and a Detect click on a sibling is not consent to overwrite it.
 export function siblingAutoFillTargets(plugin: PluginRow, tool: ToolRow): ToolRow[] {
@@ -494,7 +564,7 @@ export function siblingAutoFillTargets(plugin: PluginRow, tool: ToolRow): ToolRo
   for (const category of plugin.categories) {
     for (const other of category.tools) {
       if (other.toolKey === tool.toolKey) continue;
-      if (other.provider) continue;
+      if (!shouldAutoFill(other)) continue;
       if (other.path.effective.trim() !== '') continue;
       if (probeCommandName(other) !== name) continue;
       out.push(other);

@@ -7,6 +7,7 @@ import {
   errorRows,
   permissionSummary,
   permissionsOpen,
+  pluginDisplayLabels,
   pluginRows,
   probeCommandName,
   revertToGlobalPath,
@@ -16,6 +17,7 @@ import {
   setProjectPath,
   setToolEnabled,
   setToolVariable,
+  shouldAutoFill,
   siblingAutoFillTargets,
   toolPath,
 } from './toolPlugins';
@@ -102,9 +104,11 @@ describe('pluginRows', () => {
     const rows = pluginRows(set(), fresh(), PROJECT);
     expect(rows).toHaveLength(1);
     const row = rows[0];
-    // Decision 9's display form: the version is part of the name, because two
-    // versions of one plugin coexist.
-    expect(row.label).toBe('Acme Tools (1.0.0)');
+    // Decision 9 is now split: the row carries the bare name and the version
+    // separately, and `pluginDisplayLabels` decides which of the two the list
+    // needs (see its own describe block below).
+    expect(row.label).toBe('Acme Tools');
+    expect(row.version).toBe('1.0.0');
     expect(row.enabled).toBe(true);
     expect(row.toolCount).toBe(3);
     expect(row.categories.map((c) => c.id)).toEqual(['sec', 'misc']);
@@ -436,6 +440,48 @@ function toolchain(): PluginSet {
   };
 }
 
+/// A BUILT-IN pack: same binary behind every row, but one of them declares a
+/// `command`, which is what makes it resolve through `ebin` → `PATH` at run
+/// time. Provenance is per-plugin, so this cannot be folded into `toolchain()`.
+function builtinPack(): PluginSet {
+  return {
+    plugins: [
+      {
+        path: 'C:\\cimp\\builtin\\cargo.json',
+        provenance: 'builtin',
+        key: 'cimp-builtin@1',
+        manifest: {
+          manifest_version: 1,
+          name: 'cimp-builtin',
+          version: '1',
+          label: 'Built-in cargo',
+          description: null,
+          categories: [
+            { id: 'cargo', label: 'Cargo', tools: ['cargo', 'cargo-check', 'cargo-fmt', 'remote'] },
+          ],
+          tools: [
+            // Declares a command ⇒ resolvesByName ⇒ never pinned.
+            tool({ id: 'cargo', label: 'cargo', kind: 'command', argv: [], command: 'cargo' }),
+            tool({ id: 'cargo-check', label: 'cargo check', kind: 'check', argv: [], cmd: 'cargo check' }),
+            tool({ id: 'cargo-fmt', label: 'cargo fmt', kind: 'check', argv: [], cmd: 'cargo fmt' }),
+            tool({
+              id: 'remote',
+              label: 'Remote cargo',
+              kind: 'command',
+              argv: [],
+              provider: { server: 'acme', tool: 'cargo' },
+            }),
+          ],
+        },
+      },
+    ],
+    errors: [],
+    dir: 'C:\\cimp\\builtin',
+    scanned_at_ms: 1,
+    scan_ms: 2,
+  };
+}
+
 describe('probeCommandName', () => {
   test("a built-in's declared command wins over what the kind rules would derive", () => {
     expect(
@@ -547,5 +593,67 @@ describe('siblingAutoFillTargets', () => {
     expect(build.cmd).toBe('cargo build --message-format=json');
     expect(build.command).toBe(null);
     expect(probeCommandName(build)).toBe('cargo');
+  });
+
+  test('a sibling that resolves through ebin/PATH is left empty on purpose', () => {
+    const plugin = pluginRows(builtinPack(), fresh(), PROJECT)[0];
+    const tools = plugin.categories[0].tools;
+    const clicked = tools.find((t) => t.id === 'cargo-check')!;
+    const byName = tools.find((t) => t.id === 'cargo')!;
+    // Both rows probe for the same binary and both boxes are blank, so only the
+    // exemption keeps the by-name row out: pinning it would freeze a lookup
+    // that is meant to re-run against `ebin` on every launch.
+    expect(probeCommandName(clicked)).toBe('cargo');
+    expect(probeCommandName(byName)).toBe('cargo');
+    expect(byName.resolvesByName).toBe(true);
+    expect(byName.path.effective).toBe('');
+    expect(siblingAutoFillTargets(plugin, clicked).map((t) => t.toolKey)).toEqual([
+      'cimp-builtin@1/cargo-fmt',
+    ]);
+  });
+});
+
+describe('shouldAutoFill', () => {
+  test('a Detect hit is stored for an ordinary tool only', () => {
+    const rows = pluginRows(builtinPack(), fresh(), PROJECT)[0].categories[0].tools;
+    const byId = (id: string) => rows.find((t) => t.id === id)!;
+    // The plain rows: a path is the only way cImp would find them.
+    expect(shouldAutoFill(byId('cargo-check'))).toBe(true);
+    expect(shouldAutoFill(byId('cargo-fmt'))).toBe(true);
+    // Resolves through `ebin` → `PATH`; a stored path would replace that live
+    // lookup with today's answer, so the empty box is the working default.
+    expect(shouldAutoFill(byId('cargo'))).toBe(false);
+    // Tier 2 spawns nothing, so a path would describe nothing.
+    expect(shouldAutoFill(byId('remote'))).toBe(false);
+  });
+});
+
+describe('pluginDisplayLabels', () => {
+  test('the version appears only where the bare names collide', () => {
+    const labels = pluginDisplayLabels([
+      { key: 'acme@1.0.0', label: 'Acme Tools', version: '1.0.0' },
+      { key: 'acme@2.0.0', label: 'Acme Tools', version: '2.0.0' },
+      { key: 'solo@1.0.0', label: 'Solo', version: '1.0.0' },
+    ]);
+    // Both sides of a collision carry it: "Acme Tools" beside "Acme Tools
+    // (2.0.0)" would read as two different plugins rather than two versions.
+    expect(labels.get('acme@1.0.0')).toBe('Acme Tools (1.0.0)');
+    expect(labels.get('acme@2.0.0')).toBe('Acme Tools (2.0.0)');
+    expect(labels.get('solo@1.0.0')).toBe('Solo');
+  });
+
+  test('one of each is just the name, and an empty list is an empty map', () => {
+    const rows = pluginRows(set(), fresh(), PROJECT);
+    expect(pluginDisplayLabels(rows).get('acme@1.0.0')).toBe('Acme Tools');
+    expect(pluginDisplayLabels([]).size).toBe(0);
+  });
+
+  test('different plugins sharing one label still collide — the label is what the user reads', () => {
+    const labels = pluginDisplayLabels([
+      { key: 'a@1.0.0', label: 'Scanners', version: '1.0.0' },
+      { key: 'b@1.0.0', label: 'Scanners', version: '1.0.0' },
+    ]);
+    expect(labels.get('a@1.0.0')).toBe('Scanners (1.0.0)');
+    expect(labels.get('b@1.0.0')).toBe('Scanners (1.0.0)');
   });
 });

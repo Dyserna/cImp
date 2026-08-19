@@ -107,6 +107,7 @@
     AUDIT_PLUGIN_KEY,
     errorRows,
     permissionsOpen,
+    pluginDisplayLabels,
     pluginRows,
     revertToGlobalPath,
     setCategoryEnabled,
@@ -117,6 +118,7 @@
     setToolParameters,
     setToolTimeout,
     setToolVariable,
+    shouldAutoFill,
     siblingAutoFillTargets,
     type PluginRow,
     type PluginSet,
@@ -2031,6 +2033,14 @@
   ///
   /// A non-empty box is left alone: the probe was then asking about a path the
   /// user chose, and confirming it is not a reason to rewrite it.
+  ///
+  /// And a row `shouldAutoFill` refuses is left alone too, however empty its
+  /// box is. A built-in that resolves by name is SUPPOSED to have an empty box —
+  /// it finds its binary through `ebin` then `PATH` on every run, which is what
+  /// its placeholder promises — so storing today's hit would quietly turn that
+  /// live lookup into a pin and make the next drop-in update of the binary
+  /// invisible. The probe result is displayed either way; only the write is
+  /// refused, and per row: a sibling that does need a path still gets one.
   async function detectPluginTool(plugin: PluginRow, tool: ToolRow): Promise<void> {
     const toolKey = tool.toolKey;
     const path = tool.path.effective;
@@ -2039,20 +2049,21 @@
     // "the rows the user was looking at when they clicked" is the honest
     // population to fill.
     const siblings = path.trim() === '' ? siblingAutoFillTargets(plugin, tool) : [];
+    const fillClicked = shouldAutoFill(tool);
     auditDetect = { ...auditDetect, [toolKey]: 'probing' };
     try {
       // Probe the LIVE editing value, not the persisted setting — a just-typed
       // path would otherwise race the fire-and-forget applySettings push.
       const r = await auditDetectTool(toolKey, path);
       auditDetect = { ...auditDetect, [toolKey]: r };
-      if (path.trim() === '' && r.found && r.path) {
+      const targets = [...(fillClicked ? [toolKey] : []), ...siblings.map((s) => s.toolKey)];
+      if (path.trim() === '' && r.found && r.path && targets.length > 0) {
         const found = r.path;
         patchPlugin((s) => {
-          setGlobalPath(s, toolKey, found);
           // One binary, several rows: `cargo build`, `cargo test`, `cargo
           // clippy` and `cargo` are four tools and one executable, and making
           // the user press Detect on each is the button stopping short.
-          for (const sibling of siblings) setGlobalPath(s, sibling.toolKey, found);
+          for (const target of targets) setGlobalPath(s, target, found);
         });
       }
     } catch (e) {
@@ -2098,6 +2109,11 @@
   const pluginActive = $derived<PluginRow | null>(
     pluginList.find((p) => p.key === pluginSelected) ?? pluginList[0] ?? null,
   );
+  // What the LIST prints per key: the bare name, and the version only for rows
+  // that would otherwise read identically (decision 9's collision case). The
+  // detail pane always shows the version, so nothing is hidden — it is just not
+  // repeated on every line of a list of names.
+  const pluginLabels = $derived(pluginDisplayLabels(pluginList));
 
   function patchPlugin(updater: (s: Settings) => void): void {
     patch(updater);
@@ -7030,17 +7046,23 @@
               <ul class="plugin-list">
                 {#each pluginList as p (p.key)}
                   <li>
+                    <!-- One line, styled as the settings sidebar's entries are:
+                         this IS a category list, and a two-line bordered card
+                         per plugin made the pane read as a different app than
+                         the one it lives in. What each plugin IS (built in, how
+                         many tools, where its manifest is) belongs to the row
+                         the user selected, not to all of them at once — so it
+                         moved into the detail. The one piece of state that
+                         cannot wait for a click is "off", because a list that
+                         looks uniform while half of it is inert is a lie. -->
                     <button
                       type="button"
                       class="plugin-list-entry"
                       class:active={pluginActive?.key === p.key}
+                      class:off={!p.enabled}
                       onclick={() => (pluginSelected = p.key)}
                     >
-                      <span class="audit-name">{p.label}</span>
-                      <span class="plugin-sub">
-                        {p.builtin ? 'built in · ' : ''}{p.toolCount}
-                        {p.toolCount === 1 ? 'tool' : 'tools'}{p.enabled ? '' : ' · off'}
-                      </span>
+                      {pluginLabels.get(p.key) ?? p.label}{p.enabled ? '' : ' · off'}
                     </button>
                   </li>
                 {/each}
@@ -7063,7 +7085,16 @@
                         )}
                     />
                     <span class="audit-name">{plugin.label}</span>
+                    <!-- Decision 9's version, shown here rather than in the
+                         list: it identifies the plugin the user is looking AT,
+                         and two coexisting versions are told apart by this line
+                         plus the manifest path below it. -->
+                    <span class="plugin-version">{plugin.version}</span>
                   </label>
+                  <small class="hint plugin-origin">
+                    {plugin.builtin ? 'built in · ' : ''}{plugin.toolCount}
+                    {plugin.toolCount === 1 ? 'tool' : 'tools'}
+                  </small>
                   {#if plugin.description}
                     <small class="hint">{plugin.description}</small>
                   {/if}
@@ -8740,45 +8771,80 @@
   /* V38: Tool Plugins master-detail. */
   .plugin-split {
     display: flex;
-    gap: var(--space-3);
-    align-items: flex-start;
+    gap: var(--space-4);
+    align-items: stretch;
     margin-top: var(--space-3);
   }
+  /* The plugin list is the settings sidebar's idiom applied inside a section:
+     a column of single-line entries, separated from what they select by the
+     same hairline the window's own .sidebar uses against .content. */
   .plugin-list {
-    flex: 0 0 14rem;
+    flex: 0 0 13rem;
     list-style: none;
     margin: 0;
-    padding: 0;
+    padding: 0 var(--space-3) 0 0;
+    border-right: 1px solid var(--border-faint);
     display: flex;
     flex-direction: column;
     gap: 2px;
   }
   .plugin-list-entry {
+    display: block;
     width: 100%;
     text-align: left;
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
-    background: none;
+    padding: 7px 12px;
+    background: transparent;
     border: 1px solid transparent;
-    border-radius: 3px;
-    padding: var(--space-2);
-    color: inherit;
+    color: var(--text-quiet);
+    border-radius: var(--radius-md);
+    font-size: var(--font-size-sm);
     cursor: pointer;
+    /* A long plugin name shortens rather than reflowing: the entries are one
+       line each, and a wrapped one would break the rhythm of the column. */
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    transition:
+      background var(--motion-fast) var(--easing-standard),
+      color var(--motion-fast) var(--easing-standard);
   }
-  .plugin-list-entry:hover {
-    border-color: var(--border-subtle);
+  /* A disabled plugin keeps its place in the list — it is still the thing you
+     click to switch it back on — but reads as inactive, and says so. */
+  .plugin-list-entry.off:not(.active) {
+    color: var(--text-tertiary);
+  }
+  /* One step raised from the surface behind them, exactly as .sidebar's entries
+     are against .sidebar. That surface is --surface-1 here (a settings section)
+     rather than --surface-deep, so the same RELATIONSHIP is one token up. */
+  .plugin-list-entry:hover:not(.active) {
+    background: var(--surface-2);
+    color: var(--text-primary);
   }
   .plugin-list-entry.active {
-    border-color: var(--accent, #d77757);
+    background: var(--surface-2);
+    color: var(--accent-purple);
+    font-weight: 600;
+    border-color: var(--border-subtle);
   }
-  .plugin-list-entry .plugin-sub {
-    font-size: var(--font-size-xs);
-    color: var(--text-tertiary);
+  .plugin-list-entry:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
   }
   .plugin-detail {
     flex: 1;
     min-width: 0;
+  }
+  .plugin-version {
+    margin-left: var(--space-2);
+    font-size: var(--font-size-xs);
+    color: var(--text-tertiary);
+  }
+  /* "built in · N tools" — the provenance/size line the list used to carry
+     under every entry. It belongs to the plugin's identity, so it sits tight
+     under the enable checkbox rather than a paragraph away from it. (Top margin
+     comes from the `label.checkbox + small.hint` rule further down.) */
+  small.hint.plugin-origin {
+    margin-bottom: var(--space-2);
   }
   .plugin-category {
     margin-top: var(--space-3);

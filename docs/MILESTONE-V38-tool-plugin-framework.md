@@ -1,6 +1,9 @@
 # V38 — Unified Tool Registry + Plugin Framework
 
-**Status:** SPEC — not yet coded (2026-08-18). GitHub: #77 (investigation +
+**Status:** CODE-COMPLETE (2026-08-19) — phases A–G, the V37 merge, the starter
+plugin pack, and Phase F all landed on `feat/v38-tool-plugin-framework` and passed
+adversarial review; gated on live-verify only. Contract spec: `docs/TOOL-PLUGINS.md`.
+Follow-ups: #81 (machine-scope enables), #82 (junit-xml/TRX directory ingestion). GitHub: #77 (investigation +
 full decision log in dated comments; the closing comment there is an 11-point
 index of the locked decisions this doc distills; from now on this doc is the
 design authority).

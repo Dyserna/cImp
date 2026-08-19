@@ -23,8 +23,8 @@ fn set_linux_origin_rpath() {
     }
 }
 
-/// Copy the repo-root `themes/`, `palettes/`, `ebin/` and `detection/` folders
-/// next to the built binary (`target/{profile}/themes` etc.), the same place the
+/// Copy the repo-root `themes/`, `palettes/`, `ebin/`, `detection/` and
+/// `plugins/` folders next to the built binary (`target/{profile}/themes` etc.), the same place the
 /// portable release stages them (`<exe-dir>/themes`, sibling `ebin/`). The app
 /// reads themes/palettes and the V32 detection rules purely from disk and
 /// resolves bundled tools out of `ebin/` (see `pty::resolve`) — nothing is
@@ -40,6 +40,13 @@ fn set_linux_origin_rpath() {
 /// on the next build. That is correct for a dev tree (the repo is the source of
 /// truth) and harmless for users, whose `local/` folder lives beside a released
 /// binary that no build ever touches.
+///
+/// `plugins/` (V38) is the starter tool-plugin pack, and joins the list for the
+/// same reason: `plugins::loader` reads `<exe-dir>/plugins/` and only there, so
+/// without this copy a dev build shows an empty Tool Plugins pane while the
+/// release zip shows seven. The same prune caveat applies — a manifest dropped
+/// straight into `target/{profile}/plugins/` is removed on the next build, so
+/// author it in the repo folder instead.
 fn copy_theming_assets() {
     let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));
     // OUT_DIR = target/{profile}/build/cimp-{hash}/out → up 3 = target/{profile}.
@@ -53,7 +60,7 @@ fn copy_theming_assets() {
         PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let repo_root = manifest.parent().expect("manifest has no parent");
 
-    for folder in ["themes", "palettes", "ebin", "detection"] {
+    for folder in ["themes", "palettes", "ebin", "detection", "plugins"] {
         let src = repo_root.join(folder);
         println!("cargo:rerun-if-changed={}", src.display());
         if !src.is_dir() {

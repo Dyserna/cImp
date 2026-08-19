@@ -1832,6 +1832,11 @@ export interface OffloadSettings {
   /// V37: per-project activation overrides for servers and categories. The
   /// only MCP-registry field a project overlay carries (see `McpActivation`).
   mcp_activation: McpActivation;
+  /// V37 (contract C6): how often the MCP health checker probes each LIVE
+  /// server, in seconds. `0` = off. Clamped to 5–3600 backend-side, where the
+  /// per-probe timeout is also derived from it, so the "timeout well under the
+  /// cadence" relation cannot be expressed away here.
+  mcp_health_interval_secs: number;
   backends: OffloadBackend[];
   /// Saved, reusable server-command templates (see `ServerCommandTemplate`).
   /// A convenience library only — nothing reads these at runtime.
@@ -2249,6 +2254,7 @@ export function defaultSettings(): Settings {
       // pre-v32 file advertise exactly the same surface.
       mcp_categories: [],
       mcp_activation: { categories: {}, servers: {} },
+      mcp_health_interval_secs: 60,
       backends: [],
       server_command_templates: [],
       remote_backend_templates: [],

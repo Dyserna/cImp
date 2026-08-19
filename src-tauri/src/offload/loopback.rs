@@ -6280,6 +6280,8 @@ fn contract_drift_row(
             // with F-6's drift-canary work, not here.
             crate::activity::Attribution::Unattributed,
             Some(session.clone()),
+            None,
+            None,
         ),
         request: format!(
             "shim {shim} payload missing required fields (session {session}) — report {total} \
@@ -6564,6 +6566,8 @@ fn hello_row(
             // flags its entry.
             true,
             crate::activity::Attribution::Tab(tab.to_string()),
+            None,
+            None,
             None,
         ),
         request: format!(

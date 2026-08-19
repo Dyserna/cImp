@@ -44,6 +44,8 @@ function entry(id: number, over: Partial<ActivityEntry> = {}): ActivityEntry {
     ok: true,
     tab: 'unattributed',
     session: null,
+    server: null,
+    category: null,
     ...over,
   };
 }
@@ -357,8 +359,80 @@ describe('rowStatus', () => {
       // Phase A added it — the tooltip existed, but nothing checked it did.
       'unsandboxed',
       'boundary',
+      // V37 C6 health lane.
+      'unhealthy',
+      'recovered',
     ];
     for (const s of all) expect(STATUS_TITLE[s].length).toBeGreaterThan(0);
+  });
+});
+
+// ── V37 C6: mcp_health rows ───────────────────────────────────────────────
+//
+// Same discipline as the lifecycle feed below: the verb is in `tool`, and `ok`
+// is the transition's OUTCOME. Reading `ok` first would render "this server
+// came back" and "this call succeeded" as the same word in a lane whose whole
+// purpose is telling you a server went away.
+
+/// One `mcp_health` row for transition `tool`.
+function mcpHealth(tool: string, ok: boolean, over: Partial<ActivityEntry> = {}): ActivityEntry {
+  return entry(1, {
+    kind: 'mcp_health',
+    source: tool === 'connect_failed' ? 'connect' : 'probe',
+    tool,
+    ok,
+    server: 'ddg',
+    category: 'research',
+    ...over,
+  });
+}
+
+describe('rowStatus — mcp health', () => {
+  it('gives the down transitions and the recovery different words', () => {
+    expect(rowStatus(mcpHealth('unhealthy', false))).toBe('unhealthy');
+    expect(rowStatus(mcpHealth('connect_failed', false))).toBe('unhealthy');
+    expect(rowStatus(mcpHealth('healthy', true))).toBe('recovered');
+  });
+
+  it('never borrows the offload-server vocabulary', () => {
+    // `down`/`ready` are written about a process cImp owns and stopped; an MCP
+    // server is somebody else's, and the tooltips say so.
+    const seen = [rowStatus(mcpHealth('unhealthy', false)), rowStatus(mcpHealth('healthy', true))];
+    expect(seen).not.toContain('down');
+    expect(seen).not.toContain('ready');
+    expect(seen).not.toContain('stopped');
+  });
+
+  it('falls back on ok for a transition this build predates', () => {
+    expect(rowStatus(mcpHealth('quarantined', false))).toBe('unhealthy');
+    expect(rowStatus(mcpHealth('quarantined', true))).toBe('recovered');
+  });
+
+  it('does not classify an ordinary mcp CALL row as a health row', () => {
+    // The two kinds share a server but not a lane: a failed call is a failed
+    // call, not a server going down (that is exactly what the flap guard is
+    // for).
+    const call = entry(2, { kind: 'mcp', tool: 'ddg__search', ok: false, server: 'ddg' });
+    expect(rowStatus(call)).toBe('failed');
+  });
+});
+
+describe('mcp identity columns', () => {
+  it('carries server and category through the poll merge untouched', () => {
+    // `mergeEntries` reuses row objects by id; the identity columns must ride
+    // along rather than be recomputed anywhere on this side.
+    const row = entry(9, { kind: 'mcp', tool: 'git__extra__log', server: 'git__extra', category: 'vcs' });
+    const merged = mergeEntries([], [row]);
+    expect(merged[0].server).toBe('git__extra');
+    expect(merged[0].category).toBe('vcs');
+    // The `__` split the backend refuses to do would have said `git`.
+    expect(merged[0].server).not.toBe('git');
+  });
+
+  it('treats a null server as absent, not as an empty name', () => {
+    const row = entry(10, { kind: 'graph' });
+    expect(row.server).toBeNull();
+    expect(row.category).toBeNull();
   });
 });
 

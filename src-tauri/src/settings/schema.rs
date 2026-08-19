@@ -1705,6 +1705,20 @@ pub struct OffloadSettings {
     /// map-shaped so `deep_merge` composes it per key — see [`McpActivation`].
     /// Empty = inherit every global toggle.
     pub mcp_activation: McpActivation,
+    /// V37 (contract C6): how often the MCP health checker probes each LIVE
+    /// server, in seconds. `0` turns the checker off entirely.
+    ///
+    /// A setting rather than a constant because the right cadence is a property
+    /// of the servers, not of cImp: a local `npx` server is free to probe, a
+    /// metered remote HTTP endpoint is not. Clamped at use
+    /// (`OffloadService::spawn_mcp_health_watch`) rather than at parse, so a
+    /// hand-edited `settings.json` cannot turn the checker into a hot loop, and
+    /// the per-probe timeout is derived from this value so it stays well under
+    /// the cadence by construction.
+    ///
+    /// Additive under the struct-level `#[serde(default)]`, so every pre-V37
+    /// file loads with the 60s default.
+    pub mcp_health_interval_secs: u32,
     /// V8-02: the offload backend pool. One entry per backend (Local
     /// `llama-server`, Remote-LAN, or Remote-cloud), each with its own
     /// capabilities, tier, and tool scope. The router picks one per
@@ -2112,6 +2126,7 @@ impl std::fmt::Debug for OffloadSettings {
             // V37: no secrets — names and booleans.
             .field("mcp_categories", &self.mcp_categories)
             .field("mcp_activation", &self.mcp_activation)
+            .field("mcp_health_interval_secs", &self.mcp_health_interval_secs)
             // OffloadBackend redacts the Remote `auth_token`.
             .field("backends", &self.backends)
             // No secrets: plain saved command lines.
@@ -2204,6 +2219,11 @@ impl Default for OffloadSettings {
             // advertise exactly the same surface.
             mcp_categories: Vec::new(),
             mcp_activation: McpActivation::default(),
+            // V37 C6: one probe a minute. Cheap for a stdio server (a
+            // non-blocking `try_wait`, no I/O at all) and one small POST for an
+            // HTTP one, while still noticing a dead endpoint inside two
+            // minutes — the flap guard needs two consecutive failures.
+            mcp_health_interval_secs: 60,
             backends: Vec::new(),
             server_command_templates: Vec::new(),
             remote_backend_templates: Vec::new(),

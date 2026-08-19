@@ -1253,6 +1253,9 @@ fn start_offload_runtime(
     tauri::async_runtime::spawn(async move {
         service.warm_host().await;
         service.spawn_health_watch();
+        // V37 C6: the MCP health checker — its own cadence, and it never
+        // reconciles (see `spawn_mcp_health_watch`).
+        service.spawn_mcp_health_watch();
         service.spawn_metrics_poller();
         // The launch root rides the discovery entry so MCP children spawned
         // by a DIFFERENT project's agent can't misroute to this instance

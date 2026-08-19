@@ -1,5 +1,7 @@
 import { describe, expect, test } from 'vitest';
 
+import { describeMcpServerHealth, type McpServerHealth } from '../offload';
+
 import type { McpActivation, McpCategory, McpServerConfig } from './types';
 import type { McpRegistry } from './mcpEditor';
 import {
@@ -346,5 +348,75 @@ describe('cloneRegistry', () => {
     expect(reg.categories[0].servers).toEqual(['ddg']);
     expect(reg.activation.servers).toEqual({ ddg: false });
     expect(reg.activation.categories).toEqual({ research: true });
+  });
+});
+
+// ── V37 C6: the health chip's single formatter ────────────────────────────
+//
+// `describeMcpServerHealth` lives in `offload.ts` and is rendered in exactly one
+// place (this editor's health chip). It is tested here rather than beside its
+// source because this is the component whose contract it is — and because a
+// SECOND formatter is precisely how "unhealthy" and "one probe short of
+// unhealthy" end up worded one way in one view and another way elsewhere.
+
+function healthRow(over: Partial<McpServerHealth> = {}): McpServerHealth {
+  return {
+    name: 'ddg',
+    transport: 'http',
+    connected: true,
+    healthy: true,
+    tool_count: 3,
+    error: null,
+    state: 'healthy',
+    consecutive_failures: 0,
+    ...over,
+  };
+}
+
+describe('describeMcpServerHealth', () => {
+  test('a settled healthy server reads exactly as it did before V37', () => {
+    expect(describeMcpServerHealth(healthRow())).toBe('Healthy — 3 tools (http)');
+    expect(describeMcpServerHealth(healthRow({ tool_count: 1 }))).toBe('Healthy — 1 tool (http)');
+  });
+
+  test('surfaces the flap guard mid-count, which is the only warning there is', () => {
+    // The state has NOT changed and no tools were withdrawn — but a server that
+    // is visibly wobbling must not look untouched.
+    const chip = describeMcpServerHealth(healthRow({ consecutive_failures: 1 }));
+    expect(chip).toContain('Healthy');
+    expect(chip).toContain('1 consecutive failed probe since the last success');
+  });
+
+  test('an unhealthy server names the evidence, not just the verdict', () => {
+    const chip = describeMcpServerHealth(
+      healthRow({
+        healthy: false,
+        state: 'unhealthy',
+        consecutive_failures: 2,
+        error: 'read timed out',
+      }),
+    );
+    expect(chip).toContain('Unhealthy');
+    expect(chip).toContain('read timed out');
+    expect(chip).toContain('2 consecutive failed probes');
+  });
+
+  test('an unprobed connection is not reported as a failure', () => {
+    // `unknown` is "connected, never probed yet". Rendering it as anything but
+    // healthy would make every server look broken for one cadence at startup.
+    expect(describeMcpServerHealth(healthRow({ state: 'unknown' }))).toBe(
+      'Healthy — 3 tools (http)',
+    );
+  });
+
+  test('keeps the pre-V37 disconnected wording', () => {
+    expect(
+      describeMcpServerHealth(
+        healthRow({ healthy: false, connected: false, state: 'unknown', error: 'resolve `npx`' }),
+      ),
+    ).toBe('Down — resolve `npx`');
+    expect(
+      describeMcpServerHealth(healthRow({ healthy: false, tool_count: 0, state: 'unknown' })),
+    ).toBe('Connected, no tools (http)');
   });
 });

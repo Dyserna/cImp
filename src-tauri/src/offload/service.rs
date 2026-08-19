@@ -1421,6 +1421,8 @@ impl OffloadService {
                 // A worker run is real work with no tab behind it.
                 crate::activity::Attribution::Headless,
                 None,
+                None,
+                None,
             ),
             request,
             response,
@@ -2207,6 +2209,50 @@ impl OffloadService {
         });
     }
 
+    /// V37 contract C6 — spawn the MCP-server health checker.
+    ///
+    /// One task for the whole pool, on its own cadence
+    /// (`offload.mcp_health_interval_secs`, `0` = off). Deliberately a SECOND
+    /// task rather than another job inside [`Self::spawn_health_watch`], and the
+    /// separation is the contract: that watcher's whole purpose is to call
+    /// `warm_host` (and therefore `reconcile`, under `host_reconcile_lock`),
+    /// while this one must never reconcile at all — it probes the live pool and
+    /// records. Folding them together would tie the probe cadence to the
+    /// reconcile cadence and put the checker behind a lock every offload run
+    /// takes.
+    ///
+    /// The cadence is re-read every iteration, so editing it in Settings takes
+    /// effect on the next tick with no restart. The interval is clamped to
+    /// [`MCP_HEALTH_MIN_SECS`]..=[`MCP_HEALTH_MAX_SECS`] and the per-probe
+    /// timeout is derived from it ([`mcp_probe_timeout`]), so "well under the
+    /// cadence" is a property of the code rather than of the user's number.
+    pub fn spawn_mcp_health_watch(self: &Arc<Self>) {
+        let this = self.clone();
+        tauri::async_runtime::spawn(async move {
+            loop {
+                let configured = this.settings.current().offload.mcp_health_interval_secs;
+                // Off. Still ticks, so turning it back on does not need a
+                // restart — it just does nothing while it is off.
+                let interval = if configured == 0 {
+                    Duration::from_secs(MCP_HEALTH_MAX_SECS as u64)
+                } else {
+                    Duration::from_secs(
+                        configured.clamp(MCP_HEALTH_MIN_SECS, MCP_HEALTH_MAX_SECS) as u64
+                    )
+                };
+                // Sleep FIRST: at launch the pool is still connecting, and a
+                // probe against a half-warm host would report a connect that
+                // has not finished as a failure.
+                tokio::time::sleep(interval).await;
+                let snap = this.settings.current().offload;
+                if snap.mcp_health_interval_secs == 0 || !snap.mcp_host_needed() {
+                    continue;
+                }
+                this.host.probe_health(mcp_probe_timeout(interval)).await;
+            }
+        });
+    }
+
     /// Spawn a lightweight health watcher: periodically re-resolves the pool
     /// and fires a capability-change pulse when the ready-set changes, so
     /// `/events` (and thus Claude's `tools/list_changed`) tracks a backend
@@ -2245,6 +2291,25 @@ impl OffloadService {
             }
         });
     }
+}
+
+/// Floor under the MCP health cadence. Not a preference — a guard: the setting
+/// is hand-editable, and a `1` there would put a `tools/list` on every HTTP
+/// server every second forever.
+const MCP_HEALTH_MIN_SECS: u32 = 5;
+/// Ceiling under the same clamp, and the idle tick when the checker is off. Also
+/// the longest a cadence edit can take to be noticed.
+const MCP_HEALTH_MAX_SECS: u32 = 3600;
+
+/// The per-probe timeout for one health sweep: a third of the cadence, bounded
+/// to a sane window.
+///
+/// Derived rather than configured because the invariant contract C6 states is a
+/// RELATION ("per-check timeout well under the cadence"), and a second setting
+/// would let a user express a pair that violates it — a 60s timeout on a 10s
+/// cadence, where every sweep overlaps the next.
+fn mcp_probe_timeout(interval: Duration) -> Duration {
+    Duration::from_secs((interval.as_secs() / 3).clamp(2, 10))
 }
 
 /// V37 contract C5 — where a capability-change pulse came from, and therefore

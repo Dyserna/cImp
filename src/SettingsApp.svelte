@@ -5674,8 +5674,11 @@
             categories={snapshot.offload.mcp_categories}
             activation={snapshot.offload.mcp_activation}
             health={serviceStatus?.mcp_servers ?? []}
+            healthIntervalSecs={snapshot.offload.mcp_health_interval_secs}
             onedit={setMcpRegistry}
             onapply={applyMcpRegistry}
+            onhealthinterval={(secs) =>
+              patch((s) => (s.offload.mcp_health_interval_secs = secs))}
           />
         </section>
       {:else if activeSection === 'graph'}

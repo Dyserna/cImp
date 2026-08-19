@@ -51,8 +51,10 @@
     categories,
     activation,
     health = [],
+    healthIntervalSecs = 60,
     onedit,
     onapply,
+    onhealthinterval,
   }: {
     servers: McpServerConfig[];
     categories: McpCategory[];
@@ -61,6 +63,12 @@
     /// `ServiceStatus.mcp_servers`. Disabled servers are not connected, so they
     /// simply have no row here — that is the truth, not a gap.
     health?: McpServerHealth[];
+    /// V37 contract C6: the health checker's cadence in seconds, `0` = off.
+    /// Global (it is a property of cImp's polling, not of a project), and NOT
+    /// part of `McpRegistry` — it changes no server's effective state, so it
+    /// must not travel through `onapply`, whose whole contract is one settings
+    /// write plus one host reconcile.
+    healthIntervalSecs?: number;
     /// Update the parent's local snapshot ONLY — no backend write. Used for
     /// keystrokes: persisting per keystroke raced, because fire-and-forget
     /// saves could land out of order and leave the backend holding a half-typed
@@ -71,6 +79,10 @@
     /// through here, and each is ONE call no matter how many servers it affects
     /// — contract C5's UI half.
     onapply: (next: McpRegistry) => Promise<void>;
+    /// Persist the cadence. Separate from `onapply` because reconciling the warm
+    /// host over a polling-interval edit would tear down and rebuild every
+    /// connection to change a number the checker re-reads each tick anyway.
+    onhealthinterval: (secs: number) => void;
   } = $props();
 
   const registry = $derived<McpRegistry>({ servers, categories, activation });
@@ -114,6 +126,32 @@
     Live health of the warm MCP host's connections. Updates as you add, remove,
     enable or disable servers below — no cImp restart needed. A disabled server
     is not connected at all, so it has no health row.
+  </small>
+  <!-- V37 contract C6. Next to the chips because it is the thing that MOVES
+       them: a reader wondering why a chip is stale is looking at the answer.
+       Committed on change rather than per keystroke, and never routed through
+       `onapply` — see `onhealthinterval`. -->
+  <label class="mcp-cadence">
+    <span>Health check every</span>
+    <input
+      type="number"
+      min="0"
+      max="3600"
+      step="5"
+      value={healthIntervalSecs}
+      onchange={(e) => {
+        const n = Number((e.currentTarget as HTMLInputElement).value);
+        onhealthinterval(Number.isFinite(n) && n >= 0 ? Math.round(n) : 60);
+      }}
+    />
+    <span>seconds</span>
+  </label>
+  <small class="hint">
+    How often cImp probes each connected server — a process check for stdio, a
+    small <code>tools/list</code> for HTTP. Two consecutive failures mark a
+    server unhealthy and withdraw its tools; the next success brings them back,
+    and both write a row in the Events feed. <strong>0 turns the checker off</strong>,
+    and values are clamped to 5–3600 seconds.
   </small>
   {#if servers.length === 0}
     <small class="hint">No MCP servers configured yet.</small>
@@ -488,6 +526,7 @@
   }
   input[type='text'],
   input[type='password'],
+  input[type='number'],
   select {
     width: 100%;
     background: var(--surface-sunken);
@@ -502,6 +541,7 @@
   }
   input[type='text']:focus,
   input[type='password']:focus,
+  input[type='number']:focus,
   select:focus {
     outline: none;
     border-color: var(--accent);
@@ -539,6 +579,18 @@
     gap: 0.5rem;
     margin-top: 0.4rem;
     flex-wrap: wrap;
+  }
+  /* The cadence row: label, number, unit on one line, so it reads as a
+     sentence rather than as a form. */
+  .mcp-cadence {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    margin: 0.35rem 0 0.15rem;
+    font-size: 0.85rem;
+  }
+  .mcp-cadence input {
+    width: 5rem;
   }
   small.hint {
     display: block;

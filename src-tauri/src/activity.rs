@@ -83,6 +83,18 @@ const MCP_CAP: usize = 200;
 /// app runs, while a crash-restart loop still cannot reach back and delete the
 /// task history that shows what the server was doing when it died.
 const OFFLOAD_SERVER_CAP: usize = 200;
+/// V37 contract C6: MCP-server **health** transitions — a server confirmed
+/// unhealthy, a server recovered, or a server that was enabled but could not be
+/// connected at all.
+///
+/// Its own window for the reason `offload_server` has one, one layer up: a
+/// server that is down serves no calls, so its `mcp` rows stop exactly when its
+/// health rows start, and the busy servers either side of it are what would
+/// evict the rows explaining the quiet one. Sized like `offload_server` (200)
+/// because the volumes match — steady states mint nothing at all (the state
+/// machine only writes on a transition), so a healthy app run emits zero rows
+/// and a flapping endpoint emits two per cycle.
+const MCP_HEALTH_CAP: usize = 200;
 /// V33 Phase A: OS-sandbox rows — an unsandboxed degradation (with its distinct
 /// `off (user choice)` / `unavailable` reason) or a grant/mapping event.
 ///
@@ -136,6 +148,7 @@ const TOTAL_CAPACITY: usize = GRAPH_CAP
     + OFFLOAD_SERVER_CAP
     + AUDIT_CAP
     + MCP_CAP
+    + MCP_HEALTH_CAP
     + SANDBOX_CAP
     + INJECTION_FLAG_TOTAL_CAP;
 /// Appends between compactions once the ring is full. Compaction rewrites the
@@ -180,6 +193,22 @@ pub enum ActivityKind {
     /// via the loopback `/mcp/call` route or from the offload worker's
     /// in-process router (recorded by `McpHost::call_recorded`).
     Mcp,
+    /// V37 contract C6: one MCP-server **health** transition — a server the
+    /// periodic checker confirmed unhealthy (N consecutive failed probes), a
+    /// server that came back, or an enabled server `reconcile` could not connect
+    /// at all.
+    ///
+    /// Distinct from [`ActivityKind::Mcp`], which is one *call* a server served,
+    /// exactly as [`ActivityKind::OffloadServer`] is distinct from
+    /// [`ActivityKind::Offload`] — and for the same reason: a server that is
+    /// down serves no calls, so the rows explaining it cannot live in the
+    /// window its traffic fills.
+    ///
+    /// Which transition it was lives in `tool`, why in `target`, and which
+    /// producer saw it in `source`. Steady states mint nothing: only a
+    /// transition writes, so an idle-but-healthy pool is silent rather than a
+    /// heartbeat feed.
+    McpHealth,
     /// One offload **server process** lifecycle transition: a local backend
     /// spawned, became healthy, was stopped, or failed to start. Recorded by
     /// [`offload::supervisor::lifecycle_record`](crate::offload::supervisor).
@@ -215,6 +244,7 @@ impl ActivityKind {
             ActivityKind::OffloadServer => "offload_server",
             ActivityKind::Audit => "audit",
             ActivityKind::Mcp => "mcp",
+            ActivityKind::McpHealth => "mcp_health",
             ActivityKind::InjectionFlag => "injection_flag",
             ActivityKind::Sandbox => "sandbox",
         }
@@ -243,6 +273,8 @@ fn kind_cap(kind: &str) -> usize {
         AUDIT_CAP
     } else if kind == ActivityKind::Mcp.as_str() {
         MCP_CAP
+    } else if kind == ActivityKind::McpHealth.as_str() {
+        MCP_HEALTH_CAP
     } else if kind == ActivityKind::Sandbox.as_str() {
         SANDBOX_CAP
     } else {
@@ -483,6 +515,26 @@ pub struct ActivityEntry {
     /// tab whose session the registry withholds, and for every pre-#51 row.
     #[serde(default)]
     pub session: Option<String>,
+    /// V37 contract C7: which MCP server this row is about — the `mcp` call
+    /// rows and every [`ActivityKind::McpHealth`] row. `None` for every other
+    /// kind and for every row written before this column existed.
+    ///
+    /// **Never derived by splitting `tool` on `__`.** A server name or a raw
+    /// tool name may itself contain `__`, so the split routes to the wrong (or
+    /// to a nonexistent) server — `offload::mcp_host` has documented that hazard
+    /// since V8-03 and routes by ownership instead. The writer knows the owner
+    /// from the same routing fact that dispatched the call, and this column is
+    /// that fact recorded, not re-guessed.
+    #[serde(default)]
+    pub server: Option<String>,
+    /// V37 contract C7: the MCP category `server` belongs to — the FIRST
+    /// containing category in registry order, which is the one the C3
+    /// `categories-off` verdict blames and the one the Settings UI groups the
+    /// server under, so all three name the same category for a multi-category
+    /// server. `None` for an uncategorized server, for every non-MCP kind, and
+    /// for every pre-V37 row.
+    #[serde(default)]
+    pub category: Option<String>,
 }
 
 impl ActivityEntry {
@@ -497,6 +549,15 @@ impl ActivityEntry {
     /// answering as new recorders were added. Passing
     /// [`Attribution::Unattributed`] explicitly is fine; passing it by omission
     /// is not.
+    ///
+    /// **`server` and `category` are required for the same reason** (V37 C7).
+    /// They are identity columns: a recorder that omits them produces a row that
+    /// *looks* answered ("no server") when the truth is "nobody asked". Every
+    /// call site that has no MCP server to name passes `None, None` explicitly,
+    /// so adding a recorder is a decision about identity rather than a default
+    /// inherited by silence. Old JSONL rows still parse — the `#[serde(default)]`
+    /// on the fields is the READ path, which is a different question from what a
+    /// writer may leave out.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         kind: ActivityKind,
@@ -510,6 +571,8 @@ impl ActivityEntry {
         ok: bool,
         tab: Attribution,
         session: Option<String>,
+        server: Option<String>,
+        category: Option<String>,
     ) -> Self {
         Self {
             id: 0,
@@ -524,6 +587,8 @@ impl ActivityEntry {
             ok,
             tab,
             session,
+            server,
+            category,
         }
     }
 }
@@ -1071,6 +1136,8 @@ mod tests {
                 0,
                 true,
                 Attribution::Unattributed,
+                None,
+                None,
                 None,
             ),
             request: format!("{{\"file\": \"{target}\"}}"),
@@ -1770,6 +1837,73 @@ mod tests {
         let snap = store.snapshot_since(0);
         assert_eq!(snap.len(), 2);
         assert_ne!(snap[0].id, snap[1].id);
+        let _ = fs::remove_file(&path);
+    }
+
+    /// V37 C6: `mcp_health` has its own retention lane. The rows that explain a
+    /// server going down are written exactly when that server stops producing
+    /// `mcp` rows, so sharing MCP_CAP with call traffic would mean the OTHER,
+    /// still-busy servers evict the only record of the quiet one.
+    #[test]
+    fn mcp_health_rows_keep_their_own_window() {
+        let store = temp_store("mcp-health-lane");
+        store.record(rec_kind(ActivityKind::McpHealth, "ddg went unhealthy"));
+        for i in 0..(MCP_CAP + 50) {
+            store.record(rec_kind(ActivityKind::Mcp, &format!("call {i}")));
+        }
+        for i in 0..(GRAPH_CAP + 50) {
+            store.record(rec(&format!("g{i}")));
+        }
+        let snap = store.snapshot_since(0);
+        let rows: Vec<_> = snap.iter().filter(|e| e.kind == "mcp_health").collect();
+        assert_eq!(rows.len(), 1, "the health row was evicted by call traffic");
+        assert_eq!(rows[0].target, "ddg went unhealthy");
+        let _ = fs::remove_file(&store.path);
+    }
+
+    /// …and is itself bounded: a server flapping every cadence writes two rows a
+    /// minute forever, and must not be able to grow the store without limit.
+    #[test]
+    fn mcp_health_rows_are_capped_at_their_own_window() {
+        let store = temp_store("mcp-health-cap");
+        for i in 0..(MCP_HEALTH_CAP + 40) {
+            store.record(rec_kind(ActivityKind::McpHealth, &format!("flap {i}")));
+        }
+        let snap = store.snapshot_since(0);
+        assert_eq!(
+            snap.iter().filter(|e| e.kind == "mcp_health").count(),
+            MCP_HEALTH_CAP
+        );
+        assert_eq!(
+            snap.iter()
+                .find(|e| e.kind == "mcp_health")
+                .map(|e| e.target.as_str()),
+            Some(format!("flap {}", MCP_HEALTH_CAP + 39).as_str())
+        );
+        let _ = fs::remove_file(&store.path);
+    }
+
+    /// V37 C7: `server`/`category` are REQUIRED at the writer and defaulted at
+    /// the reader, and those are different questions. Every row on disk predates
+    /// the columns, so a load that failed on them would drop a user's whole
+    /// activity history the first time they upgraded.
+    #[test]
+    fn a_pre_v37_row_without_server_or_category_still_loads() {
+        let store = temp_store("pre-v37-row");
+        let path = store.path.clone();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // Written by hand rather than by serializing an entry: the point is a
+        // line that does NOT have the keys, which today's writer cannot produce.
+        let line = r#"{"id":7,"ts_ms":1000,"kind":"mcp","root":"/p","source":"claude","tool":"ddg__search","target":"rust","chars":12,"ms":3,"ok":true,"tab":"unattributed","session":null,"request":"{}","response":"ok"}"#;
+        fs::write(&path, format!("{line}
+")).unwrap();
+
+        let snap = store.snapshot_since(0);
+        assert_eq!(snap.len(), 1, "the pre-V37 row failed to parse");
+        assert_eq!(snap[0].tool, "ddg__search");
+        // Absent, not empty — and NOT back-filled by splitting `ddg__search`.
+        assert_eq!(snap[0].server, None);
+        assert_eq!(snap[0].category, None);
         let _ = fs::remove_file(&path);
     }
 

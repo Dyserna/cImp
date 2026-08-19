@@ -96,12 +96,22 @@ export interface ActivityEntry {
   /// questions — V32's screens say a model was refused something, this says
   /// the OS boundary was or was not in place — and because it carries its own
   /// retention lane (`SANDBOX_CAP` backend-side).
+  ///
+  /// `mcp_health` = one MCP-server HEALTH transition (V37 contract C6): a
+  /// server the periodic checker confirmed unhealthy, one that came back, or an
+  /// enabled server that could not be connected at all. It stands to `mcp` as
+  /// `offload_server` stands to `offload` — a server that is down serves no
+  /// calls, so the rows explaining it cannot share the window its traffic fills
+  /// (`MCP_HEALTH_CAP` backend-side). Steady states mint nothing: only
+  /// transitions are written, so a healthy pool is silent rather than a
+  /// heartbeat feed.
   kind:
     | 'graph'
     | 'offload'
     | 'offload_server'
     | 'audit'
     | 'mcp'
+    | 'mcp_health'
     | 'injection_flag'
     | 'sandbox';
   /// The project this row belongs to, canonicalized backend-side
@@ -166,6 +176,22 @@ export interface ActivityEntry {
   /// worker task, a tab whose session the registry withholds, and every
   /// pre-#51 row.
   session: string | null;
+  /// V37 contract C7: which MCP server this row is about — `mcp` call rows and
+  /// every `mcp_health` row. `null` for every other kind and for every row
+  /// written before the column existed.
+  ///
+  /// **Display only; never recompute it here.** The backend resolves the owner
+  /// from live routing knowledge, and the two things this side could reach for
+  /// instead are both wrong: splitting `tool` on `__` misroutes whenever a
+  /// server or raw tool name contains `__` (the Rust side has documented that
+  /// hazard since V8-03), and matching against the settings registry would
+  /// answer with today's config about a row written under an older one.
+  server: string | null;
+  /// V37 contract C7: the category `server` belonged to when the row was
+  /// written — the FIRST containing category in registry order, the same one the
+  /// C3 `categories-off` refusal blames and the Settings UI groups the server
+  /// under. `null` for an uncategorized server and for every non-MCP kind.
+  category: string | null;
 }
 
 /// The full record: entry + captured payloads. Mirror of Rust
@@ -273,7 +299,20 @@ export type RowStatus =
   /// the other way: the call itself returned normally (a nonzero exit is still
   /// output the model receives), and reading a boundary hit as an ordinary
   /// broken command is exactly the confusion this row exists to end.
-  | 'boundary';
+  | 'boundary'
+  /// V37 C6: an MCP server was confirmed unhealthy (the flap guard tripped), or
+  /// an enabled one could not be connected at all.
+  ///
+  /// Its own word rather than `down`, whose tooltip is written about an offload
+  /// SERVER PROCESS cImp owns — an MCP server is somebody else's process (or
+  /// somebody else's URL), cImp neither started nor stopped it, and reading one
+  /// row's vocabulary onto the other would promise a lifecycle this app does not
+  /// have.
+  | 'unhealthy'
+  /// V37 C6: an MCP server answered again after having been unhealthy. The row
+  /// contract C6 guarantees follows every error row about a server that came
+  /// back, so an error is never the lane's last word.
+  | 'recovered';
 
 /// Classify one row.
 ///
@@ -328,6 +367,20 @@ export function rowStatus(e: ActivityEntry): RowStatus {
         // `grant` and anything added backend-side that this build predates:
         // `ok` is that event's outcome, which is a claim we can still make.
         return e.ok ? 'ok' : 'failed';
+    }
+  }
+  if (e.kind === 'mcp_health') {
+    // Keyed on `tool` (the transition), like `offload_server` and `sandbox` —
+    // `ok` alone cannot carry the verb, and here it is the transition's outcome.
+    switch (e.tool) {
+      case 'unhealthy':
+      case 'connect_failed':
+        return 'unhealthy';
+      case 'healthy':
+        return 'recovered';
+      default:
+        // A transition added backend-side that this build predates.
+        return e.ok ? 'recovered' : 'unhealthy';
     }
   }
   if (e.kind === 'injection_flag') {
@@ -397,6 +450,10 @@ export const STATUS_TITLE: Record<RowStatus, string> = {
     'This command ran WITHOUT the OS sandbox — the row says whether that was your choice (the Sandboxing switch is off) or a missing prerequisite. The command itself ran normally; only the OS boundary was absent.',
   boundary:
     'A sandboxed command failed with output MATCHING an access-denial signature — likely the sandbox boundary, but cImp cannot see the OS decision itself, so this is a labeled guess, not proof. Open the row for the command, the exit code and the stderr tail. Several of these in a row is the pattern worth looking at.',
+  unhealthy:
+    'An MCP server stopped answering — two consecutive health probes failed — or an enabled one could not be connected at all. Its tools are withdrawn from every consumer until it comes back. cImp does not own this process, so it does not restart it; open the row for what the probe saw.',
+  recovered:
+    'An MCP server answered again after having been unhealthy, and its tools are back on every consumer that is granted it. Every error row in this lane is followed by one of these when the server returns.',
 };
 
 /// The feed (graph + offload), newest first, payload-free. Pass `sinceTs` to

@@ -659,6 +659,116 @@ struct HostTool {
     raw_name: String,
 }
 
+/// V37 contract C6 — where one live server sits in the health state machine.
+///
+/// Deliberately three states rather than the `healthy: bool` above, and the
+/// third one is the point: *not yet probed* and *probed and failing* are
+/// different facts, and collapsing them would make a freshly connected server
+/// look like a broken one for one cadence (or, the other way round, make a
+/// broken one look merely unexamined forever).
+///
+/// The machine is `Unknown -> Healthy <-> Unhealthy`. The edge INTO
+/// [`Unhealthy`](Self::Unhealthy) needs
+/// [`HEALTH_FAILURES_TO_UNHEALTHY`] consecutive failures — the flap guard —
+/// while the edge back out needs a single success: evidence that something is
+/// broken should be corroborated, evidence that it works is self-proving.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HealthState {
+    /// Connected (or not) but never probed — the state every server starts in.
+    Unknown,
+    /// The last probe succeeded.
+    Healthy,
+    /// [`HEALTH_FAILURES_TO_UNHEALTHY`] consecutive probes failed.
+    Unhealthy,
+}
+
+/// How many consecutive failed probes it takes to declare a server unhealthy —
+/// the flap guard (contract C6). Two, not one: a single missed probe is what a
+/// restarting endpoint, a paused laptop or a busy `npx` server produces, and a
+/// state machine that believed the first one would spend its life writing an
+/// error row and a recovery row about a server that never actually went away.
+pub const HEALTH_FAILURES_TO_UNHEALTHY: u32 = 2;
+
+/// The per-server flap-guard state the checker owns. Behind one mutex rather
+/// than as separate atomics because the transition rule reads and writes all
+/// three together, and a torn read here would mint the wrong Events row.
+#[derive(Clone, Copy, Debug)]
+struct ProbeState {
+    state: HealthState,
+    /// Failed probes since the last success. Reset by any success, and
+    /// surfaced to the UI so a server one failure short of the guard is
+    /// visibly wobbling rather than silently fine.
+    consecutive_failures: u32,
+    /// [`McpServer::is_healthy`] as of the previous sweep, or `None` before the
+    /// first one.
+    ///
+    /// This is what decides whether a transition PULSES, and it is a stored
+    /// observation rather than a before/after pair around our own write because
+    /// the checker is not the only thing that moves visibility: a stdio child
+    /// that hits EOF flips `is_healthy` from the reader task with no pulse at
+    /// all. Comparing against the last thing this checker SAW therefore catches
+    /// both its own transitions and that silent one, and the pulse gate's
+    /// surface fingerprint suppresses the case where nothing really moved.
+    last_visible: Option<bool>,
+}
+
+impl Default for ProbeState {
+    fn default() -> Self {
+        Self {
+            state: HealthState::Unknown,
+            consecutive_failures: 0,
+            last_visible: None,
+        }
+    }
+}
+
+/// V37 contract C6 — one health TRANSITION worth an Events row. Steady states
+/// are absent on purpose: this enum has no "still healthy" variant because the
+/// lane has no heartbeat rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HealthEvent {
+    /// The flap guard tripped: `HEALTH_FAILURES_TO_UNHEALTHY` consecutive
+    /// probes failed.
+    Unhealthy,
+    /// A probe succeeded after the server had been declared unhealthy. Every
+    /// error row in this lane is eventually followed by one of these when the
+    /// server comes back — an error is never the lane's last word about a
+    /// server that is now fine.
+    Recovered,
+    /// `reconcile` tried to connect an ENABLED server and could not. Recorded
+    /// where the connect error used to be nothing but a `warn!` line.
+    ConnectFailed,
+}
+
+impl HealthEvent {
+    /// The row's `tool` column — the transition verb, read the way
+    /// `offload_server` rows are read (never from `ok` alone).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            HealthEvent::Unhealthy => "unhealthy",
+            HealthEvent::Recovered => "healthy",
+            HealthEvent::ConnectFailed => "connect_failed",
+        }
+    }
+
+    /// The row's `ok` column. A recovery is the only good news here.
+    const fn ok(self) -> bool {
+        matches!(self, HealthEvent::Recovered)
+    }
+
+    /// The row's `source` column — which producer saw it. `probe` is the
+    /// periodic checker, `connect` is `reconcile`'s connect attempt; the two
+    /// answer different questions ("it stopped working" vs "it never started")
+    /// and a reader should not have to infer which from the verb.
+    const fn source(self) -> &'static str {
+        match self {
+            HealthEvent::ConnectFailed => "connect",
+            _ => "probe",
+        }
+    }
+}
+
 /// Per-server health row for the Settings status display.
 #[derive(Clone, Debug, Serialize)]
 pub struct McpServerHealth {
@@ -673,6 +783,13 @@ pub struct McpServerHealth {
     pub tool_count: usize,
     /// Short error if the server failed to connect / went unhealthy.
     pub error: Option<String>,
+    /// V37 C6: where this server sits in the health state machine. Richer than
+    /// [`Self::healthy`] and NOT a duplicate of it — see [`HealthState`].
+    pub state: HealthState,
+    /// V37 C6: failed probes since the last success. Non-zero while
+    /// [`Self::state`] is still `Healthy` is the flap guard mid-count, which is
+    /// the one warning the UI can give before a server is declared down.
+    pub consecutive_failures: u32,
 }
 
 /// Shared state a stdio reader task and the request path both touch.
@@ -905,10 +1022,16 @@ pub struct McpServer {
     /// V19: expose this server's tools to OpenCode (proxied through the
     /// `--consumer opencode` child). Like the others, part of `config_sig`.
     opencode_access: bool,
+    /// V37 C6: the health checker's flap-guard state for this server. Lives on
+    /// the server rather than in a side map on the host so it cannot outlive the
+    /// connection it describes: a teardown drops the `Arc` and the state with
+    /// it, which is exactly the "no checks, no state" a disabled server is owed.
+    probe: StdMutex<ProbeState>,
 }
 
 impl McpServer {
     fn health_row(&self) -> McpServerHealth {
+        let probe = *self.probe.lock().unwrap();
         McpServerHealth {
             name: self.name.clone(),
             transport: self.transport_label.to_string(),
@@ -916,6 +1039,8 @@ impl McpServer {
             healthy: self.is_healthy(),
             tool_count: self.tools.len(),
             error: self.error.lock().unwrap().clone(),
+            state: probe.state,
+            consecutive_failures: probe.consecutive_failures,
         }
     }
 
@@ -933,6 +1058,173 @@ impl McpServer {
     fn set_unhealthy(&self, why: impl Into<String>) {
         self.healthy.store(false, Ordering::Relaxed);
         *self.error.lock().unwrap() = Some(why.into());
+    }
+
+    /// V37 C6: the inverse of [`Self::set_unhealthy`], for a server the checker
+    /// watched come back.
+    ///
+    /// This exists because `set_unhealthy` is otherwise a one-way door — nothing
+    /// but a reconnect ever cleared it — and a checker that could only ever
+    /// subtract from the surface would turn one bad minute into a permanently
+    /// smaller tool set. A health flip never touches the stored `tools`, so
+    /// restoring the flag restores exactly the surface that was there before.
+    fn set_healthy(&self) {
+        self.healthy.store(true, Ordering::Relaxed);
+        *self.error.lock().unwrap() = None;
+    }
+
+    /// V37 contract C6 — one transport-appropriate liveness probe.
+    ///
+    /// **Observes; never repairs.** A failure here records a fact and nothing
+    /// else: no teardown, no reconnect, no config read. Reconnection is
+    /// `reconcile`'s job and runs under `host_reconcile_lock`, and a checker
+    /// that reached for it would contend with every offload run's `warm_host`
+    /// on a timer.
+    ///
+    /// * **stdio** — process liveness. The reader task flips `alive` on EOF, and
+    ///   a non-blocking `try_wait` catches a child that exited without the
+    ///   reader having noticed yet. Nothing is written to the child's stdin: a
+    ///   health check must not compete with a real call for the stdin lock, and
+    ///   an `npx` server mid-`tools/call` is busy, not sick.
+    /// * **HTTP** — a real `tools/list` on the initialized session, because
+    ///   there is no process to look at. The session id is refreshed from the
+    ///   response like [`McpServer::call`] does, so a server that rotated it
+    ///   mid-session does not wedge the next call.
+    /// * **no connection** — the connect attempt failed (or was never made);
+    ///   that is a failed probe, reported with the stored connect error.
+    async fn probe(&self, timeout: Duration) -> Result<(), String> {
+        match &self.conn {
+            Some(Conn::Stdio(c)) => {
+                if !c.alive.load(Ordering::Relaxed) {
+                    return Err("stdio connection closed (the child's stdout hit EOF)".into());
+                }
+                // Non-blocking on both counts: `try_lock` yields rather than
+                // waiting behind a `shutdown` that is killing the child, and
+                // `try_wait` reaps without blocking. A contended lock is not
+                // evidence of anything, so it reads as healthy — `alive` above
+                // is the authoritative signal.
+                if let Ok(mut child) = c.child.try_lock() {
+                    match child.try_wait() {
+                        Ok(Some(status)) => return Err(format!("child process exited ({status})")),
+                        Ok(None) => {}
+                        Err(e) => return Err(format!("child status unavailable: {e}")),
+                    }
+                }
+                Ok(())
+            }
+            Some(Conn::Http {
+                url,
+                client,
+                session_id,
+                protocol_version,
+                auth_token,
+            }) => {
+                let current = session_id.lock().unwrap().clone();
+                match http_request(
+                    client,
+                    url,
+                    "tools/list",
+                    json!({}),
+                    HttpHeaders {
+                        session_id: current.as_deref(),
+                        protocol_version: Some(protocol_version.as_str()),
+                        auth_token: auth_token.as_deref(),
+                    },
+                    timeout,
+                )
+                .await
+                {
+                    Ok((new_session, _)) => {
+                        if let Some(s) = new_session {
+                            *session_id.lock().unwrap() = Some(s);
+                        }
+                        Ok(())
+                    }
+                    // `HostError`'s human form: this string ends up in a health
+                    // chip and an Events row, both read by a person (#48 M-17).
+                    Err(e) => Err(e.to_string()),
+                }
+            }
+            None => Err(self
+                .error
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| "server is not connected".into())),
+        }
+    }
+
+    /// V37 contract C6 — fold one probe outcome into the state machine.
+    ///
+    /// Returns the transition worth an Events row (`None` for every steady
+    /// state — that is what keeps the lane free of heartbeats) and whether this
+    /// server's advertised visibility moved since the checker last looked, which
+    /// is the pulse question.
+    ///
+    /// The health flag is flipped HERE rather than inside [`Self::probe`] so the
+    /// flap guard is what moves the surface: a single failed probe leaves the
+    /// server advertised, and only a corroborated failure withdraws it.
+    fn apply_probe(&self, outcome: Result<(), String>) -> (Option<HealthEvent>, bool) {
+        let event = {
+            let mut st = self.probe.lock().unwrap();
+            match outcome {
+                Ok(()) => {
+                    st.consecutive_failures = 0;
+                    let was = std::mem::replace(&mut st.state, HealthState::Healthy);
+                    // `Unknown -> Healthy` is not news: it is the first probe of
+                    // a server that was already advertised as fine.
+                    (was == HealthState::Unhealthy).then(|| {
+                        self.set_healthy();
+                        HealthEvent::Recovered
+                    })
+                }
+                Err(why) => {
+                    st.consecutive_failures = st.consecutive_failures.saturating_add(1);
+                    if st.state == HealthState::Unhealthy {
+                        // Already down: refresh the reason the chip shows, mint
+                        // nothing. A state that did not change is not an event.
+                        self.set_unhealthy(why);
+                        None
+                    } else if st.consecutive_failures < HEALTH_FAILURES_TO_UNHEALTHY {
+                        // Inside the flap guard. Deliberately does NOT touch the
+                        // health flag: one missed probe must not withdraw a
+                        // server's tools from every consumer's surface.
+                        None
+                    } else {
+                        st.state = HealthState::Unhealthy;
+                        self.set_unhealthy(why);
+                        Some(HealthEvent::Unhealthy)
+                    }
+                }
+            }
+        };
+        let visible = self.is_healthy();
+        let mut st = self.probe.lock().unwrap();
+        let moved = st.last_visible.is_some_and(|v| v != visible);
+        st.last_visible = Some(visible);
+        (event, moved)
+    }
+
+    /// The reason the last probe failed, for the Events row's detail payload.
+    fn probe_error(&self) -> String {
+        self.error
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| "no detail recorded".into())
+    }
+
+    /// Seed the state machine at [`HealthState::Unhealthy`] for a server that
+    /// never connected (contract C6's "enabled but unavailable at connect").
+    ///
+    /// Without this the checker would count its way to the flap guard and mint a
+    /// SECOND error row about a server `reconcile` already reported — the same
+    /// fact twice, one cadence apart, with no new information in it.
+    fn seed_unhealthy(&self) {
+        let mut st = self.probe.lock().unwrap();
+        st.state = HealthState::Unhealthy;
+        st.consecutive_failures = HEALTH_FAILURES_TO_UNHEALTHY;
+        st.last_visible = Some(false);
     }
 
     /// Namespaced, read-class tool defs for the chat `tools` array — only
@@ -1032,6 +1324,20 @@ pub struct McpHost {
     /// read paths can never invert against reconcile's writes.
     disabled: RwLock<Vec<DisabledServer>>,
     allowed_roots: RwLock<Vec<PathBuf>>,
+    /// V37 contract C7: server name -> the FIRST category (in registry order)
+    /// containing it, refreshed by every [`reconcile`](McpHost::reconcile).
+    ///
+    /// Cached here rather than resolved per row because the host is not given
+    /// the registry anywhere else: `reconcile` is handed `categories` and drops
+    /// them, and `call_recorded` — the one place an `mcp` row is written — has
+    /// no settings handle at all. Stored per SERVER rather than as the category
+    /// list itself so the "first containing category" rule is applied once, in
+    /// registry order, by the code that has the order in front of it.
+    ///
+    /// A `std` mutex on purpose: it is only ever locked for a clone, never
+    /// across an `.await`, so it takes no part in the `disabled`-before-`servers`
+    /// async lock order.
+    categories: StdMutex<HashMap<String, String>>,
     change_tx: broadcast::Sender<()>,
 }
 
@@ -1042,6 +1348,7 @@ impl McpHost {
             servers: RwLock::new(Vec::new()),
             disabled: RwLock::new(Vec::new()),
             allowed_roots: RwLock::new(Vec::new()),
+            categories: StdMutex::new(HashMap::new()),
             change_tx,
         })
     }
@@ -1078,6 +1385,15 @@ impl McpHost {
         allowed_roots: &[PathBuf],
     ) {
         *self.allowed_roots.write().await = allowed_roots.to_vec();
+
+        // V37 C7: refresh the row-identity map first, so every row minted below
+        // (and every `mcp` row a concurrent dispatch writes) names the category
+        // the user just edited rather than the previous one.
+        *self.categories.lock().unwrap() = configs
+            .iter()
+            .filter(|c| !c.name.trim().is_empty())
+            .filter_map(|c| first_category(&c.name, categories).map(|cat| (c.name.clone(), cat)))
+            .collect();
 
         // Record the disabled set BEFORE any teardown, so there is no window in
         // which a call to a just-disabled server sees neither a connection nor
@@ -1166,6 +1482,29 @@ impl McpHost {
             }
             if !new_servers.is_empty() {
                 changed = true;
+                // V37 contract C6 — "enabled but unavailable at connect". This
+                // used to be a `warn!` inside `connect_server` and nothing else:
+                // the server sat in the pool advertising no tools, the Settings
+                // chip said "Down", and the Events feed — the place a user goes
+                // to find out *when* something broke — had no record of it at
+                // all. Minted here rather than in `connect_server` because this
+                // is where the category map is in scope, and because only
+                // `reconcile` knows the attempt was made on behalf of an ENABLED
+                // server (contract C3 already excluded the disabled ones).
+                for s in &new_servers {
+                    if !s.is_healthy() {
+                        // Seeded so the periodic checker does not re-report the
+                        // same fact one cadence later.
+                        s.seed_unhealthy();
+                        record_health(
+                            HealthEvent::ConnectFailed,
+                            &s.name,
+                            self.category_of(&s.name),
+                            &s.probe_error(),
+                            0,
+                        );
+                    }
+                }
                 self.servers.write().await.extend(new_servers);
             }
         }
@@ -1520,6 +1859,10 @@ impl McpHost {
                 return Err(HostError::cimp(outbound::REFUSAL_SSRF));
             }
         }
+        // V37 contract C7 — the row's identity columns, resolved from the same
+        // ownership lookup dispatch routes by (see `identify`). Read BEFORE the
+        // call so a server torn down mid-call still names itself on its own row.
+        let (server, category) = self.identify(consumer, namespaced).await;
         let result = self.call_for_consumer(consumer, namespaced, args).await;
         crate::activity::record_bg(crate::activity::ActivityRecord {
             entry: crate::activity::ActivityEntry::new(
@@ -1534,6 +1877,8 @@ impl McpHost {
                 result.is_ok(),
                 tab,
                 None,
+                server,
+                category,
             ),
             request,
             response: match &result {
@@ -1547,6 +1892,134 @@ impl McpHost {
             },
         });
         result
+    }
+
+    /// The category [`Self::categories`] resolved for `server` at the last
+    /// reconcile, or `None` for an uncategorized (or unknown) server.
+    fn category_of(&self, server: &str) -> Option<String> {
+        self.categories.lock().unwrap().get(server).cloned()
+    }
+
+    /// V37 contract C7 — who owns `namespaced`, and which category they sit in.
+    ///
+    /// Both answers are ROUTING facts, resolved from the pool the way
+    /// [`Self::call`] routes and never by splitting the namespaced name (a
+    /// server or raw tool name may itself contain `__`; this file has documented
+    /// that hazard since V8-03). The disabled set is the fallback so a REFUSED
+    /// call still names the server it was refused for — a row that says only
+    /// "some MCP call failed" is the row a user cannot act on.
+    async fn identify(
+        &self,
+        consumer: Consumer,
+        namespaced: &str,
+    ) -> (Option<String>, Option<String>) {
+        let live = {
+            let servers = self.servers.read().await;
+            servers
+                .iter()
+                .find(|s| s.raw_name(namespaced).is_some())
+                .map(|s| s.name.clone())
+        };
+        let name = match live {
+            Some(n) => Some(n),
+            None => self
+                .disabled_owner(consumer, namespaced)
+                .await
+                .map(|(n, _)| n),
+        };
+        let category = name.as_deref().and_then(|n| self.category_of(n));
+        (name, category)
+    }
+
+    /// V37 contract C6 — one sweep of the health checker.
+    ///
+    /// # It iterates the LIVE POOL, never the config list
+    ///
+    /// That is the whole of "disabled servers get no checks and no state": a
+    /// disabled server is structurally absent from the pool (`reconcile` never
+    /// connects it and tears it down if the toggle flipped), so there is nothing
+    /// here to skip and no way for a row about one to be minted. Reading the
+    /// config list instead would need a second copy of the C3 predicate — and
+    /// would put a health row against a server the UI is already explaining with
+    /// a C3 verdict chip.
+    ///
+    /// # It never reconciles
+    ///
+    /// No settings read, no `warm_host`, no connect. `reconcile` runs under
+    /// `host_reconcile_lock`, which every offload run's `warm_host` also takes;
+    /// a checker on a timer that reached for it would contend with real work
+    /// forever. The checker's whole job is to observe and record.
+    ///
+    /// Probes run concurrently and each is bounded by `timeout`, so one wedged
+    /// server cannot push the sweep past its own cadence. One pulse for the
+    /// whole sweep, and only when some server's advertised visibility actually
+    /// moved — [`PulseSource::Host`](super::service) semantics, so the gate's
+    /// surface fingerprint gets the final say.
+    pub async fn probe_health(&self, timeout: Duration) {
+        let servers: Vec<Arc<McpServer>> = self.servers.read().await.clone();
+        if servers.is_empty() {
+            return;
+        }
+        let mut handles = Vec::new();
+        for s in servers {
+            handles.push(tauri::async_runtime::spawn(async move {
+                let started = crate::activity::now_ms();
+                // The per-transport probes bound themselves, but only the ones
+                // that do I/O can; this is the outer guarantee that a sweep ends.
+                let outcome = match tokio::time::timeout(timeout, s.probe(timeout)).await {
+                    Ok(r) => r,
+                    Err(_) => Err(format!(
+                        "health probe timed out after {}s",
+                        timeout.as_secs()
+                    )),
+                };
+                let (event, moved) = s.apply_probe(outcome);
+                let ms = crate::activity::now_ms().saturating_sub(started);
+                (s, event, moved, ms)
+            }));
+        }
+        let mut outcomes = Vec::new();
+        let mut moved_any = false;
+        for h in handles {
+            if let Ok(o) = h.await {
+                moved_any |= o.2;
+                outcomes.push(o);
+            }
+        }
+        // A reconcile can land mid-sweep, and the transitions it causes are its
+        // to explain, not ours. Two checks, because the window has two shapes:
+        // `disabled` is written BEFORE any teardown (contract C4's ordering), so
+        // a server the user just switched off is named there while still in the
+        // pool; a server that was removed or edited is gone from the pool with
+        // no `disabled` entry at all. Either way C6 owes no health row — "a
+        // disabled server gets no checks and no state" would be a hollow promise
+        // if the row could be written by a probe that started one tick earlier.
+        // The pulse is left alone: `moved_any` already went through the gate's
+        // surface fingerprint, which is the authority on whether anything moved.
+        let disabled: Vec<String> = self
+            .disabled
+            .read()
+            .await
+            .iter()
+            .map(|d| d.name.clone())
+            .collect();
+        let pool = self.servers.read().await.clone();
+        for (s, event, _, ms) in outcomes {
+            let Some(event) = event else { continue };
+            let still_ours =
+                pool.iter().any(|p| Arc::ptr_eq(p, &s)) && !disabled.iter().any(|d| *d == s.name);
+            if !still_ours {
+                continue;
+            }
+            let detail = match event {
+                HealthEvent::Recovered => "a probe succeeded".to_string(),
+                _ => s.probe_error(),
+            };
+            record_health(event, &s.name, self.category_of(&s.name), &detail, ms);
+        }
+        if moved_any {
+            self.signal_change();
+        }
     }
 
     /// Per-server health rows for the Settings status display.
@@ -1596,6 +2069,10 @@ impl McpHost {
             }
             had
         };
+        // V37 C7: the row-identity map is the last reconcile's registry too, and
+        // a host holding nothing must not keep stamping categories onto rows for
+        // servers it no longer has — the same reasoning as F4's `disabled`.
+        self.categories.lock().unwrap().clear();
         if had_servers || had_disabled {
             self.signal_change();
         }
@@ -1611,6 +2088,66 @@ impl McpServer {
             let _ = child.kill().await;
         }
     }
+}
+
+/// V37 contract C7 — the FIRST category, in registry order, that contains
+/// `server`.
+///
+/// "First" is not arbitrary: it is the same category the C3
+/// [`EnableVerdict::DisabledByCategory`] verdict blames and the same one the
+/// Settings UI groups a multi-category server under, so the refusal a user
+/// reads, the heading they see it under, and the column on its activity rows all
+/// name one category rather than three different truthful answers.
+fn first_category(server: &str, categories: &[McpCategory]) -> Option<String> {
+    categories
+        .iter()
+        .find(|c| c.servers.iter().any(|s| s == server))
+        .map(|c| c.name.clone())
+}
+
+/// V37 contract C6 — mint one `mcp_health` row.
+///
+/// The single writer for the lane, shared by the periodic checker and
+/// `reconcile`'s connect-failure path, so the two cannot word the same class of
+/// fact differently. Column shapes follow `offload::supervisor::lifecycle_record`
+/// — the transition verb in `tool`, why in `target`, the raw detail in the
+/// response payload, `root` empty because a host-level fact belongs to no
+/// project, and `Headless` because nothing a user did on a tab caused it.
+fn record_health(
+    event: HealthEvent,
+    server: &str,
+    category: Option<String>,
+    detail: &str,
+    ms: u64,
+) {
+    let target = match event {
+        HealthEvent::Unhealthy => format!(
+            "`{server}` went unhealthy after {HEALTH_FAILURES_TO_UNHEALTHY} consecutive failed probes"
+        ),
+        HealthEvent::Recovered => format!("`{server}` is answering again"),
+        HealthEvent::ConnectFailed => {
+            format!("`{server}` is enabled but could not be connected")
+        }
+    };
+    crate::activity::record_bg(crate::activity::ActivityRecord {
+        entry: crate::activity::ActivityEntry::new(
+            crate::activity::ActivityKind::McpHealth,
+            crate::activity::now_ms(),
+            String::new(),
+            event.source().to_string(),
+            event.as_str().to_string(),
+            target,
+            0,
+            ms,
+            event.ok(),
+            crate::activity::Attribution::Headless,
+            None,
+            Some(server.to_string()),
+            category,
+        ),
+        request: String::new(),
+        response: detail.to_string(),
+    });
 }
 
 /// A stable signature of a server's connection-relevant config so an edited
@@ -1741,6 +2278,7 @@ fn fake_server(
         claude_access: claude,
         offload_access: offload,
         opencode_access: opencode,
+        probe: StdMutex::new(ProbeState::default()),
     }
 }
 
@@ -1781,6 +2319,7 @@ async fn connect_server(cfg: &McpServerConfig, allowed_roots: &[PathBuf]) -> Mcp
         claude_access: cfg.claude_access,
         offload_access: cfg.offload_access,
         opencode_access: cfg.opencode_access,
+        probe: StdMutex::new(ProbeState::default()),
     };
 
     let outcome = if use_http {
@@ -3606,6 +4145,222 @@ mod tests {
         // Disabling it takes Claude's surface back to empty.
         *host.disabled.write().await = vec![disabled("alpha", EnableVerdict::ServerOff)];
         assert_eq!(host.surface_fingerprint().await, seed);
+    }
+
+    // --- V37 Phase C: the health state machine (contract C6) ---------------
+
+    /// The first successful probe of a freshly connected server is not news: it
+    /// was already advertised as healthy, and a row per server per startup is
+    /// exactly the heartbeat feed C6 says this lane must not become.
+    #[test]
+    fn unknown_to_healthy_mints_nothing() {
+        let s = fake_server("ddg", true, true, true, "ddg__search");
+        let (event, moved) = s.apply_probe(Ok(()));
+        assert_eq!(event, None);
+        assert!(!moved, "the first sweep has no previous observation to differ from");
+        assert_eq!(s.health_row().state, HealthState::Healthy);
+        assert_eq!(s.health_row().consecutive_failures, 0);
+    }
+
+    /// The flap guard, both halves: ONE failure changes no state and withdraws
+    /// no tools; the SECOND does both and pulses, because the server just
+    /// dropped out of every consumer's `advertised()`.
+    #[test]
+    fn the_flap_guard_needs_two_consecutive_failures() {
+        let s = fake_server("ddg", true, true, true, "ddg__search");
+        s.apply_probe(Ok(())); // establishes the visibility baseline
+
+        let (event, moved) = s.apply_probe(Err("read timed out".into()));
+        assert_eq!(event, None, "one missed probe is not a state change");
+        assert!(!moved);
+        assert!(s.is_healthy(), "and it must not withdraw the server's tools");
+        assert!(!s.tool_defs().is_empty());
+        assert_eq!(s.health_row().state, HealthState::Healthy);
+        assert_eq!(s.health_row().consecutive_failures, 1);
+
+        let (event, moved) = s.apply_probe(Err("read timed out".into()));
+        assert_eq!(event, Some(HealthEvent::Unhealthy));
+        assert!(moved, "the server left `advertised()` — that is a Host pulse");
+        assert!(!s.is_healthy());
+        assert!(s.tool_defs().is_empty());
+        assert_eq!(s.health_row().state, HealthState::Unhealthy);
+        assert_eq!(s.health_row().consecutive_failures, HEALTH_FAILURES_TO_UNHEALTHY);
+    }
+
+    /// C6: an error is never the lane's last word about a server that is now
+    /// fine. One success is enough — evidence that something works is
+    /// self-proving, unlike evidence that it is broken.
+    #[test]
+    fn a_recovery_event_follows_the_error_event() {
+        let s = fake_server("ddg", true, true, true, "ddg__search");
+        s.apply_probe(Ok(()));
+        s.apply_probe(Err("gone".into()));
+        assert_eq!(s.apply_probe(Err("gone".into())).0, Some(HealthEvent::Unhealthy));
+
+        let (event, moved) = s.apply_probe(Ok(()));
+        assert_eq!(event, Some(HealthEvent::Recovered));
+        assert!(moved, "the tools are back on every surface — that pulses too");
+        assert!(s.is_healthy());
+        assert!(!s.tool_defs().is_empty(), "a health flip never dropped the tools");
+        assert_eq!(s.health_row().state, HealthState::Healthy);
+        assert_eq!(s.health_row().consecutive_failures, 0);
+        assert!(s.health_row().error.is_none());
+    }
+
+    /// The guard's whole purpose: an endpoint that misses every other probe
+    /// produces no rows at all, rather than a down/up pair every cadence.
+    #[test]
+    fn a_flap_inside_the_guard_never_oscillates() {
+        let s = fake_server("ddg", true, true, true, "ddg__search");
+        s.apply_probe(Ok(()));
+        for _ in 0..5 {
+            assert_eq!(s.apply_probe(Err("blip".into())), (None, false));
+            assert_eq!(s.apply_probe(Ok(())), (None, false));
+        }
+        assert!(s.is_healthy());
+        assert_eq!(s.health_row().state, HealthState::Healthy);
+    }
+
+    /// A steady state mints nothing, however long it lasts. Without this the
+    /// lane would fill with one identical row per cadence for as long as a
+    /// server stayed down — evicting the transition that explained it.
+    #[test]
+    fn a_server_that_stays_down_writes_one_row_not_one_per_sweep() {
+        let s = fake_server("ddg", true, true, true, "ddg__search");
+        s.apply_probe(Ok(()));
+        s.apply_probe(Err("down".into()));
+        assert_eq!(s.apply_probe(Err("down".into())).0, Some(HealthEvent::Unhealthy));
+        for i in 0..20 {
+            assert_eq!(
+                s.apply_probe(Err(format!("still down ({i})"))),
+                (None, false),
+                "a steady state is not an event"
+            );
+        }
+        // The reason is still refreshed, so the health chip is not stale.
+        assert_eq!(s.health_row().error.as_deref(), Some("still down (19)"));
+    }
+
+    /// The pulse rule's other half. A stdio child that hit EOF is ALREADY out of
+    /// `advertised()` — the reader task flipped `alive` with no pulse of its own
+    /// — so when the guard trips there is a row to write but no surface move to
+    /// announce. Row yes, pulse no.
+    #[test]
+    fn a_transition_that_moves_no_surface_mints_a_row_and_no_pulse() {
+        let s = fake_server("ddg", true, true, true, "ddg__search");
+        s.set_unhealthy("connection lost: the child exited");
+        // First sweep observes it as already invisible.
+        assert_eq!(s.apply_probe(Err("closed".into())), (None, false));
+        let (event, moved) = s.apply_probe(Err("closed".into()));
+        assert_eq!(event, Some(HealthEvent::Unhealthy));
+        assert!(!moved, "it was never visible to begin with — nothing moved");
+    }
+
+    /// C6: `reconcile` already minted the connect-failure row, so the checker
+    /// must not count its way to the flap guard and report the same fact again
+    /// one cadence later with nothing new in it.
+    #[test]
+    fn a_failed_connect_is_not_re_reported_by_the_checker() {
+        let s = fake_server("ddg", true, true, true, "ddg__search");
+        s.set_unhealthy("resolve `npx`: not found");
+        s.seed_unhealthy();
+        for _ in 0..5 {
+            assert_eq!(s.apply_probe(Err("not connected".into())), (None, false));
+        }
+        // …but it is still a normal member of the machine: if it ever answers,
+        // the recovery row lands.
+        assert_eq!(s.apply_probe(Ok(())).0, Some(HealthEvent::Recovered));
+    }
+
+    /// C6: "disabled servers get no checks and no state" is structural, not a
+    /// skip — a disabled server is not in the pool the checker iterates, so
+    /// there is nothing to probe and no health row to synthesize. The UI shows
+    /// a C3 verdict chip for it instead, which is a different claim.
+    #[tokio::test]
+    async fn a_disabled_server_is_never_probed_and_carries_no_health_state() {
+        let host = McpHost::new();
+        host.reconcile(
+            &[cfg("beta", false)],
+            &[],
+            &McpActivation::default(),
+            &[],
+        )
+        .await;
+        host.probe_health(Duration::from_millis(50)).await;
+        assert!(
+            host.health().await.is_empty(),
+            "a disabled server must not appear in the health rows at all"
+        );
+        assert_eq!(host.disabled.read().await.len(), 1);
+    }
+
+    /// C7: the row-identity map is the registry's answer, resolved once per
+    /// reconcile in registry order, and cleared when the host stops holding
+    /// anything.
+    #[tokio::test]
+    async fn reconcile_resolves_the_first_containing_category_per_server() {
+        let host = McpHost::new();
+        host.reconcile(
+            &[cfg("ddg", true), cfg("solo", true)],
+            // `ddg` is in both; registry order decides, and it is the same
+            // category a `CategoriesOff` verdict would blame.
+            &[
+                category("research", true, &["ddg"]),
+                category("web", true, &["ddg"]),
+            ],
+            &McpActivation::default(),
+            &[],
+        )
+        .await;
+        assert_eq!(host.category_of("ddg").as_deref(), Some("research"));
+        assert_eq!(host.category_of("solo"), None);
+
+        host.shutdown().await;
+        assert_eq!(host.category_of("ddg"), None, "a host holding nothing stamps nothing");
+    }
+
+    /// C7: identity comes from ROUTING, and the `__` split is the trap it
+    /// avoids — `git__extra__log` belongs to `git__extra`, not to `git`.
+    #[tokio::test]
+    async fn row_identity_comes_from_routing_not_from_a_name_split() {
+        let host = McpHost::new();
+        host.insert_fake_server("git__extra", true, true, true, "git__extra__log")
+            .await;
+        host.insert_fake_server("solo", true, true, true, "solo__x")
+            .await;
+        host.categories
+            .lock()
+            .unwrap()
+            .insert("git__extra".into(), "vcs".into());
+
+        let (server, category) = host.identify(Consumer::Claude, "git__extra__log").await;
+        assert_eq!(server.as_deref(), Some("git__extra"));
+        assert_eq!(category.as_deref(), Some("vcs"));
+
+        // Uncategorized rides with no category — absent, not empty.
+        let (server, category) = host.identify(Consumer::Claude, "solo__x").await;
+        assert_eq!(server.as_deref(), Some("solo"));
+        assert_eq!(category, None);
+
+        // A refused call still names the server it was refused for: a row that
+        // says only "an MCP call failed" is one nobody can act on.
+        *host.disabled.write().await = vec![disabled("beta", EnableVerdict::ServerOff)];
+        let (server, _) = host.identify(Consumer::Offload, "beta__y").await;
+        assert_eq!(server.as_deref(), Some("beta"));
+
+        // Nothing owns it, live or disabled.
+        assert_eq!(host.identify(Consumer::Claude, "ghost__x").await, (None, None));
+    }
+
+    #[test]
+    fn first_category_is_registry_order() {
+        let cats = vec![
+            category("web", true, &["fetch"]),
+            category("research", true, &["ddg", "fetch"]),
+        ];
+        assert_eq!(first_category("fetch", &cats).as_deref(), Some("web"));
+        assert_eq!(first_category("ddg", &cats).as_deref(), Some("research"));
+        assert_eq!(first_category("nobody", &cats), None);
     }
 
     /// Pool ORDER is an artefact of connect timing (reconcile appends as

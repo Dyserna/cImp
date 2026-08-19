@@ -2149,6 +2149,8 @@ pub fn flag_record(flag: Flag<'_>) -> ActivityRecord {
             // [`Flag::attribution`].
             flag.attribution,
             flag.session.map(str::to_string),
+            None,
+            None,
         ),
         request: serde_json::to_string_pretty(&request).unwrap_or_default(),
         response: flag.detail.to_string(),

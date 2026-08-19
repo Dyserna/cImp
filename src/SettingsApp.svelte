@@ -7,6 +7,7 @@
     settings,
     applySettings,
   } from './lib/settings/store';
+  import { createDraftSync } from './lib/settings/draftSync';
   import {
     aiToolTabDefaults,
     auditDetectTool,
@@ -1046,7 +1047,14 @@
   async function applyMcpRegistry(next: McpRegistry): Promise<void> {
     setMcpRegistry(next);
     if (!snapshot) return;
-    await applySettings($state.snapshot(snapshot));
+    // Same lost-update gate as `patch()`: this is a wholesale push too, and a
+    // broadcast landing during the awaits below must not regress the draft.
+    const settled = draftSync.beginPush();
+    try {
+      await applySettings($state.snapshot(snapshot));
+    } finally {
+      settled();
+    }
     await reloadMcpHost();
   }
   // Reconcile the warm host now and fold the fresh status into the health chips.
@@ -1396,7 +1404,20 @@
 
   // Keep `snapshot` in sync with the global store. Every input mutates
   // `snapshot` and pushes via `applySettings`; the broadcast comes back and
-  // overwrites `snapshot` (which is fine — same value, no churn).
+  // overwrites `snapshot`.
+  //
+  // That overwrite is NOT unconditional any more. `settings_update` is a
+  // wholesale replace and `settings-changed` is asynchronous, so a burst of
+  // edits used to lose one: the echo of an earlier push replaced the draft with
+  // a state missing a newer edit, and the next `patch()` cloned the regressed
+  // draft and pushed it — erasing that edit from the backend too (observed live
+  // on a machine-wide tool path). `draftSync` gates the overwrite on "no push of
+  // ours in flight" and replays the last suppressed broadcast once the burst
+  // ends; see `lib/settings/draftSync.ts` for the full rule and its residual.
+  const draftSync = createDraftSync<Settings>((s) => {
+    if (disposed) return;
+    snapshot = structuredClone(s);
+  });
   let unsub: (() => void) | undefined;
 
   function aiTabFromSnapshot(id: string): AiToolTabConfig | null {
@@ -1477,7 +1498,7 @@
     for (const t of AI_TABS) captureBaseline(t);
     injectionAppBaseline = injectionAppShape(snapshot);
     unsub = settings.subscribe((s) => {
-      snapshot = structuredClone(s);
+      draftSync.broadcast(s);
     });
     listVoices()
       .then((v) => {
@@ -1576,12 +1597,21 @@
 
   /// Mutate the live snapshot via `updater`, then push to the backend.
   /// Backend's debounced save coalesces rapid calls (slider drags).
+  ///
+  /// The push is registered with `draftSync` for as long as it is in flight, so
+  /// a `settings-changed` broadcast that lands mid-burst cannot replace the
+  /// draft with a state that is missing an edit this window just made — the
+  /// lost-update race. The promise is no longer discarded silently: settling it
+  /// is what reopens the gate, in either direction (`applySettings` resolves
+  /// even on a rejected push — it rolls the store back itself — but `finally`
+  /// keeps that from mattering here).
   function patch(updater: (s: Settings) => void) {
     if (!snapshot) return;
     const next = structuredClone($state.snapshot(snapshot));
     updater(next);
     snapshot = next;
-    void applySettings(next);
+    const settled = draftSync.beginPush();
+    void applySettings(next).finally(settled);
   }
 
   /// Toggle one AI tab's enabled state. Routes through the dedicated

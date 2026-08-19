@@ -85,7 +85,9 @@ pub const LEDGER: &[SpawnSite] = &[
     SpawnSite {
         file: "audit/runner.rs",
         symbol: "spawn_and_capture",
-        spawns: "the resolved audit scanner binary (semgrep/gitleaks/…) with its argv",
+        spawns: "the resolved audit scanner binary — a built-in adapter (semgrep, \
+                 gitleaks, …) or any binary a tool plugin's manifest is pointed at \
+                 — with its argv",
         class: AgentSpawn,
         count: 1,
         reason: "Backs `security_audit`/`quality_audit`, which are reachable BOTH from the \
@@ -97,7 +99,13 @@ pub const LEDGER: &[SpawnSite] = &[
                  scanner inside the AppContainer through `sandbox::windows` and this \
                  `Command::new` is the PLAIN arm (sandbox off, or unavailable — recorded \
                  loudly either way). It is also the only seam that can be CANCELLED \
-                 mid-flight, which is why the engine's wait loop grew a cancel flag.",
+                 mid-flight, which is why the engine's wait loop grew a cancel flag. Since \
+                 V38 the population is OPEN: a `command`/`audit`/`security` tool plugin adds \
+                 rows to this same seam, so the file that runs here is whatever binary the \
+                 user configured for an enabled plugin tool, and its argv is the manifest's \
+                 template rendered once (never re-scanned) plus the user's appended \
+                 parameters. What does not change is that no shell is interposed and no \
+                 model input selects the file.",
     },
     SpawnSite {
         file: "checks/gitls.rs",

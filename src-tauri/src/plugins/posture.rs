@@ -149,8 +149,20 @@ pub fn required_refusal(
 ///
 /// cImp runs with what the manifest DECLARED — inference cannot know a runtime
 /// it has never met — and records the disagreement rather than silently trusting
-/// either side. A no-op unless a profile was declared: `auto` IS inference, and
-/// `none` is a statement inference has nothing to say about.
+/// either side.
+///
+/// # Why `none` is checked too (Phase D review, B-C2 — closed in Phase G)
+///
+/// `auto` IS inference, so it can never disagree with itself and is the one
+/// genuine no-op here. `none` is a different thing entirely: it is the positive
+/// claim *"this is a single static binary, its own directory is the whole
+/// grant"*. When detection then recognizes an interpreter behind the resolved
+/// program, that claim is false — and it is the most consequential way for it to
+/// be false, because the tool runs with NO runtime grants at all and fails inside
+/// the boundary with a denial that names a path nobody declared. Reading a stale
+/// `none` as "nothing to compare" is exactly the silent-drift case the
+/// cross-check exists to catch, so it mints the same row every other declaration
+/// gets.
 pub fn runtime_canary(
     seam: &str,
     root: &Path,
@@ -158,8 +170,11 @@ pub fn runtime_canary(
     select: &RuntimeSelect,
     resolved: &Path,
 ) {
-    let RuntimeSelect::Profile(declared) = select else {
-        return;
+    let declared = match select {
+        RuntimeSelect::Profile(declared) => *declared,
+        RuntimeSelect::None => "none",
+        // `auto` cannot disagree with the inference it IS.
+        RuntimeSelect::Infer => return,
     };
     let lookup = |k: &str| std::env::var_os(k);
     let is_dir = |d: &Path| d.is_dir();
@@ -168,7 +183,7 @@ pub fn runtime_canary(
         is_dir: &is_dir,
     };
     let inferred = sandbox::inferred_runtime_ids(resolved, &machine);
-    if !inferred.is_empty() && !inferred.contains(declared) {
+    if !inferred.is_empty() && !inferred.contains(&declared) {
         sandbox::record_runtime_mismatch(seam, root, subject, declared, &inferred);
     }
 }
@@ -272,6 +287,44 @@ mod tests {
             runtime_select(RuntimeReq::Python),
             RuntimeSelect::Profile("python")
         );
+    }
+}
+
+#[cfg(test)]
+mod canary_tests {
+    use super::*;
+
+    /// **B-C2, closed.** The cross-check has to run for an explicit `none`:
+    /// that value is a CLAIM ("single static binary"), and a claim inference
+    /// contradicts is drift. Only `auto` is exempt, because `auto` IS the
+    /// inference.
+    ///
+    /// Asserted on the selection rather than on the row, because minting a row
+    /// needs a resolved program that really is interpreter-fronted on the test
+    /// machine; what the review found was a control-flow hole, and this is the
+    /// branch that had no arm.
+    #[test]
+    fn only_auto_is_exempt_from_the_cross_check() {
+        assert!(matches!(
+            runtime_select(RuntimeReq::Auto),
+            RuntimeSelect::Infer
+        ));
+        // The two selections the canary DOES compare.
+        for req in [RuntimeReq::None, RuntimeReq::Python] {
+            let select = runtime_select(req);
+            assert!(
+                !matches!(select, RuntimeSelect::Infer),
+                "`{}` must be compared against inference, not treated as inference",
+                req.as_str()
+            );
+        }
+        // A resolved program with no runtime behind it never mints anything,
+        // whatever was declared — the canary is about DISAGREEMENT.
+        let root = std::env::temp_dir();
+        let program = root.join("cimp-not-a-real-program.exe");
+        for req in [RuntimeReq::None, RuntimeReq::Auto, RuntimeReq::Python] {
+            runtime_canary("test-seam", &root, "acme", &runtime_select(req), &program);
+        }
     }
 }
 

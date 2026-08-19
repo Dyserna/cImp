@@ -30,8 +30,19 @@
   //   • quiet — `ok`, `update`: ordinary traffic.
   //   • plain warning text — `signal`, `failed` keep the treatments the two
   //     feeds already gave them.
-  //   • UNDERLINED danger-soft — `down`, `boundary`: a real failure whose cause
-  //     is in the row, not a block we performed. Never the filled red.
+  //   • UNDERLINED danger-soft — `down`, `boundary`, `unhealthy`: a real
+  //     failure whose cause is in the row, not a block we performed. Never the
+  //     filled red.
+  //   • plain success, full strength — `recovered`: the answer to an
+  //     `unhealthy` row. Unlike `ready`'s quiet green, it exists to close an
+  //     alarm and must be as findable as the error it answers.
+  //   • STRUCK-THROUGH danger OUTLINE — `withheld`: a tool removed from the
+  //     advertised surface. Danger, because this is the one place in cImp where
+  //     detection actually takes something away, and the chip must not
+  //     under-claim it the way `flagged` ("nothing was blocked") would. An
+  //     outline and not the filled red, because that red is `denied`'s alone —
+  //     a call we stopped — and here no call was ever made. The line through the
+  //     word is the removal.
   //
   // Colours are theme tokens only — themes/palettes ship as external files
   // beside the exe, so a hardcoded hex breaks the `tui` and light themes.
@@ -129,6 +140,17 @@
     text-underline-offset: 2px;
   }
 
+  /* V37 C9: a tool withheld from the advertised surface by description
+     screening. Danger OUTLINE plus a line through the word — the removal is
+     real (so not `flagged`'s amber, whose sentence promises nothing was
+     blocked) and it is not a broken call (so not `failed`'s bare pink text),
+     but it is also not `denied`'s filled red: no call was ever made. */
+  .schip.withheld {
+    color: var(--text-danger-soft, #ffb0c0);
+    border-color: var(--border-danger, #5a3038);
+    text-decoration: line-through;
+  }
+
   /* Containment came on (beacon / contamination). */
   .schip.engaged {
     color: var(--text-info, #d8b8ff);
@@ -162,9 +184,19 @@
     color: var(--text-tertiary, #9aa0aa);
     opacity: 0.8;
   }
-  .schip.down {
+  .schip.down,
+  .schip.unhealthy {
     color: var(--text-danger-soft, #ffb0c0);
     text-decoration: underline dotted;
     text-underline-offset: 2px;
+  }
+
+  /* V37 C6: `unhealthy` shares `down`'s treatment on purpose — the two words
+     never appear in the same lane, and both mean "a real failure whose cause
+     is in the row", never `denied`'s red. `recovered` answers an `unhealthy`
+     row: success green at FULL strength, unlike `ready`'s quiet 0.7, because
+     its whole job is to close an alarm. */
+  .schip.recovered {
+    color: var(--text-success, #3fb950);
   }
 </style>

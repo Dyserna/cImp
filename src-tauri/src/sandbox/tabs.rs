@@ -127,6 +127,90 @@ pub fn off_note(s: &crate::settings::Settings) -> &'static str {
 
 // ── the grant table (decision B5) ────────────────────────────────────────────
 
+/// The rows cImp's **own** proxy child needs — and the reason the directory
+/// above them never becomes one.
+///
+/// Since V37 Phase F every AI tab, Claude and OpenCode alike, is handed an MCP
+/// server whose command is cImp's own executable (`cimp --offload-mcp --tab ...`;
+/// the same binary also backs the conditional `--code-audit-mcp` child). The
+/// harness spawns that child from INSIDE the container, so without these rows it
+/// cannot be started at all — and if it started it could not find the app: it
+/// resolves the loopback port + token from
+/// `<exe-dir>/.cimp-discovery/<pid>.json`, falling back to the legacy
+/// `<exe-dir>/.cimp-offload.json` (`offload::loopback::select_discovery`). Each
+/// of those is a denial row, which is loud — and still a broken tab.
+///
+/// **Three file-scoped rows, never the directory.** `<exe-dir>` is cImp's
+/// portable root: `settings.json` (backend URLs, API keys, every auth token the
+/// app holds), `tool-activity.jsonl`, the detection stores. A read+execute ACE
+/// on that directory would hand a compromised agent every secret cImp has —
+/// exactly what decision B5 exists to prevent — so this is the same shape the
+/// `~/.claude.json` row uses to reach a file without opening `%USERPROFILE%`.
+///
+/// The discovery TOKEN is readable by the child, deliberately: it is the
+/// credential the child authenticates to its own app with, and every tab
+/// carrying this child has always read it. `settings.json` beside it stays dark,
+/// which is the line that matters.
+///
+/// Two residuals, written down rather than papered over:
+///
+/// * the legacy `.cimp-offload.json` is an OPTIONAL row, so a tab prepared
+///   before the app ever wrote that file gets no ACE on it and nothing inherits
+///   one (its directory is ungranted). The per-instance entry under the granted
+///   `.cimp-discovery/` is the authoritative path and DOES inherit, so the child
+///   still resolves; only the legacy fallback would be missing.
+/// * a sibling DLL that cImp's binary imports at LOAD time would be unreadable
+///   for the same reason. The shipped layout has none — the one non-system
+///   load-time import, `DirectML.dll`, resolves from `System32`, which every app
+///   package can already read, and the GPU DLLs beside the exe are
+///   `LoadLibrary`-ed by GUI paths this headless child never runs.
+///
+/// Also deliberately absent: `<exe-dir>/tool-activity.jsonl`. The child appends
+/// to it only in the app-not-running fallback, and a sandboxed tab by
+/// construction has a running app to forward to; a write ACE on cImp's own
+/// activity log is not worth a fallback that cannot happen here.
+///
+/// Linux: nothing to do. V33 Phase D confines the three tool seams and
+/// deliberately not tabs (`portable_pty` exposes no `pre_exec` hook — see
+/// [`plan_tab`]), so this table has no Linux consumer.
+fn cimp_child_rows(exe: Option<&Path>) -> Vec<GrantRow> {
+    // No `current_exe()` (or an executable at a filesystem root): no guesses.
+    // The tab still launches and the child fails as a denial row, which is the
+    // same degradation every other absent row gets.
+    let (Some(exe), Some(dir)) = (exe, exe.and_then(Path::parent)) else {
+        return Vec::new();
+    };
+    vec![
+        GrantRow {
+            path: exe.to_path_buf(),
+            access: GrantAccess::ReadExecute,
+            is_file: true,
+            reason: "cImp's own executable, which the harness spawns as its `cimp-offload` MCP \
+                     server. A FILE grant: the directory around it is cImp's portable root and \
+                     holds settings.json, so it is never granted as a whole",
+            required: false,
+        },
+        GrantRow {
+            path: dir.join(crate::offload::loopback::DISCOVERY_FILE),
+            access: GrantAccess::ReadExecute,
+            is_file: true,
+            reason: "the legacy discovery file the proxy child reads to find this app's loopback \
+                     port and token. Read-only, and file-scoped so settings.json beside it stays \
+                     unreadable",
+            required: false,
+        },
+        GrantRow {
+            path: dir.join(crate::offload::loopback::DISCOVERY_DIR),
+            access: GrantAccess::ReadExecute,
+            is_file: false,
+            reason: "the per-instance discovery directory (<pid>.json per running instance), how \
+                     the proxy child finds THIS instance's loopback rather than a sibling's. It \
+                     holds discovery entries and nothing else, and the grant is read-only",
+            required: false,
+        },
+    ]
+}
+
 /// Where a harness keeps its own state, as data with a reason per row.
 ///
 /// **Read this as a security review, not as configuration.** Every row widens
@@ -142,6 +226,10 @@ pub fn off_note(s: &crate::settings::Settings) -> &'static str {
 /// * **`%USERPROFILE%` itself** — granting the parent to reach two files in it
 ///   would hand over the entire home directory, which is why the two Claude
 ///   config files are FILE grants (see [`GrantRow::is_file`]).
+/// * **cImp's own install directory** — the same argument, applied to cImp: the
+///   tab needs cImp's *binary* and its *discovery data*, and gets exactly those
+///   as file-scoped rows. See [`cimp_child_rows`] for what else is in that
+///   directory and must stay dark.
 ///
 /// What a user adds themselves, through `sandbox.extra_grant_dirs`: package
 /// manager caches (`~/.bun`, `%LOCALAPPDATA%\npm-cache`) if their harness
@@ -149,12 +237,21 @@ pub fn off_note(s: &crate::settings::Settings) -> &'static str {
 /// does not live under Program Files. Those surface first as a **denial row**,
 /// which is the design — the lane names what the boundary refused, and the user
 /// decides whether to widen it.
-fn grant_rows_with(harness: Harness, env: &dyn Fn(&str) -> Option<OsString>) -> Vec<GrantRow> {
+fn grant_rows_with(
+    harness: Harness,
+    env: &dyn Fn(&str) -> Option<OsString>,
+    exe: Option<&Path>,
+) -> Vec<GrantRow> {
+    // cImp's own three first: they are anchored on the executable, not on the
+    // home directory, so a machine that reports no home still gets a working
+    // proxy child.
+    let mut rows = cimp_child_rows(exe);
     let Some(home) = env("USERPROFILE").or_else(|| env("HOME")).map(PathBuf::from) else {
-        // No home directory to anchor on: return nothing rather than guessing.
-        // The tab still gets its project root and its program's install dir, and
-        // whatever it then cannot read shows up as a denial row.
-        return Vec::new();
+        // No home directory to anchor the HARNESS rows on: skip them rather than
+        // guessing. The tab still gets its project root, its program's install
+        // dir and the rows above, and whatever it then cannot read shows up as a
+        // denial row.
+        return rows;
     };
     // XDG spelling first where the harness honors it, then the default —
     // OpenCode reads `XDG_CONFIG_HOME`/`XDG_DATA_HOME` on Windows too, and a
@@ -169,7 +266,7 @@ fn grant_rows_with(harness: Harness, env: &dyn Fn(&str) -> Option<OsString>) -> 
     // Shared by both harnesses: git identity. An AI tab commits, and a commit
     // with no `user.name` fails with a message about running `git config`, which
     // is a confusing way to discover a sandbox boundary.
-    let mut rows = vec![
+    rows.extend([
         GrantRow {
             path: home.join(".gitconfig"),
             access: GrantAccess::ReadExecute,
@@ -186,7 +283,7 @@ fn grant_rows_with(harness: Harness, env: &dyn Fn(&str) -> Option<OsString>) -> 
                      instead of in ~/.gitconfig",
             required: false,
         },
-    ];
+    ]);
 
     match harness {
         Harness::Claude => {
@@ -275,12 +372,14 @@ fn grant_rows_with(harness: Harness, env: &dyn Fn(&str) -> Option<OsString>) -> 
     rows
 }
 
-/// [`grant_rows_with`] against the real process environment.
+/// [`grant_rows_with`] against the real process environment and this process's
+/// own executable.
 pub fn grant_hints(harness: Harness) -> GrantHints {
+    let exe = std::env::current_exe().ok();
     GrantHints {
         programs: Vec::new(),
         full_dirs: Vec::new(),
-        rows: grant_rows_with(harness, &|k| std::env::var_os(k)),
+        rows: grant_rows_with(harness, &|k| std::env::var_os(k), exe.as_deref()),
     }
 }
 
@@ -501,9 +600,26 @@ mod tests {
 
     const HOME: &str = r"C:\Users\tester";
 
+    /// Forward slashes on purpose (V35's CI lesson): a backslash literal is a
+    /// SINGLE path component on the Linux runner, so `Path::parent` there would
+    /// return an empty directory and every `<exe-dir>/…` expectation below would
+    /// hold locally and fail in CI. [`paths`] normalizes the separator back.
+    const EXE: &str = "C:/cimp/bin/cimp.exe";
+    const EXE_DIR: &str = r"C:\cimp\bin";
+
     fn rows(harness: Harness, pairs: &[(&str, &str)]) -> Vec<GrantRow> {
         let e = env_of(pairs);
-        grant_rows_with(harness, &e)
+        grant_rows_with(harness, &e, Some(Path::new(EXE)))
+    }
+
+    /// The three rows [`cimp_child_rows`] mints, in order, as `paths` spells
+    /// them.
+    fn cimp_paths() -> Vec<String> {
+        vec![
+            format!(r"{EXE_DIR}\cimp.exe"),
+            format!(r"{EXE_DIR}\.cimp-offload.json"),
+            format!(r"{EXE_DIR}\.cimp-discovery"),
+        ]
     }
 
     fn paths(rows: &[GrantRow]) -> Vec<String> {
@@ -531,6 +647,24 @@ mod tests {
         assert_eq!(
             by_path,
             vec![
+                // cImp's own three (V37): the binary the harness spawns as its
+                // `cimp-offload` MCP server, and the discovery data that child
+                // reads to find this app. File-scoped — see `cimp_child_rows`.
+                (
+                    format!(r"{EXE_DIR}\cimp.exe"),
+                    GrantAccess::ReadExecute,
+                    true
+                ),
+                (
+                    format!(r"{EXE_DIR}\.cimp-offload.json"),
+                    GrantAccess::ReadExecute,
+                    true
+                ),
+                (
+                    format!(r"{EXE_DIR}\.cimp-discovery"),
+                    GrantAccess::ReadExecute,
+                    false
+                ),
                 (format!(r"{HOME}\.gitconfig"), GrantAccess::ReadExecute, true),
                 (
                     format!(r"{HOME}\.config\git"),
@@ -569,6 +703,17 @@ mod tests {
         assert_eq!(
             by_path,
             vec![
+                // The same cImp three: the proxy child is unconditional in BOTH
+                // harnesses since V37 Phase F.
+                (format!(r"{EXE_DIR}\cimp.exe"), GrantAccess::ReadExecute),
+                (
+                    format!(r"{EXE_DIR}\.cimp-offload.json"),
+                    GrantAccess::ReadExecute
+                ),
+                (
+                    format!(r"{EXE_DIR}\.cimp-discovery"),
+                    GrantAccess::ReadExecute
+                ),
                 (format!(r"{HOME}\.gitconfig"), GrantAccess::ReadExecute),
                 (format!(r"{HOME}\.config\git"), GrantAccess::ReadExecute),
                 (format!(r"{HOME}\.config\opencode"), GrantAccess::Full),
@@ -596,8 +741,15 @@ mod tests {
                     !lower.contains(r"\.aws") && !lower.contains(r"\.docker"),
                     "{harness:?} grants a credential directory ({p})"
                 );
+                // Component-EXACT, not a substring: `.cimp` is the
+                // project-level config directory (`.cimp/config.json`, the file
+                // that switches this sandbox off). `.cimp-offload.json` and
+                // `.cimp-discovery` are different names and are the two the
+                // proxy child legitimately reads — see `cimp_child_rows`, and
+                // `the_proxy_child_gets_the_binary_and_its_discovery_and_nothing_wider`
+                // for what stays dark beside them.
                 assert!(
-                    !lower.contains(r"\.cimp"),
+                    !lower.split('\\').any(|seg| seg == ".cimp"),
                     "{harness:?} grants cImp's own config ({p}) — the sandbox must not hand a \
                      model the file that switches the sandbox off"
                 );
@@ -662,12 +814,99 @@ mod tests {
         )
     }
 
-    /// No home directory ⇒ no guesses. An empty table is honest; a table rooted
+    /// No home directory ⇒ no guesses about the HARNESS state. A table rooted
     /// at `\` would stamp ACEs on directories chosen by accident.
+    ///
+    /// cImp's own three survive, and must: they are anchored on
+    /// `current_exe()`, not on a home that may not exist, and without them the
+    /// tab's MCP child cannot start at all. With neither a home nor an
+    /// executable there is nothing left to guess from, and the table is empty.
     #[test]
-    fn a_missing_home_yields_no_rows_rather_than_a_guess() {
-        assert!(rows(Harness::Claude, &[]).is_empty());
-        assert!(rows(Harness::OpenCode, &[]).is_empty());
+    fn a_missing_home_yields_no_home_anchored_rows() {
+        for harness in [Harness::Claude, Harness::OpenCode] {
+            assert_eq!(paths(&rows(harness, &[])), cimp_paths());
+        }
+        let e = env_of(&[]);
+        assert!(grant_rows_with(Harness::Claude, &e, None).is_empty());
+        assert!(grant_rows_with(Harness::OpenCode, &e, None).is_empty());
+    }
+
+    /// **The proxy child's three, and nothing wider.** V37 Phase F made
+    /// `cimp --offload-mcp` unconditional in every AI tab, so a sandboxed tab
+    /// must be able to run cImp's binary and read its discovery data — and must
+    /// NOT be able to read the rest of cImp's portable root, `settings.json`
+    /// above all (backend URLs, API keys, every auth token the app holds).
+    ///
+    /// Pinned per harness because the child is unconditional in both, and
+    /// pinned as "the exe DIRECTORY is not a row" because the one-character
+    /// change from three file grants to one directory grant is the change that
+    /// would quietly hand a compromised agent all of it.
+    #[test]
+    fn the_proxy_child_gets_the_binary_and_its_discovery_and_nothing_wider() {
+        for harness in [Harness::Claude, Harness::OpenCode] {
+            let rows = rows(harness, &[("USERPROFILE", HOME)]);
+            let head: Vec<(String, GrantAccess, bool)> = rows
+                .iter()
+                .take(3)
+                .map(|r| {
+                    (
+                        r.path.to_string_lossy().replace('/', "\\"),
+                        r.access,
+                        r.is_file,
+                    )
+                })
+                .collect();
+            assert_eq!(
+                head,
+                vec![
+                    // Read+execute: the container has to LAUNCH this one.
+                    (format!(r"{EXE_DIR}\cimp.exe"), GrantAccess::ReadExecute, true),
+                    // Read-only, file-scoped, both of them.
+                    (
+                        format!(r"{EXE_DIR}\.cimp-offload.json"),
+                        GrantAccess::ReadExecute,
+                        true
+                    ),
+                    (
+                        format!(r"{EXE_DIR}\.cimp-discovery"),
+                        GrantAccess::ReadExecute,
+                        false
+                    ),
+                ],
+                "{harness:?}"
+            );
+            for p in paths(&rows) {
+                let lower = p.to_ascii_lowercase();
+                assert_ne!(
+                    lower,
+                    EXE_DIR.to_ascii_lowercase(),
+                    "{harness:?} grants cImp's install DIRECTORY — settings.json and every \
+                     token in it would come with it. The three rows above are file-scoped \
+                     precisely so this row never exists"
+                );
+                for secret in ["settings.json", "tool-activity.jsonl"] {
+                    assert!(
+                        !lower.ends_with(secret),
+                        "{harness:?} grants {secret} ({p}) — no secret cImp holds may reach a \
+                         sandboxed child"
+                    );
+                }
+                assert!(
+                    !lower.split('\\').any(|seg| seg == "detection"),
+                    "{harness:?} grants the detection store ({p})"
+                );
+            }
+            // Nothing under cImp's root beyond those three, whatever else the
+            // harness table grows.
+            let under_root = paths(&rows)
+                .into_iter()
+                .filter(|p| {
+                    p.to_ascii_lowercase()
+                        .starts_with(&format!(r"{EXE_DIR}\").to_ascii_lowercase())
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(under_root, cimp_paths(), "{harness:?}");
+        }
     }
 
     /// Nothing in the table is REQUIRED: harness state is created on first use,

@@ -1692,6 +1692,8 @@ fn report_subagent_drift(project_dir: &Path, session_id: &str, summary: &str) {
             // rather than a tab, but the session is known.
             crate::activity::Attribution::Unattributed,
             Some(session_id.to_string()),
+            None,
+            None,
         ),
         request: format!("sub-agent transcript contract drift (session {session_id})"),
         response: summary.to_string(),

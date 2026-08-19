@@ -234,6 +234,8 @@ fn lifecycle_record(
             event != ServerEvent::Fail,
             crate::activity::Attribution::Headless,
             None,
+            None,
+            None,
         ),
         request: String::new(),
         response: detail,

@@ -1612,6 +1612,59 @@ export interface McpServerConfig {
   /// deserializes to). It is part of the Rust `config_sig`, so editing it
   /// reconnects the server — the UI must persist it through `commitMcpEdits`.
   auth_token: string;
+  /// V37 (contract C2): where this server came from. Metadata in V37 — it
+  /// badges the row and scopes the Phase E description screen to external
+  /// surfaces. A pre-v32 file has no key; Rust defaults it to `'external'`.
+  origin: McpOrigin;
+  /// V37 (contract C2/C3): the server's own global on/off, orthogonal to the
+  /// three `*_access` flags. `*_access` says *who may see it*; `enabled` says
+  /// *does it exist at all*. Off ⇒ not connected, not advertised to anyone, and
+  /// a stale call is refused naming the level (contract C4). Defaults to
+  /// `true`, which is what keeps a migrated pre-v32 config's surface unchanged.
+  /// Category membership can still turn it off — the effective state is the
+  /// Rust `offload::mcp_host::effective_enable` predicate, not this flag alone.
+  enabled: boolean;
+}
+
+/// V37: provenance of an MCP server (mirror of Rust `McpOrigin`). `internal`
+/// is reserved for servers cImp itself manages (#41); everything the user
+/// pastes into Settings is `external`, which is also the default for an entry
+/// that does not say.
+export type McpOrigin = 'internal' | 'external';
+
+/// V37 (contract C1/C2): a user-created grouping of MCP servers, by server
+/// `name` — there is no parallel id space, the name IS the id (mirror of Rust
+/// `McpCategory`).
+///
+/// Global-only: no project overlay may write this list. That is what makes an
+/// array safe here, unlike `McpActivation` — the Rust `deep_merge` replaces
+/// arrays wholesale but merges objects per key.
+export interface McpCategory {
+  /// Unique, user-chosen; renaming creates a new identity and leaves any
+  /// activation entry keyed by the old name inert.
+  name: string;
+  /// Member server names. A name with no matching server is ignored.
+  servers: string[];
+  /// Global on/off for the whole category; a project overlay may override it
+  /// through `McpActivation.categories`.
+  enabled: boolean;
+}
+
+/// V37 (contract C2): the per-project activation overlay — the ONLY part of
+/// the MCP registry a project settings overlay may carry (mirror of Rust
+/// `McpActivation`).
+///
+/// Both halves are maps keyed by name, never arrays: the Rust `deep_merge`
+/// composes objects key-by-key, so `{ servers: { ddg: false } }` in a project
+/// overlay overrides exactly that one server and inherits every other entry.
+/// A present key is an OVERRIDE of the global flag; an absent key inherits it,
+/// which is what lets the UI show inherited-vs-overridden and offer a revert
+/// (delete the key).
+export interface McpActivation {
+  /// Per-category overrides, keyed by `McpCategory.name`.
+  categories: Record<string, boolean>;
+  /// Per-server overrides, keyed by `McpServerConfig.name`.
+  servers: Record<string, boolean>;
 }
 
 /// V8-02: which capability tier a backend serves (mirror of Rust
@@ -1773,6 +1826,17 @@ export interface OffloadSettings {
   /// with a default `git` policy (see `defaultSettings`).
   command_policies: CommandPolicy[];
   mcp_servers: McpServerConfig[];
+  /// V37: user-created groupings over `mcp_servers`. Global-only — never
+  /// written by a project overlay (see `McpCategory`).
+  mcp_categories: McpCategory[];
+  /// V37: per-project activation overrides for servers and categories. The
+  /// only MCP-registry field a project overlay carries (see `McpActivation`).
+  mcp_activation: McpActivation;
+  /// V37 (contract C6): how often the MCP health checker probes each LIVE
+  /// server, in seconds. `0` = off. Clamped to 5–3600 backend-side, where the
+  /// per-probe timeout is also derived from it, so the "timeout well under the
+  /// cadence" relation cannot be expressed away here.
+  mcp_health_interval_secs: number;
   backends: OffloadBackend[];
   /// Saved, reusable server-command templates (see `ServerCommandTemplate`).
   /// A convenience library only — nothing reads these at runtime.
@@ -2186,6 +2250,11 @@ export function defaultSettings(): Settings {
         },
       ],
       mcp_servers: [],
+      // V37 C2: no categories, no overrides — a fresh install and a migrated
+      // pre-v32 file advertise exactly the same surface.
+      mcp_categories: [],
+      mcp_activation: { categories: {}, servers: {} },
+      mcp_health_interval_secs: 60,
       backends: [],
       server_command_templates: [],
       remote_backend_templates: [],

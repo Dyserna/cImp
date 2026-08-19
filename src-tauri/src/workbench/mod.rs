@@ -399,6 +399,8 @@ fn checkpoint_miss_row(
                 None => crate::activity::Attribution::Unattributed,
             },
             origin.session.clone(),
+            None,
+            None,
         ),
         request: format!(
             "pre-tool checkpoint for {source} abandoned after {ms} ms — the shadow-repo snapshot \

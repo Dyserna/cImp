@@ -176,9 +176,18 @@ pub fn plugins_project_key(state: State<'_, crate::AppState>) -> String {
 #[tauri::command]
 pub async fn plugins_rescan(
     state: State<'_, Arc<PluginStore>>,
+    offload: State<'_, Arc<crate::offload::OffloadService>>,
 ) -> Result<Arc<PluginSet>, crate::error::AppError> {
     let store = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || store.rescan())
+    let service = offload.inner().clone();
+    let set = tauri::async_runtime::spawn_blocking(move || store.rescan())
         .await
-        .map_err(|e| crate::error::AppError::Ipc(format!("plugin rescan task failed: {e}")))
+        .map_err(|e| crate::error::AppError::Ipc(format!("plugin rescan task failed: {e}")))?;
+    // V38 Phase F: a rescan can add, remove or rename every `check`-kind tool
+    // `run_check` advertises, and it writes no settings — so nothing else would
+    // tell a live session its tool list moved. Only an ASK: the pulse gate
+    // compares the native surface fingerprint and stays silent when the rescan
+    // found the same plugins it already had.
+    service.signal_native_change();
+    Ok(set)
 }

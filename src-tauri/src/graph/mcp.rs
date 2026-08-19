@@ -398,7 +398,7 @@ pub struct SurfaceStats {
 ///   serving a stale surface across every plugin enable, path change and
 ///   Rescan — the advertised bytes would move while the fingerprint stood
 ///   still, which is the one failure this type exists to prevent.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, std::hash::Hash)]
 struct SurfaceFingerprint {
     graph_enabled: bool,
     semantic_search: bool,
@@ -430,6 +430,45 @@ fn checks_sig(settings: &crate::settings::Settings) -> u64 {
     for name in &names {
         name.hash(&mut h);
     }
+    h.finish()
+}
+
+/// V38 Phase F — the NATIVE tool surface's fingerprint, for the pulse gate.
+///
+/// # Why the pulse needs this at all
+///
+/// The `change` frame a consumer receives as `tools/list_changed` covers the
+/// whole of what a per-session child advertises, and until this phase only two
+/// thirds of that could move it: the proxied MCP surface ([`PulseSource::Host`])
+/// and the backend ready-set ([`PulseSource::Backend`]). The third — the tools
+/// this process serves itself, of which `run_check`'s `name` enum is the only
+/// project-dynamic part — had **never pulsed**. [`checks_sig`] existed, but it
+/// is a memo key for the statistics poll, not a notifier: enabling a plugin
+/// check, setting its path, editing `settings.checks` or rescanning the plugins
+/// folder all moved the advertised bytes while every live session went on
+/// showing the old enum until its next restart.
+///
+/// # It is the same fingerprint, hashed
+///
+/// Deliberately [`SurfaceFingerprint`] and not a parallel list of inputs: that
+/// type is already defined as "every setting that moves what [`tools`]
+/// advertises", and a second answer to the same question is the drift this file
+/// spends a long comment preventing. The hash exists only because the gate wants
+/// one comparable value per source.
+///
+/// # Per-process and per-cwd, and that is correct here
+///
+/// [`checks_sig`] resolves the effective check set against `current_dir()`, so
+/// this value describes the surface of the process that computes it. The gate
+/// runs in the APP, whose cwd is the launch directory — the same directory the
+/// registry's per-project paths are keyed by and the audit fan-out scans. A
+/// child process would compute its own answer for its own project, which is
+/// what it should advertise; it just never asks, because it does not own a
+/// pulse.
+pub fn native_surface_sig(settings: &crate::settings::Settings) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    SurfaceFingerprint::of(settings).hash(&mut h);
     h.finish()
 }
 

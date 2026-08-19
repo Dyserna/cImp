@@ -470,7 +470,14 @@ counter. **A configured check is never shadowed**: the project's own `checks`
 array is laid down first and a plugin renames itself around it, because a plugin
 that could claim the name `cargo` could make `run_check{name:"cargo"}` run
 anything at all. Plugin checks are included in the advertised name enum and in
-its schema fingerprint, so a roster change propagates.
+its schema fingerprint, and since V38 Phase F that fingerprint also **notifies**:
+a settings save or a plugin Rescan that moves the effective check set emits one
+debounced `tools/list_changed`, so a live session picks the new roster up (same
+session for OpenCode, next turn for Claude Code) instead of showing the old enum
+until it restarts. One pulse per action, and none at all when the set did not
+actually move — the applicability gate of § 3.6 is part of "the set", but a
+filesystem change that flips a gate is not watched for: it is seen on the next
+advertisement, within the census's 60-second cache.
 
 `run_check` hands the rendered command line to the platform shell (`cmd.exe /S /C`
 on Windows, `sh -c` elsewhere), which is what a check has always been. That is

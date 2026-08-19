@@ -82,6 +82,48 @@ pub fn norm_dir_key_path(dir: &Path) -> PathBuf {
 // deliberate difference between them, are visible in a single place.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Shared "is this path absolute?" verdict.
+//
+// Two subsystems refuse an absolute path where a relative one is required —
+// `checks::lexically_confined` (a `CheckDef`'s `cwd`/`report_file`) and
+// `plugins::manifest` (a plugin tool's `cwd`/`report_file`, and the shape of
+// its `extra_grants`, which must be absolute). They must agree, so the
+// predicate lives here rather than once per caller.
+// ---------------------------------------------------------------------------
+
+/// Whether a path string is absolute in the **platform-agnostic** sense: a
+/// POSIX root (`/etc`), a Windows rooted/UNC path (`\\server\share`,
+/// `\Windows`), or a drive-letter prefix (`C:\Tools`).
+///
+/// Deliberately NOT [`Path::is_absolute`], which answers for the *running*
+/// platform only: on Windows `"/etc"` is not absolute (it is root-relative to
+/// the current drive) and on Linux `"C:\Tools"` is an ordinary relative
+/// filename. Both callers treat "absolute" as a REFUSAL condition, so the
+/// platform-specific answer refuses one shape and waves the other through —
+/// and which one it waves through depends on where the check happens to run:
+///
+/// * `checks::lexically_confined` guards a `CheckDef`'s `cwd`/`report_file`.
+///   The canonical `confine_under_root` re-check catches the escape at spawn
+///   time either way, so this is the lexical half reaching the same verdict on
+///   both platforms rather than deferring half of them to a later, differently
+///   worded failure.
+/// * `plugins::manifest` validates a manifest, which is authored once and read
+///   on **every** platform: a file refused on Linux must not load on Windows
+///   and fail later at run time. One artifact, one verdict.
+pub fn looks_absolute(s: &str) -> bool {
+    let b = s.as_bytes();
+    let Some(&first) = b.first() else {
+        return false;
+    };
+    // POSIX root, or a Windows UNC / drive-rooted path.
+    if first == b'/' || first == b'\\' {
+        return true;
+    }
+    // `X:` drive prefix, with or without a following separator.
+    b.len() >= 2 && first.is_ascii_alphabetic() && b[1] == b':'
+}
+
 /// Directory names a *broad* recursive scan should never descend into: build
 /// output, vendored dependencies, and VCS/tool-cache metadata. Used by any full
 /// filesystem pass whose cost of a false skip is only wasted scanning, never a
@@ -204,6 +246,40 @@ mod tests {
         // Canonicalize so the returned root matches what `confine_*` yields and
         // comparisons don't trip over `\\?\`/8.3-name differences on Windows.
         p.canonicalize().unwrap()
+    }
+
+    /// The whole point of the predicate: BOTH platforms' absolute shapes are
+    /// absolute everywhere, so the two callers (`checks::lexically_confined`,
+    /// `plugins::manifest`) reach the same verdict on Windows and on Linux.
+    #[test]
+    fn looks_absolute_answers_for_both_platforms_at_once() {
+        for abs in [
+            "/etc",
+            "/etc/passwd",
+            "\\Windows",
+            "\\\\server\\share",
+            "C:\\Tools\\x",
+            "c:/tools/x",
+        ] {
+            assert!(looks_absolute(abs), "`{abs}` must read as absolute");
+        }
+        for rel in ["", "src", "src/main.rs", "target\\report.xml", "./out", ".."] {
+            assert!(!looks_absolute(rel), "`{rel}` must read as relative");
+        }
+    }
+
+    /// Regression guard for the reason this exists: `Path::is_absolute` gives a
+    /// platform-dependent answer to at least one of these, and that difference
+    /// is exactly what let a refusal turn into an acceptance on the other OS.
+    #[test]
+    fn looks_absolute_disagrees_with_the_platform_specific_answer() {
+        let foreign = if cfg!(windows) { "/etc" } else { "C:\\Windows" };
+        assert!(!Path::new(foreign).is_absolute());
+        assert!(
+            looks_absolute(foreign),
+            "`{foreign}` is absolute on the OTHER platform, which is the case \
+             `Path::is_absolute` misses"
+        );
     }
 
     #[test]

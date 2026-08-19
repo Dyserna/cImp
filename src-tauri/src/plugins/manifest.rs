@@ -563,25 +563,16 @@ fn valid_env_key(s: &str) -> bool {
 
 /// Whether a path string is absolute in the **platform-agnostic** sense.
 ///
-/// Deliberately NOT `Path::is_absolute()`: that is evaluated on the *loading*
-/// machine, so `C:\Tools\x` fails on Linux and `/opt/x` fails on Windows — and
-/// a manifest is a cross-platform artifact, so either answer would reject a
-/// perfectly good plugin for running on the other OS. The real screening is
-/// V33's `extra_grant_refusal` at enable time, which runs on the machine whose
-/// paths these are; here we only refuse the shapes that are *never* a grant: a
-/// relative path (which would silently resolve against whatever cwd the spawn
-/// happened to have) and anything with a `..` component.
+/// One verdict, shared with `checks::lexically_confined` via
+/// [`crate::fsutil::looks_absolute`] — a manifest is a cross-platform artifact
+/// (authored once, read on every OS), and a `CheckDef` is a shared config file,
+/// so neither may get a different answer depending on which machine asks. The
+/// real screening of a grant is V33's `extra_grant_refusal` at enable time, on
+/// the machine whose paths these are; here we only refuse the shapes that are
+/// *never* a grant: a relative path (which would silently resolve against
+/// whatever cwd the spawn happened to have) and anything with a `..` component.
 fn looks_absolute(s: &str) -> bool {
-    let b = s.as_bytes();
-    if b.is_empty() {
-        return false;
-    }
-    // POSIX root, or a Windows UNC / rooted path.
-    if b[0] == b'/' || b[0] == b'\\' {
-        return true;
-    }
-    // `X:` drive prefix, with or without a following separator.
-    b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':'
+    crate::fsutil::looks_absolute(s)
 }
 
 /// One `{...}` group found in an argv token.
@@ -1242,6 +1233,28 @@ mod tests {
             assert!(
                 matches!(err(&json), ValidationError::Confinement(_)),
                 "{to} should have been refused"
+            );
+        }
+    }
+
+    /// **Lockstep with `checks`.** The manifest and `CheckDef::validate` must
+    /// reach ONE verdict on "is this absolute?", on every platform — they share
+    /// `fsutil::looks_absolute` precisely so they cannot drift, and this asserts
+    /// the agreement rather than trusting it. The twin lives at
+    /// `checks::tests::validate_rejects_the_other_platforms_absolute_form_too`;
+    /// tighten the predicate and both move.
+    #[test]
+    fn both_platforms_absolute_forms_are_refused() {
+        for abs in ["/etc", "C:\\Windows", "\\\\srv\\share", "c:/tools"] {
+            assert!(looks_absolute(abs), "`{abs}` must read as absolute here");
+            let probe = CheckDef {
+                cwd: Some(abs.to_string()),
+                ..CheckDef::default()
+            };
+            assert!(
+                probe.validate().is_err(),
+                "`{abs}` is absolute to the manifest but not to CheckDef — the two \
+                 verdicts have drifted apart"
             );
         }
     }

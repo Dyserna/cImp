@@ -625,9 +625,17 @@ fn normalize_rel(root: &Path, file: &str) -> String {
 /// The lexical half of confinement: reject an absolute path or any `..`
 /// component up front, so escaping fails even when the target (or its
 /// ancestors) don't exist on disk yet (a `report_file` the run will write).
+///
+/// "Absolute" is [`crate::fsutil::looks_absolute`], NOT `Path::is_absolute` —
+/// the latter answers for the running platform, so a POSIX-absolute `"/etc"`
+/// sailed past this on Windows (and `"C:\Windows"` past it on Linux) and was
+/// left to [`confine_under_root`]'s canonical re-check to catch at spawn time,
+/// under a different message. A config is edited on one machine and shared
+/// across a team, so the lexical verdict has to be the same everywhere; see
+/// that function for the full reasoning, which `plugins::manifest` shares.
 fn lexically_confined(field: &str, rel: &str) -> AppResult<()> {
     let raw = Path::new(rel);
-    if raw.is_absolute() {
+    if crate::fsutil::looks_absolute(rel) {
         return Err(AppError::Checks(format!(
             "check `{field}` must be relative to the project root, not an absolute path (`{rel}`)"
         )));
@@ -2188,6 +2196,39 @@ mod tests {
             def.validate().is_ok(),
             "a plain relative report_file is allowed"
         );
+    }
+
+    /// V38: the lexical guard is platform-AGNOSTIC — the foreign platform's
+    /// absolute form is refused too. Before this, `Path::is_absolute` let
+    /// `"/etc"` through on Windows (and `"C:\Windows"` through on Linux), so
+    /// the same `.cimp/config.json` was accepted on one machine and refused on
+    /// another, and the escape was only caught later by `confine_under_root`
+    /// under a different message. Twin of
+    /// `plugins::manifest::tests::both_platforms_absolute_forms_are_refused`;
+    /// both call `fsutil::looks_absolute`, so they move together.
+    #[test]
+    fn validate_rejects_the_other_platforms_absolute_form_too() {
+        for abs in ["/etc", "C:\\Windows\\Temp", "\\\\server\\share", "c:/tools"] {
+            let def = CheckDef {
+                cwd: Some(abs.into()),
+                ..Default::default()
+            };
+            let err = def
+                .validate()
+                .expect_err(&format!("`{abs}` must be refused as absolute"));
+            assert!(
+                err.to_string().contains("absolute"),
+                "`{abs}` was refused, but not as an absolute path: {err}"
+            );
+            let def = CheckDef {
+                report_file: Some(abs.into()),
+                ..Default::default()
+            };
+            assert!(
+                def.validate().is_err(),
+                "`{abs}` must be refused as an absolute report_file"
+            );
+        }
     }
 
     #[tokio::test]

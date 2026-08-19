@@ -1108,6 +1108,58 @@ fn validate_tool(t: &ToolManifest, provenance: Provenance) -> Result<(), Validat
             // come from user state (decision 10), and the arguments come from
             // the caller of `run_command`. Anything else declared here would be
             // a template nothing renders.
+            //
+            // **The three fields below are refused rather than ignored** — a
+            // tightening ordered after the Phase G spec pass found them accepted
+            // by the schema and read by nothing. Each has its own reason, and
+            // none of them is tidiness:
+            //
+            // * `timeout_secs` — `run_command` runs every tool under ONE fixed
+            //   budget because it is advertised to a model as a short read-only
+            //   probe. Honouring a manifest's timeout would quietly turn it into
+            //   a long-job runner, and the description a model reads would stop
+            //   being true.
+            // * `env` — a manifest-supplied environment is grant-shaped power
+            //   (`LD_PRELOAD`, `PYTHONPATH`, a proxy pointer) with no
+            //   enable-time disclosure: unlike `extra_grants`, nothing shows it
+            //   to the user beside the switch that turns the tool on.
+            // * `variables` — this kind has no template to substitute a value
+            //   into, so a declaration would render a settings input whose value
+            //   went nowhere. That is worse than not offering the field.
+            //
+            // Refusing is reversible — a later phase can consume any of them and
+            // every manifest written today keeps loading. Consuming is not: a
+            // manifest authored against a field that silently did nothing would
+            // change behaviour the day it started working.
+            let unread = |field: &str, why: &str| {
+                ValidationError::KindField(format!(
+                    "tool `{}` is a `command` tool and sets `{field}`, which nothing reads on \
+                     this kind — {why}",
+                    t.id
+                ))
+            };
+            if t.timeout_secs.is_some() {
+                return Err(unread(
+                    "timeout_secs",
+                    "`run_command` runs every tool under one fixed budget, because it is \
+                     advertised to a model as a short read-only probe",
+                ));
+            }
+            if !t.env.is_empty() {
+                return Err(unread(
+                    "env",
+                    "`run_command` composes its child environment from cImp's allowlist plus the \
+                     applicable command policy, and a manifest-set variable would be \
+                     grant-shaped power with nothing disclosing it at enable time",
+                ));
+            }
+            if !t.variables.is_empty() {
+                return Err(unread(
+                    "variables",
+                    "there is no argv or command template on this kind to substitute a value \
+                     into, so the settings pane would render an input that goes nowhere",
+                ));
+            }
             if !t.argv.is_empty() {
                 return Err(wrong("argv", "audit/security"));
             }
@@ -1431,27 +1483,30 @@ mod tests {
     /// A timeout is a wall-clock budget something waits out, so both ends are
     /// bounded — and 0 is refused rather than silently meaning one of the two
     /// opposite things a reader would take it for.
+    ///
+    /// Exercised on an AUDIT tool: a `command`-kind tool refuses `timeout_secs`
+    /// outright (nothing on that kind reads one), so the range rule has no
+    /// values to have an opinion about there.
     #[test]
     fn a_timeout_outside_the_supported_range_is_refused() {
+        let with_timeout = |secs: u64| {
+            audit_json().replace(
+                r#""id": "scan","#,
+                &format!(r#""id": "scan", "timeout_secs": {secs},"#),
+            )
+        };
         for bad in [0u64, MAX_TIMEOUT_SECS + 1, u64::MAX] {
-            let json = command_json().replace(
-                "\"kind\": \"command\"",
-                &format!("\"kind\": \"command\", \"timeout_secs\": {bad}"),
-            );
-            match err(&json) {
+            match err(&with_timeout(bad)) {
                 ValidationError::Timeout { tool, found } => {
-                    assert_eq!(tool, "git");
+                    assert_eq!(tool, "scan");
                     assert_eq!(found, bad);
                 }
                 other => panic!("expected a timeout error for {bad}, got {other:?}"),
             }
         }
         for ok in [1u64, 600, MAX_TIMEOUT_SECS] {
-            let json = command_json().replace(
-                "\"kind\": \"command\"",
-                &format!("\"kind\": \"command\", \"timeout_secs\": {ok}"),
-            );
-            parse(&json, Provenance::User).unwrap_or_else(|e| panic!("{ok}s rejected: {e:?}"));
+            parse(&with_timeout(ok), Provenance::User)
+                .unwrap_or_else(|e| panic!("{ok}s rejected: {e:?}"));
         }
     }
 
@@ -1655,6 +1710,67 @@ mod tests {
             "\"kind\": \"command\", \"parser\": \"sarif\"",
         );
         assert!(matches!(err(&json), ValidationError::KindField(_)));
+    }
+
+    /// The three fields a `command`-kind tool may not declare, one negative
+    /// test apiece — because "nothing reads it" is a different mistake for each
+    /// and the message has to name the right one.
+    ///
+    /// Refused at LOAD rather than ignored at run time: a manifest written
+    /// against a field that silently did nothing would change behaviour the day
+    /// somebody made it work, and by then it would be in files cImp did not
+    /// write. Refusing is reversible; consuming is not.
+    #[test]
+    fn a_command_tool_refuses_the_fields_nothing_reads() {
+        for (field, snippet) in [
+            ("timeout_secs", r#""timeout_secs": 600"#),
+            ("env", r#""env": [["HTTPS_PROXY", "http://evil:8080"]]"#),
+            (
+                "variables",
+                r#""variables": [{"name": "ruleset", "label": "Ruleset"}]"#,
+            ),
+        ] {
+            let json = command_json().replace(
+                r#""kind": "command""#,
+                &format!(r#""kind": "command", {snippet}"#),
+            );
+            match err(&json) {
+                ValidationError::KindField(m) => {
+                    assert!(
+                        m.contains(field) && m.contains("nothing reads"),
+                        "`{field}` must be refused BY NAME with its reason: {m}"
+                    );
+                }
+                other => {
+                    panic!("`{field}` on a command tool must be a kind-field error: {other:?}")
+                }
+            }
+        }
+
+        // …and each of them still loads on a kind that DOES read it, so the
+        // refusal is about the kind and not about the field.
+        for (what, json) in [
+            (
+                "audit timeout",
+                audit_json().replace(r#""id": "scan","#, r#""id": "scan", "timeout_secs": 600,"#),
+            ),
+            (
+                "audit env",
+                audit_json().replace(
+                    r#""id": "scan","#,
+                    r#""id": "scan", "env": [["PYTHONUTF8", "1"]],"#,
+                ),
+            ),
+            (
+                "check env",
+                check_json().replace(r#""id": "t","#, r#""id": "t", "env": [["CI", "1"]],"#),
+            ),
+        ] {
+            assert!(
+                parse(&json, Provenance::User).is_ok(),
+                "{what} must still load on the kind that reads it"
+            );
+        }
     }
 
     #[test]

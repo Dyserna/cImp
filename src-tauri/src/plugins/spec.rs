@@ -439,6 +439,89 @@ fn the_documented_environment_is_the_child_env_table() {
     );
 }
 
+/// The identity charsets, exercised rather than described.
+///
+/// § 2.1 states two character classes in prose, and prose is exactly what
+/// drifts: `valid_id` and `valid_version` are four lines each, and either could
+/// be widened by a well-meaning fix without anyone re-reading the document that
+/// promises what a plugin author may type. So every row of the block is a real
+/// value fed to the real validator, and the verdict it claims is asserted.
+#[test]
+fn the_documented_identity_charsets_are_the_validator() {
+    let mut names = 0usize;
+    let mut versions = 0usize;
+    for row in block("identity-charset") {
+        let mut parts = row.splitn(3, ':');
+        let (field, verdict, value) = (
+            parts.next().unwrap_or_default(),
+            parts.next().unwrap_or_default(),
+            parts.next().unwrap_or_default(),
+        );
+        // `<empty>` is the one value a whitespace-split block cannot spell.
+        let value = if value == "<empty>" { "" } else { value };
+        let accept = match verdict {
+            "accept" => true,
+            "refuse" => false,
+            other => panic!(
+                "docs/TOOL-PLUGINS.md's `identity-charset` row `{row}` has verdict `{other}` \
+                 (expected `accept` or `refuse`)"
+            ),
+        };
+        let text = match field {
+            "name" => {
+                names += 1;
+                identity_manifest(value, "1.0.0")
+            }
+            "version" => {
+                versions += 1;
+                identity_manifest("acme", value)
+            }
+            other => panic!(
+                "docs/TOOL-PLUGINS.md's `identity-charset` row `{row}` names field `{other}` \
+                 (expected `name` or `version`)"
+            ),
+        };
+        let got = manifest::parse(&text, Provenance::User);
+        assert_eq!(
+            got.is_ok(),
+            accept,
+            "the doc says `{field}` `{value}` should {}; the validator disagreed ({:?})",
+            if accept { "load" } else { "be refused" },
+            got.as_ref().err().map(|e| e.error.clone())
+        );
+        // A refusal has to be about IDENTITY, not about some other rule the
+        // sample happened to trip — otherwise the row would pass for the wrong
+        // reason and the charset would be free to drift underneath it.
+        if let Err(e) = got {
+            assert!(
+                matches!(e.error, manifest::ValidationError::Identity(_)),
+                "`{field}` `{value}` was refused, but not as an identity error: {e}"
+            );
+        }
+    }
+    // A block that lost its rows would pass vacuously.
+    assert!(
+        names >= 4 && versions >= 4,
+        "docs/TOOL-PLUGINS.md's `identity-charset` block parsed as {names} name rows and \
+         {versions} version rows — a charset claim needs samples on both sides of both fields"
+    );
+}
+
+/// A minimal, valid manifest with a caller-chosen identity, so the charset test
+/// goes through the real parse path rather than calling the two predicates
+/// directly (which would prove they exist, not that anything consults them).
+fn identity_manifest(name: &str, version: &str) -> String {
+    format!(
+        r#"{{
+          "manifest_version": 1,
+          "name": "{name}",
+          "version": "{version}",
+          "categories": [{{ "id": "c", "label": "C", "tools": ["t"] }}],
+          "tools": [{{ "id": "t", "label": "T", "kind": "command" }}]
+        }}"#
+    )
+}
+
 /// A minimal, valid audit-kind manifest with one extra field spliced in, so the
 /// tests above exercise the real parse path (`deny_unknown_fields` included)
 /// rather than a hand-built struct that can never carry an unknown key.

@@ -73,6 +73,33 @@ typo that silently does nothing surfaces weeks later as a behaviour difference.
 * A plugin declaring **no tools** is refused. A well-formed no-op would sit in
   the settings list forever explaining nothing.
 
+The two charsets are not prose. Every row below is fed to the real validator by
+a drift test, so a sentence in this section cannot outlive the rule it
+describes. Format: `field:verdict:value`, with `<empty>` for the empty string.
+
+<!-- drift:identity-charset -->
+```text
+# `name` and the id charset (tool ids and category ids share it)
+name:accept:acme
+name:accept:acme-tools
+name:accept:acme_tools
+name:accept:ACME9
+name:refuse:acme.tools
+name:refuse:acme+tools
+name:refuse:acme@1
+name:refuse:acme/tools
+name:refuse:<empty>
+# `version` — the id charset plus `.` and `+`, and never `@` or `/`
+version:accept:1
+version:accept:1.0.0
+version:accept:1.0.0-rc.1
+version:accept:1.0.0+build_7
+version:refuse:1.0.0@x
+version:refuse:1/0
+version:refuse:1,0
+version:refuse:<empty>
+```
+
 ### 2.2 Discovery and rescan
 
 The `plugins/` directory beside the cImp executable, and **only** there — the
@@ -101,10 +128,7 @@ Tool level, every kind:
 | `runtime` | which sandbox runtime profile applies (§ 6.2) |
 | `sandbox` | what cImp does when it cannot confine this tool (§ 6.1) |
 | `extra_grants[]` | absolute paths to grant beyond the profile (§ 6.3) |
-| `variables[{name,label,default?}]` | the settings fields cImp renders, and the only names `{var:…}` may reference |
 | `parameters_allowed` | whether the settings pane offers a free-form "extra CLI parameters" field |
-| `timeout_secs` | per-tool wall-clock budget (`audit`/`security`/`check` only — see § 5.3) |
-| `env[[k,v]]` | environment forced onto the child (`audit`/`security`/`check` only — see § 5.3) |
 
 Kind-specific fields, refused when they appear on the wrong kind:
 
@@ -119,9 +143,20 @@ Kind-specific fields, refused when they appear on the wrong kind:
 | `report_file` | `check` | parse this file after the run instead of stdout; relative, confined |
 | `pattern` | `check` | the `regex-custom` parser's pattern |
 | `parser` | `audit`, `security`, `check` | see § 5.2 and § 4.2 |
+| `variables[{name,label,default?}]` | `audit`, `security`, `check` | the settings fields cImp renders, and the only names `{var:…}` may reference |
+| `timeout_secs` | `audit`, `security`, `check` | per-tool wall-clock budget |
+| `env[[k,v]]` | `audit`, `security`, `check` | environment forced onto the child |
 
 A `command`-kind tool is **identity only**: the path and the enable come from
-user state, and the arguments come from the caller.
+user state, and the arguments come from the caller. It therefore refuses
+`timeout_secs`, `env` and `variables` at load, by the same cross-check that
+refuses `argv` on a `check`. Nothing on that kind would read them —
+`run_command` runs every tool under one fixed budget because it is advertised to
+a model as a short read-only probe, it composes its child environment from
+cImp's allowlist plus the applicable `CommandPolicy`, and it has no template to
+substitute a variable into. Refusing is reversible and consuming is not: a
+manifest written against a field that silently did nothing would change
+behaviour the day it started working.
 
 ### 2.4 Limits
 
@@ -457,22 +492,60 @@ survives while the storage location does not sit inside the sandbox.
   names only**. A stored value whose name the manifest no longer declares is kept
   (a plugin mid-upgrade) but never substituted.
 
-### 5.3 Fields a `command`-kind tool may declare but nothing reads
-
-`timeout_secs`, `env` and `variables` are accepted on a `command`-kind tool by
-the schema, but `run_command` uses its own fixed timeout, composes its
-environment from the allowlisted table plus the applicable `CommandPolicy`, and
-has no template to substitute a variable into. Treat them as having no effect on
-that kind. (Recorded here rather than quietly: the honest resolutions are either
-to refuse them at load or to consume them, and that is a decision for the phase
-that owns `run_command`'s configuration surface.)
-
 ---
 
 ## 6. Security posture
 
 One posture, resolved the same way at all three seams (the audit fan-out,
-`run_check`, `run_command`), from three manifest fields.
+`run_check`, `run_command`), from three manifest fields — plus one machine-wide
+switch that is not a manifest field at all.
+
+### 6.0 Network, and the tool that needs egress
+
+`allow_network` is a **single cImp-wide setting** (Settings → Sandbox), off by
+default. It is deliberately not a manifest field: per-host scoping is not
+something either OS engine can express today, so the honest granularity is
+all-or-nothing for the whole app, and a plugin asking for "just this one host"
+would be a promise cImp cannot keep.
+
+What "off" means for a plugin's child process:
+
+* **Windows (AppContainer).** The container is created without the
+  `internetClient` capability, so no outbound socket succeeds — DNS included.
+  With the switch on, that capability is granted whole; it was measured on a
+  Public-profile NIC to open the **LAN** as well as the internet, which is why
+  the switch is one bit rather than a list.
+* **Linux (Landlock).** On an ABI 4+ kernel, TCP `bind()` and `connect()` are
+  denied. **UDP is not restricted at all**, so a direct-socket DNS query still
+  leaves the machine, and on a kernel below ABI 4 there is no network
+  confinement whatsoever. Both facts are stated in the sandbox lane's posture
+  line rather than papered over.
+* **Either platform, sandbox switched off.** No boundary, therefore no network
+  restriction — the tool has whatever access you do.
+
+The consequence for a plugin author is concrete. A tool that **needs** egress —
+a scanner fetching a registry ruleset, an auditor querying an advisory database,
+anything that resolves a name — fails inside the boundary on a default install,
+and it fails looking like a tool error rather than like a policy decision:
+an empty report, or an exit code with nothing on either stream.
+
+> **If your tool needs the network, declare `sandbox: unsupported`.** That runs
+> it outside the boundary as a stated, visible choice, with a row saying so and
+> the ask shown beside the switch that enables it. Do **not** declare `optional`
+> and hope: `optional` means "run degraded when no boundary is available", so on
+> a machine where one *is* available the tool runs inside it — which is exactly
+> the case that breaks. And `required` on a network tool means it never runs at
+> all.
+
+**Taxonomy.** cImp classifies every tool name a dispatcher can serve
+(`offload::toolclass::TABLE`) and **defaults an unknown name to EXTERNAL**, the
+most restrictive class. Plugins add no model-visible name at all, so nothing a
+plugin does moves a class: the seams a plugin reaches through
+(`security_audit`, `quality_audit`, `run_check`, `run_command`) keep the
+`LocalCapability` rows they were reviewed into before plugins existed. A plugin
+widens what those tools *run*; it never changes the class their output is
+handled under, nor the injection screening it passes on the way to a model
+(§ 4.4).
 
 ### 6.1 `sandbox` — what happens when cImp cannot confine the tool
 

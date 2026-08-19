@@ -362,6 +362,8 @@ describe('rowStatus', () => {
       // V37 C6 health lane.
       'unhealthy',
       'recovered',
+      // V37 C9: a tool withheld by description screening.
+      'withheld',
     ];
     for (const s of all) expect(STATUS_TITLE[s].length).toBeGreaterThan(0);
   });
@@ -414,6 +416,66 @@ describe('rowStatus — mcp health', () => {
     // for).
     const call = entry(2, { kind: 'mcp', tool: 'ddg__search', ok: false, server: 'ddg' });
     expect(rowStatus(call)).toBe('failed');
+  });
+});
+
+// ── V37 C9: tools withheld by description screening ───────────────────────
+//
+// These rows land in the `mcp` lane with `ok: false` and `source: "screen"` —
+// the wire value the Rust side pins in one constant (`SCREEN_DROP_SOURCE` in
+// `mcp_host.rs`), because a reader has to be able to tell a screening row from a
+// call row without parsing prose. With no branch for them the classifier fell
+// through to `failed`, whose sentence is "Call failed" — a claim about a call
+// that was never made. `flagged` would be worse: its sentence promises "nothing
+// was blocked", and this is the one site in cImp where detection really does
+// remove something.
+
+/// One `mcp`-lane screening row for the withheld tool `tool`.
+function screenDrop(tool: string, over: Partial<ActivityEntry> = {}): ActivityEntry {
+  return entry(3, {
+    kind: 'mcp',
+    source: 'screen',
+    tool,
+    target:
+      'withheld from `evil` advertised tools: the injection screen flagged its name or description',
+    ok: false,
+    server: 'evil',
+    category: 'research',
+    ...over,
+  });
+}
+
+describe('rowStatus — screen-withheld tools', () => {
+  it('gives a withheld tool its own status, not a failed call', () => {
+    const s = rowStatus(screenDrop('exfiltrate'));
+    expect(s).toBe('withheld');
+    expect(s).not.toBe('failed');
+  });
+
+  it('never reports a withheld tool as merely flagged', () => {
+    // `flagged` means delivered-anyway, and its tooltip says so out loud. This
+    // row is the opposite fact.
+    expect(rowStatus(screenDrop('exfiltrate'))).not.toBe('flagged');
+    expect(STATUS_TITLE.flagged).toContain('nothing was blocked');
+    expect(STATUS_TITLE.withheld).not.toContain('nothing was blocked');
+  });
+
+  it('says the tool was withheld and that the server is unaffected', () => {
+    const t = STATUS_TITLE.withheld;
+    expect(t).toContain('WITHHELD');
+    expect(t).toContain('unaffected');
+    expect(t).toContain('re-screened');
+  });
+
+  it('keys on the exact wire source, not on kind alone', () => {
+    // An ordinary failed CALL row on the same lane and the same server stays
+    // `failed`: only `source === "screen"` marks a screening row, and matching
+    // it loosely (a prefix, a substring) would relabel real failures.
+    const call = entry(4, { kind: 'mcp', tool: 'ddg__search', ok: false, server: 'ddg' });
+    expect(rowStatus(call)).toBe('failed');
+    expect(rowStatus(screenDrop('x', { source: 'screening' }))).toBe('failed');
+    // …and the source alone does not hijack another lane.
+    expect(rowStatus(entry(5, { kind: 'graph', source: 'screen', ok: false }))).toBe('failed');
   });
 });
 

@@ -32,6 +32,13 @@
   //     feeds already gave them.
   //   • UNDERLINED danger-soft — `down`, `boundary`: a real failure whose cause
   //     is in the row, not a block we performed. Never the filled red.
+  //   • STRUCK-THROUGH danger OUTLINE — `withheld`: a tool removed from the
+  //     advertised surface. Danger, because this is the one place in cImp where
+  //     detection actually takes something away, and the chip must not
+  //     under-claim it the way `flagged` ("nothing was blocked") would. An
+  //     outline and not the filled red, because that red is `denied`'s alone —
+  //     a call we stopped — and here no call was ever made. The line through the
+  //     word is the removal.
   //
   // Colours are theme tokens only — themes/palettes ship as external files
   // beside the exe, so a hardcoded hex breaks the `tui` and light themes.
@@ -127,6 +134,17 @@
     border-color: color-mix(in srgb, var(--text-danger-soft, #ffb0c0) 40%, transparent);
     text-decoration: underline dotted;
     text-underline-offset: 2px;
+  }
+
+  /* V37 C9: a tool withheld from the advertised surface by description
+     screening. Danger OUTLINE plus a line through the word — the removal is
+     real (so not `flagged`'s amber, whose sentence promises nothing was
+     blocked) and it is not a broken call (so not `failed`'s bare pink text),
+     but it is also not `denied`'s filled red: no call was ever made. */
+  .schip.withheld {
+    color: var(--text-danger-soft, #ffb0c0);
+    border-color: var(--border-danger, #5a3038);
+    text-decoration: line-through;
   }
 
   /* Containment came on (beacon / contamination). */

@@ -312,7 +312,26 @@ export type RowStatus =
   /// V37 C6: an MCP server answered again after having been unhealthy. The row
   /// contract C6 guarantees follows every error row about a server that came
   /// back, so an error is never the lane's last word.
-  | 'recovered';
+  | 'recovered'
+  /// V37 C9: an external server's tool was WITHHELD from every consumer's
+  /// advertised surface because description screening flagged its name or
+  /// description. It lives in the `mcp` lane beside call rows, but no call ever
+  /// happened.
+  ///
+  /// Its own word, and neither of the two it kept falling into:
+  /// * `failed` is what it renders as with no branch here, and its sentence is
+  ///   "Call failed" — a claim about a call that was never made.
+  /// * `flagged` is worse, not better: that word's whole promise is "nothing was
+  ///   blocked", and this is the one place in cImp where detection actually
+  ///   REMOVES something. A row that reports a removal as a delivery is the
+  ///   M-24 defect pointed the other way.
+  | 'withheld';
+
+/// The `source` value the backend stamps on every C9 screening row
+/// (`SCREEN_DROP_SOURCE` in `src-tauri/src/offload/mcp_host.rs` — the Rust side
+/// keeps it in one constant for exactly this reason). Matched exactly: it is a
+/// wire value, not a prose prefix.
+const SCREEN_DROP_SOURCE = 'screen';
 
 /// Classify one row.
 ///
@@ -413,6 +432,10 @@ export function rowStatus(e: ActivityEntry): RowStatus {
         return e.ok ? 'recorded' : 'denied';
     }
   }
+  // V37 C9, and BEFORE the generic `ok` fallthrough on purpose: these rows are
+  // minted `ok: false` in the `mcp` lane, so without this branch a withheld tool
+  // renders as "Call failed" — a claim about a call that never happened.
+  if (e.kind === 'mcp' && e.source === SCREEN_DROP_SOURCE) return 'withheld';
   if (!e.ok) return CANARY_SOURCES.has(e.source) ? 'signal' : 'failed';
   return 'ok';
 }
@@ -454,6 +477,8 @@ export const STATUS_TITLE: Record<RowStatus, string> = {
     'An MCP server stopped answering — two consecutive health probes failed — or an enabled one could not be connected at all. Its tools are withdrawn from every consumer until it comes back. cImp does not own this process, so it does not restart it; open the row for what the probe saw.',
   recovered:
     'An MCP server answered again after having been unhealthy, and its tools are back on every consumer that is granted it. Every error row in this lane is followed by one of these when the server returns.',
+  withheld:
+    'This tool was WITHHELD from the advertised tool surface every consumer sees — detection screening flagged its name or description, so no agent was ever offered it and no call was made. Something really was blocked here. The server and its other tools are unaffected, and the tool is re-screened on every reconnect, so it comes back if the screen stops matching.',
 };
 
 /// The feed (graph + offload), newest first, payload-free. Pass `sinceTs` to

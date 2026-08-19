@@ -916,7 +916,7 @@ its manifest's `enabled_by_default` AND applicable
 declare `enabled_by_default: false` and so stay opt-in; security tools and user
 plugins are never touched). Applied at every scan start and by the
 `audit_refresh_census` IPC (tab mount + Settings open take a real census, ≤60s
-cache, so gating/hints/selection work before the first scan). Since schema v33
+cache, so gating/hints/selection work before the first scan). Since schema v34
 the flags it writes live in `tool_plugins`, under the built-in audit plugin's
 key. A manual quality checkbox edit (Settings → Tool Plugins) flips the setting
 to manual mode; the **Auto-select for this project** button (Settings → Code

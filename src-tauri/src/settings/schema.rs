@@ -160,7 +160,7 @@ pub const SHELL_BROOT_TAB_ID: &str = "shell-broot";
 /// Files that pre-date V1.10 lack the field entirely; the cascade still
 /// uses the `looks_v1_X` predicates for those, falling through to a final
 /// step that stamps the field with the current value.
-pub const CURRENT_SCHEMA_VERSION: u8 = 33;
+pub const CURRENT_SCHEMA_VERSION: u8 = 34;
 
 fn current_schema_version() -> u8 {
     CURRENT_SCHEMA_VERSION
@@ -442,7 +442,7 @@ pub struct Settings {
     pub code_audit: CodeAuditSettings,
     /// V38 Phase B: user state for the drop-in **tool plugins** — which of a
     /// manifest's tools are enabled, what their declared variables are set to,
-    /// and where their binaries live on this machine. Schema v32 (additive: the
+    /// and where their binaries live on this machine. Schema v33 (additive: the
     /// container materializes empty, nothing moved into it).
     ///
     /// Keyed maps rather than typed fields, on purpose: the set of plugins is
@@ -505,7 +505,7 @@ impl Default for Settings {
     }
 }
 
-/// V38 Phase B: the **tool plugin** user-state container (schema v32).
+/// V38 Phase B: the **tool plugin** user-state container (schema v33).
 ///
 /// One stable, keyed-map block so plugin churn never migrates the schema: a
 /// plugin is a file a user drops into `<exe-dir>/plugins/`, so the set of keys
@@ -600,7 +600,7 @@ pub struct ToolState {
     /// consuming pipeline's default.
     pub timeout_secs: Option<u64>,
     /// Extra CLI arguments appended after the tool's own argv — the successor
-    /// to the pre-v33 `code_audit.tools[].extra_args`, offered only for a tool
+    /// to the pre-v34 `code_audit.tools[].extra_args`, offered only for a tool
     /// whose manifest sets `parameters_allowed`.
     pub parameters: Vec<String>,
     /// Values for the tool's **declared** variables, by declared name. A name
@@ -1613,7 +1613,7 @@ pub struct CodeAuditSettings {
     /// are never touched, and neither is a user plugin's tool — auto-selection
     /// is a statement about the roster cImp ships and knows the shape of.
     ///
-    /// Since schema v33 the flags it writes live in
+    /// Since schema v34 the flags it writes live in
     /// [`ToolPluginsSettings::plugins`], under the built-in audit plugin's key.
     /// This switch stays here because it is a property of the Code Audit
     /// FEATURE rather than of any one tool.
@@ -1735,6 +1735,31 @@ pub struct OffloadSettings {
     /// and exposed to the local model as OpenAI tools. Mirrors Claude's
     /// own `mcpServers` config shape so users can paste familiar config.
     pub mcp_servers: Vec<McpServerConfig>,
+    /// V37 (contract C2): user-created groupings over [`Self::mcp_servers`],
+    /// referenced by server name. Global-only — no project overlay ever writes
+    /// this, which is what makes a `Vec` safe here (see [`McpCategory`]). Empty
+    /// on every pre-v32 file and on a fresh install: no categories means every
+    /// server rides its own toggle, i.e. the migration changes no surface.
+    pub mcp_categories: Vec<McpCategory>,
+    /// V37 (contract C2): per-project activation overrides for servers and
+    /// categories. The ONLY MCP-registry field a project overlay may carry, and
+    /// map-shaped so `deep_merge` composes it per key — see [`McpActivation`].
+    /// Empty = inherit every global toggle.
+    pub mcp_activation: McpActivation,
+    /// V37 (contract C6): how often the MCP health checker probes each LIVE
+    /// server, in seconds. `0` turns the checker off entirely.
+    ///
+    /// A setting rather than a constant because the right cadence is a property
+    /// of the servers, not of cImp: a local `npx` server is free to probe, a
+    /// metered remote HTTP endpoint is not. Clamped at use
+    /// (`OffloadService::spawn_mcp_health_watch`) rather than at parse, so a
+    /// hand-edited `settings.json` cannot turn the checker into a hot loop, and
+    /// the per-probe timeout is derived from this value so it stays well under
+    /// the cadence by construction.
+    ///
+    /// Additive under the struct-level `#[serde(default)]`, so every pre-V37
+    /// file loads with the 60s default.
+    pub mcp_health_interval_secs: u32,
     /// V8-02: the offload backend pool. One entry per backend (Local
     /// `llama-server`, Remote-LAN, or Remote-cloud), each with its own
     /// capabilities, tier, and tool scope. The router picks one per
@@ -2139,6 +2164,10 @@ impl std::fmt::Debug for OffloadSettings {
             .field("command_policies", &self.command_policies)
             // McpServerConfig has its own redacted Debug.
             .field("mcp_servers", &self.mcp_servers)
+            // V37: no secrets — names and booleans.
+            .field("mcp_categories", &self.mcp_categories)
+            .field("mcp_activation", &self.mcp_activation)
+            .field("mcp_health_interval_secs", &self.mcp_health_interval_secs)
             // OffloadBackend redacts the Remote `auth_token`.
             .field("backends", &self.backends)
             // No secrets: plain saved command lines.
@@ -2226,6 +2255,16 @@ impl Default for OffloadSettings {
             command_allowlist: Vec::new(),
             command_policies: default_command_policies(),
             mcp_servers: Vec::new(),
+            // V37 C2: no categories, no overrides — every server rides its own
+            // `enabled` (true), so a fresh install and a migrated pre-v32 file
+            // advertise exactly the same surface.
+            mcp_categories: Vec::new(),
+            mcp_activation: McpActivation::default(),
+            // V37 C6: one probe a minute. Cheap for a stdio server (a
+            // non-blocking `try_wait`, no I/O at all) and one small POST for an
+            // HTTP one, while still noticing a dead endpoint inside two
+            // minutes — the flap guard needs two consecutive failures.
+            mcp_health_interval_secs: 60,
             backends: Vec::new(),
             server_command_templates: Vec::new(),
             remote_backend_templates: Vec::new(),
@@ -3160,6 +3199,89 @@ impl Default for OffloadToolToggles {
     }
 }
 
+/// V37 (contract C2): where an MCP server's definition came from.
+///
+/// `External` is every server the user pasted into Settings — an endpoint cImp
+/// neither ships nor supervises. `Internal` is reserved for servers cImp itself
+/// manages (#41's managed bundle); nothing in V37 *hosts* one, the flag only
+/// badges the row and scopes the V37 Phase E description screen, which applies
+/// to external surfaces only.
+///
+/// Defaults to `External` — the same direction the V32 `toolclass.rs` table
+/// takes for an unknown name, and the safe one: a server whose origin nobody
+/// declared is treated as untrusted, not as cImp's own.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum McpOrigin {
+    /// A server cImp itself manages (reserved; see #41).
+    Internal,
+    /// A user-configured third-party endpoint. The default.
+    #[default]
+    External,
+}
+
+/// V37 (contract C1/C2): a user-created grouping of MCP servers, referenced by
+/// server `name` (there is no parallel id space — the name IS the id).
+///
+/// The category list is **global-only**: a `Vec` is safe here precisely because
+/// no project overlay ever writes it, so `deep_merge`'s replace-arrays-wholesale
+/// rule (`persistence.rs`) can never half-merge two category lists. The
+/// per-project surface is [`McpActivation`], which is maps for exactly that
+/// reason.
+///
+/// Membership is many-to-many: a server may appear in several categories, and a
+/// server in no category rides its own toggle alone. See the effective-enable
+/// predicate `offload::mcp_host::effective_enable` — the single owner of that
+/// rule for both advertisement and dispatch.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct McpCategory {
+    /// Unique, user-chosen. This IS the category's id: renaming a category
+    /// creates a new identity, and any activation entry keyed by the old name
+    /// becomes inert (it names a category that no longer exists).
+    pub name: String,
+    /// Member server names ([`McpServerConfig::name`]). A name with no matching
+    /// server is simply ignored — membership is resolved against the live list.
+    pub servers: Vec<String>,
+    /// Global on/off for the whole category. A project overlay may override it
+    /// through [`McpActivation::categories`].
+    pub enabled: bool,
+}
+
+impl Default for McpCategory {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            // A freshly-created category is ON: creating a group must never
+            // silently take tools away from the surface (the V37 C2 migration
+            // invariant in the small).
+            enabled: true,
+            servers: Vec::new(),
+        }
+    }
+}
+
+/// V37 (contract C2): the per-project activation overlay — the ONLY part of the
+/// MCP registry a project settings overlay may carry.
+///
+/// Both halves are **maps keyed by name**, never arrays. `persistence::deep_merge`
+/// merges JSON objects key-by-key but replaces arrays *wholesale*, so an array
+/// here would mean a project that overrides one server silently discards every
+/// other project-level entry the global file carried. As maps, a project's
+/// `{"servers": {"ddg": false}}` overlays exactly that one key.
+///
+/// An entry is an OVERRIDE, not a copy: `Some(v)` wins over the global
+/// `enabled`, absence inherits it. That is what lets the UI show
+/// inherited-vs-overridden and offer a revert (delete the key).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct McpActivation {
+    /// Per-category overrides, keyed by [`McpCategory::name`].
+    pub categories: BTreeMap<String, bool>,
+    /// Per-server overrides, keyed by [`McpServerConfig::name`].
+    pub servers: BTreeMap<String, bool>,
+}
+
 /// One user-installed MCP tool server, aggregated by cImp's MCP host.
 /// Mirrors Claude Code's own `mcpServers` entry shape: either a stdio
 /// server (`command` + `args` + `env`) or an HTTP server (`url`). Only
@@ -3168,7 +3290,13 @@ impl Default for OffloadToolToggles {
 /// The hand-rolled `Debug` redacts `env` values, which may carry API
 /// keys, and (V33 Phase E) the HTTP transport's `auth_token`, so a stray
 /// `?settings` log line cannot leak either.
-#[derive(Clone, Serialize, Deserialize)]
+// V37 F5: `PartialEq`/`Eq` because the registry is written THROUGH to the
+// physical global settings file on save (`persistence::sync_mcp_registry_into`),
+// and that write-through only rewrites the file when the array actually moved.
+// Derived rather than hand-rolled: every field is connection- or
+// identity-relevant, so "equal" must mean all of them, and a field added later
+// must join the comparison without anyone remembering to.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct McpServerConfig {
     /// Display + namespacing prefix (e.g. `ddg`, `git`). Tools are
@@ -3207,6 +3335,26 @@ pub struct McpServerConfig {
     /// the v18 → v19 migration seeds it from `claude_access` so upgraders keep
     /// their web-research tools across both agents.
     pub opencode_access: bool,
+    /// V37 (contract C2): where this server came from — see [`McpOrigin`].
+    /// Metadata only in V37: it badges the Settings row and scopes the Phase E
+    /// tool-description screen to external surfaces. Defaults to `external`.
+    pub origin: McpOrigin,
+    /// V37 (contract C2/C3): the server's own global on/off switch, orthogonal
+    /// to the three per-consumer `*_access` flags.
+    ///
+    /// `*_access` answers *who may see this server*; `enabled` answers *does it
+    /// exist at all right now*. A disabled server is not connected, not
+    /// advertised to any consumer, and `call_for_consumer` refuses a stale call
+    /// naming the disabled state (contract C4). A project overlay may override
+    /// it through [`McpActivation::servers`]; membership of a disabled category
+    /// can turn it off even when this is `true`.
+    ///
+    /// Defaults to `true` — the C2 migration invariant: every pre-v32 config's
+    /// effective tool surface is unchanged after the upgrade.
+    ///
+    /// Part of `offload::mcp_host::config_sig`, so a toggle moves
+    /// `host_config_sig` and `warm_host` actually reconciles.
+    pub enabled: bool,
 }
 
 impl std::fmt::Debug for McpServerConfig {
@@ -3230,6 +3378,8 @@ impl std::fmt::Debug for McpServerConfig {
             .field("claude_access", &self.claude_access)
             .field("offload_access", &self.offload_access)
             .field("opencode_access", &self.opencode_access)
+            .field("origin", &self.origin)
+            .field("enabled", &self.enabled)
             .finish()
     }
 }
@@ -3246,6 +3396,10 @@ impl Default for McpServerConfig {
             claude_access: false,
             offload_access: true,
             opencode_access: false,
+            // V37 C2: unknown provenance ⇒ external (untrusted), and a server
+            // exists unless the user says otherwise.
+            origin: McpOrigin::External,
+            enabled: true,
         }
     }
 }
@@ -3667,11 +3821,42 @@ impl OffloadSettings {
     }
 
     /// Whether at least one MCP server is exposed to Claude Code.
+    ///
+    /// # V37 D-1, amended by Phase F: NOTHING here is spawn-baked any more
+    ///
+    /// **The new record.** The `cimp-offload` proxy child is written into EVERY
+    /// AI tab's harness config unconditionally (`harness::claude::overlay` /
+    /// `harness::opencode::config`), so neither `*_access` nor `enabled` decides
+    /// whether a tab has a proxy — every tab has one, and both flags are
+    /// re-read live: `*_access` picks the per-consumer surface at
+    /// `POST /mcp/list` time, `enabled` (with `mcp_categories` /
+    /// `mcp_activation`, via `offload::mcp_host::effective_enable`) is
+    /// re-evaluated on every reconcile and every dispatch. Flipping either one
+    /// reaches a running tab through the contract-C5 pulse. This predicate and
+    /// its two neighbours survive for HOST-LIFECYCLE and advertisement
+    /// decisions only; they no longer gate any injection.
+    ///
+    /// **The original warning, kept because its reasoning is what got us here.**
+    /// D-1 said: do not add an `enabled` term, because with every server
+    /// disabled at spawn time the tab would come up with no proxy and
+    /// re-enabling later could not reach it. That hazard was real, and Phase F
+    /// found the same hole one level up — `*_access` had it too, for a tab
+    /// spawned with zero grants. The fix was not a better predicate but removing
+    /// the spawn-time decision entirely. So the warning is now MOOT FOR
+    /// INJECTION (there is no injection gate left to poison) and still live for
+    /// [`Self::mcp_host_needed`]: a host that shut itself down because
+    /// everything was toggled off would have nothing left to turn back on.
+    ///
+    /// Spawn broadly — now maximally broadly — and enforce at dispatch.
     pub fn any_claude_mcp(&self) -> bool {
         self.mcp_servers.iter().any(|m| m.claude_access)
     }
 
     /// V19: whether at least one MCP server is exposed to OpenCode.
+    ///
+    /// V37 D-1 (as amended by Phase F): reads `opencode_access` and NOT
+    /// `enabled`, and gates no injection at all, for the reasons spelled out on
+    /// [`Self::any_claude_mcp`].
     pub fn any_opencode_mcp(&self) -> bool {
         self.mcp_servers.iter().any(|m| m.opencode_access)
     }
@@ -3683,6 +3868,24 @@ impl OffloadSettings {
     /// warm-host lifecycle. NOTE: runtime/loopback startup gates on the
     /// broader [`Settings::loopback_needed`] — graph and Code Audit children
     /// need the loopback without needing the host.
+    ///
+    /// V37 D-1: composed from the two `*_access` predicates, so it inherits
+    /// their deliberate blindness to `enabled` (see [`Self::any_claude_mcp`]).
+    /// The warm host must run whenever a server COULD become reachable: it is
+    /// the host that owns `effective_enable`, holds the disabled set behind
+    /// contract C4's refusal, and is the thing a re-enable has to reconcile
+    /// into. A host that shut itself down because everything was toggled off
+    /// would have nothing left to turn back on. **This is the one place D-1's
+    /// warning is still live** — Phase F retired its injection half, not this.
+    ///
+    /// V37 Phase F: this predicate must stay NARROW even though the proxy child
+    /// is now unconditional. The child is not a reason to hold a pool of
+    /// connections open: with no server exposed to anyone it asks
+    /// `POST /mcp/list` and gets an empty array from a torn-down host — which
+    /// is the correct answer, not a degraded one (`tool_defs_for_*` return
+    /// nothing when the pool is empty, and the child's own graph/offload tools
+    /// are unaffected). The first grant flips this predicate, `warm_host`
+    /// reconciles, and the pulse reaches the tab that was already listening.
     pub fn mcp_host_needed(&self) -> bool {
         self.enabled || self.any_claude_mcp() || self.any_opencode_mcp()
     }
@@ -5419,7 +5622,7 @@ mod tests {
     fn code_audit_field_names_mirrored_in_types_ts() {
         // Serialize a fully-populated CodeAuditSettings and assert each JSON key
         // appears in types.ts, so any field added on the Rust side must also
-        // land in the TS interface. The per-tool array is gone (schema v33):
+        // land in the TS interface. The per-tool array is gone (schema v34):
         // what a tool is configured with lives in `tool_plugins` now, and its
         // own mirror is `tool_plugins_field_names_mirrored_in_types_ts`.
         let s = CodeAuditSettings {
@@ -5442,7 +5645,7 @@ mod tests {
         // frontend would keep reading an array the backend no longer writes.
         assert!(
             !AUDIT_TS_TYPES.contains("tools: AuditToolConfig[]"),
-            "src/lib/settings/types.ts still declares `code_audit.tools`, which schema v33 \
+            "src/lib/settings/types.ts still declares `code_audit.tools`, which schema v34 \
              moved into `tool_plugins`"
         );
     }
@@ -5472,7 +5675,7 @@ mod tests {
     }
 
     /// A v23-era `code_audit` block still deserializes, and the per-tool array
-    /// it carries is simply not a field any more — the v32 → v33 migration is
+    /// it carries is simply not a field any more — the v33 → v34 migration is
     /// what moves it, and a file that skipped the migration must not fail to
     /// load over a key it no longer has a home for.
     #[test]
@@ -5774,6 +5977,95 @@ mod tests {
         let dbg = format!("{with_token:?}");
         assert!(!dbg.contains("sk-mcp-secret"), "{dbg}");
         assert!(dbg.contains("auth_token: \"<redacted>\""), "{dbg}");
+    }
+
+    /// V37 contract C2. Both new server fields must default to the values that
+    /// reproduce pre-v32 behaviour — a server EXISTS and its provenance is
+    /// UNTRUSTED — because the v31 → v32 migration deliberately writes no data
+    /// and leans entirely on these.
+    #[test]
+    fn mcp_server_config_defaults_origin_and_enabled() {
+        let cfg: McpServerConfig = serde_json::from_value(json!({
+            "name": "ddg",
+            "url": "http://172.21.1.11:17201/mcp",
+            "offload_access": true,
+        }))
+        .expect("a pre-V37 mcp server entry deserializes");
+        assert!(cfg.enabled, "a pre-v32 server must stay on the surface");
+        assert_eq!(cfg.origin, McpOrigin::External);
+        // Neither is a secret; the redacted Debug shows both.
+        let dbg = format!("{cfg:?}");
+        assert!(dbg.contains("enabled: true"), "{dbg}");
+        assert!(dbg.contains("origin: External"), "{dbg}");
+
+        // Explicit values round-trip, and `origin` uses the lowercase wire form
+        // the TS mirror (`src/lib/settings/types.ts`) writes.
+        let internal: McpServerConfig = serde_json::from_value(json!({
+            "name": "bundled",
+            "command": "cimp-mcp",
+            "origin": "internal",
+            "enabled": false,
+        }))
+        .expect("an explicit v32 entry deserializes");
+        assert_eq!(internal.origin, McpOrigin::Internal);
+        assert!(!internal.enabled);
+        let text = serde_json::to_string(&internal).unwrap();
+        assert!(text.contains("\"origin\":\"internal\""), "{text}");
+        let back: McpServerConfig = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.origin, McpOrigin::Internal);
+        assert!(!back.enabled);
+    }
+
+    /// V37 contract C2: the registry starts empty, and the activation halves
+    /// are OBJECTS on the wire. The shape is load-bearing, not cosmetic —
+    /// `persistence::deep_merge` merges objects per key but replaces arrays
+    /// wholesale, so an array here would make one project's override discard
+    /// every other entry (see `overlay_activation_merges_per_key`).
+    #[test]
+    fn offload_settings_default_registry_is_empty_and_activation_is_map_shaped() {
+        let o = OffloadSettings::default();
+        assert!(o.mcp_categories.is_empty());
+        assert!(o.mcp_activation.categories.is_empty());
+        assert!(o.mcp_activation.servers.is_empty());
+
+        // A pre-v32 offload block loads with the empty registry.
+        let parsed: OffloadSettings = serde_json::from_value(json!({ "enabled": true })).unwrap();
+        assert!(parsed.mcp_categories.is_empty());
+        assert!(parsed.mcp_activation.servers.is_empty());
+
+        // Round-trip with content, and check the wire shape.
+        let mut full = OffloadSettings {
+            mcp_servers: vec![McpServerConfig {
+                name: "ddg".into(),
+                url: "http://x/mcp".into(),
+                origin: McpOrigin::External,
+                enabled: true,
+                ..Default::default()
+            }],
+            mcp_categories: vec![McpCategory {
+                name: "research".into(),
+                servers: vec!["ddg".into()],
+                enabled: true,
+            }],
+            ..Default::default()
+        };
+        full.mcp_activation.servers.insert("ddg".into(), false);
+        full.mcp_activation
+            .categories
+            .insert("research".into(), true);
+
+        let v = serde_json::to_value(&full).unwrap();
+        assert!(v["mcp_activation"]["servers"].is_object(), "{v}");
+        assert!(v["mcp_activation"]["categories"].is_object(), "{v}");
+        assert!(v["mcp_categories"].is_array(), "{v}");
+
+        let back: OffloadSettings = serde_json::from_value(v).unwrap();
+        assert_eq!(back.mcp_categories.len(), 1);
+        assert_eq!(back.mcp_categories[0].servers, vec!["ddg".to_string()]);
+        assert_eq!(back.mcp_activation.servers.get("ddg"), Some(&false));
+        assert_eq!(back.mcp_activation.categories.get("research"), Some(&true));
+        // A fresh category is ON: creating a group never silently hides tools.
+        assert!(McpCategory::default().enabled);
     }
 
     #[test]

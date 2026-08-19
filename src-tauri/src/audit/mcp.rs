@@ -503,6 +503,8 @@ pub async fn run_audit(
             // tab, absent ⇒ the worker, which has none.
             crate::activity::Attribution::from_child_argv(tab),
             None,
+            None,
+            None,
         ),
         request: format!("{tool} ({source})"),
         // The RAW report, deliberately: this row is read by a human in the Tool

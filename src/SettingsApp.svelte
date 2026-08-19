@@ -60,7 +60,6 @@
     offloadServiceStatus,
     offloadReloadMcp,
     offloadEnableReadonlyCommands,
-    describeMcpServerHealth,
     detectionStatus,
     detectionCheckNow,
     detectionRevert,
@@ -78,7 +77,6 @@
     ToolScope,
     BackendTier,
     CommandPolicy,
-    McpServerConfig,
     ServerCommandTemplate,
     RemoteBackendTemplate,
     PromptTemplate,
@@ -102,6 +100,9 @@
   import BackgroundConfigEditor from './lib/settings/BackgroundConfigEditor.svelte';
   import ChecksEditor from './lib/settings/ChecksEditor.svelte';
   import { formatDetect } from './lib/settings/codeAudit';
+  // V37 Phase D: the MCP-servers section's body, extracted (contract C8).
+  import McpManagementEditor from './lib/settings/McpManagementEditor.svelte';
+  import type { McpRegistry } from './lib/settings/mcpEditor';
   import {
     AUDIT_PLUGIN_KEY,
     errorRows,
@@ -1016,87 +1017,39 @@
     if (updated) snapshot = updated;
   }
   // ── MCP tool servers (MCP servers section) ─────────────────────────────
-  // Add/remove/toggle with live host reload — no cImp restart. Edits persist
-  // through the same awaited `applySettings` the rest of the panel uses; once
-  // the backend has the new value we call `offload_reload_mcp`, which
-  // reconciles the warm MCP host and returns fresh health for the status list.
-  function uniqueMcpName(base: string): string {
-    const names = new Set((snapshot?.offload.mcp_servers ?? []).map((m) => m.name));
-    if (!names.has(base)) return base;
-    let i = 2;
-    while (names.has(`${base}-${i}`)) i++;
-    return `${base}-${i}`;
-  }
-  // Persist `next` to the backend and wait for it (so the live reload below
-  // reconciles against the new config, not the stale one). Mirrors `patch` but
-  // awaitable.
-  async function applyMcp(updater: (s: Settings) => void): Promise<void> {
+  // V37 Phase D (contract C8): the editor itself is `McpManagementEditor`. What
+  // stays here is the persistence seam, because only this file owns `snapshot`
+  // and the awaited `applySettings` the rest of the panel uses.
+  //
+  // Two callbacks, deliberately distinct:
+  //
+  // * `setMcpRegistry` — the LOCAL snapshot only, no backend write. Text fields
+  //   commit on blur rather than per keystroke: persisting per keystroke raced,
+  //   because fire-and-forget `applySettings` calls could complete out of order
+  //   and leave the backend holding a half-typed URL, which the 12s health watch
+  //   would then flag as down.
+  // * `applyMcpRegistry` — ONE awaited `settings_update` followed by ONE
+  //   `offload_reload_mcp` (contract C5's UI half). Awaited in that order so the
+  //   reconcile runs against the new config rather than the stale one, and a
+  //   category toggle spanning N servers is still exactly one of each.
+  function setMcpRegistry(next: McpRegistry): void {
     if (!snapshot) return;
-    const next = structuredClone($state.snapshot(snapshot));
-    updater(next);
-    snapshot = next;
-    await applySettings(next);
+    const s = structuredClone($state.snapshot(snapshot));
+    s.offload.mcp_servers = next.servers;
+    s.offload.mcp_categories = next.categories;
+    s.offload.mcp_activation = next.activation;
+    snapshot = s;
   }
-  // Reconcile the warm host now and fold the fresh status into the read-only
-  // list above the editor.
-  async function reloadMcpHost(): Promise<void> {
-    const status = await offloadReloadMcp();
-    if (status) serviceStatus = status;
-  }
-  // A text-field edit (name/url): update the local snapshot ONLY — no backend
-  // write per keystroke. The full snapshot is persisted on blur/Enter
-  // (`commitMcpEdits`), which also reloads the host. Persisting per keystroke
-  // (the old `patch` path) raced: fire-and-forget `applySettings` calls could
-  // complete out of order and leave the backend holding a half-typed URL, which
-  // the 12s health watch would then flag as down.
-  function setMcpServer(i: number, fn: (m: McpServerConfig) => void): void {
-    if (!snapshot) return;
-    const next = structuredClone($state.snapshot(snapshot));
-    fn(next.offload.mcp_servers[i]);
-    snapshot = next;
-  }
-  // Blur handler for the name/url inputs: ensure the latest snapshot is
-  // persisted, then reload the host.
-  async function commitMcpEdits(): Promise<void> {
+  async function applyMcpRegistry(next: McpRegistry): Promise<void> {
+    setMcpRegistry(next);
     if (!snapshot) return;
     await applySettings($state.snapshot(snapshot));
     await reloadMcpHost();
   }
-  function addMcpServer(): void {
-    // New rows default to an HTTP endpoint (empty url → shows "down" until
-    // filled); no reload yet since there's nothing to connect to.
-    patch((s) => {
-      s.offload.mcp_servers = [
-        ...s.offload.mcp_servers,
-        {
-          name: uniqueMcpName('server'),
-          command: '',
-          args: [],
-          env: {},
-          url: '',
-          claude_access: false,
-          offload_access: true,
-          opencode_access: false,
-          auth_token: '',
-        },
-      ];
-    });
-  }
-  async function removeMcpServer(i: number): Promise<void> {
-    await applyMcp((s) => {
-      s.offload.mcp_servers = s.offload.mcp_servers.filter((_, idx) => idx !== i);
-    });
-    await reloadMcpHost();
-  }
-  async function setMcpAccess(
-    i: number,
-    field: 'claude_access' | 'offload_access' | 'opencode_access',
-    value: boolean,
-  ): Promise<void> {
-    await applyMcp((s) => {
-      s.offload.mcp_servers[i][field] = value;
-    });
-    await reloadMcpHost();
+  // Reconcile the warm host now and fold the fresh status into the health chips.
+  async function reloadMcpHost(): Promise<void> {
+    const status = await offloadReloadMcp();
+    if (status) serviceStatus = status;
   }
   // Comma-separated <-> string[] for the flag/subcommand inputs (mirrors the
   // allowlist input). Empty entries are dropped.
@@ -5703,136 +5656,26 @@
           <small class="hint top">
             Model Context Protocol servers cImp connects to and keeps warm. Each
             server's read-class tools (web search, fetch, docs, …) can be exposed
-            to <strong>Claude Code</strong> directly and/or to the
-            <strong>offload worker</strong> — toggle per server below.
+            to <strong>Claude Code</strong>, to <strong>OpenCode</strong> and/or
+            to the <strong>offload worker</strong> — per server, below.
             Write/destructive tools are filtered out. Exposing a server to Claude
             Code works whether or not offload is enabled.
           </small>
-
-          <h3>Server status</h3>
-          <small class="hint top">
-            Live health of the warm MCP host's connections. Updates as you add,
-            remove, or enable/disable servers below — no cImp restart needed.
-          </small>
-          {#if serviceStatus && serviceStatus.mcp_servers.length > 0}
-            <ul class="mcp-health">
-              {#each serviceStatus.mcp_servers as srv (srv.name)}
-                <li class:healthy={srv.healthy} class:down={!srv.healthy}>
-                  <span class="mcp-dot" aria-hidden="true"></span>
-                  <span class="mcp-name">{srv.name}</span>
-                  <span class="mcp-detail">{describeMcpServerHealth(srv)}</span>
-                </li>
-              {/each}
-            </ul>
-          {:else if snapshot.offload.mcp_servers.length > 0}
-            <small class="hint">
-              {snapshot.offload.mcp_servers.length} server(s) configured —
-              health appears once the warm MCP host is running (it starts when
-              offload is enabled or any server is exposed to Claude Code).
-            </small>
-          {:else}
-            <small class="hint">No MCP servers configured yet.</small>
-          {/if}
-
-          <h3>Tool servers</h3>
-          <small class="hint top">
-            Add an HTTP MCP endpoint by name + URL; changes apply live for the
-            warm host and the offload worker. cImp's warm MCP host aggregates
-            the read-class tools from these servers and keeps the connections
-            warm. Claude Code and OpenCode capture their tool list when the tab
-            starts — after adding a server or flipping its Claude Code/OpenCode
-            exposure, restart the tab (Tabs → Restart) for the tools to appear.
-            Advanced stdio servers (command/args/env) remain editable in
-            <code>settings.json</code> under <code>offload.mcp_servers</code>.
-          </small>
-          <!-- Keyed by index deliberately: name/url are editable and the
-               snapshot is replaced (cloned) on every edit, so a name/url/object
-               key would change mid-edit and drop input focus. Inputs are
-               controlled (`value={…}`), so values always track the data after a
-               removal/reorder, and removal is button-triggered (no focused text
-               field to bleed) — the index-key caveat is harmless here. -->
-          {#each snapshot.offload.mcp_servers as srv, i (i)}
-            <div class="mcp-row">
-              <div class="mcp-line">
-                <label class="mcp-field grow">
-                  <span>Name</span>
-                  <input
-                    type="text"
-                    placeholder="duckduckgo"
-                    value={srv.name}
-                    oninput={(e) =>
-                      setMcpServer(i, (m) => (m.name = (e.currentTarget as HTMLInputElement).value.trim()))}
-                    onchange={commitMcpEdits}
-                  />
-                </label>
-                <button type="button" class="secondary danger" onclick={() => removeMcpServer(i)}>
-                  Remove
-                </button>
-              </div>
-              <label class="mcp-field">
-                <span>URL</span>
-                <input
-                  type="text"
-                  placeholder="http://host:port/mcp"
-                  value={srv.url}
-                  oninput={(e) =>
-                    setMcpServer(i, (m) => (m.url = (e.currentTarget as HTMLInputElement).value.trim()))}
-                  onchange={commitMcpEdits}
-                />
-              </label>
-              <!-- V33: the token belongs on this row, not in settings.json with
-                   command/args/env, because it is an HTTP concern — it becomes
-                   an `Authorization` header on the URL above, and this editor
-                   IS the HTTP editor. stdio servers pass secrets through `env`
-                   and are unaffected. Same commit path as name/url: keystrokes
-                   update the snapshot only, `onchange` persists AND reloads the
-                   warm host — the token is part of the Rust `config_sig`, so
-                   without that reload an edit here would never reconnect. -->
-              <label class="mcp-field">
-                <span>Auth token (HTTP, optional)</span>
-                <input
-                  type="password"
-                  placeholder="Bearer token — leave empty for no auth"
-                  value={srv.auth_token ?? ''}
-                  oninput={(e) =>
-                    setMcpServer(i, (m) => (m.auth_token = (e.currentTarget as HTMLInputElement).value))}
-                  onchange={commitMcpEdits}
-                />
-              </label>
-              <div class="mcp-enable-row">
-                <label class="mcp-enable" title="Expose this server's tools to Claude Code">
-                  <input
-                    type="checkbox"
-                    checked={srv.claude_access}
-                    onchange={(e) =>
-                      setMcpAccess(i, 'claude_access', (e.currentTarget as HTMLInputElement).checked)}
-                  />
-                  <span>Claude Code</span>
-                </label>
-                <label class="mcp-enable" title="Expose this server's tools to the offload worker">
-                  <input
-                    type="checkbox"
-                    checked={srv.offload_access}
-                    onchange={(e) =>
-                      setMcpAccess(i, 'offload_access', (e.currentTarget as HTMLInputElement).checked)}
-                  />
-                  <span>Offload</span>
-                </label>
-                <label class="mcp-enable" title="Expose this server's tools to OpenCode">
-                  <input
-                    type="checkbox"
-                    checked={srv.opencode_access}
-                    onchange={(e) =>
-                      setMcpAccess(i, 'opencode_access', (e.currentTarget as HTMLInputElement).checked)}
-                  />
-                  <span>OpenCode</span>
-                </label>
-              </div>
-            </div>
-          {/each}
-          <div class="button-row mcp-add">
-            <button type="button" onclick={addMcpServer}>Add MCP server</button>
-          </div>
+          <!-- V37 Phase D (contract C8): the body of this section is
+               `McpManagementEditor` — registry, categories, per-project
+               activation and health chips. The two callbacks are the whole
+               contract between it and this file, which owns `snapshot`. -->
+          <McpManagementEditor
+            servers={snapshot.offload.mcp_servers}
+            categories={snapshot.offload.mcp_categories}
+            activation={snapshot.offload.mcp_activation}
+            health={serviceStatus?.mcp_servers ?? []}
+            healthIntervalSecs={snapshot.offload.mcp_health_interval_secs}
+            onedit={setMcpRegistry}
+            onapply={applyMcpRegistry}
+            onhealthinterval={(secs) =>
+              patch((s) => (s.offload.mcp_health_interval_secs = secs))}
+          />
         </section>
       {:else if activeSection === 'graph'}
         <section>
@@ -8166,7 +8009,8 @@
     color: var(--text-secondary);
   }
   /* V32 C3 — one updatable detection component: a header line, its mode
-     select, and the three buttons. Boxed like `.mcp-row` so the two components
+     select, and the three buttons. Boxed like the MCP editor's server rows
+     so the two components
      read as two units rather than one long column of controls. */
   .updater-row {
     display: flex;
@@ -8204,32 +8048,6 @@
     margin: var(--space-4) 0 var(--space-1) 0;
     color: var(--text-primary);
   }
-  /* Editable MCP server groups: three stacked lines per server —
-     name + remove, full-width URL, then the access checkboxes. */
-  .mcp-row {
-    display: flex;
-    flex-direction: column;
-    gap: 0.35rem;
-    margin-top: 0.4rem;
-  }
-  .mcp-row + .mcp-row {
-    /* Two blank-line-ish breathing room between server info groups. */
-    margin-top: 1.5rem;
-  }
-  .button-row.mcp-add {
-    margin-top: 1.5rem;
-  }
-  .mcp-line {
-    display: flex;
-    align-items: flex-end;
-    gap: 0.5rem;
-  }
-  .mcp-enable-row {
-    display: flex;
-    align-items: center;
-    gap: 1rem;
-    flex-wrap: wrap;
-  }
   /* LLM pricing editor: shared column template so the header row and every
      data row line up as a table. Provider/model get the flexible tracks; the
      four $/MTok fields are fixed-width numerics. */
@@ -8250,30 +8068,6 @@
   .pricing-head-row .num,
   .pricing-row input.num {
     text-align: right;
-  }
-  .mcp-field {
-    display: flex;
-    flex-direction: column;
-    gap: 0.15rem;
-    /* Cancel the global `label` bottom margin: the .mcp-row column gap owns
-       line spacing, and the stray margin misaligns the Remove button. */
-    margin-bottom: 0;
-  }
-  .mcp-field.grow {
-    flex: 1 1 16rem;
-  }
-  .mcp-field input {
-    width: 100%;
-  }
-  .mcp-enable {
-    display: flex;
-    align-items: center;
-    gap: 0.3rem;
-    white-space: nowrap;
-    margin-bottom: 0;
-  }
-  .mcp-enable input {
-    width: auto;
   }
   .offload-test-result {
     margin-top: 0.5rem;

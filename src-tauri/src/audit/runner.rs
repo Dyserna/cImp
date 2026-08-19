@@ -1616,6 +1616,8 @@ fn record_audit_run(name: &str, root: &Path, findings: usize, ms: u64, ok: bool)
             // cImp runs the scanner itself — no calling tab.
             activity::Attribution::Headless,
             None,
+            None,
+            None,
         ),
         request: format!("audit scan: {name}"),
         response: format!("{findings} findings"),

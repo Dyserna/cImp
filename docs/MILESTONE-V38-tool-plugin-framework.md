@@ -298,7 +298,7 @@ the storage location moves, not the capability.
   `Adapter` table and `audit/parsers.rs` are gone; `adapters.rs` keeps only what
   is not per-tool configuration (`Category`, `Transport`, `classify_exit`), and
   `AuditParser` moved beside the kind-aware resolution that produces it. Schema
-  v32 → v33 moves `code_audit.tools` into `tool_plugins` in the same commit that
+  v33 → v34 moves `code_audit.tools` into `tool_plugins` in the same commit that
   switches the reader. Four built-in-only manifest fields carry what the tier
   needs and a scanned file may not have (`ingest`, `command`,
   `project_local_bin`, `dir_argv`), each refused on the scanned path by the

@@ -44,6 +44,8 @@ function entry(id: number, over: Partial<ActivityEntry> = {}): ActivityEntry {
     ok: true,
     tab: 'unattributed',
     session: null,
+    server: null,
+    category: null,
     ...over,
   };
 }
@@ -357,8 +359,142 @@ describe('rowStatus', () => {
       // Phase A added it — the tooltip existed, but nothing checked it did.
       'unsandboxed',
       'boundary',
+      // V37 C6 health lane.
+      'unhealthy',
+      'recovered',
+      // V37 C9: a tool withheld by description screening.
+      'withheld',
     ];
     for (const s of all) expect(STATUS_TITLE[s].length).toBeGreaterThan(0);
+  });
+});
+
+// ── V37 C6: mcp_health rows ───────────────────────────────────────────────
+//
+// Same discipline as the lifecycle feed below: the verb is in `tool`, and `ok`
+// is the transition's OUTCOME. Reading `ok` first would render "this server
+// came back" and "this call succeeded" as the same word in a lane whose whole
+// purpose is telling you a server went away.
+
+/// One `mcp_health` row for transition `tool`.
+function mcpHealth(tool: string, ok: boolean, over: Partial<ActivityEntry> = {}): ActivityEntry {
+  return entry(1, {
+    kind: 'mcp_health',
+    source: tool === 'connect_failed' ? 'connect' : 'probe',
+    tool,
+    ok,
+    server: 'ddg',
+    category: 'research',
+    ...over,
+  });
+}
+
+describe('rowStatus — mcp health', () => {
+  it('gives the down transitions and the recovery different words', () => {
+    expect(rowStatus(mcpHealth('unhealthy', false))).toBe('unhealthy');
+    expect(rowStatus(mcpHealth('connect_failed', false))).toBe('unhealthy');
+    expect(rowStatus(mcpHealth('healthy', true))).toBe('recovered');
+  });
+
+  it('never borrows the offload-server vocabulary', () => {
+    // `down`/`ready` are written about a process cImp owns and stopped; an MCP
+    // server is somebody else's, and the tooltips say so.
+    const seen = [rowStatus(mcpHealth('unhealthy', false)), rowStatus(mcpHealth('healthy', true))];
+    expect(seen).not.toContain('down');
+    expect(seen).not.toContain('ready');
+    expect(seen).not.toContain('stopped');
+  });
+
+  it('falls back on ok for a transition this build predates', () => {
+    expect(rowStatus(mcpHealth('quarantined', false))).toBe('unhealthy');
+    expect(rowStatus(mcpHealth('quarantined', true))).toBe('recovered');
+  });
+
+  it('does not classify an ordinary mcp CALL row as a health row', () => {
+    // The two kinds share a server but not a lane: a failed call is a failed
+    // call, not a server going down (that is exactly what the flap guard is
+    // for).
+    const call = entry(2, { kind: 'mcp', tool: 'ddg__search', ok: false, server: 'ddg' });
+    expect(rowStatus(call)).toBe('failed');
+  });
+});
+
+// ── V37 C9: tools withheld by description screening ───────────────────────
+//
+// These rows land in the `mcp` lane with `ok: false` and `source: "screen"` —
+// the wire value the Rust side pins in one constant (`SCREEN_DROP_SOURCE` in
+// `mcp_host.rs`), because a reader has to be able to tell a screening row from a
+// call row without parsing prose. With no branch for them the classifier fell
+// through to `failed`, whose sentence is "Call failed" — a claim about a call
+// that was never made. `flagged` would be worse: its sentence promises "nothing
+// was blocked", and this is the one site in cImp where detection really does
+// remove something.
+
+/// One `mcp`-lane screening row for the withheld tool `tool`.
+function screenDrop(tool: string, over: Partial<ActivityEntry> = {}): ActivityEntry {
+  return entry(3, {
+    kind: 'mcp',
+    source: 'screen',
+    tool,
+    target:
+      'withheld from `evil` advertised tools: the injection screen flagged its name or description',
+    ok: false,
+    server: 'evil',
+    category: 'research',
+    ...over,
+  });
+}
+
+describe('rowStatus — screen-withheld tools', () => {
+  it('gives a withheld tool its own status, not a failed call', () => {
+    const s = rowStatus(screenDrop('exfiltrate'));
+    expect(s).toBe('withheld');
+    expect(s).not.toBe('failed');
+  });
+
+  it('never reports a withheld tool as merely flagged', () => {
+    // `flagged` means delivered-anyway, and its tooltip says so out loud. This
+    // row is the opposite fact.
+    expect(rowStatus(screenDrop('exfiltrate'))).not.toBe('flagged');
+    expect(STATUS_TITLE.flagged).toContain('nothing was blocked');
+    expect(STATUS_TITLE.withheld).not.toContain('nothing was blocked');
+  });
+
+  it('says the tool was withheld and that the server is unaffected', () => {
+    const t = STATUS_TITLE.withheld;
+    expect(t).toContain('WITHHELD');
+    expect(t).toContain('unaffected');
+    expect(t).toContain('re-screened');
+  });
+
+  it('keys on the exact wire source, not on kind alone', () => {
+    // An ordinary failed CALL row on the same lane and the same server stays
+    // `failed`: only `source === "screen"` marks a screening row, and matching
+    // it loosely (a prefix, a substring) would relabel real failures.
+    const call = entry(4, { kind: 'mcp', tool: 'ddg__search', ok: false, server: 'ddg' });
+    expect(rowStatus(call)).toBe('failed');
+    expect(rowStatus(screenDrop('x', { source: 'screening' }))).toBe('failed');
+    // …and the source alone does not hijack another lane.
+    expect(rowStatus(entry(5, { kind: 'graph', source: 'screen', ok: false }))).toBe('failed');
+  });
+});
+
+describe('mcp identity columns', () => {
+  it('carries server and category through the poll merge untouched', () => {
+    // `mergeEntries` reuses row objects by id; the identity columns must ride
+    // along rather than be recomputed anywhere on this side.
+    const row = entry(9, { kind: 'mcp', tool: 'git__extra__log', server: 'git__extra', category: 'vcs' });
+    const merged = mergeEntries([], [row]);
+    expect(merged[0].server).toBe('git__extra');
+    expect(merged[0].category).toBe('vcs');
+    // The `__` split the backend refuses to do would have said `git`.
+    expect(merged[0].server).not.toBe('git');
+  });
+
+  it('treats a null server as absent, not as an empty name', () => {
+    const row = entry(10, { kind: 'graph' });
+    expect(row.server).toBeNull();
+    expect(row.category).toBeNull();
   });
 });
 
@@ -540,5 +676,31 @@ describe('rowStatus — plugin discovery', () => {
     expect(rowStatus(plug('rescan', false, { source: 'plugins', target: 'loaded 1 · rejected 1' }))).toBe(
       'failed',
     );
+  });
+});
+
+// Every RowStatus word must have pixels. The chip's class IS the status word
+// (`<span class="schip {status}">` in StatusChip.svelte), so a status missing
+// from that component's scoped <style> renders as the bare base chip — which
+// is how "a server went down" and "a server came back" briefly drew identically
+// (the V37 close-out review found `unhealthy`/`recovered` styleless: the
+// F-V37-1 defect class, one layer down). STATUS_TITLE's Record type is the
+// tooltip-completeness guard; this is its CSS twin. Raw-source mechanism per
+// settingsPointers.test.ts: Vite's glob, not node:fs.
+const STATUS_CHIP_SOURCE = import.meta.glob('/src/lib/StatusChip.svelte', {
+  query: '?raw',
+  import: 'default',
+  eager: true,
+}) as Record<string, string>;
+
+describe('StatusChip covers every RowStatus', () => {
+  it('has a .schip.<status> rule for each STATUS_TITLE key', () => {
+    const css = Object.values(STATUS_CHIP_SOURCE)[0] ?? '';
+    expect(css.length).toBeGreaterThan(0);
+    for (const status of Object.keys(STATUS_TITLE)) {
+      expect(css, `StatusChip.svelte has no .schip.${status} rule`).toMatch(
+        new RegExp(String.raw`\.schip\.${status}\b`),
+      );
+    }
   });
 });

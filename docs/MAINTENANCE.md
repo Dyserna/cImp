@@ -1332,7 +1332,7 @@ in the **Quality** sub-tab:
 
 16. Take a pre-V38 config (schema ≤ 32, with a `code_audit.tools` array — e.g. a
     v0.43/v0.44 `settings.json` carrying only the three security ids, or a
-    fully-configured v0.52 one), launch → the v32 → v33 migration moves it into
+    fully-configured v0.52 one), launch → the v33 → v34 migration moves it into
     `tool_plugins` under `cimp-audit@1`. Check in Settings → Tool Plugins that
     every customization survived (disabled / custom path / extra arguments /
     timeout / ruleset), that the tools the old file never mentioned are present

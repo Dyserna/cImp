@@ -876,7 +876,7 @@ fields of § 2.5, each one documented, refused on the scanned path, and gated on
 the loader's provenance stamp rather than on the `cimp-` name.
 
 **These are settings keys.** Per-tool enables, timeouts, variable values and
-binary paths are stored under `cimp-audit@1/<tool-id>`, and the schema v32 → v33
+binary paths are stored under `cimp-audit@1/<tool-id>`, and the schema v33 → v34
 migration writes exactly these strings when it moves the pre-V38
 `code_audit.tools` array into the container. The `1` is the identity of the
 shipped set, not the cImp release it came in — bumping it would orphan every

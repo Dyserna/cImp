@@ -77,6 +77,10 @@ fn row(source: String, tool: &str, target: String, ok: bool, ms: u64, detail: St
             ok,
             Attribution::Headless,
             None,
+            // V37 added `server`/`category`: MCP-row columns. A plugin
+            // discovery row is about a manifest file, not about a server.
+            None,
+            None,
         ),
         request: String::new(),
         response: detail,

@@ -331,6 +331,11 @@ const MIGRATION_STEPS: &[MigrationStep] = &[
         detect: looks_v32,
         transform: migrate_v32_to_v33_step,
     },
+    MigrationStep {
+        from_version: "v33",
+        detect: looks_v33,
+        transform: migrate_v33_to_v34_step,
+    },
 ];
 
 // --- Uniform-signature wrappers -------------------------------------------
@@ -2474,27 +2479,32 @@ fn migrate_v31_to_v32_step(value: &mut Value, _shell: &ShellSpec) {
     migrate_v31_to_v32(value)
 }
 
-/// V31 → V32: pure version stamp for the V38 `tool_plugins` container.
+/// V31 → V32: pure version stamp for the V37 MCP registry fields.
 ///
-/// **Nothing moves.** V38 Phase B adds one additive
-/// [`ToolPluginsSettings`](crate::settings::schema::ToolPluginsSettings) block
-/// carrying `#[serde(default)]`, so an existing v31 file deserializes with an
-/// empty container and behaves byte-for-byte as before — there is no data to
-/// transform, and every consumer of an empty container sees "no plugins
-/// configured", which is the truth on a machine that has never had one.
+/// V37 Phase A (contract C2) adds four additive fields, every one of which
+/// deserializes from an absent key to the value that reproduces pre-V37
+/// behaviour exactly:
 ///
-/// It is stamped anyway, following the v23 → v24 / v28 → v29 / v30 → v31
-/// precedent for additive-only changes, and for one reason of its own: this is
-/// the version boundary the LATER move gates on. Phase E migrates
-/// `code_audit.tools` into this container in the same commit that switches the
-/// reader, as a v32 → v33 step — and that step needs a version to detect. An
-/// unversioned addition would leave it testing for the presence of keys the
-/// user may legitimately not have.
+/// * `offload.mcp_servers[].enabled` → `true` (the server exists),
+/// * `offload.mcp_servers[].origin` → `external` (unknown provenance is
+///   untrusted — the safe direction, and metadata-only in V37),
+/// * `offload.mcp_categories` → `[]` (no categories),
+/// * `offload.mcp_activation` → `{categories:{}, servers:{}}` (no overrides).
 ///
-/// Deliberately NOT touching `code_audit`: every intermediate tree has to stay
-/// releasable (the user cuts RCs from it), and a container that exists but is
-/// not yet read by anything is releasable, while a half-moved `code_audit` is
-/// not.
+/// **The C2 invariant this step exists to protect**: the *effective tool
+/// surface* of every existing config is unchanged after migration. It holds
+/// because the effective-enable predicate
+/// (`offload::mcp_host::effective_enable`) reduces to the server's own
+/// `enabled` when no category contains it — and after this step no category
+/// contains anything, because there are no categories. So there is **no data
+/// transform to do**; the schema tests
+/// `mcp_server_config_defaults_origin_and_enabled` and
+/// `offload_settings_default_registry_is_empty` pin the defaults this relies on.
+///
+/// It is stamped anyway, following the v23 → v24, v28 → v29 and v30 → v31
+/// precedent for additive-only changes: the marker is what a later step gates
+/// on, and what tells a future reader whether a file could carry a category
+/// list at all.
 ///
 /// Idempotent: a second pass finds `schema_version == 32` so `looks_v31` is
 /// false.
@@ -2521,6 +2531,50 @@ fn migrate_v32_to_v33_step(value: &mut Value, _shell: &ShellSpec) {
     migrate_v32_to_v33(value)
 }
 
+/// V31 → V33: pure version stamp for the V38 `tool_plugins` container.
+///
+/// **Nothing moves.** V38 Phase B adds one additive
+/// [`ToolPluginsSettings`](crate::settings::schema::ToolPluginsSettings) block
+/// carrying `#[serde(default)]`, so an existing v31 file deserializes with an
+/// empty container and behaves byte-for-byte as before — there is no data to
+/// transform, and every consumer of an empty container sees "no plugins
+/// configured", which is the truth on a machine that has never had one.
+///
+/// It is stamped anyway, following the v23 → v24 / v28 → v29 / v30 → v31
+/// precedent for additive-only changes, and for one reason of its own: this is
+/// the version boundary the LATER move gates on. Phase E migrates
+/// `code_audit.tools` into this container in the same commit that switches the
+/// reader, as a v33 → v34 step — and that step needs a version to detect. An
+/// unversioned addition would leave it testing for the presence of keys the
+/// user may legitimately not have.
+///
+/// Deliberately NOT touching `code_audit`: every intermediate tree has to stay
+/// releasable (the user cuts RCs from it), and a container that exists but is
+/// not yet read by anything is releasable, while a half-moved `code_audit` is
+/// not.
+fn migrate_v32_to_v33(value: &mut Value) {
+    let Some(root) = value.as_object_mut() else {
+        return;
+    };
+    // Stamps a *literal* 33 (not `CURRENT_SCHEMA_VERSION`): the v33 → v34 step
+    // runs next in the same cascade pass and gates on `schema_version == 33`.
+    root.insert(
+        "schema_version".to_string(),
+        Value::Number(serde_json::Number::from(33u8)),
+    );
+}
+
+fn looks_v33(value: &Value) -> bool {
+    value
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .is_some_and(|v| v == 33)
+}
+
+fn migrate_v33_to_v34_step(value: &mut Value, _shell: &ShellSpec) {
+    migrate_v33_to_v34(value)
+}
+
 /// The fourteen built-in audit tool ids, and nothing else this step needs to
 /// know about them.
 ///
@@ -2533,12 +2587,12 @@ fn migrate_v32_to_v33_step(value: &mut Value, _shell: &ShellSpec) {
 /// how a migration starts producing a different result for the same input file
 /// on two different releases.
 ///
-/// The ids are the pre-v33 `code_audit.tools[].id` wire names, which are also
+/// The ids are the pre-v34 `code_audit.tools[].id` wire names, which are also
 /// the tool ids in `plugins/builtin/cimp-audit.json` — that identity is what
 /// makes this a move of the STORAGE rather than a rename of the tools, and
-/// `the_v33_migration_ids_are_the_shipped_roster` checks it has not quietly
+/// `the_v34_migration_ids_are_the_shipped_roster` checks it has not quietly
 /// stopped being true.
-const V33_AUDIT_TOOL_IDS: &[&str] = &[
+const V34_AUDIT_TOOL_IDS: &[&str] = &[
     "osv-scanner",
     "gitleaks",
     "semgrep",
@@ -2555,11 +2609,11 @@ const V33_AUDIT_TOOL_IDS: &[&str] = &[
     "semgrep-quality",
 ];
 
-/// The `tool_plugins` key the v33 container writes the built-in audit tools
+/// The `tool_plugins` key the v34 container writes the built-in audit tools
 /// under. A literal for the same reason the id list is one.
-const V33_AUDIT_PLUGIN_KEY: &str = "cimp-audit@1";
+const V34_AUDIT_PLUGIN_KEY: &str = "cimp-audit@1";
 
-/// V32 → V33: move `code_audit.tools` into the `tool_plugins` container.
+/// V33 → V34: move `code_audit.tools` into the `tool_plugins` container.
 ///
 /// V38 Phase E turned the fourteen built-in scanners into embedded plugin
 /// manifests, so the array that configured them has no field to deserialize
@@ -2568,7 +2622,7 @@ const V33_AUDIT_PLUGIN_KEY: &str = "cimp-audit@1";
 ///
 /// The mapping, field by field:
 ///
-/// | v32 `code_audit.tools[]` | v33 |
+/// | v33 `code_audit.tools[]` | v34 |
 /// |---|---|
 /// | `enabled` | `tool_plugins.plugins["cimp-audit@1"].tools[<id>].enabled` |
 /// | `timeout_secs` | …`.timeout_secs` |
@@ -2579,7 +2633,7 @@ const V33_AUDIT_PLUGIN_KEY: &str = "cimp-audit@1";
 /// Three decisions worth stating rather than leaving to be reverse-engineered:
 ///
 /// * **`path` goes to the machine-wide map, not a per-project one.** It was
-///   already machine scope before v33 (the load/save write-through pair existed
+///   already machine scope before v34 (the load/save write-through pair existed
 ///   precisely to keep it out of project overlays), so the machine-wide map is
 ///   where it already lived — moving it into a project map would *narrow* it.
 /// * **An empty `ruleset` writes nothing.** Empty meant "use the tool's own
@@ -2595,9 +2649,9 @@ const V33_AUDIT_PLUGIN_KEY: &str = "cimp-audit@1";
 /// "is gitleaks on?" in one file, and the one nothing reads would be the one a
 /// person editing by hand would find first.
 ///
-/// Idempotent: a second pass finds `schema_version == 33` so `looks_v32` is
+/// Idempotent: a second pass finds `schema_version == 34` so `looks_v33` is
 /// false, and the array it would read is gone in any case.
-fn migrate_v32_to_v33(value: &mut Value) {
+fn migrate_v33_to_v34(value: &mut Value) {
     let Some(root) = value.as_object_mut() else {
         return;
     };
@@ -2616,10 +2670,10 @@ fn migrate_v32_to_v33(value: &mut Value) {
                 continue;
             };
             // An id this build never shipped (a hand edit, or a tool a future
-            // version removed) is dropped, exactly as the pre-v33 lenient
+            // version removed) is dropped, exactly as the pre-v34 lenient
             // deserializer dropped it. Migrating it would manufacture container
             // state for a tool that does not exist.
-            if !V33_AUDIT_TOOL_IDS.contains(&id) {
+            if !V34_AUDIT_TOOL_IDS.contains(&id) {
                 continue;
             }
             let mut state = serde_json::Map::new();
@@ -2650,7 +2704,7 @@ fn migrate_v32_to_v33(value: &mut Value) {
             if let Some(path) = e.get("path").and_then(Value::as_str) {
                 if !path.trim().is_empty() {
                     paths.insert(
-                        format!("{V33_AUDIT_PLUGIN_KEY}/{id}"),
+                        format!("{V34_AUDIT_PLUGIN_KEY}/{id}"),
                         Value::String(path.to_string()),
                     );
                 }
@@ -2659,7 +2713,7 @@ fn migrate_v32_to_v33(value: &mut Value) {
 
         if !states.is_empty() || !paths.is_empty() {
             // Merged into whatever `tool_plugins` already holds rather than
-            // written over it: the v31 → v32 step created the container empty,
+            // written over it: the v31 → v33 step created the container empty,
             // but a file that has been through a newer build once may already
             // carry user plugins, and losing those to an audit migration would
             // be the exact failure this step exists to prevent.
@@ -2679,7 +2733,7 @@ fn migrate_v32_to_v33(value: &mut Value) {
                     let mut plugin = serde_json::Map::new();
                     plugin.insert("enabled".to_string(), Value::Bool(true));
                     plugin.insert("tools".to_string(), Value::Object(states));
-                    plugins.insert(V33_AUDIT_PLUGIN_KEY.to_string(), Value::Object(plugin));
+                    plugins.insert(V34_AUDIT_PLUGIN_KEY.to_string(), Value::Object(plugin));
                 }
             }
             if !paths.is_empty() {
@@ -2695,10 +2749,10 @@ fn migrate_v32_to_v33(value: &mut Value) {
         }
     }
 
-    // Final cascade step ⇒ stamp CURRENT (33).
+    // Final cascade step ⇒ stamp CURRENT (34).
     root.insert(
         "schema_version".to_string(),
-        Value::Number(serde_json::Number::from(33u8)),
+        Value::Number(serde_json::Number::from(34u8)),
     );
 }
 
@@ -3692,26 +3746,31 @@ mod tests {
         assert_eq!(v, once);
     }
 
-    /// V31 → V32 moves nothing: the V38 `tool_plugins` container is additive and
-    /// `#[serde(default)]`, so an existing file is byte-identical apart from the
-    /// marker. Phase E's v32 → v33 step is the one that moves `code_audit.tools`,
-    /// and it gates on the version this stamps.
+    /// V37 Phase A's step is a pure stamp: it must advance the marker and touch
+    /// **nothing else**. The C2 invariant — an existing config's effective tool
+    /// surface is unchanged — is carried entirely by serde defaults, so any
+    /// data written here would be a bug.
     #[test]
-    fn v31_to_v32_only_stamps_the_version_and_v32_moves_the_audit_tools() {
+    fn v31_to_v32_only_stamps_the_version() {
         let mut v = json!({
             "schema_version": 31,
-            "code_audit": {
-                "enabled": true,
-                "tools": [{ "id": "gitleaks", "enabled": true, "path": "C:\\bin\\gitleaks.exe" }],
+            "offload": {
+                "mcp_servers": [
+                    { "name": "ddg", "url": "http://172.21.1.11:17201/mcp", "claude_access": true },
+                    { "name": "git", "command": "uvx", "args": ["mcp-server-git"] },
+                ],
             },
-            "checks": [{ "name": "cargo", "cmd": "cargo check", "parser": "cargo-json" }],
         });
         let before = v.clone();
         migrate_v31_to_v32(&mut v);
         assert_eq!(v["schema_version"], json!(32));
         assert!(!looks_v31(&v));
-        // Everything but the marker is byte-identical — `code_audit` in
-        // particular is untouched (Phase E owns that move).
+        // No registry keys are written: the defaults do the work.
+        assert!(v["offload"].get("mcp_categories").is_none());
+        assert!(v["offload"].get("mcp_activation").is_none());
+        assert!(v["offload"]["mcp_servers"][0].get("enabled").is_none());
+        assert!(v["offload"]["mcp_servers"][0].get("origin").is_none());
+        // Everything but the marker is byte-identical.
         let mut stripped = v.clone();
         stripped["schema_version"] = json!(31);
         assert_eq!(stripped, before);
@@ -3719,10 +3778,79 @@ mod tests {
         let once = v.clone();
         migrate_v31_to_v32(&mut v);
         assert_eq!(v, once);
+    }
 
-        // …and the NEXT step in the same cascade pass is the one that moves it.
+    /// The C2 invariant itself, end to end: a v31 file run through the cascade
+    /// deserializes to a `Settings` whose every MCP server is effectively
+    /// enabled — same surface as before the upgrade, with no categories and no
+    /// activation overrides.
+    #[test]
+    fn v31_to_v32_leaves_the_effective_mcp_surface_unchanged() {
+        let shell = fake_default_shell();
+        let mut v = json!({
+            "schema_version": 31,
+            "tabs": [],
+            "offload": {
+                "mcp_servers": [
+                    { "name": "ddg", "url": "http://x/mcp", "claude_access": true },
+                    { "name": "git", "command": "uvx", "offload_access": false },
+                ],
+            },
+        });
+        for step in MIGRATION_STEPS {
+            if (step.detect)(&v) {
+                (step.transform)(&mut v, &shell);
+            }
+        }
+        let s: crate::settings::Settings = serde_json::from_value(v).unwrap();
+        assert!(s.offload.mcp_categories.is_empty());
+        assert!(s.offload.mcp_activation.categories.is_empty());
+        assert!(s.offload.mcp_activation.servers.is_empty());
+        for m in &s.offload.mcp_servers {
+            assert!(m.enabled, "{} lost its surface", m.name);
+            assert_eq!(m.origin, crate::settings::McpOrigin::External);
+            assert!(crate::offload::mcp_host::server_enabled(
+                m,
+                &s.offload.mcp_categories,
+                &s.offload.mcp_activation,
+            ));
+        }
+        // The pre-existing access flags are untouched by the step.
+        assert!(s.offload.mcp_servers[0].claude_access);
+        assert!(!s.offload.mcp_servers[1].offload_access);
+    }
+
+    /// V32 → V33 moves nothing: the V38 `tool_plugins` container is additive and
+    /// `#[serde(default)]`, so an existing file is byte-identical apart from the
+    /// marker. Phase E's v33 → v34 step is the one that moves `code_audit.tools`,
+    /// and it gates on the version this stamps.
+    #[test]
+    fn v32_to_v33_only_stamps_the_version_and_v33_moves_the_audit_tools() {
+        let mut v = json!({
+            "schema_version": 32,
+            "code_audit": {
+                "enabled": true,
+                "tools": [{ "id": "gitleaks", "enabled": true, "path": "C:\\bin\\gitleaks.exe" }],
+            },
+            "checks": [{ "name": "cargo", "cmd": "cargo check", "parser": "cargo-json" }],
+        });
+        let before = v.clone();
         migrate_v32_to_v33(&mut v);
         assert_eq!(v["schema_version"], json!(33));
+        assert!(!looks_v32(&v));
+        // Everything but the marker is byte-identical — `code_audit` in
+        // particular is untouched (Phase E owns that move).
+        let mut stripped = v.clone();
+        stripped["schema_version"] = json!(32);
+        assert_eq!(stripped, before);
+        // Idempotent.
+        let once = v.clone();
+        migrate_v32_to_v33(&mut v);
+        assert_eq!(v, once);
+
+        // …and the NEXT step in the same cascade pass is the one that moves it.
+        migrate_v33_to_v34(&mut v);
+        assert_eq!(v["schema_version"], json!(34));
         assert!(v["code_audit"].get("tools").is_none(), "the array is removed");
         assert_eq!(
             v["tool_plugins"]["global_paths"]["cimp-audit@1/gitleaks"],
@@ -3730,7 +3858,7 @@ mod tests {
         );
     }
 
-    /// **The v33 move, field by field**, against a settings file that has been
+    /// **The v34 move, field by field**, against a settings file that has been
     /// configured the way a real one gets configured: some tools off, a path
     /// set, extra arguments, a ruleset override, a longer timeout.
     ///
@@ -3738,9 +3866,9 @@ mod tests {
     /// configuration or silently gets a fresh one, so every mapping is asserted
     /// by name rather than by round-tripping a blob.
     #[test]
-    fn v32_to_v33_moves_a_configured_audit_roster_into_the_container() {
+    fn v33_to_v34_moves_a_configured_audit_roster_into_the_container() {
         let mut v = json!({
-            "schema_version": 32,
+            "schema_version": 33,
             "code_audit": {
                 "enabled": true,
                 "timeout_secs": 900,
@@ -3771,7 +3899,7 @@ mod tests {
                         "timeout_secs": null
                     },
                     // A tool this build never shipped: dropped, exactly as the
-                    // pre-v33 lenient deserializer dropped it. Migrating it
+                    // pre-v34 lenient deserializer dropped it. Migrating it
                     // would manufacture state for something that cannot run.
                     { "id": "guarddog", "enabled": true, "path": "C:\\bin\\gd.exe" }
                 ]
@@ -3783,8 +3911,8 @@ mod tests {
                 "global_paths": { "acme@1.0.0/scan": "D:\\acme.exe" }
             }
         });
-        migrate_v32_to_v33(&mut v);
-        assert_eq!(v["schema_version"], json!(33));
+        migrate_v33_to_v34(&mut v);
+        assert_eq!(v["schema_version"], json!(34));
 
         // The umbrella-level settings STAY on `code_audit` — they are facts
         // about the feature, not about any one tool.
@@ -3835,32 +3963,32 @@ mod tests {
 
         // Idempotent: a second pass has no array to read and stamps the same.
         let once = v.clone();
-        migrate_v32_to_v33(&mut v);
+        migrate_v33_to_v34(&mut v);
         assert_eq!(v, once);
     }
 
-    /// A v32 file with NO audit tools configured must not gain a container
+    /// A v33 file with NO audit tools configured must not gain a container
     /// entry: "the user never touched this" and "the user set it to the
     /// defaults" are different states, and only the first lets a later release
     /// change a default.
     #[test]
-    fn v32_to_v33_writes_nothing_when_there_was_nothing_to_move() {
+    fn v33_to_v34_writes_nothing_when_there_was_nothing_to_move() {
         for tools in [json!([]), json!(null)] {
             let mut v = json!({
-                "schema_version": 32,
+                "schema_version": 33,
                 "code_audit": { "enabled": true, "tools": tools },
             });
-            migrate_v32_to_v33(&mut v);
-            assert_eq!(v["schema_version"], json!(33));
+            migrate_v33_to_v34(&mut v);
+            assert_eq!(v["schema_version"], json!(34));
             assert!(
                 v.get("tool_plugins").is_none(),
                 "an empty roster must not manufacture container state"
             );
         }
         // …and a file with no `code_audit` block at all is just a version stamp.
-        let mut v = json!({ "schema_version": 32 });
-        migrate_v32_to_v33(&mut v);
-        assert_eq!(v, json!({ "schema_version": 33 }));
+        let mut v = json!({ "schema_version": 33 });
+        migrate_v33_to_v34(&mut v);
+        assert_eq!(v, json!({ "schema_version": 34 }));
     }
 
     /// The ids this frozen step knows are the ids the shipped roster uses.
@@ -3870,7 +3998,7 @@ mod tests {
     /// is the check that the list was RIGHT when it was written — a typo here
     /// would silently drop one tool's configuration for every upgrading user.
     #[test]
-    fn the_v33_migration_ids_are_the_shipped_roster() {
+    fn the_v34_migration_ids_are_the_shipped_roster() {
         let shipped: std::collections::BTreeSet<String> = crate::plugins::builtin::plugin_set()
             .plugins
             .iter()
@@ -3878,17 +4006,94 @@ mod tests {
             .map(|t| t.id.clone())
             .collect();
         let step: std::collections::BTreeSet<String> =
-            V33_AUDIT_TOOL_IDS.iter().map(|s| (*s).to_string()).collect();
+            V34_AUDIT_TOOL_IDS.iter().map(|s| (*s).to_string()).collect();
         assert_eq!(
             step, shipped,
-            "the v32 → v33 step migrates a different set of tool ids than cImp ships — a tool in \
+            "the v33 → v34 step migrates a different set of tool ids than cImp ships — a tool in \
              the roster but not the step loses every upgrading user's configuration for it"
         );
         assert_eq!(
-            V33_AUDIT_PLUGIN_KEY,
+            V34_AUDIT_PLUGIN_KEY,
             crate::plugins::builtin::AUDIT_PLUGIN_KEY,
             "the step writes container keys under a plugin key nothing reads"
         );
+    }
+
+    /// **The V37/V38 linearization caveat, pinned** (develop merge, 2026-08-19).
+    ///
+    /// Both milestones took `v31 → v32` while unreleased: V37 landed the MCP
+    /// registry stamp on develop, V38 had taken the same number for its additive
+    /// `tool_plugins` container and then `v32 → v33` for the audit move. The
+    /// merge linearized V38's pair onto `v32 → v33` and `v33 → v34`, which means
+    /// a DEV machine that ran a pre-merge V38 build holds a file stamped 32 or 33
+    /// with a V38 meaning — a state no released build ever produced (real users
+    /// are at v31 or below).
+    ///
+    /// No content-aware detector was built for it because none is needed, and
+    /// this is the test that says why: the additive step only stamps, and the
+    /// move step only moves `code_audit.tools` IF IT IS THERE. So both pre-merge
+    /// shapes fall through the renumbered cascade onto the same v34 result —
+    /// the one still carrying the array gets it moved, the one that already
+    /// moved it keeps the container it built. A file stamped 33 by the old build
+    /// never runs V37's v31 → v32 step, which costs nothing: that step writes no
+    /// data (serde defaults carry the C2 invariant).
+    #[test]
+    fn a_pre_merge_v38_dev_file_converges_on_the_current_shape() {
+        let shell = fake_default_shell();
+        let cascade = |mut v: Value| {
+            for step in MIGRATION_STEPS {
+                if (step.detect)(&v) {
+                    (step.transform)(&mut v, &shell);
+                }
+            }
+            v
+        };
+
+        // (a) Stamped 32 by the pre-merge V38 build: the container exists and is
+        //     empty, the audit array has NOT moved yet.
+        let a = cascade(json!({
+            "schema_version": 32,
+            "tabs": [],
+            "offload": {},
+            "tool_plugins": { "plugins": {}, "project_paths": {}, "global_paths": {} },
+            "code_audit": { "tools": [{ "id": "semgrep", "enabled": false }] },
+        }));
+        assert_eq!(a["schema_version"], json!(34));
+        assert!(a["code_audit"].get("tools").is_none(), "the array still moves");
+        assert_eq!(
+            a["tool_plugins"]["plugins"]["cimp-audit@1"]["tools"]["semgrep"]["enabled"],
+            json!(false)
+        );
+
+        // (b) Stamped 33 by the pre-merge V38 build: the move already happened.
+        //     The renumbered move step must be a no-op over it, not a reset.
+        let b = cascade(json!({
+            "schema_version": 33,
+            "tabs": [],
+            "offload": {},
+            "tool_plugins": {
+                "plugins": { "cimp-audit@1": { "enabled": true, "tools": {
+                    "semgrep": { "enabled": false, "parameters": ["--foo"] } } } },
+                "project_paths": {},
+                "global_paths": { "cimp-audit@1/semgrep": "C:/bin/semgrep.exe" },
+            },
+            "code_audit": { "enabled": true },
+        }));
+        assert_eq!(b["schema_version"], json!(34));
+        assert_eq!(
+            b["tool_plugins"]["plugins"]["cimp-audit@1"]["tools"]["semgrep"]["parameters"],
+            json!(["--foo"])
+        );
+        assert_eq!(
+            b["tool_plugins"]["global_paths"]["cimp-audit@1/semgrep"],
+            json!("C:/bin/semgrep.exe")
+        );
+        // Both land on a shape `Settings` accepts.
+        for v in [a, b] {
+            let s: crate::settings::Settings =
+                serde_json::from_value(v).expect("the migrated shape deserializes");
+            assert!(s.tool_plugins.plugins.contains_key("cimp-audit@1"));
+        }
     }
 
     /// A v31 file loads with an empty container rather than failing — the

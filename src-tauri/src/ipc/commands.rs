@@ -3826,6 +3826,8 @@ mod tests {
             true,
             crate::activity::Attribution::Unattributed,
             None,
+            None,
+            None,
         )
     }
 

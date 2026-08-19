@@ -230,7 +230,7 @@ function toolState(plugin: PluginState | undefined, toolId: string): ToolState |
 ///
 /// A mirror of Rust's `plugins::builtin::AUDIT_PLUGIN_KEY`, pinned by
 /// `builtin_audit_tool_ids_are_mirrored_in_the_frontend_union`. It is a
-/// SETTINGS key — the v32 → v33 migration writes these exact strings — so the
+/// SETTINGS key — the v33 → v34 migration writes these exact strings — so the
 /// version in it is the identity of the shipped set, not the cImp release.
 export const AUDIT_PLUGIN_KEY = 'cimp-audit@1';
 

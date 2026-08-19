@@ -3069,6 +3069,8 @@ impl GraphService {
                 // cImp's own read advisor — positively no calling tab.
                 crate::activity::Attribution::Headless,
                 None,
+                None,
+                None,
             ),
         });
         Some(text)
@@ -3173,6 +3175,8 @@ impl GraphService {
                     0,
                     false, // a bypass is a miss for the advisor — flag it
                     crate::activity::Attribution::Headless,
+                    None,
+                    None,
                     None,
                 ),
             });
@@ -3483,6 +3487,8 @@ impl GraphService {
                 true,
                 // cImp's own auto-check — positively no calling tab.
                 crate::activity::Attribution::Headless,
+                None,
+                None,
                 None,
             ),
             request: format!("agent edit of `{file_path}` (the trigger — no explicit request)"),

@@ -151,6 +151,15 @@ export interface McpServerHealth {
   healthy: boolean;
   tool_count: number;
   error: string | null;
+  /// V37 contract C6: where the server sits in the health state machine
+  /// (`Unknown -> Healthy <-> Unhealthy`). NOT a duplicate of `healthy`:
+  /// `unknown` is "connected but never probed yet", which `healthy: true` alone
+  /// cannot distinguish from "probed and fine".
+  state: 'unknown' | 'healthy' | 'unhealthy';
+  /// V37 contract C6: failed probes since the last success. Non-zero while
+  /// `state` is still `healthy` is the flap guard mid-count — the one warning
+  /// available before a server is declared down.
+  consecutive_failures: number;
 }
 
 /// V8-03: aggregate offload-service status (mirror of Rust `ServiceStatus`).
@@ -577,9 +586,28 @@ export function onOffloadServerMetrics(
 }
 
 /// One-line summary of an MCP-server health row for the Settings list.
+///
+/// **The single formatter** (V37): the health chip in `McpManagementEditor` is
+/// its only render site, so the state machine's vocabulary is defined once. A
+/// second formatter is how "unhealthy" and "one probe short of unhealthy" end up
+/// reading the same in one place and differently in another.
 export function describeMcpServerHealth(s: McpServerHealth): string {
+  const probes = (n: number) => `${n} consecutive failed probe${n === 1 ? '' : 's'}`;
+  // Checked before `healthy` because the two are set together by the backend
+  // and this is the more specific claim — it names the evidence, not just the
+  // verdict.
+  if (s.state === 'unhealthy') {
+    const why = s.error ? ` — ${s.error}` : '';
+    return `Unhealthy${why} (${probes(s.consecutive_failures)}, ${s.transport})`;
+  }
   if (s.healthy) {
-    return `Healthy — ${s.tool_count} tool${s.tool_count === 1 ? '' : 's'} (${s.transport})`;
+    const base = `Healthy — ${s.tool_count} tool${s.tool_count === 1 ? '' : 's'} (${s.transport})`;
+    // A failure short of the flap guard changes no state and withdraws no
+    // tools, but it is the only warning there is before one that does. Silence
+    // here would make a server that is visibly wobbling look untouched.
+    return s.consecutive_failures > 0
+      ? `${base} · ${probes(s.consecutive_failures)} since the last success`
+      : base;
   }
   if (s.connected) {
     return `Connected, no tools (${s.transport})`;

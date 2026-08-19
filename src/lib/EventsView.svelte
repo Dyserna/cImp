@@ -252,7 +252,23 @@
   // they persist through viewSection.ts / localStorage, not settings. Widths
   // are px; `target` is the one flexible column (minmax → 1fr) so the table
   // always fills the card, and its width acts as a minimum.
-  type ColKey = 'time' | 'kind' | 'source' | 'tool' | 'target' | 'status' | 'tab' | 'session';
+  // V37 C7: `server` and `category` are the MCP identity pair. They are their
+  // own columns rather than a decoration on `tool` because they are the two
+  // things a user filters and scans by ("what is that server doing", "is the
+  // research category noisy") and because the row already carries them as
+  // separate facts — folding them into one cell would make the reader unfold it
+  // again by eye. Empty for every non-MCP kind, and hideable like any other.
+  type ColKey =
+    | 'time'
+    | 'kind'
+    | 'source'
+    | 'server'
+    | 'category'
+    | 'tool'
+    | 'target'
+    | 'status'
+    | 'tab'
+    | 'session';
   interface Col {
     key: ColKey;
     label: string;
@@ -264,6 +280,8 @@
     { key: 'time', label: 'Time', min: 52, def: 88 },
     { key: 'kind', label: 'Kind', min: 48, def: 80 },
     { key: 'source', label: 'Source', min: 52, def: 96 },
+    { key: 'server', label: 'Server', min: 52, def: 104 },
+    { key: 'category', label: 'Category', min: 52, def: 96 },
     { key: 'tool', label: 'Tool', min: 60, def: 144 },
     { key: 'target', label: 'Target', min: 80, def: 160, flex: true },
     { key: 'status', label: 'Status', min: 52, def: 104 },
@@ -751,6 +769,18 @@
               {#if visible.source}<span class="esrc{srcClass(r.source)}" title={r.source}
                   >{r.source}</span
                 >{/if}
+              <!-- V37 C7: rendered EXACTLY as Rust sent them. Never derived
+                   from `tool` (a `__` split misroutes) and never looked up in
+                   the live settings registry (that would answer with today's
+                   config about a row written under an older one). -->
+              {#if visible.server}<span class="eserver" class:none={!r.server} title={r.server ?? 'Not an MCP row'}
+                  >{r.server ?? ''}</span
+                >{/if}
+              {#if visible.category}<span
+                  class="ecategory"
+                  class:none={!r.category}
+                  title={r.category ?? 'Uncategorized, or not an MCP row'}>{r.category ?? ''}</span
+                >{/if}
               {#if visible.tool}<span class="etool" title={r.tool}>{rowTool(r)}</span>{/if}
               {#if visible.target}<span class="etarget" title={r.target}>{r.target}</span>{/if}
               {#if visible.status}<StatusChip status={rowStatus(r)} />{/if}
@@ -787,6 +817,10 @@
                   class="esrc{srcClass(cpSource(cp))}"
                   title={cpSource(cp)}>{cpSource(cp)}</span
                 >{/if}
+              <!-- A checkpoint is not an MCP call; the cells exist only so the
+                   grid columns line up with the entry rows above. -->
+              {#if visible.server}<span class="eserver none"></span>{/if}
+              {#if visible.category}<span class="ecategory none"></span>{/if}
               {#if visible.tool}<span class="etool" title={cp.trigger}>{cp.trigger}</span>{/if}
               {#if visible.target}<span class="etarget" title={cp.label}>{cp.label}</span>{/if}
               {#if visible.status}<span
@@ -926,6 +960,16 @@
         <span class="detail-session">
           session: {detail.session ?? 'not recorded'}
         </span>
+        <!-- V37 C7. Shown only when the row HAS a server: an "MCP server: —"
+             line on a graph row would answer a question nobody asked. The
+             category line is separate for the same reason, since an
+             uncategorized server legitimately has none. -->
+        {#if detail.server}
+          <span class="detail-session">server: {detail.server}</span>
+        {/if}
+        {#if detail.category}
+          <span class="detail-session">category: {detail.category}</span>
+        {/if}
       </div>
       <div class="detail-body">
         <div class="payload">
@@ -1211,6 +1255,11 @@
   .ekind.mcp {
     color: var(--accent-purple, #d2a8ff);
   }
+  /* V37: the health lane sits beside `mcp` and reads as its sibling, the way
+     `offload_server` sits beside `offload`. */
+  .ekind.mcp_health {
+    color: color-mix(in srgb, var(--accent) 62%, var(--warn, #d19a66));
+  }
   .ekind.injection_flag {
     color: var(--danger, #f06080);
     background: color-mix(in srgb, var(--danger, #f06080) 14%, transparent);
@@ -1257,6 +1306,23 @@
   .esrc.auto_check,
   .esrc.audit {
     color: color-mix(in srgb, var(--warning, #f0a020) 60%, var(--danger, #f06080));
+  }
+  /* V37 C7: the MCP identity pair. Quiet by default — they are context for the
+     rows that have them, not the headline — and the empty state is a real gap
+     rather than a dash, because most rows are simply not MCP rows. */
+  .eserver,
+  .ecategory {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--fg);
+  }
+  .eserver.none,
+  .ecategory.none {
+    color: transparent;
+  }
+  .ecategory {
+    opacity: 0.75;
   }
   .etool {
     font-family: var(--font-mono, monospace);

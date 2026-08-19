@@ -23,9 +23,9 @@ use crate::harness::claude::hook as claude_hook;
 use crate::settings::injection::NativeWebMode as NativeWebVisibility;
 use crate::settings::{AiToolTabConfig, Settings};
 use crate::tabs::config::{
-    advertises_audit_to_claude, advertises_offload_to_claude, command_is,
-    compose_capability_guidance, native_web_for, read_advisor_gate_blocked, CHANNEL_PUSH_FLAG,
-    CHANNEL_REGISTRATION_FLAG, CHANNEL_REGISTRATION_TARGET,
+    advertises_audit_to_claude, command_is, compose_capability_guidance, native_web_for,
+    read_advisor_gate_blocked, CHANNEL_PUSH_FLAG, CHANNEL_REGISTRATION_FLAG,
+    CHANNEL_REGISTRATION_TARGET,
 };
 
 /// The Claude `PreToolUse` matcher and the OpenCode tool names for the two
@@ -762,23 +762,46 @@ pub(crate) fn build_pre_args(
     // `--mcp-config` overlay, never written to `~/.claude`. Claude spawns each
     // `command` as argv (no shell), so the raw exe path is correct — no
     // shell-quoting needed (unlike the statusLine command). Up to two servers
-    // ride the same overlay, each under its own gate:
+    // ride the same overlay:
     //
     //   - V8-01 + V9-01 `cimp-offload` (`--offload-mcp`) carries the
     //     `offload_task` tool, the `graph_*` tools, AND any MCP server exposed
-    //     to Claude Code. Injected whenever ANY of those is in play — the graph
-    //     tools and Claude-exposed MCP servers must reach Claude even when
-    //     offload is disabled (they ride the same MCP child).
+    //     to Claude Code. **V37 Phase F: UNCONDITIONAL** — see the block
+    //     comment on the insert below.
     //   - V26 `cimp-code-audit` (`--code-audit-mcp`) carries `security_audit` /
     //     `quality_audit`. Injected when Code Audit is enabled AND opted in for
     //     the Claude consumer (`code_audit.expose_claude`).
     //
     // The `--mcp-config` flag is emitted only if at least one server made the
-    // cut, so behavior is unchanged (no flag) when every gate is off.
+    // cut — which, since Phase F, is every Claude tab whose exe path resolves.
     if let Ok(exe) = std::env::current_exe() {
         let exe = exe.to_string_lossy().to_string();
         let mut servers = serde_json::Map::new();
-        if advertises_offload_to_claude(settings) {
+        {
+            // ── V37 Phase F: the proxy child is UNCONDITIONAL in AI tabs ────
+            //
+            // It used to be gated on `advertises_offload_to_claude` (offload
+            // enabled ∨ graph enabled ∨ any Claude-exposed MCP server). That
+            // gate made a whole class of settings changes un-propagatable: a
+            // tab spawned with none of them had no stdio child, so there was no
+            // channel for the V37 contract-C5 pulse to travel on and granting a
+            // server later needed a fresh tab — which is the restart-tab
+            // semantics V37 exists to remove.
+            //
+            // The child is cheap when it has nothing to serve: its `tools/list`
+            // is assembled live (offload tools gated on `offload.enabled`,
+            // `graph::mcp_tools()` on the graph feature, and the proxied surface
+            // fetched per call from `POST /mcp/list`), so with everything off it
+            // advertises an EMPTY tool list — legal MCP, and self-consistent
+            // with the loopback being down in exactly that case (nothing to
+            // strand; see `every_advertised_mcp_server_gets_a_loopback`).
+            //
+            // Self-healing in both directions: `read_discovery_for` memoizes
+            // successes only and `events_relay` re-resolves on a 2s retry loop,
+            // so a child spawned before the loopback existed finds it when a
+            // grant brings it up, and the relay's post-connect
+            // `tools/list_changed` refreshes a client that missed the pulse.
+            //
             // V28 (issue #13): `--tab <id>` binds this per-tab child to the tab
             // that spawned it. The child forwards it on `/graph_run`, where the
             // app resolves it against the live-session registry — that is what
@@ -835,14 +858,18 @@ pub(crate) fn build_pre_args(
     // V30 Phase A: register the `cimp-offload` child as a session channel so it
     // can push out-of-band notices into this tab. Gated on the default-off
     // `offload.session_push` (research preview — see
-    // [`CHANNEL_REGISTRATION_FLAG`]) AND on the same predicate that writes the
-    // `cimp-offload` entry into the `--mcp-config` overlay above — a channel
-    // registration for a server that is never injected would be pure banner
-    // noise. Both inputs are carried in `spawn_inject_sig`'s `claude` object
-    // (`"channels"` + the `"mcp"` pair), so any mid-session change to the
-    // effective value raises the restart hint. Claude-only, like every other
-    // pre-arg here.
-    if settings.offload.session_push && advertises_offload_to_claude(settings) {
+    // [`CHANNEL_REGISTRATION_FLAG`]) and nothing else.
+    //
+    // V37 Phase F removed the second conjunct (`advertises_offload_to_claude`),
+    // which existed so a channel was never registered against a server that the
+    // overlay above had not defined. The overlay above now ALWAYS defines
+    // `cimp-offload`, so the conjunct is constant-true and its only remaining
+    // effect would be to keep a dead input in `spawn_inject_sig`'s `"channels"`
+    // entry — nagging every tab to restart for an MCP-grant flip that now
+    // propagates live. The `session_push` half is still carried there, so
+    // flipping the research-preview toggle still raises the restart hint.
+    // Claude-only, like every other pre-arg here.
+    if settings.offload.session_push {
         args.push(CHANNEL_REGISTRATION_FLAG.to_string());
         args.push(CHANNEL_REGISTRATION_TARGET.to_string());
     }

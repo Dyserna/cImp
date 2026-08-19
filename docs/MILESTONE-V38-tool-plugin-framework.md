@@ -160,11 +160,12 @@ authoritative, versioned (manifest schema version validated at load),
 The category layer appears in this spec only to state that it carries none of
 the above.
 
-### PROPOSAL (2026-08-19, not yet approved) — the sandbox fields of the manifest
+### APPROVED (2026-08-19) — the sandbox fields of the manifest
 
 Raised by the V33 live battery, which measured what actually happens when a
-real tool runs inside the OS sandbox. **Not a locked decision; approve, amend
-or drop.** Detail and evidence: `MILESTONE-V33-sandboxing.md`'s rc.9
+real tool runs inside the OS sandbox. **Approved 2026-08-19: all three fields
+(`runtime`, `sandbox`, `extra_grants`) are locked into the Phase A manifest
+schema.** Detail and evidence: `MILESTONE-V33-sandboxing.md`'s rc.9
 corrections block and #72.
 
 **The finding that motivates it.** Of the 14 built-in audit tools, 7 are
@@ -225,16 +226,23 @@ a code-execution primitive: repoint a tool's `path` and cImp runs it. V33 hit
 the identical hole (a project overlay could switch the sandbox off, or name
 `~/.ssh` as an extra grant) and closed it by making the whole `sandbox` block
 overlay-banned and machine-global, with a write-through so the settings still
-save. **Recommendation: binary paths, and any field that widens the boundary,
-must be global/machine scope only — never overlay-settable.** Variable values
-and CLI parameters can stay project-scoped. Cheaper to decide now than to
-retrofit after authors depend on per-project paths.
+save. **DECIDED 2026-08-19 (amends decision 10): binary paths, and any field
+that widens the boundary, are never overlay-settable.** Per-project binary
+paths survive, but via a **machine-global per-project map** (keyed by project
+root, stored alongside the global settings — outside every sandbox grant), so
+a compromised repo cannot write them. `.cimp/config.json` carries variable
+values and CLI parameters only; a `path` (or other banned field) appearing in
+the overlay is ignored with a loud warning event, and a write-through keeps
+project-scoped path edits saving to the machine-global map (the V33 `sandbox`
+block treatment). Live-verify 5 stands unchanged — two projects, two paths —
+the storage location moves, not the capability.
 
 ## Registry semantics
 
 - Registry entry = plugin-declared tool + user state: executable path
-  (global, project-overridable), enabled (plugin / category / tool levels),
-  declared variable + CLI parameter values (global, project-overridable).
+  (global, per-project via the machine-global per-project map — never the
+  overlay), enabled (plugin / category / tool levels), declared variable +
+  CLI parameter values (global, project-overridable via the overlay).
 - `command`-kind entries **feed `run_command`**: the registry entry (explicit
   path + enabled) becomes the allowlist entry and path resolution —
   superseding a separate allowlist for registered tools.

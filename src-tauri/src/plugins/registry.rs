@@ -105,10 +105,26 @@ impl EffectiveTool {
         self.manifest.kind
     }
 
-    /// Enabled **and** configured with a path. The predicate every pipeline
+    /// Enabled, **and** cImp knows what to spawn. The predicate every pipeline
     /// filters on; see the module docs for why it is not the same as `enabled`.
+    ///
+    /// The built-in arm is the one place decision 10's "no automatic PATH
+    /// resolution" gives way, and it is narrow on purpose: a built-in tool's
+    /// manifest names a bare COMMAND cImp has shipped support for since V23
+    /// (`gitleaks`, `ruff`, …), so "no path configured" means "resolve it the
+    /// way this tool has always been resolved" rather than "inert". The rule
+    /// protects a user from cImp guessing a binary for a definition a stranger
+    /// wrote; it was never an argument for making the fourteen shipped scanners
+    /// stop working on upgrade.
     pub fn runnable(&self) -> bool {
-        self.enabled && self.path.is_some()
+        self.enabled && (self.path.is_some() || self.resolves_by_name())
+    }
+
+    /// Whether this tool can be found without a configured path — built-in
+    /// provenance AND a declared command name. Both halves: provenance is the
+    /// gate, and the name is what there is to resolve.
+    pub fn resolves_by_name(&self) -> bool {
+        self.provenance == Provenance::Builtin && self.manifest.command.is_some()
     }
 }
 
@@ -160,7 +176,13 @@ pub fn effective_tools(
         for tool in &plugin.manifest.tools {
             let tool_key = plugin.tool_key(&tool.id);
             let tool_state = state.and_then(|s| s.tools.get(&tool.id));
-            let tool_enabled = tool_state.is_none_or(|t| t.enabled);
+            // No stored state ⇒ the manifest's own default, which is `true` for
+            // everything except a tool its author marked expensive enough that
+            // nobody should get it by accident (`dotnet-analyzers` runs a real
+            // build; `semgrep-quality` fetches a ruleset over the network).
+            // Once a state exists it wins in BOTH directions — the field is a
+            // default, not a lock.
+            let tool_enabled = tool_state.map_or(tool.enabled_by_default, |t| t.enabled);
 
             let (path, path_scope) = match project_paths
                 .and_then(|m| m.get(&tool_key))
@@ -186,8 +208,19 @@ pub fn effective_tools(
                 .collect();
             if let Some(t) = tool_state {
                 for v in &tool.variables {
-                    if let Some(value) = t.variables.get(&v.name) {
-                        variables.insert(v.name.clone(), value.clone());
+                    // A BLANK stored value is not an override — it is the shape
+                    // a cleared input leaves, exactly as for a path. Treating it
+                    // as a value would render `--config ""` on the next scan and
+                    // the user would have no way back to the declared default
+                    // short of deleting a settings key by hand. (This is also
+                    // what makes the v33 migration of `code_audit.tools[].ruleset`
+                    // exact: an empty legacy ruleset meant "use the built-in
+                    // default", which is the same thing as no value at all.)
+                    match t.variables.get(&v.name) {
+                        Some(value) if !value.trim().is_empty() => {
+                            variables.insert(v.name.clone(), value.clone());
+                        }
+                        _ => {}
                     }
                 }
             }

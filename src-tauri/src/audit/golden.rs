@@ -31,7 +31,7 @@
 use std::path::{Path, PathBuf};
 
 use super::adapters::Category;
-use super::runnable::ToolKey;
+use super::runnable::RunnableAudit;
 use super::runner::{AuditSnapshot, Outcome, ToolState, ToolStatus};
 
 /// The captured document. Compared, never consulted at run time.
@@ -667,72 +667,77 @@ pub(super) fn assert_matches(rendered: &str) {
 
 /// Materialize every built-in tool.
 ///
-/// **The one function Phase E rewrites.** Today it reads the `static Adapter`
-/// table through the closed `AuditToolId` enum; after the migration it reads
-/// the embedded manifests through the same registry a user plugin goes through.
-/// Everything above is representation-independent, so the document matching
-/// afterwards is the proof that the two representations agree.
+/// **Rewritten by Phase E, and that is the whole point of this module.** It used
+/// to read the `static Adapter` table through the closed `AuditToolId` enum; it
+/// now reads the embedded manifests through the same registry a dropped-in
+/// plugin goes through — an untouched settings container, so every value is the
+/// manifest's own default. Everything above this function is
+/// representation-independent, so the document still matching afterwards is the
+/// proof that the two representations agree.
 fn cases() -> Vec<ToolCase> {
-    use super::adapters;
-    use crate::settings::AuditToolId;
+    let set = crate::plugins::builtin::plugin_set();
+    let cfg = crate::settings::ToolPluginsSettings::default();
+    let root = root();
+    let report = report();
 
-    const ORDER: &[AuditToolId] = &[
-        AuditToolId::OsvScanner,
-        AuditToolId::Gitleaks,
-        AuditToolId::Semgrep,
-        AuditToolId::Oxlint,
-        AuditToolId::GolangciLint,
-        AuditToolId::Ruff,
-        AuditToolId::Cppcheck,
-        AuditToolId::Typos,
-        AuditToolId::Eslint,
-        AuditToolId::Pmd,
-        AuditToolId::Knip,
-        AuditToolId::CargoMachete,
-        AuditToolId::DotnetAnalyzers,
-        AuditToolId::SemgrepQuality,
-    ];
-
-    ORDER
+    crate::plugins::registry::effective_tools(&set, &cfg, None)
         .iter()
-        .map(|id| {
-            let a = adapters::adapter(*id);
-            let wire = ToolKey::from(*id).wire();
-            let findings_exit = a.findings_exit_codes.first().copied();
-            let root = root();
-            let report = report();
+        .filter_map(|t| {
+            let tool = RunnableAudit::from_effective(t)
+                .unwrap_or_else(|e| panic!("built-in tool `{}` is not runnable: {e}", t.tool_id))?;
+            let wire = tool.key.wire();
+            let findings_exit = tool.findings_exit_codes.first().copied();
+
+            // The third argv shape needs a ruleset override and appended
+            // parameters. Inserting `ruleset` unconditionally mirrors the
+            // pre-migration behaviour exactly: the old `full_argv` took a
+            // ruleset string that only tools carrying an `Arg::Ruleset` token
+            // did anything with, and a `{var:ruleset}` token is the same gate.
+            let mut tuned = tool.clone();
+            tuned
+                .variables
+                .insert("ruleset".to_string(), "RULESET/OVERRIDE".to_string());
+            tuned.parameters = vec!["--exclude".to_string(), "vendor".to_string()];
+
             let argvs = vec![
                 (
                     "(git repo, report path, no overrides)",
-                    a.full_argv(&root, Some(&report), true, &[], ""),
+                    tool.full_argv(&root, Some(&report), true),
                 ),
                 (
                     "(not a git repo, no report path)",
-                    a.full_argv(&root, None, false, &[], ""),
+                    tool.full_argv(&root, None, false),
                 ),
                 (
                     "(git repo, report path, ruleset + extra args)",
-                    a.full_argv(
-                        &root,
-                        Some(&report),
-                        true,
-                        &["--exclude".to_string(), "vendor".to_string()],
-                        "RULESET/OVERRIDE",
-                    ),
+                    tuned.full_argv(&root, Some(&report), true),
                 ),
             ];
+
             let outcomes = CASES
                 .iter()
                 .map(|case| {
                     let (outcome, output, stdout, stderr) = case.inputs(&wire, findings_exit);
-                    let (status, findings, error) = super::runner::finalize_outcome(
-                        *id, a, outcome, &output, false, &stdout, &stderr, &root, TIMEOUT,
+                    let (status, findings, error) = super::runner::finalize(
+                        &super::runner::Finalize {
+                            key: tool.key.clone(),
+                            findings_exit_codes: &tool.findings_exit_codes,
+                            parser: tool.parser,
+                            gate: tool.gate,
+                        },
+                        outcome,
+                        &output,
+                        false,
+                        &stdout,
+                        &stderr,
+                        &root,
+                        TIMEOUT,
                     );
                     (
                         case.label(),
                         ToolState {
-                            id: ToolKey::from(*id),
-                            category: a.category,
+                            id: tool.key.clone(),
+                            category: tool.category,
                             status,
                             findings,
                             duration_ms: FIXED_MS,
@@ -744,19 +749,19 @@ fn cases() -> Vec<ToolCase> {
                 })
                 .collect();
 
-            ToolCase {
+            Some(ToolCase {
                 wire,
-                category: a.category,
-                transport: match a.transport {
+                category: tool.category,
+                transport: match tool.transport {
                     super::adapters::Transport::Stdout => "stdout",
                     super::adapters::Transport::ReportFile => "report_file",
                 },
-                findings_exit_codes: a.findings_exit_codes.to_vec(),
-                extensions: a.applicability.extensions.iter().map(|s| s.to_string()).collect(),
-                markers: a.applicability.markers.iter().map(|s| s.to_string()).collect(),
+                findings_exit_codes: tool.findings_exit_codes.clone(),
+                extensions: tool.applicability.extensions.clone(),
+                markers: tool.applicability.markers.clone(),
                 argvs,
                 outcomes,
-            }
+            })
         })
         .collect()
 }

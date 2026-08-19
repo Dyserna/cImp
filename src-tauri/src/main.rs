@@ -1157,9 +1157,6 @@ fn main() {
             audit::audit_snapshot,
             audit::audit_refresh_census,
             audit::audit_effective_roster,
-            audit::audit_tools_global_config,
-            audit::audit_tools_save_global,
-            audit::audit_tools_load_global,
             // V38: tool-plugin discovery (read + Rescan) and the key the
             // settings pane stores this project's path overrides under.
             // Nothing here RUNS a plugin — the pipelines that consume one

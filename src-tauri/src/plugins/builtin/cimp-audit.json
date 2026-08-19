@@ -1,0 +1,334 @@
+{
+  "manifest_version": 1,
+  "name": "cimp-audit",
+  "version": "1",
+  "label": "Code Audit scanners",
+  "description": "The fourteen security and quality scanners cImp ships knowing how to call. Nothing is bundled: each one resolves from the ebin drop-in folder and then your PATH, or from a path you set here.",
+  "categories": [
+    {
+      "id": "security",
+      "label": "Security",
+      "tools": ["osv-scanner", "gitleaks", "semgrep"]
+    },
+    {
+      "id": "quality",
+      "label": "Quality",
+      "tools": [
+        "oxlint",
+        "golangci-lint",
+        "ruff",
+        "cppcheck",
+        "typos",
+        "eslint",
+        "pmd",
+        "knip",
+        "cargo-machete",
+        "dotnet-analyzers",
+        "semgrep-quality"
+      ]
+    }
+  ],
+  "tools": [
+    {
+      "id": "osv-scanner",
+      "label": "osv-scanner",
+      "description": "dependency vulnerabilities + known-malicious packages",
+      "kind": "security",
+      "command": "osv-scanner",
+      "argv": ["scan", "source", "-r", "{root}", "--format", "sarif"],
+      "transport": "stdout",
+      "findings_exit_codes": [1],
+      "parser": "sarif",
+      "ingest": "grandfathered",
+      "runtime": "none",
+      "sandbox": "optional",
+      "parameters_allowed": true
+    },
+    {
+      "id": "gitleaks",
+      "label": "gitleaks",
+      "description": "secrets in the working tree and in git history",
+      "kind": "security",
+      "command": "gitleaks",
+      "argv": [
+        "git",
+        "{root}",
+        "--report-format",
+        "sarif",
+        "--report-path",
+        "{report}",
+        "--exit-code",
+        "1"
+      ],
+      "dir_argv": [
+        "dir",
+        "{root}",
+        "--report-format",
+        "sarif",
+        "--report-path",
+        "{report}",
+        "--exit-code",
+        "1"
+      ],
+      "transport": "report_file",
+      "findings_exit_codes": [1],
+      "parser": "sarif",
+      "ingest": "grandfathered",
+      "runtime": "none",
+      "sandbox": "optional",
+      "parameters_allowed": true
+    },
+    {
+      "id": "semgrep",
+      "label": "semgrep",
+      "description": "SAST — requires Python, Windows support beta",
+      "kind": "security",
+      "command": "semgrep",
+      "argv": [
+        "scan",
+        "--config",
+        "{var:ruleset}",
+        "--sarif",
+        "--quiet",
+        "{root}"
+      ],
+      "variables": [
+        {
+          "name": "ruleset",
+          "label": "Ruleset (--config slug; set a replacement if the default 404s upstream)",
+          "default": "auto"
+        }
+      ],
+      "env": [["PYTHONUTF8", "1"]],
+      "transport": "stdout",
+      "findings_exit_codes": [1],
+      "parser": "sarif",
+      "ingest": "grandfathered",
+      "runtime": "python",
+      "sandbox": "optional",
+      "parameters_allowed": true
+    },
+    {
+      "id": "oxlint",
+      "label": "oxlint",
+      "description": "JS/TS linter — single Rust binary, zero-config",
+      "kind": "audit",
+      "command": "oxlint",
+      "argv": ["--format", "sarif"],
+      "transport": "stdout",
+      "findings_exit_codes": [1],
+      "applicability": {
+        "extensions": ["js", "ts", "jsx", "tsx", "mjs", "cjs"],
+        "markers": []
+      },
+      "parser": "sarif",
+      "ingest": "grandfathered",
+      "runtime": "none",
+      "sandbox": "optional",
+      "parameters_allowed": true
+    },
+    {
+      "id": "golangci-lint",
+      "label": "golangci-lint",
+      "description": "Go meta-linter",
+      "kind": "audit",
+      "command": "golangci-lint",
+      "argv": ["run", "--output.sarif.path", "stdout"],
+      "transport": "stdout",
+      "findings_exit_codes": [1],
+      "applicability": { "extensions": ["go"], "markers": ["go.mod"] },
+      "parser": "sarif",
+      "ingest": "grandfathered",
+      "runtime": "go",
+      "sandbox": "optional",
+      "parameters_allowed": true
+    },
+    {
+      "id": "ruff",
+      "label": "ruff",
+      "description": "Python linter — single Rust binary",
+      "kind": "audit",
+      "command": "ruff",
+      "argv": ["check", "--output-format", "sarif"],
+      "transport": "stdout",
+      "findings_exit_codes": [1],
+      "applicability": { "extensions": ["py"], "markers": [] },
+      "parser": "sarif",
+      "ingest": "grandfathered",
+      "runtime": "none",
+      "sandbox": "optional",
+      "parameters_allowed": true
+    },
+    {
+      "id": "cppcheck",
+      "label": "cppcheck",
+      "description": "C/C++ static analysis (>= 2.16 — SARIF to a report file)",
+      "kind": "audit",
+      "command": "cppcheck",
+      "argv": [
+        "--enable=warning,style",
+        "--output-format=sarif",
+        "--output-file={report}",
+        "{root}"
+      ],
+      "transport": "report_file",
+      "findings_exit_codes": [],
+      "applicability": {
+        "extensions": ["c", "cc", "cpp", "cxx", "h", "hpp"],
+        "markers": []
+      },
+      "parser": "sarif",
+      "ingest": "grandfathered",
+      "runtime": "none",
+      "sandbox": "optional",
+      "parameters_allowed": true
+    },
+    {
+      "id": "typos",
+      "label": "typos",
+      "description": "source spell-checker — applies to every project",
+      "kind": "audit",
+      "command": "typos",
+      "argv": ["--format", "json", "{root}"],
+      "transport": "stdout",
+      "findings_exit_codes": [2],
+      "parser": "typos-jsonl",
+      "ingest": "grandfathered",
+      "runtime": "none",
+      "sandbox": "optional",
+      "parameters_allowed": true
+    },
+    {
+      "id": "eslint",
+      "label": "eslint",
+      "description": "JS/TS linter — uses the project's own config",
+      "kind": "audit",
+      "command": "eslint",
+      "project_local_bin": "eslint",
+      "argv": ["--format", "json", "{root}"],
+      "transport": "stdout",
+      "findings_exit_codes": [1],
+      "applicability": {
+        "extensions": [],
+        "markers": ["eslint.config", ".eslintrc"]
+      },
+      "parser": "eslint-json",
+      "ingest": "grandfathered",
+      "runtime": "node",
+      "sandbox": "optional",
+      "parameters_allowed": true
+    },
+    {
+      "id": "pmd",
+      "label": "PMD",
+      "description": "Java static analysis — needs a JRE",
+      "kind": "audit",
+      "command": "pmd",
+      "argv": [
+        "check",
+        "-d",
+        "{root}",
+        "-R",
+        "{var:ruleset}",
+        "-f",
+        "sarif"
+      ],
+      "variables": [
+        {
+          "name": "ruleset",
+          "label": "Ruleset (-R argument; set a replacement if the bundled default breaks)",
+          "default": "rulesets/java/quickstart.xml"
+        }
+      ],
+      "transport": "stdout",
+      "findings_exit_codes": [4],
+      "applicability": { "extensions": ["java"], "markers": [] },
+      "parser": "sarif",
+      "ingest": "grandfathered",
+      "runtime": "java",
+      "sandbox": "optional",
+      "parameters_allowed": true
+    },
+    {
+      "id": "knip",
+      "label": "knip",
+      "description": "unused files / exports / dependencies (Node)",
+      "kind": "audit",
+      "command": "knip",
+      "project_local_bin": "knip",
+      "argv": ["--reporter", "json"],
+      "transport": "stdout",
+      "findings_exit_codes": [1],
+      "applicability": { "extensions": [], "markers": ["package.json"] },
+      "parser": "knip-json",
+      "ingest": "grandfathered",
+      "runtime": "node",
+      "sandbox": "optional",
+      "parameters_allowed": true
+    },
+    {
+      "id": "cargo-machete",
+      "label": "cargo-machete",
+      "description": "unused Rust dependencies",
+      "kind": "audit",
+      "command": "cargo-machete",
+      "argv": [],
+      "transport": "stdout",
+      "findings_exit_codes": [1],
+      "applicability": { "extensions": [], "markers": ["Cargo.toml"] },
+      "parser": "machete-text",
+      "ingest": "grandfathered",
+      "runtime": "none",
+      "sandbox": "optional",
+      "parameters_allowed": true
+    },
+    {
+      "id": "dotnet-analyzers",
+      "label": "Roslyn analyzers",
+      "description": "runs a real .NET build (writes obj/ and bin/) — off by default, wants a longer timeout",
+      "kind": "audit",
+      "command": "dotnet",
+      "argv": ["build", "/p:ErrorLog={report},version=2.1", "-nologo"],
+      "transport": "report_file",
+      "findings_exit_codes": [1],
+      "applicability": { "extensions": [], "markers": ["*.sln", "*.csproj"] },
+      "parser": "sarif",
+      "ingest": "grandfathered",
+      "runtime": "dotnet",
+      "sandbox": "optional",
+      "parameters_allowed": true,
+      "enabled_by_default": false
+    },
+    {
+      "id": "semgrep-quality",
+      "label": "semgrep (quality)",
+      "description": "best-practice rulesets — off by default, its ruleset needs network",
+      "kind": "audit",
+      "command": "semgrep",
+      "argv": [
+        "scan",
+        "--config",
+        "{var:ruleset}",
+        "--sarif",
+        "--quiet",
+        "{root}"
+      ],
+      "variables": [
+        {
+          "name": "ruleset",
+          "label": "Ruleset (--config slug; set a replacement if the default 404s upstream)",
+          "default": "p/r2c-best-practices"
+        }
+      ],
+      "env": [["PYTHONUTF8", "1"]],
+      "transport": "stdout",
+      "findings_exit_codes": [1],
+      "parser": "sarif",
+      "ingest": "grandfathered",
+      "runtime": "python",
+      "sandbox": "optional",
+      "parameters_allowed": true,
+      "enabled_by_default": false
+    }
+  ]
+}

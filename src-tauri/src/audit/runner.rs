@@ -26,12 +26,13 @@ use crate::activity::{self, now_ms, ActivityEntry, ActivityKind, ActivityRecord}
 use crate::checks::{parsers, Diag};
 use crate::offload::service::PushNotice;
 use crate::plugins::manifest::SandboxReq;
-use crate::settings::{AuditToolConfig, AuditToolId, SettingsHandle};
+use crate::plugins::registry::EffectiveTool;
+use crate::settings::SettingsHandle;
 
-use super::adapters::{self, Adapter, Category, ExitClass, Transport};
+use super::adapters::{self, Category, ExitClass, Transport};
 use super::census;
 use super::parsers::AuditParser;
-use super::runnable::{IngestGate, RunnableAudit, ToolKey};
+use super::runnable::{RunnableAudit, ToolKey};
 
 /// Tauri event emitted on every per-tool transition, carrying a (findings-
 /// capped) [`AuditSnapshot`]. Phase C subscribes to this.
@@ -451,7 +452,6 @@ impl AuditState {
         category: Category,
     ) -> Result<
         (
-            Vec<AuditToolConfig>,
             Vec<RunnableAudit>,
             PathBuf,
             Duration,
@@ -494,49 +494,49 @@ impl AuditState {
         // scan keeps the sync by design: the report is documented to match the
         // auto-selected Code Audit view 1:1, and `refresh_census` already
         // applies the same sync on tab/Settings open.)
-        let cfg = if category == Category::Quality && self.apply_quality_auto_select(&census) {
-            self.settings.current().code_audit
+        // Auto-selection writes into the tool-plugins container, so re-read
+        // THAT (not `code_audit`, whose per-tool array is gone) before planning
+        // — otherwise the scan would run the selection the census just replaced.
+        let tool_plugins = if category == Category::Quality
+            && self.apply_quality_auto_select(&census, &tool_plugins, &root)
+        {
+            self.settings.current().tool_plugins
         } else {
-            cfg
+            tool_plugins
         };
 
-        // The chips (one per this-category tool) and the enabled+applicable
-        // subset to launch — pure, so the filter is unit-tested directly.
-        let (mut chips, to_run) = plan_scan(&cfg.tools, category, &census);
-
-        // V38 Phase C — the plugin half of the roster, appended. Two properties
-        // hold by construction and are pinned by test:
+        // ONE population since Phase E. The fourteen tools cImp ships are
+        // embedded manifests living in the same registry a dropped-in plugin
+        // lands in, so the fan-out reads one list and applies one set of rules.
         //
-        // * the built-in roster above is computed FIRST and is never filtered by
-        //   anything below, so no plugin can remove a built-in from a fan-out
-        //   (the security floor, generalized);
+        // Two properties hold by construction and are pinned by test:
+        //
+        // * cImp's own plugins are laid down FIRST by `loader::scan_all`, and
+        //   nothing below reorders or filters by provenance, so no user plugin
+        //   can remove a built-in scanner from a fan-out (the security floor);
         // * the project root handed to the registry is the runner's own `root`,
         //   which `main.rs` sets from `current_dir()` — THE LAUNCH CWD, the same
         //   value `plugins_project_key` hands the settings pane. A per-project
         //   binary path is stored under that key, so resolving against anything
         //   else (a graph root found by an ancestor walk, say) would silently
         //   miss every project override.
-        let (plugin_chips, plugin_runs) =
-            plan_plugin_scan(&plugin_tools(&tool_plugins, &root), category, &census);
+        let tools = registry_tools(&tool_plugins, &root);
+        let (chips, to_run) = plan_scan(&tools, category, &census);
 
-        // "Nothing to run" now spans BOTH populations. Before V38 the built-in
-        // roster was the whole roster, so its enabled-count answered the
-        // question; a plugin-only category (this milestone's "add language X in
-        // one drop") would otherwise be rejected with "no tools are enabled"
-        // while the user is looking at an enabled, path-configured tool. The
-        // wording is unchanged, because from the user's side the fact is the
-        // same one.
-        let in_category = cfg
-            .tools
+        // "Nothing to run" spans both provenances: a plugin-only category (this
+        // milestone's "add language X in one drop") must not be rejected with
+        // "no tools are enabled" while the user is looking at an enabled,
+        // path-configured tool. The wording is unchanged, because from the
+        // user's side the fact is the same one.
+        if !tools
             .iter()
-            .filter(|t| adapters::adapter(t.id).category == category);
-        if !in_category.clone().any(|t| t.enabled) && plugin_chips.is_empty() {
+            .any(|t| t.enabled && audit_category(t) == Some(category))
+        {
             return Err(format!(
                 "no {} audit tools are enabled",
                 category_label(category)
             ));
         }
-        chips.extend(plugin_chips);
 
         let (root, cancel, global_timeout) = {
             let mut inner = self.inner.lock().unwrap();
@@ -555,7 +555,6 @@ impl AuditState {
 
         Ok((
             to_run,
-            plugin_runs,
             root,
             Duration::from_secs(global_timeout),
             cancel,
@@ -570,8 +569,7 @@ impl AuditState {
     /// enabled. Returns immediately; work runs on a background task and streams
     /// progress via `audit-status`.
     pub fn start_scan(self: &Arc<Self>, category: Category) -> Result<(), String> {
-        let (to_run, plugin_runs, root, global_timeout, cancel, sandbox) =
-            self.begin_scan(category)?;
+        let (to_run, root, global_timeout, cancel, sandbox) = self.begin_scan(category)?;
         let this = self.clone();
         tauri::async_runtime::spawn(async move {
             // V30 Phase C: `Initiator::Gui` — nobody is awaiting this scan, so
@@ -579,7 +577,6 @@ impl AuditState {
             // exists for.
             this.run(
                 to_run,
-                plugin_runs,
                 root,
                 category,
                 global_timeout,
@@ -612,8 +609,7 @@ impl AuditState {
         self: &Arc<Self>,
         category: Category,
     ) -> Result<AuditSnapshot, String> {
-        let (to_run, plugin_runs, root, global_timeout, cancel, sandbox) =
-            self.begin_scan(category)?;
+        let (to_run, root, global_timeout, cancel, sandbox) = self.begin_scan(category)?;
         // V30 Phase C: `Initiator::Agent` — the snapshot returned below IS the
         // caller's tool result, so this path never pushes (it would duplicate
         // the report into the very session that asked for it).
@@ -621,7 +617,6 @@ impl AuditState {
             .clone()
             .run(
                 to_run,
-                plugin_runs,
                 root,
                 category,
                 global_timeout,
@@ -637,23 +632,33 @@ impl AuditState {
     /// The write goes through the settings handle by id (broadcast + debounced
     /// save), so the Settings checkboxes follow live. Returns whether anything
     /// changed. No-op in manual mode.
-    fn apply_quality_auto_select(&self, census: &census::Census) -> bool {
-        let cfg = self.settings.current().code_audit;
-        if !cfg.quality_auto_select {
+    fn apply_quality_auto_select(
+        &self,
+        census: &census::Census,
+        cfg: &crate::settings::ToolPluginsSettings,
+        root: &Path,
+    ) -> bool {
+        if !self.settings.current().code_audit.quality_auto_select {
             return false;
         }
-        let mut tools = cfg.tools;
-        if !auto_select_quality(&mut tools, census) {
+        let Some(store) = crate::plugins::global() else {
+            return false;
+        };
+        let tools = crate::plugins::registry::effective_tools(&store.snapshot(), cfg, Some(root));
+        let changes = auto_select_quality(&tools, census);
+        if changes.is_empty() {
             return false;
         }
-        // Copy the recomputed flags back BY ID under the settings lock — the
-        // live struct may have moved since the snapshot above, so never
-        // replace the whole vec.
+        // Written BY TOOL ID under the settings lock — the live container may
+        // have moved since the snapshot above, so never replace a subtree.
         self.settings.mutate(|s| {
-            for t in &tools {
-                if let Some(cur) = s.code_audit.tools.iter_mut().find(|c| c.id == t.id) {
-                    cur.enabled = t.enabled;
-                }
+            let plugin = s
+                .tool_plugins
+                .plugins
+                .entry(crate::plugins::builtin::AUDIT_PLUGIN_KEY.to_string())
+                .or_default();
+            for (id, want) in &changes {
+                plugin.tools.entry(id.clone()).or_default().enabled = *want;
             }
         });
         true
@@ -676,7 +681,7 @@ impl AuditState {
         }
         let root = self.inner.lock().unwrap().root.clone();
         let census = census::cached(&root);
-        self.apply_quality_auto_select(&census);
+        self.apply_quality_auto_select(&census, &self.settings.current().tool_plugins, &root);
         let stored = {
             let mut inner = self.inner.lock().unwrap();
             // A scan that started mid-walk owns the census/tools state now.
@@ -732,8 +737,7 @@ impl AuditState {
         let census_known = !(block.extensions.is_empty() && block.markers.is_empty());
         let census = census::Census::from_block(&block.extensions, &block.markers);
         plan_roster(
-            &settings.code_audit.tools,
-            &plugin_tools(&settings.tool_plugins, &root),
+            &registry_tools(&settings.tool_plugins, &root),
             category,
             &census,
             census_known,
@@ -762,8 +766,7 @@ impl AuditState {
     #[allow(clippy::too_many_arguments)]
     async fn run(
         self: Arc<Self>,
-        tools: Vec<AuditToolConfig>,
-        plugin_tools: Vec<RunnableAudit>,
+        tools: Vec<RunnableAudit>,
         root: PathBuf,
         category: Category,
         global_timeout: Duration,
@@ -779,45 +782,28 @@ impl AuditState {
         let mut handles = Vec::new();
 
         for tool in tools {
-            // V25 Phase C: per-tool timeout override (`None` = the global
-            // `code_audit.timeout_secs`). A build-style tool (dotnet-analyzers)
-            // wants a longer budget than a linter.
+            // Per-tool timeout override (`None` = the global
+            // `code_audit.timeout_secs`). A build-style tool
+            // (`dotnet-analyzers`) wants a longer budget than a linter.
             let timeout = effective_tool_timeout(tool.timeout_secs, global_timeout);
-            // The same resolver Detect uses — override → project-local
-            // `node_modules/.bin` (eslint/knip) → ebin/PATH — so a Detect ✓
-            // can't disagree with what a scan launches.
-            match super::resolve_audit_binary(tool.id, &tool.path, Some(&root)) {
-                Err(_) => {
-                    // Distinguish "no path configured and not discoverable"
-                    // from "the configured path itself is broken" — the first
-                    // is fixed by installing or setting a path, the second by
-                    // correcting the path in Settings.
-                    let (status, error) = if tool.path.trim().is_empty() {
-                        (
-                            ToolStatus::NotInstalled,
-                            "not found on PATH or ebin — install it or set its path in Settings"
-                                .to_string(),
-                        )
-                    } else {
-                        (
-                            ToolStatus::PathInvalid,
-                            format!(
-                                "configured path not found: {} — fix it in Settings",
-                                tool.path.trim()
-                            ),
-                        )
-                    };
-                    self.patch_tool(&ToolKey::Builtin(tool.id), |ts| {
+            // ONE resolution rule, branching only where the two provenances
+            // genuinely differ: cImp resolves a bare command name for a tool it
+            // shipped, and never for one it did not (decision 7). See
+            // [`resolve_runnable`].
+            match resolve_runnable(&tool, &root) {
+                Err((status, error)) => {
+                    self.patch_tool(&tool.key, |ts| {
                         ts.status = status;
                         ts.error = Some(error);
                         ts.resolved = None;
                     });
                 }
                 Ok(resolved) => {
-                    let path = resolved.clone();
-                    self.patch_tool(&ToolKey::Builtin(tool.id), |ts| {
+                    let key = tool.key.clone();
+                    let shown = resolved.clone();
+                    self.patch_tool(&key, |ts| {
                         ts.status = ToolStatus::Running;
-                        ts.resolved = Some(path);
+                        ts.resolved = Some(shown);
                     });
                     let this = self.clone();
                     let cancel = cancel.clone();
@@ -829,45 +815,6 @@ impl AuditState {
                     }));
                 }
             }
-        }
-
-        // V38: the plugin population, launched exactly like the built-in one —
-        // same cancel token, same global-timeout fallback, same concurrency.
-        // The one resolution difference is deliberate: cImp never resolves a
-        // plugin's binary from PATH (decision 7), so there is no `NotInstalled`
-        // state here — a tool with no path was never runnable and never reached
-        // this list.
-        for tool in plugin_tools {
-            let timeout = effective_tool_timeout(tool.timeout_secs, global_timeout);
-            let resolved = PathBuf::from(&tool.program);
-            if !resolved.is_file() {
-                let key = tool.key.clone();
-                let program = tool.program.clone();
-                let label = tool.label.clone();
-                self.patch_tool(&key, |ts| {
-                    ts.status = ToolStatus::PathInvalid;
-                    ts.error = Some(format!(
-                        "{label}: configured path not found: {program} — fix it in Settings, \
-                         Tool Plugins"
-                    ));
-                    ts.resolved = None;
-                });
-                continue;
-            }
-            let key = tool.key.clone();
-            let shown = resolved.clone();
-            self.patch_tool(&key, |ts| {
-                ts.status = ToolStatus::Running;
-                ts.resolved = Some(shown);
-            });
-            let this = self.clone();
-            let cancel = cancel.clone();
-            let root = root.clone();
-            let sandbox = sandbox.clone();
-            handles.push(tauri::async_runtime::spawn(async move {
-                this.run_one_plugin(tool, resolved, root, timeout, cancel, sandbox)
-                    .await;
-            }));
         }
 
         for h in handles {
@@ -940,12 +887,22 @@ impl AuditState {
         );
     }
 
-    /// Run one resolved tool end to end: spawn, capture, classify, parse SARIF,
+    /// Run one resolved tool end to end: spawn, capture, classify, decode,
     /// record the result, emit. Independent of the other tools.
+    ///
+    /// **One function for both provenances since Phase E.** Before it there
+    /// were two — an adapter twin and a plugin twin — and every rule about
+    /// timeouts, cancellation, output caps, report cleanup and status events had
+    /// to be written twice. What actually differs between a scanner cImp ships
+    /// and one somebody dropped in a folder is entirely in the manifest that
+    /// reached here (its posture, its ingest gate, whether it declared a `dir`
+    /// argv), and a manifest is data. The one branch left is the coverage pass,
+    /// which is a fact about `osv-scanner` specifically rather than about
+    /// built-ins in general.
     #[allow(clippy::too_many_arguments)]
     async fn run_one(
         self: Arc<Self>,
-        tool: AuditToolConfig,
+        tool: RunnableAudit,
         resolved: PathBuf,
         root: PathBuf,
         git_repo: bool,
@@ -953,147 +910,29 @@ impl AuditState {
         cancel: CancellationToken,
         sandbox: crate::sandbox::SandboxCfg,
     ) {
-        let adapter = adapters::adapter(tool.id);
         let started = Instant::now();
-        let report_path = match adapter.transport {
-            Transport::ReportFile => Some(temp_report_path(tool.id.command_name())),
+        // What the sandbox lane and the activity row call this run. For a
+        // built-in that is its command name (`audit:semgrep`), which is what
+        // those rows have said since V33 and what a user grepping them expects;
+        // for a plugin it is the namespaced key, which is the only name it has.
+        let subject = tool.spawn_subject();
+        let report_path = match tool.transport {
+            Transport::ReportFile => Some(temp_report_path(&subject)),
             Transport::Stdout => None,
         };
-        let argv = adapter.full_argv(
-            &root,
-            report_path.as_deref(),
-            git_repo,
-            &tool.extra_args,
-            &tool.ruleset,
-        );
+        let argv = tool.full_argv(&root, report_path.as_deref(), git_repo);
 
         // V33: a report-file tool writes its SARIF to the absolute path that is
         // already inside `argv`; the sandbox has to be able to let it. Derived
         // from the SAME `report_path` value, so the granted directory and the
         // argument cannot drift apart.
-        let full_dirs = sandbox_full_dirs(adapter.transport, report_path.as_deref());
-
-        let cap = spawn_and_capture(
-            &resolved,
-            &argv,
-            &adapter
-                .env
-                .iter()
-                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
-                .collect::<Vec<_>>(),
-            &root,
-            timeout,
-            &cancel,
-            &sandbox,
-            tool.id.command_name(),
-            &SpawnPosture {
-                full_dirs,
-                // A built-in adapter declares nothing: V33's inference, the
-                // seam's own grant rows (none), and the historical `optional`
-                // behaviour — degrade loudly, never refuse.
-                ..SpawnPosture::default()
-            },
-        )
-        .await;
-        let duration_ms = started.elapsed().as_millis() as u64;
-
-        // SARIF is only meaningful for a completed (non-killed) child; a
-        // cancelled/timed-out gitleaks may have left a half-written report.
-        let sarif = match &cap.outcome {
-            Outcome::Exited(_) => {
-                read_sarif(adapter.transport, &cap.stdout, report_path.as_deref()).await
-            }
-            _ => String::new(),
-        };
-        // A truncated stdout only invalidates the SARIF when stdout IS the
-        // SARIF; for report-file tools it merely truncates captured logs.
-        let sarif_truncated = adapter.transport == Transport::Stdout && cap.stdout_truncated;
-        let (status, findings, error) = finalize_outcome(
-            tool.id,
-            adapter,
-            cap.outcome,
-            &sarif,
-            sarif_truncated,
-            &cap.stdout,
-            &cap.stderr,
-            &root,
-            timeout,
-        );
-
-        // Scan-coverage: the lockfiles/manifests osv-scanner reports scanning,
-        // pulled from the same SARIF in a second best-effort pass (osv-scanner
-        // only — its `runs[].artifacts` are the audit-only coverage signal).
-        let scanned_artifacts = if tool.id == AuditToolId::OsvScanner && status == ToolStatus::Done
-        {
-            parsers::sarif_scanned_artifacts(&sarif, &root)
-        } else {
-            Vec::new()
-        };
-
-        // Clean up the temp report regardless of outcome.
-        if let Some(p) = &report_path {
-            let _ = tokio::fs::remove_file(p).await;
-        }
-
-        let ok = status == ToolStatus::Done;
-        let findings_count = findings.len();
-        self.patch_tool(&ToolKey::Builtin(tool.id), |ts| {
-            ts.status = status;
-            ts.findings = findings;
-            ts.duration_ms = duration_ms;
-            ts.error = error;
-            ts.scanned_artifacts = scanned_artifacts;
-        });
-
-        record_audit_run(
-            tool.id.command_name(),
-            &root,
-            findings_count,
-            duration_ms,
-            ok,
-        );
-    }
-
-    /// V38 Phase C: run one PLUGIN audit tool end to end.
-    ///
-    /// The twin of [`run_one`](Self::run_one), and deliberately the same shape:
-    /// same spawn/capture/timeout/cancel machinery, same `ToolState` and status
-    /// event, same report budget. Everything that differs is a manifest fact
-    /// this population carries and the built-in one does not:
-    ///
-    /// * **argv** comes from a template with untrusted variable values, so it is
-    ///   substituted once and never re-scanned ([`runnable::render_argv`]);
-    /// * **the sandbox posture** is declared, not assumed — `required` refuses
-    ///   to run unprotected, `unsupported` runs outside on purpose, and the
-    ///   declared runtime selects the profile whose grants apply;
-    /// * **`extra_grants`** are screened by V33's refusal rules at spawn-planning
-    ///   time, refused ones dropped with a row;
-    /// * **ingest** passes the SARIF envelope gate before any finding is
-    ///   attributed — to the registry entry that ran, never to a name inside
-    ///   the output.
-    async fn run_one_plugin(
-        self: Arc<Self>,
-        tool: RunnableAudit,
-        resolved: PathBuf,
-        root: PathBuf,
-        timeout: Duration,
-        cancel: CancellationToken,
-        sandbox: crate::sandbox::SandboxCfg,
-    ) {
-        let started = Instant::now();
-        let subject = tool.key.wire();
-        let report_path = match tool.transport {
-            Transport::ReportFile => Some(temp_report_path(&subject)),
-            Transport::Stdout => None,
-        };
-        let argv = tool.full_argv(&root, report_path.as_deref());
         let full_dirs = sandbox_full_dirs(tool.transport, report_path.as_deref());
 
         // The manifest's sandbox posture, resolved by the rules every plugin
         // seam shares (`plugins::posture`) rather than by a copy that lives
-        // here: Phase D gave `run_check` and `run_command` the same three
-        // fields, and three spellings of "what `required` means" is three
-        // chances for one of them to mean something else.
+        // here: `run_check` and `run_command` read the same three fields, and
+        // three spellings of what `required` means is three chances for one of
+        // them to mean something else.
         //
         // `boundary_expected` is B-C1: a refusal row promises "this path was not
         // granted, every other grant was", which is false when nothing is being
@@ -1101,8 +940,7 @@ impl AuditState {
         // a `GrantRow` — only the row is withheld.
         let seam = crate::sandbox::audit_seam(&subject);
         let select = tool.runtime_select();
-        let boundary_expected =
-            sandbox.enabled && tool.sandbox != crate::plugins::manifest::SandboxReq::Unsupported;
+        let boundary_expected = sandbox.enabled && tool.sandbox != SandboxReq::Unsupported;
         let rows = crate::plugins::posture::screen_extra_grants(
             &seam,
             &root,
@@ -1130,23 +968,23 @@ impl AuditState {
         .await;
         let duration_ms = started.elapsed().as_millis() as u64;
 
+        // Output is only meaningful for a completed (non-killed) child; a
+        // cancelled/timed-out gitleaks may have left a half-written report.
         let sarif = match &cap.outcome {
             Outcome::Exited(_) => {
                 read_sarif(tool.transport, &cap.stdout, report_path.as_deref()).await
             }
             _ => String::new(),
         };
+        // A truncated stdout only invalidates the report when stdout IS the
+        // report; for report-file tools it merely truncates captured logs.
         let sarif_truncated = tool.transport == Transport::Stdout && cap.stdout_truncated;
         let (status, findings, error) = finalize(
             &Finalize {
                 key: tool.key.clone(),
                 findings_exit_codes: &tool.findings_exit_codes,
                 parser: tool.parser,
-                // The ingest gate, for this population only. A built-in's
-                // semantics are pinned by its own tests and by fourteen tools'
-                // measured behaviour (R4); a plugin's contract is the one
-                // decision 3 states, and it is checked rather than assumed.
-                gate: IngestGate::for_parser(tool.parser),
+                gate: tool.gate,
             },
             cap.outcome,
             &sarif,
@@ -1157,6 +995,18 @@ impl AuditState {
             timeout,
         );
 
+        // Scan-coverage: the lockfiles/manifests osv-scanner reports scanning,
+        // pulled from the same SARIF in a second best-effort pass. `osv-scanner`
+        // only — its `runs[].artifacts` are the audit-only coverage signal, and
+        // no other tool emits them.
+        let scanned_artifacts = if tool.key.is_builtin("osv-scanner") && status == ToolStatus::Done
+        {
+            parsers::sarif_scanned_artifacts(&sarif, &root)
+        } else {
+            Vec::new()
+        };
+
+        // Clean up the temp report regardless of outcome.
         if let Some(p) = &report_path {
             let _ = tokio::fs::remove_file(p).await;
         }
@@ -1168,9 +1018,72 @@ impl AuditState {
             ts.findings = findings;
             ts.duration_ms = duration_ms;
             ts.error = error;
+            ts.scanned_artifacts = scanned_artifacts;
         });
+
         record_audit_run(&subject, &root, findings_count, duration_ms, ok);
     }
+}
+
+/// Resolve one runnable tool to an on-disk binary, or say which kind of
+/// misconfiguration this is.
+///
+/// The two provenances differ in exactly one way, and it is the amended
+/// decision 10: cImp resolves a bare command NAME for a tool it shipped, and
+/// never for one a user dropped in a folder.
+///
+/// * **Built-in.** A configured path wins verbatim (the V23 override contract:
+///   "use exactly this binary" is a deliberate choice project-local resolution
+///   must not second-guess). Otherwise the project's own `node_modules/.bin`
+///   shim, if the manifest names one, then `ebin` then `PATH` on the declared
+///   command. The two failure messages stay distinct: nothing configured and
+///   nothing found is *not installed* (fixed by installing it), while a
+///   configured path that does not resolve is *misconfigured* (fixed in
+///   Settings). Presenting the second as the first is what sends a user
+///   installing a tool they already have.
+/// * **Plugin.** The configured path, and only that. Nothing is bundled and
+///   cImp never guesses a binary for a definition it does not vouch for, so
+///   there is no "not installed" state here — a tool with no path was never
+///   runnable and never reached this list.
+fn resolve_runnable(tool: &RunnableAudit, root: &Path) -> Result<PathBuf, (ToolStatus, String)> {
+    let configured = tool.program.trim();
+    let Some(command) = tool.command.as_deref() else {
+        // A user plugin: verbatim, and it must be a real file. `resolve_command`
+        // is deliberately not used — a PATH search on a plugin's behalf is the
+        // guess decision 10 forbids.
+        let path = PathBuf::from(configured);
+        return if path.is_file() {
+            Ok(path)
+        } else {
+            Err((
+                ToolStatus::PathInvalid,
+                format!(
+                    "{}: configured path not found: {configured} — fix it in Settings, Tool \
+                     Plugins",
+                    tool.label
+                ),
+            ))
+        };
+    };
+    if !configured.is_empty() {
+        return crate::pty::resolve_command(configured).map_err(|_| {
+            (
+                ToolStatus::PathInvalid,
+                format!("configured path not found: {configured} — fix it in Settings"),
+            )
+        });
+    }
+    if let Some(bin) = tool.project_local_bin.as_deref() {
+        if let Some(local) = super::resolve_project_local_bin(root, bin) {
+            return Ok(local);
+        }
+    }
+    crate::pty::resolve_command(command).map_err(|_| {
+        (
+            ToolStatus::NotInstalled,
+            "not found on PATH or ebin — install it or set its path in Settings".to_string(),
+        )
+    })
 }
 
 /// cImp's own scratch directory for audit report files, created if absent.
@@ -1236,81 +1149,24 @@ async fn read_sarif(transport: Transport, stdout: &str, report: Option<&Path>) -
     }
 }
 
-/// Turn a completed [`Capture`] into the tool's terminal state. Pure — the
-/// `sarif` text (a tool's stdout or report-file contents; still named `sarif`
-/// for continuity though a quality tool may emit JSON/text) has already been
-/// resolved from the adapter's transport by the caller (empty for a killed
-/// child), and `sarif_truncated` says whether that text is known-incomplete
-/// (stdout blew the capture cap / drain timed out). This is the one place the
-/// audit runner's findings-vs-error exit semantics are applied.
+/// What [`finalize`] needs to know about the tool whose run it is classifying.
 ///
-/// V25 Phase C decision table (output always parsed via the adapter's parser):
-///
-/// | outcome | parsed findings | result |
-/// |---|---|---|
-/// | spawn error / cancel / timeout | — | `failed` |
-/// | [`ExitClass::Error`] (non-findings non-zero code) | — | `failed` (code + tail) |
-/// | Clean/Findings but output known-truncated | — | `failed` (incomplete) |
-/// | [`ExitClass::Clean`] (exit 0), any parsed findings | ≥ 0 | `done` (findings authoritative) |
-/// | [`ExitClass::Findings`] code, ≥ 1 parsed finding | ≥ 1 | `done` with findings |
-/// | [`ExitClass::Findings`] code, 0 parsed findings | 0 | `failed` — and the message distinguishes NO output at all (the tool never ran) from a report that was written but unreadable |
-///
-/// The Clean row is the V25 correction: cppcheck ALWAYS exits 0 (findings only
-/// in its report) and eslint exits 0 when it has warnings-only — both must be
-/// read from their parsed output on a clean exit, not assumed empty. A clean
-/// exit with genuinely empty/absent output still parses to zero findings and
-/// stays `done`-no-findings (gitleaks writes no report on a clean run). The
-/// "report lost" guard fires only for a *findings exit code* whose output didn't
-/// parse — never for a clean exit, whose empty output is a legitimate clean bill.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn finalize_outcome(
-    id: AuditToolId,
-    adapter: &Adapter,
-    outcome: Outcome,
-    sarif: &str,
-    sarif_truncated: bool,
-    stdout: &str,
-    stderr: &str,
-    root: &Path,
-    timeout: Duration,
-) -> (ToolStatus, Vec<AuditFinding>, Option<String>) {
-    finalize(
-        &Finalize {
-            key: ToolKey::Builtin(id),
-            findings_exit_codes: adapter.findings_exit_codes,
-            parser: adapter.parser,
-            // Built-ins keep the exact semantics fourteen tools were measured
-            // against (R4): gitleaks writes NO report on a clean run, cppcheck
-            // always exits 0. The ingest gate is the plugin population's
-            // contract, not a retroactive rule for theirs.
-            gate: IngestGate::None,
-        },
-        outcome,
-        sarif,
-        sarif_truncated,
-        stdout,
-        stderr,
-        root,
-        timeout,
-    )
-}
-
-/// What [`finalize`] needs to know about the tool whose run it is classifying —
-/// the small, owned set of facts that differ between an `Adapter` and a
-/// [`RunnableAudit`]. Everything else about the decision is shared, which is
-/// the point: two copies of the findings-vs-error matrix would be two places
-/// for "empty is not absent" to be forgotten in.
-struct Finalize<'a> {
-    key: ToolKey,
-    findings_exit_codes: &'a [i32],
-    parser: AuditParser,
-    /// The ingest gate output passes before it becomes findings — keyed on the
-    /// RESOLVED parser (G2), and [`IngestGate::None`] for the built-in tier.
-    gate: IngestGate,
+/// A small owned struct rather than a `&RunnableAudit` so the findings-vs-error
+/// matrix can be driven directly by a test that has no manifest, no registry and
+/// no plugin set — which is most of them, because that matrix is where "empty is
+/// not absent" lives.
+pub(super) struct Finalize<'a> {
+    pub key: ToolKey,
+    pub findings_exit_codes: &'a [i32],
+    pub parser: AuditParser,
+    /// The ingest gate output passes before it becomes findings — resolved once
+    /// on `RunnableAudit`, from the manifest's declaration and the RESOLVED
+    /// parser (G2).
+    pub gate: super::runnable::IngestGate,
 }
 
 #[allow(clippy::too_many_arguments)]
-fn finalize(
+pub(super) fn finalize(
     spec: &Finalize,
     outcome: Outcome,
     sarif: &str,
@@ -1518,112 +1374,126 @@ fn category_label(category: Category) -> &'static str {
     }
 }
 
-/// Recompute each QUALITY tool's `enabled` flag to its automatic value:
-/// factory-default-enabled AND applicable to `census`. Deriving from
-/// [`crate::settings::default_audit_tools`] keeps the default-disabled
-/// heavyweights (dotnet-analyzers — runs a real build; semgrep-quality —
-/// network rulesets) opt-in even when applicable, and security tools are
-/// never in scope. Returns whether any flag changed. Pure — the settings
-/// write and the auto/manual mode gate live in
+/// Recompute each built-in QUALITY tool's `enabled` flag to its automatic
+/// value — the manifest's own default AND applicable to `census` — and return
+/// the `(tool id, want)` pairs that differ from what is stored.
+///
+/// Reading the manifest's `enabled_by_default` rather than a second table is
+/// what keeps the heavyweights (`dotnet-analyzers` runs a real build,
+/// `semgrep-quality` fetches a network ruleset) opt-in: their definitions say
+/// so, and auto-selection has no separate opinion to drift from it.
+///
+/// **Built-ins only.** Auto-selection is a statement about the roster cImp
+/// ships and knows the shape of; a user plugin's tool is enabled because the
+/// user enabled it, and a census walk is not an argument for turning somebody
+/// else's tool off. Security tools are never in scope either — a security audit
+/// must not become census-dependent.
+///
+/// Pure: the settings write and the auto/manual gate live in
 /// [`AuditState::apply_quality_auto_select`].
-pub(crate) fn auto_select_quality(tools: &mut [AuditToolConfig], census: &census::Census) -> bool {
-    let defaults = crate::settings::default_audit_tools();
-    let default_enabled = |id: AuditToolId| {
-        defaults
-            .iter()
-            .find(|d| d.id == id)
-            .is_some_and(|d| d.enabled)
-    };
-    let mut changed = false;
-    for t in tools.iter_mut() {
-        if adapters::adapter(t.id).category != Category::Quality {
+pub(crate) fn auto_select_quality(
+    tools: &[EffectiveTool],
+    census: &census::Census,
+) -> Vec<(String, bool)> {
+    let mut out = Vec::new();
+    for t in tools {
+        if t.provenance != crate::plugins::manifest::Provenance::Builtin
+            || audit_category(t) != Some(Category::Quality)
+        {
             continue;
         }
-        let want = default_enabled(t.id) && adapters::adapter(t.id).applicable(census);
-        if t.enabled != want {
-            t.enabled = want;
-            changed = true;
+        let Ok(Some(runnable)) = RunnableAudit::from_effective(t) else {
+            continue;
+        };
+        let want = t.manifest.enabled_by_default && runnable.applicable(census);
+        if t.tool_enabled != want {
+            out.push((t.tool_id.clone(), want));
         }
     }
-    changed
+    out
 }
 
-/// V25 Phase C: pure scan planning. From the configured tools, the target
-/// `category`, and the project `census`, produce `(chips, to_run)`:
+/// Which umbrella a resolved tool fans out under, or `None` when it is not an
+/// umbrella tool at all (a `check`/`command` kind, which `run_check` and
+/// `run_command` own).
 ///
-/// - `chips`: one [`ToolState`] per tool **of this category** (the other
-///   category belongs to the other tab), in configured order — `idle` when
-///   disabled, `skipped-not-applicable` when enabled but gated off by the
-///   census, `running` (about to resolve) when enabled + applicable.
-/// - `to_run`: the enabled + applicable subset actually launched.
-///
-/// Split out from [`AuditState::start_scan`] so the category + applicability
-/// filter is unit-testable without a Tauri `AppHandle`.
-fn plan_scan(
-    tools: &[AuditToolConfig],
-    category: Category,
-    census: &census::Census,
-) -> (Vec<ToolState>, Vec<AuditToolConfig>) {
-    let mut chips = Vec::new();
-    let mut to_run = Vec::new();
-    for t in tools
-        .iter()
-        .filter(|t| adapters::adapter(t.id).category == category)
-    {
-        if !t.enabled {
-            chips.push(ToolState::idle(t.id, category));
-        } else if adapters::adapter(t.id).applicable(census) {
-            chips.push(ToolState::fresh(t.id, category));
-            to_run.push(t.clone());
-        } else {
-            chips.push(ToolState::skipped_not_applicable(t.id, category));
-        }
+/// One function, so every audit-side reader asks the question the same way and
+/// nobody re-derives "security kind means the Security umbrella" — the mapping
+/// that carries the security floor.
+fn audit_category(tool: &EffectiveTool) -> Option<Category> {
+    match tool.kind() {
+        crate::plugins::manifest::ToolKind::Security => Some(Category::Security),
+        crate::plugins::manifest::ToolKind::Audit => Some(Category::Quality),
+        _ => None,
     }
-    (chips, to_run)
 }
 
-/// The plugin tools this launch can run, resolved against the live plugin set,
-/// the user's stored state and this project.
+/// Every tool the registry knows about for this project — cImp's own embedded
+/// definitions and whatever the user dropped in the plugins folder, joined with
+/// the stored configuration.
 ///
-/// Empty (never an error) when no store has been published — the headless
-/// subcommands and every test construct an `AuditState` without one, and a scan
-/// with no plugins is exactly the pre-V38 scan.
-fn plugin_tools(
+/// Empty (never an error) when no store has been published: the headless
+/// subcommands and most tests construct an `AuditState` without one. That is a
+/// real degradation since Phase E — the fourteen built-ins live in the registry
+/// now — so every path that must see them publishes a store, and the ones that
+/// do not are paths where no scan runs.
+fn registry_tools(
     cfg: &crate::settings::ToolPluginsSettings,
     root: &Path,
-) -> Vec<crate::plugins::registry::EffectiveTool> {
+) -> Vec<EffectiveTool> {
     let Some(store) = crate::plugins::global() else {
         return Vec::new();
     };
-    crate::plugins::registry::runnable_tools(&store.snapshot(), cfg, Some(root))
+    crate::plugins::registry::effective_tools(&store.snapshot(), cfg, Some(root))
 }
 
-/// V38 Phase C: the plugin half of a category's roster.
+/// Pure scan planning: from every registered tool, the target `category` and
+/// the project `census`, produce `(chips, to_run)`.
 ///
-/// `tools` is `plugins::registry::runnable_tools` — already enabled, already
-/// path-configured, already joined with this project. What is left is the same
-/// three questions `plan_scan` answers for a built-in: is it this category's,
-/// does it apply to this project, and can it run at all.
+/// * `chips` — one [`ToolState`] per tool of this category, in registry order
+///   (cImp's own first): `idle` when disabled, `skipped-not-applicable` when
+///   enabled but gated off by the census, `running` (about to resolve)
+///   otherwise, and `failed` for one that belongs to an umbrella and cannot be
+///   prepared at all.
+/// * `to_run` — the subset actually launched.
 ///
-/// Pure, so the fan-out rule is unit-testable without a `PluginStore`, an
-/// `AppHandle` or a settings file — the reason `plan_scan` is a free function
-/// too.
-fn plan_plugin_scan(
-    tools: &[crate::plugins::registry::EffectiveTool],
+/// # Why the two provenances are not treated identically here
+///
+/// A **built-in** appears whether or not it is enabled, because that is the
+/// contract the Code Audit panel and the umbrella report have had since V23: a
+/// disabled scanner is greyed out and counted as `disabled`, so the roster is
+/// the same fourteen names every time and a user can see what they turned off.
+/// A **user plugin's** tool appears only when it is runnable, because an
+/// unconfigured one is configuration the Tool Plugins pane shows — a chip
+/// promising a scan cImp has no binary for would be a worse answer than
+/// silence.
+///
+/// Pure, so the filter is unit-testable without an `AppHandle`, a settings file
+/// or a plugin store.
+fn plan_scan(
+    tools: &[EffectiveTool],
     category: Category,
     census: &census::Census,
 ) -> (Vec<ToolState>, Vec<RunnableAudit>) {
     let mut chips = Vec::new();
     let mut to_run = Vec::new();
     for tool in tools {
+        let builtin = tool.provenance == crate::plugins::manifest::Provenance::Builtin;
+        if !builtin && !tool.runnable() {
+            continue;
+        }
         match RunnableAudit::from_effective(tool) {
-            // A `check`/`command`-kind tool: Phase D's population, not ours.
-            Ok(None) => continue,
             Ok(Some(runnable)) => {
+                // The RESOLVED tool's own category, not a second derivation of
+                // it: `RunnableAudit` is what the runner spawns, so its answer
+                // is the one that has to decide which umbrella this belongs to.
                 if runnable.category != category {
                     continue;
                 }
-                if runnable.applicable(census) {
+                if !tool.enabled {
+                    // Built-in only (a disabled plugin tool never reaches here).
+                    chips.push(ToolState::idle(runnable.key, category));
+                } else if runnable.applicable(census) {
                     chips.push(ToolState::fresh(runnable.key.clone(), category));
                     to_run.push(runnable);
                 } else {
@@ -1633,73 +1503,71 @@ fn plan_plugin_scan(
                     ));
                 }
             }
+            // A `check`/`command`-kind tool: `run_check` and `run_command` own
+            // that population, and it never appears under an umbrella.
+            Ok(None) => continue,
             // A tool that belongs to an umbrella and cannot run: a failed chip
-            // with the reason, never a silent omission. Which umbrella is not
-            // knowable when the manifest itself is the problem, so it is filed
-            // under the category being scanned — visible in the run the user is
-            // looking at rather than in one they may never trigger.
-            Err(why) => chips.push(ToolState::failed_to_plan(
-                ToolKey::Plugin(tool.tool_key.clone()),
-                category,
-                format!("this plugin tool cannot run: {why}"),
-            )),
+            // with the reason, never a silent omission. A tool the user enabled
+            // and pointed at a binary must not vanish from a report in silence.
+            // Which umbrella is not knowable once resolution has failed, so it
+            // is filed under the one being scanned — visible in the run the user
+            // is looking at rather than in one they may never trigger.
+            Err(why) if audit_category(tool) == Some(category) => {
+                chips.push(ToolState::failed_to_plan(
+                    ToolKey::of(tool),
+                    category,
+                    format!("this plugin tool cannot run: {why}"),
+                ))
+            }
+            Err(_) => continue,
         }
     }
     (chips, to_run)
 }
 
-/// V38 Phase D: the PRE-SCAN roster for one category — what a scan would run,
-/// as `idle` chips, before any scan has run.
+/// The PRE-SCAN roster for one category — what a scan would run right now, as
+/// `idle` chips, before any scan has produced one.
 ///
-/// Pure, and split out of [`AuditState::effective_roster`] for the reason
-/// [`plan_scan`] and [`plan_plugin_scan`] are free functions: the rule is
-/// assertable without a runner, an `AppHandle` or a settings file.
-///
-/// The two populations are treated differently, on purpose:
-///
-/// * **built-ins** are listed exactly as configured, disabled ones included —
-///   the pre-V38 contract this replaces (`configuredToolStates`), which the
-///   panel renders greyed. Applicability is left to the frontend, which has the
-///   built-in table and already applies it.
-/// * **plugin tools** are the RUNNABLE set (enabled ∩ path-configured): a plugin
-///   tool that is off or unconfigured is configuration the Tool Plugins pane
-///   shows, not a chip promising a scan. Their applicability lives in a manifest
-///   the frontend cannot read, so it is decided here — but only against a census
-///   that has actually been taken (`census_known`), because an unwalked project
-///   is unknown, not empty.
+/// The same population and the same two provenance rules as [`plan_scan`], with
+/// one deliberate difference: a built-in is **not** gated on applicability here.
+/// The panel has always rendered the full built-in roster and applied its own
+/// language gate to it, and moving that decision server-side would change what a
+/// cold tab shows before the first census walk. A plugin tool's applicability
+/// lives in a manifest the frontend cannot read, so that half is decided here —
+/// but only against a census that has actually been taken (`census_known`),
+/// because an unwalked project is unknown, not empty.
 fn plan_roster(
-    builtin: &[AuditToolConfig],
-    plugin_tools: &[crate::plugins::registry::EffectiveTool],
+    tools: &[EffectiveTool],
     category: Category,
     census: &census::Census,
     census_known: bool,
 ) -> Vec<ToolState> {
-    let mut out: Vec<ToolState> = builtin
-        .iter()
-        .filter(|t| adapters::adapter(t.id).category == category)
-        .map(|t| ToolState::idle(t.id, category))
-        .collect();
-
-    for tool in plugin_tools {
+    let mut out = Vec::new();
+    for tool in tools {
+        let builtin = tool.provenance == crate::plugins::manifest::Provenance::Builtin;
+        if !builtin && !tool.runnable() {
+            continue;
+        }
         match RunnableAudit::from_effective(tool) {
-            // A `check`/`command`-kind tool: not an umbrella population.
-            Ok(None) => continue,
             Ok(Some(runnable)) if runnable.category == category => {
-                out.push(if census_known && !runnable.applicable(census) {
+                let gated = !builtin && census_known && !runnable.applicable(census);
+                out.push(if gated {
                     ToolState::skipped_not_applicable(runnable.key, category)
                 } else {
                     ToolState::idle(runnable.key, category)
                 });
             }
-            Ok(Some(_)) => continue,
-            // A tool that belongs to an umbrella and cannot run. Shown for the
-            // same reason `plan_plugin_scan` shows it during a scan: a
+            Ok(_) => continue,
+            // Shown for the reason `plan_scan` shows it during a scan: a
             // configured capability must not be invisible.
-            Err(why) => out.push(ToolState::failed_to_plan(
-                ToolKey::Plugin(tool.tool_key.clone()),
-                category,
-                format!("this plugin tool cannot run: {why}"),
-            )),
+            Err(why) if audit_category(tool) == Some(category) => {
+                out.push(ToolState::failed_to_plan(
+                    ToolKey::of(tool),
+                    category,
+                    format!("this plugin tool cannot run: {why}"),
+                ))
+            }
+            Err(_) => continue,
         }
     }
     out
@@ -2281,10 +2149,88 @@ mod tests {
     use super::*;
     use crate::checks::Severity;
 
+    /// Every built-in tool, resolved through the embedded manifest against an
+    /// UNTOUCHED settings container — so each one is exactly what a fresh
+    /// install gets.
+    ///
+    /// This is the fixture that replaced `adapters::adapter(AuditToolId::…)`.
+    /// The difference is the point of Phase E: the facts these tests assert on
+    /// (argv, exit codes, parser, applicability) used to be a `static` table and
+    /// are now read from `plugins/builtin/cimp-audit.json` through the same
+    /// registry a dropped-in plugin goes through.
+    fn builtin_tools() -> Vec<EffectiveTool> {
+        crate::plugins::registry::effective_tools(
+            &crate::plugins::builtin::plugin_set(),
+            &crate::settings::ToolPluginsSettings::default(),
+            None,
+        )
+    }
+
+    /// One built-in tool by its wire id, resolved and ready to run.
+    fn builtin(id: &str) -> RunnableAudit {
+        let tools = builtin_tools();
+        let tool = tools
+            .iter()
+            .find(|t| t.tool_id == id)
+            .unwrap_or_else(|| panic!("no built-in tool `{id}`"));
+        RunnableAudit::from_effective(tool)
+            .unwrap_or_else(|e| panic!("`{id}` is not runnable: {e}"))
+            .unwrap_or_else(|| panic!("`{id}` is not an umbrella tool"))
+    }
+
+    /// The built-in roster with `enabled` overridden per tool — the fixture the
+    /// planning tests use in place of the old `Vec<AuditToolConfig>`.
+    fn builtin_tools_with(enables: &[(&str, bool)]) -> Vec<EffectiveTool> {
+        let mut cfg = crate::settings::ToolPluginsSettings::default();
+        let plugin = cfg
+            .plugins
+            .entry(crate::plugins::builtin::AUDIT_PLUGIN_KEY.to_string())
+            .or_default();
+        for (id, on) in enables {
+            plugin.tools.entry((*id).to_string()).or_default().enabled = *on;
+        }
+        crate::plugins::registry::effective_tools(
+            &crate::plugins::builtin::plugin_set(),
+            &cfg,
+            None,
+        )
+    }
+
+    /// [`finalize`] for one built-in tool, reading its exit codes, parser and
+    /// ingest gate from its manifest.
+    #[allow(clippy::too_many_arguments)]
+    fn finalize_builtin(
+        id: &str,
+        outcome: Outcome,
+        sarif: &str,
+        sarif_truncated: bool,
+        stdout: &str,
+        stderr: &str,
+        root: &Path,
+        timeout: Duration,
+    ) -> (ToolStatus, Vec<AuditFinding>, Option<String>) {
+        let tool = builtin(id);
+        finalize(
+            &Finalize {
+                key: tool.key.clone(),
+                findings_exit_codes: &tool.findings_exit_codes,
+                parser: tool.parser,
+                gate: tool.gate,
+            },
+            outcome,
+            sarif,
+            sarif_truncated,
+            stdout,
+            stderr,
+            root,
+            timeout,
+        )
+    }
+
     /// The security trio's parser — every fixture below is SARIF, and naming it
     /// once keeps the `parse_findings` call sites about the fixture.
     fn sarif_parser() -> AuditParser {
-        adapters::adapter(AuditToolId::OsvScanner).parser
+        builtin("osv-scanner").parser
     }
 
     // ── SARIF fixtures ─────────────────────────────────────────────────────
@@ -2363,9 +2309,10 @@ mod tests {
 
     #[test]
     fn osv_sarif_fixture_maps_to_findings() {
-        let f = parse_findings(&AuditToolId::OsvScanner.into(), sarif_parser(), OSV_SARIF, &root());
+        let key = ToolKey::Builtin("osv-scanner".to_string());
+        let f = parse_findings(&key, sarif_parser(), OSV_SARIF, &root());
         assert_eq!(f.len(), 1);
-        assert_eq!(f[0].tool, AuditToolId::OsvScanner);
+        assert_eq!(f[0].tool, key);
         assert_eq!(f[0].diag.code.as_deref(), Some("GHSA-r8w9-5wcg-vfj7"));
         assert_eq!(f[0].diag.severity, Severity::Warning);
         assert_eq!(f[0].diag.file, "Cargo.lock");
@@ -2375,7 +2322,7 @@ mod tests {
     #[test]
     fn gitleaks_sarif_fixture_relativizes_path() {
         let f = parse_findings(
-            &AuditToolId::Gitleaks.into(),
+            &ToolKey::Builtin("gitleaks".to_string()),
             sarif_parser(),
             GITLEAKS_SARIF,
             &root(),
@@ -2391,7 +2338,12 @@ mod tests {
 
     #[test]
     fn semgrep_sarif_fixture_maps_to_findings() {
-        let f = parse_findings(&AuditToolId::Semgrep.into(), sarif_parser(), SEMGREP_SARIF, &root());
+        let f = parse_findings(
+            &ToolKey::Builtin("semgrep".to_string()),
+            sarif_parser(),
+            SEMGREP_SARIF,
+            &root(),
+        );
         assert_eq!(f.len(), 1);
         assert_eq!(
             f[0].diag.code.as_deref(),
@@ -2450,10 +2402,8 @@ mod tests {
 
     #[test]
     fn findings_exit_is_done_with_findings() {
-        let a = adapters::adapter(AuditToolId::OsvScanner);
-        let (status, findings, error) = finalize_outcome(
-            AuditToolId::OsvScanner,
-            a,
+        let (status, findings, error) = finalize_builtin(
+            "osv-scanner",
             Outcome::Exited(Some(1)), // findings-present code
             OSV_SARIF,
             false,
@@ -2469,10 +2419,8 @@ mod tests {
 
     #[test]
     fn clean_exit_is_done_no_findings() {
-        let a = adapters::adapter(AuditToolId::Gitleaks);
-        let (status, findings, error) = finalize_outcome(
-            AuditToolId::Gitleaks,
-            a,
+        let (status, findings, error) = finalize_builtin(
+            "gitleaks",
             Outcome::Exited(Some(0)),
             "", // clean run wrote no report
             false,
@@ -2492,11 +2440,9 @@ mod tests {
     /// it was, because they send the reader to three different places.
     #[test]
     fn findings_exit_with_empty_sarif_is_failed() {
-        let a = adapters::adapter(AuditToolId::Gitleaks);
         for sarif in ["", "not json at all"] {
-            let (status, findings, error) = finalize_outcome(
-                AuditToolId::Gitleaks,
-                a,
+            let (status, findings, error) = finalize_builtin(
+                "gitleaks",
                 Outcome::Exited(Some(1)), // "leaks found"
                 sarif,
                 false,
@@ -2534,10 +2480,8 @@ mod tests {
     /// interpreter the sandbox does not grant) that actually causes it.
     #[test]
     fn a_findings_exit_with_no_output_at_all_is_not_a_lost_report() {
-        let a = adapters::adapter(AuditToolId::Semgrep);
-        let (status, findings, error) = finalize_outcome(
-            AuditToolId::Semgrep,
-            a,
+        let (status, findings, error) = finalize_builtin(
+            "semgrep",
             Outcome::Exited(Some(1)), // semgrep's findings code
             "",                       // no SARIF
             false,                    // not truncated — there was nothing to truncate
@@ -2566,11 +2510,9 @@ mod tests {
     /// on a "clean" exit — a truncated document must not read as a clean bill.
     #[test]
     fn truncated_sarif_is_failed_not_clean() {
-        let a = adapters::adapter(AuditToolId::OsvScanner);
         for code in [0, 1] {
-            let (status, findings, error) = finalize_outcome(
-                AuditToolId::OsvScanner,
-                a,
+            let (status, findings, error) = finalize_builtin(
+                "osv-scanner",
                 Outcome::Exited(Some(code)),
                 OSV_SARIF, // even a parseable prefix is untrustworthy
                 true,      // stdout blew the capture cap
@@ -2587,10 +2529,8 @@ mod tests {
 
     #[test]
     fn tool_error_exit_is_failed_with_message() {
-        let a = adapters::adapter(AuditToolId::Semgrep);
-        let (status, findings, error) = finalize_outcome(
-            AuditToolId::Semgrep,
-            a,
+        let (status, findings, error) = finalize_builtin(
+            "semgrep",
             Outcome::Exited(Some(2)), // neither 0 nor a findings code
             "",
             false,
@@ -2608,11 +2548,9 @@ mod tests {
 
     #[test]
     fn timeout_and_cancel_and_spawn_error_map_to_failed() {
-        let a = adapters::adapter(AuditToolId::Semgrep);
         let f = |o: Outcome| {
-            finalize_outcome(
-                AuditToolId::Semgrep,
-                a,
+            finalize_builtin(
+                "semgrep",
                 o,
                 "",
                 false,
@@ -2659,10 +2597,8 @@ mod tests {
             }]
           }]
         }"#;
-        let a = adapters::adapter(AuditToolId::Cppcheck);
-        let (status, findings, error) = finalize_outcome(
-            AuditToolId::Cppcheck,
-            a,
+        let (status, findings, error) = finalize_builtin(
+            "cppcheck",
             Outcome::Exited(Some(0)), // cppcheck's normal "findings present" path
             CPPCHECK_SARIF,
             false,
@@ -2691,10 +2627,8 @@ mod tests {
             ]
           }
         ]"#;
-        let a = adapters::adapter(AuditToolId::Eslint);
-        let (status, findings, error) = finalize_outcome(
-            AuditToolId::Eslint,
-            a,
+        let (status, findings, error) = finalize_builtin(
+            "eslint",
             Outcome::Exited(Some(0)), // warnings-only ⇒ exit 0
             ESLINT_JSON,
             false,
@@ -2717,15 +2651,9 @@ mod tests {
     /// clean bill.
     #[test]
     fn clean_exit_with_empty_output_is_done_no_findings() {
-        for id in [
-            AuditToolId::Cppcheck,
-            AuditToolId::Eslint,
-            AuditToolId::Oxlint,
-        ] {
-            let a = adapters::adapter(id);
-            let (status, findings, error) = finalize_outcome(
+        for id in ["cppcheck", "eslint", "oxlint"] {
+            let (status, findings, error) = finalize_builtin(
                 id,
-                a,
                 Outcome::Exited(Some(0)),
                 "",
                 false,
@@ -2734,9 +2662,9 @@ mod tests {
                 &root(),
                 Duration::from_secs(600),
             );
-            assert_eq!(status, ToolStatus::Done, "{id:?}");
-            assert!(findings.is_empty(), "{id:?}");
-            assert!(error.is_none(), "{id:?}");
+            assert_eq!(status, ToolStatus::Done, "{id}");
+            assert!(findings.is_empty(), "{id}");
+            assert!(error.is_none(), "{id}");
         }
     }
 
@@ -2760,46 +2688,46 @@ mod tests {
 
     // ── V25 plan_scan: category + applicability + disabled filter ────────────
 
-    fn tool_cfg(id: AuditToolId, enabled: bool) -> AuditToolConfig {
-        AuditToolConfig {
-            id,
-            enabled,
-            path: String::new(),
-            extra_args: Vec::new(),
-            ruleset: String::new(),
-            timeout_secs: None,
-        }
-    }
-
-    /// A Quality scan never launches a Security tool, hides a disabled tool as
+    /// A Quality scan never launches a Security tool, shows a disabled tool as
     /// `idle`, and reports an enabled-but-inapplicable tool `skipped-not-
     /// applicable`; only enabled + applicable tools land in `to_run`.
     #[test]
     fn plan_scan_quality_filters_category_disabled_and_applicability() {
         // A Rust + JS project: no `.py`, no `.go`.
         let census = census::Census::from_parts(&["ts", "rs"], &["Cargo.toml", "package.json"]);
-        let tools = vec![
-            tool_cfg(AuditToolId::OsvScanner, true), // security — excluded here
-            tool_cfg(AuditToolId::Oxlint, true),     // quality, applicable (ts)
-            tool_cfg(AuditToolId::Ruff, true),       // quality, NOT applicable (no py)
-            tool_cfg(AuditToolId::CargoMachete, false), // quality, disabled
-            tool_cfg(AuditToolId::Typos, true),      // quality, always applicable
-        ];
+        let tools = builtin_tools_with(&[("cargo-machete", false)]);
         let (chips, to_run) = plan_scan(&tools, Category::Quality, &census);
 
         // No security tool leaks into a quality scan.
         assert!(chips.iter().all(|c| c.category == Category::Quality));
-        assert!(!chips.iter().any(|c| c.id == AuditToolId::OsvScanner));
+        assert!(!chips.iter().any(|c| c.id.is_builtin("osv-scanner")));
 
-        let status = |id: AuditToolId| chips.iter().find(|c| c.id == id).unwrap().status;
-        assert_eq!(status(AuditToolId::Oxlint), ToolStatus::Running);
-        assert_eq!(status(AuditToolId::Ruff), ToolStatus::SkippedNotApplicable);
-        assert_eq!(status(AuditToolId::CargoMachete), ToolStatus::Idle);
-        assert_eq!(status(AuditToolId::Typos), ToolStatus::Running);
+        let status = |id: &str| {
+            chips
+                .iter()
+                .find(|c| c.id.is_builtin(id))
+                .unwrap_or_else(|| panic!("no chip for `{id}`"))
+                .status
+        };
+        assert_eq!(status("oxlint"), ToolStatus::Running, "applicable (.ts)");
+        assert_eq!(
+            status("ruff"),
+            ToolStatus::SkippedNotApplicable,
+            "no .py in this project"
+        );
+        assert_eq!(status("cargo-machete"), ToolStatus::Idle, "disabled");
+        assert_eq!(status("typos"), ToolStatus::Running, "always applicable");
+        // A DISABLED built-in is still a chip — the pre-V38 contract the panel
+        // greys out and the report counts as `disabled`.
+        assert_eq!(
+            chips.len(),
+            11,
+            "every quality built-in gets a chip, enabled or not"
+        );
 
-        // to_run is exactly the enabled + applicable set, in configured order.
-        let run_ids: Vec<AuditToolId> = to_run.iter().map(|t| t.id).collect();
-        assert_eq!(run_ids, vec![AuditToolId::Oxlint, AuditToolId::Typos]);
+        // `to_run` is exactly the enabled + applicable set, in manifest order.
+        let run: Vec<String> = to_run.iter().map(|t| t.key.wire()).collect();
+        assert_eq!(run, vec!["oxlint", "typos", "knip"]);
     }
 
     /// A Security scan excludes every Quality tool; the always-applicable trio
@@ -2807,60 +2735,102 @@ mod tests {
     #[test]
     fn plan_scan_security_excludes_quality_tools() {
         let census = census::Census::default();
-        let tools = vec![
-            tool_cfg(AuditToolId::OsvScanner, true),
-            tool_cfg(AuditToolId::Gitleaks, true),
-            tool_cfg(AuditToolId::Oxlint, true), // quality — must not appear
-        ];
-        let (chips, to_run) = plan_scan(&tools, Category::Security, &census);
+        let (chips, to_run) = plan_scan(&builtin_tools(), Category::Security, &census);
         assert!(chips.iter().all(|c| c.category == Category::Security));
-        assert!(!chips.iter().any(|c| c.id == AuditToolId::Oxlint));
-        let run_ids: Vec<AuditToolId> = to_run.iter().map(|t| t.id).collect();
-        assert_eq!(
-            run_ids,
-            vec![AuditToolId::OsvScanner, AuditToolId::Gitleaks]
-        );
+        assert!(!chips.iter().any(|c| c.id.is_builtin("oxlint")));
+        let run: Vec<String> = to_run.iter().map(|t| t.key.wire()).collect();
+        assert_eq!(run, vec!["osv-scanner", "gitleaks", "semgrep"]);
     }
 
-    /// Quality auto-selection: each quality tool's `enabled` becomes
-    /// factory-default-enabled AND census-applicable; the default-disabled
-    /// heavyweights stay opt-in even when applicable; security tools are
-    /// never touched; a second pass is a no-op.
+    /// Quality auto-selection: each built-in quality tool's `enabled` becomes
+    /// its manifest default AND census-applicable; the tools whose manifests say
+    /// `enabled_by_default: false` stay opt-in even when applicable; security
+    /// tools and user plugins are never touched; a second pass is a no-op.
+    ///
+    /// Driven from two extreme starting states rather than one, because the
+    /// function returns only what CHANGES: from all-off, every "must be
+    /// selected" claim is a real change to assert, and from all-on every "must
+    /// be deselected" one is. A single starting state would leave half the rules
+    /// asserted as `None`, which is also what a broken implementation returns.
     #[test]
     fn auto_select_quality_follows_census_and_keeps_heavyweights_opt_in() {
         // A Rust + TS project: no `.py` / `.go` / `.java` / C / eslint config.
         let census = census::Census::from_parts(&["ts", "rs"], &["Cargo.toml", "package.json"]);
-        // Start from an everything-flipped manual state so every rule below
-        // proves auto-select actually rewrote (or deliberately skipped) it.
-        let mut tools = crate::settings::default_audit_tools();
-        for t in tools.iter_mut() {
-            t.enabled = !t.enabled;
+        const QUALITY: &[&str] = &[
+            "oxlint",
+            "golangci-lint",
+            "ruff",
+            "cppcheck",
+            "typos",
+            "eslint",
+            "pmd",
+            "knip",
+            "cargo-machete",
+            "dotnet-analyzers",
+            "semgrep-quality",
+        ];
+        let all = |on: bool| -> Vec<(&'static str, bool)> {
+            QUALITY.iter().map(|id| (*id, on)).collect()
+        };
+        let decide = |state: &[(&'static str, bool)]| {
+            let changes = auto_select_quality(&builtin_tools_with(state), &census);
+            move |id: &str| changes.iter().find(|(k, _)| k == id).map(|(_, v)| *v)
+        };
+
+        // From ALL OFF: exactly the default-on, applicable tools turn on.
+        let off = all(false);
+        let from_off = decide(&off);
+        for id in ["oxlint", "typos", "knip", "cargo-machete"] {
+            assert_eq!(from_off(id), Some(true), "{id} applies to this project");
         }
-        assert!(auto_select_quality(&mut tools, &census));
-        let enabled = |id: AuditToolId| tools.iter().find(|t| t.id == id).unwrap().enabled;
+        for id in ["ruff", "golangci-lint", "cppcheck", "pmd", "eslint"] {
+            assert_eq!(from_off(id), None, "{id} does not apply and stays off");
+        }
+        // The two the MANIFEST marks opt-in stay off even though
+        // `semgrep-quality` is ungated (always applicable) — this is the rule
+        // that stops a first quality audit running a real .NET build or
+        // fetching a ruleset over the network.
+        for id in ["dotnet-analyzers", "semgrep-quality"] {
+            assert_eq!(from_off(id), None, "{id} is opt-in by its manifest");
+        }
 
-        // Default-on + applicable → selected.
-        assert!(enabled(AuditToolId::Oxlint)); // .ts
-        assert!(enabled(AuditToolId::CargoMachete)); // Cargo.toml
-        assert!(enabled(AuditToolId::Knip)); // package.json
-        assert!(enabled(AuditToolId::Typos)); // ungated
-                                              // Default-on but not applicable → deselected.
-        assert!(!enabled(AuditToolId::Ruff));
-        assert!(!enabled(AuditToolId::GolangciLint));
-        assert!(!enabled(AuditToolId::Cppcheck));
-        assert!(!enabled(AuditToolId::Pmd));
-        assert!(!enabled(AuditToolId::Eslint));
-        // Default-disabled heavyweights stay opt-in — semgrep-quality is
-        // ungated (always applicable) and still must NOT be auto-enabled.
-        assert!(!enabled(AuditToolId::SemgrepQuality));
-        assert!(!enabled(AuditToolId::DotnetAnalyzers));
-        // Security tools keep their (flipped-off) state — out of scope.
-        assert!(!enabled(AuditToolId::OsvScanner));
-        assert!(!enabled(AuditToolId::Gitleaks));
-        assert!(!enabled(AuditToolId::Semgrep));
+        // From ALL ON: exactly the inapplicable and the opt-in tools turn off.
+        let on = all(true);
+        let from_on = decide(&on);
+        for id in ["ruff", "golangci-lint", "cppcheck", "pmd", "eslint"] {
+            assert_eq!(from_on(id), Some(false), "{id} does not apply here");
+        }
+        for id in ["dotnet-analyzers", "semgrep-quality"] {
+            assert_eq!(from_on(id), Some(false), "{id} is opt-in by its manifest");
+        }
+        for id in ["oxlint", "typos", "knip", "cargo-machete"] {
+            assert_eq!(from_on(id), None, "{id} is already at its automatic value");
+        }
+        // Security tools are out of scope entirely, from either direction — a
+        // security audit must never become census-dependent.
+        for id in ["osv-scanner", "gitleaks", "semgrep"] {
+            assert_eq!(from_off(id), None, "{id} is a security tool");
+            assert_eq!(from_on(id), None, "{id} is a security tool");
+        }
 
-        // Idempotent: the flags now ARE the automatic values.
-        assert!(!auto_select_quality(&mut tools, &census));
+        // Idempotent: applying what it asked for leaves nothing to decide.
+        let mut applied = on.clone();
+        for (id, v) in auto_select_quality(&builtin_tools_with(&on), &census) {
+            let id = leaked(&id);
+            match applied.iter_mut().find(|(k, _)| *k == id) {
+                Some(slot) => slot.1 = v,
+                None => applied.push((id, v)),
+            }
+        }
+        assert!(auto_select_quality(&builtin_tools_with(&applied), &census).is_empty());
+    }
+
+    /// `builtin_tools_with` takes `&'static str` keys; these ids come from a
+    /// manifest read at run time. Leaking a handful of short strings in a test
+    /// process is the honest trade against threading a lifetime through a
+    /// fixture helper.
+    fn leaked(s: &str) -> &'static str {
+        Box::leak(s.to_string().into_boxed_str())
     }
 
     /// V25 Phase C: a per-tool `timeout_secs` override wins over the global; a
@@ -2884,10 +2854,10 @@ mod tests {
 
     #[test]
     fn event_snapshot_caps_findings_and_flags_truncated() {
-        let mut ts = ToolState::fresh(AuditToolId::Gitleaks, Category::Security);
+        let mut ts = ToolState::fresh(ToolKey::Builtin("gitleaks".to_string()), Category::Security);
         ts.status = ToolStatus::Done;
         let one = || AuditFinding {
-            tool: AuditToolId::Gitleaks.into(),
+            tool: ToolKey::Builtin("gitleaks".to_string()),
             diag: Diag {
                 severity: Severity::Error,
                 code: Some("generic-api-key".into()),
@@ -2931,7 +2901,7 @@ mod tests {
             root: root(),
             scanning: false,
             last_scan_at: None,
-            tools: vec![ToolState::fresh(AuditToolId::Oxlint, Category::Quality)],
+            tools: vec![ToolState::fresh(ToolKey::Builtin("oxlint".to_string()), Category::Quality)],
             census: CensusBlock {
                 extensions: vec!["rs".into(), "ts".into()],
                 markers: vec!["Cargo.toml".into()],
@@ -2968,11 +2938,11 @@ mod tests {
             scanning: true,
             last_scan_at: Some(123),
             tools: vec![ToolState {
-                id: AuditToolId::Gitleaks.into(),
+                id: ToolKey::Builtin("gitleaks".to_string()),
                 category: Category::Security,
                 status: ToolStatus::Done,
                 findings: vec![AuditFinding {
-                    tool: AuditToolId::Gitleaks.into(),
+                    tool: ToolKey::Builtin("gitleaks".to_string()),
                     diag: Diag {
                         severity: Severity::Error,
                         code: Some("generic-api-key".into()),
@@ -3128,7 +3098,9 @@ mod tests {
         (set, dir)
     }
 
-    /// Every tool of the fixture, resolved with a path so it is runnable.
+    /// The fixture plugin's tools, resolved with a path so they are runnable —
+    /// **without** the built-in roster, for the tests that are about the plugin
+    /// population alone.
     fn effective(set: &crate::plugins::PluginSet) -> Vec<crate::plugins::registry::EffectiveTool> {
         let mut cfg = crate::settings::ToolPluginsSettings::default();
         for id in ["scan", "gitleaks", "lint", "fmt"] {
@@ -3137,7 +3109,18 @@ mod tests {
                 "C:\\bin\\acme.exe".to_string(),
             );
         }
-        crate::plugins::registry::runnable_tools(set, &cfg, None)
+        crate::plugins::registry::effective_tools(set, &cfg, None)
+    }
+
+    /// The whole population the runner sees: cImp's own embedded definitions
+    /// FIRST, then the fixture plugin's — the order `loader::scan_all`
+    /// establishes and that the security floor rests on.
+    fn effective_with_builtins(
+        set: &crate::plugins::PluginSet,
+    ) -> Vec<crate::plugins::registry::EffectiveTool> {
+        let mut all = builtin_tools();
+        all.extend(effective(set));
+        all
     }
 
     /// **The chip residual Phase C left open, closed.** The PRE-SCAN roster
@@ -3147,16 +3130,9 @@ mod tests {
     #[test]
     fn the_pre_scan_roster_shows_plugin_tools_beside_the_builtins() {
         let (set, dir) = plugin_fixture();
-        let tools = effective(&set);
-        let builtin = crate::settings::default_audit_tools();
+        let tools = effective_with_builtins(&set);
 
-        let roster = plan_roster(
-            &builtin,
-            &tools,
-            Category::Security,
-            &census::Census::default(),
-            false,
-        );
+        let roster = plan_roster(&tools, Category::Security, &census::Census::default(), false);
         let ids: Vec<String> = roster.iter().map(|t| t.id.wire()).collect();
         // The built-in security trio, then the plugin tools of that category.
         assert!(ids.contains(&"gitleaks".to_string()));
@@ -3178,7 +3154,7 @@ mod tests {
         // actually taken. Unknown census ⇒ shown; known-and-not-matching ⇒
         // already marked, so `partitionChips` hides it with no new rule.
         let quality = |census: &census::Census, known| {
-            plan_roster(&builtin, &tools, Category::Quality, census, known)
+            plan_roster(&tools, Category::Quality, census, known)
                 .into_iter()
                 .find(|t| t.id.wire() == "acme@1.0.0/lint")
                 .expect("the java-gated tool is in the quality roster")
@@ -3205,13 +3181,12 @@ mod tests {
     /// them), and untouched by whatever the plugin population does.
     #[test]
     fn the_roster_still_lists_disabled_builtins() {
-        let mut builtin = crate::settings::default_audit_tools();
-        for t in builtin.iter_mut() {
-            t.enabled = false;
-        }
+        let all_off: Vec<(&str, bool)> = ["osv-scanner", "gitleaks", "semgrep"]
+            .iter()
+            .map(|id| (*id, false))
+            .collect();
         let roster = plan_roster(
-            &builtin,
-            &[],
+            &builtin_tools_with(&all_off),
             Category::Security,
             &census::Census::default(),
             true,
@@ -3225,11 +3200,11 @@ mod tests {
     /// The fan-out rule: this category's kind, gated by the SAME census test a
     /// built-in gets, with `check`/`command` kinds left to Phase D.
     #[test]
-    fn plan_plugin_scan_filters_by_kind_category_and_applicability() {
+    fn plan_scan_filters_a_plugin_by_kind_category_and_applicability() {
         let (set, dir) = plugin_fixture();
         let tools = effective(&set);
 
-        let (chips, to_run) = plan_plugin_scan(&tools, Category::Security, &census::Census::default());
+        let (chips, to_run) = plan_scan(&tools, Category::Security, &census::Census::default());
         let ids: Vec<String> = to_run.iter().map(|t| t.key.wire()).collect();
         assert_eq!(ids, vec!["acme@1.0.0/scan", "acme@1.0.0/gitleaks"]);
         assert!(
@@ -3240,7 +3215,7 @@ mod tests {
         // Quality, empty census: the Java-gated tool is planned as a chip and
         // NOT launched — the built-in `skipped-not-applicable` state, reached by
         // the built-in rule.
-        let (chips, to_run) = plan_plugin_scan(&tools, Category::Quality, &census::Census::default());
+        let (chips, to_run) = plan_scan(&tools, Category::Quality, &census::Census::default());
         assert!(to_run.is_empty(), "the java gate held");
         assert_eq!(chips.len(), 1);
         assert_eq!(chips[0].status, ToolStatus::SkippedNotApplicable);
@@ -3248,12 +3223,12 @@ mod tests {
 
         // …and it runs once the project actually contains Java.
         let java = census::Census::from_parts(&["java"], &[]);
-        let (_, to_run) = plan_plugin_scan(&tools, Category::Quality, &java);
+        let (_, to_run) = plan_scan(&tools, Category::Quality, &java);
         assert_eq!(to_run.len(), 1);
 
         // The `command`-kind tool never appears in either umbrella.
         for category in [Category::Security, Category::Quality] {
-            let (chips, _) = plan_plugin_scan(&tools, category, &java);
+            let (chips, _) = plan_scan(&tools, category, &java);
             assert!(
                 !chips.iter().any(|c| c.id.wire().ends_with("/fmt")),
                 "a command-kind tool is Phase D's population, not an umbrella's"
@@ -3269,49 +3244,60 @@ mod tests {
     #[test]
     fn plugins_add_to_the_security_fanout_and_can_never_displace_a_builtin() {
         let (set, dir) = plugin_fixture();
-        let plugin_tools = effective(&set);
         let census = census::Census::default();
+        let all = effective_with_builtins(&set);
 
-        let builtin_cfg = crate::settings::default_audit_tools();
-        let (builtin_chips, builtin_runs) =
-            plan_scan(&builtin_cfg, Category::Security, &census);
-        let (plugin_chips, plugin_runs) =
-            plan_plugin_scan(&plugin_tools, Category::Security, &census);
+        let (chips, runs) = plan_scan(&all, Category::Security, &census);
 
-        // The trio is in the built-in half, running, before any plugin is asked.
-        for id in [
-            AuditToolId::OsvScanner,
-            AuditToolId::Gitleaks,
-            AuditToolId::Semgrep,
-        ] {
+        // The trio is in the fan-out, running, and it is FIRST — cImp's own
+        // definitions are laid down before anything scanned from a folder.
+        let run_ids: Vec<String> = runs.iter().map(|t| t.key.wire()).collect();
+        assert_eq!(
+            &run_ids[..3],
+            &["osv-scanner", "gitleaks", "semgrep"],
+            "the built-in security trio leads every security fan-out"
+        );
+        // A plugin can only ADD: every entry after the trio is user provenance,
+        // and no plugin tool can present itself as a built-in. Keyed off
+        // `Provenance` and the key namespaces, never off a name (R3).
+        for t in &runs[3..] {
             assert!(
-                builtin_runs.iter().any(|t| t.id == id),
-                "{id:?} must always be in the security fan-out"
+                matches!(t.key, ToolKey::Plugin(_)),
+                "a scanned plugin must never land in the built-in namespace"
             );
-        }
-        // Every plugin-side entry is user provenance and none of them IS a
-        // built-in — the property the floor rests on, asserted structurally
-        // rather than by name.
-        for t in &plugin_runs {
             assert_eq!(t.provenance, crate::plugins::manifest::Provenance::User);
-            assert!(t.key.builtin().is_none());
+        }
+        assert_eq!(runs.len(), 5, "three built-ins + the fixture's two");
+
+        // Each built-in appears exactly once in the chip roster.
+        for id in ["osv-scanner", "gitleaks", "semgrep"] {
+            assert_eq!(
+                chips.iter().filter(|c| c.id.is_builtin(id)).count(),
+                1,
+                "{id} appears exactly once"
+            );
         }
 
-        // The merged roster is a superset, in that order.
-        let mut chips = builtin_chips.clone();
-        chips.extend(plugin_chips);
-        for id in [
-            AuditToolId::OsvScanner,
-            AuditToolId::Gitleaks,
-            AuditToolId::Semgrep,
-        ] {
-            assert_eq!(
-                chips.iter().filter(|c| c.id == id).count(),
-                1,
-                "{id:?} appears exactly once, from the built-in roster"
-            );
+        // …and disabling every built-in still cannot remove them from the
+        // ROSTER (they become `idle` chips), which is what keeps a user who
+        // switched one off able to see that they did.
+        let mut cfg = crate::settings::ToolPluginsSettings::default();
+        let plugin = cfg
+            .plugins
+            .entry(crate::plugins::builtin::AUDIT_PLUGIN_KEY.to_string())
+            .or_default();
+        for id in ["osv-scanner", "gitleaks", "semgrep"] {
+            plugin.tools.entry(id.to_string()).or_default().enabled = false;
         }
-        assert_eq!(chips.len(), builtin_chips.len() + 2);
+        let off = crate::plugins::registry::effective_tools(
+            &crate::plugins::builtin::plugin_set(),
+            &cfg,
+            None,
+        );
+        let (chips, runs) = plan_scan(&off, Category::Security, &census);
+        assert!(runs.is_empty());
+        assert_eq!(chips.len(), 3);
+        assert!(chips.iter().all(|c| c.status == ToolStatus::Idle));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3325,19 +3311,19 @@ mod tests {
         let tools = effective(&set);
         let census = census::Census::default();
 
-        let (_, plugin_runs) = plan_plugin_scan(&tools, Category::Security, &census);
+        let (_, plugin_runs) = plan_scan(&tools, Category::Security, &census);
         let shadow = plugin_runs
             .iter()
             .find(|t| t.label == "gitleaks")
             .expect("the shadowing fixture");
         assert_eq!(shadow.key.wire(), "acme@1.0.0/gitleaks");
-        assert!(shadow.key != AuditToolId::Gitleaks, "not the built-in");
+        assert!(!shadow.key.is_builtin("gitleaks"), "not the built-in");
 
         // Both populations produce findings, and each finding carries its own
         // key — a report reader can always tell which tool said what.
         let mine = parse_findings(&shadow.key, AuditParser::Sarif, GITLEAKS_SARIF, &root());
         let theirs = parse_findings(
-            &AuditToolId::Gitleaks.into(),
+            &ToolKey::Builtin("gitleaks".to_string()),
             sarif_parser(),
             GITLEAKS_SARIF,
             &root(),
@@ -3380,7 +3366,7 @@ mod tests {
         let tools = crate::plugins::registry::runnable_tools(&set, &cfg, None);
 
         let (chips, to_run) =
-            plan_plugin_scan(&tools, Category::Security, &census::Census::default());
+            plan_scan(&tools, Category::Security, &census::Census::default());
         assert!(to_run.is_empty());
         assert_eq!(chips.len(), 1);
         assert_eq!(chips[0].status, ToolStatus::Failed);
@@ -3398,7 +3384,7 @@ mod tests {
             key: key.clone(),
             findings_exit_codes: &[1],
             parser: AuditParser::Sarif,
-            gate: IngestGate::Sarif,
+            gate: crate::audit::runnable::IngestGate::Sarif,
         }
     }
 
@@ -3481,7 +3467,7 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].tool, key);
         assert!(
-            findings[0].tool != AuditToolId::Gitleaks,
+            !findings[0].tool.is_builtin("gitleaks"),
             "the embedded driver name must never become attribution"
         );
     }
@@ -3491,9 +3477,8 @@ mod tests {
     /// a clean, zero-finding pass.
     #[test]
     fn the_envelope_gate_does_not_apply_to_the_builtin_tier() {
-        let (status, findings, error) = finalize_outcome(
-            AuditToolId::Gitleaks,
-            adapters::adapter(AuditToolId::Gitleaks),
+        let (status, findings, error) = finalize_builtin(
+            "gitleaks",
             Outcome::Exited(Some(0)),
             "",
             false,
@@ -3724,26 +3709,22 @@ mod tests {
         // runner always pairs the two, and an empty grant is the safe answer).
         assert!(sandbox_full_dirs(Transport::ReportFile, None).is_empty());
 
-        // Cross-check against the real adapter table: every report-file adapter
-        // asks for a grant, every stdout one does not. A hand-listed pair would
-        // rot the moment a tool changed transport.
-        for id in [
-            AuditToolId::Gitleaks,
-            AuditToolId::Cppcheck,
-            AuditToolId::DotnetAnalyzers,
-            AuditToolId::Semgrep,
-            AuditToolId::OsvScanner,
-            AuditToolId::Typos,
-        ] {
-            let adapter = adapters::adapter(id);
-            let path = matches!(adapter.transport, Transport::ReportFile)
-                .then(|| temp_report_path(id.command_name()));
-            let dirs = sandbox_full_dirs(adapter.transport, path.as_deref());
+        // Cross-check against the REAL roster — every one of the fourteen, not a
+        // hand-listed sample that would rot the moment a tool changed transport
+        // or a fifteenth arrived.
+        let mut report_file_tools = 0usize;
+        for tool in builtin_tools() {
+            let tool = RunnableAudit::from_effective(&tool)
+                .expect("runnable")
+                .expect("an umbrella tool");
+            let subject = tool.spawn_subject();
+            let path = matches!(tool.transport, Transport::ReportFile)
+                .then(|| temp_report_path(&subject));
+            let dirs = sandbox_full_dirs(tool.transport, path.as_deref());
             assert_eq!(
                 dirs.is_empty(),
-                adapter.transport == Transport::Stdout,
-                "{} asks for the wrong grant for its transport",
-                id.command_name()
+                tool.transport == Transport::Stdout,
+                "{subject} asks for the wrong grant for its transport"
             );
             // …and the granted directory really is where the ARGUMENT points.
             // The sandboxed path passes argv through `SpawnRequest::args` with
@@ -3751,16 +3732,22 @@ mod tests {
             // runtime parses the identical string back: the absolute report path
             // reaches the tool unmangled, spaces and all.
             if let Some(path) = &path {
-                let argv = adapter.full_argv(Path::new("/proj"), Some(path), true, &[], "");
+                report_file_tools += 1;
+                let argv = tool.full_argv(Path::new("/proj"), Some(path), true);
                 let rendered = path.to_string_lossy().into_owned();
                 assert!(
                     argv.iter().any(|a| a.contains(&rendered)),
-                    "{}'s argv does not carry the report path it will be graded on: {argv:?}",
-                    id.command_name()
+                    "{subject}'s argv does not carry the report path it will be graded on: \
+                     {argv:?}"
                 );
                 assert_eq!(dirs, vec![path.parent().unwrap().to_path_buf()]);
             }
         }
+        assert_eq!(
+            report_file_tools, 3,
+            "gitleaks, cppcheck and dotnet-analyzers write to a report file; a change here is a \
+             change to what the sandbox has to grant"
+        );
     }
 
     /// An audit tool's `sandbox`-lane rows name the SCANNER, not just "an
@@ -3769,22 +3756,27 @@ mod tests {
     /// Each label is also distinct from the other two seams, which is what
     /// keeps `run_command`'s and `run_check`'s rows apart from these.
     ///
-    /// The label is derived from `command_name`, so the Security `semgrep` and
-    /// the Quality `semgrep` share one — deliberately: it is the same binary
+    /// The label is a built-in's COMMAND name, so the Security `semgrep` and the
+    /// Quality `semgrep-quality` share one — deliberately: it is the same binary
     /// under the same grants, and the boundary cannot tell them apart either.
+    /// That is also why `spawn_subject` exists rather than the runner using the
+    /// tool key: a user who greps `audit:semgrep` after this migration must
+    /// still find their rows.
     #[test]
     fn audit_rows_name_the_scanner_and_not_just_the_seam() {
         let mut seen = std::collections::BTreeSet::new();
         for id in [
-            AuditToolId::OsvScanner,
-            AuditToolId::Gitleaks,
-            AuditToolId::Semgrep,
-            AuditToolId::Eslint,
-            AuditToolId::DotnetAnalyzers,
+            "osv-scanner",
+            "gitleaks",
+            "semgrep",
+            "eslint",
+            "dotnet-analyzers",
         ] {
-            let seam = crate::sandbox::audit_seam(id.command_name());
+            let tool = builtin(id);
+            let command = tool.spawn_subject();
+            let seam = crate::sandbox::audit_seam(&command);
             assert!(
-                seam.starts_with("audit:") && seam.contains(id.command_name()),
+                seam.starts_with("audit:") && seam.contains(&command),
                 "an audit seam label must name its scanner: {seam}"
             );
             assert_ne!(seam, crate::sandbox::SEAM_RUN_COMMAND);
@@ -3794,9 +3786,12 @@ mod tests {
         assert_eq!(seen.len(), 5, "distinct binaries must get distinct labels");
         // …and the documented exception: one binary, one label.
         assert_eq!(
-            crate::sandbox::audit_seam(AuditToolId::Semgrep.command_name()),
-            crate::sandbox::audit_seam(AuditToolId::SemgrepQuality.command_name()),
+            crate::sandbox::audit_seam(&builtin("semgrep").spawn_subject()),
+            crate::sandbox::audit_seam(&builtin("semgrep-quality").spawn_subject()),
         );
+        // The label really is the COMMAND, not the tool id — `dotnet-analyzers`
+        // runs `dotnet`, and the lane says so.
+        assert_eq!(builtin("dotnet-analyzers").spawn_subject(), "dotnet");
     }
 
     #[tokio::test]
@@ -3820,10 +3815,7 @@ mod tests {
     // ── V30 Phase C: completion-push gate + payload ────────────────────────
 
     /// A finished snapshot with the given per-tool statuses.
-    fn done_snapshot(
-        statuses: &[(AuditToolId, ToolStatus)],
-        total_findings: usize,
-    ) -> AuditSnapshot {
+    fn done_snapshot(statuses: &[(&str, ToolStatus)], total_findings: usize) -> AuditSnapshot {
         AuditSnapshot {
             root: "/proj/root".to_string(),
             scanning: false,
@@ -3832,7 +3824,7 @@ mod tests {
                 .iter()
                 .map(|(id, status)| ToolState {
                     status: *status,
-                    ..ToolState::fresh(*id, adapters::adapter(*id).category)
+                    ..ToolState::fresh(ToolKey::Builtin((*id).to_string()), Category::Security)
                 })
                 .collect(),
             census: CensusBlock::default(),
@@ -3918,8 +3910,8 @@ mod tests {
     fn audit_push_notice_states_counts_and_its_pull_twin() {
         let snap = done_snapshot(
             &[
-                (AuditToolId::Gitleaks, ToolStatus::Done),
-                (AuditToolId::OsvScanner, ToolStatus::Done),
+                ("gitleaks", ToolStatus::Done),
+                ("osv-scanner", ToolStatus::Done),
             ],
             7,
         );
@@ -3951,9 +3943,9 @@ mod tests {
     fn audit_push_notice_reports_failures_and_the_quality_twin() {
         let snap = done_snapshot(
             &[
-                (AuditToolId::Ruff, ToolStatus::Done),
-                (AuditToolId::Eslint, ToolStatus::Failed),
-                (AuditToolId::Pmd, ToolStatus::NotInstalled),
+                ("ruff", ToolStatus::Done),
+                ("eslint", ToolStatus::Failed),
+                ("pmd", ToolStatus::NotInstalled),
             ],
             0,
         );

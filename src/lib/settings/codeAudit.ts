@@ -1,135 +1,34 @@
-// V23 Phase A: extractable logic for the Code Audit settings section. The
-// Svelte component (`SettingsApp.svelte`) is not unit-tested in this repo, so
-// the row-selection and Detect-result formatting live here where Vitest can
-// exercise them, mirroring the `checksEditor.ts` split.
+// Extractable logic for the Code Audit settings section. The Svelte component
+// (`SettingsApp.svelte`) is not unit-tested in this repo, so the bits that can
+// be tested live here, mirroring the `checksEditor.ts` split.
+//
+// # What left in V38 Phase E
+//
+// Most of this file was per-tool metadata and per-tool row plumbing:
+// `AUDIT_TOOL_META` (display name, one-line role, the built-in ruleset default
+// for the three tools that have one), `auditToolRows`/`auditToolGroups` (rows
+// over `settings.code_audit.tools`), `toolNotApplicable`, and
+// `toolMatchesGlobal` (the per-tool global/local scope badge).
+//
+// All of it is gone because its subject is gone. The fourteen built-in scanners
+// are embedded plugin manifests now, so:
+//
+// * the display name and role text ARE the manifest's `label` and
+//   `description`, and the ruleset default is a declared variable's `default` —
+//   read from the shipped definition rather than restated here, where the two
+//   could disagree and only the user would find out;
+// * their configuration lives in `tool_plugins` and is rendered by the Tool
+//   Plugins pane, which already knows how to render a tool;
+// * that container is machine scope by construction, so there is no
+//   project-versus-global ambiguity left for a badge to indicate.
+//
+// What remains is the Detect probe's display state, which is UI state rather
+// than tool metadata: the pane tracks a probe per tool key, and this decides
+// what the inline label says.
 
-import type { AuditCategory, AuditCensus } from '../codeAudit/types';
-import { AUDIT_TOOL_CATEGORY, censusIsEmpty, isToolApplicable } from '../codeAudit/logic';
-import type { AuditDetectResult, AuditToolConfig, AuditToolId, Settings } from './types';
+import type { AuditDetectResult } from './types';
 
-/// Static per-tool presentation for the Code Audit section: display name +
-/// one-line role text, in display order (Security trio first, then the V25
-/// Quality tools). The `role` strings are the spec's one-liners.
-/// `rulesetDefault`, when present, is the adapter's built-in ruleset — the
-/// section then renders the per-tool ruleset override input (the two semgrep
-/// tools + PMD; mirrors the Rust adapters' `Arg::Ruleset` defaults).
-export const AUDIT_TOOL_META: {
-  id: AuditToolId;
-  name: string;
-  role: string;
-  rulesetDefault?: string;
-}[] = [
-  // Security (V23).
-  {
-    id: 'osv-scanner',
-    name: 'osv-scanner',
-    role: 'dependency vulnerabilities + known-malicious',
-  },
-  { id: 'gitleaks', name: 'gitleaks', role: 'secrets' },
-  {
-    id: 'semgrep',
-    name: 'semgrep',
-    role: 'SAST — requires Python, Windows support beta',
-    rulesetDefault: 'auto',
-  },
-  // Quality (V25) — language-gated linters / dead-code / spell-check.
-  { id: 'oxlint', name: 'oxlint', role: 'JS/TS linter — single Rust binary, zero-config' },
-  { id: 'golangci-lint', name: 'golangci-lint', role: 'Go meta-linter' },
-  { id: 'ruff', name: 'ruff', role: 'Python linter — single Rust binary' },
-  { id: 'cppcheck', name: 'cppcheck', role: 'C/C++ static analysis' },
-  { id: 'typos', name: 'typos', role: 'source spell-checker — applies to every project' },
-  { id: 'eslint', name: 'eslint', role: 'JS/TS linter — uses the project-local config' },
-  {
-    id: 'pmd',
-    name: 'PMD',
-    role: 'Java static analysis — needs a JRE',
-    rulesetDefault: 'rulesets/java/quickstart.xml',
-  },
-  { id: 'knip', name: 'knip', role: 'unused files / exports / dependencies (Node)' },
-  { id: 'cargo-machete', name: 'cargo-machete', role: 'unused Rust dependencies' },
-  {
-    id: 'dotnet-analyzers',
-    name: 'Roslyn analyzers',
-    role: 'runs a real .NET build (writes obj/bin) — default-disabled, longer timeout',
-  },
-  {
-    id: 'semgrep-quality',
-    name: 'semgrep (quality)',
-    role: 'best-practices rulesets — default-disabled, needs network',
-    rulesetDefault: 'p/r2c-best-practices',
-  },
-];
-
-/// One rendered per-tool row: the metadata, the matching config entry, and its
-/// index into `settings.code_audit.tools` (for the component's `bind:` paths).
-export interface AuditToolRow {
-  meta: (typeof AUDIT_TOOL_META)[number];
-  tool: AuditToolConfig;
-  index: number;
-}
-
-/// The per-tool rows to render, in metadata (display) order. A tool with no
-/// matching config entry is skipped, and any unknown id the backend kept in the
-/// list is ignored (it never matches a `meta`). This is the same selection the
-/// section's `{#each AUDIT_TOOL_META}` + `findIndex` performs.
-export function auditToolRows(settings: Settings): AuditToolRow[] {
-  const rows: AuditToolRow[] = [];
-  for (const meta of AUDIT_TOOL_META) {
-    const index = settings.code_audit.tools.findIndex((t) => t.id === meta.id);
-    if (index >= 0) rows.push({ meta, tool: settings.code_audit.tools[index], index });
-  }
-  return rows;
-}
-
-/// V25 Phase D: the per-tool rows split into the Security and Quality groups the
-/// Settings section renders under separate headers. Non-applicable tools are NOT
-/// hidden here (Settings is global config) — the section shows a census-based
-/// hint instead (`toolNotApplicable`).
-export interface AuditToolGroups {
-  security: AuditToolRow[];
-  quality: AuditToolRow[];
-}
-
-export function auditToolGroups(settings: Settings): AuditToolGroups {
-  const security: AuditToolRow[] = [];
-  const quality: AuditToolRow[] = [];
-  for (const row of auditToolRows(settings)) {
-    (AUDIT_TOOL_CATEGORY[row.meta.id] === 'quality' ? quality : security).push(row);
-  }
-  return { security, quality };
-}
-
-/// Whether the Settings section should show the "not applicable to the current
-/// project" hint for `id`: the latest scan's census gates it off. An empty
-/// census (before any scan) shows no hint — nothing is known to gate on yet.
-export function toolNotApplicable(id: AuditToolId, census: AuditCensus): boolean {
-  return !censusIsEmpty(census) && !isToolApplicable(id, census);
-}
-
-/// Whether a tool's project-scoped config matches the global settings file's
-/// entry for the same id — the per-tool "global"/"local" scope indicator.
-/// Compares `enabled`, `extra_args`, `ruleset`, and `timeout_secs` only:
-/// `path` is machine-scope (always written through to the global file) and
-/// never makes a tool "local". A tool the global file doesn't know counts as
-/// local.
-export function toolMatchesGlobal(
-  tool: AuditToolConfig,
-  globalTools: AuditToolConfig[],
-): boolean {
-  const g = globalTools.find((t) => t.id === tool.id);
-  if (!g) return false;
-  return (
-    tool.enabled === g.enabled &&
-    (tool.timeout_secs ?? null) === (g.timeout_secs ?? null) &&
-    (tool.ruleset ?? '') === (g.ruleset ?? '') &&
-    tool.extra_args.length === g.extra_args.length &&
-    tool.extra_args.every((a, i) => a === g.extra_args[i])
-  );
-}
-
-export type { AuditCategory };
-
-/// The per-tool Detect probe state the section tracks: `undefined` before any
+/// The per-tool Detect probe state the pane tracks: `undefined` before any
 /// probe, `'probing'` while the IPC is in flight, or a result.
 export type AuditDetectState = AuditDetectResult | 'probing' | undefined;
 
@@ -139,7 +38,7 @@ export interface DetectDisplay {
   text: string;
 }
 
-/// Map a Detect state to its inline label. Display-only — mirrors the spec's
+/// Map a Detect state to its inline label. Display-only — the
 /// `✓ v2.4.0 — C:\...\osv-scanner.exe` (found) and `not found on PATH or ebin`
 /// (not-found) forms. Never mutates the stored path.
 export function formatDetect(state: AuditDetectState): DetectDisplay {

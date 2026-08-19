@@ -42,7 +42,7 @@ use serde_json::{Map, Value};
 use crate::error::{AppError, AppResult};
 use crate::settings::migration;
 use crate::settings::schema::{
-    default_ai_tab, default_audit_tools, default_events_tab, default_graph_monitor_tab,
+    default_ai_tab, default_events_tab, default_graph_monitor_tab,
     default_shell_1_tab, default_tool_activity_tab, default_workbench_tab, pricing_rows_since,
     starter_prompt_templates, AiTabId, HarnessVersions, LayoutNodePersisted, LlmPricingModel,
     PromptTemplate, RemoteBackendTemplate, ServerCommandTemplate, Settings, TabConfig,
@@ -208,7 +208,7 @@ pub fn load(default_shell: &ShellSpec, launch_cwd: &Path) -> LoadOutcome {
     //     Persisted below via the post-load `save`, which also rewrites the
     //     overlay in the stripped shape.
     let promoted = overlay_value.as_ref().is_some_and(|ov| {
-        let paths = promote_overlay_audit_paths(&mut global, ov);
+        let paths = promote_overlay_audit_config(&mut global, ov);
         let templates = promote_overlay_offload_templates(&mut global, ov);
         paths || templates
     });
@@ -230,7 +230,6 @@ pub fn load(default_shell: &ShellSpec, launch_cwd: &Path) -> LoadOutcome {
         // 3b. Paths and template libraries always come from the
         //     (post-promotion) global baseline — an overlay's copies are
         //     legacy data, not authority.
-        enforce_global_audit_paths(&mut merged, &global);
         enforce_global_offload_templates(&mut merged, &global);
     }
 
@@ -776,42 +775,43 @@ fn sync_sandbox_into(disk_global: &mut Settings, current: &Settings) -> bool {
     true
 }
 
-// ── Audit scanner paths: machine-scope splitting ─────────────────────────────
+// ── Legacy audit-tool config: one-time promotion into `tool_plugins` ─────────
 //
-// Scanner exe paths (`code_audit.tools[].path`) are MACHINE facts (where
-// gitleaks.exe lives on this box), but the `tools` array as a whole is
-// project-scoped (the `enabled` flags follow each project's census and the
-// user's per-project selection) and the generic `diff` replaces arrays
-// WHOLESALE — the two scopes share one array. Left alone, whichever project
-// the user configured a scanner from keeps the path hostage in ITS overlay
-// while every other project sees "" (the V26 field report: paths set up in
-// one repo, audits in a second repo resolved nothing). The splitting rules:
+// Before schema v33, the fourteen built-in scanners were configured through
+// `code_audit.tools`, a project-scoped array with one machine-scoped field
+// inside it (`path`), split apart here by a promote-on-load / write-through-on-
+// save pair. V38 moved the whole of that configuration into the `tool_plugins`
+// container, where the scope split is structural rather than enforced by these
+// functions — so the pair is gone and only the LEGACY DATA question is left.
 //
-//   * LOAD — a legacy overlay's non-empty paths are promoted into the global
-//     baseline's EMPTY slots once, then the merged view's paths are ALWAYS
-//     overwritten from the global baseline: overlays carry no path authority.
-//   * SAVE — the live paths are written through to the PHYSICAL global file
-//     (`sync_audit_paths_into` + `save_to`, the same bypass pattern as
-//     `write_global_prompt_templates`), and `path` is normalized to "" on
-//     both diff sides so no new overlay ever pins a copy.
+// That question is real and easy to miss: the v32 → v33 migration rewrites the
+// GLOBAL settings file, and **a project overlay is never schema-migrated** (see
+// `load`). A user who configured audit tools from inside a project has that
+// configuration in `.cimp/config.json` as a `code_audit.tools` array, which the
+// new schema simply does not have a field for — so without this it would be
+// silently dropped the first time they launched the new build. "The setting
+// moved, so I threw yours away" is a data-loss bug wearing an upgrade's costume.
 //
-// `load_readonly` is deliberately exempt: the MCP children it serves never
-// read `code_audit.tools` (scans run in the app, not the child).
+// So: promote what the overlay carries into the container's EMPTY slots, once,
+// and let the next save write the overlay out in its new shape (the diff is
+// recomputed whole, so the stale key disappears by itself). Idempotent — it only
+// ever fills a slot the container does not already have — which matters because
+// a project that is never saved would otherwise re-promote on every launch.
 
-/// The serde wire id (`osv-scanner`, `semgrep-quality`, …) of a typed tool id.
-fn audit_wire_id(id: crate::settings::schema::AuditToolId) -> String {
-    serde_json::to_value(id)
-        .ok()
-        .and_then(|v| v.as_str().map(str::to_string))
-        .unwrap_or_default()
+/// The v33 container key each legacy `code_audit.tools[].id` maps to.
+///
+/// A plain string join rather than a lookup: the ids were `AuditToolId`'s wire
+/// names and the built-in manifest reuses them verbatim, which is the property
+/// that makes the migration a rename of the STORAGE and not of the tools.
+fn legacy_tool_key(id: &str) -> String {
+    format!("{}/{id}", crate::plugins::builtin::AUDIT_PLUGIN_KEY)
 }
 
-/// LOAD step 1: promote a legacy overlay's non-empty scanner paths into the
-/// global baseline's empty slots (first project launched wins per slot; a
-/// non-empty global path is never overwritten). Returns true when `global`
-/// changed — the caller persists via the post-load `save`, which also
-/// rewrites the overlay in the stripped shape so promotion is one-time.
-fn promote_overlay_audit_paths(global: &mut Settings, overlay: &Value) -> bool {
+/// Promote a legacy overlay's `code_audit.tools` into the global baseline's
+/// `tool_plugins` container, filling only slots the container does not have.
+/// Returns true when `global` changed — the caller persists via the post-load
+/// `save`, which also rewrites the overlay in its new shape.
+fn promote_overlay_audit_config(global: &mut Settings, overlay: &Value) -> bool {
     let Some(entries) = overlay
         .get("code_audit")
         .and_then(|c| c.get("tools"))
@@ -821,96 +821,73 @@ fn promote_overlay_audit_paths(global: &mut Settings, overlay: &Value) -> bool {
     };
     let mut changed = false;
     for e in entries {
-        let (Some(id), Some(path)) = (
-            e.get("id").and_then(Value::as_str),
-            e.get("path").and_then(Value::as_str),
-        ) else {
+        let Some(id) = e.get("id").and_then(Value::as_str) else {
             continue;
         };
-        let path = path.trim();
-        if path.is_empty() {
-            continue;
-        }
-        if let Some(t) = global
-            .code_audit
-            .tools
-            .iter_mut()
-            .find(|t| audit_wire_id(t.id) == id)
-        {
-            if t.path.trim().is_empty() {
-                t.path = path.to_string();
+        let tool_key = legacy_tool_key(id);
+
+        // The path is machine scope and always was: promote it into the
+        // machine-wide map, first project launched wins per slot.
+        if let Some(path) = e.get("path").and_then(Value::as_str) {
+            let path = path.trim();
+            if !path.is_empty() && !global.tool_plugins.global_paths.contains_key(&tool_key) {
+                global
+                    .tool_plugins
+                    .global_paths
+                    .insert(tool_key.clone(), path.to_string());
                 changed = true;
             }
         }
-    }
-    changed
-}
 
-/// LOAD step 2: overwrite the merged view's scanner paths from the
-/// (post-promotion) global baseline. Entries for ids the baseline doesn't
-/// know are left untouched (forward compat — the lenient deserializer drops
-/// them later anyway).
-fn enforce_global_audit_paths(merged: &mut Value, global: &Settings) {
-    let Some(entries) = merged
-        .get_mut("code_audit")
-        .and_then(|c| c.get_mut("tools"))
-        .and_then(Value::as_array_mut)
-    else {
-        return;
-    };
-    for e in entries {
-        let Some(id) = e.get("id").and_then(Value::as_str).map(str::to_string) else {
+        // Everything else lands as this tool's state — but only if the
+        // container has no state for it yet, so a value the user has since set
+        // through the new pane is never overwritten by a stale overlay.
+        let plugin = global
+            .tool_plugins
+            .plugins
+            .entry(crate::plugins::builtin::AUDIT_PLUGIN_KEY.to_string())
+            .or_default();
+        if plugin.tools.contains_key(id) {
             continue;
-        };
-        let Some(t) = global
-            .code_audit
-            .tools
-            .iter()
-            .find(|t| audit_wire_id(t.id) == id)
-        else {
-            continue;
-        };
-        if let Some(o) = e.as_object_mut() {
-            o.insert("path".to_string(), Value::String(t.path.clone()));
         }
-    }
-}
-
-/// SAVE step 1 (pure half of the write-through): copy the live scanner paths
-/// onto the on-disk global settings. Returns true when anything changed —
-/// the caller only rewrites the physical file then.
-fn sync_audit_paths_into(disk_global: &mut Settings, current: &Settings) -> bool {
-    let mut changed = false;
-    for t in &current.code_audit.tools {
-        if let Some(g) = disk_global
-            .code_audit
-            .tools
-            .iter_mut()
-            .find(|g| g.id == t.id)
-        {
-            if g.path != t.path {
-                g.path = t.path.clone();
-                changed = true;
+        let mut state = crate::settings::ToolState::default();
+        let mut carried = false;
+        if let Some(v) = e.get("enabled").and_then(Value::as_bool) {
+            state.enabled = v;
+            carried = true;
+        }
+        if let Some(v) = e.get("timeout_secs").and_then(Value::as_u64) {
+            state.timeout_secs = Some(v);
+            carried = true;
+        }
+        if let Some(a) = e.get("extra_args").and_then(Value::as_array) {
+            let args: Vec<String> = a
+                .iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect();
+            if !args.is_empty() {
+                state.parameters = args;
+                carried = true;
             }
         }
-    }
-    changed
-}
-
-/// SAVE step 2: normalize every scanner path to "" on a diff side so the
-/// overlay never carries one.
-fn strip_audit_tool_paths(v: &mut Value) {
-    if let Some(entries) = v
-        .get_mut("code_audit")
-        .and_then(|c| c.get_mut("tools"))
-        .and_then(Value::as_array_mut)
-    {
-        for e in entries {
-            if let Some(o) = e.as_object_mut() {
-                o.insert("path".to_string(), Value::String(String::new()));
+        // An EMPTY legacy ruleset meant "use the tool's built-in default",
+        // which in the container is the absence of a value rather than a
+        // stored blank — see `registry::effective_tools`.
+        if let Some(r) = e.get("ruleset").and_then(Value::as_str) {
+            if !r.trim().is_empty() {
+                state.variables.insert("ruleset".to_string(), r.to_string());
+                carried = true;
             }
         }
+        if carried {
+            plugin.tools.insert(id.to_string(), state);
+            changed = true;
+        }
     }
+    if changed {
+        tracing::info!("settings: promoted a legacy project overlay's audit tool config");
+    }
+    changed
 }
 
 // ── Offload backend template libraries: machine-scope splitting ──────────────
@@ -1014,33 +991,6 @@ fn sync_offload_templates_into(disk_global: &mut Settings, current: &Settings) -
         changed = true;
     }
     changed
-}
-
-/// Read the audit tool config from the PHYSICAL global settings file,
-/// reconciled to the current tool set (a stale file gains missing tools at
-/// their defaults). Powers the Settings → Code Audit "Load from global"
-/// action and the per-tool global/local scope indicator.
-pub fn read_global_audit_tools() -> (Vec<crate::settings::schema::AuditToolConfig>, bool) {
-    let mut s = global_path()
-        .ok()
-        .map(|p| read_settings_or_default(&p))
-        .unwrap_or_default();
-    let _ = reconcile_audit_tools(&mut s);
-    (s.code_audit.tools, s.code_audit.quality_auto_select)
-}
-
-/// Write the live audit tool config (tools + `quality_auto_select`) through
-/// to the PHYSICAL global settings file (read-modify-write; every other
-/// field preserved — the `write_global_prompt_templates` pattern). Powers
-/// the "Save to global" action. The caller must also bring the in-memory
-/// baseline in line (`SettingsHandle::mutate_global`) so the next overlay
-/// diff drops the now-global config instead of keeping a project copy.
-pub fn write_global_audit_tools(current: &Settings) -> AppResult<()> {
-    let gpath = global_path()?;
-    let mut disk = read_settings_or_default(&gpath);
-    disk.code_audit.tools = current.code_audit.tools.clone();
-    disk.code_audit.quality_auto_select = current.code_audit.quality_auto_select;
-    save_to(&gpath, &disk)
 }
 
 // ── V38 tool plugins: scope splitting INSIDE one subtree ────────────────────
@@ -1283,7 +1233,7 @@ fn strip_offload_templates(v: &mut Value) {
 pub fn save(settings: &Settings, launch_cwd: &Path, global: &Settings) -> AppResult<()> {
     let path = custom_path(launch_cwd);
 
-    // Scanner paths and the offload template libraries are machine-scope:
+    // The offload template libraries are machine-scope:
     // write them through to the PHYSICAL global file (read-modify-write,
     // every other field preserved — the `write_global_prompt_templates`
     // pattern) so every project sees them, then normalize both diff sides
@@ -1293,7 +1243,6 @@ pub fn save(settings: &Settings, launch_cwd: &Path, global: &Settings) -> AppRes
     if let Ok(gpath) = global_path() {
         if gpath.exists() {
             let mut disk = read_settings_or_default(&gpath);
-            let paths_changed = sync_audit_paths_into(&mut disk, settings);
             let templates_changed = sync_offload_templates_into(&mut disk, settings);
             // V33: `sandbox` is banned from overlays (it configures a boundary
             // whose own writable area holds the overlay file), so the global
@@ -1304,7 +1253,7 @@ pub fn save(settings: &Settings, launch_cwd: &Path, global: &Settings) -> AppRes
             // `variables`/`parameters`, so this is the only place the rest can
             // land — see the block comment above `strip_overlay_tool_plugins`.
             let plugins_changed = sync_tool_plugin_state_into(&mut disk, settings);
-            if paths_changed || templates_changed || sandbox_changed || plugins_changed {
+            if templates_changed || sandbox_changed || plugins_changed {
                 if let Err(e) = save_to(&gpath, &disk) {
                     tracing::warn!(error = %e, "settings: machine-scope global write-through failed");
                 }
@@ -1318,8 +1267,6 @@ pub fn save(settings: &Settings, launch_cwd: &Path, global: &Settings) -> AppRes
         .map_err(|e| AppError::Settings(format!("serialize global: {e}")))?;
     strip_overlay_banned(&mut current);
     strip_overlay_banned(&mut baseline);
-    strip_audit_tool_paths(&mut current);
-    strip_audit_tool_paths(&mut baseline);
     strip_offload_templates(&mut current);
     strip_offload_templates(&mut baseline);
     // Both sides, identically: what remains under `tool_plugins` on either side
@@ -1886,36 +1833,6 @@ pub fn reconcile_reserved_tabs(settings: &mut Settings) -> bool {
     changed
 }
 
-/// V25: reconcile `code_audit.tools` with the built-in adapter set. A config
-/// persisted by v0.43/v0.44 (before the Quality tools existed) carries only the
-/// three Security entries; the lenient `tools` deserializer keeps a present
-/// array verbatim, so those installs would never gain the eleven Quality tools
-/// and the Quality sub-tab / Settings section would stay empty. This appends a
-/// default entry (per [`default_audit_tools`]: enabled except `dotnet-analyzers`
-/// and `semgrep-quality`) for every [`AuditToolId`] missing from the array,
-/// **preserving every existing entry verbatim and in its current order** —
-/// the user's `enabled`/`path`/`extra_args`/`timeout_secs` and any customization
-/// survive untouched. Stale/unknown ids were already dropped by the lenient
-/// deserializer, and that stays: this only ever *adds* the missing built-ins.
-/// Idempotent (a second call finds every id present and is a no-op). Runs on
-/// both the load path ([`integrity_check`]) and the live settings-update
-/// round-trip (`apply_incoming_settings`), exactly like
-/// [`reconcile_reserved_tabs`]. Returns `true` if anything was appended.
-pub fn reconcile_audit_tools(settings: &mut Settings) -> bool {
-    let tools = &mut settings.code_audit.tools;
-    let mut changed = false;
-    for def in default_audit_tools() {
-        if !tools.iter().any(|t| t.id == def.id) {
-            tools.push(def);
-            changed = true;
-        }
-    }
-    if changed {
-        tracing::info!("integrity: appended missing built-in code_audit tools");
-    }
-    changed
-}
-
 /// All three reserved AI tab ids. Used by the integrity check's "is this
 /// id one of our reserved AI builtins?" loops; a single source of truth
 /// keeps the `ai_builtins` membership check, the `use_local_provider`
@@ -2059,13 +1976,6 @@ pub fn integrity_check(settings: &mut Settings) -> bool {
         changed = true;
     }
 
-    // 4c. Reconcile `code_audit.tools` with the built-in adapter set so a
-    //     pre-V25 config (three Security tools only) gains the eleven Quality
-    //     tools on load. Existing entries are preserved verbatim; only missing
-    //     built-ins are appended. Idempotent.
-    if reconcile_audit_tools(settings) {
-        changed = true;
-    }
 
     // 5. Backend layout sanity. The frontend owns the deep integrity
     //    walk (orphan placement, empty-pane collapse) — it has the tree
@@ -2550,142 +2460,6 @@ mod tests {
         assert!(!RETIRED_TAB_IDS.contains(&EVENTS_TAB_ID));
         assert!(!RETIRED_TAB_IDS.contains(&TOOL_ACTIVITY_TAB_ID));
         assert!(!RETIRED_TAB_IDS.contains(&WORKBENCH_TAB_ID));
-    }
-
-    #[test]
-    fn reconcile_audit_tools_appends_missing_quality_tools() {
-        use crate::settings::schema::{AuditToolConfig, AuditToolId};
-        // A v0.43/v0.44 persisted config: only the three Security tools, one of
-        // them customized (disabled + custom path + extra args + timeout).
-        let mut s = base_test_settings();
-        s.code_audit.tools = vec![
-            AuditToolConfig {
-                id: AuditToolId::OsvScanner,
-                enabled: false,
-                path: r"C:\tools\osv.exe".to_string(),
-                extra_args: vec!["--offline".to_string()],
-                ruleset: String::new(),
-                timeout_secs: Some(42),
-            },
-            AuditToolConfig {
-                id: AuditToolId::Gitleaks,
-                enabled: true,
-                path: String::new(),
-                extra_args: vec![],
-                ruleset: String::new(),
-                timeout_secs: None,
-            },
-            AuditToolConfig {
-                id: AuditToolId::Semgrep,
-                enabled: true,
-                path: String::new(),
-                extra_args: vec![],
-                ruleset: String::new(),
-                timeout_secs: None,
-            },
-        ];
-
-        let changed = reconcile_audit_tools(&mut s);
-        assert!(changed);
-        let tools = &s.code_audit.tools;
-        assert_eq!(tools.len(), 14);
-
-        // The three Security entries are preserved verbatim, in order — the
-        // customized osv-scanner survives untouched.
-        assert_eq!(tools[0].id, AuditToolId::OsvScanner);
-        assert!(!tools[0].enabled);
-        assert_eq!(tools[0].path, r"C:\tools\osv.exe");
-        assert_eq!(tools[0].extra_args, vec!["--offline".to_string()]);
-        assert_eq!(tools[0].timeout_secs, Some(42));
-        assert_eq!(tools[1].id, AuditToolId::Gitleaks);
-        assert_eq!(tools[2].id, AuditToolId::Semgrep);
-
-        // The eleven Quality ids are appended with correct enabled defaults:
-        // enabled except dotnet-analyzers and semgrep-quality.
-        let by_id = |id| tools.iter().find(|t| t.id == id).unwrap();
-        for id in [
-            AuditToolId::Oxlint,
-            AuditToolId::GolangciLint,
-            AuditToolId::Ruff,
-            AuditToolId::Cppcheck,
-            AuditToolId::Typos,
-            AuditToolId::Eslint,
-            AuditToolId::Pmd,
-            AuditToolId::Knip,
-            AuditToolId::CargoMachete,
-        ] {
-            assert!(by_id(id).enabled, "{id:?} enabled by default");
-            assert!(by_id(id).path.is_empty(), "{id:?} no path override");
-            assert!(by_id(id).timeout_secs.is_none(), "{id:?} global timeout");
-        }
-        assert!(!by_id(AuditToolId::DotnetAnalyzers).enabled);
-        assert!(!by_id(AuditToolId::SemgrepQuality).enabled);
-    }
-
-    #[test]
-    fn reconcile_audit_tools_leaves_full_config_untouched() {
-        // A fresh install already carries all fourteen tools — nothing to add.
-        let mut s = base_test_settings();
-        let before = s.code_audit.tools.clone();
-        assert_eq!(before.len(), 14);
-        assert!(!reconcile_audit_tools(&mut s));
-        assert_eq!(s.code_audit.tools, before);
-    }
-
-    #[test]
-    fn reconcile_audit_tools_is_idempotent() {
-        use crate::settings::schema::{AuditToolConfig, AuditToolId};
-        let mut s = base_test_settings();
-        s.code_audit.tools = vec![AuditToolConfig {
-            id: AuditToolId::Gitleaks,
-            enabled: true,
-            path: String::new(),
-            extra_args: vec![],
-            ruleset: String::new(),
-            timeout_secs: None,
-        }];
-        assert!(reconcile_audit_tools(&mut s));
-        let after_first = s.code_audit.tools.clone();
-        assert_eq!(after_first.len(), 14);
-        // A second pass finds every id present and changes nothing.
-        assert!(!reconcile_audit_tools(&mut s));
-        assert_eq!(s.code_audit.tools, after_first);
-    }
-
-    #[test]
-    fn integrity_reconciles_pre_v25_audit_tools() {
-        use crate::settings::schema::{AuditToolConfig, AuditToolId};
-        // The load-path integrity pass performs the same reconcile, so an
-        // upgraded install gains the Quality tools on first load.
-        let mut s = base_test_settings();
-        s.code_audit.tools = vec![
-            AuditToolConfig {
-                id: AuditToolId::OsvScanner,
-                enabled: true,
-                path: String::new(),
-                extra_args: vec![],
-                ruleset: String::new(),
-                timeout_secs: None,
-            },
-            AuditToolConfig {
-                id: AuditToolId::Gitleaks,
-                enabled: true,
-                path: String::new(),
-                extra_args: vec![],
-                ruleset: String::new(),
-                timeout_secs: None,
-            },
-            AuditToolConfig {
-                id: AuditToolId::Semgrep,
-                enabled: true,
-                path: String::new(),
-                extra_args: vec![],
-                ruleset: String::new(),
-                timeout_secs: None,
-            },
-        ];
-        integrity_check(&mut s);
-        assert_eq!(s.code_audit.tools.len(), 14);
     }
 
     #[test]
@@ -4236,142 +4010,70 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    // ── Audit scanner paths: machine-scope splitting ──────────────────────────
+    // ── Legacy audit-tool config: one-time promotion ──────────────────────
 
-    use crate::settings::schema::AuditToolId;
-
-    fn set_tool_path(s: &mut Settings, id: AuditToolId, p: &str) {
-        s.code_audit
-            .tools
-            .iter_mut()
-            .find(|t| t.id == id)
-            .expect("tool seeded by default")
-            .path = p.to_string();
-    }
-
-    fn get_tool_path(s: &Settings, id: AuditToolId) -> String {
-        s.code_audit
-            .tools
-            .iter()
-            .find(|t| t.id == id)
-            .expect("tool seeded by default")
-            .path
-            .clone()
-    }
-
+    /// The v33 promotion, and the two rules that make it safe to run on every
+    /// launch: it fills only EMPTY slots, and a container the user has already
+    /// touched wins over a stale overlay.
     #[test]
-    fn audit_path_promotion_fills_only_empty_global_slots() {
+    fn legacy_audit_config_promotes_into_empty_container_slots_only() {
         let mut global = base_test_settings();
-        set_tool_path(&mut global, AuditToolId::Semgrep, "C:\\global\\semgrep.exe");
+        // Already configured through the new pane: must survive untouched.
+        global.tool_plugins.global_paths.insert(
+            "cimp-audit@1/semgrep".to_string(),
+            "C:\\global\\semgrep.exe".to_string(),
+        );
         let overlay = serde_json::json!({
             "code_audit": { "tools": [
-                { "id": "gitleaks", "path": "P:\\ebin\\gitleaks.exe" },
-                { "id": "semgrep", "path": "D:\\stale\\semgrep.exe" },
-                { "id": "ruff", "path": "   " },
-            ]}
+                {
+                    "id": "gitleaks",
+                    "enabled": false,
+                    "path": "P:\\ebin\\gitleaks.exe",
+                    "extra_args": ["--redact"],
+                    "timeout_secs": 900
+                },
+                { "id": "semgrep", "path": "P:\\stale\\semgrep.exe", "ruleset": "p/ci" },
+                { "id": "pmd", "path": "   ", "ruleset": "   " }
+            ] }
         });
 
-        assert!(promote_overlay_audit_paths(&mut global, &overlay));
-        // Empty global slot: filled from the legacy overlay.
-        assert_eq!(
-            get_tool_path(&global, AuditToolId::Gitleaks),
-            "P:\\ebin\\gitleaks.exe"
-        );
-        // Non-empty global slot: the overlay copy never overwrites it.
-        assert_eq!(
-            get_tool_path(&global, AuditToolId::Semgrep),
-            "C:\\global\\semgrep.exe"
-        );
-        // Whitespace-only overlay path: not a promotion.
-        assert_eq!(get_tool_path(&global, AuditToolId::Ruff), "");
+        assert!(promote_overlay_audit_config(&mut global, &overlay));
 
-        // Idempotent: a second pass changes nothing.
-        assert!(!promote_overlay_audit_paths(&mut global, &overlay));
+        // The path the container did not have is promoted; the one it had is not.
+        assert_eq!(
+            global.tool_plugins.global_paths.get("cimp-audit@1/gitleaks"),
+            Some(&"P:\\ebin\\gitleaks.exe".to_string())
+        );
+        assert_eq!(
+            global.tool_plugins.global_paths.get("cimp-audit@1/semgrep"),
+            Some(&"C:\\global\\semgrep.exe".to_string()),
+            "an already-configured machine path must not be overwritten by a stale overlay"
+        );
+
+        let tools = &global.tool_plugins.plugins["cimp-audit@1"].tools;
+        let gitleaks = &tools["gitleaks"];
+        assert!(!gitleaks.enabled);
+        assert_eq!(gitleaks.timeout_secs, Some(900));
+        assert_eq!(gitleaks.parameters, vec!["--redact".to_string()]);
+        assert_eq!(tools["semgrep"].variables["ruleset"], "p/ci");
+        // A blank ruleset meant "use the tool's own default", which is the
+        // ABSENCE of a value in the container — storing "" would render
+        // `-R ""` on the next scan with no way back.
+        assert!(!tools.contains_key("pmd"), "a blank-only entry carries nothing");
+
+        // Idempotent: a second pass over the same overlay changes nothing, so a
+        // project that is never saved does not re-promote on every launch.
+        assert!(!promote_overlay_audit_config(&mut global, &overlay));
     }
 
+    /// An overlay with no legacy block at all is not a promotion.
     #[test]
-    fn merged_audit_paths_come_from_global_not_overlay() {
+    fn a_modern_overlay_promotes_nothing() {
         let mut global = base_test_settings();
-        set_tool_path(&mut global, AuditToolId::Gitleaks, "P:\\ebin\\gitleaks.exe");
-
-        // Simulate the deep-merge outcome: the overlay's tools array replaced
-        // the global's wholesale, with empty/stale path copies.
-        let mut merged = serde_json::to_value(&global).unwrap();
-        let tools = merged["code_audit"]["tools"].as_array_mut().unwrap();
-        for t in tools.iter_mut() {
-            t["path"] = serde_json::json!("");
-        }
-
-        enforce_global_audit_paths(&mut merged, &global);
-        let settings: Settings = serde_json::from_value(merged).unwrap();
-        assert_eq!(
-            get_tool_path(&settings, AuditToolId::Gitleaks),
-            "P:\\ebin\\gitleaks.exe",
-            "the merged view must take paths from the global baseline"
-        );
-    }
-
-    #[test]
-    fn overlay_diff_never_carries_audit_paths() {
-        // A settings state that differs from global ONLY in a scanner path
-        // must produce NO overlay at all once both sides are stripped — the
-        // path lands in the global file via the save() write-through instead.
-        let global = base_test_settings();
-        let mut current = global.clone();
-        set_tool_path(
-            &mut current,
-            AuditToolId::Gitleaks,
-            "P:\\ebin\\gitleaks.exe",
-        );
-
-        let mut cur_v = serde_json::to_value(&current).unwrap();
-        let mut base_v = serde_json::to_value(&global).unwrap();
-        strip_audit_tool_paths(&mut cur_v);
-        strip_audit_tool_paths(&mut base_v);
-        assert!(
-            diff(&cur_v, &base_v).is_none(),
-            "a path-only change must not create an overlay"
-        );
-
-        // A real per-project difference (an `enabled` flip) still diffs — and
-        // the emitted tools array carries only stripped paths.
-        let mut current2 = current.clone();
-        current2
-            .code_audit
-            .tools
-            .iter_mut()
-            .find(|t| t.id == AuditToolId::Gitleaks)
-            .unwrap()
-            .enabled = false;
-        let mut cur2_v = serde_json::to_value(&current2).unwrap();
-        strip_audit_tool_paths(&mut cur2_v);
-        let delta = diff(&cur2_v, &base_v).expect("enabled flip must diff");
-        let tools = delta["code_audit"]["tools"].as_array().unwrap();
-        assert!(
-            tools.iter().all(|t| t["path"].as_str() == Some("")),
-            "overlay tools entries must carry no path copies: {delta}"
-        );
-    }
-
-    #[test]
-    fn sync_audit_paths_into_disk_global_reports_changes() {
-        let mut disk = base_test_settings();
-        let mut live = base_test_settings();
-        set_tool_path(&mut live, AuditToolId::Semgrep, "C:\\py\\semgrep.exe");
-
-        assert!(sync_audit_paths_into(&mut disk, &live));
-        assert_eq!(
-            get_tool_path(&disk, AuditToolId::Semgrep),
-            "C:\\py\\semgrep.exe"
-        );
-        // Unchanged on a second sync — the physical file isn't rewritten.
-        assert!(!sync_audit_paths_into(&mut disk, &live));
-
-        // Clearing a path in the live settings clears the global slot too
-        // (the Clear button means "forget the configured path everywhere").
-        set_tool_path(&mut live, AuditToolId::Semgrep, "");
-        assert!(sync_audit_paths_into(&mut disk, &live));
-        assert_eq!(get_tool_path(&disk, AuditToolId::Semgrep), "");
+        let overlay = serde_json::json!({ "ui": { "theme": "tui" } });
+        assert!(!promote_overlay_audit_config(&mut global, &overlay));
+        assert!(global.tool_plugins.plugins.is_empty());
+        assert!(global.tool_plugins.global_paths.is_empty());
     }
 
     fn cmd_template(name: &str, command: &str) -> ServerCommandTemplate {

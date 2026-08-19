@@ -160,7 +160,7 @@ pub const SHELL_BROOT_TAB_ID: &str = "shell-broot";
 /// Files that pre-date V1.10 lack the field entirely; the cascade still
 /// uses the `looks_v1_X` predicates for those, falling through to a final
 /// step that stamps the field with the current value.
-pub const CURRENT_SCHEMA_VERSION: u8 = 32;
+pub const CURRENT_SCHEMA_VERSION: u8 = 33;
 
 fn current_schema_version() -> u8 {
     CURRENT_SCHEMA_VERSION
@@ -600,8 +600,8 @@ pub struct ToolState {
     /// consuming pipeline's default.
     pub timeout_secs: Option<u64>,
     /// Extra CLI arguments appended after the tool's own argv — the successor
-    /// to `AuditToolConfig::extra_args`, offered only for a tool whose manifest
-    /// sets `parameters_allowed`.
+    /// to the pre-v33 `code_audit.tools[].extra_args`, offered only for a tool
+    /// whose manifest sets `parameters_allowed`.
     pub parameters: Vec<String>,
     /// Values for the tool's **declared** variables, by declared name. A name
     /// the manifest does not declare is inert (the registry only substitutes
@@ -1580,150 +1580,6 @@ pub struct ExternalToolsSettings {
     pub broot: String,
 }
 
-/// V23 Phase A / V25 Phase B: closed set of built-in audit tools. Wire names
-/// are kebab-case (`osv-scanner`, `golangci-lint`, `dotnet-analyzers`, …).
-/// Closed — not free-form — because each id binds to a built-in adapter
-/// ([`crate::audit::adapters`]); an unknown id in a settings file is *dropped*
-/// (see [`deserialize_lenient_audit_tools`]), never an error, which keeps
-/// forward-compat if a future version removes a tool.
-///
-/// The V23 trio (`osv-scanner`/`gitleaks`/`semgrep`) is the Security category;
-/// V25 adds eleven Quality-category ids (ten linters + a separate
-/// `semgrep-quality` so quality rulesets never pollute the Security section).
-#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq, Hash)]
-#[serde(rename_all = "kebab-case")]
-pub enum AuditToolId {
-    /// Google osv-scanner — dependency CVEs + known-malicious packages.
-    OsvScanner,
-    /// gitleaks — secrets in the working tree + git history.
-    Gitleaks,
-    /// semgrep — SAST (requires Python; Windows support is beta).
-    Semgrep,
-    /// oxlint — Rust-based JS/TS linter (SARIF, zero-config).
-    Oxlint,
-    /// golangci-lint — Go meta-linter (SARIF via v2 `--output.*` flags).
-    GolangciLint,
-    /// ruff — Rust-based Python linter (SARIF).
-    Ruff,
-    /// cppcheck — C/C++ static analysis (SARIF to a report file, ≥ 2.16).
-    Cppcheck,
-    /// typos — source spell checker (JSONL; the only tool valuable everywhere).
-    Typos,
-    /// ESLint — JS/TS linter, resolved project-local-first (JSON reporter).
-    Eslint,
-    /// PMD — Java static analysis (SARIF; `pmd.bat` on Windows, needs a JRE).
-    Pmd,
-    /// Roslyn analyzers via `dotnet build` (SARIF report file). Runs a real
-    /// build, so default-disabled.
-    DotnetAnalyzers,
-    /// knip — unused files/exports/dependencies for JS/TS (JSON reporter),
-    /// resolved project-local-first like ESLint.
-    Knip,
-    /// cargo-machete — unused Rust dependencies (text output).
-    CargoMachete,
-    /// semgrep with a quality ruleset (`p/r2c-best-practices`). Separate id from the
-    /// Security `semgrep`; default-disabled (registry configs need network).
-    SemgrepQuality,
-}
-
-impl AuditToolId {
-    /// The bare command name resolved via `pty::resolve` (ebin → PATH) when the
-    /// per-tool `path` override is empty. Matches the wire id for most tools;
-    /// `dotnet-analyzers` invokes `dotnet` and `semgrep-quality` reuses the
-    /// `semgrep` binary.
-    pub fn command_name(&self) -> &'static str {
-        match self {
-            AuditToolId::OsvScanner => "osv-scanner",
-            AuditToolId::Gitleaks => "gitleaks",
-            AuditToolId::Semgrep => "semgrep",
-            AuditToolId::Oxlint => "oxlint",
-            AuditToolId::GolangciLint => "golangci-lint",
-            AuditToolId::Ruff => "ruff",
-            AuditToolId::Cppcheck => "cppcheck",
-            AuditToolId::Typos => "typos",
-            AuditToolId::Eslint => "eslint",
-            AuditToolId::Pmd => "pmd",
-            // Roslyn analyzers run through the .NET SDK driver.
-            AuditToolId::DotnetAnalyzers => "dotnet",
-            AuditToolId::Knip => "knip",
-            AuditToolId::CargoMachete => "cargo-machete",
-            // Same binary as the Security `semgrep`, different ruleset.
-            AuditToolId::SemgrepQuality => "semgrep",
-        }
-    }
-}
-
-/// V23 Phase A: one configured audit tool. `id` selects the built-in adapter
-/// (Phase B). `path`, when non-empty, is used as the launch command verbatim —
-/// overriding the normal `ebin/` → PATH resolution (the `ExternalToolsSettings`
-/// contract); empty (the default) means "resolve normally". `extra_args` are
-/// appended after the adapter's fixed argv (e.g. an `--exclude` filter; a
-/// semgrep ruleset swap belongs in `ruleset`, not here — see that field).
-/// `id` is required on the wire — a missing/unknown id makes the whole entry
-/// fail to deserialize, which the tolerant `tools` deserializer then drops.
-#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
-pub struct AuditToolConfig {
-    pub id: AuditToolId,
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    #[serde(default)]
-    pub path: String,
-    #[serde(default)]
-    pub extra_args: Vec<String>,
-    /// Ruleset override for a tool whose adapter carries an `Arg::Ruleset`
-    /// token: the two semgrep tools (`--config <slug>`) and PMD
-    /// (`-R <ruleset>`). Empty (the default) uses the adapter's built-in
-    /// value (`auto` / `p/r2c-best-practices` / `rulesets/java/quickstart.xml`).
-    /// Exists because these defaults are upstream-owned and can break without
-    /// notice (semgrep's `p/best-practices` 404'd 2026-07) — the recovery is
-    /// then a settings edit, not a rebuild. Ignored by every other tool.
-    /// `extra_args` can't serve this purpose: semgrep *merges* repeated
-    /// `--config` flags, so an appended slug can't replace a dead baked-in one.
-    #[serde(default)]
-    pub ruleset: String,
-    /// V25 Phase C: per-tool wall-clock timeout override in seconds. `None` (the
-    /// default) falls back to the global [`CodeAuditSettings::timeout_secs`]. A
-    /// tool that runs a real build wants a longer budget than a linter —
-    /// `dotnet-analyzers` (restores packages + compiles) is the motivating case;
-    /// a value around **1200** is recommended for it. Additive `#[serde(default)]`
-    /// so old settings files round-trip with `None` (global timeout).
-    #[serde(default)]
-    pub timeout_secs: Option<u64>,
-}
-
-impl AuditToolConfig {
-    /// A tool entry with defaults: enabled, no path override (resolve normally),
-    /// no extra args, global timeout.
-    fn new(id: AuditToolId) -> Self {
-        Self {
-            id,
-            enabled: true,
-            path: String::new(),
-            extra_args: Vec::new(),
-            ruleset: String::new(),
-            timeout_secs: None,
-        }
-    }
-
-    /// Same as [`new`](Self::new) but `enabled: false` — the default-disabled
-    /// tools (`dotnet-analyzers` runs a real build; `semgrep-quality` needs
-    /// network to fetch its ruleset).
-    fn disabled(id: AuditToolId) -> Self {
-        Self {
-            id,
-            enabled: false,
-            path: String::new(),
-            extra_args: Vec::new(),
-            ruleset: String::new(),
-            timeout_secs: None,
-        }
-    }
-}
-
-fn default_true() -> bool {
-    true
-}
-
 /// V23 Phase A: Code Audit (aggregated security scanning) config. cImp runs
 /// external security scanners against the project root and aggregates their
 /// SARIF output into one findings table (Phase B/C). Off by default
@@ -1742,23 +1598,25 @@ pub struct CodeAuditSettings {
     /// (its reserved tab was retired in schema v27), no scanning, no
     /// bottom-bar entry.
     pub enabled: bool,
-    /// The configured audit tools (v1 default: osv-scanner, gitleaks, semgrep).
-    /// An entry whose `id` isn't a known [`AuditToolId`] is dropped with a warn
-    /// (forward compat); see [`deserialize_lenient_audit_tools`].
-    #[serde(deserialize_with = "deserialize_lenient_audit_tools")]
-    pub tools: Vec<AuditToolConfig>,
     /// Per-tool wall-clock timeout in seconds. A tool that exceeds it is killed
     /// and reported `failed` (Phase B); the other tools are unaffected.
     pub timeout_secs: u64,
-    /// Keep the QUALITY tools' `enabled` flags following the project's language
-    /// census automatically: whenever a census is (re)taken — scan start, tab
-    /// open, Settings open — each quality tool is selected iff it's factory-
-    /// default-enabled AND applicable to the project (see
-    /// `audit::runner::auto_select_quality`; the default-disabled heavyweights
-    /// `dotnet-analyzers`/`semgrep-quality` stay opt-in). On by default; any
-    /// manual quality-checkbox edit in Settings flips this to `false` (manual
-    /// mode) so user choices stick, and the Settings section's "Auto-select for
-    /// this project" button turns it back on. Security tools are never touched.
+    /// Keep the built-in QUALITY tools' `enabled` flags following the project's
+    /// language census automatically: whenever a census is (re)taken — scan
+    /// start, tab open, Settings open — each is selected iff its manifest says
+    /// it is on by default AND it applies to the project (see
+    /// `audit::runner::auto_select_quality`; the heavyweights
+    /// `dotnet-analyzers`/`semgrep-quality` declare `enabled_by_default: false`
+    /// and so stay opt-in). On by default; any manual quality-checkbox edit
+    /// flips this to `false` (manual mode) so user choices stick, and the
+    /// "Auto-select for this project" button turns it back on. Security tools
+    /// are never touched, and neither is a user plugin's tool — auto-selection
+    /// is a statement about the roster cImp ships and knows the shape of.
+    ///
+    /// Since schema v33 the flags it writes live in
+    /// [`ToolPluginsSettings::plugins`], under the built-in audit plugin's key.
+    /// This switch stays here because it is a property of the Code Audit
+    /// FEATURE rather than of any one tool.
     pub quality_auto_select: bool,
     /// V26: advertise the `cimp-code-audit` MCP server to Claude Code tabs.
     /// When on (default), `tabs::config::build_pre_args` inserts the server
@@ -1790,7 +1648,6 @@ impl Default for CodeAuditSettings {
     fn default() -> Self {
         Self {
             enabled: false,
-            tools: default_audit_tools(),
             timeout_secs: 600,
             quality_auto_select: true,
             // Exposure defaults on for all three consumers: the master
@@ -1814,66 +1671,6 @@ impl CodeAuditSettings {
     pub fn mcp_exposed(&self) -> bool {
         self.enabled && (self.expose_claude || self.expose_opencode)
     }
-}
-
-/// The built-in audit tools seeded on a fresh install: the V23 Security trio
-/// plus the V25 Quality set. All resolve ebin → PATH (empty `path`). Every tool
-/// is `enabled` except `dotnet-analyzers` (runs a real build) and
-/// `semgrep-quality` (needs network for its ruleset). Seeded via serde/`Default`
-/// so a fresh install lists them all; a file that carries the `tools` key (even
-/// as `[]`) keeps exactly what it has — no schema-version bump (V23 precedent),
-/// so an existing config that already persisted the trio simply doesn't gain
-/// the Quality ids until re-seeded, which the applicability gate makes harmless.
-pub(crate) fn default_audit_tools() -> Vec<AuditToolConfig> {
-    vec![
-        // Security (V23).
-        AuditToolConfig::new(AuditToolId::OsvScanner),
-        AuditToolConfig::new(AuditToolId::Gitleaks),
-        AuditToolConfig::new(AuditToolId::Semgrep),
-        // Quality (V25) — enabled by default.
-        AuditToolConfig::new(AuditToolId::Oxlint),
-        AuditToolConfig::new(AuditToolId::GolangciLint),
-        AuditToolConfig::new(AuditToolId::Ruff),
-        AuditToolConfig::new(AuditToolId::Cppcheck),
-        AuditToolConfig::new(AuditToolId::Typos),
-        AuditToolConfig::new(AuditToolId::Eslint),
-        AuditToolConfig::new(AuditToolId::Pmd),
-        AuditToolConfig::new(AuditToolId::Knip),
-        AuditToolConfig::new(AuditToolId::CargoMachete),
-        // Quality — default-disabled.
-        AuditToolConfig::disabled(AuditToolId::DotnetAnalyzers),
-        AuditToolConfig::disabled(AuditToolId::SemgrepQuality),
-    ]
-}
-
-/// Tolerant deserializer for `CodeAuditSettings::tools`. An entry whose `id`
-/// isn't a known [`AuditToolId`] — a tool removed in a future version, or a
-/// typo — is dropped with a warn rather than failing the whole settings load;
-/// this is the forward-compat half of the closed-adapter contract. Mirrors the
-/// `deserialize_lenient_presets` pattern. A non-array value degrades to an
-/// empty list (the struct-level `Default` still supplies the three tools only
-/// when the `tools` key is entirely absent).
-fn deserialize_lenient_audit_tools<'de, D>(d: D) -> Result<Vec<AuditToolConfig>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let raw = serde_json::Value::deserialize(d)?;
-    let serde_json::Value::Array(items) = raw else {
-        if !raw.is_null() {
-            tracing::warn!("settings: code_audit.tools was not an array; ignoring");
-        }
-        return Ok(Vec::new());
-    };
-    let mut out = Vec::with_capacity(items.len());
-    for item in items {
-        match serde_json::from_value::<AuditToolConfig>(item) {
-            Ok(c) => out.push(c),
-            Err(e) => {
-                tracing::warn!(error = %e, "settings: unknown/malformed code_audit tool dropped")
-            }
-        }
-    }
-    Ok(out)
 }
 
 /// V8-01: local task-offload configuration. cImp runs a user-supplied
@@ -5579,78 +5376,54 @@ mod tests {
     /// file (`src-tauri/src/settings/`), up to the repo root.
     const AUDIT_TS_TYPES: &str = include_str!("../../../src/lib/settings/types.ts");
 
-    /// Every [`AuditToolId`] variant. The exhaustive `match` is the Rust-side
-    /// half of the tripwire: adding a variant without extending this list is a
-    /// compile error, so it can't reach `cargo test` unnoticed.
-    fn all_audit_tool_ids() -> Vec<AuditToolId> {
-        let all = vec![
-            AuditToolId::OsvScanner,
-            AuditToolId::Gitleaks,
-            AuditToolId::Semgrep,
-            AuditToolId::Oxlint,
-            AuditToolId::GolangciLint,
-            AuditToolId::Ruff,
-            AuditToolId::Cppcheck,
-            AuditToolId::Typos,
-            AuditToolId::Eslint,
-            AuditToolId::Pmd,
-            AuditToolId::DotnetAnalyzers,
-            AuditToolId::Knip,
-            AuditToolId::CargoMachete,
-            AuditToolId::SemgrepQuality,
-        ];
-        fn _assert_exhaustive(id: AuditToolId) {
-            match id {
-                AuditToolId::OsvScanner
-                | AuditToolId::Gitleaks
-                | AuditToolId::Semgrep
-                | AuditToolId::Oxlint
-                | AuditToolId::GolangciLint
-                | AuditToolId::Ruff
-                | AuditToolId::Cppcheck
-                | AuditToolId::Typos
-                | AuditToolId::Eslint
-                | AuditToolId::Pmd
-                | AuditToolId::DotnetAnalyzers
-                | AuditToolId::Knip
-                | AuditToolId::CargoMachete
-                | AuditToolId::SemgrepQuality => {}
-            }
-        }
-        all
+    /// The eleven audit-tool wire ids the FRONTEND still keys off, and the
+    /// mirror that keeps them true.
+    ///
+    /// V38 Phase E deleted `AuditToolId`: the fourteen built-in tools are
+    /// embedded plugin manifests now, so their ids are strings read from JSON
+    /// rather than an enum. The mirror did not go away with it, because the ids
+    /// still cross the wire — the Code Audit panel's category, order and
+    /// applicability maps are all keyed by them, and a rename in the manifest
+    /// with no matching rename in `src/lib/codeAudit/types.ts` would show up as
+    /// a chip that never lights.
+    ///
+    /// So the authority moved from the enum to the manifest, and the tripwire
+    /// moved with it: the list below is READ from the embedded manifest rather
+    /// than restated, so it cannot drift from what actually ships.
+    fn builtin_audit_tool_ids() -> Vec<String> {
+        let set = crate::plugins::builtin::plugin_set();
+        set.plugins
+            .iter()
+            .flat_map(|p| p.manifest.tools.iter())
+            .map(|t| t.id.clone())
+            .collect()
     }
 
     #[test]
-    fn audit_tool_id_wire_names_mirrored_in_types_ts() {
-        for id in all_audit_tool_ids() {
-            let wire = serde_json::to_value(id)
-                .expect("AuditToolId serializes")
-                .as_str()
-                .expect("AuditToolId serializes to a string")
-                .to_string();
+    fn builtin_audit_tool_ids_are_mirrored_in_the_frontend_union() {
+        const CODE_AUDIT_TS: &str = include_str!("../../../src/lib/codeAudit/types.ts");
+        let ids = builtin_audit_tool_ids();
+        assert_eq!(ids.len(), 14, "the built-in audit roster is fourteen tools");
+        for id in ids {
             assert!(
-                AUDIT_TS_TYPES.contains(&format!("'{wire}'")),
-                "AuditToolId `{id:?}` (wire `{wire}`) is missing from the TS `AuditToolId` \
-                 union in src/lib/settings/types.ts — add it to keep the mirror in sync",
+                CODE_AUDIT_TS.contains(&format!("'{id}'")),
+                "built-in audit tool `{id}` is missing from the TS `AuditToolId` union in \
+                 src/lib/codeAudit/types.ts — the panel keys its category, order and \
+                 applicability maps off that union, so an id it does not know renders as a \
+                 chip that never lights"
             );
         }
     }
 
     #[test]
     fn code_audit_field_names_mirrored_in_types_ts() {
-        // Serialize a fully-populated CodeAuditSettings + AuditToolConfig and
-        // assert each JSON key appears in types.ts, so any field added on the
-        // Rust side must also land in the TS interfaces.
+        // Serialize a fully-populated CodeAuditSettings and assert each JSON key
+        // appears in types.ts, so any field added on the Rust side must also
+        // land in the TS interface. The per-tool array is gone (schema v33):
+        // what a tool is configured with lives in `tool_plugins` now, and its
+        // own mirror is `tool_plugins_field_names_mirrored_in_types_ts`.
         let s = CodeAuditSettings {
             enabled: true,
-            tools: vec![AuditToolConfig {
-                id: AuditToolId::Semgrep,
-                enabled: true,
-                path: "C:/tools/semgrep.exe".into(),
-                extra_args: vec!["--config".into(), "auto".into()],
-                ruleset: "p/ci".into(),
-                timeout_secs: Some(1200),
-            }],
             timeout_secs: 600,
             quality_auto_select: true,
             expose_claude: true,
@@ -5665,20 +5438,19 @@ mod tests {
                  interface in src/lib/settings/types.ts",
             );
         }
-        let tool = serde_json::to_value(&s.tools[0]).expect("AuditToolConfig serializes");
-        for key in tool.as_object().expect("object").keys() {
-            assert!(
-                AUDIT_TS_TYPES.contains(&format!("{key}:")),
-                "AuditToolConfig field `{key}` is missing from the TS `AuditToolConfig` \
-                 interface in src/lib/settings/types.ts",
-            );
-        }
+        // …and the field that LEFT must be gone from the mirror too, or the
+        // frontend would keep reading an array the backend no longer writes.
+        assert!(
+            !AUDIT_TS_TYPES.contains("tools: AuditToolConfig[]"),
+            "src/lib/settings/types.ts still declares `code_audit.tools`, which schema v33 \
+             moved into `tool_plugins`"
+        );
     }
 
     #[test]
     fn code_audit_defaults_present_when_block_absent() {
         // An old settings file with no `code_audit` key round-trips to the
-        // feature-disabled defaults with the Security trio + Quality set present.
+        // feature-disabled defaults.
         let s: Settings = serde_json::from_value(json!({})).expect("empty settings deserialize");
         assert!(!s.code_audit.enabled);
         assert_eq!(s.code_audit.timeout_secs, 600);
@@ -5692,40 +5464,34 @@ mod tests {
         assert!(s.code_audit.expose_claude);
         assert!(s.code_audit.expose_opencode);
         assert!(s.code_audit.expose_offload);
-        let ids: Vec<AuditToolId> = s.code_audit.tools.iter().map(|t| t.id).collect();
-        assert_eq!(
-            ids,
-            vec![
-                AuditToolId::OsvScanner,
-                AuditToolId::Gitleaks,
-                AuditToolId::Semgrep,
-                AuditToolId::Oxlint,
-                AuditToolId::GolangciLint,
-                AuditToolId::Ruff,
-                AuditToolId::Cppcheck,
-                AuditToolId::Typos,
-                AuditToolId::Eslint,
-                AuditToolId::Pmd,
-                AuditToolId::Knip,
-                AuditToolId::CargoMachete,
-                AuditToolId::DotnetAnalyzers,
-                AuditToolId::SemgrepQuality,
+        // The roster no longer needs seeding into settings at all: it IS the
+        // embedded manifest, and an untouched container means "every tool at
+        // its declared default". That is what makes a fresh install and an
+        // upgraded one agree without a seeding step to keep in step.
+        assert!(s.tool_plugins.plugins.is_empty());
+    }
+
+    /// A v23-era `code_audit` block still deserializes, and the per-tool array
+    /// it carries is simply not a field any more — the v32 → v33 migration is
+    /// what moves it, and a file that skipped the migration must not fail to
+    /// load over a key it no longer has a home for.
+    #[test]
+    fn a_legacy_code_audit_block_still_loads_and_ignores_its_tool_array() {
+        let ca: CodeAuditSettings = serde_json::from_value(json!({
+            "enabled": true,
+            "timeout_secs": 120,
+            "quality_auto_select": false,
+            "tools": [
+                { "id": "gitleaks", "enabled": true, "path": "", "extra_args": [] },
+                { "id": "semgrep", "enabled": false, "path": "sg.exe", "extra_args": [] }
             ]
-        );
-        // Every tool resolves normally (empty path); all enabled except the two
-        // default-disabled ones.
-        assert!(s.code_audit.tools.iter().all(|t| t.path.is_empty()));
-        let disabled: Vec<AuditToolId> = s
-            .code_audit
-            .tools
-            .iter()
-            .filter(|t| !t.enabled)
-            .map(|t| t.id)
-            .collect();
-        assert_eq!(
-            disabled,
-            vec![AuditToolId::DotnetAnalyzers, AuditToolId::SemgrepQuality]
-        );
+        }))
+        .expect("a v23-era code_audit block still deserializes");
+        assert!(ca.enabled);
+        assert_eq!(ca.timeout_secs, 120);
+        assert!(!ca.quality_auto_select);
+        // …and the additive V26 flags still fill in.
+        assert!(ca.expose_claude);
     }
 
     #[test]
@@ -5768,52 +5534,6 @@ mod tests {
         assert!(!o.session_push);
         // Default-constructed settings agree (the toggle ships off).
         assert!(!OffloadSettings::default().session_push);
-    }
-
-    #[test]
-    fn code_audit_unknown_tool_id_dropped_keeping_known() {
-        // A future/typo'd tool id is dropped; the recognized entries survive.
-        let ca: CodeAuditSettings = serde_json::from_value(json!({
-            "enabled": true,
-            "timeout_secs": 120,
-            "tools": [
-                { "id": "gitleaks", "enabled": true, "path": "", "extra_args": [] },
-                { "id": "guarddog", "enabled": true, "path": "", "extra_args": [] },
-                { "id": "semgrep", "enabled": false, "path": "sg.exe", "extra_args": ["--config", "auto"] }
-            ]
-        }))
-        .expect("code_audit with an unknown tool still deserializes");
-        assert!(ca.enabled);
-        assert_eq!(ca.timeout_secs, 120);
-        let ids: Vec<AuditToolId> = ca.tools.iter().map(|t| t.id).collect();
-        assert_eq!(ids, vec![AuditToolId::Gitleaks, AuditToolId::Semgrep]);
-        // Field values on the surviving entries are preserved.
-        let semgrep = ca
-            .tools
-            .iter()
-            .find(|t| t.id == AuditToolId::Semgrep)
-            .unwrap();
-        assert!(!semgrep.enabled);
-        assert_eq!(semgrep.path, "sg.exe");
-        assert_eq!(
-            semgrep.extra_args,
-            vec!["--config".to_string(), "auto".to_string()]
-        );
-    }
-
-    #[test]
-    fn code_audit_missing_optional_tool_fields_default() {
-        // A tool entry with only `id` gets enabled=true + empty path/args.
-        let ca: CodeAuditSettings = serde_json::from_value(json!({
-            "tools": [ { "id": "osv-scanner" } ]
-        }))
-        .expect("terse tool entry deserializes");
-        assert_eq!(ca.tools.len(), 1);
-        assert!(ca.tools[0].enabled);
-        assert!(ca.tools[0].path.is_empty());
-        assert!(ca.tools[0].extra_args.is_empty());
-        // V25: the per-tool timeout override defaults to None (global timeout).
-        assert!(ca.tools[0].timeout_secs.is_none());
     }
 
     #[test]

@@ -251,6 +251,32 @@ pub fn scan_dir(dir: &Path, provenance: Provenance) -> PluginSet {
     set
 }
 
+/// The whole plugin population: cImp's own embedded definitions, then whatever
+/// is in `<exe-dir>/plugins/`.
+///
+/// One function rather than a merge at each call site, because there are three
+/// (the managed store's rescan, a store-less process's lazy scan, and the tests)
+/// and a call site that forgot the built-in half would silently lose fourteen
+/// scanners.
+///
+/// The two halves cannot collide: a scanned file may not claim the `cimp-`
+/// prefix ([`manifest::RESERVED_NAME_PREFIX`]), so no user plugin can produce a
+/// key an embedded one already holds. The embedded plugins are laid down FIRST
+/// for the same reason the built-in audit roster used to be computed first —
+/// order is what a report and a settings list read, and cImp's own tools lead
+/// it.
+pub fn scan_all(dir: &Path) -> PluginSet {
+    let embedded = super::builtin::plugin_set();
+    let mut set = scan_dir(dir, Provenance::User);
+    let mut plugins = embedded.plugins.clone();
+    plugins.append(&mut set.plugins);
+    set.plugins = plugins;
+    let mut errors = embedded.errors.clone();
+    errors.append(&mut set.errors);
+    set.errors = errors;
+    set
+}
+
 /// The app-managed plugin state: one [`PluginSet`], replaced **atomically** by
 /// a rescan.
 ///
@@ -295,11 +321,18 @@ impl PluginStore {
     /// what "loaded" means.
     pub fn rescan(&self) -> Arc<PluginSet> {
         let set = match plugins_dir() {
-            Some(dir) => scan_dir(&dir, Provenance::User),
-            None => PluginSet {
-                scanned_at_ms: crate::activity::now_ms(),
-                ..PluginSet::default()
-            },
+            Some(dir) => scan_all(&dir),
+            // No plugins directory at all still leaves cImp's own definitions:
+            // an exe whose parent cannot be named must not lose its scanners.
+            None => {
+                let embedded = super::builtin::plugin_set();
+                PluginSet {
+                    plugins: embedded.plugins.clone(),
+                    errors: embedded.errors.clone(),
+                    scanned_at_ms: crate::activity::now_ms(),
+                    ..PluginSet::default()
+                }
+            }
         };
         super::events::record_scan(&set);
         self.replace(set)

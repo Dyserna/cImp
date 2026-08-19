@@ -2,8 +2,6 @@ import { invoke } from '@tauri-apps/api/core';
 import type {
   AiToolTabConfig,
   AuditDetectResult,
-  AuditToolConfig,
-  AuditToolId,
   HarnessStatus,
   LlmPricingModel,
   Settings,
@@ -115,39 +113,22 @@ export async function harnessRunChecks(harness: string): Promise<boolean> {
   return invoke('harness_run_checks', { harness });
 }
 
-/// V23 Phase A: resolve one Code Audit tool and probe `<tool> --version`.
-/// `path` is the LIVE override from the Settings input (empty = resolve the
-/// bare command name) — passed explicitly so a just-typed value can't race the
-/// fire-and-forget settings push. Display-only — the Detect button renders the
-/// result inline and never writes the resolved path back into the stored
-/// config, so it stays "resolve normally" unless the user browses.
-export async function auditDetectTool(id: AuditToolId, path: string): Promise<AuditDetectResult> {
-  return invoke('audit_detect_tool', { id, path });
-}
-
-/// The audit tool config as stored in the PHYSICAL global settings file
-/// (reconciled to the current tool set). Backs the Settings → Code Audit
-/// per-tool global/local scope indicator.
-export interface AuditGlobalToolConfig {
-  tools: AuditToolConfig[];
-  quality_auto_select: boolean;
-}
-
-export async function auditToolsGlobalConfig(): Promise<AuditGlobalToolConfig> {
-  return invoke('audit_tools_global_config');
-}
-
-/// "Save to global": write the live tool config through to the physical
-/// global settings file (and drop the project overlay's copy). Returns the
-/// new global config for indicator refresh.
-export async function auditToolsSaveGlobal(): Promise<AuditGlobalToolConfig> {
-  return invoke('audit_tools_save_global');
-}
-
-/// "Load from global": adopt the global file's tool config as the live
-/// config, removing the project's own copy. Returns the adopted config.
-export async function auditToolsLoadGlobal(): Promise<AuditGlobalToolConfig> {
-  return invoke('audit_tools_load_global');
+/// Resolve one registered tool and probe `<tool> --version`.
+///
+/// `toolKey` is the registry key (`cimp-audit@1/gitleaks` for a built-in
+/// scanner, `name@version/tool-id` for a user plugin's tool); `path` is the LIVE
+/// value from the Settings input, passed explicitly so a just-typed path cannot
+/// race the fire-and-forget settings push. An empty `path` means "resolve the
+/// way this tool normally resolves", which for a built-in is its command name
+/// through `ebin` then `PATH` and for a plugin is nowhere at all.
+///
+/// Display-only: the button renders the result inline and never writes the
+/// resolved path back into the stored config.
+export async function auditDetectTool(
+  toolKey: string,
+  path: string,
+): Promise<AuditDetectResult> {
+  return invoke('audit_detect_tool', { toolKey, path });
 }
 
 /// V38 Phase B: the current plugin set — what loaded from `<exe-dir>/plugins/`

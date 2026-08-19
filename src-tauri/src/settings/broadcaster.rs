@@ -190,11 +190,21 @@ impl SettingsHandle {
 
     /// Mutate the in-memory global BASELINE the overlay diff is computed
     /// against, then request a save so the overlay is recomputed against the
-    /// new baseline. For the explicit "save/load global" flows only: the
-    /// caller has just rewritten (or re-read) the PHYSICAL global file and
-    /// the baseline must be brought in line with it — a value equal on both
-    /// diff sides drops out of the project overlay. This never writes the
+    /// new baseline. For an explicit "this value is now the machine default"
+    /// flow: the caller has just rewritten (or re-read) the PHYSICAL global
+    /// file and the baseline must be brought in line with it — a value equal on
+    /// both diff sides drops out of the project overlay. This never writes the
     /// physical global file itself.
+    ///
+    /// **No caller today.** Its only one was Code Audit'''s "Save/Load to
+    /// global" pair, which V38 Phase E retired: per-tool audit configuration
+    /// moved into `tool_plugins`, which is machine scope by construction, so
+    /// there is no project copy left to promote. Kept rather than deleted
+    /// because it is the counterpart of `sync_*_into` — every machine-scope
+    /// write-through in `persistence` needs a way to tell the in-memory
+    /// baseline what it just did, and the next one that needs it should find
+    /// this rather than invent a second.
+    #[allow(dead_code)]
     pub fn mutate_global<F: FnOnce(&mut Settings)>(&self, f: F) {
         {
             let mut g = match self.global.lock() {

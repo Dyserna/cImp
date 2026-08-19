@@ -22,6 +22,10 @@
 //! * [`posture`] — the manifest's sandbox fields, applied identically at every
 //!   seam that spawns a plugin tool.
 
+/// cImp's own tool definitions, embedded and read through the same validator a
+/// dropped-in file goes through. See the module docs for why the fourteen audit
+/// scanners are a plugin rather than a table.
+pub mod builtin;
 pub mod events;
 pub mod loader;
 pub mod manifest;
@@ -116,8 +120,16 @@ pub fn snapshot_or_scan() -> Arc<PluginSet> {
     LOCAL
         .get_or_init(|| {
             Arc::new(match loader::plugins_dir() {
-                Some(dir) => loader::scan_dir(&dir, manifest::Provenance::User),
-                None => PluginSet::default(),
+                Some(dir) => loader::scan_all(&dir),
+                // Still the embedded half: a store-less process that lost the
+                // built-in definitions would answer a different tool list from
+                // the app's, which is the one thing this function exists to
+                // prevent.
+                None => PluginSet {
+                    plugins: builtin::plugin_set().plugins.clone(),
+                    errors: builtin::plugin_set().errors.clone(),
+                    ..PluginSet::default()
+                },
             })
         })
         .clone()

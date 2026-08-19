@@ -64,8 +64,9 @@ typo that silently does nothing surfaces weeks later as a behaviour difference.
   depend on directory read order, so the same pair would behave differently on
   another machine.
 * Same name, different version ⇒ both load, and settings disambiguates them.
-* The `cimp-` prefix is **reserved** for cImp's own built-in plugins and refused
-  in a scanned file.
+* The `cimp-` prefix is **reserved** for cImp's own plugins and refused in a
+  scanned file. It is in use: the fourteen Code Audit scanners are
+  `cimp-audit@1` (§ 10).
 * A plugin's tool ids must be unique within it, and every tool must belong to
   exactly one category — a category toggle is a group operation, so a tool in two
   categories would have two conflicting group states and a tool in none would be
@@ -125,6 +126,8 @@ Tool level, every kind:
 | field | meaning |
 |---|---|
 | `id`, `label`, `kind` | identity and capability kind |
+| `description?` | one line saying what the tool is for, shown beside the label |
+| `enabled_by_default` | whether the tool is on before the user touches it (default `true`) |
 | `runtime` | which sandbox runtime profile applies (§ 6.2) |
 | `sandbox` | what cImp does when it cannot confine this tool (§ 6.1) |
 | `extra_grants[]` | absolute paths to grant beyond the profile (§ 6.3) |
@@ -190,10 +193,19 @@ who read it.
 
 ### 2.5 Fields cImp stamps, and a file may never claim
 
+Format: `field:verdict:a valid value for it`. `never` = refused in every file,
+embedded or scanned; `builtin-only` = accepted in cImp's own embedded manifests
+and refused in a scanned one. Both verdicts are exercised against the real
+validator by a drift test, so "reserved" here means refused rather than
+discouraged.
+
 <!-- drift:reserved-fields -->
 ```text
-builtin
-ingest
+builtin:never:true
+ingest:builtin-only:"grandfathered"
+command:builtin-only:"acme-scan"
+project_local_bin:builtin-only:"acme"
+dir_argv:builtin-only:["--dir","{root}"]
 ```
 
 `builtin` is **not a manifest field, in any file**. Whether a plugin is built in
@@ -203,11 +215,22 @@ string. A file carrying it is refused with a message that says so, rather than
 with serde's generic "unknown field" — which would read as a typo instead of as
 the provenance forgery it is.
 
-`ingest` is reserved on the same terms. It arrives with the embedded built-in
-plugins (V38 Phase E) as `"ingest": "grandfathered"`, which relaxes the output
-gate to the semantics the fourteen built-in scanners were measured against; a
-**user** plugin may never select it, because the strict gate is what stops a
-blank artifact reading as a clean scan (§ 4.1).
+The other four are **built-in only**, and each of them relaxes a rule this
+document states for everyone else:
+
+* `ingest: "grandfathered"` relaxes the output gate to the semantics the
+  fourteen built-in scanners were measured against (§ 4.1). A user plugin may
+  never select it, because the strict gate is what stops a blank artifact
+  reading as a clean scan.
+* `command` is a bare command NAME cImp resolves through `ebin` then `PATH` when
+  no path is configured — the one exception to "no automatic PATH resolution"
+  (§ 5.2). It is a name, never a path.
+* `project_local_bin` prefers a `node_modules/.bin` shim over a global install
+  when no path is configured (the built-in `eslint` and `knip`).
+* `dir_argv` is a second argv template used when the scan root is not a git
+  repository (the built-in `gitleaks`, whose `dir` form differs from its `git`
+  one). A user plugin that wants the distinction makes it inside the wrapper it
+  already points cImp at.
 
 ---
 
@@ -330,6 +353,15 @@ transport. Then the **ingest gate**:
 | JSON, but no `runs` array | **tool ERROR** |
 | `{"runs": []}` | **clean scan**, zero findings |
 | `{"runs": [ … ]}` | findings ingested |
+
+**One exception, and it is cImp's own.** The fourteen built-in scanners predate
+this contract and their behaviour was measured against the real binaries rather
+than designed: a clean `gitleaks` run writes **no report at all**, and `cppcheck`
+exits 0 whether or not it found anything. Their embedded manifests therefore
+carry `"ingest": "grandfathered"` (§ 2.5), which keeps the pre-V38 semantics —
+whatever the tool wrote is what it meant, including nothing. A user plugin may
+not select it, so the table above is the whole of the contract for anything you
+install.
 
 The middle three rows are the point. *Empty is not absent*: a tool that printed
 nothing said nothing, and reading zero findings out of it would report a clean
@@ -486,6 +518,14 @@ survives while the storage location does not sit inside the sandbox.
   A tool with no path is **inert** — visible, unrunnable. Installation is not
   activation; there is no automatic `PATH` resolution, because cImp never picks a
   binary on your behalf.
+  * **The one exception is cImp's own tools.** A plugin whose provenance the
+    loader stamped `builtin` may declare a bare `command` name, and with no path
+    configured cImp resolves that name through the `ebin` drop-in folder and then
+    your `PATH` — which is exactly how the Code Audit scanners have resolved
+    since V23. The rule above protects you from cImp guessing a binary for a
+    definition a stranger wrote; it was never an argument for making fourteen
+    shipped scanners stop working. The gate is the loader's provenance stamp, not
+    the `cimp-` name.
 * **Runnable** = enabled AND path set. Two separate questions, kept separate, so
   "why is my enabled tool not running?" has an answer.
 * **Variables** = declared defaults, overlaid by your values, **for declared
@@ -810,12 +850,64 @@ the code:
 | `drift:child-env` | `sandbox::child_env::CHILD_ENV` |
 | `drift:shell-unsafe` | `checks::plugin::SHELL_UNSAFE` |
 | `drift:shell-allowed` | that none of those characters is in `SHELL_UNSAFE` |
-| `drift:reserved-fields` | that a user manifest carrying either field is refused |
+| `drift:reserved-fields` | that a scanned manifest carrying any of them is refused, and that the built-in-only ones load when the loader stamped `builtin` |
+| `drift:identity-charset` | `manifest::valid_id` / `valid_version`, both verdicts on both fields |
+| `drift:builtin-roster` | the tool keys of cImp's own embedded manifests |
 
 Format rules for those blocks: an HTML comment `<!-- drift:NAME -->` immediately
 followed by a fenced block; lines beginning with `#` are comments; blank lines are
 ignored; everything else is whitespace-separated values. Parsing normalizes line
 endings, so a CRLF checkout reads the same as an LF one.
+
+---
+
+## 10. cImp's own plugins
+
+The framework has exactly one user: **cImp**. The fourteen Code Audit scanners
+are not a second, privileged tier — they are embedded manifests parsed by the
+same validator, joined by the same registry, spawned through the same runner and
+configured in the same settings pane as anything you drop in the folder. That is
+deliberate, and it is the only honest test of whether the contract above is
+sufficient: a framework whose own author needed a private door has not been
+shown to work.
+
+What they get that a scanned file does not is exactly the four built-in-only
+fields of § 2.5, each one documented, refused on the scanned path, and gated on
+the loader's provenance stamp rather than on the `cimp-` name.
+
+**These are settings keys.** Per-tool enables, timeouts, variable values and
+binary paths are stored under `cimp-audit@1/<tool-id>`, and the schema v32 → v33
+migration writes exactly these strings when it moves the pre-V38
+`code_audit.tools` array into the container. The `1` is the identity of the
+shipped set, not the cImp release it came in — bumping it would orphan every
+one of those keys.
+
+<!-- drift:builtin-roster -->
+```text
+cimp-audit@1/osv-scanner
+cimp-audit@1/gitleaks
+cimp-audit@1/semgrep
+cimp-audit@1/oxlint
+cimp-audit@1/golangci-lint
+cimp-audit@1/ruff
+cimp-audit@1/cppcheck
+cimp-audit@1/typos
+cimp-audit@1/eslint
+cimp-audit@1/pmd
+cimp-audit@1/knip
+cimp-audit@1/cargo-machete
+cimp-audit@1/dotnet-analyzers
+cimp-audit@1/semgrep-quality
+```
+
+Two of them declare `enabled_by_default: false` — `dotnet-analyzers` runs a real
+build (it restores packages and writes `obj/` and `bin/`) and `semgrep-quality`
+fetches its ruleset over the network. Nobody should get either by accident.
+
+A tool's WIRE id — what a finding is attributed to, what a chip is keyed by,
+what the report a model reads prints — is the bare tool id (`osv-scanner`), not
+the namespaced key. The two namespaces stay disjoint because a plugin key always
+contains `@` and `/` and a built-in id never does (§ 8).
 
 <!-- drift:kinds -->
 ```text

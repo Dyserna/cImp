@@ -5,7 +5,6 @@
 // piece of logic that can be tested lives here (mirrors the `checksEditor.ts` /
 // `codeAudit.ts` split).
 
-import type { CodeAuditSettings } from '../settings/types';
 import type {
   AuditCategory,
   AuditCensus,
@@ -108,23 +107,27 @@ export const AUDIT_TOOL_DEFAULT_OFF: ReadonlySet<AuditToolId> = new Set([
   'semgrep-quality',
 ]);
 
-/// Recompute each QUALITY tool's `enabled` to its automatic value —
-/// factory-default-enabled AND applicable to `census` — returning a NEW tools
-/// array (input untouched; unchanged entries are reused by reference).
-/// Security tools are never in scope. Mirror of Rust
-/// `audit::runner::auto_select_quality`; the Settings button uses this for an
-/// instant client-side apply, the backend re-applies on every census refresh.
-/// Callers should skip an empty census (`censusIsEmpty`) — "no languages seen
-/// yet" must not deselect everything.
-export function autoSelectQuality<T extends { id: AuditToolId; enabled: boolean }>(
-  tools: readonly T[],
+/// Every built-in QUALITY tool paired with the `enabled` auto-selection wants
+/// for it: its factory default AND applicable to `census`. Security tools are
+/// never in scope, and neither is a user plugin's tool — auto-selection is a
+/// statement about the roster cImp ships and knows the shape of.
+///
+/// Mirror of Rust `audit::runner::auto_select_quality`; the Settings button
+/// uses it for an instant client-side apply, and the backend re-applies the
+/// same rule on every census refresh. Callers must skip an empty census
+/// (`censusIsEmpty`) — "no languages seen yet" must not deselect everything.
+///
+/// Returns the full desired state rather than a diff: the caller writes into a
+/// keyed settings container where "absent" already means "the manifest's
+/// default", so it needs to know what every tool should be, not only what
+/// changed.
+export function qualityAutoSelection(
   census: AuditCensus,
-): T[] {
-  return tools.map((t) => {
-    if (AUDIT_TOOL_CATEGORY[t.id] !== 'quality') return t;
-    const want = !AUDIT_TOOL_DEFAULT_OFF.has(t.id) && isToolApplicable(t.id, census);
-    return t.enabled === want ? t : { ...t, enabled: want };
-  });
+): { id: AuditToolId; enabled: boolean }[] {
+  return toolsInCategory('quality').map((id) => ({
+    id,
+    enabled: !AUDIT_TOOL_DEFAULT_OFF.has(id) && isToolApplicable(id, census),
+  }));
 }
 
 /// A census with neither extensions nor markers — the pre-first-scan state.
@@ -388,51 +391,22 @@ export function formatCoverageLine(paths: readonly string[]): string {
   return paths.map((p) => `${p} ✓`).join(' · ');
 }
 
-// ── Pre-scan configured tool list ────────────────────────────────────────────
-
-/// Before the first scan of `category` the backend snapshot has no tools of it;
-/// render that category's configured tool list from settings as idle chips (in
-/// canonical order, including disabled tools — spec). Once a scan of the
-/// category starts the backend's `tools` is authoritative and this is unused.
-///
-/// **V38: this is the LAST RESORT, not the pre-scan answer.** It knows only the
-/// built-in roster (`code_audit.tools`), so a plugin tool the user enabled and
-/// pointed at a binary is absent from it — exactly the residual Phase C left
-/// open. `audit_effective_roster` answers the same question with the registry
-/// joined in and `chipToolStates` prefers it; this stays for the moment before
-/// that IPC has answered (and if it ever fails), where showing the built-ins
-/// beats showing nothing.
-export function configuredToolStates(
-  settings: CodeAuditSettings,
-  category: AuditCategory,
-): AuditToolState[] {
-  const byId = new Map<AuditToolId, boolean>();
-  for (const t of settings.tools) byId.set(t.id, t.enabled);
-  const out: AuditToolState[] = [];
-  for (const id of toolsInCategory(category)) {
-    if (!byId.has(id)) continue;
-    out.push({
-      id,
-      category,
-      status: 'idle',
-      findings: [],
-      duration_ms: 0,
-      error: null,
-      resolved: null,
-      scanned_artifacts: [],
-    });
-  }
-  return out;
-}
+// ── Pre-scan chips ─────────────────────────────────────────────────────────
 
 /// The `category` tool states to render as chips, in preference order:
 ///
 /// 1. the snapshot's OWN (category-filtered) list, once a scan of this category
 ///    has produced one — authoritative, it is what actually ran;
 /// 2. `roster`, the backend's `audit_effective_roster` answer — what a scan
-///    *would* run right now, built-ins **and** plugin tools;
-/// 3. `configuredToolStates`, the built-ins-only derivation, for the moment
-///    before the IPC answers.
+///    *would* run right now, built-ins **and** plugin tools.
+///
+/// There is no third fallback since V38 Phase E. There used to be
+/// `configuredToolStates`, a built-ins-only derivation from
+/// `settings.code_audit.tools`; that array is gone, and re-deriving the roster
+/// in the browser from the settings container would mean re-implementing the
+/// manifest ⋈ user-state ⋈ project join that `audit_effective_roster` exists to
+/// answer — which is exactly how two lists start disagreeing. Before the IPC
+/// answers the chip strip is empty for a moment, which is honest.
 ///
 /// A merged snapshot may carry both categories' tools (see
 /// `mergeAuditSnapshot`), so this always filters by category first. `roster` is
@@ -440,14 +414,12 @@ export function configuredToolStates(
 /// stale answer for the other one must not leak into it.
 export function chipToolStates(
   snapshot: AuditSnapshot,
-  settings: CodeAuditSettings,
   category: AuditCategory,
   roster: readonly AuditToolState[] | null = null,
 ): AuditToolState[] {
   const own = snapshot.tools.filter((t) => t.category === category);
   if (own.length > 0) return own;
-  const fromRoster = (roster ?? []).filter((t) => t.category === category);
-  return fromRoster.length > 0 ? fromRoster : configuredToolStates(settings, category);
+  return (roster ?? []).filter((t) => t.category === category);
 }
 
 /// The chip-visibility split for one tab. A tool is HIDDEN when it's

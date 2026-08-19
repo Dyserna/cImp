@@ -1,14 +1,12 @@
 import { describe, expect, test } from 'vitest';
 
-import type { CodeAuditSettings } from '../settings/types';
 import type { AuditSnapshot, AuditToolId, AuditToolState } from './types';
 import {
   AUDIT_TOOL_CATEGORY,
-  autoSelectQuality,
+  qualityAutoSelection,
   categoryFindingsCount,
   censusIsEmpty,
   chipToolStates,
-  configuredToolStates,
   defaultFilters,
   deselectAll,
   filterFindings,
@@ -267,46 +265,17 @@ describe('toolChip', () => {
   });
 });
 
-// ── configured pre-scan chips ────────────────────────────────────────────────
+// ── the pre-scan chip list ──────────────────────────────────────────────────
 
-describe('configuredToolStates / chipToolStates', () => {
-  const settings: CodeAuditSettings = {
-    enabled: true,
-    timeout_secs: 600,
-    quality_auto_select: true,
-    expose_claude: true,
-    expose_opencode: true,
-    expose_offload: true,
-    tools: [
-      { id: 'semgrep', enabled: false, path: '', extra_args: [], ruleset: '', timeout_secs: null },
-      { id: 'osv-scanner', enabled: true, path: '', extra_args: [], ruleset: '', timeout_secs: null },
-      { id: 'gitleaks', enabled: true, path: '', extra_args: [], ruleset: '', timeout_secs: null },
-    ],
-  };
-
-  test('renders configured tools as idle, in canonical order (incl. disabled)', () => {
-    const states = configuredToolStates(settings, 'security');
-    expect(states.map((s) => s.id)).toEqual(['osv-scanner', 'gitleaks', 'semgrep']);
-    expect(states.every((s) => s.status === 'idle')).toBe(true);
-    expect(states.every((s) => s.category === 'security')).toBe(true);
-  });
-
-  test('chipToolStates prefers the runtime snapshot once it has tools of the category', () => {
-    expect(chipToolStates(snapshot({ tools: [] }), settings, 'security').map((s) => s.id)).toEqual([
-      'osv-scanner',
-      'gitleaks',
-      'semgrep',
-    ]);
-    // FULL has only security tools, so the (filtered) list is the same array
-    // contents — chipToolStates filters by category, so it is a new array.
-    expect(chipToolStates(FULL, settings, 'security').map((s) => s.id)).toEqual([
+describe('chipToolStates', () => {
+  test('the runtime snapshot wins once it has tools of this category', () => {
+    // FULL carries only security tools, so the filtered list is those.
+    expect(chipToolStates(FULL, 'security').map((s) => s.id)).toEqual([
       'osv-scanner',
       'gitleaks',
       'semgrep',
     ]);
   });
-
-  // ── V38: the effective roster is the pre-scan answer ──────────────────────
 
   const roster: AuditToolState[] = [
     tool({ id: 'osv-scanner', status: 'idle' }),
@@ -315,52 +284,39 @@ describe('configuredToolStates / chipToolStates', () => {
     tool({ id: 'other@2.0.0/lint', status: 'idle', category: 'quality' }),
   ];
 
-  test('a plugin tool shows in the PRE-SCAN chip list, from the backend roster', () => {
-    // The residual Phase C left open: derived from settings alone, a plugin
-    // tool the user had enabled and pointed at a binary was invisible until a
-    // scan started running it.
-    expect(configuredToolStates(settings, 'security').map((s) => s.id)).not.toContain(
-      'acme@1.0.0/scan',
-    );
+  test('before any scan, the chips are the backend roster — plugins included', () => {
+    // The join that answers "what would run" (manifests ⋈ user state ⋈ project
+    // ⋈ census) exists once, on the Rust side. A plugin tool the user enabled
+    // and pointed at a binary is visible here BEFORE a scan starts, which is
+    // the whole reason `audit_effective_roster` exists.
     expect(
-      chipToolStates(snapshot({ tools: [] }), settings, 'security', roster).map((s) => s.id),
+      chipToolStates(snapshot({ tools: [] }), 'security', roster).map((s) => s.id),
     ).toEqual(['osv-scanner', 'gitleaks', 'acme@1.0.0/scan']);
   });
 
   test('the roster is filtered by category and never outranks a real scan', () => {
     // The other category's entry must not leak into this panel…
     expect(
-      chipToolStates(snapshot({ tools: [] }), settings, 'security', roster).map((s) => s.id),
+      chipToolStates(snapshot({ tools: [] }), 'security', roster).map((s) => s.id),
     ).not.toContain('other@2.0.0/lint');
     // …and once a scan has produced tools of this category, THEY are the truth.
-    expect(chipToolStates(FULL, settings, 'security', roster).map((s) => s.id)).toEqual([
+    expect(chipToolStates(FULL, 'security', roster).map((s) => s.id)).toEqual([
       'osv-scanner',
       'gitleaks',
       'semgrep',
     ]);
   });
 
-  test('an unanswered or empty roster falls back to the configured built-ins', () => {
+  test('no roster and no scan means no chips, rather than a guess', () => {
+    // There is no settings-derived fallback since V38: `code_audit.tools` is
+    // gone, and re-deriving the roster in the browser would mean duplicating
+    // the backend join — which is how two lists start disagreeing. An empty
+    // strip for the moment before the IPC answers is the honest state.
     for (const r of [null, [] as AuditToolState[]]) {
-      expect(
-        chipToolStates(snapshot({ tools: [] }), settings, 'security', r).map((s) => s.id),
-      ).toEqual(['osv-scanner', 'gitleaks', 'semgrep']);
+      expect(chipToolStates(snapshot({ tools: [] }), 'security', r)).toEqual([]);
     }
   });
-
-  test('a plugin tool the backend gated out is hidden by partitionChips', () => {
-    // Only the backend can evaluate a manifest's applicability gate, so a
-    // gated-out plugin tool arrives pre-decided as `skipped-not-applicable` —
-    // the same status the built-in population uses, so the existing partition
-    // needs no new rule for it.
-    const gated = [tool({ id: 'acme@1.0.0/scan', status: 'skipped-not-applicable' })];
-    const { visible, hiddenCount } = partitionChips(gated, { extensions: ['rs'], markers: [] });
-    expect(visible).toHaveLength(0);
-    expect(hiddenCount).toBe(1);
-  });
 });
-
-// ── event-merge reducer ──────────────────────────────────────────────────────
 
 describe('mergeAuditSnapshot', () => {
   test('per-tool arrival order is independent', () => {
@@ -546,40 +502,37 @@ describe('isToolApplicable / censusIsEmpty', () => {
   });
 });
 
-describe('autoSelectQuality', () => {
+describe('qualityAutoSelection', () => {
   const rustTs = { extensions: ['ts', 'rs'], markers: ['Cargo.toml', 'package.json'] };
-  const cfg = (id: AuditToolId, enabled: boolean) => ({ id, enabled });
 
-  test('quality enabled follows applicability; heavyweights stay opt-in; security untouched', () => {
-    // Everything flipped from its automatic value, so each rule below proves
-    // the function rewrote (or deliberately skipped) it.
-    const tools = [
-      cfg('osv-scanner', false), // security — out of scope, stays false
-      cfg('oxlint', false), // applicable (.ts) → on
-      cfg('ruff', true), // not applicable → off
-      cfg('cargo-machete', false), // applicable (Cargo.toml) → on
-      cfg('typos', false), // ungated → on
-      cfg('semgrep-quality', true), // ungated BUT default-off heavyweight → off
-      cfg('dotnet-analyzers', true), // default-off heavyweight → off
-    ];
-    const out = autoSelectQuality(tools, rustTs);
-    const enabled = (id: AuditToolId) => out.find((t) => t.id === id)!.enabled;
-    expect(enabled('osv-scanner')).toBe(false);
-    expect(enabled('oxlint')).toBe(true);
-    expect(enabled('ruff')).toBe(false);
-    expect(enabled('cargo-machete')).toBe(true);
-    expect(enabled('typos')).toBe(true);
-    expect(enabled('semgrep-quality')).toBe(false);
-    expect(enabled('dotnet-analyzers')).toBe(false);
-    // Input untouched (patch-path safety: the caller assigns the new array).
-    expect(tools.find((t) => t.id === 'oxlint')!.enabled).toBe(false);
+  test('quality follows applicability; heavyweights stay opt-in; security is out of scope', () => {
+    const want = new Map(qualityAutoSelection(rustTs).map((t) => [t.id, t.enabled]));
+    // Applicable, on by default → selected.
+    expect(want.get('oxlint')).toBe(true); // .ts
+    expect(want.get('cargo-machete')).toBe(true); // Cargo.toml
+    expect(want.get('knip')).toBe(true); // package.json
+    expect(want.get('typos')).toBe(true); // ungated
+    // Not applicable to a Rust + TS project → deselected.
+    expect(want.get('ruff')).toBe(false);
+    expect(want.get('pmd')).toBe(false);
+    expect(want.get('golangci-lint')).toBe(false);
+    // Off by default → opt-in, even though `semgrep-quality` is ungated and
+    // would otherwise "apply". This is what stops a first quality audit running
+    // a real .NET build or fetching a ruleset over the network.
+    expect(want.get('semgrep-quality')).toBe(false);
+    expect(want.get('dotnet-analyzers')).toBe(false);
+    // Security tools are never named at all — a security audit must not become
+    // census-dependent.
+    for (const id of ['osv-scanner', 'gitleaks', 'semgrep']) {
+      expect(want.has(id as AuditToolId)).toBe(false);
+    }
   });
 
-  test('already-automatic flags come back unchanged by reference', () => {
-    const tools = [cfg('oxlint', true), cfg('ruff', false)];
-    const out = autoSelectQuality(tools, rustTs);
-    expect(out[0]).toBe(tools[0]);
-    expect(out[1]).toBe(tools[1]);
+  test('it answers for every quality tool, not only the ones it would change', () => {
+    // The caller writes into a keyed container where "absent" already means
+    // "the manifest's default", so a diff would leave it unable to tell
+    // "deliberately off" from "never configured".
+    expect(qualityAutoSelection(rustTs).map((t) => t.id)).toEqual(toolsInCategory('quality'));
   });
 });
 
@@ -602,39 +555,33 @@ describe('categoryFindingsCount', () => {
   });
 });
 
-describe('chipToolStates falls back per category', () => {
-  const settings: CodeAuditSettings = {
-    enabled: true,
-    timeout_secs: 600,
-    quality_auto_select: true,
-    expose_claude: true,
-    expose_opencode: true,
-    expose_offload: true,
-    tools: [
-      { id: 'oxlint', enabled: true, path: '', extra_args: [], ruleset: '', timeout_secs: null },
-      { id: 'ruff', enabled: true, path: '', extra_args: [], ruleset: '', timeout_secs: null },
-      { id: 'typos', enabled: true, path: '', extra_args: [], ruleset: '', timeout_secs: null },
-    ],
-  };
+describe('chipToolStates is per category', () => {
+  const roster: AuditToolState[] = [
+    tool({ id: 'oxlint', status: 'idle', category: 'quality' }),
+    tool({ id: 'ruff', status: 'idle', category: 'quality' }),
+    tool({ id: 'typos', status: 'idle', category: 'quality' }),
+  ];
 
-  test('a quality tab over a security-only snapshot renders configured quality idle chips', () => {
+  test('a quality tab over a security-only snapshot renders the quality roster', () => {
     const secOnly = snapshot({ tools: [OSV, GITLEAKS] });
-    const states = chipToolStates(secOnly, settings, 'quality');
+    const states = chipToolStates(secOnly, 'quality', roster);
     expect(states.map((s) => s.id)).toEqual(['oxlint', 'ruff', 'typos']);
     expect(states.every((s) => s.status === 'idle' && s.category === 'quality')).toBe(true);
   });
 
   test('prefers the snapshot once the category has scanned tools', () => {
-    expect(chipToolStates(MIXED, settings, 'quality').map((s) => s.id)).toEqual(['oxlint', 'typos']);
+    expect(chipToolStates(MIXED, 'quality', roster).map((s) => s.id)).toEqual(['oxlint', 'typos']);
   });
 });
 
 describe('partitionChips (chip gating + hidden count)', () => {
+  /// Every quality built-in as an `idle` chip — the shape the backend's
+  /// effective roster hands the panel before a scan.
+  const idleQualityChips = (): AuditToolState[] =>
+    toolsInCategory('quality').map((id) => tool({ id, category: 'quality', status: 'idle' }));
+
   test('empty census hides nothing', () => {
-    const states = configuredToolStates(
-      { enabled: true, timeout_secs: 600, quality_auto_select: true, expose_claude: true, expose_opencode: true, expose_offload: true, tools: toolsInCategory('quality').map((id) => ({ id, enabled: true, path: '', extra_args: [], ruleset: '', timeout_secs: null })) },
-      'quality',
-    );
+    const states = idleQualityChips();
     const p = partitionChips(states, { extensions: [], markers: [] });
     expect(p.hiddenCount).toBe(0);
     expect(p.visible.length).toBe(states.length);
@@ -643,10 +590,7 @@ describe('partitionChips (chip gating + hidden count)', () => {
   test('known census hides not-applicable idle chips and counts them', () => {
     // A Rust + JS project: no .py, no .java, no .go, no .cs, no .c.
     const census = { extensions: ['rs', 'ts'], markers: ['Cargo.toml', 'package.json'] };
-    const states = configuredToolStates(
-      { enabled: true, timeout_secs: 600, quality_auto_select: true, expose_claude: true, expose_opencode: true, expose_offload: true, tools: toolsInCategory('quality').map((id) => ({ id, enabled: true, path: '', extra_args: [], ruleset: '', timeout_secs: null })) },
-      'quality',
-    );
+    const states = idleQualityChips();
     const p = partitionChips(states, census);
     const visibleIds = p.visible.map((s) => s.id);
     // oxlint (ts), typos (always), cargo-machete (Cargo.toml), knip (package.json),

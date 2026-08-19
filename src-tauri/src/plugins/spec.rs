@@ -22,7 +22,7 @@
 use std::collections::BTreeSet;
 
 use crate::plugins::manifest::{
-    self, LegacyAuditParser, Provenance, RuntimeReq, SandboxReq, ToolKind, Transport,
+    self, IngestReq, LegacyAuditParser, Provenance, RuntimeReq, SandboxReq, ToolKind, Transport,
 };
 
 /// The document, at compile time. Path is relative to this file
@@ -254,19 +254,111 @@ fn the_legacy_findings_parsers_are_documented_and_refused() {
     }
 }
 
-/// `builtin` and `ingest` are stamped or reserved by cImp, never claimed by a
-/// scanned file. `ingest` has no implementation yet (it arrives with the
-/// embedded built-ins); documenting it as reserved is only honest if a file
-/// carrying it is refused TODAY, which `deny_unknown_fields` sees to.
+/// The fields a scanned manifest may not carry, and — for the four that cImp's
+/// OWN embedded manifests do carry — that the difference really is provenance
+/// rather than prose.
+///
+/// Both halves matter. The refusal alone would pass if the field simply did not
+/// exist; the acceptance alone would pass if it were accepted everywhere. Each
+/// row is fed to the real validator twice, once per provenance, with a value
+/// that is valid for the field — so a typo'd value cannot make a row pass by
+/// being refused for the wrong reason.
 #[test]
 fn the_reserved_fields_are_refused_in_a_user_manifest() {
-    for field in block("reserved-fields") {
-        let text = audit_manifest_with(&format!(r#""{field}": "anything""#));
-        assert!(
-            manifest::parse(&text, Provenance::User).is_err(),
-            "`{field}` must not load from a scanned manifest — it is stamped or reserved by              cImp, never claimed by a file"
+    let mut builtin_only = 0usize;
+    for row in block("reserved-fields") {
+        let mut parts = row.splitn(3, ':');
+        let (field, verdict, value) = (
+            parts.next().unwrap_or_default(),
+            parts.next().unwrap_or_default(),
+            parts.next().unwrap_or_default(),
         );
+        let text = audit_manifest_with(&format!(r#""{field}": {value}"#));
+
+        // Refused in a scanned file, both verdicts.
+        let err = manifest::parse(&text, Provenance::User).err().unwrap_or_else(|| {
+            panic!(
+                "`{field}` loaded from a SCANNED manifest — it is stamped or reserved by cImp, \
+                 never claimed by a file"
+            )
+        });
+        match verdict {
+            "never" => {
+                assert!(
+                    matches!(err.error, manifest::ValidationError::BuiltinField(_)),
+                    "`{field}` must be refused as provenance forgery, got {err}"
+                );
+                // …and refused on the EMBEDDED path too, which is what makes
+                // `never` different from `builtin-only`: provenance is stamped
+                // by the loader, so not even cImp's own file may claim it.
+                assert!(
+                    manifest::parse(&text, Provenance::Builtin).is_err(),
+                    "`{field}` must be refused in every file, embedded included"
+                );
+            }
+            "builtin-only" => {
+                builtin_only += 1;
+                // The one built-in-only field with a VOCABULARY rather than a
+                // free value: the doc must spell it the way the enum does, or a
+                // built-in manifest written against the doc would not load.
+                if field == "ingest" {
+                    assert_eq!(
+                        value.trim_matches('"'),
+                        IngestReq::Grandfathered.as_str(),
+                        "docs/TOOL-PLUGINS.md spells the `ingest` value differently from \
+                         `IngestReq`"
+                    );
+                }
+                assert!(
+                    matches!(err.error, manifest::ValidationError::BuiltinOnlyField { .. }),
+                    "`{field}` must be refused as a built-in-only field, got {err}"
+                );
+                // The twin: the same bytes, stamped `builtin`, load.
+                manifest::parse(&text, Provenance::Builtin).unwrap_or_else(|e| {
+                    panic!("`{field}` must load when the loader stamped `builtin`: {e}")
+                });
+            }
+            other => panic!(
+                "docs/TOOL-PLUGINS.md's `reserved-fields` row `{row}` has verdict `{other}` \
+                 (expected `never` or `builtin-only`)"
+            ),
+        }
     }
+    assert!(
+        builtin_only >= 4,
+        "the doc lists {builtin_only} built-in-only fields; a block that lost its rows would \
+         assert nothing"
+    );
+}
+
+/// cImp's own plugins, by tool key — the settings keys the v32 → v33 migration
+/// writes and the identity of the roster the milestone claims to have migrated.
+///
+/// Read from the embedded manifests rather than restated, so a fifteenth tool,
+/// a rename, or a plugin-version bump fails HERE (with the doc named) rather
+/// than silently orphaning every stored path and enable.
+#[test]
+fn the_documented_builtin_roster_is_the_embedded_one() {
+    let set = crate::plugins::builtin::plugin_set();
+    assert!(set.errors.is_empty(), "{:?}", set.errors);
+    let code: BTreeSet<String> = set
+        .plugins
+        .iter()
+        .flat_map(|p| p.manifest.tools.iter().map(|t| p.tool_key(&t.id)))
+        .collect();
+    assert_eq!(code.len(), 14, "the built-in roster is fourteen tools");
+    same_set(
+        "builtin-roster",
+        &code,
+        "the embedded manifests in `plugins/builtin/` are the authority — and these strings are \
+         SETTINGS keys, so changing one orphans every stored path, enable and variable value \
+         under it",
+    );
+    // The prefix § 2.1 reserves really is in use, and by these.
+    assert!(set
+        .plugins
+        .iter()
+        .all(|p| p.manifest.name.starts_with(manifest::RESERVED_NAME_PREFIX)));
 }
 
 /// The caps the doc states are the caps the code applies.

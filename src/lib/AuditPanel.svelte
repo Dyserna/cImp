@@ -128,9 +128,9 @@
     tools: Object.fromEntries([...hiddenTools].map((t) => [t, false])),
     text,
   });
-  // Chips: this category's states (snapshot-own or configured fallback), then
-  // split into visible / hidden-because-not-applicable.
-  const chipStates = $derived(chipToolStates(snapshot, $settings.code_audit, category, roster));
+  // Chips: this category's states (the snapshot's own, else the backend's
+  // effective roster), then split into visible / hidden-because-not-applicable.
+  const chipStates = $derived(chipToolStates(snapshot, category, roster));
   const chipPartition = $derived(partitionChips(chipStates, snapshot.census));
   const toolToggleIds = $derived(chipPartition.visible.map((t) => t.id));
   // Scan-coverage is osv-scanner-only, and osv-scanner is Security-only (V23).

@@ -25,7 +25,9 @@ function tool(over: Partial<PluginToolManifest> = {}): PluginToolManifest {
   return {
     id: 'scan',
     label: 'Acme Scan',
+    description: null,
     kind: 'security',
+    enabled_by_default: true,
     runtime: 'auto',
     sandbox: 'required',
     extra_grants: [],
@@ -42,6 +44,10 @@ function tool(over: Partial<PluginToolManifest> = {}): PluginToolManifest {
     report_file: null,
     pattern: null,
     parser: null,
+    ingest: null,
+    command: null,
+    project_local_bin: null,
+    dir_argv: [],
     ...over,
   };
 }

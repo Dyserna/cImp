@@ -31,7 +31,6 @@ use tauri::State;
 
 use crate::error::{AppError, AppResult};
 use crate::ipc::AppState;
-use crate::settings::AuditToolId;
 
 pub use runner::{AuditSnapshot, AuditState};
 
@@ -80,89 +79,109 @@ pub struct AuditDetectResult {
     pub error: Option<String>,
 }
 
-/// V23 Phase A: resolve one audit tool honoring the per-tool `path` override and
-/// probe `<tool> --version`. Read-only and side-effect-free w.r.t. settings —
-/// the Detect button shows the result inline but never mutates the stored path.
+/// Resolve one registered tool honoring its configured `path` and probe
+/// `<tool> --version`. Read-only and side-effect-free w.r.t. settings — the
+/// Detect button shows the result inline but never mutates the stored path.
 /// Always returns `Ok`: a not-found tool is a normal result (`found = false`),
 /// not an error.
 ///
-/// `path` is the LIVE override from the Settings input (empty = resolve the
-/// bare command name). The frontend passes it explicitly so a just-typed value
-/// can't race the fire-and-forget `settings_update` push; `None` falls back to
-/// the persisted setting.
+/// `tool_key` is the registry key (`cimp-audit@1/gitleaks`, or a user plugin's
+/// `name@version/tool-id`), and `path` is the LIVE value from the Settings
+/// input — passed explicitly so a just-typed value cannot race the
+/// fire-and-forget `settings_update` push. `None` falls back to what the
+/// registry resolved for this project.
+///
+/// # Why this takes a key rather than an id
+///
+/// Before V38 it took an `AuditToolId`, because the only tools with a Detect
+/// button were the fourteen built-in scanners. They are registry entries now,
+/// beside whatever the user dropped in the plugins folder, and the button lives
+/// in the Tool Plugins pane where both populations are configured. A key is what
+/// that pane has.
 #[tauri::command]
 pub async fn audit_detect_tool(
     state: State<'_, AppState>,
-    id: AuditToolId,
+    tool_key: String,
     path: Option<String>,
 ) -> AppResult<AuditDetectResult> {
-    let override_path = match path {
-        Some(p) => p,
-        // The persisted per-tool override (empty = resolve ebin → PATH).
-        None => state
-            .settings
-            .current()
-            .code_audit
-            .tools
-            .iter()
-            .find(|t| t.id == id)
-            .map(|t| t.path.clone())
-            .unwrap_or_default(),
-    };
-    // The launch project root scopes project-local `node_modules/.bin`
-    // resolution (eslint/knip) so a Detect ✓ matches what a scan will launch.
+    let settings = state.settings.current();
     let root = state.launch.cwd.clone();
-    Ok(detect_tool(id, &override_path, Some(&root)).await)
+    let tool = crate::plugins::registry::effective_tools(
+        &crate::plugins::snapshot_or_scan(),
+        &settings.tool_plugins,
+        Some(&root),
+    )
+    .into_iter()
+    .find(|t| t.tool_key == tool_key);
+    let Some(tool) = tool else {
+        return Ok(AuditDetectResult {
+            found: false,
+            path: None,
+            version: None,
+            error: Some(format!(
+                "no registered tool `{tool_key}` — the plugin that declared it may have been \
+                 removed; press Rescan"
+            )),
+        });
+    };
+    let override_path = path.or_else(|| tool.path.clone()).unwrap_or_default();
+    Ok(detect_tool(
+        &override_path,
+        tool.resolves_by_name()
+            .then(|| tool.manifest.command.clone())
+            .flatten()
+            .as_deref(),
+        tool.manifest.project_local_bin.as_deref(),
+        Some(&root),
+    )
+    .await)
 }
 
-/// The command to resolve for a tool: the per-tool `path` override verbatim
-/// (trimmed), or the bare command name when the override is empty. The single
-/// definition of the override contract — the Detect probe AND the scan runner
-/// both go through [`resolve_audit_binary`], so a ✓ from Detect can't disagree
-/// with what a scan actually launches.
-fn effective_command(id: AuditToolId, override_path: &str) -> String {
-    let p = override_path.trim();
-    if p.is_empty() {
-        id.command_name().to_string()
-    } else {
-        p.to_string()
-    }
-}
-
-/// Resolve a tool's binary to an on-disk path. Resolution order (V25 Phase B):
+/// Resolve a tool's binary to an on-disk path, for the DETECT probe.
 ///
-/// 1. **Per-tool `path` override** (non-empty) — used verbatim (the V23
-///    contract): a deliberate "use exactly this binary" that project-local
-///    resolution must not second-guess.
-/// 2. **Project-local `node_modules/.bin`** — for a node tool that declares
-///    [`Adapter::project_local_bin`] (eslint, knip), the project's own install
-///    beats a global one. Only consulted when there is no override and a `root`
-///    is known.
-/// 3. **ebin → PATH** on the bare [`AuditToolId::command_name`].
+/// Deliberately the same ladder `audit::runner::resolve_runnable` walks — a ✓
+/// from Detect that disagreed with what a scan launches would be worse than no
+/// button at all:
 ///
-/// Both the Detect probe and the scan runner go through here, so the two agree.
-/// `root` is the scan/launch project root (`None` when unavailable — e.g. a
-/// unit test — collapses to override-then-ebin/PATH).
+/// 1. **Configured `path`** (non-empty) — used verbatim (the V23 contract): a
+///    deliberate "use exactly this binary" that project-local resolution must
+///    not second-guess.
+/// 2. **Project-local `node_modules/.bin`** — for a tool whose manifest names a
+///    shim (eslint, knip), the project's own install beats a global one. Only
+///    when there is no configured path and a `root` is known.
+/// 3. **`ebin` → `PATH`** on the manifest's bare command name.
+///
+/// `command` is `None` for a user plugin, which has no name cImp may resolve
+/// (decision 10) — so an unconfigured one resolves nowhere, which is the honest
+/// answer rather than a guess.
 fn resolve_audit_binary(
-    id: AuditToolId,
     override_path: &str,
+    command: Option<&str>,
+    project_local_bin: Option<&str>,
     root: Option<&Path>,
 ) -> AppResult<PathBuf> {
-    if override_path.trim().is_empty() {
-        if let (Some(bin), Some(root)) = (adapters::adapter(id).project_local_bin, root) {
-            if let Some(local) = resolve_project_local_bin(root, bin) {
-                return Ok(local);
-            }
+    let configured = override_path.trim();
+    if !configured.is_empty() {
+        return crate::pty::resolve_command(configured);
+    }
+    if let (Some(bin), Some(root)) = (project_local_bin, root) {
+        if let Some(local) = resolve_project_local_bin(root, bin) {
+            return Ok(local);
         }
     }
-    crate::pty::resolve_command(&effective_command(id, override_path))
+    let Some(command) = command else {
+        return Err(AppError::Audit(
+            "no path is configured for this tool".to_string(),
+        ));
+    };
+    crate::pty::resolve_command(command)
 }
 
 /// The first existing `node_modules/.bin/<name>` shim under `root`, or `None`.
 /// On Windows the runnable shim is the `.cmd`/`.CMD`/`.bat` launcher (the bare
 /// `<name>` is a POSIX shell script npm also drops that Windows can't spawn), so
 /// those are tried first — mirroring `pty::resolve`'s Windows extension order.
-fn resolve_project_local_bin(root: &Path, name: &str) -> Option<PathBuf> {
+pub(super) fn resolve_project_local_bin(root: &Path, name: &str) -> Option<PathBuf> {
     let bin_dir = root.join("node_modules").join(".bin");
     for candidate in project_local_candidates(name) {
         let p = bin_dir.join(&candidate);
@@ -192,14 +211,15 @@ fn project_local_candidates(name: &str) -> Vec<String> {
 
 /// The detection core, split out so tests can exercise it without a Tauri
 /// `State`. `override_path` is the tool's configured `path` (empty = resolve via
-/// project-local `node_modules/.bin` then ebin → PATH; non-empty = used
-/// verbatim). `root` scopes the project-local lookup (`None` = skip it).
+/// project-local `node_modules/.bin` then ebin → PATH); `root` scopes the
+/// project-local lookup (`None` = skip it).
 async fn detect_tool(
-    id: AuditToolId,
     override_path: &str,
+    command: Option<&str>,
+    project_local_bin: Option<&str>,
     root: Option<&Path>,
 ) -> AuditDetectResult {
-    let resolved = match resolve_audit_binary(id, override_path, root) {
+    let resolved = match resolve_audit_binary(override_path, command, project_local_bin, root) {
         Ok(p) => p,
         Err(_) => {
             // Same distinction the scan runner makes: an empty override that
@@ -362,77 +382,21 @@ pub async fn audit_refresh_census(state: State<'_, Arc<AuditState>>) -> AppResul
         .map_err(|e| AppError::Audit(format!("census task failed: {e}")))
 }
 
-// ── Tool-config scope actions (Settings → Code Audit) ────────────────────────
+// ── The audit-tool scope actions retired in V38 Phase E ─────────────────────
 //
-// The tool config (enabled / extra_args / timeout_secs + quality_auto_select)
-// is PROJECT-scoped by default: edits ride the normal settings flow and diff
-// into the project overlay. These commands are the explicit scope actions on
-// top: promote the current config to the global baseline ("Save to global"),
-// re-adopt the global config ("Load from global" — clears the project copy),
-// and read the global config for the per-tool global/local indicator. `path`
-// stays machine-scope via the existing write-through regardless.
-
-/// The audit tool config as stored in the PHYSICAL global settings file.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct AuditGlobalToolConfig {
-    pub tools: Vec<crate::settings::AuditToolConfig>,
-    pub quality_auto_select: bool,
-}
-
-fn read_global_tool_config() -> AuditGlobalToolConfig {
-    let (tools, quality_auto_select) = crate::settings::read_global_audit_tools();
-    AuditGlobalToolConfig {
-        tools,
-        quality_auto_select,
-    }
-}
-
-/// The global-file tool config, for the Settings section's per-tool
-/// global/local scope indicator. Read-only.
-#[tauri::command]
-pub async fn audit_tools_global_config(
-    _state: State<'_, AppState>,
-) -> AppResult<AuditGlobalToolConfig> {
-    Ok(read_global_tool_config())
-}
-
-/// "Save to global": write the live tool config through to the physical
-/// global settings file and bring the in-memory diff baseline in line, so
-/// the project overlay drops its (now-global) copy on the next save.
-/// Returns the new global config so the UI can refresh its indicators.
-#[tauri::command]
-pub async fn audit_tools_save_global(
-    state: State<'_, AppState>,
-) -> AppResult<AuditGlobalToolConfig> {
-    let live = state.settings.current();
-    crate::settings::write_global_audit_tools(&live)?;
-    state.settings.mutate_global(|g| {
-        g.code_audit.tools = live.code_audit.tools.clone();
-        g.code_audit.quality_auto_select = live.code_audit.quality_auto_select;
-    });
-    Ok(read_global_tool_config())
-}
-
-/// "Load from global": adopt the physical global file's tool config as the
-/// live config AND as the diff baseline — live == baseline means the project
-/// overlay's copy is removed on the next save, so future global changes show
-/// through again. Returns the adopted config for the UI's indicators.
-#[tauri::command]
-pub async fn audit_tools_load_global(
-    state: State<'_, AppState>,
-) -> AppResult<AuditGlobalToolConfig> {
-    let cfg = read_global_tool_config();
-    let (tools, auto) = (cfg.tools.clone(), cfg.quality_auto_select);
-    state.settings.mutate(|s| {
-        s.code_audit.tools = tools.clone();
-        s.code_audit.quality_auto_select = auto;
-    });
-    state.settings.mutate_global(|g| {
-        g.code_audit.tools = tools;
-        g.code_audit.quality_auto_select = auto;
-    });
-    Ok(cfg)
-}
+// `audit_tools_global_config` / `_save_global` / `_load_global` existed because
+// `code_audit.tools` was PROJECT-scoped with one machine-scoped field inside it
+// (`path`): the user needed an explicit way to say "make this project's tool
+// selection the default for every project", and an indicator saying which of the
+// two a given tool was currently following.
+//
+// Schema v33 removed the reason. Per-tool enables, timeouts and paths now live
+// in `tool_plugins`, which is machine scope by construction (the overlay strip
+// enforces it structurally rather than by write-through), so there is no project
+// copy to promote and no local/global ambiguity to indicate. What a project may
+// still differ on — a tool's declared variable values and its extra CLI
+// parameters — rides the overlay exactly as before and needs no button, because
+// editing it in a project IS the project-scoped act.
 
 #[cfg(test)]
 mod tests {
@@ -463,12 +427,7 @@ mod tests {
         // the error names the offending value (distinct from the empty-path
         // "not found on PATH or ebin" case, which the scan runner also
         // branches on).
-        let r = detect_tool(
-            AuditToolId::OsvScanner,
-            "cimp-definitely-not-a-real-tool-xyz",
-            None,
-        )
-        .await;
+        let r = detect_tool("cimp-definitely-not-a-real-tool-xyz", None, None, None).await;
         assert!(!r.found);
         assert!(r.path.is_none());
         assert_eq!(
@@ -489,7 +448,7 @@ mod tests {
         let exe = which::which("where").expect("where on PATH");
         #[cfg(not(windows))]
         let exe = which::which("false").expect("false on PATH");
-        let r = detect_tool(AuditToolId::Gitleaks, &exe.display().to_string(), None).await;
+        let r = detect_tool(&exe.display().to_string(), None, None, None).await;
         assert!(!r.found, "{r:?}");
         assert!(r.path.is_some());
         assert!(r.version.is_none());
@@ -505,10 +464,10 @@ mod tests {
     #[tokio::test]
     async fn detect_with_override_runs_version_probe() {
         // Use a real binary present in the build/test env (`cargo`) as the
-        // verbatim override so the version probe actually runs end to end. The
-        // adapter id is irrelevant to detection — only the resolved exe is run.
+        // verbatim override so the version probe actually runs end to end. Which
+        // tool it is is irrelevant to detection — only the resolved exe is run.
         let cargo = which::which("cargo").expect("cargo on PATH in the test env");
-        let r = detect_tool(AuditToolId::Semgrep, &cargo.display().to_string(), None).await;
+        let r = detect_tool(&cargo.display().to_string(), None, None, None).await;
         assert!(r.found, "cargo override should resolve + probe: {r:?}");
         assert!(r.path.is_some());
         assert!(

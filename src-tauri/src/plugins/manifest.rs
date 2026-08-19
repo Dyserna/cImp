@@ -228,6 +228,49 @@ pub enum Transport {
     ReportFile,
 }
 
+/// How much of the ingest contract a tool's output must satisfy — **a built-in
+/// declaration, refused in a scanned file**.
+///
+/// Decision 3 gives every plugin's findings one parse boundary and one
+/// substantiveness rule: output that is empty, unparseable, or not a SARIF log
+/// is a tool ERROR, never a clean scan. That rule is what stops a blank
+/// artifact reading as "no problems found".
+///
+/// The fourteen tools cImp ships predate it, and their semantics were measured
+/// against the real binaries rather than designed: gitleaks writes **no report
+/// at all** on a clean run, and cppcheck exits 0 whether or not it found
+/// anything. Retro-fitting the strict gate onto them would turn a clean gitleaks
+/// scan into a tool failure — a regression dressed as a hardening. So the
+/// embedded manifests say so out loud, in one field, once.
+///
+/// A **user** plugin may never select it ([`ValidationError::BuiltinOnlyField`]),
+/// because the strict gate is the only thing standing between a blank artifact
+/// and a reassuring zero.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IngestReq {
+    /// The pre-V38 built-in semantics: whatever the tool wrote is what it
+    /// meant, including nothing.
+    Grandfathered,
+}
+
+/// The wire spelling, pinned against serde's by the drift test that checks
+/// docs/TOOL-PLUGINS.md § 2.5 spells the value the way this enum does.
+///
+/// `allow(dead_code)` because that test is its only caller: unlike
+/// [`RuntimeReq`] and [`SandboxReq`], no Events row names an ingest gate — the
+/// gate shows up as a tool ERROR with a reason, which is the useful thing to
+/// say. Kept because the doc has to spell the value somewhere, and a hand-typed
+/// string in a test would be the second spelling this exists to prevent.
+#[allow(dead_code)]
+impl IngestReq {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            IngestReq::Grandfathered => "grandfathered",
+        }
+    }
+}
+
 /// The audit-era parsers that are NOT (yet) `checks::ParserKind` variants.
 ///
 /// They exist on the wire only so Phase E's embedded built-in manifests can be
@@ -375,6 +418,11 @@ pub struct ToolManifest {
     pub id: String,
     /// What the settings pane calls it.
     pub label: String,
+    /// One line saying what the tool is FOR, shown beside the label. Optional,
+    /// and worth writing: a settings list of names alone makes the user look
+    /// each one up, and the author is the person who knows.
+    #[serde(default)]
+    pub description: Option<String>,
     pub kind: ToolKind,
 
     // ── sandbox posture (APPROVED 2026-08-19; every tool kind) ──────────────
@@ -400,6 +448,22 @@ pub struct ToolManifest {
     /// tool gets an appendable argv only when its author says it tolerates one.
     #[serde(default)]
     pub parameters_allowed: bool,
+    /// Whether this tool is ON before the user has ever touched it. Default
+    /// `true` — installing a plugin is the consent that matters, and a second
+    /// invisible "and now switch each one on" step only teaches people to click
+    /// past it.
+    ///
+    /// `false` is for a tool whose author knows it is expensive or intrusive
+    /// enough that nobody should get it by accident: the built-in
+    /// `dotnet-analyzers` runs a real build (restores packages, writes `obj/`
+    /// and `bin/`) and `semgrep-quality` fetches its ruleset over the network.
+    /// Both were default-disabled before V38 and stay so, which is the whole
+    /// reason this is a field rather than a constant `true`.
+    ///
+    /// A DEFAULT, not a lock: the moment the user stores a state for the tool,
+    /// that state wins in both directions.
+    #[serde(default = "default_true")]
+    pub enabled_by_default: bool,
     /// Hard timeout. `None` = the consuming pipeline's default.
     #[serde(default)]
     pub timeout_secs: Option<u64>,
@@ -443,6 +507,43 @@ pub struct ToolManifest {
     #[serde(default)]
     pub parser: Option<ManifestParser>,
 
+    // ── built-in only (refused in a scanned file, `builtin`'s mechanism) ─────
+    //
+    // These four are not a back door. Each states a fact that is true of the
+    // fourteen tools cImp ships and of nothing a user can drop in a folder, and
+    // each is refused by [`ValidationError::BuiltinOnlyField`] keyed on the
+    // loader's [`Provenance`] stamp — never on a name.
+    /// Relax the output gate to the pre-V38 built-in semantics. See
+    /// [`IngestReq`] for why this exists and why a user plugin may not have it.
+    #[serde(default)]
+    pub ingest: Option<IngestReq>,
+    /// The bare command name a built-in resolves through `ebin` → `PATH` when
+    /// the user has configured no explicit path.
+    ///
+    /// **The one place decision 10's "no automatic PATH resolution" is relaxed,
+    /// and only for the built-in tier.** That rule protects the user from cImp
+    /// guessing a binary for a definition a stranger wrote; it is not an
+    /// argument against cImp resolving `gitleaks` for the gitleaks adapter it
+    /// has shipped since V23. Leaving the fourteen inert on upgrade would be a
+    /// regression wearing a hardening's clothes. It is a *name*, never a path:
+    /// what it selects is still whatever the machine says, exactly as before.
+    #[serde(default)]
+    pub command: Option<String>,
+    /// A `node_modules/.bin` shim name to prefer over a global install (eslint,
+    /// knip). Consulted only when the user configured no path.
+    #[serde(default)]
+    pub project_local_bin: Option<String>,
+    /// The argv template used when the scan root is **not** a git repository
+    /// (gitleaks' `dir` form against its `git` form). Empty = this tool does not
+    /// care, and `argv` is used for both.
+    ///
+    /// Built-in only because it is a fact about one shipped scanner rather than
+    /// a vocabulary plugins need: a user plugin that wants the distinction makes
+    /// it inside the wrapper it already points cImp at, and a second template on
+    /// every manifest would double the surface every argv rule has to cover.
+    #[serde(default)]
+    pub dir_argv: Vec<String>,
+
     /// **Never an author claim.** Declared here only so a file carrying it gets
     /// [`ValidationError::BuiltinField`] instead of serde's generic
     /// "unknown field", which would read as a typo rather than as the
@@ -454,6 +555,12 @@ pub struct ToolManifest {
     /// `LoadedPlugin::provenance`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub builtin: Option<serde_json::Value>,
+}
+
+/// serde's `default` for a `bool` is `false`; a field whose safe answer is
+/// `true` needs a function. Named after the settings crate's, for its reason.
+fn default_true() -> bool {
+    true
 }
 
 /// One plugin's manifest file (`<exe-dir>/plugins/<anything>.json`).
@@ -514,6 +621,8 @@ pub enum ValidationError {
     ReservedName(String),
     /// A `builtin` field appeared in a manifest FILE. Provenance is stamped.
     BuiltinField(String),
+    /// A scanned file used a field reserved for cImp's own embedded manifests.
+    BuiltinOnlyField { tool: String, field: &'static str },
     /// A category references a tool id the manifest does not declare, or a tool
     /// is in no category / in two.
     Category(String),
@@ -566,6 +675,13 @@ impl std::fmt::Display for ValidationError {
                 f,
                 "`builtin` is not a manifest field ({where_}): whether a plugin is built in is \
                  stamped by cImp when it loads the definition, never claimed by the file"
+            ),
+            ValidationError::BuiltinOnlyField { tool, field } => write!(
+                f,
+                "tool `{tool}` sets `{field}`, which only cImp's own built-in tool definitions \
+                 may declare — each of those fields relaxes a rule (an output gate, a binary \
+                 cImp resolves for you) that exists precisely because a dropped-in definition \
+                 is not one cImp vouches for"
             ),
             ValidationError::Category(m) => write!(f, "categories: {m}"),
             ValidationError::ArgvToken(m) => write!(f, "argv: {m}"),
@@ -834,6 +950,27 @@ fn validate_tool(t: &ToolManifest, provenance: Provenance) -> Result<(), Validat
         return Err(ValidationError::BuiltinField(format!("tool `{}`", t.id)));
     }
 
+    // The built-in-only fields, refused on the SCANNED path by the same rule
+    // that refuses `builtin`: the loader's stamp, never a name string. Checked
+    // first, so a file trying to relax the output gate is told that rather than
+    // being told about some later field it also got wrong.
+    if provenance == Provenance::User {
+        let reserved: [(&'static str, bool); 4] = [
+            ("ingest", t.ingest.is_some()),
+            ("command", t.command.is_some()),
+            ("project_local_bin", t.project_local_bin.is_some()),
+            ("dir_argv", !t.dir_argv.is_empty()),
+        ];
+        for (field, present) in reserved {
+            if present {
+                return Err(ValidationError::BuiltinOnlyField {
+                    tool: t.id.clone(),
+                    field,
+                });
+            }
+        }
+    }
+
     for (k, _v) in &t.env {
         if !valid_env_key(k) {
             return Err(ValidationError::Env(format!(
@@ -909,6 +1046,30 @@ fn validate_tool(t: &ToolManifest, provenance: Provenance) -> Result<(), Validat
         }
     }
 
+    // A resolved command is a NAME, not a path: `pty::resolve` searches `ebin`
+    // then `PATH` for it, and a value carrying a separator would silently
+    // become a relative path against whatever directory the spawn had. Refused
+    // rather than normalized, because "which binary ran" is not a question to
+    // answer by guessing.
+    for (field, value) in [
+        ("command", t.command.as_deref()),
+        ("project_local_bin", t.project_local_bin.as_deref()),
+    ] {
+        let Some(value) = value else { continue };
+        if value.trim().is_empty()
+            || value.contains(['/', '\\'])
+            || looks_absolute(value)
+        {
+            return Err(ValidationError::Identity(format!(
+                "tool `{}`: `{field}` (`{value}`) must be a bare command NAME — cImp searches \
+                 `ebin` and then `PATH` for it, and a value carrying a path separator would \
+                 resolve against whatever directory the spawn happened to have",
+                t.id
+            )));
+        }
+        length_checked(&format!("tool `{}`'s `{field}`", t.id), value)?;
+    }
+
     // Fields that belong to a kind other than this one. Refused rather than
     // ignored: a `cmd` on an audit tool is an author who believes something
     // will run that never will.
@@ -934,7 +1095,13 @@ fn validate_tool(t: &ToolManifest, provenance: Provenance) -> Result<(), Validat
             if t.pattern.is_some() {
                 return Err(wrong("pattern", "check"));
             }
-            if t.argv.is_empty() {
+            // A findings tool with no fixed arguments at all is almost always
+            // an author who forgot the template, so a scanned file is refused.
+            // It is NOT always that: `cargo-machete` analyses its cwd and takes
+            // no arguments, and cImp has shipped it since V25 — so the built-in
+            // tier, whose fourteen shapes were measured against real binaries,
+            // is allowed to say "none" and mean it.
+            if t.argv.is_empty() && provenance == Provenance::User {
                 return Err(ValidationError::KindField(format!(
                     "tool `{}` is a `{}` tool and needs an `argv` template",
                     t.id,
@@ -955,7 +1122,10 @@ fn validate_tool(t: &ToolManifest, provenance: Provenance) -> Result<(), Validat
 
             let transport = t.transport.unwrap_or_default();
             let mut saw_report = false;
-            for arg in &t.argv {
+            // `dir_argv` is scanned with `argv` and under the same rules: it is
+            // a template this tool can be spawned with, so "it is only the
+            // fallback" is not a reason to check it less.
+            for arg in t.argv.iter().chain(t.dir_argv.iter()) {
                 for tok in scan_tokens(arg).map_err(ValidationError::ArgvToken)? {
                     match tok {
                         Token::Root => {}
@@ -990,6 +1160,12 @@ fn validate_tool(t: &ToolManifest, provenance: Provenance) -> Result<(), Validat
         ToolKind::Check => {
             if !t.argv.is_empty() {
                 return Err(wrong("argv", "audit/security"));
+            }
+            if !t.dir_argv.is_empty() {
+                return Err(wrong("dir_argv", "audit/security"));
+            }
+            if t.ingest.is_some() {
+                return Err(wrong("ingest", "audit/security"));
             }
             if t.transport.is_some() {
                 return Err(wrong("transport", "audit/security"));
@@ -1162,6 +1338,12 @@ fn validate_tool(t: &ToolManifest, provenance: Provenance) -> Result<(), Validat
             }
             if !t.argv.is_empty() {
                 return Err(wrong("argv", "audit/security"));
+            }
+            if !t.dir_argv.is_empty() {
+                return Err(wrong("dir_argv", "audit/security"));
+            }
+            if t.ingest.is_some() {
+                return Err(wrong("ingest", "audit/security"));
             }
             if t.transport.is_some() {
                 return Err(wrong("transport", "audit/security"));

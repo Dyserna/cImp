@@ -5,14 +5,33 @@
 // `total_findings` is always the TRUE total; on `truncated` the view fetches
 // the full (uncapped) set via `audit_snapshot`.
 //
-// The settings-side audit types (`AuditToolId`, `AuditToolConfig`,
-// `CodeAuditSettings`, `AuditDetectResult`) live in `../settings/types` — Phase
-// A only mirrored the settings block, so the runtime snapshot/event/finding
-// types are new here.
+// `CodeAuditSettings` and `AuditDetectResult` live in `../settings/types`.
 
-import type { AuditToolId } from '../settings/types';
-
-export type { AuditToolId };
+/// The fourteen tool ids cImp ships knowing how to call.
+///
+/// **This union is presentation metadata, not settings.** Until V38 it mirrored
+/// a Rust `AuditToolId` enum; that enum is gone — the fourteen are embedded
+/// plugin manifests now, and their configuration lives in `tool_plugins` like
+/// any other tool's. What did NOT change is that these ids cross the audit wire
+/// (a chip's `id`, a finding's `tool`) and that this file keys its category,
+/// order and applicability maps off them, so the union has to stay in step with
+/// the manifest. `builtin_audit_tool_ids_are_mirrored_in_the_frontend_union`
+/// (Rust) reads the shipped manifest and checks every id appears here.
+export type AuditToolId =
+  | 'osv-scanner'
+  | 'gitleaks'
+  | 'semgrep'
+  | 'oxlint'
+  | 'golangci-lint'
+  | 'ruff'
+  | 'cppcheck'
+  | 'typos'
+  | 'eslint'
+  | 'pmd'
+  | 'dotnet-analyzers'
+  | 'knip'
+  | 'cargo-machete'
+  | 'semgrep-quality';
 
 /// V38: a tool id on the audit WIRE — a built-in `AuditToolId`, or a plugin
 /// tool's key (`name@version/tool-id`), which no closed union can enumerate

@@ -30,10 +30,10 @@ use super::adapters::{Category, Transport};
 use super::census::Census;
 use super::parsers::AuditParser;
 use crate::plugins::manifest::{
-    self, LegacyAuditParser, ManifestParser, Provenance, RuntimeReq, SandboxReq, ToolKind,
+    self, IngestReq, LegacyAuditParser, ManifestParser, Provenance, RuntimeReq, SandboxReq,
+    ToolKind,
 };
 use crate::plugins::registry::EffectiveTool;
-use crate::settings::AuditToolId;
 
 /// Which tool a `ToolState` / `AuditFinding` belongs to.
 ///
@@ -42,68 +42,59 @@ use crate::settings::AuditToolId;
 /// itself to the UI, the report or the filter bar AS a built-in. That is not a
 /// coincidence to rely on quietly: it is asserted by
 /// `a_plugin_key_can_never_collide_with_a_builtin_wire_id`.
+///
+/// # Why a built-in is a bare string since V38 Phase E
+///
+/// It used to be `AuditToolId`, a closed enum, and the enum is gone: the
+/// fourteen tools are embedded manifests now, so their ids are strings this
+/// build reads from JSON like any other. The **wire spelling is unchanged** —
+/// `osv-scanner`, `semgrep-quality` — because the Code Audit view, the report a
+/// model reads, the findings filter and every settings file key off it. What a
+/// built-in is called did not move; only where the name is written down.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ToolKey {
-    /// One of the 14 built-in adapters.
-    Builtin(AuditToolId),
-    /// A plugin tool, by `plugins::loader::LoadedPlugin::tool_key`.
+    /// A tool from one of cImp's embedded manifests, by its manifest-local id
+    /// (`osv-scanner`). Never namespaced: a built-in's id IS its public name.
+    Builtin(String),
+    /// A user plugin's tool, by `plugins::loader::LoadedPlugin::tool_key`
+    /// (`name@version/tool-id`).
     Plugin(String),
 }
 
 impl ToolKey {
-    /// The wire string — for a built-in, EXACTLY what `AuditToolId` serialized
-    /// to before V38 (`osv-scanner`, `semgrep-quality`), because the Code Audit
-    /// view, the report and the settings all key off it.
+    /// The wire string every consumer keys off.
     pub fn wire(&self) -> String {
         match self {
-            ToolKey::Builtin(id) => serde_json::to_value(id)
-                .ok()
-                .and_then(|v| v.as_str().map(str::to_string))
-                .unwrap_or_else(|| id.command_name().to_string()),
+            ToolKey::Builtin(id) => id.clone(),
             ToolKey::Plugin(key) => key.clone(),
         }
     }
 
-    /// The built-in id, when this is one. The security floor and the
-    /// no-shadowing tests ask this; nothing else may branch on it, which is
-    /// why it is test-only until something outside a test legitimately needs
-    /// to (Phase E's migration is the candidate).
-    #[cfg(test)]
-    pub fn builtin(&self) -> Option<AuditToolId> {
-        match self {
-            ToolKey::Builtin(id) => Some(*id),
-            ToolKey::Plugin(_) => None,
+    /// The identity of one resolved tool: its provenance decides which of the
+    /// two namespaces it lands in, and nothing else does. Keyed off the
+    /// loader's stamp rather than off a name, which is the rule R3 exists for.
+    pub fn of(tool: &EffectiveTool) -> Self {
+        match tool.provenance {
+            Provenance::Builtin => ToolKey::Builtin(tool.tool_id.clone()),
+            Provenance::User => ToolKey::Plugin(tool.tool_key.clone()),
         }
     }
-}
 
-impl PartialEq<AuditToolId> for ToolKey {
-    /// So a caller that legitimately asks "is this chip the built-in gitleaks?"
-    /// can, without unwrapping. A plugin key never equals a built-in id — which
-    /// is the answer the security floor and the no-shadowing rule both want.
-    fn eq(&self, other: &AuditToolId) -> bool {
-        matches!(self, ToolKey::Builtin(id) if id == other)
-    }
-}
-
-impl From<AuditToolId> for ToolKey {
-    /// So a built-in call site still reads `ToolState::fresh(id, category)` —
-    /// the 14 adapters are keyed by their enum everywhere they are declared,
-    /// and only the RUNNER needs the widened identity.
-    fn from(id: AuditToolId) -> Self {
-        ToolKey::Builtin(id)
+    /// Whether this is a built-in with the given id — the one question the
+    /// osv-scanner coverage pass and the security-floor tests ask. Spelled as a
+    /// method so no caller matches on the variant and starts branching on
+    /// built-in-ness for reasons of its own.
+    pub fn is_builtin(&self, id: &str) -> bool {
+        matches!(self, ToolKey::Builtin(b) if b == id)
     }
 }
 
 impl Serialize for ToolKey {
-    /// Delegates to `AuditToolId`'s own serializer for a built-in rather than
-    /// re-spelling its kebab ids here — a second spelling is a second thing to
-    /// keep in step with the TS mirror.
+    /// Both variants are their wire string. A built-in serialized exactly as
+    /// `AuditToolId` did before V38, which is what keeps every stored report,
+    /// settings file and TS mirror valid across the migration.
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        match self {
-            ToolKey::Builtin(id) => id.serialize(s),
-            ToolKey::Plugin(key) => s.serialize_str(key),
-        }
+        s.serialize_str(&self.wire())
     }
 }
 
@@ -122,11 +113,24 @@ pub struct RunnableAudit {
     pub label: String,
     /// Which umbrella this tool fans out under.
     pub category: Category,
-    /// The configured binary path, verbatim. Never resolved from PATH:
-    /// decision 7 — cImp never picks a binary for a plugin.
+    /// The configured binary path, verbatim, or empty when there is none.
+    ///
+    /// Empty is only legal for a built-in (see [`command`](Self::command)):
+    /// decision 7 — cImp never picks a binary for a definition it did not ship.
     pub program: String,
+    /// The bare command name to resolve through `ebin` → `PATH` when
+    /// [`program`](Self::program) is empty. `None` for a user plugin, always
+    /// `Some` for a built-in — the narrow, provenance-gated relaxation that
+    /// keeps the fourteen shipped scanners working without a configured path.
+    pub command: Option<String>,
+    /// A `node_modules/.bin` shim name preferred over a global install when no
+    /// path is configured (eslint, knip).
+    pub project_local_bin: Option<String>,
     /// The manifest's argv template, tokens unsubstituted.
     pub argv: Vec<String>,
+    /// The template used when the scan root is not a git repository. Empty =
+    /// [`argv`](Self::argv) is used either way.
+    pub dir_argv: Vec<String>,
     /// Declared variables, layered (manifest default → user value) by the
     /// registry. **Untrusted**: values ride the project overlay.
     pub variables: BTreeMap<String, String>,
@@ -138,6 +142,10 @@ pub struct RunnableAudit {
     pub timeout_secs: Option<u64>,
     /// The FINDINGS parser (G2's namespace rule), resolved at plan time.
     pub parser: AuditParser,
+    /// The gate this tool's output passes before any of it becomes a finding —
+    /// resolved once, here, from the manifest's declaration and the resolved
+    /// parser. See [`IngestGate`].
+    pub gate: IngestGate,
     pub runtime: RuntimeReq,
     pub sandbox: SandboxReq,
     pub extra_grants: Vec<String>,
@@ -166,19 +174,28 @@ impl RunnableAudit {
             ToolKind::Audit => Category::Quality,
             ToolKind::Check | ToolKind::Command => return Ok(None),
         };
-        let Some(program) = tool.path.clone() else {
-            // `runnable_tools` filters these out; a caller that did not is
-            // asking for a spawn with no program, which is not a tool error to
-            // report but a caller bug to refuse.
+        // A tool with neither a configured path nor a name cImp may resolve for
+        // it cannot be spawned. `runnable_tools` filters these out, so reaching
+        // here is a caller bug rather than a tool error — but it is reported as
+        // a reason rather than dropped, because a tool the user enabled must not
+        // vanish from a report in silence either way.
+        let program = tool.path.clone().unwrap_or_default();
+        if program.is_empty() && !tool.resolves_by_name() {
             return Err("no binary path is configured".to_string());
-        };
+        }
         let parser = findings_parser(tool.manifest.parser)?;
         Ok(Some(Self {
-            key: ToolKey::Plugin(tool.tool_key.clone()),
+            key: ToolKey::of(tool),
             label: tool.manifest.label.clone(),
             category,
             program,
+            command: tool
+                .resolves_by_name()
+                .then(|| tool.manifest.command.clone())
+                .flatten(),
+            project_local_bin: tool.manifest.project_local_bin.clone(),
             argv: tool.manifest.argv.clone(),
+            dir_argv: tool.manifest.dir_argv.clone(),
             variables: tool.variables.clone(),
             parameters: tool.parameters.clone(),
             transport: match tool.manifest.transport {
@@ -189,6 +206,14 @@ impl RunnableAudit {
             findings_exit_codes: tool.manifest.findings_exit_codes.clone(),
             timeout_secs: tool.timeout_secs,
             parser,
+            // The manifest's grandfathering, resolved here rather than at the
+            // spawn site: which gate applies is a fact about the TOOL, and a
+            // runner that re-derived it would be a second place for "built-in
+            // semantics" to be spelled differently.
+            gate: match tool.manifest.ingest {
+                Some(IngestReq::Grandfathered) => IngestGate::None,
+                None => IngestGate::for_parser(parser),
+            },
             runtime: tool.manifest.runtime,
             sandbox: tool.manifest.sandbox,
             extra_grants: tool.manifest.extra_grants.clone(),
@@ -212,10 +237,32 @@ impl RunnableAudit {
 
     /// The full argv: the substituted template, then the user's parameters
     /// appended verbatim (the `extra_args` contract).
-    pub fn full_argv(&self, root: &Path, report: Option<&Path>) -> Vec<String> {
-        let mut argv = render_argv(&self.argv, &self.variables, root, report);
+    ///
+    /// `git_repo` selects [`dir_argv`](Self::dir_argv) when the scan root is not
+    /// a git repository and the tool declared one (gitleaks' `dir` form). A tool
+    /// that declared none is indifferent and gets [`argv`](Self::argv) either
+    /// way — the same rule the built-in adapter table applied before V38.
+    pub fn full_argv(&self, root: &Path, report: Option<&Path>, git_repo: bool) -> Vec<String> {
+        let template = if !git_repo && !self.dir_argv.is_empty() {
+            &self.dir_argv
+        } else {
+            &self.argv
+        };
+        let mut argv = render_argv(template, &self.variables, root, report);
         argv.extend(self.parameters.iter().cloned());
         argv
+    }
+
+    /// What the sandbox lane, the spawn ledger and the activity row call this
+    /// run.
+    ///
+    /// A built-in answers with its COMMAND name (`semgrep`), which is what those
+    /// rows have said since V33 — they are about the program that ran, and a
+    /// user grepping `audit:semgrep` in the sandbox lane after an upgrade must
+    /// still find it. A plugin has no such name and answers with its key, which
+    /// is the only identity it has.
+    pub fn spawn_subject(&self) -> String {
+        self.command.clone().unwrap_or_else(|| self.key.wire())
     }
 
     /// Which sandbox runtime profile this tool's grants come from.
@@ -584,21 +631,32 @@ mod tests {
     /// disambiguate them, which is why nothing downstream does.
     #[test]
     fn a_plugin_key_can_never_collide_with_a_builtin_wire_id() {
-        for id in crate::settings::default_audit_tools() {
-            let wire = ToolKey::Builtin(id.id).wire();
+        let set = crate::plugins::builtin::plugin_set();
+        let ids: Vec<&str> = set
+            .plugins
+            .iter()
+            .flat_map(|p| p.manifest.tools.iter())
+            .map(|t| t.id.as_str())
+            .collect();
+        assert_eq!(ids.len(), 14, "the built-in roster is fourteen tools");
+        for id in ids {
+            let key = ToolKey::Builtin(id.to_string());
             assert!(
-                !wire.contains('@') && !wire.contains('/'),
-                "built-in wire id `{wire}` entered the plugin key namespace"
+                !key.wire().contains('@') && !key.wire().contains('/'),
+                "built-in wire id `{id}` entered the plugin key namespace"
             );
+            // The wire form is the bare id, byte-identical to what
+            // `AuditToolId` serialized to before V38 — which is what keeps
+            // every stored report, settings file and TS mirror valid.
             assert_eq!(
-                serde_json::to_value(ToolKey::Builtin(id.id)).unwrap(),
-                serde_json::to_value(id.id).unwrap(),
-                "a built-in's wire form must be byte-identical to the pre-V38 one"
+                serde_json::to_value(&key).unwrap(),
+                serde_json::Value::String(id.to_string())
             );
+            assert!(key.is_builtin(id));
         }
         let plugin = ToolKey::Plugin("acme@1.0.0/scan".to_string());
         assert_eq!(plugin.wire(), "acme@1.0.0/scan");
-        assert_eq!(plugin.builtin(), None);
+        assert!(!plugin.is_builtin("scan"));
     }
 
     /// The join, end to end: kind decides the umbrella, the registry's layered
@@ -662,10 +720,21 @@ mod tests {
         assert_eq!(runnable.parser, AuditParser::Sarif);
         assert_eq!(runnable.transport, Transport::Stdout);
         assert_eq!(
-            runnable.full_argv(Path::new(r"C:\proj"), None),
+            runnable.full_argv(Path::new(r"C:\proj"), None, true),
             vec!["--rules", "p/ci", r"C:\proj", "--exclude", "vendor"],
             "the user's value substitutes, and parameters land AFTER the template"
         );
+        // A tool that declared no `dir_argv` is indifferent to whether the root
+        // is a git repository — the same answer the pre-V38 adapter table gave.
+        assert_eq!(
+            runnable.full_argv(Path::new(r"C:\proj"), None, false),
+            runnable.full_argv(Path::new(r"C:\proj"), None, true)
+        );
+        // A user plugin never resolves by name: no path, nothing runs.
+        assert!(runnable.command.is_none());
+        assert_eq!(runnable.spawn_subject(), "acme@2.0.0/lint");
+        // Nothing declared `ingest`, so the strict kind-appropriate gate applies.
+        assert_eq!(runnable.gate, IngestGate::Sarif);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -711,7 +780,10 @@ mod tests {
             label: "Acme Scan".to_string(),
             category: Category::Security,
             program: "C:\\bin\\acme.exe".to_string(),
+            command: None,
+            project_local_bin: None,
             argv: vec!["{root}".to_string()],
+            dir_argv: Vec::new(),
             variables: BTreeMap::new(),
             parameters: Vec::new(),
             transport: Transport::Stdout,
@@ -719,6 +791,7 @@ mod tests {
             findings_exit_codes: vec![1],
             timeout_secs: None,
             parser: AuditParser::Sarif,
+            gate: IngestGate::Sarif,
             runtime: RuntimeReq::Auto,
             sandbox: SandboxReq::Required,
             extra_grants: Vec::new(),

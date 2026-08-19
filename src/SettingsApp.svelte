@@ -10,9 +10,6 @@
   import {
     aiToolTabDefaults,
     auditDetectTool,
-    auditToolsGlobalConfig,
-    auditToolsLoadGlobal,
-    auditToolsSaveGlobal,
     consumeSettingsDeepLink,
     harnessRunChecks,
     harnessVersionsGet,
@@ -23,14 +20,11 @@
     pluginsRescan,
     pluginsSnapshot,
     requestTabRestart,
-    type AuditGlobalToolConfig,
   } from './lib/settings/ipc';
   import { listen } from '@tauri-apps/api/event';
   import type {
     AiToolTabConfig,
     AuditDetectResult,
-    AuditToolConfig,
-    AuditToolId,
     CapabilityHealth,
     HarnessHealth,
     HarnessStatus,
@@ -107,14 +101,9 @@
   import CustomThemeEditor from './lib/settings/CustomThemeEditor.svelte';
   import BackgroundConfigEditor from './lib/settings/BackgroundConfigEditor.svelte';
   import ChecksEditor from './lib/settings/ChecksEditor.svelte';
+  import { formatDetect } from './lib/settings/codeAudit';
   import {
-    auditToolGroups,
-    formatDetect,
-    toolMatchesGlobal,
-    toolNotApplicable,
-    type AuditToolRow,
-  } from './lib/settings/codeAudit';
-  import {
+    AUDIT_PLUGIN_KEY,
     errorRows,
     permissionsOpen,
     pluginRows,
@@ -132,11 +121,7 @@
     type ToolRow,
   } from './lib/settings/toolPlugins';
   import { auditRefreshCensus } from './lib/codeAudit/ipc';
-  import {
-    AUDIT_TOOL_CATEGORY,
-    autoSelectQuality,
-    censusIsEmpty,
-  } from './lib/codeAudit/logic';
+  import { censusIsEmpty, qualityAutoSelection } from './lib/codeAudit/logic';
   import type { AuditCensus } from './lib/codeAudit/types';
   import { resolveBundledTheme, defaultPalette } from './lib/themes';
   import { themeRegistry, paletteRegistry } from './lib/themes/registry';
@@ -1442,10 +1427,6 @@
   // injection + the read advisor under 'efficiency'; the 3D view under 'viz'.
   type GraphSubSection = 'graph' | 'semantic' | 'efficiency' | 'viz';
   let graphSubSection = $state<GraphSubSection>('graph');
-  // Sub-tab nav within the Code Audit section: feature toggle + scan/MCP
-  // settings under 'settings'; the two scanner lists under their own tabs.
-  type AuditSubSection = 'settings' | 'security' | 'quality';
-  let auditSubSection = $state<AuditSubSection>('settings');
   function subSectionForTabId(tabId: string): TabsSubSection {
     if (
       tabId === 'claude' ||
@@ -1529,7 +1510,6 @@
     await initSettings();
     if (disposed) return;
     startBackendStatusPolling();
-    void refreshAuditGlobalConfig();
     void refreshPlugins();
     pluginsProjectKey()
       .then((k) => (pluginProjectKey = k))
@@ -2037,142 +2017,66 @@
     if (p) patch((s) => (s.external_tools[tool] = p));
   }
 
-  // ── V23 Phase A: Code Audit tools ──────────────────────────────────────
-  // Per-tool Detect probe result, keyed by tool id. `'probing'` while the IPC
-  // is in flight. Display-only — the probe never writes back into the tool's
-  // `path` field, so the stored config stays "resolve normally" unless the user
-  // browses to an exe.
+  // ── Code Audit ─────────────────────────────────────────────────────────
+  //
+  // What is left here is the FEATURE's settings. The fourteen scanners
+  // themselves are configured in the Tool Plugins section, because since V38
+  // they are a plugin — one whose manifests cImp ships rather than one you drop
+  // in a folder, but a plugin, rendered by the pane that already knows how.
+
+  // Per-tool Detect probe result, keyed by TOOL KEY (`cimp-audit@1/gitleaks`,
+  // or a user plugin's `name@version/tool-id`). `'probing'` while the IPC is in
+  // flight. Display-only — the probe never writes back into the tool's path, so
+  // the stored config stays "resolve normally" unless the user browses.
   let auditDetect = $state<Record<string, AuditDetectResult | 'probing' | undefined>>({});
 
-  // V25 Phase D: the latest scan's language census, read once from the runner so
-  // the tool rows can flag those the current project gates off ("not applicable
-  // to the current project"). Empty (both lists) before any scan — no hint then.
+  // The latest scan's language census, read from the runner so the
+  // auto-selection button can apply the project's languages immediately rather
+  // than waiting for the next census refresh. Empty (both lists) before any
+  // scan.
   let auditCensus = $state<AuditCensus>({ extensions: [], markers: [] });
 
-  // V25 Phase D: the tool rows split into the Security / Quality groups the
-  // section renders under separate headers.
-  let auditGroups = $derived(
-    snapshot ? auditToolGroups(snapshot) : { security: [], quality: [] },
-  );
-
-  // Mutate one audit tool's config (by id) in place through the normal patch
-  // path. No-op if the id isn't present (e.g. dropped by a future migration).
-  function patchAuditTool(id: AuditToolId, updater: (t: AuditToolConfig) => void): void {
-    patch((s) => {
-      const t = s.code_audit.tools.find((x) => x.id === id);
-      if (t) updater(t);
-    });
-  }
-
-  // The enabled checkbox goes through here (not the generic patchAuditTool):
-  // a manual QUALITY edit flips auto-selection to manual mode, so the choice
-  // sticks across census refreshes instead of being re-derived at next scan.
-  function toggleAuditToolEnabled(id: AuditToolId, enabled: boolean): void {
-    patch((s) => {
-      const t = s.code_audit.tools.find((x) => x.id === id);
-      if (t) t.enabled = enabled;
-      if (AUDIT_TOOL_CATEGORY[id] === 'quality') s.code_audit.quality_auto_select = false;
-    });
-  }
-
   // The "Auto-select for this project" button: back to automatic mode, and —
-  // when a census is already known — apply the project-language selection
-  // immediately rather than waiting for the next census refresh/scan.
+  // when a census is already known — apply the project-language selection at
+  // once. The rule is `codeAudit/logic`'s mirror of the backend's, and the
+  // flags land in the tool-plugins container where the built-in scanners'
+  // state lives.
   function applyQualityAutoSelect(): void {
     patch((s) => {
       s.code_audit.quality_auto_select = true;
-      if (!censusIsEmpty(auditCensus)) {
-        s.code_audit.tools = autoSelectQuality(s.code_audit.tools, auditCensus);
+      if (censusIsEmpty(auditCensus)) return;
+      for (const { id, enabled } of qualityAutoSelection(auditCensus)) {
+        setToolEnabled(s, AUDIT_PLUGIN_KEY, id, enabled);
       }
     });
   }
 
-  async function detectAuditTool(id: AuditToolId): Promise<void> {
-    auditDetect = { ...auditDetect, [id]: 'probing' };
+  // A manual edit of a BUILT-IN QUALITY tool's checkbox switches auto-selection
+  // to manual mode, so the choice sticks across census refreshes instead of
+  // being re-derived at the next scan. Only for that population: a user
+  // plugin's tool is never auto-selected, so toggling one says nothing about
+  // the mode.
+  function noteManualToolEdit(pluginKey: string, toolId: string): void {
+    if (pluginKey !== AUDIT_PLUGIN_KEY) return;
+    if (qualityAutoSelection(auditCensus).some((t) => t.id === toolId)) {
+      patch((s) => (s.code_audit.quality_auto_select = false));
+    }
+  }
+
+  async function detectPluginTool(toolKey: string, path: string): Promise<void> {
+    auditDetect = { ...auditDetect, [toolKey]: 'probing' };
     try {
       // Probe the LIVE editing value, not the persisted setting — a just-typed
       // path would otherwise race the fire-and-forget applySettings push.
-      const path = snapshot?.code_audit.tools.find((t) => t.id === id)?.path ?? '';
-      const r = await auditDetectTool(id, path);
-      auditDetect = { ...auditDetect, [id]: r };
+      const r = await auditDetectTool(toolKey, path);
+      auditDetect = { ...auditDetect, [toolKey]: r };
     } catch (e) {
       auditDetect = {
         ...auditDetect,
-        [id]: { found: false, path: null, version: null, error: String(e) },
+        [toolKey]: { found: false, path: null, version: null, error: String(e) },
       };
     }
   }
-
-  // Browse for an audit tool executable and store it as that tool's `path`
-  // override. Includes `.cmd`/`.bat` — the node tools (eslint, knip) only
-  // exist as npm launcher shims, never as standalone .exes.
-  async function pickAuditToolExe(id: AuditToolId): Promise<void> {
-    const p = await pickFile('Executable', ['exe', 'cmd', 'bat', 'com']);
-    if (p) patchAuditTool(id, (t) => (t.path = p));
-  }
-
-  // Persist after an in-place `bind:` edit of an audit tool's extra_args
-  // (mirrors `commitGraphIgnore`). Fired on ArrayEditor commit boundaries.
-  function commitAudit(): void {
-    if (!snapshot) return;
-    void applySettings($state.snapshot(snapshot));
-  }
-
-  // ── Tool-config scope (global vs project) ──────────────────────────────
-  // The global settings file's tool config, for the per-tool scope badge.
-  // Tool edits are project-scoped by default (they diff into the project
-  // overlay); the Save/Load buttons promote to / re-adopt from global.
-  let auditGlobalConfig = $state<AuditGlobalToolConfig | null>(null);
-  let auditScopeError = $state<string | null>(null);
-
-  async function refreshAuditGlobalConfig(): Promise<void> {
-    try {
-      auditGlobalConfig = await auditToolsGlobalConfig();
-    } catch (e) {
-      console.warn('audit_tools_global_config failed', e);
-    }
-  }
-
-  function auditToolScope(tool: AuditToolConfig): 'global' | 'local' {
-    if (!auditGlobalConfig) return 'global';
-    return toolMatchesGlobal(tool, auditGlobalConfig.tools) ? 'global' : 'local';
-  }
-
-  async function auditSaveGlobal(): Promise<void> {
-    auditScopeError = null;
-    try {
-      auditGlobalConfig = await auditToolsSaveGlobal();
-    } catch (e) {
-      auditScopeError = `Save to global failed: ${e}`;
-    }
-  }
-
-  async function auditLoadGlobal(): Promise<void> {
-    auditScopeError = null;
-    try {
-      // The backend mutates the live settings too; the snapshot follows via
-      // the settings-changed broadcast.
-      auditGlobalConfig = await auditToolsLoadGlobal();
-    } catch (e) {
-      auditScopeError = `Load from global failed: ${e}`;
-    }
-  }
-
-  // "Clear all": an all-off tool config saved as a normal project setting
-  // (paths are machine-scope and stay).
-  function auditClearAll(): void {
-    auditScopeError = null;
-    patch((s) => {
-      for (const t of s.code_audit.tools) {
-        t.enabled = false;
-        t.extra_args = [];
-        t.ruleset = '';
-        t.timeout_secs = null;
-      }
-      s.code_audit.quality_auto_select = false;
-    });
-  }
-
 
   // ── V38 Tool Plugins ───────────────────────────────────────────────────
   // The section is master-detail over `plugins_snapshot`: the loader's set is
@@ -6816,191 +6720,18 @@
         <section>
           <h2>Code Audit</h2>
           <small class="hint top">
-            Aggregated security scanning. cImp runs external scanners against the
-            project root and merges their findings into one table. Nothing is
-            bundled — each tool resolves from the <code>ebin\</code> drop-in
-            folder first, then your PATH; point cImp at a specific build with
-            Browse, or check availability with Detect. Configured paths are
-            machine-wide (saved to the global settings, shared by every
-            project); the enable checkboxes stay per-project. Enable the
-            feature to show the Code audit section in the Tools tab.
+            Aggregated security and quality scanning. cImp runs external
+            scanners against the project root and merges their findings into one
+            table. Nothing is bundled — each scanner resolves from the
+            <code>ebin\</code> drop-in folder first, then your PATH.
+            <strong>The scanners themselves are configured in
+            <button type="button" class="linkish" onclick={() => (activeSection = 'tool-plugins')}
+              >Tool Plugins</button
+            ></strong>: they are a plugin cImp ships, so they are enabled, pointed
+            at a binary and given their extra arguments in the same place as any
+            tool you drop in yourself. What is here is the feature.
           </small>
-          <div class="sub-tabs" role="tablist" aria-label="Code Audit sub-sections">
-            <button
-              type="button"
-              role="tab"
-              class:active={auditSubSection === 'settings'}
-              aria-selected={auditSubSection === 'settings'}
-              onclick={() => (auditSubSection = 'settings')}
-            >
-              Settings
-            </button>
-            <button
-              type="button"
-              role="tab"
-              class:active={auditSubSection === 'security'}
-              aria-selected={auditSubSection === 'security'}
-              onclick={() => (auditSubSection = 'security')}
-            >
-              Security tools
-            </button>
-            <button
-              type="button"
-              role="tab"
-              class:active={auditSubSection === 'quality'}
-              aria-selected={auditSubSection === 'quality'}
-              onclick={() => (auditSubSection = 'quality')}
-            >
-              Quality tools
-            </button>
-          </div>
 
-          {#snippet auditToolRow(row: AuditToolRow)}
-            {@const det = auditDetect[row.meta.id]}
-            {@const disp = formatDetect(det)}
-            <div class="audit-tool">
-              <label class="checkbox">
-                <input
-                  type="checkbox"
-                  checked={row.tool.enabled}
-                  onchange={(e) =>
-                    toggleAuditToolEnabled(
-                      row.meta.id,
-                      (e.currentTarget as HTMLInputElement).checked,
-                    )}
-                />
-                <span class="audit-name">{row.meta.name}</span>
-                <span class="audit-role">{row.meta.role}</span>
-                <span
-                  class="audit-scope"
-                  class:local={auditToolScope(row.tool) === 'local'}
-                  title="Whether this tool's config matches the global settings file (paths are always machine-wide)"
-                >
-                  {auditToolScope(row.tool)}
-                </span>
-              </label>
-              {#if toolNotApplicable(row.meta.id, auditCensus)}
-                <small class="hint audit-na">
-                  not applicable to the current project
-                </small>
-              {/if}
-              <div class="input-with-action">
-                <input
-                  type="text"
-                  placeholder="(use ebin / PATH)"
-                  value={row.tool.path}
-                  oninput={(e) =>
-                    patchAuditTool(
-                      row.meta.id,
-                      (t) =>
-                        (t.path = (e.currentTarget as HTMLInputElement).value),
-                    )}
-                />
-                <button
-                  type="button"
-                  class="secondary"
-                  onclick={() => void detectAuditTool(row.meta.id)}
-                >
-                  Detect
-                </button>
-                <button
-                  type="button"
-                  class="secondary"
-                  onclick={() => void pickAuditToolExe(row.meta.id)}
-                >
-                  Browse…
-                </button>
-                <button
-                  type="button"
-                  class="secondary"
-                  onclick={() => patchAuditTool(row.meta.id, (t) => (t.path = ''))}
-                >
-                  Clear
-                </button>
-              </div>
-              {#if disp.kind !== 'idle'}
-                <small
-                  class="hint audit-detect"
-                  class:ok={disp.kind === 'found'}
-                  class:bad={disp.kind === 'not-found'}
-                >
-                  {disp.text}
-                </small>
-              {/if}
-              <label class="audit-timeout">
-                <span>Timeout override (seconds — blank uses the global)</span>
-                <input
-                  type="number"
-                  min="1"
-                  placeholder="(global)"
-                  value={row.tool.timeout_secs ?? ''}
-                  oninput={(e) =>
-                    patchAuditTool(row.meta.id, (t) => {
-                      const raw = (e.currentTarget as HTMLInputElement).value.trim();
-                      const v = Number(raw);
-                      t.timeout_secs =
-                        raw !== '' && Number.isFinite(v) && v >= 1 ? Math.floor(v) : null;
-                    })}
-                />
-              </label>
-              {#if row.meta.rulesetDefault}
-                <label class="audit-timeout">
-                  <span>
-                    Ruleset (blank uses {row.meta.rulesetDefault}; if the
-                    default breaks upstream the tool shows an error — set the
-                    replacement here)
-                  </span>
-                  <input
-                    type="text"
-                    placeholder={row.meta.rulesetDefault}
-                    value={row.tool.ruleset}
-                    oninput={(e) =>
-                      patchAuditTool(
-                        row.meta.id,
-                        (t) =>
-                          (t.ruleset = (e.currentTarget as HTMLInputElement).value.trim()),
-                      )}
-                  />
-                </label>
-              {/if}
-              <small class="hint">
-                Extra arguments (appended after the tool's fixed argv):
-              </small>
-              <ArrayEditor
-                bind:items={snapshot!.code_audit.tools[row.index].extra_args}
-                placeholder="e.g. --exclude vendor"
-                oncommit={commitAudit}
-              />
-            </div>
-          {/snippet}
-
-          {#snippet auditScopeControls()}
-            <div class="button-row">
-              <button type="button" class="secondary" onclick={() => void auditSaveGlobal()}>
-                Save to global
-              </button>
-              <button type="button" class="secondary" onclick={() => void auditLoadGlobal()}>
-                Load from global
-              </button>
-              <button type="button" class="secondary danger" onclick={auditClearAll}>
-                Clear all
-              </button>
-            </div>
-            <small class="hint">
-              Tool changes are saved to this project by default
-              (<strong>local</strong> badge). <strong>Save to global</strong>
-              makes the current tool config the default for every project;
-              <strong>Load from global</strong> discards this project's tool
-              config in favor of the global one; <strong>Clear all</strong>
-              saves an all-off tool config to this project. Tool paths are
-              always machine-wide.
-            </small>
-            {#if auditScopeError}
-              <small class="hint status-error">{auditScopeError}</small>
-            {/if}
-          {/snippet}
-
-          {#if auditSubSection === 'settings'}
           <label class="checkbox">
             <input
               type="checkbox"
@@ -7031,6 +6762,32 @@
                 })}
             />
           </label>
+
+          <h3>Quality tool selection</h3>
+          <small class="hint">
+            The quality scanners are language-gated: one only runs when the
+            project contains files it applies to. In <strong>automatic</strong>
+            mode cImp keeps their checkboxes following the project's languages
+            (the two that run a real build or need the network stay opt-in);
+            editing one of their checkboxes in Tool Plugins switches to manual so
+            your choice sticks. Security scanners are never touched.
+          </small>
+          {#if snapshot.code_audit.quality_auto_select}
+            <small class="hint audit-auto-note">
+              Selection: <strong>automatic</strong> — follows this project's
+              languages.
+            </small>
+          {:else}
+            <div class="audit-auto-row">
+              <button type="button" class="secondary" onclick={applyQualityAutoSelect}>
+                Auto-select for this project
+              </button>
+              <small class="hint">
+                re-select the scanners matching this project's languages and keep
+                them in sync automatically
+              </small>
+            </div>
+          {/if}
 
           <h3>MCP exposure</h3>
           <small class="hint">
@@ -7084,58 +6841,21 @@
             />
             <span>Expose to offload worker</span>
           </label>
-          {:else if auditSubSection === 'security'}
-          <small class="hint top">
-            Shown in the Code audit section's <strong>Security</strong> sub-tab
-            (Tools tab).
-          </small>
-          {@render auditScopeControls()}
-          {#each auditGroups.security as row (row.meta.id)}
-            {@render auditToolRow(row)}
-          {/each}
-
-          {:else if auditSubSection === 'quality'}
-          <small class="hint top">
-            Shown in the Code audit section's <strong>Quality</strong> sub-tab
-            (Tools tab).
-            Language-gated — a tool only appears there (and only runs) when the
-            project contains files it applies to. All tools are listed here
-            regardless of the current project.
-          </small>
-          {@render auditScopeControls()}
-          {#if snapshot.code_audit.quality_auto_select}
-            <small class="hint audit-auto-note">
-              Selection: <strong>automatic</strong> — follows the project's
-              languages (heavyweight opt-ins stay off); editing a checkbox
-              switches to manual.
-            </small>
-          {:else}
-            <div class="audit-auto-row">
-              <button type="button" class="secondary" onclick={applyQualityAutoSelect}>
-                Auto-select for this project
-              </button>
-              <small class="hint">
-                re-select the tools matching the project's languages and keep
-                them in sync automatically
-              </small>
-            </div>
-          {/if}
-          {#each auditGroups.quality as row (row.meta.id)}
-            {@render auditToolRow(row)}
-          {/each}
-          {/if}
         </section>
       {:else if activeSection === 'tool-plugins'}
         <section>
           <h2>Tool Plugins</h2>
           <small class="hint top">
-            Drop-in tool definitions. A plugin is one JSON file in the
-            <code>plugins\</code> folder beside cImp describing tools it can run
-            — no rebuild, and <strong>no binaries</strong>: the plugin says how
-            to call a tool, you say where that tool lives. A tool with no path
-            is inert. Enables, timeouts and paths are machine-wide (they
-            describe this computer); the per-project path override and the
-            declared variables are per project.
+            Tool definitions. A plugin is one JSON file describing tools cImp can
+            run — no rebuild, and <strong>no binaries</strong>: the plugin says
+            how to call a tool, you say where that tool lives. Drop your own into
+            the <code>plugins\</code> folder beside cImp. The ones marked
+            <strong>built in</strong> ship with cImp (the Code Audit scanners
+            live here) and are the only ones that resolve a binary for you, from
+            the <code>ebin\</code> folder then your PATH; for every other tool an
+            unset path means it does not run. Enables, timeouts and paths are
+            machine-wide (they describe this computer); the per-project path
+            override and the declared variables are per project.
           </small>
 
           {#snippet toolPluginRow(plugin: PluginRow, tool: ToolRow)}
@@ -7145,17 +6865,18 @@
                   type="checkbox"
                   checked={tool.enabled}
                   onchange={(e) =>
-                    patchPlugin((s) =>
-                      setToolEnabled(
-                        s,
-                        plugin.key,
-                        tool.id,
-                        (e.currentTarget as HTMLInputElement).checked,
-                      ),
-                    )}
+                    {
+                      const on = (e.currentTarget as HTMLInputElement).checked;
+                      patchPlugin((s) => setToolEnabled(s, plugin.key, tool.id, on));
+                      // A manual edit of a built-in QUALITY scanner switches
+                      // auto-selection to manual mode, so the choice sticks
+                      // across census refreshes instead of being re-derived at
+                      // the next scan.
+                      noteManualToolEdit(plugin.key, tool.id);
+                    }}
                 />
                 <span class="audit-name">{tool.label}</span>
-                <span class="audit-role">{tool.kind}</span>
+                <span class="audit-role">{tool.description ?? tool.kind}</span>
                 <span class="audit-scope" class:local={tool.path.scope === 'project'}>
                   {tool.path.scope === 'unset' ? 'no path' : tool.path.scope}
                 </span>
@@ -7175,7 +6896,7 @@
 
               {#if !plugin.enabled}
                 <small class="hint audit-na">off — the plugin is disabled</small>
-              {:else if tool.path.effective === ''}
+              {:else if tool.path.effective === '' && !tool.resolvesByName}
                 <small class="hint audit-na">
                   no path set, so this tool does not run
                 </small>
@@ -7185,7 +6906,9 @@
               <div class="input-with-action">
                 <input
                   type="text"
-                  placeholder="(not set — the tool will not run)"
+                  placeholder={tool.resolvesByName
+                    ? '(use the ebin folder / PATH)'
+                    : '(not set — the tool will not run)'}
                   value={tool.path.global}
                   oninput={(e) =>
                     patchPlugin((s) =>
@@ -7196,6 +6919,14 @@
                       ),
                     )}
                 />
+                <button
+                  type="button"
+                  class="secondary"
+                  onclick={() =>
+                    void detectPluginTool(tool.toolKey, tool.path.effective)}
+                >
+                  Detect
+                </button>
                 <button
                   type="button"
                   class="secondary"
@@ -7211,6 +6942,16 @@
                   Clear
                 </button>
               </div>
+              {#if formatDetect(auditDetect[tool.toolKey]).kind !== 'idle'}
+                {@const disp = formatDetect(auditDetect[tool.toolKey])}
+                <small
+                  class="hint audit-detect"
+                  class:ok={disp.kind === 'found'}
+                  class:bad={disp.kind === 'not-found'}
+                >
+                  {disp.text}
+                </small>
+              {/if}
 
               {#if pluginProjectKey}
                 <small class="hint plugin-field">
@@ -7404,7 +7145,7 @@
                     >
                       <span class="audit-name">{p.label}</span>
                       <span class="plugin-sub">
-                        {p.toolCount}
+                        {p.builtin ? 'built in · ' : ''}{p.toolCount}
                         {p.toolCount === 1 ? 'tool' : 'tools'}{p.enabled ? '' : ' · off'}
                       </span>
                     </button>

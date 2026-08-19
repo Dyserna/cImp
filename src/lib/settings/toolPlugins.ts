@@ -44,7 +44,13 @@ export interface PluginVariableDecl {
 export interface PluginToolManifest {
   id: string;
   label: string;
+  /// One line saying what the tool is for, shown beside the label.
+  description: string | null;
   kind: PluginToolKind;
+  /// Whether the tool is on before the user has ever touched it. `false` is for
+  /// a tool its author knows is expensive or intrusive enough that nobody
+  /// should get it by accident.
+  enabled_by_default: boolean;
   runtime: PluginRuntimeReq;
   sandbox: PluginSandboxReq;
   extra_grants: string[];
@@ -61,6 +67,16 @@ export interface PluginToolManifest {
   report_file: string | null;
   pattern: string | null;
   parser: string | null;
+  /// Built-in only (a scanned file carrying any of these is refused). See
+  /// `plugins::manifest` for why each one is a relaxation cImp reserves for the
+  /// definitions it ships.
+  ingest: string | null;
+  /// The bare command name a BUILT-IN resolves through `ebin` then `PATH` when
+  /// no path is configured. `null` for a user plugin, which cImp never resolves
+  /// a binary for.
+  command: string | null;
+  project_local_bin: string | null;
+  dir_argv: string[];
 }
 
 export interface PluginCategoryDecl {
@@ -136,6 +152,8 @@ export interface ToolRow {
   id: string;
   label: string;
   kind: PluginToolKind;
+  /// One line saying what the tool is for, from its manifest.
+  description: string | null;
   /// The tool's OWN flag — what the checkbox binds to.
   enabled: boolean;
   /// `plugin.enabled && tool.enabled` — what actually happens.
@@ -152,6 +170,11 @@ export interface ToolRow {
   /// anything other than `required` is the alarming ask and must not be the
   /// one that arrives collapsed.
   sandbox: PluginSandboxReq;
+  /// Whether cImp will find this tool without a configured path — true only for
+  /// a built-in whose manifest names a command. It changes what the empty path
+  /// box MEANS ("resolve normally" against "this tool does not run"), which is
+  /// the difference between a working default and an invisible one.
+  resolvesByName: boolean;
 }
 
 export type CategoryToggleState = 'on' | 'off' | 'mixed';
@@ -168,6 +191,9 @@ export interface CategoryRow {
 
 export interface PluginRow {
   key: string;
+  /// cImp's own, stamped by the loader. Rendered as a badge, and the reason the
+  /// pane never offers to delete the file: there is no file.
+  builtin: boolean;
   /// `name (version)` — decision 9's display form. Two versions of one plugin
   /// coexist, so the version is part of the name, not a detail.
   label: string;
@@ -199,6 +225,14 @@ const EMPTY_STATE: PluginState = { enabled: true, tools: {} };
 function toolState(plugin: PluginState | undefined, toolId: string): ToolState | undefined {
   return plugin?.tools?.[toolId];
 }
+
+/// The plugin key cImp's own fourteen audit scanners live under.
+///
+/// A mirror of Rust's `plugins::builtin::AUDIT_PLUGIN_KEY`, pinned by
+/// `builtin_audit_tool_ids_are_mirrored_in_the_frontend_union`. It is a
+/// SETTINGS key — the v32 → v33 migration writes these exact strings — so the
+/// version in it is the identity of the shipped set, not the cImp release.
+export const AUDIT_PLUGIN_KEY = 'cimp-audit@1';
 
 export function toolKeyOf(pluginKey: string, toolId: string): string {
   return `${pluginKey}/${toolId}`;
@@ -293,11 +327,14 @@ export function pluginRows(set: PluginSet, settings: Settings, projectKey: strin
         const t = byId.get(id);
         if (!t) continue; // Validation forbids it; rendering nothing is honest.
         const ts = toolState(state, id);
-        const enabled = ts?.enabled ?? true;
+        // No stored state ⇒ the MANIFEST's default, which is how the two
+        // built-in heavyweights stay off on a fresh install.
+        const enabled = ts?.enabled ?? t.enabled_by_default ?? true;
         tools.push({
           toolKey: toolKeyOf(p.key, id),
           id,
           label: t.label,
+          description: t.description ?? null,
           kind: t.kind,
           enabled,
           effectiveEnabled: pluginEnabled && enabled,
@@ -313,6 +350,7 @@ export function pluginRows(set: PluginSet, settings: Settings, projectKey: strin
           })),
           permissions: permissionSummary(t),
           sandbox: t.sandbox,
+          resolvesByName: p.provenance === 'builtin' && !!t.command,
         });
       }
       return { id: c.id, label: c.label, tools, state: categoryState(tools) };
@@ -320,6 +358,7 @@ export function pluginRows(set: PluginSet, settings: Settings, projectKey: strin
 
     return {
       key: p.key,
+      builtin: p.provenance === 'builtin',
       label: `${p.manifest.label ?? p.manifest.name} (${p.manifest.version})`,
       manifestPath: p.path,
       description: p.manifest.description,

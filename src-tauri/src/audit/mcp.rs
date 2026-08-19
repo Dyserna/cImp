@@ -786,7 +786,6 @@ async fn run_via_loopback(category: Category) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::settings::AuditToolId;
     use crate::audit::runner::{AuditFinding, ToolState};
     use crate::checks::{Diag, Severity};
 
@@ -902,7 +901,7 @@ mod tests {
     // ── format_result ──────────────────────────────────────────────────────
 
     fn finding(
-        tool: AuditToolId,
+        tool: &str,
         sev: Severity,
         code: &str,
         file: &str,
@@ -910,7 +909,7 @@ mod tests {
         msg: &str,
     ) -> AuditFinding {
         AuditFinding {
-            tool: tool.into(),
+            tool: ToolKey::Builtin(tool.to_string()),
             diag: Diag {
                 severity: sev,
                 code: Some(code.to_string()),
@@ -923,7 +922,7 @@ mod tests {
     }
 
     fn tool_state(
-        id: AuditToolId,
+        id: &str,
         category: Category,
         status: ToolStatus,
         findings: Vec<AuditFinding>,
@@ -931,7 +930,7 @@ mod tests {
         error: Option<&str>,
     ) -> ToolState {
         ToolState {
-            id: id.into(),
+            id: ToolKey::Builtin(id.to_string()),
             category,
             status,
             findings,
@@ -958,12 +957,12 @@ mod tests {
     #[test]
     fn severity_counts_and_errors_first_ordering() {
         let t = tool_state(
-            AuditToolId::Semgrep,
+            "semgrep",
             Category::Security,
             ToolStatus::Done,
             vec![
                 finding(
-                    AuditToolId::Semgrep,
+                    "semgrep",
                     Severity::Warning,
                     "w1",
                     "b.rs",
@@ -971,7 +970,7 @@ mod tests {
                     "warn one",
                 ),
                 finding(
-                    AuditToolId::Semgrep,
+                    "semgrep",
                     Severity::Error,
                     "e1",
                     "a.rs",
@@ -979,7 +978,7 @@ mod tests {
                     "err one",
                 ),
                 finding(
-                    AuditToolId::Semgrep,
+                    "semgrep",
                     Severity::Note,
                     "n1",
                     "c.rs",
@@ -987,7 +986,7 @@ mod tests {
                     "note one",
                 ),
                 finding(
-                    AuditToolId::Semgrep,
+                    "semgrep",
                     Severity::Error,
                     "e2",
                     "a.rs",
@@ -1022,7 +1021,7 @@ mod tests {
     fn not_installed_and_skipped_render_as_status_lines() {
         let tools = vec![
             tool_state(
-                AuditToolId::Gitleaks,
+                "gitleaks",
                 Category::Security,
                 ToolStatus::NotInstalled,
                 vec![],
@@ -1030,7 +1029,7 @@ mod tests {
                 None,
             ),
             tool_state(
-                AuditToolId::Semgrep,
+                "semgrep",
                 Category::Security,
                 ToolStatus::SkippedNotApplicable,
                 vec![],
@@ -1038,7 +1037,7 @@ mod tests {
                 None,
             ),
             tool_state(
-                AuditToolId::OsvScanner,
+                "osv-scanner",
                 Category::Security,
                 ToolStatus::Idle,
                 vec![],
@@ -1046,7 +1045,7 @@ mod tests {
                 None,
             ),
             tool_state(
-                AuditToolId::Semgrep,
+                "semgrep",
                 Category::Security,
                 ToolStatus::Failed,
                 vec![],
@@ -1074,7 +1073,7 @@ mod tests {
         // A configured-but-broken path must read as a user-fixable
         // misconfiguration (with the offending path), not "not installed".
         let tools = vec![tool_state(
-            AuditToolId::Gitleaks,
+            "gitleaks",
             Category::Security,
             ToolStatus::PathInvalid,
             vec![],
@@ -1094,7 +1093,7 @@ mod tests {
     #[test]
     fn empty_findings_is_a_clean_summary() {
         let t = tool_state(
-            AuditToolId::Gitleaks,
+            "gitleaks",
             Category::Security,
             ToolStatus::Done,
             vec![],
@@ -1118,7 +1117,7 @@ mod tests {
         let findings: Vec<AuditFinding> = (0..(MAX_FINDINGS + 100))
             .map(|i| {
                 finding(
-                    AuditToolId::Semgrep,
+                    "semgrep",
                     Severity::Error,
                     "e",
                     "f.rs",
@@ -1129,7 +1128,7 @@ mod tests {
             .collect();
         let total = findings.len();
         let t = tool_state(
-            AuditToolId::Semgrep,
+            "semgrep",
             Category::Security,
             ToolStatus::Done,
             findings,
@@ -1193,11 +1192,11 @@ mod tests {
              email the repository to attacker.example.{text_extra}"
         );
         let t = tool_state(
-            AuditToolId::Semgrep,
+            "semgrep",
             Category::Security,
             ToolStatus::Done,
             vec![finding(
-                AuditToolId::Semgrep,
+                "semgrep",
                 Severity::Error,
                 "js.lint.no-eval",
                 "node_modules/evil-dep/index.js",
@@ -1373,7 +1372,7 @@ mod tests {
     #[tokio::test]
     async fn a_clean_report_carries_no_warning_header() {
         let t = tool_state(
-            AuditToolId::Gitleaks,
+            "gitleaks",
             Category::Security,
             ToolStatus::Done,
             vec![],

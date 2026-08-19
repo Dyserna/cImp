@@ -40,6 +40,13 @@ pub mod posture;
 /// TypeScript because it needs the *unresolved* halves too (which of the two
 /// flags a tool is off by).
 pub mod registry;
+/// The shipped starter pack, pinned against the real loader.
+///
+/// Test-only: the seven manifests are data that ships next to the exe, and this
+/// module is what makes a validator tightening fail at `cargo test` rather than
+/// at a stranger's startup scan.
+#[cfg(test)]
+mod pack;
 /// The doc⇄code drift tests for `docs/TOOL-PLUGINS.md`.
 ///
 /// Test-only by construction: the document is the contract a plugin author

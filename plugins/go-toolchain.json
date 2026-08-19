@@ -1,0 +1,81 @@
+{
+  "manifest_version": 1,
+  "name": "go-toolchain",
+  "version": "1.0.0",
+  "label": "Go toolchain",
+  "description": "The go tool, as a build check, a vet check, a test check and a command. Each tool takes the package pattern as a variable, so a large module can be checked one directory at a time.",
+  "categories": [
+    {
+      "id": "go",
+      "label": "Go",
+      "tools": ["go-build", "go-vet", "go-test", "go"]
+    }
+  ],
+  "tools": [
+    {
+      "id": "go-build",
+      "label": "go build",
+      "description": "Compiles the selected packages and reports the compiler's file:line: message diagnostics.",
+      "kind": "check",
+      "cmd": "go build {var:packages}",
+      "parser": "go",
+      "variables": [
+        {
+          "name": "packages",
+          "label": "Package pattern (the argument go build receives)",
+          "default": "./..."
+        }
+      ],
+      "timeout_secs": 600,
+      "runtime": "go",
+      "sandbox": "optional",
+      "parameters_allowed": true
+    },
+    {
+      "id": "go-vet",
+      "label": "go vet",
+      "description": "Runs the vet analysers over the selected packages; its findings share the compiler's diagnostic format.",
+      "kind": "check",
+      "cmd": "go vet {var:packages}",
+      "parser": "go",
+      "variables": [
+        {
+          "name": "packages",
+          "label": "Package pattern (the argument go vet receives)",
+          "default": "./..."
+        }
+      ],
+      "timeout_secs": 600,
+      "runtime": "go",
+      "sandbox": "optional",
+      "parameters_allowed": true
+    },
+    {
+      "id": "go-test",
+      "label": "go test",
+      "description": "Runs the selected packages' tests with -json and reports each failure from that event stream.",
+      "kind": "check",
+      "cmd": "go test -json {var:packages}",
+      "parser": "go-test-json",
+      "variables": [
+        {
+          "name": "packages",
+          "label": "Package pattern (the argument go test receives)",
+          "default": "./..."
+        }
+      ],
+      "timeout_secs": 1200,
+      "runtime": "go",
+      "sandbox": "optional",
+      "parameters_allowed": true
+    },
+    {
+      "id": "go",
+      "label": "go",
+      "description": "The go CLI itself, so a model can run a one-off subcommand (go env, go list) through run_command.",
+      "kind": "command",
+      "runtime": "go",
+      "sandbox": "optional"
+    }
+  ]
+}

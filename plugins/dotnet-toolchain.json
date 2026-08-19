@@ -1,0 +1,49 @@
+{
+  "manifest_version": 1,
+  "name": "dotnet-toolchain",
+  "version": "1.0.0",
+  "label": ".NET toolchain",
+  "description": "The dotnet CLI as a build check, a test check and a command. Run the build check for compiler diagnostics and the test check for failing tests — the two read different output and neither substitutes for the other.",
+  "categories": [
+    {
+      "id": "dotnet",
+      "label": ".NET",
+      "tools": ["dotnet-build", "dotnet-test", "dotnet"]
+    }
+  ],
+  "tools": [
+    {
+      "id": "dotnet-build",
+      "label": "dotnet build",
+      "description": "Builds the solution or project in the working directory and reports MSBuild's canonical file(line,col): error CODE: message diagnostics.",
+      "kind": "check",
+      "cmd": "dotnet build --nologo",
+      "parser": "dotnet",
+      "timeout_secs": 900,
+      "runtime": "dotnet",
+      "sandbox": "optional",
+      "parameters_allowed": true
+    },
+    {
+      "id": "dotnet-test",
+      "label": "dotnet test",
+      "description": "Runs the test projects and reports each failure at the source line its stack trace names. The test runner emits no diagnostics format cImp parses, so a build that fails under this tool shows up as a non-zero exit with no rows — run the build check for those.",
+      "kind": "check",
+      "cmd": "dotnet test --nologo",
+      "parser": "regex-custom",
+      "pattern": "^\\s*at (?P<message>.+) in (?P<file>.+):line (?P<line>\\d+)\\s*$",
+      "timeout_secs": 1800,
+      "runtime": "dotnet",
+      "sandbox": "optional",
+      "parameters_allowed": true
+    },
+    {
+      "id": "dotnet",
+      "label": "dotnet",
+      "description": "The dotnet CLI itself, for a one-off subcommand (dotnet --info, dotnet list package) through run_command.",
+      "kind": "command",
+      "runtime": "dotnet",
+      "sandbox": "optional"
+    }
+  ]
+}

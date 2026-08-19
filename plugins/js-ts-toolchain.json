@@ -1,0 +1,61 @@
+{
+  "manifest_version": 1,
+  "name": "js-ts-toolchain",
+  "version": "1.0.0",
+  "label": "JavaScript / TypeScript toolchain",
+  "description": "The type checker and the test runner as checks, plus npm and node as commands. Point each one at the binary you use — a node_modules/.bin shim is a normal answer.",
+  "categories": [
+    {
+      "id": "checks",
+      "label": "Type check and tests",
+      "tools": ["tsc", "vitest"]
+    },
+    {
+      "id": "cli",
+      "label": "Node CLIs",
+      "tools": ["npm", "node"]
+    }
+  ],
+  "tools": [
+    {
+      "id": "tsc",
+      "label": "tsc",
+      "description": "Type-checks the project without emitting, and reports the TypeScript compiler's diagnostics.",
+      "kind": "check",
+      "cmd": "tsc --noEmit --pretty false",
+      "parser": "tsc",
+      "timeout_secs": 600,
+      "runtime": "node",
+      "sandbox": "optional",
+      "parameters_allowed": true
+    },
+    {
+      "id": "vitest",
+      "label": "vitest",
+      "description": "Runs the suite once with the JSON reporter and reports each failing test from that document.",
+      "kind": "check",
+      "cmd": "vitest run --reporter=json",
+      "parser": "jest-json",
+      "timeout_secs": 900,
+      "runtime": "node",
+      "sandbox": "optional",
+      "parameters_allowed": true
+    },
+    {
+      "id": "npm",
+      "label": "npm",
+      "description": "The npm CLI, so a model can read the project's scripts or dependency tree through run_command.",
+      "kind": "command",
+      "runtime": "node",
+      "sandbox": "optional"
+    },
+    {
+      "id": "node",
+      "label": "node",
+      "description": "The Node runtime itself, for a one-off script or a --version probe through run_command.",
+      "kind": "command",
+      "runtime": "node",
+      "sandbox": "optional"
+    }
+  ]
+}

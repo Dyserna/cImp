@@ -1,0 +1,36 @@
+{
+  "manifest_version": 1,
+  "name": "python-toolchain",
+  "version": "1.0.0",
+  "label": "Python toolchain",
+  "description": "pytest as a check and the interpreter as a command. Point them at the binaries inside the virtualenv you actually use — cImp never picks an interpreter for you.",
+  "categories": [
+    {
+      "id": "python",
+      "label": "Python",
+      "tools": ["pytest", "python"]
+    }
+  ],
+  "tools": [
+    {
+      "id": "pytest",
+      "label": "pytest",
+      "description": "Runs the suite quietly and reports each failure from pytest's short test-summary section.",
+      "kind": "check",
+      "cmd": "pytest -q",
+      "parser": "pytest",
+      "timeout_secs": 900,
+      "runtime": "python",
+      "sandbox": "optional",
+      "parameters_allowed": true
+    },
+    {
+      "id": "python",
+      "label": "python",
+      "description": "The interpreter itself, for a one-off script or a -c probe through run_command.",
+      "kind": "command",
+      "runtime": "python",
+      "sandbox": "optional"
+    }
+  ]
+}

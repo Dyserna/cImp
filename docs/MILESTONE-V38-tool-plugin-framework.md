@@ -331,6 +331,41 @@ the storage location moves, not the capability.
   (blocking for "milestone done", per decision — written alongside C/D, not
   after).
 
+### Live-verify follow-ups (rc.1, 2026-08-19)
+
+Two defects the first live run found, and one user-ruled scope extension. All
+three are in the same code the phases above describe; they are recorded here
+because they changed the CONTRACT, not only the implementation.
+
+- **F-1 — a plugin check runs where its marker is.** The census matches
+  recursively, so the starter pack's `Cargo.toml`-gated rust checks applied to a
+  repo whose only manifest is `src-tauri/Cargo.toml` — and then ran at the root,
+  where `cargo build` exits 101 in 140 ms. The census now records the
+  **shallowest directory per marker** (ties lexicographic) and a rendered
+  `CheckDef` takes its `cwd` from it, unless the manifest declared one
+  (explicit beats inferred). One check, one directory: multi-instance monorepo
+  fan-out stays out of scope. Contract: [TOOL-PLUGINS.md § 3.5](TOOL-PLUGINS.md).
+- **F-2 — a failed check with zero diagnostics says why.** `run_check
+  cargo-build` answered `exit 101 · 140 ms — No diagnostics.`; the line that
+  explained it had been captured, handed to the `cargo-json` parser, found not
+  to be JSON and dropped. `CheckReport` now carries a bounded `raw_tail` (≤1 KB,
+  stderr's tail preferred) populated **iff** the exit was not zero AND the
+  parser produced no groups — the one case the structured report is mute — and
+  the renderer prints it under `raw output tail (unparsed):`.
+- **F-3 — `command`-kind tools reach the harnesses** *(user decision)*. The
+  "Registry semantics" bullet above said `command` entries feed `run_command`,
+  meaning the offload worker's. They now also reach Claude Code / OpenCode tabs
+  through the `cimp-offload` proxy: ONE MCP tool `run_command{tool, args}`,
+  `tool` an enum of the runnable entries (named by `run_check`'s rule), argv
+  spawn of the registered binary only — no shell, no allowlist arm, no PATH,
+  cwd = the project root and not model-controllable. Both surfaces share one
+  execution core (`offload::tools::run_command::run_resolved`), so the sandbox
+  posture, the minimal environment, the timeout, the caps and the denial rows
+  cannot drift between them. Exposure: `tool_plugins.expose_commands_claude` /
+  `…_opencode`, default on, hidden when nothing is runnable, re-checked at
+  dispatch, and folded into the `SurfaceFingerprint` so the Phase F native pulse
+  covers it.
+
 ## Live-verify (fresh tabs)
 
 1. Drop a valid plugin → appears in Tool Plugins after Rescan, tools inert;

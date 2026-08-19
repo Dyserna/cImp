@@ -1265,6 +1265,16 @@ impl GraphService {
             let root = super::mcp::find_graph_root(cwd, &sub).unwrap_or_else(|| cwd.to_path_buf());
             return super::mcp::run_check_tool(&root, &settings, source, args, tab).await;
         }
+        // V38 F-3: the warm twin of `handle_call`'s arm. This is the path a tab
+        // actually takes when the app is up (the child proxies `tools/call`
+        // here), so the exposure switch and the registry are read from the APP's
+        // live settings — which is what makes unchecking the box take effect on
+        // a running tab instead of at its next restart.
+        if name == "run_command" {
+            let root = super::mcp::find_graph_root(cwd, &sub).unwrap_or_else(|| cwd.to_path_buf());
+            return super::mcp::run_command_tool(&root, &settings, consumer, source, args, tab)
+                .await;
+        }
 
         let root = super::mcp::find_graph_root(cwd, &sub)
             .ok_or_else(|| format!("no code graph found from {}", cwd.display()))?;

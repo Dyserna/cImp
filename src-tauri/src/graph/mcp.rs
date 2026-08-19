@@ -323,6 +323,19 @@ pub fn tool_specs() -> Vec<GraphToolSpec> {
 /// `checks` being non-empty, so a project with checks configured but the
 /// graph off still gets it.
 pub fn tools() -> Vec<Value> {
+    tools_for("claude")
+}
+
+/// [`tools`] for one named consumer (`"claude"` / `"opencode"`).
+///
+/// V38 F-3 split the consumer out because the surface stopped being the same
+/// for both: `run_command` is advertised per consumer
+/// ([`crate::settings::ToolPluginsSettings::commands_exposed_to`]), so a
+/// consumer-blind builder would show a Claude tab what the user only enabled
+/// for OpenCode. The `--offload-mcp` child knows its own consumer (its
+/// `--consumer` argv) and calls this; [`tools`] keeps the old signature for the
+/// app-side surface measurement, which reports the Claude view.
+pub fn tools_for(consumer: &str) -> Vec<Value> {
     let settings = current_settings();
     let mut specs: Vec<GraphToolSpec> = Vec::new();
     if settings.graph.enabled {
@@ -345,6 +358,14 @@ pub fn tools() -> Vec<Value> {
     let names = crate::checks::plugin::effective_check_names(&settings);
     if !names.is_empty() {
         specs.push(run_check_spec_from(&names));
+    }
+    // V38 F-3: `command`-kind registry entries, as one tool with an enum. Two
+    // gates, both of which must hold — the user's per-consumer exposure switch,
+    // and a non-empty runnable set. A tool advertised with an empty enum is a
+    // capability that cannot be used, which is worse than an absent one.
+    let commands = command_tool_names(&settings);
+    if commands_advertised(&settings, consumer, &commands) {
+        specs.push(run_command_spec_from(&commands));
     }
     lean_filter(specs, settings.graph.lean_tools)
         .into_iter()
@@ -405,6 +426,22 @@ struct SurfaceFingerprint {
     embed_code_bodies: bool,
     lean_tools: bool,
     checks_sig: u64,
+    /// **V38 F-3** — `run_command`'s two inputs, hashed together: the two
+    /// per-consumer exposure switches and the runnable `command`-kind names.
+    ///
+    /// Both halves move the advertised bytes, and only together: flipping a
+    /// switch adds or removes a whole tool, and configuring a command tool's
+    /// path adds a value to its enum. Folding them into ONE component (rather
+    /// than adding three fields) keeps this type's rule intact — it is a
+    /// fingerprint, not a mirror of the settings — while `native_surface_sig`
+    /// gets exactly what it needs: a value that changes iff a session's
+    /// advertised list would.
+    ///
+    /// Both consumers' switches are hashed even though [`tools_for`] reads one:
+    /// the pulse is per PROCESS, not per consumer, and a fingerprint that
+    /// ignored the other half would leave an OpenCode session's surface moving
+    /// with nothing to notice it.
+    commands_sig: u64,
 }
 
 impl SurfaceFingerprint {
@@ -415,6 +452,7 @@ impl SurfaceFingerprint {
             embed_code_bodies: settings.graph.embed_code_bodies,
             lean_tools: settings.graph.lean_tools,
             checks_sig: checks_sig(settings),
+            commands_sig: commands_sig(settings),
         }
     }
 }
@@ -426,6 +464,51 @@ fn checks_sig(settings: &crate::settings::Settings) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     let names = crate::checks::plugin::effective_check_names(settings);
+    names.len().hash(&mut h);
+    for name in &names {
+        name.hash(&mut h);
+    }
+    h.finish()
+}
+
+/// **V38 F-3 — whether `run_command` is listed for this consumer at all.**
+///
+/// Two gates, ANDed, and the second is why the first can default to on:
+///
+/// * the user's per-consumer exposure switch, and
+/// * a non-empty runnable set — a tool advertised with an empty `tool` enum is
+///   a capability nobody can use and a schema nobody can satisfy, which is
+///   strictly worse than an absent tool.
+///
+/// Pure, and separate from [`tools_for`], so both directions of both gates are
+/// assertable without a plugins directory or a live settings file.
+fn commands_advertised(
+    settings: &crate::settings::Settings,
+    consumer: &str,
+    names: &[String],
+) -> bool {
+    settings.tool_plugins.commands_exposed_to(consumer) && !names.is_empty()
+}
+
+/// The advertised `tool` enum for `run_command` — the runnable `command`-kind
+/// registry entries, by their advertised names. Empty ⇒ the tool is not
+/// advertised at all (see [`tools_for`]).
+fn command_tool_names(settings: &crate::settings::Settings) -> Vec<String> {
+    crate::offload::tools::run_command::advertised_commands_live(settings)
+        .into_iter()
+        .map(|c| c.name)
+        .collect()
+}
+
+/// Hash both halves of `run_command`'s advertisement — see
+/// [`SurfaceFingerprint::commands_sig`]. Process-local memo/pulse key only, so
+/// `DefaultHasher`'s unstable-across-releases hash is fine.
+fn commands_sig(settings: &crate::settings::Settings) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    settings.tool_plugins.expose_commands_claude.hash(&mut h);
+    settings.tool_plugins.expose_commands_opencode.hash(&mut h);
+    let names = command_tool_names(settings);
     names.len().hash(&mut h);
     for name in &names {
         name.hash(&mut h);
@@ -592,6 +675,27 @@ pub async fn handle_call(
         return match run_check_tool(
             &root,
             &settings,
+            source,
+            &args,
+            crate::activity::Attribution::from_child_argv(tab),
+        )
+        .await
+        {
+            Ok(text) => Ok(json!({ "content": [{ "type": "text", "text": text }] })),
+            Err(msg) => Ok(tool_error(&msg)),
+        };
+    }
+
+    // V38 F-3: same shape, same reasons — a registered command tool needs a
+    // project root and no index. It sits below `headless_refusal` for the same
+    // reason `run_check` does, and more sharply: this one spawns a binary the
+    // model named by tool id, which is the definition of LOCAL-CAPABILITY.
+    if name == "run_command" {
+        let root = find_graph_root(&cwd, &sub).unwrap_or(cwd);
+        return match run_command_tool(
+            &root,
+            &settings,
+            consumer,
             source,
             &args,
             crate::activity::Attribution::from_child_argv(tab),
@@ -1628,6 +1732,141 @@ fn run_check_spec_from(names: &[String]) -> GraphToolSpec {
     }
 }
 
+/// **V38 F-3 — the `run_command` tool spec for the harness surface.**
+///
+/// One tool, whose `tool` parameter is an enum of this project's runnable
+/// `command`-kind registry entries. The shape mirrors [`run_check_spec_from`]
+/// deliberately: a project-scoped enum the caller can read, `required` because
+/// there is no sole-entry fallback, and a description that says what the caller
+/// cannot otherwise know — that the binary is the user's, that there is no
+/// shell, and that the working directory is not theirs to choose.
+///
+/// The pure half again (names in, schema out), for the same reason: [`tools_for`]
+/// needs the names to decide whether to advertise at all, and computing them
+/// twice would let a path configured between the two reads advertise a tool
+/// whose enum does not mention it.
+fn run_command_spec_from(names: &[String]) -> GraphToolSpec {
+    let enum_values: Vec<Value> = names.iter().map(|n| Value::String(n.clone())).collect();
+    GraphToolSpec {
+        name: "run_command",
+        description: "Run one of this project's registered command tools (a plugin `command`-kind \
+            entry the user enabled and pointed at a binary) and get back its exit code and \
+            output. `tool` selects among them — the `tool` enum in this schema is the exact \
+            list — and `args` is passed to the program as an ARGV vector: there is no shell, so \
+            no redirection, pipes, globs or `&&`. Which binary runs is fixed by the user's \
+            configuration and is never model-supplied, and the command always runs in the \
+            project root.",
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "tool": {
+                    "type": "string",
+                    "description": format!(
+                        "REQUIRED — which registered command tool to run. This project has {}: {}.",
+                        names.len(),
+                        names.join(", ")
+                    ),
+                    "enum": Value::Array(enum_values),
+                },
+                "args": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Arguments, one array element per argv entry (no shell)."
+                }
+            },
+            "required": ["tool"]
+        }),
+    }
+}
+
+/// Dispatch `run_command` on the harness surface: run the named registry entry
+/// at the project root and record the call, in the same shape and the same lane
+/// as [`run_check_tool`].
+///
+/// Records the row itself for the same reason `run_check` does — it bypasses
+/// [`dispatch_recorded`], which requires an open [`GraphIndex`] this tool has no
+/// use for. `ActivityKind::Graph` and the `Graph` screen are the lane both share
+/// (they are the same MCP surface); nothing about a command run is graph-shaped
+/// except where it is served from.
+pub(crate) async fn run_command_tool(
+    root: &Path,
+    settings: &crate::settings::Settings,
+    consumer: &str,
+    source: &str,
+    args: &Value,
+    tab: crate::activity::Attribution,
+) -> Result<String, String> {
+    let started = crate::activity::now_ms();
+    let result = run_command_inner(root, settings, consumer, args).await;
+    crate::activity::record_bg(crate::activity::ActivityRecord {
+        entry: crate::activity::ActivityEntry::new(
+            crate::activity::ActivityKind::Graph,
+            started,
+            crate::activity::root_key(root),
+            source.to_string(),
+            "run_command".to_string(),
+            args.get("tool")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            result.as_ref().map(|t| t.chars().count()).unwrap_or(0),
+            crate::activity::now_ms().saturating_sub(started),
+            result.is_ok(),
+            tab,
+            None,
+            None,
+            None,
+        ),
+        request: serde_json::to_string_pretty(args).unwrap_or_default(),
+        response: activity_response(&result),
+    });
+    result
+}
+
+async fn run_command_inner(
+    root: &Path,
+    settings: &crate::settings::Settings,
+    consumer: &str,
+    args: &Value,
+) -> Result<String, String> {
+    // The exposure switch is re-checked at DISPATCH, not only at advertisement.
+    // A tab holds the tool list it was given at connect (OpenCode caches it
+    // outright), so a user who unchecks the box would otherwise keep serving
+    // calls from every session already running — the `code_audit` exposure
+    // flags' per-run re-check, for the same reason.
+    if !settings.tool_plugins.commands_exposed_to(consumer) {
+        return Err(
+            "run_command is not exposed to this consumer — re-enable it under Settings → Tool \
+             Plugins if you meant to allow it"
+                .to_string(),
+        );
+    }
+    let tool = args.get("tool").and_then(|v| v.as_str()).unwrap_or("");
+    // Model-supplied argv, taken as strings and nothing else: a non-string
+    // element is refused rather than stringified, because `["--flag", 7]` is a
+    // caller mistake and guessing at it is how an argument silently changes
+    // meaning.
+    let argv: Vec<String> = match args.get("args") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(items)) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                match item.as_str() {
+                    Some(s) => out.push(s.to_string()),
+                    None => {
+                        return Err(
+                            "run_command: every element of `args` must be a string".to_string()
+                        )
+                    }
+                }
+            }
+            out
+        }
+        Some(_) => return Err("run_command: `args` must be an array of strings".to_string()),
+    };
+    crate::offload::tools::run_command::run_registered(root, settings, tool, &argv).await
+}
+
 /// Dispatch `run_check`: look up the named (or sole) configured [`CheckDef`],
 /// run it, and format the result. Deliberately bypasses [`dispatch_recorded`]
 /// (which requires an already-open [`GraphIndex`]) — `run_check` touches
@@ -1791,6 +2030,21 @@ fn fmt_check_report(report: &crate::checks::CheckReport, max_rows: usize) -> Str
     );
     if report.groups.is_empty() {
         out.push_str("No diagnostics.");
+        // V38 F-2: …and, when the run FAILED, the last lines of what it actually
+        // printed. `exit 101 · 140 ms — No diagnostics.` was the whole answer a
+        // live `run_check cargo-build` gave, while the line that explained it
+        // ("could not find `Cargo.toml` in … or any parent directory") had been
+        // parsed by a JSON parser, found not to be JSON, and dropped. The report
+        // is only mute in this one branch, so this is the only place that needs
+        // to speak.
+        //
+        // Labeled UNPARSED so the reader knows this is the tool's own text and
+        // not cImp's structure: everything above this line came through a parser
+        // and a dedup, and this did not.
+        if let Some(tail) = report.raw_tail.as_deref() {
+            out.push_str("\nraw output tail (unparsed):\n");
+            out.push_str(tail);
+        }
         return out;
     }
     let mut lines: Vec<String> = report
@@ -3095,6 +3349,136 @@ mod run_check_tests {
         assert_eq!(spec.parameters["properties"]["name"]["enum"], json!(null));
     }
 
+    // ── V38 F-3: the `run_command` surface ─────────────────────────────────
+
+    /// **The listing gate, both directions of both halves.** The tool is hidden
+    /// when the consumer's switch is off, and hidden when nothing is runnable —
+    /// and the switches are per consumer, so one tab's choice never decides the
+    /// other's.
+    #[test]
+    fn the_command_tool_is_listed_only_when_exposed_and_runnable() {
+        let names = vec!["svn".to_string()];
+        let s = Settings::default();
+        assert!(super::commands_advertised(&s, "claude", &names));
+        assert!(super::commands_advertised(&s, "opencode", &names));
+        // Nothing runnable ⇒ hidden for everyone, whatever the switches say.
+        assert!(!super::commands_advertised(&s, "claude", &[]));
+        assert!(!super::commands_advertised(&s, "opencode", &[]));
+
+        let mut off_for_claude = Settings::default();
+        off_for_claude.tool_plugins.expose_commands_claude = false;
+        assert!(!super::commands_advertised(&off_for_claude, "claude", &names));
+        assert!(
+            super::commands_advertised(&off_for_claude, "opencode", &names),
+            "the two switches are independent"
+        );
+
+        let mut off_for_opencode = Settings::default();
+        off_for_opencode.tool_plugins.expose_commands_opencode = false;
+        assert!(!super::commands_advertised(&off_for_opencode, "opencode", &names));
+        assert!(super::commands_advertised(&off_for_opencode, "claude", &names));
+
+        // An unrecognized consumer reads as Claude, the same way
+        // `source_for_consumer` classifies it — one mapping, not two.
+        assert!(super::commands_advertised(&off_for_opencode, "", &names));
+        assert!(!super::commands_advertised(&off_for_claude, "", &names));
+    }
+
+    /// The advertised schema enumerates exactly the runnable tools, and `tool`
+    /// is REQUIRED — there is no sole-entry fallback on this surface.
+    #[test]
+    fn the_command_spec_enumerates_the_runnable_tools() {
+        let spec = super::run_command_spec_from(&["svn".to_string(), "acme@1.0.0/hg".to_string()]);
+        assert_eq!(spec.name, "run_command");
+        assert_eq!(spec.parameters["required"], json!(["tool"]));
+        assert_eq!(
+            spec.parameters["properties"]["tool"]["enum"],
+            json!(["svn", "acme@1.0.0/hg"])
+        );
+        // The description tells the caller the two things it cannot see: there
+        // is no shell, and the working directory is not its to choose.
+        assert!(spec.description.contains("no shell"), "{}", spec.description);
+        assert!(
+            spec.description.contains("project root"),
+            "{}",
+            spec.description
+        );
+        assert_eq!(
+            spec.parameters["properties"]["args"]["items"]["type"],
+            json!("string")
+        );
+    }
+
+    /// The pulse gate must move when this surface moves: flipping either switch
+    /// changes the advertised list for one consumer, and a fingerprint that
+    /// stood still would leave every live session showing the old one.
+    #[test]
+    fn surface_fingerprint_tracks_the_command_exposure_switches() {
+        let base = super::SurfaceFingerprint::of(&Settings::default());
+        let mut claude_off = Settings::default();
+        claude_off.tool_plugins.expose_commands_claude = false;
+        let mut opencode_off = Settings::default();
+        opencode_off.tool_plugins.expose_commands_opencode = false;
+        assert_ne!(base, super::SurfaceFingerprint::of(&claude_off));
+        assert_ne!(base, super::SurfaceFingerprint::of(&opencode_off));
+        assert_ne!(
+            super::SurfaceFingerprint::of(&claude_off),
+            super::SurfaceFingerprint::of(&opencode_off),
+            "the two switches must not hash to the same value"
+        );
+        // …and the pulse's own value is derived from it, so it moves too.
+        assert_ne!(
+            super::native_surface_sig(&Settings::default()),
+            super::native_surface_sig(&claude_off)
+        );
+    }
+
+    /// The dispatch re-checks the exposure switch. A tab holds the tool list it
+    /// was given at connect (OpenCode caches it outright), so unchecking the box
+    /// has to stop the CALL, not only the next listing.
+    #[tokio::test]
+    async fn a_call_is_refused_when_the_consumer_is_not_exposed() {
+        let mut settings = Settings::default();
+        settings.tool_plugins.expose_commands_claude = false;
+        let err = super::run_command_inner(
+            &std::env::temp_dir(),
+            &settings,
+            "claude",
+            &json!({ "tool": "svn" }),
+        )
+        .await
+        .expect_err("an unexposed consumer must be refused at dispatch");
+        assert!(err.contains("not exposed"), "{err}");
+        assert!(err.contains("Tool Plugins"), "{err}");
+    }
+
+    /// `args` is an argv vector, and a non-string element is a caller mistake
+    /// rather than something to stringify: guessing is how an argument silently
+    /// changes meaning.
+    #[tokio::test]
+    async fn a_non_string_argv_element_is_refused() {
+        let settings = Settings::default();
+        let err = super::run_command_inner(
+            &std::env::temp_dir(),
+            &settings,
+            "claude",
+            &json!({ "tool": "svn", "args": ["--flag", 7] }),
+        )
+        .await
+        .expect_err("a number is not an argv element");
+        assert!(err.contains("must be a string"), "{err}");
+
+        let err = super::run_command_inner(
+            &std::env::temp_dir(),
+            &settings,
+            "claude",
+            &json!({ "tool": "svn", "args": "--flag" }),
+        )
+        .await
+        .expect_err("a bare string is not an argv vector");
+        assert!(err.contains("array of strings"), "{err}");
+    }
+
     /// The advertised bytes now depend on the check NAMES, so the memo key must
     /// too — renaming a check with the count unchanged has to invalidate the
     /// cache, which the old `has_checks: bool` could not see.
@@ -3151,13 +3535,30 @@ mod run_check_tests {
             let end = rest.find("\n}").unwrap_or(rest.len());
             rest[..end].to_string()
         };
-        for sig in ["fn checks_sig(", "pub fn tools()"] {
+        // `tools_for` and not `tools`: V38 F-3 made the builder consumer-aware,
+        // and `tools()` is now a one-line delegation to it. The invariant did not
+        // move — the body that decides what is advertised did.
+        for sig in ["fn checks_sig(", "pub fn tools_for("] {
             let body = body_of(sig);
             assert!(
                 body.contains("effective_check_names"),
                 "`{sig}` must read the effective check set (settings.checks ∪ plugin checks), \
                  or a plugin enable/rescan changes the advertised surface without moving the \
                  fingerprint that gates it"
+            );
+            // V38 F-3, the same invariant for the second project-dynamic tool:
+            // the gate in `tools_for` and the memo/pulse key in `commands_sig`
+            // must read the runnable `command`-kind set through ONE function, or
+            // configuring a command tool's path moves the advertised bytes
+            // without moving the fingerprint that would tell a live session.
+            let sig = if sig == "fn checks_sig(" {
+                "fn commands_sig("
+            } else {
+                sig
+            };
+            assert!(
+                body_of(sig).contains("command_tool_names"),
+                "`{sig}` must read the runnable command-tool set"
             );
         }
         assert!(
@@ -3250,6 +3651,7 @@ mod run_check_tests {
             ],
             stdout_bytes: 0,
             stderr_bytes: 0,
+            raw_tail: None,
         };
         let out = fmt_check_report(&report, 1);
         assert!(out.starts_with("cargo — exit 1 · 42 ms"), "{out}");
@@ -3270,9 +3672,55 @@ mod run_check_tests {
             groups: vec![],
             stdout_bytes: 0,
             stderr_bytes: 0,
+            raw_tail: None,
         };
         let out = fmt_check_report(&report, 50);
         assert!(out.contains("No diagnostics."), "{out}");
+    }
+
+    /// V38 F-2 — the mute branch is the one that speaks. A failed check with no
+    /// groups renders its raw tail under a label that says the text is the
+    /// tool's own and not cImp's structure; a report without a tail is
+    /// byte-identical to what it always was.
+    #[test]
+    fn fmt_check_report_shows_the_raw_tail_only_when_there_is_one() {
+        let base = CheckReport {
+            name: "cargo-build".into(),
+            exit_code: Some(101),
+            duration_ms: 140,
+            timed_out: false,
+            groups: vec![],
+            stdout_bytes: 0,
+            stderr_bytes: 96,
+            raw_tail: Some(
+                "error: could not find `Cargo.toml` in `C:\\proj` or any parent directory".into(),
+            ),
+        };
+        let out = fmt_check_report(&base, 50);
+        assert!(out.contains("No diagnostics."), "{out}");
+        assert!(out.contains("raw output tail (unparsed):"), "{out}");
+        assert!(out.contains("could not find `Cargo.toml`"), "{out}");
+
+        let silent = CheckReport {
+            raw_tail: None,
+            ..base.clone()
+        };
+        assert!(!fmt_check_report(&silent, 50).contains("raw output tail"));
+
+        // A report WITH diagnostics never grows the section: the tail exists to
+        // fill a gap, and there is no gap here. (`run` would not populate it in
+        // this shape either — this pins the renderer's half of the rule.)
+        let with_groups = CheckReport {
+            groups: vec![DiagGroup {
+                key: "k".into(),
+                severity: Severity::Error,
+                message: "boom".into(),
+                count: 1,
+                sites: vec![("src/a.rs".into(), 1)],
+            }],
+            ..base
+        };
+        assert!(!fmt_check_report(&with_groups, 50).contains("raw output tail"));
     }
 
     #[test]
@@ -3285,6 +3733,7 @@ mod run_check_tests {
             groups: vec![],
             stdout_bytes: 0,
             stderr_bytes: 0,
+            raw_tail: None,
         };
         let out = fmt_check_report(&report, 50);
         assert!(out.contains("TIMED OUT"), "{out}");
@@ -4925,6 +5374,10 @@ mod headless_capability_boundary_tests {
         // Executes the project's configured build/test/lint commands. The one
         // M-8 names, and the sharpest: it is process execution.
         "run_check",
+        // V38 F-3 — sharper still: it spawns a registered `command`-kind tool's
+        // binary with a model-supplied argv. It joins this surface with this
+        // milestone, so it joins this list with it.
+        "run_command",
         // Return repo SOURCE TEXT (the H-1 demotions and their neighbours).
         "graph_snippet",
         "graph_search_docs",
@@ -4948,7 +5401,7 @@ mod headless_capability_boundary_tests {
             .iter()
             .filter(|r| r.class == ToolClass::LocalCapability)
             .map(|r| r.name)
-            .filter(|n| n.starts_with("graph_") || *n == "run_check")
+            .filter(|n| n.starts_with("graph_") || *n == "run_check" || *n == "run_command")
             .collect();
         from_table.sort_unstable();
         let mut named = HEADLESS_LOCAL_CAPABILITY.to_vec();

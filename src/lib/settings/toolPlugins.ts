@@ -585,7 +585,15 @@ export function siblingAutoFillTargets(plugin: PluginRow, tool: ToolRow): ToolRo
 /// against an older backend would otherwise throw on the first click rather
 /// than degrade — and an empty container is exactly the right fallback.
 function container(settings: Settings): Settings['tool_plugins'] {
-  return (settings.tool_plugins ??= { plugins: {}, project_paths: {}, global_paths: {} });
+  return (settings.tool_plugins ??= {
+    plugins: {},
+    project_paths: {},
+    global_paths: {},
+    // Same defaults as the backend's `ToolPluginsSettings::default()` — this
+    // branch only fires for a snapshot that predates the container entirely.
+    expose_commands_claude: true,
+    expose_commands_opencode: true,
+  });
 }
 
 function pluginEntry(settings: Settings, pluginKey: string): PluginState {

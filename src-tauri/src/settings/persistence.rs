@@ -1222,6 +1222,19 @@ fn sync_tool_plugin_state_into(disk_global: &mut Settings, current: &Settings) -
         disk_global.tool_plugins.project_paths = cur.project_paths.clone();
         changed = true;
     }
+    // V38 F-3: the two `command`-kind exposure switches. Machine scope like the
+    // enables above, so this is the ONLY place a UI toggle of them can land —
+    // the overlay strip (an allow-list) drops them from a project diff, and
+    // without this line the checkbox would flip in memory and be gone on the
+    // next launch.
+    if disk_global.tool_plugins.expose_commands_claude != cur.expose_commands_claude {
+        disk_global.tool_plugins.expose_commands_claude = cur.expose_commands_claude;
+        changed = true;
+    }
+    if disk_global.tool_plugins.expose_commands_opencode != cur.expose_commands_opencode {
+        disk_global.tool_plugins.expose_commands_opencode = cur.expose_commands_opencode;
+        changed = true;
+    }
     for (plugin_key, live) in &cur.plugins {
         let disk = disk_global
             .tool_plugins

@@ -397,7 +397,13 @@ async fn handle(method: &str, params: Value) -> Result<Value, (i64, String)> {
             }
             // V9-01 code-knowledge-graph tools (present only when the graph
             // feature is enabled for this project).
-            tools.extend(crate::graph::mcp_tools());
+            //
+            // V38 F-3: built FOR THIS CONSUMER. `run_command`'s advertisement is
+            // per-consumer (Settings → Tool Plugins has one switch for Claude
+            // Code and one for OpenCode), and this child knows which one it
+            // serves from its own `--consumer` argv — the same identity it
+            // already passes on every `tools/call`.
+            tools.extend(crate::graph::mcp_tools_for(consumer()));
             // Claude-Code-exposed MCP servers (those with `claude_access`),
             // proxied through the app's warm host. Empty when the app is down.
             tools.extend(proxy_mcp_list().await);
@@ -405,7 +411,16 @@ async fn handle(method: &str, params: Value) -> Result<Value, (i64, String)> {
         }
         "tools/call" => {
             let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
-            if name.starts_with("graph_") || name.starts_with("context_") || name == "run_check" {
+            // V38 F-3 adds `run_command` to this set. It is not a graph tool and
+            // never was one — like `run_check` it simply lives on this dispatch
+            // surface, and it MUST be routed here rather than falling through to
+            // `handle_tools_call` (which serves `offload_task` alone and would
+            // answer a perfectly valid call with "unknown tool").
+            if name.starts_with("graph_")
+                || name.starts_with("context_")
+                || name == "run_check"
+                || name == "run_command"
+            {
                 // Graph + session-memory tools, plus `run_check` (V12 Phase A —
                 // independent of the graph, but shares this dispatch surface).
                 // Warm path: let the app's single index serve it (no second

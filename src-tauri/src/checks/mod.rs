@@ -275,6 +275,26 @@ pub struct CheckReport {
     /// `run_check` MCP renderer (`graph::mcp::fmt_check_report`).
     pub stdout_bytes: usize,
     pub stderr_bytes: usize,
+    /// **V38 F-2: the last few lines of raw output, kept only when the report
+    /// would otherwise say nothing at all.**
+    ///
+    /// The live defect: `run_check cargo-build` answered
+    /// `exit 101 · 140 ms — No diagnostics.` The one line that explained it
+    /// (`error: could not find `Cargo.toml` in … or any parent directory`) had
+    /// been captured, handed to the `cargo-json` parser, ignored as non-JSON and
+    /// dropped. A report that is mute about a FAILURE is worse than a raw dump:
+    /// it reads as "the check ran and found nothing".
+    ///
+    /// Populated **iff** the exit was not a clean zero AND the parser produced
+    /// no groups — the one case where the structured report carries no
+    /// information. A failing check whose diagnostics parsed fine already
+    /// explains itself, and a clean run has nothing to explain, so neither pays
+    /// the bytes. Capped at [`MAX_RAW_TAIL_BYTES`]; stderr's tail is preferred
+    /// over stdout's, because that is where a tool that failed to start says so.
+    ///
+    /// `Option` and not `String`: "no tail" and "an empty tail" are different
+    /// facts, and only the first means "this branch did not apply".
+    pub raw_tail: Option<String>,
 }
 
 /// V22 Phase E: the `checks_test` dry-run result the ChecksEditor renders
@@ -556,6 +576,15 @@ pub async fn run_with_posture(
         cap_sites(&mut g.sites, root, changed.as_ref());
     }
 
+    // F-2: the explaining tail, and ONLY for the mute case — see
+    // [`CheckReport::raw_tail`]. Computed here because this is the last point at
+    // which the raw streams and the parsed groups both exist.
+    let raw_tail = if matches!(exit_code, Some(0)) || !groups.is_empty() {
+        None
+    } else {
+        raw_tail(&stdout, &stderr)
+    };
+
     Ok(CheckReport {
         name: def.name.clone(),
         exit_code,
@@ -564,7 +593,49 @@ pub async fn run_with_posture(
         groups,
         stdout_bytes,
         stderr_bytes,
+        raw_tail,
     })
+}
+
+/// Cap on the raw tail a mute failure carries back ([`CheckReport::raw_tail`]).
+///
+/// Small on purpose. This is not a fallback dump — the parser output is still
+/// the product, and a check that floods stderr with a megabyte of progress bars
+/// must not turn a 5-line report into a transcript. A kilobyte holds the dozen
+/// lines a build system prints when it refuses to start, which is the whole
+/// population this exists for.
+pub(crate) const MAX_RAW_TAIL_BYTES: usize = 1024;
+
+/// The last [`MAX_RAW_TAIL_BYTES`] of the run's output: stderr's tail when
+/// stderr said anything, else stdout's. `None` when the command printed nothing
+/// at all — a silent failure has no tail to show, and an empty string would
+/// render as a label with nothing under it.
+///
+/// The TAIL and not the head: a tool that fails prints its reason last (the
+/// summary line, the fatal error), while the head is the banner. Cut on a char
+/// boundary and then forward to the next line break when one is near, so the
+/// fragment starts at a line rather than mid-token.
+fn raw_tail(stdout: &str, stderr: &str) -> Option<String> {
+    let source = if stderr.trim().is_empty() { stdout } else { stderr };
+    let source = source.trim_end();
+    if source.is_empty() {
+        return None;
+    }
+    if source.len() <= MAX_RAW_TAIL_BYTES {
+        return Some(source.to_string());
+    }
+    // Char-boundary-safe cut at the cap, then advance past the first newline so
+    // the tail begins at a whole line.
+    let mut start = source.len() - MAX_RAW_TAIL_BYTES;
+    while start < source.len() && !source.is_char_boundary(start) {
+        start += 1;
+    }
+    let cut = &source[start..];
+    let tail = match cut.find('\n') {
+        Some(nl) => &cut[nl + 1..],
+        None => cut,
+    };
+    Some(tail.to_string())
 }
 
 /// Group raw diagnostics by `(severity, code, normalized message)`, folding
@@ -2179,6 +2250,110 @@ mod tests {
         ).await.expect("run");
         assert_eq!(report.exit_code, Some(0));
         assert!(!report.timed_out);
+    }
+
+    /// **V38 F-2 — a failed check with zero diagnostics says why.**
+    ///
+    /// The live shape, reproduced: a command that fails and prints a plain-text
+    /// reason, read by a parser that decodes JSON. The parser is right to yield
+    /// nothing; the report was wrong to say nothing.
+    #[tokio::test]
+    async fn a_mute_failure_carries_the_raw_tail() {
+        #[cfg(windows)]
+        let cmd = "echo could not find Cargo.toml in this directory 1>&2 & exit /b 101";
+        #[cfg(not(windows))]
+        let cmd = "echo could not find Cargo.toml in this directory 1>&2; exit 101";
+        let def = CheckDef {
+            name: "cargo-build".into(),
+            cmd: cmd.into(),
+            parser: ParserKind::CargoJson,
+            timeout_secs: 30,
+            ..Default::default()
+        };
+        let report = run(
+            &std::env::temp_dir(),
+            &def,
+            false,
+            &crate::sandbox::SandboxCfg::disabled(),
+        )
+        .await
+        .expect("run");
+        assert_eq!(report.exit_code, Some(101));
+        assert!(report.groups.is_empty(), "the parser decodes nothing here");
+        let tail = report
+            .raw_tail
+            .as_deref()
+            .expect("a failure with no diagnostics must carry its own explanation");
+        assert!(tail.contains("could not find Cargo.toml"), "{tail}");
+    }
+
+    /// The two cases that must carry NOTHING new: a clean run has nothing to
+    /// explain, and a failure whose diagnostics parsed already explains itself.
+    #[tokio::test]
+    async fn a_clean_run_and_a_parsed_failure_carry_no_tail() {
+        let clean = CheckDef {
+            name: "clean".into(),
+            cmd: "echo nothing to see here".into(),
+            parser: ParserKind::CargoJson,
+            timeout_secs: 30,
+            ..Default::default()
+        };
+        let report = run(
+            &std::env::temp_dir(),
+            &clean,
+            false,
+            &crate::sandbox::SandboxCfg::disabled(),
+        )
+        .await
+        .expect("run");
+        assert_eq!(report.exit_code, Some(0));
+        assert_eq!(report.raw_tail, None, "a clean run has nothing to explain");
+
+        // Fails AND parses: `generic-gcc` decodes the `file:line: message` shape,
+        // so the report is already informative and the tail would be noise.
+        #[cfg(windows)]
+        let cmd = "echo src/a.rs:1: error: boom & exit /b 1";
+        #[cfg(not(windows))]
+        let cmd = "echo src/a.rs:1: error: boom; exit 1";
+        let parsed = CheckDef {
+            name: "parsed".into(),
+            cmd: cmd.into(),
+            parser: ParserKind::GenericGcc,
+            timeout_secs: 30,
+            ..Default::default()
+        };
+        let report = run(
+            &std::env::temp_dir(),
+            &parsed,
+            false,
+            &crate::sandbox::SandboxCfg::disabled(),
+        )
+        .await
+        .expect("run");
+        assert!(!report.groups.is_empty(), "the parser decoded this one");
+        assert_eq!(report.raw_tail, None);
+    }
+
+    /// The tail is bounded, prefers stderr, and starts at a line boundary — the
+    /// three properties that keep it from becoming an unbounded raw dump.
+    #[test]
+    fn the_raw_tail_is_bounded_and_line_aligned() {
+        assert_eq!(raw_tail("", ""), None, "a silent failure has no tail");
+        assert_eq!(
+            raw_tail("out", "   \n").as_deref(),
+            Some("out"),
+            "whitespace-only stderr falls through to stdout"
+        );
+        assert_eq!(raw_tail("out", "err").as_deref(), Some("err"));
+
+        let flood: String = (0..2000).map(|i| format!("line {i}\n")).collect();
+        let tail = raw_tail("", &flood).expect("some tail");
+        assert!(tail.len() <= MAX_RAW_TAIL_BYTES, "{} bytes", tail.len());
+        assert!(tail.ends_with("line 1999"), "the TAIL, not the head: {tail}");
+        assert!(
+            tail.starts_with("line "),
+            "the cut lands on a line boundary: {tail}"
+        );
     }
 
     /// The TS mirror of this module's wire types, embedded at compile time so a

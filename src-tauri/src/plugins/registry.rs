@@ -361,6 +361,38 @@ pub fn runnable_tools(
         .collect()
 }
 
+/// **The** model-facing name for one plugin tool, given what is already taken.
+///
+/// The manifest-local id first (short, authored, and what a user reading the
+/// settings pane sees), then the fully-qualified `name@version/tool-id` key,
+/// then the key with a counter. Total by construction: the loop cannot run out
+/// of candidates, so there is no "and otherwise drop it" branch for a name clash
+/// to fall into.
+///
+/// Shared rather than per-surface (V38 F-3 moved it here from
+/// `checks::plugin`). Two surfaces now advertise plugin tools by name —
+/// `run_check`'s `name` enum and `run_command`'s `tool` enum — and a second copy
+/// of "which spelling wins a collision" is how one surface ends up advertising a
+/// name the other cannot resolve. The `taken` list is the caller's, because what
+/// counts as taken differs per surface: `run_check` lays down the user's own
+/// `settings.checks` first (a plugin may never shadow a configured check), while
+/// the command surface has only its own population to collide with.
+pub fn advertised_name(tool: &EffectiveTool, taken: &[&str]) -> String {
+    if !taken.contains(&tool.tool_id.as_str()) {
+        return tool.tool_id.clone();
+    }
+    if !taken.contains(&tool.tool_key.as_str()) {
+        return tool.tool_key.clone();
+    }
+    for n in 2u32.. {
+        let candidate = format!("{}#{n}", tool.tool_key);
+        if !taken.contains(&candidate.as_str()) {
+            return candidate;
+        }
+    }
+    unreachable!("the counter is unbounded")
+}
+
 /// The category a tool is filed under. Validation guarantees a partition (every
 /// tool in exactly one), so the fallback can only be reached by a manifest that
 /// did not come through [`super::manifest::validate`] — and an empty string is

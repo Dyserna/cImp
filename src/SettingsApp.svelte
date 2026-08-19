@@ -6749,6 +6749,46 @@
             override and the declared variables are per project.
           </small>
 
+          <h3>Command tools in AI tabs</h3>
+          <small class="hint">
+            Let Claude Code / OpenCode tabs run this project's
+            <strong>command</strong> tools through the
+            <code>run_command</code> MCP tool — the enabled ones with a path set,
+            and nothing else. It runs the registered binary directly with the
+            arguments the model passes (no shell) in the project root. Hidden
+            while no command tool is runnable. OpenCode caches its tool list at
+            connect, so a change here shows up there only after a tab restart
+            (Tabs → Restart).
+          </small>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.tool_plugins?.expose_commands_claude ?? true}
+              onchange={(e) =>
+                patch(
+                  (s) =>
+                    (s.tool_plugins.expose_commands_claude = (
+                      e.currentTarget as HTMLInputElement
+                    ).checked),
+                )}
+            />
+            <span>Expose to Claude Code</span>
+          </label>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.tool_plugins?.expose_commands_opencode ?? true}
+              onchange={(e) =>
+                patch(
+                  (s) =>
+                    (s.tool_plugins.expose_commands_opencode = (
+                      e.currentTarget as HTMLInputElement
+                    ).checked),
+                )}
+            />
+            <span>Expose to OpenCode</span>
+          </label>
+
           {#snippet toolPluginRow(plugin: PluginRow, tool: ToolRow)}
             <div class="audit-tool">
               <label class="checkbox">

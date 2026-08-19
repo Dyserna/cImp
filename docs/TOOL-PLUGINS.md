@@ -322,8 +322,24 @@ whitespace); the *allowlist* that decides what a sandboxed child sees is § 6.4'
 | kind | cwd |
 |---|---|
 | `audit`, `security` | the project root (the scan root, which is the launch directory) |
-| `check` | the project root, or the manifest's `cwd` confined strictly beneath it |
-| `command` | the first allowed root of the calling session |
+| `check` | the manifest's `cwd` confined strictly beneath the project root; else the directory its `applicability` marker was found in; else the project root |
+| `command` | the project root (harness surface) / the first allowed root of the calling session (offload worker) |
+
+**A check runs where its marker is.** The census matches recursively, so a tool
+gated on `Cargo.toml` applies to a repo whose only manifest is
+`src-tauri/Cargo.toml` — and running it at the root would then fail before doing
+any work. When a `check`-kind tool declares no `cwd` of its own, cImp uses the
+**shallowest** directory one of its declared markers was seen in, ties broken
+lexicographically, `""` (the root) winning outright. A manifest-declared `cwd`
+always wins over the derived one: explicit beats inferred.
+
+Two limits worth stating rather than discovering:
+
+* **One check, one directory.** A monorepo with four `pom.xml`s gets one maven
+  check, in one of them. Multi-instance fan-out (one advertised check per hit)
+  is a different feature and is not in this contract.
+* **`extensions` carry no location.** The census records which extensions exist,
+  not where, so a tool gated only on extensions still runs at the root.
 
 `cwd` and `report_file` are relative and confined: absolute paths (in the
 platform-agnostic sense — a POSIX-rooted path is absolute on Windows too, for
@@ -346,7 +362,7 @@ another under `run_check`:
 | kind | what the gate removes |
 |---|---|
 | `audit`, `security` | the tool is not spawned in the fan-out; the report shows it as `skipped-not-applicable` rather than dropping it silently |
-| `check` | the check is not advertised to `run_check` and cannot be dispatched — the advertised name list and the runnable one are the same list |
+| `check` | the check is not advertised to `run_check` and cannot be dispatched — the advertised name list and the runnable one are the same list. A marker that matched in a SUBDIRECTORY also decides where the check runs (§ 3.5) |
 | `command` | refused at load: `run_command` resolves one named tool on demand and has no population to filter |
 
 **`extensions`** are lowercase and dot-less (`java`, `cs`, `py`) and match any
@@ -507,11 +523,38 @@ explanation.
 **Purpose.** Pick this for an ad-hoc dev binary a model should be able to invoke
 directly: `git`, `svn`, a project's own CLI.
 
-**Invocation.** `run_command{command, args}`. A registered `command`-kind tool
-that is enabled **and** has a path becomes both the permission and the
-resolution: the registry is consulted first, and a match runs *that exact file*
-rather than resolving the name through `PATH`. A miss falls through to the
-project's `command_allowlist` unchanged.
+**Invocation.** A `command`-kind tool has **two** callers, and they name it
+differently because they are asking different questions.
+
+*The offload worker* calls `run_command{command, args}`, where `command` is a
+bare program name. A registered tool that is enabled **and** has a path becomes
+both the permission and the resolution: the registry is consulted first, and a
+match runs *that exact file* rather than resolving the name through `PATH`. A
+miss falls through to the project's `command_allowlist` unchanged.
+
+*A Claude Code / OpenCode tab* calls `run_command{tool, args}` on the
+`cimp-offload` MCP surface — the same surface that serves `run_check`. Here
+`tool` is an **enum of this project's runnable command entries** (enabled ∩
+path-configured), named the way `run_check` names checks: the manifest-local id
+where it is unique, the fully-qualified `name@version/tool-id` key where two
+plugins collide. There is no allowlist arm and no `PATH` resolution on this
+surface — a tab can run registered tools and nothing else — and the command runs
+in the **project root**, which is not model-controllable.
+
+`args` is an argv vector on both surfaces: the program is spawned directly, so
+there is **no shell** and nothing in `args` can be read as redirection, a pipe, a
+glob or `&&`. (A `check`'s `cmd` is the opposite case — see § 6.2 — which is why
+that one screens its substituted values and this one does not need to.)
+
+**Exposure.** Two switches in Settings → Tool Plugins, both on by default, decide
+whether the harness surface lists `run_command` for Claude Code and for OpenCode.
+The tool is **hidden entirely** while no command tool is runnable — an enum with
+no values is a schema nobody can satisfy — and the switch is re-checked at
+dispatch, so unchecking it stops calls from sessions that already hold the old
+list. The listing rides the same surface-change pulse as `run_check`'s enum, so
+configuring a path updates a live Claude session with no app restart; **OpenCode
+caches `tools/list` at connect, so that tab needs a restart**. The offload
+worker's own surface is unaffected by both switches.
 
 Everything else applies to both populations: the bare-name guard (the caller
 names a program, never a path), the per-program `CommandPolicy` argument rules
@@ -520,7 +563,9 @@ because the binary came from a plugin), the fixed timeout and the output cap
 (§ 2.4), and the sandbox.
 
 **Output.** Raw, truncated at the cap with a notice, prefixed with the exit code.
-There is no parser and no `parser` field.
+There is no parser and no `parser` field. The harness surface adds one header
+line naming the tool and the wall-clock duration; the body underneath is
+byte-identical to what the worker sees.
 
 **Failure modes.** A configured path that does not exist is reported as a
 configuration problem naming the tool and the path, not as an opaque spawn error.

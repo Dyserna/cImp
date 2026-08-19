@@ -58,7 +58,10 @@ pub use memory::{classify_tool, MemArg, MemorySnapshot, ProjectFact, UsageEvent,
 pub use mcp::{
     handle_call as handle_mcp_call, lean_filter, native_surface_sig, offload_query,
     offload_run_check, run_check_spec, semantic_code_spec, semantic_spec, source_for_consumer,
-    surface_stats, tool_specs, tools as mcp_tools, LEAN_HIDDEN,
+    // V38 F-3: the consumer-aware builder replaced the blind one here. `tools()`
+    // itself stays (the app's own surface measurement calls it), it is simply no
+    // longer something a consumer-serving caller may reach for by accident.
+    surface_stats, tool_specs, tools_for as mcp_tools_for, LEAN_HIDDEN,
 };
 pub use memory::{SessionUsageDetail, UsageSnapshot};
 pub use model::*;

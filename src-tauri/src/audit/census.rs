@@ -64,6 +64,21 @@ pub const MARKERS: &[&str] = &[
 pub struct Census {
     extensions: HashSet<String>,
     markers: HashSet<&'static str>,
+    /// V38 F-1: for each marker seen, the **shallowest** directory it was seen
+    /// in, relative to the walked root and `/`-separated (`""` = the root
+    /// itself).
+    ///
+    /// The census matches recursively, so `src-tauri/Cargo.toml` admits a tool
+    /// gated on `Cargo.toml` — but the rendered check then ran at the project
+    /// ROOT, where `cargo build` exits 101 in 140 ms because there is no
+    /// manifest there. The census knew where the marker was and threw the
+    /// location away; this field is that location, kept.
+    ///
+    /// Shallowest, and one per marker: a check is one command in one directory,
+    /// so the census must answer with one directory. Ties (two hits at the same
+    /// depth) break lexicographically, so the answer is deterministic across
+    /// walks whose entry order the filesystem chose.
+    marker_dirs: HashMap<&'static str, String>,
 }
 
 impl Census {
@@ -78,6 +93,12 @@ impl Census {
     /// interned: the invariant `markers ⊆ MARKERS` is what makes the private
     /// representation safe, and a block that has been through a snapshot is not
     /// a reason to weaken it.
+    /// `marker_dirs` is deliberately EMPTY here: the serialized census block
+    /// carries names, not locations, and a rehydrated census answers the
+    /// applicability question (`admits`) rather than the "where does this run"
+    /// one. A consumer that gets `None` from [`Self::marker_dir`] falls back to
+    /// the root, which is the pre-F-1 behaviour — the safe direction for a
+    /// census that was serialized before locations existed.
     pub fn from_block(extensions: &[String], markers: &[String]) -> Census {
         Census {
             extensions: extensions.iter().cloned().collect(),
@@ -85,6 +106,7 @@ impl Census {
                 .iter()
                 .filter_map(|m| MARKERS.iter().find(|known| *known == m).copied())
                 .collect(),
+            marker_dirs: HashMap::new(),
         }
     }
 
@@ -96,6 +118,39 @@ impl Census {
     /// Whether this [`MARKERS`] token was seen.
     pub fn has_marker(&self, marker: &str) -> bool {
         self.markers.contains(marker)
+    }
+
+    /// V38 F-1 — the shallowest directory this marker was seen in, relative to
+    /// the walked root and `/`-separated. `Some("")` means the root itself;
+    /// `None` means the marker was not seen at all, or was seen by a census
+    /// that carries no locations (see [`Self::from_block`]).
+    ///
+    /// The one consumer is [`crate::checks::plugin`], which turns it into a
+    /// plugin check's `cwd` so a check admitted by a nested marker runs where
+    /// that marker is. Deliberately NOT part of [`Self::admits`]: whether a
+    /// tool applies and where it should run are two questions, and folding them
+    /// together would make a gate that passes at the root and fails one
+    /// directory down.
+    pub fn marker_dir(&self, marker: &str) -> Option<&str> {
+        self.marker_dirs.get(marker).map(String::as_str)
+    }
+
+    /// Record a marker hit's directory, keeping the shallowest one and breaking
+    /// depth ties lexicographically.
+    ///
+    /// Both halves matter. Shallowest is the right answer for a monorepo whose
+    /// root manifest is the workspace (`Cargo.toml` at the root wins over
+    /// `crates/foo/Cargo.toml`), and the lexicographic tie-break is what makes
+    /// the value independent of the order `ignore`'s parallel-ready walk
+    /// happened to yield entries in — without it the same tree could produce
+    /// two different `cwd`s on two runs.
+    fn note_marker_dir(&mut self, marker: &'static str, dir: String) {
+        match self.marker_dirs.get(marker) {
+            Some(current) if !dir_is_better(&dir, current) => {}
+            _ => {
+                self.marker_dirs.insert(marker, dir);
+            }
+        }
     }
 
     /// **The** applicability rule: no gate = always applicable, else ANY listed
@@ -133,6 +188,26 @@ impl Census {
         let mut v: Vec<String> = self.markers.iter().map(|s| (*s).to_string()).collect();
         v.sort();
         v
+    }
+}
+
+/// Whether `candidate` should replace `current` as a marker's recorded
+/// directory: shallower wins, and at equal depth the lexicographically smaller
+/// one does. Shared by [`Census::note_marker_dir`] and by
+/// [`crate::checks::plugin`], which applies the SAME ordering when a manifest
+/// gates on several markers at once — one rule, so "shallowest, ties
+/// lexicographic" cannot mean two things one call apart.
+pub(crate) fn dir_is_better(candidate: &str, current: &str) -> bool {
+    (dir_depth(candidate), candidate) < (dir_depth(current), current)
+}
+
+/// Path depth of a `/`-separated relative census directory; the root (`""`) is
+/// 0. Not `split('/').count()`, which counts `""` as one segment.
+fn dir_depth(dir: &str) -> usize {
+    if dir.is_empty() {
+        0
+    } else {
+        dir.split('/').count()
     }
 }
 
@@ -263,10 +338,31 @@ fn take_bounded(root: &Path, max_entries: usize, max_walk: Duration) -> Census {
         if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
             if let Some(m) = marker_for(name) {
                 census.markers.insert(m);
+                // …and WHERE it was seen (F-1). Derived from the entry's own
+                // path against the root the walk started from, so it needs no
+                // second traversal and costs one `strip_prefix` per marker hit
+                // — of which a project has a handful.
+                census.note_marker_dir(m, relative_dir(root, path));
             }
         }
     }
     census
+}
+
+/// The directory of `path`'s parent relative to `root`, `/`-separated, `""` for
+/// a file directly in the root.
+///
+/// `/`-separated on every platform because the value becomes a `CheckDef::cwd`,
+/// which is confined and joined by the same code on Windows and Unix, and
+/// because a backslash in a stored relative path is a needless second spelling
+/// of the same directory. A path that is somehow not under `root` yields `""`
+/// (the root) — the pre-F-1 answer, and the only safe one for a value that is
+/// about to be confined beneath that root.
+fn relative_dir(root: &Path, path: &Path) -> String {
+    path.parent()
+        .and_then(|p| p.strip_prefix(root).ok())
+        .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -277,6 +373,24 @@ impl Census {
         Census {
             extensions: extensions.iter().map(|s| s.to_string()).collect(),
             markers: markers.iter().copied().collect(),
+            marker_dirs: HashMap::new(),
+        }
+    }
+
+    /// Test-only: the same, plus each marker's recorded directory — so a check
+    /// seam test can pin an exact project SHAPE *and* an exact project LAYOUT
+    /// without laying out a tree on disk.
+    pub(crate) fn from_parts_with_dirs(
+        extensions: &[&str],
+        markers: &[(&'static str, &str)],
+    ) -> Census {
+        Census {
+            extensions: extensions.iter().map(|s| s.to_string()).collect(),
+            markers: markers.iter().map(|(m, _)| *m).collect(),
+            marker_dirs: markers
+                .iter()
+                .map(|(m, d)| (*m, (*d).to_string()))
+                .collect(),
         }
     }
 }
@@ -433,6 +547,62 @@ mod tests {
             "the walk stopped at the bound; collected {} of 60",
             c.extensions().len()
         );
+    }
+
+    /// V38 F-1 — the census records WHERE each marker was seen, not only that
+    /// it was. This repo's own shape is the defect that motivated it: the only
+    /// `Cargo.toml` is one directory down, and a check rendered to run at the
+    /// root exits 101 before it does any work.
+    #[test]
+    fn marker_directories_are_recorded_shallowest_first() {
+        let fx = Fixture::new();
+        fx.file("src-tauri/Cargo.toml", "")
+            .file("crates/deep/Cargo.toml", "")
+            .file("package.json", "{}");
+        let c = take(&fx.root);
+        assert_eq!(
+            c.marker_dir("Cargo.toml"),
+            Some("src-tauri"),
+            "the SHALLOWEST hit wins: `src-tauri` is depth 1, `crates/deep` is depth 2 — and \
+             this is exactly this repo's own shape"
+        );
+
+        // Two hits at the SAME depth: the lexicographic tie-break decides, so
+        // two walks of one tree cannot render two different commands.
+        let tied = Fixture::new();
+        tied.file("src-tauri/Cargo.toml", "").file("cli/Cargo.toml", "");
+        assert_eq!(take(&tied.root).marker_dir("Cargo.toml"), Some("cli"));
+        // A root hit beats any nested one, whatever the walk order.
+        assert_eq!(c.marker_dir("package.json"), Some(""));
+        // An unseen marker has no directory at all.
+        assert_eq!(c.marker_dir("pom.xml"), None);
+
+        // …and a root `Cargo.toml` added later takes it over: depth beats the
+        // tie-break, which is the workspace-root case.
+        let fx2 = Fixture::new();
+        fx2.file("Cargo.toml", "").file("crates/a/Cargo.toml", "");
+        assert_eq!(take(&fx2.root).marker_dir("Cargo.toml"), Some(""));
+    }
+
+    /// The ordering rule itself, stated once and shared with the check seam.
+    #[test]
+    fn shallower_wins_then_lexicographic() {
+        assert!(dir_is_better("", "src-tauri"));
+        assert!(!dir_is_better("src-tauri", ""));
+        assert!(dir_is_better("a", "b"));
+        assert!(dir_is_better("zzz", "a/b"), "depth beats the name");
+        assert!(!dir_is_better("a/b", "zzz"));
+        assert!(!dir_is_better("a", "a"));
+    }
+
+    /// A census rehydrated from a serialized block answers the applicability
+    /// question but carries no locations — and says so by returning `None`,
+    /// which its one consumer reads as "run at the root".
+    #[test]
+    fn a_rehydrated_census_has_no_marker_directories() {
+        let c = Census::from_block(&[], &["Cargo.toml".to_string()]);
+        assert!(c.has_marker("Cargo.toml"));
+        assert_eq!(c.marker_dir("Cargo.toml"), None);
     }
 
     #[test]

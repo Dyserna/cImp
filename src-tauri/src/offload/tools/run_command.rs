@@ -128,6 +128,194 @@ fn registered_commands(cwd: &Path) -> RegisteredCommands {
     out
 }
 
+// ── V38 F-3 — the same registry entries, on the HARNESS surface ─────────────
+//
+// User decision (V38 live-verify): a `command`-kind registry entry must be
+// callable from a Claude Code / OpenCode tab, not only by the offload worker.
+// It rides the `cimp-offload` MCP proxy those tabs already connect to — the
+// surface that serves `run_check` — as ONE tool named `run_command` whose
+// `tool` parameter is an enum of the runnable entries. One tool and not one per
+// entry, because V38's "no direct per-tool model exposure" is what keeps the
+// advertised surface from growing with the plugin folder.
+//
+// What is deliberately NOT shared with the worker's surface:
+//
+// * **the allowlist**. `command_allowlist` is the worker's own policy for
+//   programs nobody registered; the harness surface offers registry entries
+//   only, so there is no PATH resolution and no allowlist arm here at all.
+// * **the `command` parameter**. The worker names a program; the harness names
+//   a TOOL, and cImp resolves the file. Same bare-name property, expressed as
+//   an enum the caller can read instead of a guard it can trip over.
+//
+// What IS shared: the execution core ([`run_resolved`]) — one spawn, one
+// sandbox plan, one timeout, one set of caps.
+
+/// One `command`-kind registry entry as the harness surface advertises it.
+pub(crate) struct AdvertisedCommand {
+    /// The value the `tool` enum carries and a call selects by. The manifest id
+    /// where it is unique, else the fully-qualified key — the SAME rule
+    /// `run_check`'s `name` enum uses ([`crate::plugins::registry::advertised_name`]),
+    /// so a user reading Settings sees one vocabulary rather than two.
+    pub name: String,
+    pub tool: EffectiveTool,
+}
+
+/// The runnable `command`-kind entries for one project, named for the surface.
+///
+/// Pure — a plugin set, a settings container and a registry root in, a `Vec`
+/// out — so the advertisement gate, the enum contents and the dispatch can all
+/// be asserted without a `PluginStore` or a disk. `runnable_tools` is the
+/// filter: enabled AND path-configured, the same predicate the worker's
+/// registry arm applies, so a tool can never be advertised here and refused
+/// there for want of a path.
+pub(crate) fn advertised_commands(
+    set: &crate::plugins::loader::PluginSet,
+    cfg: &crate::settings::ToolPluginsSettings,
+    registry_root: Option<&Path>,
+) -> Vec<AdvertisedCommand> {
+    let mut out: Vec<AdvertisedCommand> = Vec::new();
+    for tool in crate::plugins::registry::runnable_tools(set, cfg, registry_root) {
+        if tool.kind() != ToolKind::Command {
+            continue;
+        }
+        let taken: Vec<&str> = out.iter().map(|c| c.name.as_str()).collect();
+        let name = crate::plugins::registry::advertised_name(&tool, &taken);
+        out.push(AdvertisedCommand { name, tool });
+    }
+    out
+}
+
+/// [`advertised_commands`] against the live plugin set and this process's
+/// project.
+///
+/// The registry root is `current_dir()` — in an `--offload-mcp` child that is
+/// the tab's project, and in the app the launch directory. Exactly the rule
+/// `checks::plugin::effective_checks_live` follows, and for the same reason:
+/// the advertised list and the runnable list must be resolved against one root,
+/// or a name the model can see is a name the dispatcher cannot find.
+pub(crate) fn advertised_commands_live(
+    settings: &crate::settings::Settings,
+) -> Vec<AdvertisedCommand> {
+    let cwd = std::env::current_dir().ok();
+    advertised_commands(
+        &crate::plugins::snapshot_or_scan(),
+        &settings.tool_plugins,
+        cwd.as_deref(),
+    )
+}
+
+/// Run one advertised `command`-kind tool at `root` — the harness surface's
+/// dispatch.
+///
+/// `root` is the project root the calling surface resolved, and it is NOT
+/// model-controllable: there is no `cwd` parameter on this tool, exactly as
+/// there is none on `run_check`. `args` is an argv vector spawned directly —
+/// **no shell**, so nothing in it can be read as syntax.
+pub(crate) async fn run_registered(
+    root: &Path,
+    settings: &crate::settings::Settings,
+    tool_name: &str,
+    args: &[String],
+) -> Result<String, String> {
+    run_selected(
+        root,
+        settings,
+        &advertised_commands_live(settings),
+        tool_name,
+        args,
+    )
+    .await
+}
+
+/// [`run_registered`] against an explicit command list.
+///
+/// Split out so the selection, the refusals and the spawn are assertable against
+/// a fixture registry — `advertised_commands_live` reaches for the process-wide
+/// plugin snapshot, which a unit test cannot furnish.
+async fn run_selected(
+    root: &Path,
+    settings: &crate::settings::Settings,
+    commands: &[AdvertisedCommand],
+    tool_name: &str,
+    args: &[String],
+) -> Result<String, String> {
+    if commands.is_empty() {
+        return Err(
+            "run_command has no runnable tools in this project — enable a plugin that declares a \
+             `command`-kind tool and set its binary path in Settings → Tool Plugins"
+                .to_string(),
+        );
+    }
+    let names = || {
+        commands
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let requested = tool_name.trim();
+    // No sole-tool fallback (the one place this differs from `run_check`, which
+    // has one): `run_check` inherited a single-check era, while this surface is
+    // new and every caller reads the same enum. Requiring the name keeps the
+    // recorded activity row honest about WHICH tool ran.
+    let Some(selected) = commands.iter().find(|c| c.name == requested) else {
+        return Err(format!(
+            "run_command: no command tool named `{requested}` — available: {}",
+            names()
+        ));
+    };
+    let tool = &selected.tool;
+    // A `CommandPolicy` is a statement about ARGUMENTS and applies here for the
+    // same reason it applies to the worker's registry arm: it does not stop
+    // being true because the caller is a harness rather than the local model.
+    // Matched by the tool id, which is the vocabulary this surface names.
+    if let Some(reason) = dangerous_args(&tool.tool_id, args, &settings.offload.command_policies) {
+        return Err(reason);
+    }
+    // Decision 7: cImp runs the file the user named, and says so plainly when
+    // that file is gone — the worker arm's wording, because it is the same fact.
+    let program = PathBuf::from(tool.path.as_deref().unwrap_or_default());
+    if !program.is_file() {
+        return Err(format!(
+            "`{requested}` is the plugin command tool `{}`, but its configured path does not \
+             exist: {} — fix it in Settings → Tool Plugins",
+            tool.tool_key,
+            program.display()
+        ));
+    }
+    let sandbox = crate::sandbox::SandboxCfg::from_settings(settings);
+    let posture = ToolPosture::resolve(
+        crate::sandbox::SEAM_RUN_COMMAND,
+        root,
+        &sandbox,
+        tool.manifest.runtime,
+        tool.manifest.sandbox,
+        &tool.manifest.extra_grants,
+    );
+    // The duration is this surface's addition, and it is measured HERE rather
+    // than inside the shared core: the worker's rendering is a contract its own
+    // tests pin, and a harness convenience is not a reason to move it. The
+    // header reads like `run_check`'s (`name — exit N · T ms`) with the core's
+    // own `(exit N)` line left exactly as it is underneath, so the two surfaces
+    // still show a model the same body.
+    let started = std::time::Instant::now();
+    let out = run_resolved(RunSpec {
+        label: &selected.name,
+        program: &program,
+        args,
+        cwd: root,
+        posture: &posture,
+        sandbox: &sandbox,
+        policies: &settings.offload.command_policies,
+    })
+    .await?;
+    Ok(format!(
+        "{} · {} ms\n{out}",
+        selected.name,
+        started.elapsed().as_millis()
+    ))
+}
+
 /// This project's `command`-kind registry entries, split by the one thing that
 /// decides whether they can run.
 ///
@@ -523,24 +711,67 @@ pub async fn execute(args: serde_json::Value, ctx: &ToolCtx) -> Result<String, S
             &tool.manifest.extra_grants,
         ),
     };
-    let subject = crate::sandbox::program_subject(&program);
+    run_resolved(RunSpec {
+        label: &args.command,
+        program: &program,
+        args: &args.args,
+        cwd: &cwd,
+        posture: &posture,
+        sandbox: &ctx.sandbox,
+        policies: &ctx.command_policies,
+    })
+    .await
+}
+
+/// One resolved command run: WHICH file, with WHICH argv, WHERE, and under
+/// which posture. Everything the shared core needs and nothing about how the
+/// caller decided it.
+///
+/// V38 F-3 extracted this so the harness-facing `run_command` MCP tool and the
+/// offload worker's native one execute through the SAME code — the spawn, the
+/// minimal environment, the sandbox plan, the timeout, the caps, the process-
+/// group kill and the denial rows. Two copies of a sandboxed spawn is two
+/// sandboxes, and the second one is always the one that drifts.
+pub(crate) struct RunSpec<'a> {
+    /// What the caller named this program — the allowlisted/registered name for
+    /// the worker, the advertised tool name for the harness surface. Used in
+    /// every message and to match a [`CommandPolicy`] by stem; never used to
+    /// FIND the binary, which `program` already names.
+    pub label: &'a str,
+    /// The exact file to spawn. Already resolved and existence-checked.
+    pub program: &'a Path,
+    pub args: &'a [String],
+    /// Where it runs. Never model-supplied on either surface.
+    pub cwd: &'a Path,
+    pub posture: &'a ToolPosture,
+    pub sandbox: &'a crate::sandbox::SandboxCfg,
+    pub policies: &'a [CommandPolicy],
+}
+
+/// Run one resolved command: sandbox plan, spawn, capture, render.
+///
+/// Everything above this line is ADMISSION (who may run what, and which file);
+/// everything below it is EXECUTION, and it is identical for both callers by
+/// construction rather than by care.
+pub(crate) async fn run_resolved(spec: RunSpec<'_>) -> Result<String, String> {
+    let subject = crate::sandbox::program_subject(spec.program);
     crate::plugins::posture::runtime_canary(
         crate::sandbox::SEAM_RUN_COMMAND,
-        &cwd,
+        spec.cwd,
         &subject,
-        &posture.runtime,
-        &program,
+        &spec.posture.runtime,
+        spec.program,
     );
     // `unsupported` means the boundary is not ATTEMPTED — a disabled config is
     // how that reaches `plan`, so nothing is stamped or mapped for a tool that
     // declared it can use neither.
     let unsupported = crate::plugins::posture::unsupported_cfg(
         crate::sandbox::SEAM_RUN_COMMAND,
-        &cwd,
+        spec.cwd,
         &subject,
-        posture.sandbox,
+        spec.posture.sandbox,
     );
-    let sandbox_cfg = unsupported.as_ref().unwrap_or(&ctx.sandbox);
+    let sandbox_cfg = unsupported.as_ref().unwrap_or(spec.sandbox);
     // V33 Phase A: decide whether this child runs inside the OS sandbox before
     // building the plain command, because the sandboxed path is a different
     // spawn mechanism (a bespoke `CreateProcessW` — std/tokio cannot attach the
@@ -551,7 +782,7 @@ pub async fn execute(args: serde_json::Value, ctx: &ToolCtx) -> Result<String, S
     // sandbox that is off or unavailable changes the OS boundary and nothing
     // about which variables the child sees.
     let base_env = minimal_env(&|key| std::env::var_os(key));
-    let policy_env: Vec<(String, OsString)> = policy_for(&args.command, &ctx.command_policies)
+    let policy_env: Vec<(String, OsString)> = policy_for(spec.label, spec.policies)
         .map(|p| {
             p.env
                 .iter()
@@ -564,18 +795,18 @@ pub async fn execute(args: serde_json::Value, ctx: &ToolCtx) -> Result<String, S
         crate::sandbox::plan(
             sandbox_cfg,
             crate::sandbox::SEAM_RUN_COMMAND,
-            &program,
+            spec.program,
             // Nothing to infer: the model named the program, cImp resolved it,
             // its install dir is granted by `prepare` itself, and everything it
             // writes goes in the (already granted) root. V38 adds a registered
             // tool's declared runtime profile and its screened `extra_grants`;
             // both are empty for an allowlisted program.
             &crate::sandbox::GrantHints {
-                runtime: posture.runtime.clone(),
-                rows: posture.rows.clone(),
+                runtime: spec.posture.runtime.clone(),
+                rows: spec.posture.rows.clone(),
                 ..Default::default()
             },
-            &cwd,
+            spec.cwd,
             &base_env,
         ),
     )
@@ -588,16 +819,16 @@ pub async fn execute(args: serde_json::Value, ctx: &ToolCtx) -> Result<String, S
             // silently is worse than refusing (decision 5, loudly).
             crate::sandbox::record_event(
                 crate::sandbox::SEAM_RUN_COMMAND,
-                &cwd,
+                spec.cwd,
                 "wedged",
-                crate::sandbox::state_target("wedged", &crate::sandbox::program_subject(&program)),
+                crate::sandbox::state_target("wedged", &crate::sandbox::program_subject(spec.program)),
                 format!(
                     "sandbox preparation for `{}` did not settle within {}s \
                      (profile / ACL grants / drive mapping). The command was NOT run — \
                      refusing rather than silently dropping the sandbox boundary. The \
                      preparation thread may still be blocked; if this repeats, restart cImp \
                      and check the sandbox lane for what preceded it.",
-                    args.command,
+                    spec.label,
                     PREPARE_BACKSTOP.as_secs(),
                 ),
                 false,
@@ -606,22 +837,13 @@ pub async fn execute(args: serde_json::Value, ctx: &ToolCtx) -> Result<String, S
                 "sandbox preparation did not settle within {}s — treating as wedged \
                  (see sandbox lane); `{}` was not run",
                 PREPARE_BACKSTOP.as_secs(),
-                args.command
+                spec.label
             ));
         }
     };
     #[cfg(windows)]
     if let crate::sandbox::Plan::Sandboxed(prepared) = &plan {
-        return run_sandboxed(
-            prepared,
-            &program,
-            &args,
-            &base_env,
-            &policy_env,
-            ctx,
-            &cwd,
-        )
-        .await;
+        return run_sandboxed(prepared, &spec, &base_env, &policy_env).await;
     }
     if let crate::sandbox::Plan::Plain(reason) = &plan {
         // V38: `required` means never run unprotected — including when the
@@ -629,9 +851,9 @@ pub async fn execute(args: serde_json::Value, ctx: &ToolCtx) -> Result<String, S
         // the lane and the result the model sees.
         if let Some(refusal) = crate::plugins::posture::required_refusal(
             crate::sandbox::SEAM_RUN_COMMAND,
-            &cwd,
+            spec.cwd,
             &subject,
-            posture.sandbox,
+            spec.posture.sandbox,
             reason,
         ) {
             return Err(refusal);
@@ -644,13 +866,13 @@ pub async fn execute(args: serde_json::Value, ctx: &ToolCtx) -> Result<String, S
                 crate::sandbox::SEAM_RUN_COMMAND,
                 reason,
                 &subject,
-                &cwd,
+                spec.cwd,
             );
         }
     }
-    let mut cmd = tokio::process::Command::new(&program);
-    cmd.args(&args.args)
-        .current_dir(&cwd)
+    let mut cmd = tokio::process::Command::new(spec.program);
+    cmd.args(spec.args)
+        .current_dir(spec.cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -667,7 +889,7 @@ pub async fn execute(args: serde_json::Value, ctx: &ToolCtx) -> Result<String, S
     // (GIT_PAGER=cat overrides core.pager; an empty GIT_SSH_COMMAND disarms a
     // config-injected ssh helper; NOSYSTEM/GLOBAL/PROMPT keep the probe from
     // honoring ambient config or hanging on a credential prompt).
-    if let Some(policy) = policy_for(&args.command, &ctx.command_policies) {
+    if let Some(policy) = policy_for(spec.label, spec.policies) {
         for ev in &policy.env {
             cmd.env(&ev.key, &ev.value);
         }
@@ -702,7 +924,7 @@ pub async fn execute(args: serde_json::Value, ctx: &ToolCtx) -> Result<String, S
     // (The Linux sandbox needs no exclusive window: it opens no inheritable
     // handles, so it takes the gate SHARED right here, like any other spawn.)
     let mut child = crate::spawn_gate::spawn_tokio(&mut cmd)
-        .map_err(|e| format!("failed to spawn `{}`: {e}", args.command))?;
+        .map_err(|e| format!("failed to spawn `{}`: {e}", spec.label))?;
     // Backstop: reap this command subprocess via the kill-on-job-close job if
     // cImp dies hard before kill_on_drop can fire.
     crate::process_guard::guard_child(&child);
@@ -714,9 +936,9 @@ pub async fn execute(args: serde_json::Value, ctx: &ToolCtx) -> Result<String, S
     if matches!(&plan, crate::sandbox::Plan::Sandboxed(_)) {
         crate::sandbox::record_sandboxed(
             crate::sandbox::SEAM_RUN_COMMAND,
-            &cwd,
-            &crate::sandbox::program_subject(&program),
-            &ctx.sandbox,
+            spec.cwd,
+            &crate::sandbox::program_subject(spec.program),
+            spec.sandbox,
         );
     }
 
@@ -753,12 +975,12 @@ pub async fn execute(args: serde_json::Value, ctx: &ToolCtx) -> Result<String, S
             crate::procutil::kill_tree(&mut child).await;
             return Err(format!(
                 "`{}` timed out after {}s",
-                args.command,
+                spec.label,
                 TIMEOUT.as_secs()
             ));
         }
     };
-    let status = status.map_err(|e| format!("`{}` failed: {e}", args.command))?;
+    let status = status.map_err(|e| format!("`{}` failed: {e}", spec.label))?;
 
     // V33 Phase D — the Linux denial row. This is the last point at which the
     // raw exit code and stderr exist (a nonzero exit is returned to the model as
@@ -768,17 +990,17 @@ pub async fn execute(args: serde_json::Value, ctx: &ToolCtx) -> Result<String, S
     if matches!(&plan, crate::sandbox::Plan::Sandboxed(_)) {
         let stderr_text = String::from_utf8_lossy(&err.bytes);
         if let Some(class) =
-            crate::sandbox::denial_signature(status.code(), &stderr_text, ctx.sandbox.allow_network)
+            crate::sandbox::denial_signature(status.code(), &stderr_text, spec.sandbox.allow_network)
         {
             crate::sandbox::record_denial(
                 crate::sandbox::SEAM_RUN_COMMAND,
-                &cwd,
-                &crate::sandbox::program_subject(&program),
-                &args.args,
+                spec.cwd,
+                &crate::sandbox::program_subject(spec.program),
+                spec.args,
                 status.code(),
                 &stderr_text,
                 class,
-                &ctx.sandbox,
+                spec.sandbox,
             );
         }
     }
@@ -868,13 +1090,15 @@ fn format_run_output(
 #[cfg(windows)]
 async fn run_sandboxed(
     prepared: &crate::sandbox::windows::Prepared,
-    program: &std::path::Path,
-    args: &Args,
+    spec: &RunSpec<'_>,
     base_env: &[(&str, OsString)],
     policy_env: &[(String, OsString)],
-    ctx: &ToolCtx,
-    root: &std::path::Path,
 ) -> Result<String, String> {
+    // Named locals for the two the body reaches for constantly; everything else
+    // is read off `spec` where it is used, so the moved code still reads as the
+    // sandboxed twin of the plain path directly above it.
+    let program = spec.program;
+    let root = spec.cwd;
     // Same composition order as the plain path, through the one shared
     // composer: minimal env first, then the program's policy env, then the
     // sandbox's own redirections last — those point at the mapped drive and
@@ -899,7 +1123,7 @@ async fn run_sandboxed(
             prepared,
             crate::sandbox::windows::SpawnRequest {
                 program,
-                args: &args.args,
+                args: spec.args,
                 // This seam builds argv itself, so the CRT quoting rules apply.
                 raw_tail: None,
                 env: &env,
@@ -928,7 +1152,7 @@ async fn run_sandboxed(
                      still be running, or may never have started — cImp cannot tell, so this \
                      row asserts only the wedge. Job-object membership still reaps the tree on \
                      cImp's death.",
-                    args.command,
+                    spec.label,
                     SANDBOX_BACKSTOP.as_secs(),
                     TIMEOUT.as_secs(),
                     crate::sandbox::SANDBOX_SETTLE_SLACK.as_secs(),
@@ -955,9 +1179,9 @@ async fn run_sandboxed(
                 crate::sandbox::SEAM_RUN_COMMAND,
                 root,
                 &crate::sandbox::program_subject(program),
-                &args.args,
+                spec.args,
                 &e,
-                &ctx.sandbox,
+                spec.sandbox,
             );
             return Err(e);
         }
@@ -968,7 +1192,7 @@ async fn run_sandboxed(
         crate::sandbox::SEAM_RUN_COMMAND,
         root,
         &crate::sandbox::program_subject(program),
-        &ctx.sandbox,
+        spec.sandbox,
     );
 
     if run.timed_out {
@@ -976,7 +1200,7 @@ async fn run_sandboxed(
         // labeling one would be the guess this lane must not make.
         return Err(format!(
             "`{}` timed out after {}s",
-            args.command,
+            spec.label,
             TIMEOUT.as_secs()
         ));
     }
@@ -984,17 +1208,17 @@ async fn run_sandboxed(
     // this is the last point at which the raw exit code and stderr exist.
     let stderr_text = String::from_utf8_lossy(&run.stderr);
     if let Some(class) =
-        crate::sandbox::denial_signature(run.exit_code, &stderr_text, ctx.sandbox.allow_network)
+        crate::sandbox::denial_signature(run.exit_code, &stderr_text, spec.sandbox.allow_network)
     {
         crate::sandbox::record_denial(
             crate::sandbox::SEAM_RUN_COMMAND,
             root,
             &crate::sandbox::program_subject(program),
-            &args.args,
+            spec.args,
             run.exit_code,
             &stderr_text,
             class,
-            &ctx.sandbox,
+            spec.sandbox,
         );
     }
     let mut out = format_run_output(
@@ -1011,7 +1235,7 @@ async fn run_sandboxed(
         // MISSING a stream, and a model told nothing would read the gap as
         // "the command printed nothing".
         tracing::warn!(
-            command = %args.command,
+            command = %spec.label,
             "sandbox: a pipe drain never finished (leaked write end) — captured output is incomplete"
         );
         out.push_str(
@@ -1272,6 +1496,264 @@ mod tests {
         assert!(row.response.contains("Subversion"), "{}", row.response);
         assert!(row.response.contains("allowlist"), "{}", row.response);
         assert!(!row.entry.ok);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── V38 F-3: the harness-facing surface ────────────────────────────────
+
+    /// A plugin declaring two `command`-kind tools, one of them pointed at a
+    /// real binary — built through the real loader and the real registry, so
+    /// these assertions run against the same join the live surface uses.
+    ///
+    /// `sandbox: optional` is DECLARED here rather than left to default, and the
+    /// distinction is the point: `SandboxReq::default()` is `required`, so a
+    /// manifest that says nothing refuses to run with the OS sandbox off (which
+    /// is its default). `a_required_sandbox_command_refuses_to_run_unprotected`
+    /// pins that half; these fixtures are about the surface, so they opt into
+    /// the posture that lets a spawn happen at all.
+    fn harness_fixture(
+        path: &str,
+        second_path: Option<&str>,
+    ) -> (Vec<AdvertisedCommand>, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("cimp-cmdsurface-{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(
+            dir.join("acme.json"),
+            r#"{
+              "manifest_version": 1,
+              "name": "acme",
+              "version": "1.0.0",
+              "categories": [{ "id": "vcs", "label": "VCS", "tools": ["svn", "hg"] }],
+              "tools": [
+                { "id": "svn", "label": "Subversion", "kind": "command", "sandbox": "optional" },
+                { "id": "hg", "label": "Mercurial", "kind": "command", "sandbox": "optional" }
+              ]
+            }"#,
+        )
+        .expect("write manifest");
+        let set = crate::plugins::loader::scan_dir(&dir, crate::plugins::manifest::Provenance::User);
+        assert!(set.errors.is_empty(), "{:?}", set.errors);
+        let mut cfg = crate::settings::ToolPluginsSettings::default();
+        cfg.global_paths
+            .insert("acme@1.0.0/svn".to_string(), path.to_string());
+        if let Some(p) = second_path {
+            cfg.global_paths
+                .insert("acme@1.0.0/hg".to_string(), p.to_string());
+        }
+        (advertised_commands(&set, &cfg, None), dir)
+    }
+
+    /// A program that exists on this machine and echoes its argv, for the one
+    /// test that must actually spawn. `None` (with a printed skip) rather than a
+    /// panic where it is absent — a silent skip is how a green suite hides a
+    /// broken probe, and a hard failure on a minimal box is not a defect.
+    fn echo_program() -> Option<(std::path::PathBuf, Vec<String>)> {
+        #[cfg(windows)]
+        {
+            let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
+            let cmd = std::path::PathBuf::from(root).join("System32\\cmd.exe");
+            if cmd.is_file() {
+                return Some((cmd, vec!["/c".into(), "echo".into(), "cimp-argv-ok".into()]));
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let echo = std::path::PathBuf::from("/bin/echo");
+            if echo.is_file() {
+                return Some((echo, vec!["cimp-argv-ok".into()]));
+            }
+        }
+        println!("SKIPPED: no echo-shaped program on this machine");
+        None
+    }
+
+    /// **The advertised enum is exactly the RUNNABLE command entries.** A tool
+    /// with no path is not offered — the same predicate the worker's registry
+    /// arm applies, so a name the model can see is a name that can run.
+    #[test]
+    fn the_command_enum_is_the_runnable_registry_entries() {
+        let (only_svn, dir) = harness_fixture("C:\\tools\\svn.exe", None);
+        assert_eq!(
+            only_svn.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            vec!["svn"],
+            "the pathless `hg` is not advertised"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let (both, dir) = harness_fixture("C:\\tools\\svn.exe", Some("C:\\tools\\hg.exe"));
+        let mut names: Vec<&str> = both.iter().map(|c| c.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["hg", "svn"]);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Nothing configured at all ⇒ an empty set, which is what hides the tool.
+        let empty = advertised_commands(
+            &crate::plugins::loader::PluginSet::default(),
+            &crate::settings::ToolPluginsSettings::default(),
+            None,
+        );
+        assert!(empty.is_empty());
+    }
+
+    /// The enum's vocabulary is `run_check`'s: the short manifest id where it is
+    /// unique, the fully-qualified key where two plugins collide. One rule, one
+    /// shared function — a user reading Settings must not have to learn two.
+    #[test]
+    fn two_plugins_declaring_the_same_command_id_both_stay_reachable() {
+        let dir = std::env::temp_dir().join(format!("cimp-cmdcollide-{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        for (file, name, version) in [("a.json", "acme", "1.0.0"), ("b.json", "other", "2.0.0")] {
+            std::fs::write(
+                dir.join(file),
+                format!(
+                    r#"{{
+                  "manifest_version": 1,
+                  "name": "{name}",
+                  "version": "{version}",
+                  "categories": [{{ "id": "c", "label": "C", "tools": ["svn"] }}],
+                  "tools": [{{ "id": "svn", "label": "Subversion", "kind": "command" }}]
+                }}"#
+                ),
+            )
+            .expect("write manifest");
+        }
+        let set = crate::plugins::loader::scan_dir(&dir, crate::plugins::manifest::Provenance::User);
+        assert!(set.errors.is_empty(), "{:?}", set.errors);
+        let mut cfg = crate::settings::ToolPluginsSettings::default();
+        cfg.global_paths
+            .insert("acme@1.0.0/svn".to_string(), "C:\\a\\svn.exe".to_string());
+        cfg.global_paths
+            .insert("other@2.0.0/svn".to_string(), "C:\\b\\svn.exe".to_string());
+        let names: Vec<String> = advertised_commands(&set, &cfg, None)
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+        assert_eq!(names, vec!["svn", "other@2.0.0/svn"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **The dispatch spawns the REGISTERED file with the caller's argv**, in
+    /// the project root, with no shell anywhere in the path.
+    #[tokio::test]
+    async fn a_registered_command_runs_with_the_callers_argv() {
+        let Some((program, args)) = echo_program() else {
+            return;
+        };
+        let (commands, dir) = harness_fixture(&program.to_string_lossy(), None);
+        let settings = crate::settings::Settings::default();
+        let out = run_selected(&std::env::temp_dir(), &settings, &commands, "svn", &args)
+            .await
+            .expect("the registered tool runs");
+        // The harness header (tool + duration), then the shared core's own
+        // rendering underneath — the argv reached the program verbatim.
+        assert!(out.starts_with("svn · "), "{out}");
+        assert!(out.contains(" ms\n(exit 0)"), "{out}");
+        assert!(out.contains("cimp-argv-ok"), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The refusals a caller can actually hit, each naming what to do about it.
+    #[tokio::test]
+    async fn the_harness_surface_refuses_unknown_names_and_stale_paths() {
+        let settings = crate::settings::Settings::default();
+        let root = std::env::temp_dir();
+
+        // Nothing runnable at all: the answer names the two things that make a
+        // command tool runnable, because both are the user's to supply.
+        let err = run_selected(&root, &settings, &[], "svn", &[])
+            .await
+            .expect_err("an empty registry cannot run anything");
+        assert!(err.contains("no runnable tools"), "{err}");
+        assert!(err.contains("Tool Plugins"), "{err}");
+
+        let (commands, dir) = harness_fixture("C:\\tools\\definitely-not-here.exe", None);
+        // A name that is not in the enum lists what is.
+        let err = run_selected(&root, &settings, &commands, "nope", &[])
+            .await
+            .expect_err("unknown name");
+        assert!(err.contains("no command tool named `nope`"), "{err}");
+        assert!(err.contains("svn"), "{err}");
+
+        // A configured path that no longer exists is a CONFIGURATION problem,
+        // named as one — not an opaque spawn error.
+        let err = run_selected(&root, &settings, &commands, "svn", &[])
+            .await
+            .expect_err("stale path");
+        assert!(err.contains("acme@1.0.0/svn"), "{err}");
+        assert!(err.contains("does not exist"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `CommandPolicy` is a statement about ARGUMENTS, and the harness surface
+    /// is not a way around it: the same stem match, the same refusal.
+    #[tokio::test]
+    async fn command_policies_apply_on_the_harness_surface_too() {
+        let Some((program, _)) = echo_program() else {
+            return;
+        };
+        let (commands, dir) = harness_fixture(&program.to_string_lossy(), None);
+        let mut settings = crate::settings::Settings::default();
+        settings.offload.command_policies = vec![CommandPolicy {
+            program: "svn".to_string(),
+            denied_flags: vec!["--config-dir".to_string()],
+            ..CommandPolicy::default()
+        }];
+        let err = run_selected(
+            &std::env::temp_dir(),
+            &settings,
+            &commands,
+            "svn",
+            &["--config-dir".to_string(), "x".to_string()],
+        )
+        .await
+        .expect_err("the policy refuses this argument");
+        assert!(err.contains("command policy"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **The manifest's posture reaches this spawn too.** A `command` tool
+    /// declaring `sandbox: required` is NOT run when the boundary cannot be
+    /// provided — including when the user switched the sandbox off, which is the
+    /// case a plugin author cannot see. Run through the real `run_selected`, so
+    /// this asserts the wiring and not just `ToolPosture::resolve`.
+    #[tokio::test]
+    async fn a_required_sandbox_command_refuses_to_run_unprotected() {
+        let Some((program, args)) = echo_program() else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("cimp-cmdposture-{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(
+            dir.join("acme.json"),
+            r#"{
+              "manifest_version": 1,
+              "name": "acme",
+              "version": "1.0.0",
+              "categories": [{ "id": "c", "label": "C", "tools": ["svn"] }],
+              "tools": [
+                { "id": "svn", "label": "Subversion", "kind": "command", "sandbox": "required" }
+              ]
+            }"#,
+        )
+        .expect("write manifest");
+        let set = crate::plugins::loader::scan_dir(&dir, crate::plugins::manifest::Provenance::User);
+        assert!(set.errors.is_empty(), "{:?}", set.errors);
+        let mut cfg = crate::settings::ToolPluginsSettings::default();
+        cfg.global_paths.insert(
+            "acme@1.0.0/svn".to_string(),
+            program.to_string_lossy().to_string(),
+        );
+        let commands = advertised_commands(&set, &cfg, None);
+
+        let mut settings = crate::settings::Settings::default();
+        settings.sandbox.enabled = false;
+        let err = run_selected(&std::env::temp_dir(), &settings, &commands, "svn", &args)
+            .await
+            .expect_err("`required` must refuse rather than run unprotected");
+        assert!(err.contains("sandbox: required"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

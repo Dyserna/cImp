@@ -1554,6 +1554,15 @@ export interface ToolPluginsSettings {
   plugins: Record<string, PluginState>;
   project_paths: Record<string, Record<string, string>>;
   global_paths: Record<string, string>;
+  /// V38 F-3: advertise the `run_command` MCP tool — the registry's runnable
+  /// `command`-kind entries under one tool with a `tool` enum — to Claude Code
+  /// tabs. Default true; the real gate is whether any command tool is enabled
+  /// AND has a path, so a fresh install advertises nothing.
+  expose_commands_claude: boolean;
+  /// V38 F-3: the same for OpenCode tabs. OpenCode caches `tools/list` at
+  /// connect, so a flip here (or a newly configured command tool) shows up only
+  /// after a tab restart.
+  expose_commands_opencode: boolean;
 }
 
 /// One plugin's user state (mirror of Rust `PluginState`). Disabling the plugin
@@ -2445,6 +2454,12 @@ export function defaultSettings(): Settings {
     },
     // Empty on a fresh install: plugins are files the user drops into
     // `<exe-dir>/plugins/`, so there is nothing to seed.
-    tool_plugins: { plugins: {}, project_paths: {}, global_paths: {} },
+    tool_plugins: {
+      plugins: {},
+      project_paths: {},
+      global_paths: {},
+      expose_commands_claude: true,
+      expose_commands_opencode: true,
+    },
   };
 }

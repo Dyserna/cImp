@@ -544,7 +544,15 @@ impl Default for Settings {
 /// "the tool disappeared, so I threw away your settings" is a data-loss bug
 /// wearing a tidiness costume. The settings pane renders what the loader found;
 /// the state for everything else simply waits.
-#[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
+/// # Exposure of `command`-kind tools (V38 F-3)
+///
+/// The two `expose_commands_*` flags are the fourth member of the container and
+/// the only non-map one. They are **machine scope** like everything here except
+/// the two per-tool leaves — the overlay strip is an allow-list, so they are
+/// dropped from a project's `.cimp/config.json` without anyone adding a rule,
+/// which is the right default for a switch that decides what a model may
+/// execute.
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 #[serde(default)]
 pub struct ToolPluginsSettings {
     /// Per-plugin state, keyed `name@version` (`loader::LoadedPlugin::key`).
@@ -556,6 +564,50 @@ pub struct ToolPluginsSettings {
     /// (`loader::LoadedPlugin::tool_key`). The fallback when the current
     /// project names none.
     pub global_paths: BTreeMap<String, String>,
+    /// V38 F-3: advertise the `run_command` MCP tool — the registry's runnable
+    /// `command`-kind entries, under one tool with a `tool` enum — to Claude
+    /// Code tabs.
+    ///
+    /// Default **on**, and the real gate is elsewhere: the tool is hidden unless
+    /// at least one `command`-kind entry is enabled AND path-configured, which
+    /// on a fresh install is none of them. So a default of `false` would only
+    /// mean "the user configured a command tool and then had to find a second
+    /// switch to use it" — the `code_audit.expose_*` precedent, for the same
+    /// reason (there the master `enabled` is the gate; here it is the runnable
+    /// set).
+    pub expose_commands_claude: bool,
+    /// V38 F-3: the same for OpenCode tabs. OpenCode caches `tools/list` at
+    /// connect, so flipping this (or configuring the first command tool)
+    /// refreshes the advertised list only after a tab restart — the same known
+    /// caveat `code_audit.expose_opencode` carries.
+    pub expose_commands_opencode: bool,
+}
+
+impl Default for ToolPluginsSettings {
+    fn default() -> Self {
+        Self {
+            plugins: BTreeMap::new(),
+            project_paths: BTreeMap::new(),
+            global_paths: BTreeMap::new(),
+            expose_commands_claude: true,
+            expose_commands_opencode: true,
+        }
+    }
+}
+
+impl ToolPluginsSettings {
+    /// Whether `command`-kind tools are advertised to this consumer
+    /// (`"claude"` / `"opencode"`, matched the way
+    /// `graph::mcp::source_for_consumer` matches: anything not OpenCode is
+    /// Claude). The one place the mapping lives, so an unrecognized consumer
+    /// name cannot mean "exposed" on one surface and "hidden" on another.
+    pub fn commands_exposed_to(&self, consumer: &str) -> bool {
+        if consumer.eq_ignore_ascii_case("opencode") {
+            self.expose_commands_opencode
+        } else {
+            self.expose_commands_claude
+        }
+    }
 }
 
 /// One plugin's user state.
@@ -6503,6 +6555,7 @@ mod tests {
                 "acme@1.0.0/scan".to_string(),
                 "D:\\tools\\acme.exe".to_string(),
             )]),
+            ..ToolPluginsSettings::default()
         };
         let s = Settings {
             tool_plugins: cfg.clone(),
@@ -6585,6 +6638,7 @@ mod tests {
             plugins: BTreeMap::from([("a@1".to_string(), PluginState { enabled: true, tools })]),
             project_paths: BTreeMap::from([("root".to_string(), BTreeMap::new())]),
             global_paths: BTreeMap::new(),
+            ..ToolPluginsSettings::default()
         };
         let value = serde_json::to_value(&cfg).expect("serializes");
         let mut keys: Vec<String> = value

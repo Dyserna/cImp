@@ -28,6 +28,13 @@
 //!   they are attacker-reachable text being placed into a shell command line —
 //!   the one place V38 could turn a declarative manifest into arbitrary code
 //!   execution. [`screen_shell_value`] is the boundary.
+//! * **Where it runs (V38 F-1).** A check admitted by a marker the census found
+//!   in a SUBDIRECTORY runs in that subdirectory. The census matches
+//!   recursively, so gating on `Cargo.toml` admitted the starter pack's rust
+//!   checks in a repo whose only manifest is `src-tauri/Cargo.toml` — and then
+//!   ran them at the root, where `cargo build` exits 101 before doing any work.
+//!   [`derived_cwd`] is that fix, and it is deliberately the ONLY inference
+//!   here: a manifest-declared `cwd` still wins outright.
 //! * **Posture.** The manifest's `runtime`/`sandbox`/`extra_grants` travel with
 //!   the rendered def as a [`crate::plugins::posture::ToolPosture`], applied at
 //!   the spawn by the same four rules the audit runner uses.
@@ -189,8 +196,8 @@ pub fn effective_checks(
             continue;
         }
         let taken: Vec<&str> = out.iter().map(|c| c.def.name.as_str()).collect();
-        let name = disambiguate(&tool, &taken);
-        out.push(build(&tool, name, run_root));
+        let name = registry::advertised_name(&tool, &taken);
+        out.push(build(&tool, name, run_root, census));
     }
     out
 }
@@ -233,33 +240,80 @@ pub fn effective_check_names(settings: &Settings) -> Vec<String> {
         .collect()
 }
 
-/// The advertised name for one plugin check, given what is already taken.
+/// **V38 F-1 — where a plugin check runs when its marker is not at the root.**
 ///
-/// The manifest-local id first (short, authored, and what a user reading the
-/// settings pane sees), then the fully-qualified key, then the key with a
-/// counter. Total by construction: the loop cannot run out of candidates, so
-/// there is no "and otherwise drop it" branch for a name clash to fall into.
-fn disambiguate(tool: &EffectiveTool, taken: &[&str]) -> String {
-    if !taken.contains(&tool.tool_id.as_str()) {
-        return tool.tool_id.clone();
+/// The defect this closes, in one line: `Census::admits` matches RECURSIVELY, so
+/// `src-tauri/Cargo.toml` admitted the starter pack's rust checks in this very
+/// repo, and the rendered `CheckDef` then ran `cargo build` at the project root,
+/// where it exits 101 in 140 ms with "could not find `Cargo.toml`". The census
+/// and the run cwd disagreed about which directory the tool applies to.
+///
+/// The precedence, in the order the code reads it:
+///
+/// 1. **A manifest-declared `cwd` always wins.** Explicit beats inferred — an
+///    author who named a directory knows something the census cannot see, and a
+///    heuristic that could override them would make the field unreliable.
+/// 2. **A root hit means the root**, i.e. exactly the pre-F-1 behaviour. This is
+///    the ordinary case and it must not move.
+/// 3. Otherwise the **shallowest** directory a listed marker was seen in, ties
+///    broken lexicographically ([`census::dir_is_better`], the same ordering the
+///    census itself applied while walking).
+///
+/// # Limits, stated rather than discovered later
+///
+/// * **One check, one directory.** A monorepo with four `pom.xml`s gets one
+///   maven check in one of them, not four. Multi-instance fan-out is a different
+///   feature (it changes the advertised NAME set, not just the cwd) and is out
+///   of scope here; § 3.5 of the contract doc says so too.
+/// * **Markers only.** `extensions` carry no location — the census records which
+///   extensions exist, not where — so a tool gated only on `extensions` keeps
+///   running at the root. That is the honest answer: "some `.java` file exists
+///   somewhere" does not name a build directory.
+fn derived_cwd(
+    m: &crate::plugins::manifest::ToolManifest,
+    census: &Census,
+) -> Option<String> {
+    // Rule 1. `filter` rather than `is_some`: an empty string is how a manifest
+    // spells "no cwd" once it has been through serde, and `run` treats it that
+    // way too.
+    if m.cwd.as_deref().filter(|s| !s.is_empty()).is_some() {
+        return None;
     }
-    if !taken.contains(&tool.tool_key.as_str()) {
-        return tool.tool_key.clone();
-    }
-    for n in 2u32.. {
-        let candidate = format!("{}#{n}", tool.tool_key);
-        if !taken.contains(&candidate.as_str()) {
-            return candidate;
+    let mut best: Option<&str> = None;
+    for marker in &m.applicability.markers {
+        let Some(dir) = census.marker_dir(marker) else {
+            continue;
+        };
+        if best.is_none_or(|current| census::dir_is_better(dir, current)) {
+            best = Some(dir);
         }
     }
-    unreachable!("the counter is unbounded")
+    // Rule 2: the root is `Some("")` here, and `CheckDef::cwd = None` is how the
+    // pipeline spells the root. Returning `Some("")` would be the same directory
+    // written a second way, and every reader would have to know both.
+    let best = best.filter(|d| !d.is_empty())?;
+    // The derived value is cImp's own — a `strip_prefix` of one walked path
+    // against the root it was walked from — so it is relative and `..`-free by
+    // construction. It is checked anyway, by the SAME function `CheckDef::validate`
+    // calls, because "by construction" is a claim about today's walker and the
+    // confinement is a security property: a value that cannot pass the check is
+    // dropped in favour of the root rather than handed to a spawn.
+    match super::lexically_confined("cwd", best) {
+        Ok(()) => Some(best.to_string()),
+        Err(_) => None,
+    }
 }
 
 /// Render one registry entry into an [`EffectiveCheck`].
 ///
 /// Every failure produces an advertised-but-broken check carrying the reason,
 /// never a silent omission — see [`PluginCheck::error`].
-fn build(tool: &EffectiveTool, name: String, run_root: &Path) -> EffectiveCheck {
+fn build(
+    tool: &EffectiveTool,
+    name: String,
+    run_root: &Path,
+    census: &Census,
+) -> EffectiveCheck {
     let m = &tool.manifest;
     let plugin = |error: Option<String>| PluginCheck {
         tool_key: tool.tool_key.clone(),
@@ -313,7 +367,9 @@ fn build(tool: &EffectiveTool, name: String, run_root: &Path) -> EffectiveCheck 
                 // The pipeline default when the manifest and the user are both
                 // silent — `CheckDef::default()`'s 120s, not a second constant.
                 timeout_secs: tool.timeout_secs.unwrap_or(CheckDef::default().timeout_secs),
-                cwd: m.cwd.clone(),
+                // F-1: the manifest's directory, else the one its own
+                // applicability marker was found in. See [`derived_cwd`].
+                cwd: m.cwd.clone().or_else(|| derived_cwd(m, census)),
                 env: m.env.clone(),
                 report_file: m.report_file.clone(),
                 pattern: m.pattern.clone(),
@@ -882,6 +938,147 @@ mod applicability_tests {
         let both = names(&set, &cfg, &["pom.xml", "build.gradle"]);
         assert_eq!(both.len(), 3, "{both:?}");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **V38 F-1 — a check whose marker is nested runs where the marker is.**
+    ///
+    /// The live defect, as a test: the census admits a `Cargo.toml`-gated check
+    /// in a repo whose only manifest is `src-tauri/Cargo.toml`, and before this
+    /// the rendered def carried no `cwd` at all — so `cargo build` ran at the
+    /// root and exited 101 in 140 ms.
+    #[test]
+    fn a_check_admitted_by_a_nested_marker_runs_in_that_directory() {
+        let (set, dir) = gated_fixture();
+        let cfg = all_configured();
+        let census =
+            crate::audit::census::Census::from_parts_with_dirs(&[], &[("pom.xml", "services/api")]);
+        let checks = effective_checks(&cfg, &set, None, &PathBuf::from("C:\\proj"), &census);
+        let mvn = checks
+            .iter()
+            .find(|c| c.def.name == "mvn-build")
+            .expect("the gated check is advertised");
+        assert_eq!(mvn.def.cwd.as_deref(), Some("services/api"));
+        // The UNGATED check is untouched: no marker, no inference, and "runs at
+        // the root" stays the default for everything that does not ask.
+        let any = checks.iter().find(|c| c.def.name == "any").expect("ungated");
+        assert_eq!(any.def.cwd, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A marker at the ROOT means the root — the pre-F-1 behaviour, unmoved.
+    /// `cwd: None` and `cwd: Some("")` are the same directory, and the pipeline
+    /// spells it exactly one way.
+    #[test]
+    fn a_root_marker_still_runs_at_the_root() {
+        let (set, dir) = gated_fixture();
+        let cfg = all_configured();
+        let census = crate::audit::census::Census::from_parts_with_dirs(&[], &[("pom.xml", "")]);
+        let checks = effective_checks(&cfg, &set, None, &PathBuf::from("C:\\proj"), &census);
+        assert_eq!(
+            checks
+                .iter()
+                .find(|c| c.def.name == "mvn-build")
+                .expect("advertised")
+                .def
+                .cwd,
+            None
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **Explicit beats inferred.** A manifest that names a `cwd` keeps it, even
+    /// when the census would have derived a different one — the author knows
+    /// something the walk cannot see, and an inference that could override them
+    /// would make the field unreliable.
+    #[test]
+    fn a_manifest_declared_cwd_wins_over_the_derived_one() {
+        let dir = std::env::temp_dir().join(format!("cimp-checkcwd-{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(
+            dir.join("acme.json"),
+            r#"{
+              "manifest_version": 1,
+              "name": "acme",
+              "version": "1.0.0",
+              "categories": [{ "id": "c", "label": "C", "tools": ["mvn-build"] }],
+              "tools": [
+                { "id": "mvn-build", "label": "Maven", "kind": "check", "cmd": "mvn compile",
+                  "cwd": "declared/here",
+                  "applicability": { "markers": ["pom.xml"] } }
+              ]
+            }"#,
+        )
+        .expect("write manifest");
+        let set = scan_dir(&dir, Provenance::User);
+        assert!(set.errors.is_empty(), "{:?}", set.errors);
+
+        let mut cfg = Settings::default();
+        cfg.tool_plugins.plugins.insert(
+            "acme@1.0.0".to_string(),
+            PluginState {
+                enabled: true,
+                tools: BTreeMap::from([("mvn-build".to_string(), ToolState::default())]),
+            },
+        );
+        cfg.tool_plugins
+            .global_paths
+            .insert("acme@1.0.0/mvn-build".to_string(), "C:\\t\\mvn.exe".to_string());
+
+        let census = crate::audit::census::Census::from_parts_with_dirs(
+            &[],
+            &[("pom.xml", "services/api")],
+        );
+        let checks = effective_checks(&cfg, &set, None, &PathBuf::from("C:\\proj"), &census);
+        assert_eq!(checks[0].def.cwd.as_deref(), Some("declared/here"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Several markers, several hits: the SHALLOWEST wins and equal depths break
+    /// lexicographically, so two walks of the same tree cannot render two
+    /// different commands.
+    #[test]
+    fn the_derived_directory_is_deterministic() {
+        let (set, dir) = gated_fixture();
+        let cfg = all_configured();
+        // `gr-build` gates on `build.gradle` alone; give the census two hits for
+        // the OTHER marker so the tie-break is what decides `mvn-build`.
+        let deep = crate::audit::census::Census::from_parts_with_dirs(
+            &[],
+            &[("pom.xml", "b/one"), ("build.gradle", "a")],
+        );
+        let checks = effective_checks(&cfg, &set, None, &PathBuf::from("C:\\proj"), &deep);
+        let find = |n: &str| {
+            checks
+                .iter()
+                .find(|c| c.def.name == n)
+                .unwrap_or_else(|| panic!("{n}"))
+                .def
+                .cwd
+                .clone()
+        };
+        assert_eq!(find("mvn-build").as_deref(), Some("b/one"));
+        assert_eq!(find("gr-build").as_deref(), Some("a"), "shallower wins");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The derived value is confined by the SAME rule `CheckDef::validate`
+    /// applies, so a rendered plugin check can never carry a `cwd` the pipeline
+    /// would refuse at spawn.
+    #[test]
+    fn every_derived_cwd_passes_the_checkdef_confinement() {
+        let (set, dir) = gated_fixture();
+        let cfg = all_configured();
+        let census = crate::audit::census::Census::from_parts_with_dirs(
+            &[],
+            &[("pom.xml", "services/api"), ("build.gradle", "tools")],
+        );
+        for c in effective_checks(&cfg, &set, None, &PathBuf::from("C:\\proj"), &census) {
+            c.def
+                .validate()
+                .unwrap_or_else(|e| panic!("`{}` rendered an invalid def: {e}", c.def.name));
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -41,6 +41,14 @@ export interface PluginVariableDecl {
   default: string | null;
 }
 
+/// V38 Phase F — a tier-2 tool's provider: the MCP server that answers for it,
+/// instead of a binary cImp spawns. `null` on every tier-1 tool, which is all of
+/// them by default.
+export interface PluginProviderRef {
+  server: string;
+  tool: string;
+}
+
 export interface PluginToolManifest {
   id: string;
   label: string;
@@ -62,6 +70,8 @@ export interface PluginToolManifest {
   transport: 'stdout' | 'report_file' | null;
   findings_exit_codes: number[];
   applicability: { extensions: string[]; markers: string[] };
+  /// Tier 2 (§ 4.5): findings come from this MCP server, and nothing is spawned.
+  provider: PluginProviderRef | null;
   cmd: string | null;
   cwd: string | null;
   report_file: string | null;
@@ -175,6 +185,11 @@ export interface ToolRow {
   /// box MEANS ("resolve normally" against "this tool does not run"), which is
   /// the difference between a working default and an invisible one.
   resolvesByName: boolean;
+  /// V38 Phase F: set for a TIER-2 tool. The pane renders the server it calls
+  /// where a tier-1 tool renders its two path boxes — a provider tool has no
+  /// binary, so an empty path input beside it would be an instruction the user
+  /// cannot follow.
+  provider: PluginProviderRef | null;
 }
 
 export type CategoryToggleState = 'on' | 'off' | 'mixed';
@@ -267,6 +282,16 @@ export function toolPath(
 /// allowed.
 export function permissionSummary(tool: PluginToolManifest): string[] {
   const out: string[] = [];
+  // Tier 2 asks for something else entirely, and saying "to run inside the OS
+  // sandbox" about a tool that never runs here would be the worst kind of
+  // reassuring. The trust it asks for is the SERVER's — see § 4.5's statement.
+  if (tool.provider) {
+    out.push(
+      `to call the MCP server "${tool.provider.server}" you configured (its "${tool.provider.tool}" tool) — nothing runs on this machine`,
+    );
+    out.push("to read that server's answer as findings, which means trusting the server");
+    return out;
+  }
   if (tool.sandbox === 'unsupported') {
     out.push('to run OUTSIDE the OS sandbox (this tool declares it cannot be confined)');
   } else if (tool.sandbox === 'optional') {
@@ -351,6 +376,7 @@ export function pluginRows(set: PluginSet, settings: Settings, projectKey: strin
           permissions: permissionSummary(t),
           sandbox: t.sandbox,
           resolvesByName: p.provenance === 'builtin' && !!t.command,
+          provider: t.provider ?? null,
         });
       }
       return { id: c.id, label: c.label, tools, state: categoryState(tools) };

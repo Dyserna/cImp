@@ -6721,7 +6721,11 @@
                 <span class="audit-name">{tool.label}</span>
                 <span class="audit-role">{tool.description ?? tool.kind}</span>
                 <span class="audit-scope" class:local={tool.path.scope === 'project'}>
-                  {tool.path.scope === 'unset' ? 'no path' : tool.path.scope}
+                  {tool.provider
+                    ? 'MCP'
+                    : tool.path.scope === 'unset'
+                      ? 'no path'
+                      : tool.path.scope}
                 </span>
               </label>
 
@@ -6739,78 +6743,38 @@
 
               {#if !plugin.enabled}
                 <small class="hint audit-na">off — the plugin is disabled</small>
-              {:else if tool.path.effective === '' && !tool.resolvesByName}
+              {:else if !tool.provider && tool.path.effective === '' && !tool.resolvesByName}
                 <small class="hint audit-na">
                   no path set, so this tool does not run
                 </small>
               {/if}
 
-              <small class="hint plugin-field">Path on this machine</small>
-              <div class="input-with-action">
-                <input
-                  type="text"
-                  placeholder={tool.resolvesByName
-                    ? '(use the ebin folder / PATH)'
-                    : '(not set — the tool will not run)'}
-                  value={tool.path.global}
-                  oninput={(e) =>
-                    patchPlugin((s) =>
-                      setGlobalPath(
-                        s,
-                        tool.toolKey,
-                        (e.currentTarget as HTMLInputElement).value,
-                      ),
-                    )}
-                />
-                <button
-                  type="button"
-                  class="secondary"
-                  onclick={() =>
-                    void detectPluginTool(tool.toolKey, tool.path.effective)}
-                >
-                  Detect
-                </button>
-                <button
-                  type="button"
-                  class="secondary"
-                  onclick={() => void pickToolBinary(tool.toolKey, 'global')}
-                >
-                  Browse…
-                </button>
-                <button
-                  type="button"
-                  class="secondary"
-                  onclick={() => patchPlugin((s) => setGlobalPath(s, tool.toolKey, ''))}
-                >
-                  Clear
-                </button>
-              </div>
-              {#if formatDetect(auditDetect[tool.toolKey]).kind !== 'idle'}
-                {@const disp = formatDetect(auditDetect[tool.toolKey])}
-                <small
-                  class="hint audit-detect"
-                  class:ok={disp.kind === 'found'}
-                  class:bad={disp.kind === 'not-found'}
-                >
-                  {disp.text}
+              {#if tool.provider}
+                <!-- V38 Phase F, tier 2: no binary, so no path boxes. The pane
+                     shows the server this tool calls instead — an empty path
+                     input beside it would be an instruction nobody can follow,
+                     and a "no path set, so this tool does not run" hint would be
+                     simply false. Editing the server is MCP-registry work and
+                     lives in the MCP servers section, so this is read-only. -->
+                <small class="hint plugin-field">Answered by an MCP server</small>
+                <small class="hint">
+                  <code>{tool.provider.server}</code> → <code>{tool.provider.tool}</code>
+                  — configure and enable it under <strong>MCP servers</strong>.
+                  Nothing is installed or spawned for this tool on this machine.
                 </small>
-              {/if}
-
-              {#if pluginProjectKey}
-                <small class="hint plugin-field">
-                  This project
-                  {tool.path.project === null ? '(inherited)' : '(overridden)'}
-                </small>
+              {:else}
+                <small class="hint plugin-field">Path on this machine</small>
                 <div class="input-with-action">
                   <input
                     type="text"
-                    placeholder="(use the machine-wide path above)"
-                    value={tool.path.project ?? ''}
+                    placeholder={tool.resolvesByName
+                      ? '(use the ebin folder / PATH)'
+                      : '(not set — the tool will not run)'}
+                    value={tool.path.global}
                     oninput={(e) =>
                       patchPlugin((s) =>
-                        setProjectPath(
+                        setGlobalPath(
                           s,
-                          pluginProjectKey,
                           tool.toolKey,
                           (e.currentTarget as HTMLInputElement).value,
                         ),
@@ -6819,22 +6783,77 @@
                   <button
                     type="button"
                     class="secondary"
-                    onclick={() => void pickToolBinary(tool.toolKey, 'project')}
+                    onclick={() =>
+                      void detectPluginTool(tool.toolKey, tool.path.effective)}
+                  >
+                    Detect
+                  </button>
+                  <button
+                    type="button"
+                    class="secondary"
+                    onclick={() => void pickToolBinary(tool.toolKey, 'global')}
                   >
                     Browse…
                   </button>
                   <button
                     type="button"
                     class="secondary"
-                    disabled={tool.path.project === null}
-                    onclick={() =>
-                      patchPlugin((s) =>
-                        revertToGlobalPath(s, pluginProjectKey, tool.toolKey),
-                      )}
+                    onclick={() => patchPlugin((s) => setGlobalPath(s, tool.toolKey, ''))}
                   >
-                    Use machine-wide
+                    Clear
                   </button>
                 </div>
+                {#if formatDetect(auditDetect[tool.toolKey]).kind !== 'idle'}
+                  {@const disp = formatDetect(auditDetect[tool.toolKey])}
+                  <small
+                    class="hint audit-detect"
+                    class:ok={disp.kind === 'found'}
+                    class:bad={disp.kind === 'not-found'}
+                  >
+                    {disp.text}
+                  </small>
+                {/if}
+
+                {#if pluginProjectKey}
+                  <small class="hint plugin-field">
+                    This project
+                    {tool.path.project === null ? '(inherited)' : '(overridden)'}
+                  </small>
+                  <div class="input-with-action">
+                    <input
+                      type="text"
+                      placeholder="(use the machine-wide path above)"
+                      value={tool.path.project ?? ''}
+                      oninput={(e) =>
+                        patchPlugin((s) =>
+                          setProjectPath(
+                            s,
+                            pluginProjectKey,
+                            tool.toolKey,
+                            (e.currentTarget as HTMLInputElement).value,
+                          ),
+                        )}
+                    />
+                    <button
+                      type="button"
+                      class="secondary"
+                      onclick={() => void pickToolBinary(tool.toolKey, 'project')}
+                    >
+                      Browse…
+                    </button>
+                    <button
+                      type="button"
+                      class="secondary"
+                      disabled={tool.path.project === null}
+                      onclick={() =>
+                        patchPlugin((s) =>
+                          revertToGlobalPath(s, pluginProjectKey, tool.toolKey),
+                        )}
+                    >
+                      Use machine-wide
+                    </button>
+                  </div>
+                {/if}
               {/if}
 
               {#each tool.variables as variable (variable.name)}

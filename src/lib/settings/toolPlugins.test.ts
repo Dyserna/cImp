@@ -39,6 +39,7 @@ function tool(over: Partial<PluginToolManifest> = {}): PluginToolManifest {
     transport: null,
     findings_exit_codes: [],
     applicability: { extensions: [], markers: [] },
+    provider: null,
     cmd: null,
     cwd: null,
     report_file: null,
@@ -235,6 +236,39 @@ describe('permissionSummary', () => {
       'access to C:\\ProgramData\\acme',
       'these environment variables set: ACME_TOKEN',
     ]);
+  });
+
+  test('a tier-2 tool asks for the SERVER, never for a sandbox it will never be in', () => {
+    const lines = permissionSummary(
+      tool({
+        provider: { server: 'acme-mcp', tool: 'scan_repository' },
+        // The manifest's defaults; validation refuses anything else here.
+        sandbox: 'required',
+        runtime: 'auto',
+      }),
+    );
+    expect(lines).toHaveLength(2);
+    expect(lines[0]).toContain('acme-mcp');
+    expect(lines[0]).toContain('scan_repository');
+    expect(lines[0]).toContain('nothing runs on this machine');
+    expect(lines[1]).toContain('trusting the server');
+    // The sandbox sentence would be reassuring and false: nothing is confined
+    // because nothing is spawned.
+    expect(lines.join(' ')).not.toContain('OS sandbox');
+  });
+
+  test('a provider tool reaches the rendered row with no path affordance', () => {
+    const s = set();
+    s.plugins[0].manifest.tools = [
+      tool({ id: 'scan', provider: { server: 'acme-mcp', tool: 'scan_repository' }, argv: [] }),
+    ];
+    s.plugins[0].manifest.categories = [{ id: 'sec', label: 'Security', tools: ['scan'] }];
+    const row = pluginRows(s, fresh(), PROJECT)[0].categories[0].tools[0];
+    expect(row.provider).toEqual({ server: 'acme-mcp', tool: 'scan_repository' });
+    // …and it is NOT resolvable by name either, so the pane cannot fall back to
+    // the built-in "(use the ebin folder / PATH)" story: the provider block is
+    // the only thing it can render.
+    expect(row.resolvesByName).toBe(false);
   });
 
   test('the safe defaults still say something, so silence never reads as "asks for nothing"', () => {

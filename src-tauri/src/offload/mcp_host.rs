@@ -918,6 +918,23 @@ pub enum Consumer {
     Claude,
     Offload,
     Opencode,
+    /// V38 Phase F — cImp's own audit fan-out, calling a **tier-2 provider**
+    /// tool's server on behalf of a `security_audit` / `quality_audit` run.
+    ///
+    /// # Why a variant rather than reusing `Offload`
+    ///
+    /// It is a different CALLER and the rows have to say so: an `mcp` lane row
+    /// stamped `offload` for a scan the user started from the Code Audit tab
+    /// would send someone reading the feed to the wrong subsystem. What it is
+    /// NOT is a new grant dimension — [`Self::granted`] reads the SAME
+    /// `offload_access` flag, because that flag has always meant "cImp's own
+    /// in-app consumers may reach this server", and inventing a fourth per-server
+    /// checkbox would be a settings-schema change hiding inside an audit feature.
+    ///
+    /// Never advertises: this consumer has no `tools/list` and never appears in
+    /// [`McpSurfaceFingerprint`]. It only ever dispatches, against a name the
+    /// manifest already fixed.
+    Audit,
 }
 
 impl Consumer {
@@ -936,6 +953,7 @@ impl Consumer {
             Consumer::Claude => "Claude Code",
             Consumer::Offload => "the offload worker",
             Consumer::Opencode => "OpenCode",
+            Consumer::Audit => "the Code Audit fan-out",
         }
     }
 
@@ -951,6 +969,9 @@ impl Consumer {
             Consumer::Claude => "claude",
             Consumer::Offload => "offload",
             Consumer::Opencode => "opencode",
+            // The same word `record_audit_run` stamps on the `audit` lane, so a
+            // reader following one scan across two lanes sees one name for it.
+            Consumer::Audit => "audit",
         }
     }
 
@@ -983,6 +1004,10 @@ impl Consumer {
             Consumer::Claude => claude,
             Consumer::Offload => offload,
             Consumer::Opencode => opencode,
+            // Deliberately NOT a fourth flag — see the variant's docs. A user
+            // who wants a server reachable by cImp itself ticks one box, and it
+            // is the box that has always meant that.
+            Consumer::Audit => offload,
         }
     }
 }
@@ -5263,5 +5288,65 @@ mod tests {
         assert_eq!(HealthEvent::Reconnected.source(), "reconnect");
         assert_eq!(HealthEvent::Recovered.source(), "probe");
         assert_eq!(HealthEvent::ConnectFailed.source(), "connect");
+    }
+
+    /// V38 Phase F — the audit fan-out's consumer identity, at the two places it
+    /// has to behave: the grant it reads and the refusal it gets.
+    ///
+    /// `Audit` is deliberately not a fourth per-server checkbox — it reads
+    /// `offload_access`, the flag that has always meant "cImp itself may use
+    /// this server". A server exposed only to Claude is therefore NOT reachable
+    /// by a provider-backed audit tool, and says so in the pre-V37 wording that
+    /// does not disclose the server's existence.
+    #[tokio::test]
+    async fn the_audit_consumer_reads_the_offload_grant_and_gets_v37s_refusal() {
+        let host = McpHost::new();
+        // Exposed to Claude only: not ours.
+        host.insert_fake_server("claude-only", true, false, false, "claude-only__scan")
+            .await;
+        // Exposed to cImp's own consumers.
+        host.insert_fake_server("acme", false, true, false, "acme__scan")
+            .await;
+
+        let denied = host
+            .call_for_consumer(Consumer::Audit, "claude-only__scan", json!({}))
+            .await
+            .expect_err("a server this consumer was never granted");
+        let denied = denied.to_string();
+        assert!(
+            denied.contains("the Code Audit fan-out") && !denied.contains(REFUSAL_DISABLED),
+            "an ungranted server is unknown, never 'disabled': {denied}"
+        );
+
+        // Granted and live: routing gets past the enable check and fails only on
+        // the fake server having no connection, which is as far as a test
+        // without a socket can go.
+        let reached = host
+            .call_for_consumer(Consumer::Audit, "acme__scan", json!({}))
+            .await
+            .expect_err("a fake server has no transport");
+        assert!(
+            !reached.to_string().contains("not available"),
+            "the grant let it through to routing: {reached}"
+        );
+
+        // Now turn it off at the server level: the audit fan-out gets exactly
+        // the refusal every other consumer gets, naming the level.
+        *host.disabled.write().await = vec![DisabledServer {
+            name: "acme".to_string(),
+            verdict: EnableVerdict::ServerOff,
+            claude_access: false,
+            offload_access: true,
+            opencode_access: false,
+        }];
+        let refused = host
+            .call_for_consumer(Consumer::Audit, "acme__scan", json!({}))
+            .await
+            .expect_err("disabled")
+            .to_string();
+        assert!(
+            refused.contains(REFUSAL_DISABLED) && refused.contains(REFUSAL_DISABLED_BY_SERVER),
+            "dispatch is the enforcement point, and it names the toggle: {refused}"
+        );
     }
 }

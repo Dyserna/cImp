@@ -29,8 +29,8 @@ use serde::{Serialize, Serializer};
 use super::adapters::{Category, Transport};
 use super::census::Census;
 use crate::plugins::manifest::{
-    self, IngestReq, LegacyAuditParser, ManifestParser, Provenance, RuntimeReq, SandboxReq,
-    ToolKind,
+    self, IngestReq, LegacyAuditParser, ManifestParser, Provenance, ProviderRef, RuntimeReq,
+    SandboxReq, ToolKind,
 };
 use crate::plugins::registry::EffectiveTool;
 
@@ -157,6 +157,12 @@ pub struct RunnableAudit {
     /// The manifest's applicability gate, kept so planning can apply the same
     /// census test the built-in adapters get.
     pub applicability: manifest::Applicability,
+    /// V38 Phase F — set for a **tier-2** tool: the MCP server and tool name its
+    /// findings come from. `Some` means nothing is spawned for this tool, so the
+    /// runner takes the provider path and every spawn-shaped field above
+    /// (`program`, `argv`, `transport`, the posture trio) is at its inert
+    /// default by validation.
+    pub provider: Option<ProviderRef>,
 }
 
 impl RunnableAudit {
@@ -179,7 +185,12 @@ impl RunnableAudit {
         // a reason rather than dropped, because a tool the user enabled must not
         // vanish from a report in silence either way.
         let program = tool.path.clone().unwrap_or_default();
-        if program.is_empty() && !tool.resolves_by_name() {
+        // A tier-2 tool has no binary by construction — the whole point is that
+        // a server the user administers answers instead. Everything below is
+        // shared with tier 1 on purpose: the key, the category, the timeout, the
+        // parser and the ingest gate are facts about the TOOL, not about who
+        // produced its bytes.
+        if !tool.is_provider() && program.is_empty() && !tool.resolves_by_name() {
             return Err("no binary path is configured".to_string());
         }
         let parser = findings_parser(tool.manifest.parser)?;
@@ -218,6 +229,7 @@ impl RunnableAudit {
             extra_grants: tool.manifest.extra_grants.clone(),
             provenance: tool.provenance,
             applicability: tool.manifest.applicability.clone(),
+            provider: tool.manifest.provider.clone(),
         }))
     }
 
@@ -1071,6 +1083,7 @@ mod tests {
             extra_grants: Vec::new(),
             provenance: Provenance::User,
             applicability: manifest::Applicability::default(),
+            provider: None,
         }
     }
 

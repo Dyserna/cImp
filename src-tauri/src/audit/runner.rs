@@ -25,7 +25,7 @@ use tokio_util::sync::CancellationToken;
 use crate::activity::{self, now_ms, ActivityEntry, ActivityKind, ActivityRecord};
 use crate::checks::{parsers, Diag};
 use crate::offload::service::PushNotice;
-use crate::plugins::manifest::SandboxReq;
+use crate::plugins::manifest::{ProviderRef, SandboxReq};
 use crate::plugins::registry::EffectiveTool;
 use crate::settings::SettingsHandle;
 
@@ -47,6 +47,34 @@ pub(crate) const MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 /// via `audit_snapshot`. The full snapshot IPC is never capped.
 // `pub(crate)` so `plugins::spec` can pin it against docs/TOOL-PLUGINS.md.
 pub(crate) const EVENT_FINDINGS_PER_TOOL_CAP: usize = 500;
+
+/// V38 Phase F — the `scope` a tier-2 provider call is made under.
+///
+/// `scope` is the label the injection features and the SSRF flag rows resolve a
+/// caller by, and every other producer passes a tab's scope or a worker task's.
+/// An audit fan-out is neither, so it says what it is: one stable word, so a row
+/// about a provider call is greppable and cannot be mistaken for a tab's.
+const PROVIDER_SCOPE: &str = "audit";
+
+/// What one tier-2 provider call came back as.
+///
+/// A local enum rather than reusing [`Outcome`]: that type is about a CHILD
+/// PROCESS (it carries an exit code, a spawn error, a kill), and a provider call
+/// has none of those facts. The two meet in [`finalize`], which is where the
+/// shared half begins — see [`AuditState::run_one_provider`].
+enum ProviderOutcome {
+    /// The server answered. The text is what its `content` rendered to, which
+    /// the ingest gate then judges: answering is not the same as saying
+    /// something.
+    Answered(String),
+    /// The scan was cancelled while the call was in flight.
+    Cancelled,
+    /// The tool's wall-clock budget elapsed first.
+    TimedOut,
+    /// The host refused it (a disabled server or category), the server errored,
+    /// or there is no host in this process. Never a clean pass.
+    Failed(String),
+}
 
 /// One tool's lifecycle within a scan. Serialized kebab-case, so the wire
 /// strings are exactly `idle | running | done | failed | not-installed |
@@ -325,6 +353,16 @@ pub struct AuditState {
     /// [`OffloadService::push_registry`](crate::offload::OffloadService::push_registry)),
     /// so there is no Arc cycle back into the offload service.
     pushes: Option<Arc<crate::offload::service::PushRegistry>>,
+    /// V38 Phase F: the warm MCP host, for **tier-2 provider** tools. `None` in
+    /// tests and in any standalone construction — a provider tool then fails
+    /// with that as its reason, which is honest, rather than silently reporting
+    /// a clean scan.
+    ///
+    /// The host, not the `OffloadService`: the runner needs exactly one thing
+    /// from that layer (dispatch a `tools/call` under V37's enforcement) and
+    /// holding the service would be an Arc cycle back into the thing that holds
+    /// the push registry this struct already takes only the send half of.
+    mcp: Option<Arc<crate::offload::mcp_host::McpHost>>,
 }
 
 impl AuditState {
@@ -336,11 +374,13 @@ impl AuditState {
         settings: SettingsHandle,
         root: PathBuf,
         pushes: Option<Arc<crate::offload::service::PushRegistry>>,
+        mcp: Option<Arc<crate::offload::mcp_host::McpHost>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             app,
             settings,
             pushes,
+            mcp,
             inner: StdMutex::new(Inner {
                 root,
                 scanning: false,
@@ -785,6 +825,28 @@ impl AuditState {
             // `code_audit.timeout_secs`). A build-style tool
             // (`dotnet-analyzers`) wants a longer budget than a linter.
             let timeout = effective_tool_timeout(tool.timeout_secs, global_timeout);
+            // V38 Phase F — tier 2: nothing to resolve, because nothing is
+            // spawned. The branch is HERE rather than inside `run_one` because
+            // resolution is the whole of what the two tiers do differently
+            // before the call; everything after it (the ingest gate, the
+            // attribution, the chip, the `audit` lane row) is shared.
+            if let Some(provider) = tool.provider.clone() {
+                let key = tool.key.clone();
+                self.patch_tool(&key, |ts| {
+                    ts.status = ToolStatus::Running;
+                    // A provider tool has no on-disk program; the pane renders
+                    // the server it calls instead (`provider` on the chip).
+                    ts.resolved = None;
+                });
+                let this = self.clone();
+                let cancel = cancel.clone();
+                let root = root.clone();
+                handles.push(tauri::async_runtime::spawn(async move {
+                    this.run_one_provider(tool, provider, root, timeout, cancel)
+                        .await;
+                }));
+                continue;
+            }
             // ONE resolution rule, branching only where the two provenances
             // genuinely differ: cImp resolves a bare command name for a tool it
             // shipped, and never for one it did not (decision 7). See
@@ -884,6 +946,126 @@ impl AuditState {
             delivered,
             "audit: pushed scan-complete notice"
         );
+    }
+
+    /// V38 Phase F — run one **tier-2 provider** tool: one `tools/call` against
+    /// the MCP server its manifest names, and its SARIF text through the same
+    /// ingest gate a spawned tool's stdout goes through.
+    ///
+    /// # What is shared with tier 1, and why that is the point
+    ///
+    /// Everything after the bytes arrive: [`finalize`] applies the tool's
+    /// [`IngestGate`](super::runnable::IngestGate) (always `Sarif` here — a
+    /// provider tool's parser is forced at load), the findings are attributed to
+    /// the REGISTRY KEY rather than to whatever `runs[].tool.driver.name` claims,
+    /// the report caps apply, and the chip and the `audit` lane row are the same
+    /// ones a spawned tool produces. A blank or non-SARIF answer is therefore a
+    /// tool ERROR, not a clean scan, exactly as for tier 1.
+    ///
+    /// # What is different
+    ///
+    /// * **Nothing is spawned**, so there is no sandbox posture, no spawn ledger
+    ///   row, no runtime canary and no wedged-child backstop. Validation refuses
+    ///   the fields that would describe those things, so there is nothing to
+    ///   ignore here.
+    /// * **Nothing is passed.** The call carries an empty argument object: the
+    ///   server scans what it is configured to scan. cImp's project root is not
+    ///   sent, because a provider has no guarantee of sharing this machine's
+    ///   filesystem and a path it cannot read is worse than no path at all.
+    /// * **Enforcement is V37's.** The call goes through
+    ///   [`McpHost::call_recorded`](crate::offload::mcp_host::McpHost::call_recorded),
+    ///   so a disabled server (or a disabled category) refuses it with the same
+    ///   words any other proxied call gets, the SSRF screen runs, and the `mcp`
+    ///   lane row is minted with the server, its category and this consumer.
+    ///   Health is deliberately NOT consulted as a gate — dispatch is the truth,
+    ///   and an "unhealthy" server that answers must not be refused by cImp.
+    async fn run_one_provider(
+        self: Arc<Self>,
+        tool: RunnableAudit,
+        provider: ProviderRef,
+        root: PathBuf,
+        timeout: Duration,
+        cancel: CancellationToken,
+    ) {
+        use crate::offload::mcp_host::Consumer;
+        use crate::offload::outbound;
+
+        let started = Instant::now();
+        // The routing name the host expects. Composed here, from the manifest's
+        // two halves, rather than stored as one string: `<server>__<tool>` is
+        // the host's convention, and this is the only place a manifest's words
+        // are turned into it.
+        let namespaced = format!("{}__{}", provider.server, provider.tool);
+
+        let outcome = match self.mcp.clone() {
+            None => ProviderOutcome::Failed(
+                "this cImp process has no MCP host, so a provider-backed tool cannot be called \
+                 (the offload runtime starts one whenever any MCP server is configured)"
+                    .to_string(),
+            ),
+            Some(host) => {
+                let snap = self.settings.current();
+                // `AppWide` is the honest scope: an audit fan-out belongs to no
+                // tab and is not the offload worker, and `AppWide`'s documented
+                // meaning is "what the application is configured to do".
+                let policy = outbound::Policy::from_settings(
+                    &snap,
+                    crate::settings::injection::Scope::AppWide,
+                );
+                // One ledger per tool run: the SSRF doubling counter is a
+                // property of a caller's session, and one scan is this caller's
+                // whole session.
+                let ledger = outbound::TaskAudit::default();
+                let call = host.call_recorded(
+                    Consumer::Audit,
+                    Some(root.as_path()),
+                    &namespaced,
+                    serde_json::json!({}),
+                    PROVIDER_SCOPE,
+                    // No tab: cImp runs the scan itself, the same reading
+                    // `record_audit_run` takes a few lines below.
+                    activity::Attribution::Headless,
+                    &policy,
+                    &ledger,
+                );
+                tokio::select! {
+                    // Cancel abandons the call cleanly: the future is dropped,
+                    // which is all a cancel can mean when there is no child to
+                    // kill. A request already in flight completes on the
+                    // server's side and its answer is discarded — the same
+                    // shape V37 documents for a toggle landing mid-call.
+                    _ = cancel.cancelled() => ProviderOutcome::Cancelled,
+                    r = tokio::time::timeout(timeout, call) => match r {
+                        Err(_) => ProviderOutcome::TimedOut,
+                        Ok(Ok(text)) => ProviderOutcome::Answered(text),
+                        // `HostError`'s `Display` is bounded and carries the
+                        // server's own wording; the reader here is the Code
+                        // Audit panel, which is a human.
+                        Ok(Err(e)) => ProviderOutcome::Failed(e.to_string()),
+                    },
+                }
+            }
+        };
+
+        let duration_ms = started.elapsed().as_millis() as u64;
+        let spec = Finalize {
+            key: tool.key.clone(),
+            findings_exit_codes: &tool.findings_exit_codes,
+            parser: tool.parser,
+            gate: tool.gate,
+        };
+        let (status, findings, error) =
+            finalize_provider(&spec, &outcome, &provider, &root, timeout);
+
+        let ok = status == ToolStatus::Done;
+        let findings_count = findings.len();
+        self.patch_tool(&tool.key, |ts| {
+            ts.status = status;
+            ts.findings = findings;
+            ts.duration_ms = duration_ms;
+            ts.error = error;
+        });
+        record_audit_run(&tool.key.wire(), &root, findings_count, duration_ms, ok);
     }
 
     /// Run one resolved tool end to end: spawn, capture, classify, decode,
@@ -1272,6 +1454,56 @@ pub(super) fn finalize(
                 }
             }
         }
+    }
+}
+
+/// V38 Phase F — classify one tier-2 call's result, as a pure function.
+///
+/// Split out of [`AuditState::run_one_provider`] so the contract that matters
+/// here — a remote answer goes through the SAME ingest gate and the SAME
+/// attribution a spawned tool's stdout does, and no failure mode is a clean
+/// pass — is assertable without a socket, a settings file or an `AppHandle`.
+/// The `fake_server` pattern this file's neighbours use can only produce
+/// "not connected"; everything interesting about a provider run is what happens
+/// to the bytes after they arrive, and this is that.
+fn finalize_provider(
+    spec: &Finalize,
+    outcome: &ProviderOutcome,
+    provider: &ProviderRef,
+    root: &Path,
+    timeout: Duration,
+) -> (ToolStatus, Vec<AuditFinding>, Option<String>) {
+    match outcome {
+        // Exit code 0 = `ExitClass::Clean`, which is what "the call returned"
+        // means when there is no process to have had an exit code. The gate is
+        // what decides whether the answer SAID anything.
+        ProviderOutcome::Answered(text) => finalize(
+            spec,
+            Outcome::Exited(Some(0)),
+            text,
+            false,
+            text,
+            "",
+            root,
+            timeout,
+        ),
+        ProviderOutcome::Cancelled => {
+            finalize(spec, Outcome::Cancelled, "", false, "", "", root, timeout)
+        }
+        ProviderOutcome::TimedOut => {
+            finalize(spec, Outcome::TimedOut, "", false, "", "", root, timeout)
+        }
+        // Never a clean pass. The reason is the server's or the host's, and it
+        // names the server so the fix is findable: this failed chip is the only
+        // place the fact is shown.
+        ProviderOutcome::Failed(why) => (
+            ToolStatus::Failed,
+            Vec::new(),
+            Some(format!(
+                "the MCP provider `{}` (tool `{}`) did not deliver findings: {why}",
+                provider.server, provider.tool
+            )),
+        ),
     }
 }
 
@@ -3965,6 +4197,203 @@ mod tests {
         assert!(
             line.contains("quality_audit"),
             "names the quality pull twin: {line}"
+        );
+    }
+
+    // ── V38 Phase F: tier 2 (provider-backed audit tools) ────────────────────
+
+    /// One provider-backed security tool, resolved through the REAL loader and
+    /// registry so every assertion runs against a validated manifest.
+    fn provider_tool(enabled: bool) -> EffectiveTool {
+        let dir = std::env::temp_dir().join(format!("cimp-provider-{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(
+            dir.join("acme.json"),
+            r#"{
+              "manifest_version": 1,
+              "name": "acme",
+              "version": "1.0.0",
+              "categories": [{ "id": "sec", "label": "Security", "tools": ["cloud"] }],
+              "tools": [{
+                "id": "cloud", "label": "Acme Cloud", "kind": "security",
+                "provider": { "server": "acme-mcp", "tool": "scan_repository" }
+              }]
+            }"#,
+        )
+        .expect("write manifest");
+        let set = crate::plugins::loader::scan_dir(
+            &dir,
+            crate::plugins::manifest::Provenance::User,
+        );
+        assert!(set.errors.is_empty(), "{:?}", set.errors);
+        let mut cfg = crate::settings::ToolPluginsSettings::default();
+        cfg.plugins.insert(
+            "acme@1.0.0".to_string(),
+            crate::settings::PluginState {
+                enabled: true,
+                tools: std::collections::BTreeMap::from([(
+                    "cloud".to_string(),
+                    crate::settings::ToolState {
+                        enabled,
+                        ..crate::settings::ToolState::default()
+                    },
+                )]),
+            },
+        );
+        let tools = crate::plugins::registry::effective_tools(&set, &cfg, None);
+        let _ = std::fs::remove_dir_all(&dir);
+        tools.into_iter().next().expect("one tool")
+    }
+
+    /// The registry rule tier 2 turns on: **no path is needed**. A provider tool
+    /// is runnable on its enable alone, because there is no binary for the user
+    /// to point at — and it must therefore reach the fan-out, where a missing or
+    /// disabled server becomes a failed chip rather than silence.
+    #[test]
+    fn a_provider_tool_is_runnable_without_a_path() {
+        let t = provider_tool(true);
+        assert!(t.is_provider());
+        assert!(t.path.is_none(), "nothing to point at");
+        assert!(!t.resolves_by_name(), "and nothing to resolve by name either");
+        assert!(t.runnable(), "enabled is the whole of runnable for tier 2");
+
+        // …and the enable still governs, exactly as for tier 1.
+        assert!(!provider_tool(false).runnable());
+    }
+
+    /// It joins `plan_scan`'s population as one more member of its umbrella,
+    /// carrying the provider reference the runner branches on. The gate a
+    /// spawned tool passes (`no binary path is configured`) must not fire.
+    #[test]
+    fn a_provider_tool_joins_the_fanout_as_a_running_chip() {
+        let t = provider_tool(true);
+        let runnable = RunnableAudit::from_effective(&t)
+            .expect("a provider tool prepares")
+            .expect("and belongs to an umbrella");
+        let p = runnable.provider.as_ref().expect("the reference travels");
+        assert_eq!(p.server, "acme-mcp");
+        assert_eq!(p.tool, "scan_repository");
+        assert_eq!(runnable.category, Category::Security);
+        assert!(runnable.program.is_empty());
+        // Forced at load, so the runner never has to ask which gate applies.
+        assert_eq!(runnable.parser, AuditParser::Sarif);
+        assert_eq!(runnable.gate, crate::audit::runnable::IngestGate::Sarif);
+
+        let (chips, to_run) = plan_scan(
+            std::slice::from_ref(&t),
+            Category::Security,
+            &census::Census::from_parts(&[], &[]),
+        );
+        assert_eq!(to_run.len(), 1, "it runs");
+        assert_eq!(chips.len(), 1);
+        assert_eq!(chips[0].status, ToolStatus::Running);
+        // The quality umbrella is somebody else's fan-out.
+        assert!(plan_scan(
+            std::slice::from_ref(&t),
+            Category::Quality,
+            &census::Census::from_parts(&[], &[])
+        )
+        .1
+        .is_empty());
+    }
+
+    fn provider_spec(key: &ToolKey) -> Finalize<'static> {
+        Finalize {
+            key: key.clone(),
+            findings_exit_codes: &[],
+            parser: AuditParser::Sarif,
+            gate: crate::audit::runnable::IngestGate::Sarif,
+        }
+    }
+
+    /// The whole tier-2 ingest contract in one run: a SARIF answer becomes
+    /// findings attributed to the REGISTRY key, and every other outcome is a
+    /// failure carrying a reason. Nothing here may read as a clean scan.
+    #[test]
+    fn a_provider_answer_goes_through_the_same_gate_and_attribution() {
+        let key = ToolKey::Plugin("acme@1.0.0/cloud".to_string());
+        let spec = provider_spec(&key);
+        let provider = ProviderRef {
+            server: "acme-mcp".to_string(),
+            tool: "scan_repository".to_string(),
+        };
+        let root = Path::new("C:\\proj");
+        let t = Duration::from_secs(60);
+
+        // A SARIF log that says something. The findings are the registry
+        // entry's, NOT `runs[].tool.driver.name`'s — a provider that claimed to
+        // be `gitleaks` would otherwise file its findings under a built-in.
+        let sarif = r#"{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"gitleaks"}},
+          "results":[{"ruleId":"ACME1","level":"error",
+            "message":{"text":"secret"},
+            "locations":[{"physicalLocation":{
+              "artifactLocation":{"uri":"src/a.rs"},
+              "region":{"startLine":3}}}]}]}]}"#;
+        let (status, findings, error) = finalize_provider(
+            &spec,
+            &ProviderOutcome::Answered(sarif.to_string()),
+            &provider,
+            root,
+            t,
+        );
+        assert_eq!(status, ToolStatus::Done);
+        assert_eq!(error, None);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].tool, key, "attribution is the key that ran");
+
+        // A SARIF log that ran and found nothing is a CLEAN pass — the
+        // distinction the gate exists for.
+        let (status, findings, _) = finalize_provider(
+            &spec,
+            &ProviderOutcome::Answered(r#"{"version":"2.1.0","runs":[]}"#.to_string()),
+            &provider,
+            root,
+            t,
+        );
+        assert_eq!(status, ToolStatus::Done);
+        assert!(findings.is_empty());
+
+        // Empty, and JSON-that-is-not-SARIF: a tool that said nothing at all,
+        // and one whose output cImp never understood. Neither is a clean scan.
+        for answer in ["", "   ", "{}", "not json", r#"{"ok":true}"#] {
+            let (status, findings, error) = finalize_provider(
+                &spec,
+                &ProviderOutcome::Answered(answer.to_string()),
+                &provider,
+                root,
+                t,
+            );
+            assert_eq!(status, ToolStatus::Failed, "answer {answer:?} must not pass");
+            assert!(findings.is_empty());
+            assert!(error.is_some());
+        }
+
+        // Cancel, timeout and a refusal from the host: three different facts,
+        // three different messages, none of them a pass.
+        let (status, _, error) =
+            finalize_provider(&spec, &ProviderOutcome::Cancelled, &provider, root, t);
+        assert_eq!(status, ToolStatus::Failed);
+        assert!(error.unwrap_or_default().contains("cancelled"));
+
+        let (status, _, error) =
+            finalize_provider(&spec, &ProviderOutcome::TimedOut, &provider, root, t);
+        assert_eq!(status, ToolStatus::Failed);
+        assert!(error.unwrap_or_default().contains("timed out"));
+
+        let refusal = crate::offload::mcp_host::REFUSAL_DISABLED;
+        let (status, _, error) = finalize_provider(
+            &spec,
+            &ProviderOutcome::Failed(format!("server `acme-mcp` {refusal}server toggle)")),
+            &provider,
+            root,
+            t,
+        );
+        assert_eq!(status, ToolStatus::Failed);
+        let error = error.unwrap_or_default();
+        assert!(
+            error.contains("acme-mcp") && error.contains(refusal),
+            "a disabled server's refusal reaches the chip verbatim: {error}"
         );
     }
 }

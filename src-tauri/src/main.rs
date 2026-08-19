@@ -704,7 +704,7 @@ fn main() {
             // announce their long-running completions into channel-armed
             // sessions. Only the send half travels; nothing holds the service
             // itself, so no Arc cycle.
-            let push_registry = {
+            let (push_registry, mcp_host) = {
                 let supervisor = crate::offload::OffloadSupervisor::new(
                     app.handle().clone(),
                     settings_for_offload.clone(),
@@ -803,7 +803,9 @@ fn main() {
                     });
                 }
                 // V30 Phase C: hand the push bus to the producers below.
-                service.push_registry()
+                // V38 Phase F: and the MCP host, for the audit runner's tier-2
+                // provider tools.
+                (service.push_registry(), service.mcp_host())
             };
 
             // V13 Phase A: the Workbench service (fs-batch broadcast today;
@@ -858,6 +860,11 @@ fn main() {
                         audit_root,
                         // V30 Phase C: announce GUI-initiated scan completions.
                         Some(push_registry.clone()),
+                        // V38 Phase F: the warm MCP host, for tier-2 provider
+                        // tools. The host and not the service — the runner needs
+                        // exactly one thing from that layer and holding the
+                        // service would be a cycle.
+                        Some(mcp_host.clone()),
                     );
                     // V26: publish the runner as the process global BEFORE
                     // `manage` moves it — this is how the offload worker's native

@@ -141,6 +141,7 @@ Kind-specific fields, refused when they appear on the wrong kind:
 | `transport` | `audit`, `security` | `stdout` or `report_file` |
 | `findings_exit_codes[]` | `audit`, `security` | non-zero exits that still mean "ran fine, here are findings" |
 | `applicability{extensions,markers}` | `audit`, `security`, `check` | project-shape gate (§ 3.6); both empty = always applicable |
+| `provider{server,tool}` | `audit`, `security` | tier 2 (§ 4.5): an MCP server answers instead of a spawned binary; mutually exclusive with every spawn field |
 | `cmd` | `check` | the command line template (§ 4.2) |
 | `cwd` | `check` | run here instead of the project root; relative, confined |
 | `report_file` | `check` | parse this file after the run instead of stdout; relative, confined |
@@ -519,6 +520,103 @@ configuration problem naming the tool and the path, not as an opaque spawn error
 A tool that is enabled but has **no** path is inert — cImp never picks a binary
 for a plugin — and every refusal says so by name.
 
+### 4.5 Tier 2 — an MCP server answers instead (`provider`)
+
+**Tier 1 is the default, and this is the escape hatch.** A manifest that names an
+`argv` is a complete definition: cImp spawns the tool, confines it, caps its
+output and reads its SARIF, and the only long-running process on the machine is
+the one you already installed. A `provider` tool hands all of that to a server
+the *user* administers. The milestone's standing bias is to keep the
+standing-MCP population **small** — supervision load, notification churn and
+per-process trust are real costs, and "writing an argv looks like work" is not a
+reason to pay them. Reach for tier 2 when the tool is genuinely service-shaped:
+it already exists as an MCP server, or it holds state no per-scan process could.
+
+**Declaring one.** On an `audit` or `security` tool only, and instead of the
+spawn fields — never alongside them:
+
+```json
+{
+  "id": "acme-cloud",
+  "label": "Acme Cloud Scan",
+  "kind": "security",
+  "provider": { "server": "acme-mcp", "tool": "scan_repository" }
+}
+```
+
+`server` is the server's id in cImp's MCP registry (its **name**, which is what
+V37 keys activation and categories by — renaming the server is a new identity and
+breaks this reference). `tool` is the tool's name on that server; cImp composes
+the `<server>__<tool>` routing name itself.
+
+**Mutually exclusive with the spawn vocabulary, by refusal.** `argv`,
+`transport`, `findings_exit_codes`, `env`, `variables`, `parameters_allowed`, a
+non-default `runtime` or `sandbox`, and any `extra_grants` are all refused at
+load on a provider tool. Nothing is spawned, so each of them would describe a
+child process that never exists — and a sandbox declaration in particular would
+be a boundary the author believes in and cImp never prepares. `kind` stays the
+contract dimension: a `security` provider tool joins the `security_audit`
+fan-out exactly like a spawned one.
+
+**Invocation.** The tool joins its umbrella's fan-out as one more member. Instead
+of a spawn, cImp issues **one `tools/call`** to the named server, through the
+same host path every proxied MCP call takes. That path is the enforcement point:
+a disabled server — or a server whose every category is off — refuses the call
+with the same words any other caller gets, the outbound URL screen runs, and the
+`mcp` Events lane records the call with the server, its category, and `audit` as
+the consumer. Health state is *not* consulted as a gate: dispatch is the truth,
+and a server marked unhealthy that nevertheless answers must not be refused by
+cImp.
+
+**Input surface — nothing is passed.** The call carries an empty argument object.
+The server scans what it is configured to scan; cImp does not send the project
+root, because a provider has no guarantee of sharing this machine's filesystem
+and a path it cannot read is worse than no path. If your server needs to be told
+*what* to look at, configure that on the server.
+
+**Output contract — the same SARIF, through the same gate.** The result's text
+content is read exactly as a spawned tool's stdout is: the full SARIF envelope
+check (§ 4.1), then the shared parser, then attribution to the **registry key**
+rather than to whatever `runs[].tool.driver.name` claims. `parser` is forced to
+`sarif` and `ingest` is refused, so the two relaxations that exist for cImp's own
+fourteen scanners cannot be borrowed here. A blank, non-JSON or non-SARIF answer
+is a tool **error**, never a clean scan.
+
+**Failure modes.** Every one of them is a failed chip carrying the reason, and
+none of them is a pass:
+
+* *Server not configured, or its tools not reachable* — the host answers that
+  nothing offers the tool.
+* *Server or category disabled* — the refusal names the level that did it.
+* *The server returned an error* — its own message, bounded.
+* *Timeout* — the tool's `timeout_secs` (else the umbrella's) bounds the call.
+* *Scan cancelled* — the call is abandoned cleanly. There is no child to kill, so
+  a request already in flight completes on the server's side and its answer is
+  discarded.
+
+**Consumption path and screening.** Findings enter the report through the same
+boundary as tier 1 and pass the same delivery screening before a model sees
+them. The server itself is classified **EXTERNAL** like every other configured
+MCP server, so its tool descriptions are screened at connect time and a flagged
+one is withheld from every surface.
+
+**Security posture — what you are trusting.** There is no sandbox here, because
+nothing runs on this machine. What you extend by enabling a provider tool is
+trust in **the server you configured**: its answer becomes findings in a report a
+model reads, and cImp guarantees only that the answer is a well-formed SARIF log
+that said something. That is the same shape as tier 1's statement — *enabling a
+tool means trusting the executable you pointed it at* — with the executable
+replaced by a service, and it is strictly the larger ask: a binary you chose runs
+confined, for one scan; a server you configured runs continuously, answers every
+call, and is administered by whoever administers it.
+
+**Reachability.** cImp's own subsystems reach an MCP server through the
+per-server "offload worker" grant — that flag has always meant *cImp itself may
+use this server* — so a provider tool's server needs that box ticked, in addition
+to being enabled. There is deliberately no fourth per-server checkbox for the
+audit fan-out: a new grant dimension is a settings decision, not something an
+audit feature adds on its way past.
+
 ### 4.4 What reaches a model
 
 Findings and check output pass the delivery boundary's existing screening before
@@ -891,8 +989,10 @@ any category.
   by something that is not a tool key, say) is dropped with a `tracing` warning
   and nothing user-visible. Manifests get a settings error state and an Events
   row; a hand-edited settings file does not.
-* **No per-project plugin definitions**, no plugin-supplied binaries, no MCP-backed
-  plugin providers yet (that tier follows the MCP management milestone).
+* **No per-project plugin definitions** and no plugin-supplied binaries. An
+  MCP-backed provider (§ 4.5) is the one place a plugin's work happens somewhere
+  cImp does not control, and it is `audit`/`security` only — there is no
+  provider-backed `check` or `command`.
 
 ---
 

@@ -776,6 +776,17 @@ impl OffloadService {
     /// services need exactly the send half, and holding the whole service would
     /// make the Arc graph circular (the service reaches the graph service via
     /// its tools). The registry itself holds no back-reference to anything.
+    /// The warm MCP host.
+    ///
+    /// V38 Phase F: the audit runner takes this (and nothing else of the offload
+    /// layer) so a **tier-2 provider** tool can be dispatched under V37's
+    /// enforcement. Handing out the host rather than the service is what keeps
+    /// it a one-way edge — the host holds no reference back, so there is no
+    /// cycle and no way for the audit side to reach the run queue.
+    pub fn mcp_host(&self) -> Arc<McpHost> {
+        self.host.clone()
+    }
+
     pub fn push_registry(&self) -> Arc<PushRegistry> {
         self.pushes.clone()
     }
@@ -935,7 +946,13 @@ impl OffloadService {
             // this route. An unexpected `offload` query value therefore can't
             // arrive in practice — fall back to the Claude set (the conservative,
             // claude_access-guarded default) rather than leaking the offload set.
-            Consumer::Claude | Consumer::Offload => self.host.tool_defs_for_claude().await,
+            //
+            // V38 Phase F: `Audit` lands here for the same reason and never in
+            // practice — the audit fan-out advertises nothing and calls a name
+            // its manifest already fixed, so it has no `tools/list` at all.
+            Consumer::Claude | Consumer::Offload | Consumer::Audit => {
+                self.host.tool_defs_for_claude().await
+            }
         };
         defs.into_iter()
             .map(|d| {
@@ -1019,7 +1036,11 @@ impl OffloadService {
         // this proxy; fall back to the Claude-guarded set.
         let consumer = match consumer {
             Consumer::Opencode => Consumer::Opencode,
-            Consumer::Claude | Consumer::Offload => Consumer::Claude,
+            // V38 Phase F: `Audit` cannot reach this route either — the fan-out
+            // calls the host directly, in-process. Folded onto the Claude-guarded
+            // default with the worker, so a stray query value can never widen a
+            // grant by naming a consumer this proxy does not serve.
+            Consumer::Claude | Consumer::Offload | Consumer::Audit => Consumer::Claude,
         };
         let snap = self.settings.current();
         let agent = crate::graph::source_for_consumer(consumer.source());

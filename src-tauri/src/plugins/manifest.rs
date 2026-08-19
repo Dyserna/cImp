@@ -389,6 +389,39 @@ pub struct Applicability {
     pub markers: Vec<String>,
 }
 
+/// V38 Phase F — the **tier-2** escape hatch: an `audit`/`security` tool whose
+/// findings come from an MCP server the user configured, over `tools/call`,
+/// instead of from a child process cImp spawns.
+///
+/// # Tier 1 is the default, and this is not the easy path
+///
+/// A manifest that names an `argv` is a complete definition of a tool: cImp
+/// spawns it, confines it (V33), caps its output and reads its SARIF. A provider
+/// tool delegates all of that to a long-running server the user administers —
+/// which is why the milestone's own bias is to keep the standing-MCP population
+/// SMALL. Reach for this when the tool is genuinely service-shaped (it already
+/// exists as an MCP server, or it holds state no per-scan process could), not
+/// when writing an argv looks like work.
+///
+/// # What it does not carry
+///
+/// Nothing spawns, so the whole spawn vocabulary is refused on a provider tool
+/// rather than ignored: `argv`, `transport`, `findings_exit_codes`, `env`,
+/// `variables`, a non-default `runtime`/`sandbox`, any `extra_grants`. A field
+/// that describes a child process on a tool that has none is an author
+/// believing in a boundary that was never prepared.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderRef {
+    /// The MCP server's id in cImp's registry — `McpServerConfig::name`, the
+    /// V37 C1 identity. A name the user typed; renaming the server is a new
+    /// identity and breaks this reference, exactly as V37 documents.
+    pub server: String,
+    /// The tool's name ON that server, un-namespaced. cImp composes the
+    /// `<server>__<tool>` routing name itself.
+    pub tool: String,
+}
+
 /// One category: the **management** dimension (decision 2). Carries zero
 /// contract weight — a tool behaves identically regardless of which category
 /// presents it — so nothing outside settings may read this.
@@ -486,6 +519,10 @@ pub struct ToolManifest {
     pub findings_exit_codes: Vec<i32>,
     #[serde(default)]
     pub applicability: Applicability,
+    /// V38 Phase F — tier 2. Mutually exclusive with `argv` and the rest of the
+    /// spawn vocabulary; see [`ProviderRef`].
+    #[serde(default)]
+    pub provider: Option<ProviderRef>,
 
     // ── check kind (mirrors `CheckDef`) ─────────────────────────────────────
     /// The full command line (`CheckDef::cmd`).
@@ -1095,6 +1132,77 @@ fn validate_tool(t: &ToolManifest, provenance: Provenance) -> Result<(), Validat
             if t.pattern.is_some() {
                 return Err(wrong("pattern", "check"));
             }
+            // V38 Phase F — tier 2. A provider tool has no child process, so the
+            // entire spawn vocabulary is refused on it rather than ignored: an
+            // author who wrote `argv` beside a `provider` believes one of the
+            // two will happen, and only one of them can.
+            if let Some(provider) = &t.provider {
+                for (field, present) in [
+                    ("argv", !t.argv.is_empty()),
+                    ("transport", t.transport.is_some()),
+                    ("findings_exit_codes", !t.findings_exit_codes.is_empty()),
+                    ("dir_argv", !t.dir_argv.is_empty()),
+                    ("env", !t.env.is_empty()),
+                    ("variables", !t.variables.is_empty()),
+                    ("parameters_allowed", t.parameters_allowed),
+                    ("project_local_bin", t.project_local_bin.is_some()),
+                    ("command", t.command.is_some()),
+                ] {
+                    if present {
+                        return Err(ValidationError::KindField(format!(
+                            "tool `{}` declares a `provider`, so nothing is spawned for it and \
+                             `{field}` describes a child process that will never exist",
+                            t.id
+                        )));
+                    }
+                }
+                // The sandbox posture is about confining a child. There is none,
+                // so a non-DEFAULT value here is a boundary the author believes
+                // in and cImp will never prepare. Defaults are accepted silently
+                // because they are what an omitted field deserializes to.
+                if t.runtime != RuntimeReq::default()
+                    || t.sandbox != SandboxReq::default()
+                    || !t.extra_grants.is_empty()
+                {
+                    return Err(ValidationError::KindField(format!(
+                        "tool `{}` declares a `provider`, so cImp spawns nothing for it and has \
+                         no boundary to place it in — `runtime`, `sandbox` and `extra_grants` \
+                         have no meaning here and must be left at their defaults",
+                        t.id
+                    )));
+                }
+                for (field, value) in [("server", &provider.server), ("tool", &provider.tool)] {
+                    if value.trim().is_empty() {
+                        return Err(ValidationError::Identity(format!(
+                            "tool `{}`: `provider.{field}` is empty",
+                            t.id
+                        )));
+                    }
+                    length_checked(&format!("tool `{}`'s `provider.{field}`", t.id), value)?;
+                }
+                // The findings contract is unchanged and is the whole point of
+                // the tier: SARIF text back, through the same ingest gate.
+                // Enforced for BOTH provenances here — the user-plugin rule
+                // below is provenance-gated, and a built-in provider (there are
+                // none today) must not be able to opt out of the one boundary
+                // that makes a remote answer readable.
+                let parser = t.parser.unwrap_or(ManifestParser::SARIF);
+                if parser != ManifestParser::SARIF {
+                    return Err(ValidationError::ParserNotSarif {
+                        tool: t.id.clone(),
+                        found: parser.as_wire(),
+                    });
+                }
+                if t.ingest.is_some() {
+                    return Err(ValidationError::KindField(format!(
+                        "tool `{}` declares a `provider` and an `ingest` relaxation; the strict \
+                         SARIF gate is what makes a remote server's answer readable at all",
+                        t.id
+                    )));
+                }
+                return Ok(());
+            }
+
             // A findings tool with no fixed arguments at all is almost always
             // an author who forgot the template, so a scanned file is refused.
             // It is NOT always that: `cargo-machete` analyses its cwd and takes
@@ -1158,6 +1266,9 @@ fn validate_tool(t: &ToolManifest, provenance: Provenance) -> Result<(), Validat
             }
         }
         ToolKind::Check => {
+            if t.provider.is_some() {
+                return Err(wrong("provider", "audit/security"));
+            }
             if !t.argv.is_empty() {
                 return Err(wrong("argv", "audit/security"));
             }
@@ -1367,6 +1478,9 @@ fn validate_tool(t: &ToolManifest, provenance: Provenance) -> Result<(), Validat
                     "a project-shape gate filters a population, and `run_command` has none \
                      — it resolves one named tool on demand rather than fanning out over a set",
                 ));
+            }
+            if t.provider.is_some() {
+                return Err(wrong("provider", "audit/security"));
             }
             if !t.argv.is_empty() {
                 return Err(wrong("argv", "audit/security"));
@@ -2016,6 +2130,171 @@ mod tests {
         }
     }
 
+
+    // ── V38 Phase F: tier 2 (`provider`) ────────────────────────────────────
+
+    /// A minimal provider-backed security tool, as text.
+    fn provider_json() -> String {
+        r#"{
+          "manifest_version": 1,
+          "name": "acme",
+          "version": "1.0.0",
+          "categories": [{ "id": "sec", "label": "Security", "tools": ["cloud"] }],
+          "tools": [{
+            "id": "cloud", "label": "Acme Cloud", "kind": "security",
+            "provider": { "server": "acme-mcp", "tool": "scan_repository" }
+          }]
+        }"#
+        .to_string()
+    }
+
+    /// The shape tier 2 exists to allow: no `argv`, no path, no posture — and it
+    /// loads, because for a provider tool those are the fields that would be
+    /// wrong. The `argv`-is-mandatory rule for user plugins must not apply here.
+    #[test]
+    fn a_provider_tool_needs_no_argv_and_no_posture() {
+        let m = parse(&provider_json(), Provenance::User).expect("a provider tool loads");
+        let t = &m.tools[0];
+        let p = t.provider.as_ref().expect("the provider survives the parse");
+        assert_eq!(p.server, "acme-mcp");
+        assert_eq!(p.tool, "scan_repository");
+        assert!(t.argv.is_empty());
+        // The defaults are what an omitted field deserializes to, and they are
+        // what validation demands — so a provider tool's posture is inert by
+        // construction rather than by a spawn-site branch.
+        assert_eq!(t.runtime, RuntimeReq::default());
+        assert_eq!(t.sandbox, SandboxReq::default());
+        assert!(t.extra_grants.is_empty());
+    }
+
+    /// Every spawn-shaped field, refused BY NAME on a provider tool. Refused
+    /// rather than ignored: an author who wrote `argv` beside a `provider`
+    /// believes one of the two will happen, and only one of them can.
+    #[test]
+    fn a_provider_tool_refuses_the_whole_spawn_vocabulary() {
+        for (field, snippet) in [
+            ("argv", r#""argv": ["{root}"]"#),
+            ("transport", r#""transport": "report_file""#),
+            ("findings_exit_codes", r#""findings_exit_codes": [1]"#),
+            ("env", r#""env": [["ACME", "1"]]"#),
+            (
+                "variables",
+                r#""variables": [{"name": "ruleset", "label": "Ruleset"}]"#,
+            ),
+            ("parameters_allowed", r#""parameters_allowed": true"#),
+        ] {
+            let json = provider_json().replace(
+                r#""kind": "security","#,
+                &format!(r#""kind": "security", {snippet},"#),
+            );
+            match err(&json) {
+                ValidationError::KindField(m) => assert!(
+                    m.contains(field),
+                    "`{field}` must be refused by name on a provider tool: {m}"
+                ),
+                other => panic!("`{field}` on a provider tool must be a kind-field error: {other:?}"),
+            }
+        }
+    }
+
+    /// The posture trio is one refusal, not three, because it is one mistake:
+    /// believing in a boundary that will never be prepared. A DEFAULT value is
+    /// silent, because that is what an omitted field deserializes to.
+    #[test]
+    fn a_provider_tool_refuses_a_sandbox_posture_it_can_never_get() {
+        for snippet in [
+            r#""runtime": "python""#,
+            r#""sandbox": "unsupported""#,
+            r#""extra_grants": ["C:\\tools\\acme"]"#,
+        ] {
+            let json = provider_json().replace(
+                r#""kind": "security","#,
+                &format!(r#""kind": "security", {snippet},"#),
+            );
+            match err(&json) {
+                ValidationError::KindField(m) => assert!(
+                    m.contains("runtime") && m.contains("sandbox") && m.contains("extra_grants"),
+                    "the posture refusal names all three, because they are one mistake: {m}"
+                ),
+                other => panic!("{snippet} must be a kind-field error: {other:?}"),
+            }
+        }
+        // …and the defaults, spelled out, still load: an author restating the
+        // safe posture is not making the mistake.
+        let json = provider_json().replace(
+            r#""kind": "security","#,
+            r#""kind": "security", "runtime": "auto", "sandbox": "required", "extra_grants": [],"#,
+        );
+        assert!(parse(&json, Provenance::User).is_ok());
+    }
+
+    /// The two relaxations cImp reserves for its own fourteen scanners cannot be
+    /// borrowed by a provider tool: the strict SARIF gate is the only thing that
+    /// makes a remote server's answer readable at all.
+    #[test]
+    fn a_provider_tools_findings_contract_is_sarif_and_ungrandfatherable() {
+        let json = provider_json().replace(
+            r#""kind": "security","#,
+            r#""kind": "security", "parser": "typos-jsonl","#,
+        );
+        assert!(matches!(err(&json), ValidationError::ParserNotSarif { .. }));
+        // Even stamped BUILT-IN — the rule below this one is provenance-gated,
+        // and this one deliberately is not.
+        let json = provider_json().replace(
+            r#""kind": "security","#,
+            r#""kind": "security", "parser": "typos-jsonl","#,
+        );
+        assert!(matches!(
+            parse(&json, Provenance::Builtin).unwrap_err().error,
+            ValidationError::ParserNotSarif { .. }
+        ));
+        let json = provider_json().replace(
+            r#""kind": "security","#,
+            r#""kind": "security", "ingest": "grandfathered","#,
+        );
+        assert!(parse(&json, Provenance::Builtin).is_err());
+    }
+
+    /// `kind` stays the contract dimension: `provider` belongs to the findings
+    /// kinds and nowhere else. A `check` or `command` tool carrying one is an
+    /// author expecting a pipeline that will never look at it.
+    #[test]
+    fn only_a_findings_kind_can_be_provider_backed() {
+        for (base, kind) in [(check_json(), "check"), (command_json(), "command")] {
+            let json = base.replace(
+                &format!(r#""kind": "{kind}""#),
+                &format!(
+                    r#""kind": "{kind}", "provider": {{ "server": "s", "tool": "t" }}"#
+                ),
+            );
+            match err(&json) {
+                ValidationError::KindField(m) => {
+                    assert!(m.contains("provider"), "{m}")
+                }
+                other => panic!("a provider on a non-findings kind must be refused: {other:?}"),
+            }
+        }
+    }
+
+    /// A reference to nothing is not a reference. Both halves are identity, and
+    /// an empty one would compose the routing name `__tool` — a name no server
+    /// owns, failing at the first scan instead of at load.
+    #[test]
+    fn a_provider_reference_must_name_both_halves() {
+        for snippet in [
+            r#""provider": { "server": "", "tool": "t" }"#,
+            r#""provider": { "server": "s", "tool": "  " }"#,
+        ] {
+            let json = provider_json().replace(
+                r#""provider": { "server": "acme-mcp", "tool": "scan_repository" }"#,
+                snippet,
+            );
+            assert!(
+                matches!(err(&json), ValidationError::Identity(_)),
+                "{snippet} must be an identity error"
+            );
+        }
+    }
     #[test]
     fn an_unknown_field_is_a_refusal_not_a_shrug() {
         let json = audit_json().replace("\"name\": \"acme\"", "\"name\": \"acme\", \"nmae\": \"x\"");

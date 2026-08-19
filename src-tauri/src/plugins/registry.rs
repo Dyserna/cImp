@@ -117,7 +117,22 @@ impl EffectiveTool {
     /// wrote; it was never an argument for making the fourteen shipped scanners
     /// stop working on upgrade.
     pub fn runnable(&self) -> bool {
-        self.enabled && (self.path.is_some() || self.resolves_by_name())
+        self.enabled && (self.is_provider() || self.path.is_some() || self.resolves_by_name())
+    }
+
+    /// V38 Phase F — whether this is a **tier-2** tool: its findings come from
+    /// an MCP server the user configured, not from a binary cImp spawns.
+    ///
+    /// A provider tool needs no path, so `enabled` is the whole of `runnable`
+    /// for it. Whether the referenced SERVER exists, is enabled and answers is
+    /// deliberately NOT asked here: V37's contract C4 makes dispatch the
+    /// enforcement point and advertisement a courtesy, and a registry-level
+    /// existence gate would drop an enabled tool out of the fan-out silently —
+    /// exactly the "configured capability vanishes with no explanation" this
+    /// milestone refuses everywhere else. A missing or disabled server surfaces
+    /// as a failed CHIP with the server's own reason.
+    pub fn is_provider(&self) -> bool {
+        self.manifest.provider.is_some()
     }
 
     /// Whether this tool can be found without a configured path — built-in

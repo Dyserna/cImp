@@ -62,6 +62,10 @@ export type AuditToolStatus =
   | 'running'
   | 'done'
   | 'failed'
+  /// V38: the user stopped the scan while this tool was still running. Its own
+  /// status, not `failed` — nothing went wrong, and a cancelled tool's chip,
+  /// report line and activity row must not read as a scanner crash.
+  | 'cancelled'
   | 'not-installed'
   | 'path-invalid'
   | 'skipped-not-applicable';

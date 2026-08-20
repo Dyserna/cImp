@@ -263,6 +263,30 @@ describe('toolChip', () => {
       tooltip: 'not found on PATH or ebin',
     });
   });
+
+  // V38: an `idle` tier-2 provider carries the host's refusal so the chip can
+  // name the toggle that switched it off; a plain unticked tool has none.
+  test('an idle chip surfaces a host refusal when there is one', () => {
+    expect(toolChip(tool({ id: 'osv-scanner', status: 'idle' })).tooltip).toBeNull();
+    expect(
+      toolChip(tool({ id: 'acme@1.0.0/cloud', status: 'idle', error: 'server `acme` is disabled (server toggle)' }))
+        .tooltip,
+    ).toBe('server `acme` is disabled (server toggle)');
+  });
+
+  // V38: the user's own stop is its own chip. It used to arrive as `failed`
+  // with the detail "scan cancelled", i.e. the user's action rendered in the
+  // error styling as if a scanner had crashed.
+  test('a cancelled tool gets its own neutral chip, never the failed one', () => {
+    expect(toolChip(tool({ id: 'gitleaks', status: 'cancelled', error: 'scan cancelled' }))).toEqual({
+      kind: 'cancelled',
+      label: 'cancelled',
+      spinner: false,
+      tooltip: 'scan cancelled',
+    });
+    // No detail from the backend still reads as a cancel, not as "unknown".
+    expect(toolChip(tool({ id: 'gitleaks', status: 'cancelled' })).tooltip).toBe('scan cancelled');
+  });
 });
 
 // ── the pre-scan chip list ──────────────────────────────────────────────────

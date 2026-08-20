@@ -554,7 +554,7 @@
 == umbrella reports (what a model reads) ==
 
 --- security audit, every tool reporting findings ---
-Security audit of /proj/root: 3 tools — 3 completed, 0 failed, 0 not installed, 0 misconfigured, 0 not applicable, 0 disabled. Findings: 3 (2 errors, 1 warning, 0 notes).
+Security audit of /proj/root: 3 tools — 3 completed, 0 failed, 0 cancelled, 0 not installed, 0 misconfigured, 0 not applicable, 0 disabled. Findings: 3 (2 errors, 1 warning, 0 notes).
 
   osv-scanner — done — 1 finding in 1.2s
   gitleaks — done — 1 finding in 1.2s
@@ -566,7 +566,7 @@ ERROR src/SettingsApp.svelte:1291 [semgrep/javascript.lang.security.audit.detect
 WARNING Cargo.lock:1 [osv-scanner/GHSA-r8w9-5wcg-vfj7] tokio 1.38.0 is affected by GHSA-r8w9-5wcg-vfj7
 
 --- quality audit, every tool reporting findings ---
-Quality audit of /proj/root: 11 tools — 11 completed, 0 failed, 0 not installed, 0 misconfigured, 0 not applicable, 0 disabled. Findings: 18 (3 errors, 11 warnings, 4 notes).
+Quality audit of /proj/root: 11 tools — 11 completed, 0 failed, 0 cancelled, 0 not installed, 0 misconfigured, 0 not applicable, 0 disabled. Findings: 18 (3 errors, 11 warnings, 4 notes).
 
   oxlint — done — 1 finding in 1.2s
   golangci-lint — done — 1 finding in 1.2s
@@ -601,7 +601,7 @@ NOTE src/main/java/App.java:17 [pmd/UnusedPrivateField] Avoid unused private fie
 NOTE worker/poll.py:64 [semgrep-quality/python.lang.best-practice.sleep.arbitrary-sleep] time.sleep() call; did you mean to wait on a condition?
 
 --- security audit, mixed statuses ---
-Security audit of /proj/root: 3 tools — 0 completed, 0 failed, 1 not installed, 1 misconfigured, 1 not applicable, 0 disabled. Findings: 0 (0 errors, 0 warnings, 0 notes).
+Security audit of /proj/root: 3 tools — 0 completed, 0 failed, 0 cancelled, 1 not installed, 1 misconfigured, 1 not applicable, 0 disabled. Findings: 0 (0 errors, 0 warnings, 0 notes).
 
   osv-scanner — not installed (no path configured, not on PATH/ebin)
   gitleaks — misconfigured — configured path not found: D:\gone\gitleaks.exe — fix it in Settings

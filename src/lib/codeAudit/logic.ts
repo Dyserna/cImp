@@ -332,7 +332,8 @@ export interface ChipDisplay {
   label: string;
   /// Whether to show the running spinner.
   spinner: boolean;
-  /// Hover text for `failed` / `not-installed` (the error string); else `null`.
+  /// Hover text for `failed` / `cancelled` / `not-installed` (the error
+  /// string); else `null`.
   tooltip: string | null;
 }
 
@@ -341,7 +342,11 @@ export interface ChipDisplay {
 export function toolChip(tool: AuditToolState): ChipDisplay {
   switch (tool.status) {
     case 'idle':
-      return { kind: 'idle', label: 'idle', spinner: false, tooltip: null };
+      // V38: a tier-2 provider whose MCP server (or category) the user switched
+      // off ends `idle` carrying the host's refusal — the only place the chip
+      // can say WHICH toggle. A plain unticked tool has no error and keeps the
+      // bare chip it always had.
+      return { kind: 'idle', label: 'idle', spinner: false, tooltip: tool.error ?? null };
     case 'running':
       return { kind: 'running', label: 'running', spinner: true, tooltip: null };
     case 'done': {
@@ -350,6 +355,15 @@ export function toolChip(tool: AuditToolState): ChipDisplay {
     }
     case 'failed':
       return { kind: 'failed', label: 'error', spinner: false, tooltip: tool.error ?? 'failed' };
+    case 'cancelled':
+      // V38: the user's own stop. Neutral, never the error styling — the chip
+      // reports what the user asked for, not a fault.
+      return {
+        kind: 'cancelled',
+        label: 'cancelled',
+        spinner: false,
+        tooltip: tool.error ?? 'scan cancelled',
+      };
     case 'not-installed':
       return {
         kind: 'not-installed',

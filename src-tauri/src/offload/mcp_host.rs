@@ -93,7 +93,7 @@ impl EnableVerdict {
 
 /// V37 contract C3 — **the** effective-enable predicate. One function, one
 /// owner; both advertisement ([`McpHost::tool_defs_filtered`]) and dispatch
-/// ([`McpHost::call_for_consumer`]) read this and nothing else, so the two can
+/// ([`McpHost::call_for_consumer_with_deadline`]) read this and nothing else, so the two can
 /// never disagree about whether a server exists.
 ///
 /// ```text
@@ -344,6 +344,42 @@ pub struct HostError {
     /// [`MAX_REMOTE_ERROR_CHARS`] the moment they were captured. `None` for an
     /// error cImp raised by itself.
     remote: Option<String>,
+    /// What KIND of failure this is, for the callers that must act differently
+    /// per cause — see [`HostErrorKind`].
+    kind: HostErrorKind,
+}
+
+/// The causes of a [`HostError`] a caller is allowed to branch on.
+///
+/// A typed classification rather than callers substring-matching
+/// [`HostError::diagnostic`], because the diagnostic is prose that gets
+/// reworded, and on the remote half it is prose a *server we do not control*
+/// wrote. The audit fan-out has to tell three facts apart and render three
+/// different chips for them; before V38 all three arrived as one opaque string
+/// and the report said the wrong thing for two of them.
+///
+/// Deliberately coarse: a variant is added when a CONSUMER needs the
+/// distinction, not to mirror every error site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum HostErrorKind {
+    /// Anything else: a transport fault, a JSON-RPC error, a protocol refusal,
+    /// the SSRF screen, an unknown tool name. The safe default — a new error
+    /// site that says nothing lands here and is treated as a real failure.
+    #[default]
+    Other,
+    /// The per-call DEADLINE elapsed while the server had not answered
+    /// ([`HostError::timed_out`]). Retriable, and the number in the message is
+    /// the caller's own configured one.
+    Timeout,
+    /// The call was refused before it left cImp because the USER has the server
+    /// (or every category containing it) switched off — [`EnableVerdict`]'s
+    /// `ServerOff` / `CategoriesOff`. Not a failure at all: it is the
+    /// configuration doing exactly what it says.
+    ///
+    /// Only the toggle refusals. An ungranted consumer, a disappeared tool and
+    /// the SSRF refusal stay [`Other`](Self::Other) — those are conditions the
+    /// user did not ask for.
+    DisabledByToggle,
 }
 
 impl HostError {
@@ -352,7 +388,51 @@ impl HostError {
         HostError {
             diagnostic: diagnostic.into(),
             remote: None,
+            kind: HostErrorKind::Other,
         }
+    }
+
+    /// The per-call deadline elapsed with no answer.
+    ///
+    /// One constructor for BOTH transports, so the stdio and HTTP paths cannot
+    /// drift into two different sentences for one fact, and so
+    /// [`is_timeout`](Self::is_timeout) is true wherever the sentence is. The
+    /// deadline is named in the text because it is the user's own configured
+    /// number: "timed out after 600s" tells them which setting to raise, while
+    /// a bare "timed out" does not.
+    pub(crate) fn timed_out(deadline: Duration) -> Self {
+        HostError {
+            diagnostic: format!("timed out after {deadline:?} waiting for the server"),
+            remote: None,
+            kind: HostErrorKind::Timeout,
+        }
+    }
+
+    /// A refusal cImp raised because a USER TOGGLE is off. The sentence is
+    /// [`EnableVerdict::refusal`]'s, unchanged — the wording that names which
+    /// toggle is the whole value of the row.
+    pub(crate) fn disabled_by_toggle(diagnostic: impl Into<String>) -> Self {
+        HostError {
+            diagnostic: diagnostic.into(),
+            remote: None,
+            kind: HostErrorKind::DisabledByToggle,
+        }
+    }
+
+    /// Was this a deadline expiring, rather than a transport or protocol fault?
+    ///
+    /// `pub(crate)` and not `pub(super)`: the consumers that need the
+    /// distinction — `audit::runner`'s tier-2 provider path, which maps these
+    /// to `ProviderOutcome::TimedOut` / `RefusedDisabled` — live outside
+    /// `offload`.
+    pub(crate) fn is_timeout(&self) -> bool {
+        self.kind == HostErrorKind::Timeout
+    }
+
+    /// Was this call refused because the user has the server (or its every
+    /// category) switched off? See [`HostErrorKind::DisabledByToggle`].
+    pub(crate) fn is_disabled_by_toggle(&self) -> bool {
+        self.kind == HostErrorKind::DisabledByToggle
     }
 
     /// cImp's diagnostic plus bytes the remote server supplied. `raw` is bounded
@@ -366,6 +446,7 @@ impl HostError {
         HostError {
             diagnostic: diagnostic.into(),
             remote: Some(remote),
+            kind: HostErrorKind::Other,
         }
     }
 
@@ -861,10 +942,10 @@ impl StdioConn {
             Ok(Err(_)) => Err("server connection closed before responding".into()),
             Err(_) => {
                 self.pending.lock().unwrap().remove(&id);
-                Err(HostError::cimp(format!(
-                    "server did not respond within {}s",
-                    timeout.as_secs()
-                )))
+                // Classified, not just worded: the audit fan-out renders a
+                // deadline differently from a transport fault, and it must not
+                // have to recognize this sentence to do it.
+                Err(HostError::timed_out(timeout))
             }
         }
     }
@@ -1337,11 +1418,26 @@ impl McpServer {
             .map(|t| t.raw_name.clone())
     }
 
-    /// Execute `tools/call` for a tool on this server.
-    async fn call(&self, raw_name: &str, args: Value) -> Result<String, HostError> {
+    /// Execute `tools/call` for a tool on this server, giving the server
+    /// `deadline` to answer.
+    ///
+    /// The deadline is a PARAMETER rather than [`REQUEST_TIMEOUT`] because not
+    /// every consumer's call is a model's turn. A chat tool call is answered
+    /// inside a live conversation and 45 s is already generous; a Code Audit
+    /// tier-2 provider scan is a repository-wide scan whose budget the user
+    /// configured in minutes. Baking the constant in here meant that budget was
+    /// dead configuration and no provider scan slower than 45 s could ever
+    /// succeed — it came back as `http request failed`, i.e. as if the endpoint
+    /// were down (V38 Phase F defect).
+    async fn call(
+        &self,
+        raw_name: &str,
+        args: Value,
+        deadline: Duration,
+    ) -> Result<String, HostError> {
         let params = json!({ "name": raw_name, "arguments": args });
         let result = match &self.conn {
-            Some(Conn::Stdio(c)) => c.request("tools/call", params, REQUEST_TIMEOUT).await,
+            Some(Conn::Stdio(c)) => c.request("tools/call", params, deadline).await,
             Some(Conn::Http {
                 url,
                 client,
@@ -1360,7 +1456,7 @@ impl McpServer {
                         protocol_version: Some(protocol_version.as_str()),
                         auth_token: auth_token.as_deref(),
                     },
-                    REQUEST_TIMEOUT,
+                    deadline,
                 )
                 .await
                 {
@@ -1383,7 +1479,7 @@ impl McpServer {
                 // A single failed call must NOT permanently disable the whole
                 // server — that drops *all* its tools (`tool_defs` returns
                 // empty once unhealthy) for the app's lifetime, even though a
-                // 45s per-call timeout or a JSON-RPC tool-level error leaves a
+                // per-call deadline or a JSON-RPC tool-level error leaves a
                 // perfectly live stdio process running. Only flip unhealthy
                 // when the connection is genuinely dead (reader saw EOF/fatal,
                 // so `alive` is false). HTTP calls are independent and
@@ -1777,7 +1873,7 @@ impl McpHost {
     ///
     /// The DISPATCH DECISION is never re-checked mid-call: this function reads
     /// `disabled` once, before it routes, and a call already inside
-    /// [`Self::call`] is never re-evaluated against a newer verdict. That is not
+    /// [`Self::call_with_deadline`] is never re-evaluated against a newer verdict. That is not
     /// the same as "the call survives". `reconcile` tears the connection down as
     /// part of applying the toggle, and for a stdio server teardown kills the
     /// child process — so an in-flight request on that transport can still come
@@ -1787,17 +1883,43 @@ impl McpHost {
     /// The distinction matters because the wording differs: a call the toggle
     /// aborted mid-transport reports a lost connection, not [`REFUSAL_DISABLED`]
     /// — only the NEXT call gets the honest disabled refusal.
+    ///
+    /// The default-deadline spelling, and `#[cfg(test)]` because it is the
+    /// TESTS' spelling: production reaches this enforcement through
+    /// [`call_recorded`](Self::call_recorded), which is where the one default
+    /// lives. Kept because the twenty-odd enable/refusal tests below are about
+    /// grants and wording, not about timeouts, and threading a `Duration`
+    /// through each of them would bury what they assert. Same reason (and same
+    /// shape) as [`insert_fake_server`](Self::insert_fake_server).
+    #[cfg(test)]
     async fn call_for_consumer(
         &self,
         consumer: Consumer,
         namespaced: &str,
         args: Value,
     ) -> Result<String, HostError> {
+        self.call_for_consumer_with_deadline(consumer, namespaced, args, REQUEST_TIMEOUT)
+            .await
+    }
+
+    /// Per-consumer dispatch enforcement, under the caller's own per-call
+    /// deadline. See [`McpServer::call`] for why the deadline is a parameter.
+    async fn call_for_consumer_with_deadline(
+        &self,
+        consumer: Consumer,
+        namespaced: &str,
+        args: Value,
+        deadline: Duration,
+    ) -> Result<String, HostError> {
         if let Some((name, verdict)) = self.disabled_owner(consumer, namespaced).await {
             // `refusal` yields `None` only for `Enabled`, which
             // `disabled_owner` never returns.
             if let Some(msg) = verdict.refusal(&name) {
-                return Err(HostError::cimp(msg));
+                // Classified as the user's own switch, not as a fault: the
+                // audit fan-out renders this as a DISABLED tool rather than a
+                // failed one. The sentence is unchanged — it names which toggle,
+                // and that is what makes the row actionable.
+                return Err(HostError::disabled_by_toggle(msg));
             }
         }
         let owns = {
@@ -1813,11 +1935,28 @@ impl McpHost {
                 consumer.label(),
             )));
         }
-        self.call(namespaced, args).await
+        self.call_with_deadline(namespaced, args, deadline).await
     }
 
-    /// Route a namespaced `<server>__<tool>` call to its owning server.
+    /// Route a namespaced `<server>__<tool>` call to its owning server, under
+    /// the default [`REQUEST_TIMEOUT`]. `#[cfg(test)]` for the same reason as
+    /// [`call_for_consumer`](Self::call_for_consumer_with_deadline): every production route
+    /// carries its own deadline down from
+    /// [`call_recorded`](Self::call_recorded).
+    #[cfg(test)]
     pub async fn call(&self, namespaced: &str, args: Value) -> Result<String, HostError> {
+        self.call_with_deadline(namespaced, args, REQUEST_TIMEOUT)
+            .await
+    }
+
+    /// Route a namespaced `<server>__<tool>` call to its owning server, giving
+    /// the server `deadline` to answer — see [`McpServer::call`].
+    pub async fn call_with_deadline(
+        &self,
+        namespaced: &str,
+        args: Value,
+        deadline: Duration,
+    ) -> Result<String, HostError> {
         // Route by actual ownership (an exact match on the namespaced def
         // name) rather than parsing a `<prefix>__` split — a server or raw
         // tool name that itself contains `__` would make the split route to
@@ -1841,14 +1980,14 @@ impl McpHost {
             )));
         };
         let was_healthy = server.is_healthy();
-        let result = server.call(&raw, args).await;
+        let result = server.call(&raw, args, deadline).await;
         if was_healthy && !server.is_healthy() {
             self.signal_change(); // a server just went down mid-call
         }
         result
     }
 
-    /// [`call_for_consumer`](Self::call_for_consumer) plus a Tool Activity
+    /// [`call_for_consumer_with_deadline`](Self::call_for_consumer_with_deadline) plus a Tool Activity
     /// record (`kind: "mcp"`, source = the consumer's badge) — the one entry
     /// point every live MCP dispatch goes through: the loopback `/mcp/call`
     /// route (Claude/OpenCode) via `OffloadService::mcp_call`, and the offload
@@ -1867,7 +2006,7 @@ impl McpHost {
     /// row; `policy` carries the user's own configured endpoints, the only
     /// carve-outs from the range check.
     ///
-    /// The screen runs **before** [`call_for_consumer`](Self::call_for_consumer)
+    /// The screen runs **before** [`call_for_consumer_with_deadline`](Self::call_for_consumer_with_deadline)
     /// and therefore before any byte leaves the machine: a denied call never
     /// reaches the MCP server, which is the point (the server is a separate
     /// process on another host and would do the fetch for real).
@@ -1893,6 +2032,14 @@ impl McpHost {
     /// the ledger says — locked decision 11 fixes that string precisely so a
     /// caller cannot learn which address it hit, and the claim must not become
     /// a side channel that tells it whether this denial was its first.
+    ///
+    /// # The deadline
+    ///
+    /// This entry point keeps the host-wide [`REQUEST_TIMEOUT`] — a proxied
+    /// call is a model's turn, and 45 s is the bound that keeps a wedged server
+    /// from holding one open. A caller whose budget is its OWN configured
+    /// number (the Code Audit tier-2 fan-out) uses
+    /// [`call_recorded_with_deadline`](Self::call_recorded_with_deadline).
     // Each argument is one leg of the chokepoint's contract (who is calling,
     // for which project, under which policy, into which ledger) and is
     // documented above; bundling them into a struct would move the same list
@@ -1920,6 +2067,47 @@ impl McpHost {
         tab: crate::activity::Attribution,
         policy: &outbound::Policy,
         audit: &dyn outbound::ScopeAudit,
+    ) -> Result<String, HostError> {
+        self.call_recorded_with_deadline(
+            consumer,
+            root,
+            namespaced,
+            args,
+            scope,
+            tab,
+            policy,
+            audit,
+            REQUEST_TIMEOUT,
+        )
+        .await
+    }
+
+    /// [`call_recorded`](Self::call_recorded) with the caller's own per-call
+    /// deadline instead of the host-wide [`REQUEST_TIMEOUT`].
+    ///
+    /// Everything else is identical — the SSRF screen, the `mcp` lane row, the
+    /// V37 dispatch enforcement — because the split is one `Duration` deep on
+    /// purpose: a second enforcement path is a second place for a screen to be
+    /// forgotten. `call_recorded` is this function with the default.
+    ///
+    /// The one caller is the Code Audit tier-2 provider fan-out
+    /// (`audit::runner::AuditState::run_one_provider`), whose budget is the
+    /// tool's configured `timeout_secs` — a repository scan legitimately runs
+    /// for minutes. Before V38 that number governed only the runner's own outer
+    /// timer while the inner call was capped at 45 s, so the configuration was
+    /// dead and every slower provider failed as if unreachable.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn call_recorded_with_deadline(
+        &self,
+        consumer: Consumer,
+        root: Option<&Path>,
+        namespaced: &str,
+        args: Value,
+        scope: &str,
+        tab: crate::activity::Attribution,
+        policy: &outbound::Policy,
+        audit: &dyn outbound::ScopeAudit,
+        deadline: Duration,
     ) -> Result<String, HostError> {
         let started = crate::activity::now_ms();
         let target = mcp_target(&args);
@@ -1971,7 +2159,9 @@ impl McpHost {
         // ownership lookup dispatch routes by (see `identify`). Read BEFORE the
         // call so a server torn down mid-call still names itself on its own row.
         let (server, category) = self.identify(consumer, namespaced).await;
-        let result = self.call_for_consumer(consumer, namespaced, args).await;
+        let result = self
+            .call_for_consumer_with_deadline(consumer, namespaced, args, deadline)
+            .await;
         crate::activity::record_bg(crate::activity::ActivityRecord {
             entry: crate::activity::ActivityEntry::new(
                 crate::activity::ActivityKind::Mcp,
@@ -2030,7 +2220,7 @@ impl McpHost {
     /// V37 contract C7 — who owns `namespaced`, and which category they sit in.
     ///
     /// Both answers are ROUTING facts, resolved from the pool the way
-    /// [`Self::call`] routes and never by splitting the namespaced name (a
+    /// [`Self::call_with_deadline`] routes and never by splitting the namespaced name (a
     /// server or raw tool name may itself contain `__`; this file has documented
     /// that hazard since V8-03). The disabled set is the fallback so a REFUSED
     /// call still names the server it was refused for — a row that says only
@@ -2649,8 +2839,55 @@ fn fake_server(
     }
 }
 
+/// A fake server whose transport is a REAL Streamable-HTTP endpoint, for the
+/// one thing [`fake_server`] cannot reach: the deadline. A `conn: None` server
+/// fails at "server is not connected" before any timer is armed, so the only
+/// way to assert which `Duration` a call path threaded is to let it actually
+/// wait on a socket.
+///
+/// Granted to every consumer — the grant is a different test's subject, and a
+/// deadline test that also had to configure access would be asserting two
+/// things.
+#[cfg(test)]
+fn fake_http_server(name: &str, url: &str, namespaced: &str) -> McpServer {
+    let mut s = fake_server(name, true, true, true, namespaced);
+    s.conn = Some(Conn::Http {
+        url: url.to_string(),
+        client: reqwest::Client::new(),
+        session_id: StdMutex::new(None),
+        protocol_version: PROTOCOL_VERSION.to_string(),
+        auth_token: None,
+    });
+    s
+}
+
+/// A loopback listener that ACCEPTS and then never answers, returning its
+/// `/mcp` URL. The connection must be held open (not dropped) or the peer gets
+/// an immediate reset, which is a transport failure — the very thing these
+/// tests must tell a deadline apart from.
+#[cfg(test)]
+async fn black_hole_endpoint() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((sock, _)) = listener.accept().await {
+            held.push(sock);
+        }
+    });
+    format!("http://{addr}/mcp")
+}
+
 #[cfg(test)]
 impl McpHost {
+    /// Push a [`fake_http_server`] into the warm pool.
+    async fn insert_black_hole_server(&self, name: &str, url: &str, namespaced: &str) {
+        self.servers
+            .write()
+            .await
+            .push(Arc::new(fake_http_server(name, url, namespaced)));
+    }
+
     /// Push a [`fake_server`] into the warm pool — the only way a test outside
     /// this module can move the advertised surface.
     pub(super) async fn insert_fake_server(
@@ -3063,6 +3300,30 @@ struct HttpHeaders<'a> {
     auth_token: Option<&'a str>,
 }
 
+/// The ONE rule for turning a `reqwest` send failure into a [`HostError`]: an
+/// elapsed deadline is [`HostError::timed_out`] (classified, and worded so it
+/// cannot be read as unreachability), everything else keeps its pre-V38
+/// sentence verbatim.
+fn http_send_error(e: reqwest::Error, deadline: Duration) -> HostError {
+    if e.is_timeout() {
+        HostError::timed_out(deadline)
+    } else {
+        HostError::cimp(format!("http request failed: {e}"))
+    }
+}
+
+/// [`http_send_error`]'s twin for the body half. `reqwest`'s request timeout
+/// covers the response body too, so a slow server can just as easily blow the
+/// deadline mid-stream as before the first byte — and that is the same fact,
+/// which must not render as a decode fault.
+fn http_body_error(e: reqwest::Error, deadline: Duration) -> HostError {
+    if e.is_timeout() {
+        HostError::timed_out(deadline)
+    } else {
+        HostError::cimp(format!("http body read failed: {e}"))
+    }
+}
+
 /// Core Streamable-HTTP request: POST one JSON-RPC frame and return the
 /// `Mcp-Session-Id` the server assigned (if any) plus the JSON-RPC `result`.
 /// Sends the dual `Accept` the 2025 transport mandates (a server rejects a
@@ -3118,10 +3379,14 @@ async fn http_request(
     }
     // reqwest's `e` is cImp/reqwest-composed, not server-authored: a transport
     // failure means no server bytes arrived at all.
-    let mut resp = req
-        .send()
-        .await
-        .map_err(|e| HostError::cimp(format!("http request failed: {e}")))?;
+    //
+    // The deadline is split out from the rest because `reqwest`'s `Display` for
+    // an elapsed request timeout is `error sending request for url (…)` — which
+    // reads as "that endpoint is not reachable" and is exactly wrong: the
+    // server IS there, it is answering more slowly than the caller's budget.
+    // `is_timeout()` is reqwest's own classification (it walks the source chain
+    // for the timer), so the honest sentence is one branch away.
+    let mut resp = req.send().await.map_err(|e| http_send_error(e, timeout))?;
     let status = resp.status();
     let new_session = resp
         .headers()
@@ -3143,12 +3408,9 @@ async fn http_request(
     // before the result must not block us until it closes the stream. A plain
     // JSON body is read whole.
     let v = if is_event_stream(&content_type) {
-        read_sse_result(&mut resp).await?
+        read_sse_result(&mut resp, timeout).await?
     } else {
-        let text = resp
-            .text()
-            .await
-            .map_err(|e| HostError::cimp(format!("http body read failed: {e}")))?;
+        let text = resp.text().await.map_err(|e| http_body_error(e, timeout))?;
         serde_json::from_str::<Value>(&text)
             .map_err(|e| HostError::cimp(format!("http parse failed: {e}")))?
     };
@@ -3260,7 +3522,10 @@ impl SseAssembler {
 /// chunks (decoded at line granularity, so a multibyte char split across two
 /// chunks isn't corrupted), so we never wait for the server to close a stream
 /// that keeps emitting progress notifications after the result.
-async fn read_sse_result(resp: &mut reqwest::Response) -> Result<Value, HostError> {
+async fn read_sse_result(
+    resp: &mut reqwest::Response,
+    deadline: Duration,
+) -> Result<Value, HostError> {
     // Bound the unframed accumulation: complete lines are drained below, so this
     // caps a SINGLE newline-less line. Without it a server that streams bytes
     // without a newline grows `buf` until OOM (the caller's timeout is the only
@@ -3286,7 +3551,7 @@ async fn read_sse_result(resp: &mut reqwest::Response) -> Result<Value, HostErro
                 }
             }
             Ok(None) => break,
-            Err(e) => return Err(HostError::cimp(format!("http body read failed: {e}"))),
+            Err(e) => return Err(http_body_error(e, deadline)),
         }
     }
     // Stream ended: feed any unterminated trailing line, then flush.
@@ -5469,6 +5734,135 @@ mod tests {
             refused.contains(REFUSAL_DISABLED) && refused.contains(REFUSAL_DISABLED_BY_SERVER),
             "dispatch is the enforcement point, and it names the toggle: {refused}"
         );
+    }
+
+    /// V38 — the audit fan-out's call waits exactly as long as it was told to,
+    /// and a blown deadline says so.
+    ///
+    /// The defect this pins: `run_one_provider` wrapped the call in the tool's
+    /// configured timeout (minutes) while the host silently capped every
+    /// `tools/call` at [`REQUEST_TIMEOUT`]. A provider scan that legitimately
+    /// took longer than 45 s could therefore never succeed, and what the report
+    /// showed was `http request failed: error sending request for url (…)` —
+    /// reqwest's wording for its own elapsed timer, which reads as "that
+    /// endpoint is down". Two wrongs: an impossible budget, and a diagnosis
+    /// pointing at the wrong thing.
+    ///
+    /// Asserted against a server that accepts the connection and then says
+    /// nothing, so the ONLY thing that can end the call is a timer.
+    #[tokio::test]
+    async fn the_audit_path_waits_for_the_deadline_it_was_given_and_names_it() {
+        let url = black_hole_endpoint().await;
+        let host = McpHost::new();
+        host.insert_black_hole_server("acme", &url, "acme__scan")
+            .await;
+
+        let started = std::time::Instant::now();
+        let err = host
+            .call_for_consumer_with_deadline(
+                Consumer::Audit,
+                "acme__scan",
+                json!({}),
+                Duration::from_millis(100),
+            )
+            .await
+            .expect_err("a server that never answers cannot succeed");
+        let elapsed = started.elapsed();
+
+        // 1) The deadline honoured is the one passed, not the host's 45s.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the call must end on the 100ms deadline, not {REQUEST_TIMEOUT:?}: took {elapsed:?}"
+        );
+        // 2) Classified, so the runner never has to read the sentence.
+        assert!(err.is_timeout(), "a blown deadline is a timeout: {err}");
+        assert!(!err.is_disabled_by_toggle());
+        // 3) …and the sentence names the deadline instead of implying the
+        //    server is unreachable.
+        let text = err.to_string();
+        assert!(
+            text.contains("timed out after 100ms"),
+            "the message names the caller's own budget: {text}"
+        );
+        assert!(
+            !text.contains("http request failed"),
+            "reqwest's 'error sending request' wording is what misled the user: {text}"
+        );
+    }
+
+    /// …and every OTHER consumer still gets [`REQUEST_TIMEOUT`], threaded from
+    /// the production entry point ([`McpHost::call_recorded`]) — the deadline
+    /// split must not have moved the default a model's turn runs under.
+    ///
+    /// Virtual time (`start_paused`), so the 45 s is asserted rather than
+    /// waited out: the runtime auto-advances the clock while the call is parked
+    /// on a socket that will never speak. The value is read back out of the
+    /// message, which is composed from the `Duration` actually threaded — a
+    /// wall-clock assertion could not tell 45 s from 30 s without spending it.
+    #[tokio::test(start_paused = true)]
+    async fn a_non_audit_call_still_runs_under_the_host_default() {
+        let url = black_hole_endpoint().await;
+        let host = McpHost::new();
+        host.insert_black_hole_server("acme", &url, "acme__scan")
+            .await;
+
+        let err = host
+            .call_recorded(
+                Consumer::Claude,
+                None,
+                "acme__scan",
+                json!({}),
+                "tab:1",
+                crate::activity::Attribution::Headless,
+                &outbound::Policy::default(),
+                &outbound::TaskAudit::default(),
+            )
+            .await
+            .expect_err("a server that never answers cannot succeed");
+
+        assert!(err.is_timeout(), "{err}");
+        assert_eq!(REQUEST_TIMEOUT, Duration::from_secs(45));
+        assert!(
+            err.to_string().contains("timed out after 45s"),
+            "the proxied path keeps the host default: {err}"
+        );
+    }
+
+    /// A user's own toggle is classified as such, and the SSRF refusal beside it
+    /// is not. The audit fan-out renders the first as a DISABLED tool and the
+    /// second as a failure; both used to arrive as one opaque string.
+    #[tokio::test]
+    async fn a_toggle_refusal_is_classified_apart_from_every_other_refusal() {
+        let host = McpHost::new();
+        host.insert_fake_server("acme", false, true, false, "acme__scan")
+            .await;
+        *host.disabled.write().await = vec![DisabledServer {
+            name: "acme".to_string(),
+            verdict: EnableVerdict::ServerOff,
+            claude_access: false,
+            offload_access: true,
+            opencode_access: false,
+        }];
+
+        let refused = host
+            .call_for_consumer(Consumer::Audit, "acme__scan", json!({}))
+            .await
+            .expect_err("the server toggle is off");
+        assert!(
+            refused.is_disabled_by_toggle(),
+            "the user's switch, not a fault: {refused}"
+        );
+        assert!(!refused.is_timeout());
+        // The wording is untouched — it is what names WHICH toggle.
+        assert!(refused.to_string().contains(REFUSAL_DISABLED_BY_SERVER));
+
+        // Everything else stays unclassified, and therefore a failure.
+        let unknown = host
+            .call_for_consumer(Consumer::Audit, "nobody__scan", json!({}))
+            .await
+            .expect_err("no server owns it");
+        assert!(!unknown.is_disabled_by_toggle() && !unknown.is_timeout());
+        assert!(!HostError::cimp(outbound::REFUSAL_SSRF).is_disabled_by_toggle());
     }
 
     /// V38 Phase F (V37's E-1) — a detection change re-screens the LIVE surface,

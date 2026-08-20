@@ -420,6 +420,14 @@ landlock = "0.4"
 # new entries to the dependency tree.
 filetime = "0.2"
 
+# V38: `tokio`'s virtual clock (`#[tokio::test(start_paused = true)]`), so
+# `offload::mcp_host`'s deadline tests can ASSERT the 45s host default instead of
+# spending 45s of CI time proving it. Dev-only on purpose — the 2021 edition's
+# v2 feature resolver keeps `test-util` out of the shipped binary — and it adds
+# no Cargo.lock entries: `test-util` pulls no new crates, and `tokio` is already
+# a dependency of this package.
+tokio = { version = "1", features = ["test-util"] }
+
 [profile.release]
 codegen-units = 1
 lto = true

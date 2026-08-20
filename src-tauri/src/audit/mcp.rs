@@ -139,9 +139,9 @@ fn audit_tool(name: &str, description: &str) -> Value {
 /// 1. A **summary line**: the category, the scan root, tool counts by outcome,
 ///    and finding counts by severity.
 /// 2. One **status line per tool** in the category — `done` (N findings +
-///    duration), `failed` (error), `not installed`, `misconfigured` (a
-///    configured path that doesn't resolve), `skipped (not applicable)`,
-///    or `disabled` (idle).
+///    duration), `failed` (error), `cancelled`, `not installed`,
+///    `misconfigured` (a configured path that doesn't resolve),
+///    `skipped (not applicable)`, or `disabled` (idle).
 /// 3. The **findings**, errors first (then warnings, then notes; emit order
 ///    within each band), each as `SEVERITY file:line [tool/code] message`. Tool
 ///    ids appear here only as opaque data strings — never in a way the model is
@@ -164,6 +164,7 @@ pub fn format_result(snapshot: &AuditSnapshot, category: Category) -> String {
     let mut misconfigured = 0usize;
     let mut skipped = 0usize;
     let mut disabled = 0usize;
+    let mut cancelled = 0usize;
     for t in &tools {
         match t.status {
             ToolStatus::Done => done += 1,
@@ -172,6 +173,9 @@ pub fn format_result(snapshot: &AuditSnapshot, category: Category) -> String {
             ToolStatus::PathInvalid => misconfigured += 1,
             ToolStatus::SkippedNotApplicable => skipped += 1,
             ToolStatus::Idle => disabled += 1,
+            // V38: its own count. Folding a user-requested stop into `failed`
+            // reported the user's own action as a fault.
+            ToolStatus::Cancelled => cancelled += 1,
             // A completed snapshot shouldn't carry `Running`, but count it as
             // "running" rather than mislabel it.
             ToolStatus::Running => {}
@@ -202,7 +206,7 @@ pub fn format_result(snapshot: &AuditSnapshot, category: Category) -> String {
     // 1) Summary line.
     out.push_str(&format!(
         "{} audit of {}: {} tool{} — {done} completed, {failed} failed, \
-         {not_installed} not installed, {misconfigured} misconfigured, \
+         {cancelled} cancelled, {not_installed} not installed, {misconfigured} misconfigured, \
          {skipped} not applicable, {disabled} disabled. \
          Findings: {total_findings} ({errors} error{}, {warnings} warning{}, {notes} note{}).\n",
         category_title(category),
@@ -280,6 +284,10 @@ fn status_line(t: &super::runner::ToolState) -> String {
             fmt_duration(t.duration_ms)
         ),
         ToolStatus::Failed => format!("failed — {}", t.error.as_deref().unwrap_or("unknown error")),
+        ToolStatus::Cancelled => format!(
+            "cancelled — {}",
+            t.error.as_deref().unwrap_or("scan cancelled")
+        ),
         ToolStatus::NotInstalled => {
             "not installed (no path configured, not on PATH/ebin)".to_string()
         }
@@ -290,7 +298,15 @@ fn status_line(t: &super::runner::ToolState) -> String {
                 .unwrap_or("configured path not found — fix it in cImp Settings")
         ),
         ToolStatus::SkippedNotApplicable => "skipped (not applicable)".to_string(),
-        ToolStatus::Idle => "disabled".to_string(),
+        // A configured-but-unticked tool carries no detail and reads exactly as
+        // it always has. A V38 tier-2 provider whose MCP server (or category) is
+        // switched off carries the host's refusal, which names WHICH toggle —
+        // without it the user is told "disabled" about a tool they never
+        // disabled, and has no way to find the switch that did it.
+        ToolStatus::Idle => match t.error.as_deref() {
+            Some(why) => format!("disabled — {why}"),
+            None => "disabled".to_string(),
+        },
         ToolStatus::Running => "running".to_string(),
     }
 }
@@ -1019,6 +1035,91 @@ mod tests {
         assert!(out.contains("done — 4 findings in 1.2s"), "{out}");
     }
 
+    /// V38 — a tier-2 provider whose MCP server the user switched off is
+    /// counted as DISABLED, not failed, and the line still names which toggle.
+    ///
+    /// Live before the fix: `6 tools — 3 completed, 2 failed …`, with each
+    /// provider row reading `failed — the MCP provider … did not deliver
+    /// findings: server \`testprov\` is disabled (server toggle)`. The user was
+    /// told two tools were broken by their own configuration doing exactly what
+    /// they set it to do.
+    #[test]
+    fn a_provider_whose_server_is_switched_off_counts_as_disabled() {
+        let refusal = "server `testprov` is disabled (server toggle)";
+        let tools = vec![
+            tool_state(
+                "gitleaks",
+                Category::Security,
+                ToolStatus::Done,
+                vec![],
+                10,
+                None,
+            ),
+            tool_state(
+                "osv-scanner",
+                Category::Security,
+                ToolStatus::Idle,
+                vec![],
+                0,
+                None,
+            ),
+            tool_state(
+                "semgrep",
+                Category::Security,
+                ToolStatus::Idle,
+                vec![],
+                0,
+                Some(refusal),
+            ),
+        ];
+        let out = format_result(&snapshot(tools), Category::Security);
+        assert!(
+            out.contains("1 completed, 0 failed,"),
+            "a switched-off server is not a failure: {out}"
+        );
+        assert!(out.contains("2 disabled"), "{out}");
+        // The detail is the whole point of keeping the sentence: it names the
+        // toggle, so the user can find the switch they do not remember flipping.
+        assert!(out.contains(&format!("semgrep — disabled — {refusal}")), "{out}");
+        // A plain unticked tool is untouched — no detail, same words as always.
+        assert!(out.contains("osv-scanner — disabled\n"), "{out}");
+    }
+
+    /// V38 — a cancelled tool is counted and rendered as cancelled, not failed.
+    ///
+    /// Live symptom: the user stopped a security scan while one tool was still
+    /// running, and the umbrella report said it had failed — the user's own
+    /// action reported back to them as a broken scanner.
+    #[test]
+    fn a_cancelled_tool_is_counted_apart_from_a_failed_one() {
+        let tools = vec![
+            tool_state(
+                "gitleaks",
+                Category::Security,
+                ToolStatus::Cancelled,
+                vec![],
+                0,
+                Some("scan cancelled"),
+            ),
+            tool_state(
+                "semgrep",
+                Category::Security,
+                ToolStatus::Failed,
+                vec![],
+                0,
+                Some("timed out after 600s"),
+            ),
+        ];
+        let out = format_result(&snapshot(tools), Category::Security);
+        assert!(
+            out.contains("0 completed, 1 failed, 1 cancelled,"),
+            "cancel gets its own count: {out}"
+        );
+        assert!(out.contains("gitleaks — cancelled — scan cancelled"), "{out}");
+        // A timeout deliberately stays `failed`, and its detail says which.
+        assert!(out.contains("semgrep — failed — timed out after 600s"), "{out}");
+    }
+
     #[test]
     fn not_installed_and_skipped_render_as_status_lines() {
         let tools = vec![
@@ -1063,7 +1164,7 @@ mod tests {
         // Outcome tally in the summary reflects all four.
         assert!(
             out.contains(
-                "0 completed, 1 failed, 1 not installed, 0 misconfigured, \
+                "0 completed, 1 failed, 0 cancelled, 1 not installed, 0 misconfigured, \
                  1 not applicable, 1 disabled"
             ),
             "{out}"

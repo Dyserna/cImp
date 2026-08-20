@@ -473,6 +473,7 @@ fn status_word(s: ToolStatus) -> &'static str {
         ToolStatus::Running => "running",
         ToolStatus::Done => "done",
         ToolStatus::Failed => "failed",
+        ToolStatus::Cancelled => "cancelled",
         ToolStatus::NotInstalled => "not-installed",
         ToolStatus::PathInvalid => "path-invalid",
         ToolStatus::SkippedNotApplicable => "skipped-not-applicable",

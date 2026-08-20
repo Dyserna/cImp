@@ -24,6 +24,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::activity::{self, now_ms, ActivityEntry, ActivityKind, ActivityRecord};
 use crate::checks::{parsers, Diag};
+use crate::offload::mcp_host::HostError;
 use crate::offload::service::PushNotice;
 use crate::plugins::manifest::{ProviderRef, SandboxReq};
 use crate::plugins::registry::EffectiveTool;
@@ -69,28 +70,52 @@ enum ProviderOutcome {
     Answered(String),
     /// The scan was cancelled while the call was in flight.
     Cancelled,
-    /// The tool's wall-clock budget elapsed first.
+    /// The tool's wall-clock budget elapsed first — either the runner's own
+    /// timer or the identical deadline the host call was given.
     TimedOut,
-    /// The host refused it (a disabled server or category), the server errored,
-    /// or there is no host in this process. Never a clean pass.
+    /// The host refused the call because the USER has the server (or every
+    /// category containing it) switched off. Not a failure: the configuration
+    /// did exactly what it says, so this renders as a DISABLED tool, the same
+    /// as a built-in scanner whose checkbox is unticked. The string is the
+    /// host's refusal sentence, kept because it names WHICH toggle.
+    RefusedDisabled(String),
+    /// The server errored, the host refused it for any other reason (an
+    /// ungranted consumer, the SSRF screen, a vanished tool), or there is no
+    /// host in this process. Never a clean pass.
     Failed(String),
 }
 
 /// One tool's lifecycle within a scan. Serialized kebab-case, so the wire
-/// strings are exactly `idle | running | done | failed | not-installed |
-/// path-invalid | skipped-not-applicable`.
+/// strings are exactly `idle | running | done | failed | cancelled |
+/// not-installed | path-invalid | skipped-not-applicable`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ToolStatus {
-    /// Configured but not part of / not yet started in the current scan.
+    /// Configured but not part of / not yet started in the current scan — and,
+    /// since V38, the terminal state of a tier-2 provider tool whose MCP server
+    /// (or its every category) the user has switched off. Both are the same
+    /// fact from the reader's side: a tool that is switched off did not run and
+    /// did not fail. Rendered and counted as `disabled` by
+    /// [`format_result`](super::mcp::format_result).
     Idle,
     /// Resolved and its child is running.
     Running,
     /// Ran to completion (exit 0 = clean, or a findings exit code) — `findings`
     /// is authoritative even when empty.
     Done,
-    /// A tool error: non-findings exit code, spawn failure, timeout, or cancel.
+    /// A tool error: non-findings exit code, spawn failure, or timeout. A
+    /// timeout stays here on purpose — the budget was the user's, but the tool
+    /// failed to finish inside it, and its partial output is not a result.
     Failed,
+    /// V38: the USER stopped the scan while this tool was still running.
+    ///
+    /// Its own status rather than [`Failed`](Self::Failed), because nothing
+    /// went wrong: the chip, the umbrella report's tally and the `audit` lane
+    /// row all used to say "failed" about an outcome the user asked for, which
+    /// is indistinguishable from the scanner having crashed. A cancelled tool
+    /// produced no findings, and the ones that had already finished keep
+    /// theirs.
+    Cancelled,
     /// The binary could not be resolved with NO path configured (not in ebin,
     /// not on PATH) — the scan proceeds with the remaining tools.
     NotInstalled,
@@ -136,7 +161,9 @@ pub struct ToolState {
     pub status: ToolStatus,
     pub findings: Vec<AuditFinding>,
     pub duration_ms: u64,
-    /// Error detail when `status == failed` / `not-installed`; `null` otherwise.
+    /// Error detail when `status == failed` / `not-installed`, or (V38) the
+    /// host's refusal sentence on an `idle` tier-2 provider whose server is
+    /// switched off; `null` otherwise.
     pub error: Option<String>,
     /// The resolved binary path (once resolution succeeds); serializes as a
     /// string. `null` before resolution / when not installed.
@@ -327,6 +354,9 @@ const AUDIT_PUSH_MIN_SCAN_MS: u64 = 30_000;
 ///   "cImp finished a … audit … Call `security_audit` for the full report (it
 ///   re-runs the same scan)" — i.e. invite every armed agent to re-run the very
 ///   scan the user just stopped. A cancelled run's counts are partial anyway.
+///   Still a `bool` from the scan's own token rather than a
+///   [`ToolStatus::Cancelled`] chip in the snapshot: a stop that lands between
+///   tools produces no such chip, and this gate must hold for that case too.
 /// - **Duration**: below [`AUDIT_PUSH_MIN_SCAN_MS`] nobody walked away waiting.
 fn scan_push_worthy(
     session_push: bool,
@@ -891,8 +921,12 @@ impl AuditState {
         self.emit_event();
         // V30 (review M3): `cancel` is this scan's own token — read it BEFORE
         // announcing, because `run` is reached on every exit path including the
-        // cancelled one (`Outcome::Cancelled` classifies as `Failed`, so the
-        // snapshot alone cannot tell the two apart).
+        // cancelled one. Still the TOKEN and not the snapshot, even though V38
+        // gave a cancelled tool its own `ToolStatus::Cancelled`: that status
+        // only appears on a tool that was mid-run when the stop landed, so a
+        // scan cancelled between tools (or after the last one finished) leaves
+        // a snapshot indistinguishable from a completed run. The token is the
+        // only witness that covers every case.
         self.announce_scan_complete(
             &snap,
             category,
@@ -973,10 +1007,17 @@ impl AuditState {
     ///   sent, because a provider has no guarantee of sharing this machine's
     ///   filesystem and a path it cannot read is worse than no path at all.
     /// * **Enforcement is V37's.** The call goes through
-    ///   [`McpHost::call_recorded`](crate::offload::mcp_host::McpHost::call_recorded),
+    ///   [`call_recorded_with_deadline`](crate::offload::mcp_host::McpHost::call_recorded_with_deadline),
     ///   so a disabled server (or a disabled category) refuses it with the same
     ///   words any other proxied call gets, the SSRF screen runs, and the `mcp`
     ///   lane row is minted with the server, its category and this consumer.
+    /// * **The tool's timeout really is the budget.** The deadline handed to the
+    ///   host equals the outer timer, so a provider that legitimately scans for
+    ///   minutes gets them. It is `..._with_deadline` for exactly that reason:
+    ///   the plain entry point keeps the host's 45 s, which is right for a
+    ///   model's turn and wrong for a repository scan.
+    /// * **A toggled-off server is not a failure.** It comes back as
+    ///   [`ProviderOutcome::RefusedDisabled`] and renders as a DISABLED tool.
     ///   Health is deliberately NOT consulted as a gate — dispatch is the truth,
     ///   and an "unhealthy" server that answers must not be refused by cImp.
     async fn run_one_provider(
@@ -1016,7 +1057,12 @@ impl AuditState {
                 // property of a caller's session, and one scan is this caller's
                 // whole session.
                 let ledger = outbound::TaskAudit::default();
-                let call = host.call_recorded(
+                // `..._with_deadline`, and the deadline is the SAME `timeout`
+                // the outer timer below uses. Without it the host applied its
+                // own 45s `REQUEST_TIMEOUT` to every `tools/call`, so this
+                // tool's configured budget was dead configuration for
+                // providers and no scan slower than 45s could ever succeed.
+                let call = host.call_recorded_with_deadline(
                     Consumer::Audit,
                     Some(root.as_path()),
                     &namespaced,
@@ -1027,6 +1073,7 @@ impl AuditState {
                     activity::Attribution::Headless,
                     &policy,
                     &ledger,
+                    timeout,
                 );
                 tokio::select! {
                     // Cancel abandons the call cleanly: the future is dropped,
@@ -1035,13 +1082,13 @@ impl AuditState {
                     // server's side and its answer is discarded — the same
                     // shape V37 documents for a toggle landing mid-call.
                     _ = cancel.cancelled() => ProviderOutcome::Cancelled,
+                    // The outer timer stays the authoritative verdict; the inner
+                    // deadline is its equal, so whichever fires first the answer
+                    // is the same WORD. Which one wins is a race nobody should
+                    // depend on, and neither may report "unreachable".
                     r = tokio::time::timeout(timeout, call) => match r {
                         Err(_) => ProviderOutcome::TimedOut,
-                        Ok(Ok(text)) => ProviderOutcome::Answered(text),
-                        // `HostError`'s `Display` is bounded and carries the
-                        // server's own wording; the reader here is the Code
-                        // Audit panel, which is a human.
-                        Ok(Err(e)) => ProviderOutcome::Failed(e.to_string()),
+                        Ok(answer) => provider_outcome(answer),
                     },
                 }
             }
@@ -1057,7 +1104,6 @@ impl AuditState {
         let (status, findings, error) =
             finalize_provider(&spec, &outcome, &provider, &root, timeout);
 
-        let ok = status == ToolStatus::Done;
         let findings_count = findings.len();
         self.patch_tool(&tool.key, |ts| {
             ts.status = status;
@@ -1065,7 +1111,14 @@ impl AuditState {
             ts.duration_ms = duration_ms;
             ts.error = error;
         });
-        record_audit_run(&tool.key.wire(), &root, findings_count, duration_ms, ok);
+        record_audit_run(
+            &tool.key.wire(),
+            &root,
+            findings_count,
+            duration_ms,
+            status,
+            matches!(outcome, ProviderOutcome::TimedOut),
+        );
     }
 
     /// Run one resolved tool end to end: spawn, capture, classify, decode,
@@ -1160,6 +1213,10 @@ impl AuditState {
         // A truncated stdout only invalidates the report when stdout IS the
         // report; for report-file tools it merely truncates captured logs.
         let sarif_truncated = tool.transport == Transport::Stdout && cap.stdout_truncated;
+        // Read before `cap.outcome` is moved into `finalize`: the activity row
+        // needs the one fact the resulting `ToolStatus` deliberately does not
+        // carry (a timeout and a crash are both `Failed`).
+        let timed_out = matches!(cap.outcome, Outcome::TimedOut);
         let (status, findings, error) = finalize(
             &Finalize {
                 key: tool.key.clone(),
@@ -1192,7 +1249,6 @@ impl AuditState {
             let _ = tokio::fs::remove_file(p).await;
         }
 
-        let ok = status == ToolStatus::Done;
         let findings_count = findings.len();
         self.patch_tool(&tool.key, |ts| {
             ts.status = status;
@@ -1202,7 +1258,14 @@ impl AuditState {
             ts.scanned_artifacts = scanned_artifacts;
         });
 
-        record_audit_run(&subject, &root, findings_count, duration_ms, ok);
+        record_audit_run(
+            &subject,
+            &root,
+            findings_count,
+            duration_ms,
+            status,
+            timed_out,
+        );
     }
 }
 
@@ -1363,8 +1426,10 @@ pub(super) fn finalize(
             Vec::new(),
             Some(format!("failed to launch: {e}")),
         ),
+        // V38: `Cancelled`, not `Failed` — see `ToolStatus::Cancelled`. The
+        // detail is unchanged, so every reader that showed it still does.
         Outcome::Cancelled => (
-            ToolStatus::Failed,
+            ToolStatus::Cancelled,
             Vec::new(),
             Some("scan cancelled".to_string()),
         ),
@@ -1457,6 +1522,30 @@ pub(super) fn finalize(
     }
 }
 
+/// V38 — what one host answer MEANS to the audit fan-out.
+///
+/// Pure, and split out of [`AuditState::run_one_provider`] because two of the
+/// three error shapes are not tool failures and the difference is invisible in
+/// the sentence: a deadline the user configured, and a server the user switched
+/// off. Both used to render as `failed — … did not deliver findings: <prose>`,
+/// which told the user something was broken when nothing was — the disabled one
+/// most sharply, since it was their own toggle being reported as a fault.
+///
+/// The branch is on [`HostError`]'s CLASSIFICATION, never on its text: the text
+/// is prose that gets reworded, and its remote half is prose a server cImp does
+/// not control wrote. Anything unclassified stays a failure, so a new host error
+/// site cannot accidentally become a clean or excused result.
+fn provider_outcome(answer: Result<String, HostError>) -> ProviderOutcome {
+    match answer {
+        Ok(text) => ProviderOutcome::Answered(text),
+        Err(e) if e.is_timeout() => ProviderOutcome::TimedOut,
+        Err(e) if e.is_disabled_by_toggle() => ProviderOutcome::RefusedDisabled(e.to_string()),
+        // `HostError`'s `Display` is bounded and carries the server's own
+        // wording; the reader here is the Code Audit panel, which is a human.
+        Err(e) => ProviderOutcome::Failed(e.to_string()),
+    }
+}
+
 /// V38 Phase F — classify one tier-2 call's result, as a pure function.
 ///
 /// Split out of [`AuditState::run_one_provider`] so the contract that matters
@@ -1492,6 +1581,15 @@ fn finalize_provider(
         }
         ProviderOutcome::TimedOut => {
             finalize(spec, Outcome::TimedOut, "", false, "", "", root, timeout)
+        }
+        // The user's own switch, so the roster word is the one an unticked
+        // built-in gets — `Idle` is what `audit::mcp` counts and renders as
+        // "disabled". Counting it under "failed" told the user something was
+        // broken when nothing was. The refusal sentence rides along as the
+        // detail so the row still says which toggle, and no findings are
+        // invented: a server that was never called found nothing.
+        ProviderOutcome::RefusedDisabled(why) => {
+            (ToolStatus::Idle, Vec::new(), Some(why.clone()))
         }
         // Never a clean pass. The reason is the server's or the host's, and it
         // names the server so the fix is findable: this failed chip is the only
@@ -1537,6 +1635,11 @@ fn parse_findings(
 /// [`AuditToolConfig::timeout_secs`](crate::settings::AuditToolConfig) override
 /// (clamped to ≥ 1s) wins; `None` falls back to the global
 /// `code_audit.timeout_secs` (`global`, already clamped ≥ 1s by the caller).
+///
+/// It governs BOTH tiers since V38: a spawned tool's child is killed at it, and
+/// a tier-2 provider's `tools/call` is given it as the host deadline. (Until
+/// that fix the provider half was capped at the host's 45 s regardless, which
+/// made this number a lie for every provider tool.)
 fn effective_tool_timeout(tool_secs: Option<u64>, global: Duration) -> Duration {
     tool_secs
         .map(|s| Duration::from_secs(s.max(1)))
@@ -1831,9 +1934,51 @@ fn diag_tail(stderr: &str, stdout: &str) -> String {
     lines[lines.len().saturating_sub(3)..].join("\n")
 }
 
+/// The word an `audit` lane row leads with, or `None` for a run that simply
+/// succeeded (whose row keeps its pre-V38 shape).
+///
+/// `status` answers it for every case but one: a timeout and a crash are both
+/// [`ToolStatus::Failed`] on purpose (the tool did not finish either way), and
+/// those are two of the rows a reader most needs to tell apart afterwards — so
+/// `timed_out` comes from the `Outcome` the caller still holds rather than
+/// being guessed from the detail string.
+///
+/// Pure and total, so a status added later must be given a reading here rather
+/// than silently inheriting one. `Running` and `Idle` are not terminal — a row
+/// is only ever minted after a tool finished — but they are answered anyway:
+/// a `None` for them would quietly claim success.
+fn audit_row_outcome(status: ToolStatus, timed_out: bool) -> Option<&'static str> {
+    match status {
+        ToolStatus::Done => None,
+        ToolStatus::Cancelled => Some("cancelled"),
+        ToolStatus::Failed if timed_out => Some("timed out"),
+        ToolStatus::Failed => Some("failed"),
+        ToolStatus::NotInstalled => Some("not installed"),
+        ToolStatus::PathInvalid => Some("misconfigured"),
+        ToolStatus::SkippedNotApplicable => Some("not applicable"),
+        ToolStatus::Idle => Some("disabled"),
+        ToolStatus::Running => Some("running"),
+    }
+}
+
 /// Record one tool run in the persistent tool-activity store (kind `audit`).
 /// `chars` carries the finding count for audit entries.
-fn record_audit_run(name: &str, root: &Path, findings: usize, ms: u64, ok: bool) {
+///
+/// V38: the terminal [`ToolStatus`] itself, not a pre-computed `ok` bool. The
+/// `ok` column is derived from it here so a caller cannot disagree with the
+/// chip it just wrote, and the row's `response` NAMES the outcome — a
+/// cancelled run, a timed-out one and a crashed one were all `ok=false · 0
+/// findings`, which is the same row for three different facts and no way to
+/// tell them apart afterwards.
+fn record_audit_run(
+    name: &str,
+    root: &Path,
+    findings: usize,
+    ms: u64,
+    status: ToolStatus,
+    timed_out: bool,
+) {
+    let ok = status == ToolStatus::Done;
     let rec = ActivityRecord {
         entry: ActivityEntry::new(
             ActivityKind::Audit,
@@ -1852,7 +1997,12 @@ fn record_audit_run(name: &str, root: &Path, findings: usize, ms: u64, ok: bool)
             None,
         ),
         request: format!("audit scan: {name}"),
-        response: format!("{findings} findings"),
+        // A successful row keeps its pre-V38 wording exactly; only the rows
+        // that were previously indistinguishable gain the leading word.
+        response: match audit_row_outcome(status, timed_out) {
+            Some(word) => format!("{word} · {findings} findings"),
+            None => format!("{findings} findings"),
+        },
     };
     activity::record_bg(rec);
 }
@@ -2797,13 +2947,46 @@ mod tests {
         assert_eq!(s, ToolStatus::Failed);
         assert!(e.unwrap().contains("timed out after 5s"));
 
+        // V38: a stop the USER asked for is its own status. A timeout stays
+        // `Failed` right above — the tool did not finish inside a budget it was
+        // given, which is a tool outcome, not a user action.
         let (s, _, e) = f(Outcome::Cancelled);
-        assert_eq!(s, ToolStatus::Failed);
+        assert_eq!(s, ToolStatus::Cancelled);
         assert_eq!(e.as_deref(), Some("scan cancelled"));
 
         let (s, _, e) = f(Outcome::SpawnError("boom".into()));
         assert_eq!(s, ToolStatus::Failed);
         assert!(e.unwrap().contains("boom"));
+    }
+
+    /// V38 — the `audit` lane row names the outcome, so three facts that were
+    /// one row (`ok=false · 0 findings`) can be told apart after the fact.
+    ///
+    /// Live symptom: a user cancelled a scan mid-run and the row for the tool
+    /// that was in flight was byte-identical to the row a crashed scanner
+    /// writes. `ok` is unchanged — only success is `true` — and a successful
+    /// row keeps its pre-V38 wording exactly.
+    #[test]
+    fn the_activity_row_word_separates_cancel_timeout_and_failure() {
+        assert_eq!(audit_row_outcome(ToolStatus::Done, false), None);
+        assert_eq!(
+            audit_row_outcome(ToolStatus::Cancelled, false),
+            Some("cancelled")
+        );
+        // The one case the status cannot answer alone: both are `Failed`.
+        assert_eq!(
+            audit_row_outcome(ToolStatus::Failed, true),
+            Some("timed out")
+        );
+        assert_eq!(audit_row_outcome(ToolStatus::Failed, false), Some("failed"));
+        // A provider refused by the user's own server toggle.
+        assert_eq!(audit_row_outcome(ToolStatus::Idle, false), Some("disabled"));
+        // `timed_out` never rewrites a status that already speaks for itself.
+        assert_eq!(audit_row_outcome(ToolStatus::Done, true), None);
+        assert_eq!(
+            audit_row_outcome(ToolStatus::Cancelled, true),
+            Some("cancelled")
+        );
     }
 
     // ── V25 finalize: clean-exit-with-findings semantics ────────────────────
@@ -3228,6 +3411,7 @@ mod tests {
             ToolStatus::Running,
             ToolStatus::Done,
             ToolStatus::Failed,
+            ToolStatus::Cancelled,
             ToolStatus::NotInstalled,
             ToolStatus::PathInvalid,
             ToolStatus::SkippedNotApplicable,
@@ -3238,6 +3422,7 @@ mod tests {
                 | ToolStatus::Running
                 | ToolStatus::Done
                 | ToolStatus::Failed
+                | ToolStatus::Cancelled
                 | ToolStatus::NotInstalled
                 | ToolStatus::PathInvalid
                 | ToolStatus::SkippedNotApplicable => {}
@@ -4103,7 +4288,7 @@ mod tests {
         // Review M3: cancelling must not broadcast "cImp finished a … audit …
         // Call security_audit for the full report (it re-runs the same scan)" —
         // that invites every armed agent to re-run what the user just aborted.
-        // `Outcome::Cancelled` classifies as `Failed`, so the snapshot alone
+        // A cancel between tools leaves no `Cancelled` chip, so the snapshot alone
         // cannot distinguish the two: the cancel token is the only signal.
         assert!(
             !scan_push_worthy(true, Initiator::Gui, true, long),
@@ -4370,10 +4555,12 @@ mod tests {
         }
 
         // Cancel, timeout and a refusal from the host: three different facts,
-        // three different messages, none of them a pass.
+        // three different messages, none of them a pass. A provider cancel
+        // takes the same route a spawned tool's does — V38 gave it its own
+        // status, so it is not reported as a tool failure.
         let (status, _, error) =
             finalize_provider(&spec, &ProviderOutcome::Cancelled, &provider, root, t);
-        assert_eq!(status, ToolStatus::Failed);
+        assert_eq!(status, ToolStatus::Cancelled);
         assert!(error.unwrap_or_default().contains("cancelled"));
 
         let (status, _, error) =
@@ -4395,5 +4582,71 @@ mod tests {
             error.contains("acme-mcp") && error.contains(refusal),
             "a disabled server's refusal reaches the chip verbatim: {error}"
         );
+    }
+
+    /// V38 — the two host errors that are NOT tool failures, from the
+    /// classification the host stamps to the words the report prints.
+    ///
+    /// Both were live defects on the same call path: a provider slower than the
+    /// host's 45s came back as `http request failed: error sending request for
+    /// url (…)` and was reported as a broken tool, and a server the user had
+    /// switched off was counted under "failed" beside it. Neither could be told
+    /// apart from a real fault by the string, which is why both are asserted
+    /// through `is_timeout` / `is_disabled_by_toggle` and not through wording.
+    #[test]
+    fn a_host_timeout_reads_as_timed_out_and_a_toggle_refusal_as_disabled() {
+        let key = ToolKey::Plugin("acme@1.0.0/cloud".to_string());
+        let spec = provider_spec(&key);
+        let provider = ProviderRef {
+            server: "acme-mcp".to_string(),
+            tool: "scan_repository".to_string(),
+        };
+        let root = Path::new("C:\\proj");
+        let t = Duration::from_secs(600);
+
+        // 1) The inner deadline expiring is the same verdict as the outer timer
+        //    expiring — the report must never call it a connection failure.
+        let outcome = provider_outcome(Err(HostError::timed_out(t)));
+        assert!(matches!(outcome, ProviderOutcome::TimedOut));
+        let (status, findings, error) = finalize_provider(&spec, &outcome, &provider, root, t);
+        assert_eq!(status, ToolStatus::Failed);
+        assert!(findings.is_empty());
+        let error = error.unwrap_or_default();
+        assert!(error.contains("timed out"), "{error}");
+        assert!(
+            !error.contains("http request failed") && !error.contains("not reachable"),
+            "a slow server is not an unreachable one: {error}"
+        );
+
+        // 2) The user's own toggle: disabled, with the sentence that names it.
+        let refusal = format!(
+            "server `acme-mcp` {}{}",
+            crate::offload::mcp_host::REFUSAL_DISABLED,
+            crate::offload::mcp_host::REFUSAL_DISABLED_BY_SERVER
+        );
+        let outcome = provider_outcome(Err(HostError::disabled_by_toggle(refusal.clone())));
+        assert!(matches!(outcome, ProviderOutcome::RefusedDisabled(_)));
+        let (status, findings, error) = finalize_provider(&spec, &outcome, &provider, root, t);
+        assert_eq!(
+            status,
+            ToolStatus::Idle,
+            "`Idle` is the state `format_result` counts and renders as `disabled`"
+        );
+        assert!(findings.is_empty(), "a server that was never called found nothing");
+        assert_eq!(error.as_deref(), Some(refusal.as_str()));
+
+        // 3) An unclassified host error is still a failure — the default must
+        //    not excuse anything a new error site forgets to classify.
+        let outcome = provider_outcome(Err(HostError::from("the server exploded")));
+        assert!(matches!(outcome, ProviderOutcome::Failed(_)));
+        let (status, _, error) = finalize_provider(&spec, &outcome, &provider, root, t);
+        assert_eq!(status, ToolStatus::Failed);
+        assert!(error.unwrap_or_default().contains("did not deliver findings"));
+
+        // 4) A successful answer is untouched by the new branch.
+        assert!(matches!(
+            provider_outcome(Ok("x".to_string())),
+            ProviderOutcome::Answered(_)
+        ));
     }
 }

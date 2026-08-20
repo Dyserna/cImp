@@ -309,6 +309,7 @@
     running: '',
     done: '✓',
     failed: '✗',
+    cancelled: '⊘',
     'not-installed': '⚠',
     'path-invalid': '⚠',
   };
@@ -342,7 +343,7 @@
   {/if}
 
   <!-- Per-tool status chips (only tools applicable to this project once the
-       census is known). Tooltip: the tool's error for failed/not-installed,
+       census is known). Tooltip: the tool's error for failed/cancelled/not-installed,
        else the resolved binary path for done/running chips. -->
   <div class="chips">
     {#each chipPartition.visible as t (t.id)}
@@ -608,6 +609,12 @@
   .chip.path-invalid .chip-icon,
   .chip.path-invalid .chip-label {
     color: var(--text-danger-soft, #ffb4ab);
+  }
+  /* V38: a user-requested stop is neutral — muted, never the failed red, so a
+     cancelled scan does not read as a broken one. */
+  .chip.cancelled .chip-icon,
+  .chip.cancelled .chip-label {
+    color: var(--text-muted, #8b949e);
   }
   .chip.running .chip-name {
     color: var(--text-info, #58a6ff);

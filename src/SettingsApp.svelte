@@ -605,7 +605,7 @@
       hint: 'One fixed paragraph in the session guidance asking the harness to prefer the `run_check` and `run_command` MCP tools over running the same commands in its own shell. It names no check, binary or path — it points at the tools’ own enums, which update live — so editing the tool registry never changes it. The `run_command` half is written only when that tool is exposed to this consumer (Tool Plugins → advertise commands). Off: nothing is injected and the harness reaches for its shell as it would without cImp.',
     },
     opencode_native_gate: {
-      hint: 'OFF BY DEFAULT — the only control here that does. With it on, an OpenCode tab that has read external content is refused its OWN bash/read/edit/write/patch/glob/grep for the rest of the session (and, having gone local first, its own webfetch/websearch instead). Whole-surface by design: a partial gate is routed around. Policy, not containment — it runs inside OpenCode’s process, so a nested ungated `opencode`, OPENCODE_PURE=1, a user-typed !shell and the raw terminal all bypass it. A per-tab override is the usual way in; it does nothing on Claude tabs.',
+      hint: 'App-wide ON since V39, like every other control here — but a newly created tab has all of its own switches OFF, so this denies nothing until you enable it for a tab (its shield badge, or the per-tab override below). It shipped app-wide OFF under locked decision 17, for the reason the sentence after this one gives; V39 kept the judgement and moved it a level down. With it on, an OpenCode tab that has read external content is refused its OWN bash/read/edit/write/patch/glob/grep for the rest of the session (and, having gone local first, its own webfetch/websearch instead). Whole-surface by design: a partial gate is routed around. Policy, not containment — it runs inside OpenCode’s process, so a nested ungated `opencode`, OPENCODE_PURE=1, a user-typed !shell and the raw terminal all bypass it. A per-tab override is the usual way in; it does nothing on Claude tabs.',
     },
     terminal_escape_hygiene: {
       hint: 'Strips ANSI/OSC control sequences (including OSC 52 clipboard writes) out of external text cImp composes into spoken/toast output. Off: a fetched page’s escape sequences travel with the text.',
@@ -5155,6 +5155,12 @@
             on when the master is on <em>and</em> either the scope says so or the
             feature does. An override can re-enable a feature its app-wide switch
             disabled; nothing re-enables a containment control past the master.
+            Since V39 this master and every per-feature switch ship <em>on</em>,
+            and a <strong>newly created AI tab has all of its own overrides off</strong>
+            — so a tab's own row is where protection is actually engaged, from
+            the shield badge on the tab itself or from the per-scope selects
+            below. Tabs that existed before V39 keep their behaviour: the upgrade
+            wrote <code>inherit</code> into every cell they had not set.
             (<em>Managed-tool steering</em> below is not a containment control —
             it is a token-efficiency nudge — so the master switch does not reach
             it; its own two switches still do.)

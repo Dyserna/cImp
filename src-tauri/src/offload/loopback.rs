@@ -13181,7 +13181,11 @@ mod tests {
     /// Settings carrying the builtin OpenCode tab, so a per-tab L3 cell has a
     /// tab to attach to (`Settings::default()` ships an EMPTY tab list).
     fn oc_settings() -> (crate::settings::Settings, String) {
-        let tab = match crate::settings::default_opencode_tab() {
+        // All-`Inherit`, not the V39 shipping row: these tests move ONE level
+        // at a time — see `settings::ai_tab_inheriting_injection`.
+        let tab = match crate::settings::ai_tab_inheriting_injection(
+            crate::settings::default_opencode_tab(),
+        ) {
             crate::settings::TabConfig::AiTool(c) => c,
             _ => unreachable!("default_opencode_tab is an AI tool tab"),
         };
@@ -13195,18 +13199,24 @@ mod tests {
         )
     }
 
-    /// The verdict the plugin is handed: **off by default**, on only when the
-    /// Phase H feature AND the taint latch both resolve on, and off again the
-    /// moment the master switch goes.
+    /// The verdict the plugin is handed: it needs the Phase H feature AND the
+    /// taint latch to resolve on, and goes off the moment the master switch
+    /// does.
+    ///
+    /// The **fixture** is an all-`Inherit` tab (`oc_settings`), so this reads
+    /// the app-wide levels. What a real, newly created tab answers is the V39
+    /// per-tab baseline — every cell `Off` — and that is pinned in
+    /// `settings::injection`, not restated here.
     #[test]
-    fn the_native_gate_verdict_is_off_by_default_and_needs_the_latch_too() {
+    fn the_native_gate_verdict_needs_its_feature_and_the_latch_too() {
         use crate::settings::injection::{Feature, Override};
         let (mut s, id) = oc_settings();
         let scope = oc_scope(&id, Some("ses"));
-        assert!(
-            !native_gate_verdict(&s, scope.injection()),
-            "locked decision 17: the gate ships OFF"
-        );
+        // Stated rather than assumed: this L2 shipped `false` under locked
+        // decision 17 and ships `true` since V39, and the properties below are
+        // about the transitions, not about the shipping value.
+        s.set_l2_for_test(Feature::OpencodeNativeGate, false);
+        assert!(!native_gate_verdict(&s, scope.injection()));
 
         // The app-wide L2.
         s.set_l2_for_test(Feature::OpencodeNativeGate, true);
@@ -13269,7 +13279,9 @@ mod tests {
         assert!(matches!(anon.injection(), Scope::UnknownCaller));
 
         // Off app-wide ⇒ off for a stale id. (The regression was invisible in
-        // this direction, which is why #45 shipped.)
+        // this direction, which is why #45 shipped.) The `off` is written here
+        // rather than inherited from a default: V39 ships this L2 on.
+        s.set_l2_for_test(Feature::OpencodeNativeGate, false);
         assert!(!native_gate_verdict(&s, stale.injection()));
 
         // ON app-wide ⇒ ON for a stale id. This is the assertion that fails if
@@ -15057,11 +15069,13 @@ mod tests {
         use crate::settings::{default_ai_tab, default_graph_monitor_tab, AiTabId, TabConfig};
         let mut tabs = vec![default_graph_monitor_tab()];
         for (consumer, id) in tabs_in {
-            let mut t = default_ai_tab(if *consumer == "claude" {
-                AiTabId::Claude
-            } else {
-                AiTabId::OpenCode
-            });
+            let mut t = crate::settings::ai_tab_inheriting_injection(default_ai_tab(
+                if *consumer == "claude" {
+                    AiTabId::Claude
+                } else {
+                    AiTabId::OpenCode
+                },
+            ));
             if let TabConfig::AiTool(c) = &mut t {
                 c.id = (*id).to_string();
             }

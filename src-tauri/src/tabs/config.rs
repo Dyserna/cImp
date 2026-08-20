@@ -1440,7 +1440,21 @@ fn compose_ai_env(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::settings::{default_claude_tab, default_opencode_tab};
+    use crate::settings::{
+        ai_tab_inheriting_injection, default_claude_tab, default_opencode_tab,
+    };
+
+    /// The builtin Claude tab with an all-`Inherit` injection row — see
+    /// [`crate::settings::ai_tab_inheriting_injection`] for why these fixtures
+    /// do not use the V39 shipping row.
+    fn claude_tab_inheriting() -> crate::settings::TabConfig {
+        ai_tab_inheriting_injection(default_claude_tab())
+    }
+
+    /// The builtin OpenCode tab with an all-`Inherit` injection row.
+    fn opencode_tab_inheriting() -> crate::settings::TabConfig {
+        ai_tab_inheriting_injection(default_opencode_tab())
+    }
 
     // V35 Phase K: the two generated artifacts moved to `harness/{claude,opencode}/`.
     // These tests did NOT move with them, deliberately: most drive the emitted
@@ -4453,7 +4467,7 @@ mod tests {
     fn consumer_hygiene_off_drops_the_pins_and_the_paragraph() {
         let base = || {
             let mut s = Settings {
-                tabs: vec![default_opencode_tab()],
+                tabs: vec![opencode_tab_inheriting()],
                 ..Settings::default()
             };
             // The paragraph's own precondition: a cImp tool surface is
@@ -4523,7 +4537,7 @@ mod tests {
     #[test]
     fn the_master_switch_restores_the_pre_v32_spawn_posture() {
         let mut s = Settings {
-            tabs: vec![default_claude_tab(), default_opencode_tab()],
+            tabs: vec![claude_tab_inheriting(), opencode_tab_inheriting()],
             ..Settings::default()
         };
         s.offload.enabled = true;
@@ -4559,7 +4573,7 @@ mod tests {
     #[test]
     fn the_injection_hierarchy_moves_the_spawn_inject_signature_at_every_level() {
         let with_tab = || Settings {
-            tabs: vec![default_claude_tab()],
+            tabs: vec![claude_tab_inheriting()],
             ..Settings::default()
         };
         let base = spawn_inject_sig(&with_tab());
@@ -4583,7 +4597,7 @@ mod tests {
         // resolved booleans, so `Off` over a default-off control (the gate) is
         // not a change at all.
         let with_both = || Settings {
-            tabs: vec![default_claude_tab(), default_opencode_tab()],
+            tabs: vec![claude_tab_inheriting(), opencode_tab_inheriting()],
             ..Settings::default()
         };
         let base_both = spawn_inject_sig(&with_both());
@@ -4773,6 +4787,13 @@ mod tests {
         let with = |graph: bool, mode: &str| -> bool {
             let mut s = Settings::default();
             s.graph.enabled = graph;
+            // The Phase H gate is the plugin's FOURTH reason to exist and ships
+            // on since V39, so it has to be silenced for the two-disjunct
+            // property below to be about the two disjuncts it names.
+            s.set_l2_for_test(
+                crate::settings::injection::Feature::OpencodeNativeGate,
+                false,
+            );
             s.set_native_web_mode_for_test(NativeWebVisibility::parse(mode));
             opencode_plugin_wanted(&s, "opencode")
         };
@@ -4792,7 +4813,7 @@ mod tests {
         // trap-closing test cares about is unchanged: flipping the mode makes a
         // fresh OpenCode tab launch differently, and the signature says so.
         let mut off = Settings {
-            tabs: vec![default_opencode_tab()],
+            tabs: vec![opencode_tab_inheriting()],
             ..Settings::default()
         };
         off.graph.enabled = false;
@@ -5905,7 +5926,7 @@ console.log("OK: the swap reached neither the gate nor the beacon");
     #[test]
     fn the_gate_alone_is_enough_to_keep_the_plugin_on_disk() {
         let mut s = Settings {
-            tabs: vec![default_opencode_tab()],
+            tabs: vec![opencode_tab_inheriting()],
             ..Settings::default()
         };
         let id = match &s.tabs[0] {
@@ -5914,6 +5935,12 @@ console.log("OK: the swap reached neither the gate nor the beacon");
         };
         s.graph.enabled = false;
         s.set_native_web_mode_for_test(NativeWebVisibility::Off);
+        // V39 ships this L2 on, so the baseline has to state the `off` it is
+        // about rather than borrow a default that has moved.
+        s.set_l2_for_test(
+            crate::settings::injection::Feature::OpencodeNativeGate,
+            false,
+        );
         assert!(
             !opencode_plugin_wanted(&s, &id),
             "nothing wants it yet — the baseline"
@@ -6038,7 +6065,7 @@ console.log("OK: the swap reached neither the gate nor the beacon");
     #[test]
     fn checkpoints_alone_keep_the_opencode_plugin_on_disk_and_move_the_signature() {
         let mut s = Settings {
-            tabs: vec![default_opencode_tab()],
+            tabs: vec![opencode_tab_inheriting()],
             ..Settings::default()
         };
         let id = match &s.tabs[0] {
@@ -6047,6 +6074,11 @@ console.log("OK: the swap reached neither the gate nor the beacon");
         };
         s.graph.enabled = false;
         s.set_native_web_mode_for_test(NativeWebVisibility::Off);
+        // The Phase H gate is a disjunct of its own and ships on since V39.
+        s.set_l2_for_test(
+            crate::settings::injection::Feature::OpencodeNativeGate,
+            false,
+        );
         assert!(!opencode_plugin_wanted(&s, &id), "the baseline");
         let before = spawn_inject_sig(&s);
 
@@ -6138,15 +6170,18 @@ console.log("OK: the swap reached neither the gate nor the beacon");
     #[test]
     fn a_native_gate_flip_raises_the_restart_hint_at_both_levels() {
         let base = Settings {
-            tabs: vec![default_opencode_tab()],
+            tabs: vec![opencode_tab_inheriting()],
             ..Settings::default()
         };
         let before = spawn_inject_sig(&base);
 
+        // Both flips move AWAY from the shipping value, whatever that value is:
+        // the property is "a flip at either level moves the signature", and a
+        // write of the value already stored proves nothing.
         let mut l2 = base.clone();
         l2.set_l2_for_test(
             crate::settings::injection::Feature::OpencodeNativeGate,
-            true,
+            false,
         );
         assert_ne!(spawn_inject_sig(&l2)[1], before[1], "L2 flip");
 
@@ -6155,7 +6190,7 @@ console.log("OK: the swap reached neither the gate nor the beacon");
         l3.set_tab_override_for_test(
             &id,
             crate::settings::injection::Feature::OpencodeNativeGate,
-            crate::settings::injection::Override::On,
+            crate::settings::injection::Override::Off,
         )
         .expect("the OpenCode tab carries a native-gate cell");
         assert_ne!(spawn_inject_sig(&l3)[1], before[1], "L3 flip");

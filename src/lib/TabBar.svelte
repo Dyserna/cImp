@@ -8,6 +8,7 @@
     isTainted,
     latchByTab,
     reducedFeaturesFor,
+    tabProtectionRows,
     type LatchRow,
   } from './latch';
   import { tabs } from './tabs/store';
@@ -100,6 +101,15 @@
   /// the two disagreeing for a poll interval is how a badge stops being read.
   const taintMenuReduced = $derived(
     taintMenu ? reducedFeaturesFor($injectionStatus, taintMenu.tab) : [],
+  );
+
+  /// V39: the popover's LIVE per-tab injection switches, from the same tick as
+  /// the badge that opened it. Derived rather than copied at click time for the
+  /// M-22 reason above — but with a second one of its own now that these rows
+  /// are a CONTROL: a checkbox rendered from a click-time snapshot would show
+  /// the pre-click value after the user's own write landed.
+  const taintMenuProtection = $derived(
+    taintMenu ? tabProtectionRows($injectionStatus, taintMenu.tab) : [],
   );
 
   /// The row a badge click carries. A tab with no gated call yet has no latch
@@ -350,6 +360,7 @@
             doneWhileAway={$perTabDoneWhileAway[id] ?? false}
             taint={isTainted(latchRow) ? (latchRow ?? null) : null}
             reduced={reducedFeaturesFor($injectionStatus, id)}
+            protection={tabProtectionRows($injectionStatus, id)}
             ontaint={(e) => onTaintBadge(id, latchRow, e)}
             bind:renaming={
               () => renamingTab === id,
@@ -459,6 +470,8 @@
     y={taintMenu.y}
     row={taintMenuRow}
     reduced={taintMenuReduced}
+    protection={taintMenuProtection}
+    masterOn={$injectionStatus?.protection ?? true}
     onDismiss={() => (taintMenu = null)}
     onApplied={refreshLatches}
   />

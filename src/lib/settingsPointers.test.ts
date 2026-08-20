@@ -183,14 +183,32 @@ describe('Settings pointer strings', () => {
     // land on. The tooltip text and the click target have to agree, and both
     // live in files with no component harness — so this is where they are
     // checked.
+    //
+    // **V39 moved the gesture, not the rule.** The primary click flips the L1
+    // master now; Settings is the SECONDARY gesture. So the tooltip has to name
+    // the destination *and* the gesture that reaches it, or the chip promises a
+    // navigation its click no longer performs.
     const badge = SOURCES['/src/lib/status/InjectionBadge.svelte'] ?? '';
     expect(badge).toContain("openSettingsWindowToSection('injection')");
+    expect(badge).toContain('oncontextmenu');
     // The old call, at its call site (the prose above it still names it, which
     // is why this matches the `void` form rather than the bare identifier).
     expect(badge).not.toContain('void openSettingsWindow()');
     const latch = SOURCES['/src/lib/latch.ts'] ?? '';
-    // Every chip tooltip ends by naming the destination.
-    expect(latch).toContain('Click to open Settings → Injection protection.');
-    expect(latch).not.toContain('Click to open Settings.');
+    expect(latch).toContain('Right-click to open Settings → Injection protection.');
+    // The pre-V39 promise must be gone from every tooltip: a left click no
+    // longer opens anything.
+    expect(latch).not.toContain('Click to open Settings');
+  });
+
+  it('keeps the sandbox chips deep-linked to the Sandboxing section', () => {
+    // Same rule, same reason, for V39's two new chips: the tooltip names the
+    // gesture and the section, and the component uses that exact section id.
+    const badge = SOURCES['/src/lib/status/SandboxBadge.svelte'] ?? '';
+    expect(badge).toContain("openSettingsWindowToSection('sandboxing')");
+    expect(badge).toContain('oncontextmenu');
+    const chip = SOURCES['/src/lib/status/sandboxChip.ts'] ?? '';
+    expect(chip).toContain('Right-click to open Settings → Sandboxing.');
+    expect(chip).not.toContain('Click to open Settings');
   });
 });

@@ -5,7 +5,14 @@
   // (Close? Yes / No); clicking × on an already-closed shell skips the
   // confirm and calls close_tab immediately.
   import type { AvatarState } from './avatarState';
-  import { reducedTabLine, taintColor, type FeatureState, type LatchRow } from './latch';
+  import {
+    protectionSummary,
+    protectionTint,
+    reducedTabLine,
+    taintColor,
+    type FeatureState,
+    type LatchRow,
+  } from './latch';
   import { settings } from './settings/store';
 
   let {
@@ -21,6 +28,7 @@
     doneWhileAway = false,
     taint = null,
     reduced = [],
+    protection = [],
     onclick,
     onclose,
     onnew,
@@ -62,6 +70,11 @@
     /// latched" — and locked decision 16 requires a reduced-protection state to
     /// be visible outside Settings.
     reduced?: FeatureState[];
+    /// V39: this tab's tab-scoped injection switches, as the backend resolved
+    /// them (`tabProtectionRows`). Drives the badge's protection tint and the
+    /// first line of its tooltip. Empty means "no report for this tab yet",
+    /// which renders as its own state rather than as "nothing is on".
+    protection?: FeatureState[];
     onclick: () => void;
     /// Invoked when the user confirms the close (or skips the confirm).
     /// Optional because builtin tabs render no close button.
@@ -165,6 +178,12 @@
     confirming = true;
   }
 
+  /// V39: how much of this tab's protection is engaged — `protected`,
+  /// `partial`, `off`, or `unknown` before the first report lands. One pure
+  /// function in `latch.ts` so the badge's colour and its tooltip cannot
+  /// disagree, and so it can be tested (a `.svelte` file has no harness here).
+  let tint = $derived(protectionTint(protection));
+
   /// V32 Phase F: the badge's tooltip. States the boundary in force, because
   /// a shield glyph alone says "something happened" and the user's next
   /// question is always "so what can this tab still do?".
@@ -173,8 +192,18 @@
   /// together because they answer the same question from opposite directions:
   /// the latch says what this tab may no longer do, the reduced line says which
   /// protections are not watching it in the first place.
+  ///
+  /// V39 puts the protection COUNT first, because the badge is permanent now and
+  /// its most common state is "nothing has happened, here is your switch".
   let taintTitle = $derived(
     [
+      // Omitted entirely for a tab with no rows (a Shell tab, which never
+      // reaches this badge anyway) rather than rendered as "not known yet" — an
+      // uncertainty claim about a tab with no protection to be uncertain about.
+      protection.length === 0
+        ? ''
+        : protectionSummary(protection) +
+        '. Click the shield to turn this tab\u2019s controls on or off.',
       !taint
         ? ''
         : taint.latch === 'external'
@@ -202,8 +231,20 @@
       .join(' '),
   );
 
-  /// Whether the badge renders at all. Either containment state counts.
-  let showTaintBadge = $derived(!!taint || reduced.length > 0);
+  /// **V39: the badge is a standing control on every AI tab.**
+  ///
+  /// It used to appear only when the tab was latched, contaminated, or had a
+  /// control switched off — which was correct while per-tab protection was
+  /// inherited and rarely touched. It is now the switch: a new tab ships every
+  /// tab-scoped control off and this shield is where the user turns them on, so
+  /// a tab that showed nothing would be a tab with no reachable control at all.
+  /// It is also what lets `protection_reduced` stop counting a tab's own cells
+  /// (locked decision 16's "cannot be off and forgotten" is met by a permanent,
+  /// colour-coded badge rather than by a conditional one).
+  ///
+  /// Non-AI tabs pass no `protection` rows and never latch, so they still show
+  /// nothing.
+  let showTaintBadge = $derived(!!taint || reduced.length > 0 || protection.length > 0);
 
   /// The badge's color for the two TAINT states, from the same settings (and
   /// the same resolver) as the pane frame — the badge and the frame around
@@ -334,6 +375,9 @@
       <span
         class="taint"
         class:taint-contaminated={taint?.contaminated}
+        class:taint-protected={!taint && tint === 'protected'}
+        class:taint-partial={!taint && tint === 'partial'}
+        class:taint-off={!taint && tint === 'off'}
         class:taint-reduced={!taint && reduced.length > 0}
         class:taint-unverified={!taint && reduced.length > 0 && reduced.every((f) => f.unknown)}
         style:color={badgeColor ?? undefined}
@@ -502,9 +546,25 @@
   .taint-contaminated {
     color: var(--danger);
   }
-  /* V32 Phase G: a CLEAN tab whose protections are switched off. Muted rather
-     than warning-coloured — nothing has happened to this session; a control the
-     user turned off is a configuration fact, not an event. */
+  /* V39: the three PROTECTION tints, for a clean (untainted) tab. Taint colours
+     keep precedence — they are set inline from `taintColor` and describe an
+     event, where these describe a configuration. */
+  .taint-protected {
+    color: var(--success);
+  }
+  .taint-partial {
+    color: var(--awaiting);
+  }
+  /* Muted, deliberately: a new tab ships in this state and the user chose it.
+     Nothing has happened to the session, so it must not wear an event colour —
+     the badge is here to be reachable, not to nag. */
+  .taint-off {
+    color: var(--text-tertiary);
+  }
+  /* V32 Phase G: a CLEAN tab that LOST a control it was inheriting (an app-wide
+     flip, the master, or a rules directory that stopped matching). Later in the
+     cascade than the three tints above, so it wins over them — that is a thing
+     that happened, not a posture the tab shipped with. */
   .taint-reduced {
     color: var(--text-tertiary);
   }

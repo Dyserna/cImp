@@ -336,6 +336,11 @@ const MIGRATION_STEPS: &[MigrationStep] = &[
         detect: looks_v33,
         transform: migrate_v33_to_v34_step,
     },
+    MigrationStep {
+        from_version: "v34",
+        detect: looks_v34,
+        transform: migrate_v34_to_v35_step,
+    },
 ];
 
 // --- Uniform-signature wrappers -------------------------------------------
@@ -2774,10 +2779,118 @@ fn migrate_v33_to_v34(value: &mut Value) {
         }
     }
 
-    // Final cascade step ⇒ stamp CURRENT (34).
+    // Stamps a *literal* 34 (not `CURRENT_SCHEMA_VERSION`): the v34 → v35 step
+    // runs next in the same cascade pass and gates on `schema_version == 34`.
     root.insert(
         "schema_version".to_string(),
         Value::Number(serde_json::Number::from(34u8)),
+    );
+}
+
+fn looks_v34(value: &Value) -> bool {
+    value
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .is_some_and(|v| v == 34)
+}
+
+fn migrate_v34_to_v35_step(value: &mut Value, _shell: &ShellSpec) {
+    migrate_v34_to_v35(value)
+}
+
+/// Every per-tab injection-override cell, by its wire key.
+///
+/// The list mirrors `injection::TabInjectionOverrides`'s fields — i.e. exactly
+/// `Feature::has_tab_scope`. A *frozen* copy on purpose: a migration step is a
+/// statement about a file format at one moment, and rebuilding it from the live
+/// feature table would make this step migrate a different set the day a control
+/// is added, silently changing what a v34 file becomes. Adding a control later
+/// needs its own step, or none at all — an absent cell still reads `inherit`.
+const TAB_INJECTION_CELLS_V35: &[&str] = &[
+    "taint_latch",
+    "spotlighting",
+    "detection",
+    "ssrf_guard",
+    "fetch_budgets",
+    "memory_quarantine",
+    "native_web",
+    "consumer_hygiene",
+    "tool_steering",
+    "opencode_native_gate",
+];
+
+/// V34 → V35: **freeze every existing AI tab's injection posture in place**
+/// before the per-tab default changes underneath it.
+///
+/// # What changed above this step
+///
+/// V39's posture decision moves the per-tab injection row from "inherit
+/// everything" to "everything explicitly `Off`" for a **newly created** tab
+/// (`injection::TabInjectionOverrides::all_off`), because the master and every
+/// app-wide sub-protection now ship on and the per-tab row is the switch the
+/// user actually reaches for (from the tab's shield badge).
+///
+/// # Why a file already on disk cannot be left alone
+///
+/// A cell absent from a settings file deserializes through `#[serde(default)]`
+/// to `Override::Inherit`, and `Override::default()` deliberately stays
+/// `Inherit`. So an untouched v34 file would keep resolving at L2 — correct
+/// today. But "absent means inherit" is then the *only* thing standing between
+/// an upgraded install and a silent posture change, and it is a property of two
+/// defaults that a future edit could move without noticing this file. Writing
+/// the word makes the file say what it means: **no silent posture change on
+/// upgrade**, stated in the data rather than implied by a serde attribute.
+///
+/// # Exactly what it writes
+///
+/// For every `kind: "ai_tool"` tab: create `injection_overrides` if missing, and
+/// insert `"inherit"` for each cell of [`TAB_INJECTION_CELLS_V35`] **that is not
+/// already present**. A stored `"on"`, `"off"` — or even a hand-edited junk
+/// value, which the resolver reads post-hoc as `inherit` (#48, G-1) — is left
+/// byte-for-byte untouched: the user's own writes are not this step's business,
+/// and rewriting a junk cell to `"inherit"` would erase the evidence of a typo
+/// the user may want to find.
+///
+/// Non-AI tabs are untouched: they have no such field, and inventing one would
+/// make a shell tab carry a row nothing reads.
+///
+/// Idempotent twice over: a second pass finds `schema_version == 35` so
+/// [`looks_v34`] is false, and even run directly the cell-level insert is
+/// `or_insert`-shaped, so nothing already written moves.
+fn migrate_v34_to_v35(value: &mut Value) {
+    let Some(root) = value.as_object_mut() else {
+        return;
+    };
+    if let Some(tabs) = root.get_mut("tabs").and_then(Value::as_array_mut) {
+        for tab in tabs.iter_mut() {
+            let Some(obj) = tab.as_object_mut() else {
+                continue;
+            };
+            if obj.get("kind").and_then(Value::as_str) != Some("ai_tool") {
+                continue;
+            }
+            let cells = obj
+                .entry("injection_overrides".to_string())
+                .or_insert_with(|| Value::Object(serde_json::Map::new()));
+            // A hand-edited non-object here (`"injection_overrides": null`) is
+            // left alone rather than replaced: the typed load already reads any
+            // non-object shape as an all-`Inherit` row, and replacing it would
+            // be this step editing a value the user wrote.
+            let Some(cells) = cells.as_object_mut() else {
+                continue;
+            };
+            for key in TAB_INJECTION_CELLS_V35 {
+                cells
+                    .entry((*key).to_string())
+                    .or_insert_with(|| Value::String("inherit".to_string()));
+            }
+        }
+    }
+
+    // Final cascade step ⇒ stamp CURRENT (35).
+    root.insert(
+        "schema_version".to_string(),
+        Value::Number(serde_json::Number::from(35u8)),
     );
 }
 
@@ -4080,6 +4193,125 @@ mod tests {
         assert_eq!(slot["tools"]["gitleaks"]["enabled"], json!(false));
     }
 
+    /// **The v34 → v35 step: no silent posture change on upgrade.**
+    ///
+    /// V39 flips the per-tab injection default from "inherit everything" to
+    /// "everything explicitly off" for a NEWLY CREATED tab. A file already on
+    /// disk must keep the behaviour it had, so the step writes the word
+    /// `inherit` into every cell that is absent and touches nothing else.
+    ///
+    /// Three properties, all of them the point of the step:
+    /// absent ⇒ `inherit`; stored values untouched; idempotent.
+    #[test]
+    fn v34_to_v35_writes_inherit_into_absent_tab_cells_only() {
+        let mut v = json!({
+            "schema_version": 34,
+            "tabs": [
+                // An AI tab with no row at all — the common upgraded shape.
+                { "kind": "ai_tool", "id": "claude", "command": "claude" },
+                // An AI tab the user configured: one `on`, one `off`, one junk
+                // value (which the resolver reads post-hoc as `inherit`, #48
+                // G-1) — none of the three may move.
+                { "kind": "ai_tool", "id": "opencode", "command": "opencode",
+                  "injection_overrides": {
+                      "taint_latch": "on",
+                      "consumer_hygiene": "off",
+                      "detection": true,
+                  } },
+                // Not an AI tab: it has no such field and must not gain one.
+                { "kind": "shell", "id": "shell-1" },
+            ],
+        });
+        migrate_v34_to_v35(&mut v);
+        assert_eq!(v["schema_version"], json!(35));
+
+        let claude = &v["tabs"][0]["injection_overrides"];
+        for key in TAB_INJECTION_CELLS_V35 {
+            assert_eq!(claude[*key], json!("inherit"), "{key} on the bare tab");
+        }
+        assert_eq!(
+            claude.as_object().map(serde_json::Map::len),
+            Some(TAB_INJECTION_CELLS_V35.len()),
+            "the step writes the cells it declares and nothing else"
+        );
+
+        let opencode = &v["tabs"][1]["injection_overrides"];
+        assert_eq!(opencode["taint_latch"], json!("on"), "a stored `on` stays");
+        assert_eq!(opencode["consumer_hygiene"], json!("off"), "a stored `off` stays");
+        assert_eq!(
+            opencode["detection"],
+            json!(true),
+            "even a hand-edited junk cell stays — rewriting it would erase the evidence"
+        );
+        assert_eq!(opencode["spotlighting"], json!("inherit"), "the absent ones fill");
+
+        assert!(
+            v["tabs"][2].get("injection_overrides").is_none(),
+            "a shell tab has no injection row"
+        );
+
+        // Idempotent run directly, not just via the version gate.
+        let once = v.clone();
+        migrate_v34_to_v35(&mut v);
+        assert_eq!(v, once);
+    }
+
+    /// The behavioural half of the step, through the TYPED shape: a migrated
+    /// legacy tab still resolves at L2, while a tab the app creates today does
+    /// not. This is the property the JSON assertions above are a proxy for, and
+    /// it is the one the locked decision is actually about.
+    #[test]
+    fn a_migrated_tab_keeps_inheriting_while_a_new_tab_ships_off() {
+        let mut v = json!({
+            "schema_version": 34,
+            "tabs": [{ "kind": "ai_tool", "id": "claude", "command": "claude",
+                       "name": "Claude" }],
+        });
+        migrate_v34_to_v35(&mut v);
+        let migrated: crate::settings::Settings =
+            serde_json::from_value(v).expect("the migrated shape deserializes");
+        assert!(
+            crate::settings::injection::effective(
+                crate::settings::injection::Feature::TaintLatch,
+                crate::settings::injection::Scope::tab_only("claude"),
+                &migrated,
+            ),
+            "an upgraded tab keeps resolving at L2 — the whole point of the step"
+        );
+        assert!(!crate::settings::injection::protection_reduced(&migrated));
+
+        // The tab the app creates today is the other half of the decision.
+        let fresh = crate::settings::Settings {
+            tabs: vec![crate::settings::schema::default_claude_tab()],
+            ..Default::default()
+        };
+        assert!(!crate::settings::injection::effective(
+            crate::settings::injection::Feature::TaintLatch,
+            crate::settings::injection::Scope::tab_only("claude"),
+            &fresh,
+        ));
+    }
+
+    /// A file that entered the cascade far below still lands on 35 with its AI
+    /// tabs filled — the step has to work as a CASCADE member, not only when
+    /// called directly.
+    #[test]
+    fn the_cascade_fills_tab_cells_on_the_way_to_35() {
+        let shell = fake_default_shell();
+        let mut v = json!({
+            "schema_version": 33,
+            "tabs": [{ "kind": "ai_tool", "id": "claude", "command": "claude" }],
+            "offload": {},
+        });
+        for step in MIGRATION_STEPS {
+            if (step.detect)(&v) {
+                (step.transform)(&mut v, &shell);
+            }
+        }
+        assert_eq!(v["schema_version"], json!(35));
+        assert_eq!(v["tabs"][0]["injection_overrides"]["taint_latch"], json!("inherit"));
+    }
+
     /// **The V37/V38 linearization caveat, pinned** (develop merge, 2026-08-19).
     ///
     /// Both milestones took `v31 → v32` while unreleased: V37 landed the MCP
@@ -4093,7 +4325,7 @@ mod tests {
     /// No content-aware detector was built for it because none is needed, and
     /// this is the test that says why: the additive step only stamps, and the
     /// move step only moves `code_audit.tools` IF IT IS THERE. So both pre-merge
-    /// shapes fall through the renumbered cascade onto the same v34 result —
+    /// shapes fall through the renumbered cascade onto the same result —
     /// the one still carrying the array gets it moved, the one that already
     /// moved it keeps the container it built. A file stamped 33 by the old build
     /// never runs V37's v31 → v32 step, which costs nothing: that step writes no
@@ -4119,7 +4351,7 @@ mod tests {
             "tool_plugins": { "plugins": {}, "project_paths": {}, "global_paths": {} },
             "code_audit": { "tools": [{ "id": "semgrep", "enabled": false }] },
         }));
-        assert_eq!(a["schema_version"], json!(34));
+        assert_eq!(a["schema_version"], json!(35));
         assert!(a["code_audit"].get("tools").is_none(), "the array still moves");
         assert_eq!(
             a["tool_plugins"]["plugins"]["cimp-audit@1"]["tools"]["semgrep"]["enabled"],
@@ -4140,7 +4372,7 @@ mod tests {
             },
             "code_audit": { "enabled": true },
         }));
-        assert_eq!(b["schema_version"], json!(34));
+        assert_eq!(b["schema_version"], json!(35));
         assert_eq!(
             b["tool_plugins"]["plugins"]["cimp-audit@1"]["tools"]["semgrep"]["parameters"],
             json!(["--foo"])

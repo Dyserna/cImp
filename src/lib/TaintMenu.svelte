@@ -48,19 +48,47 @@
   // Positioning / dismissal mirror TabContextMenu: fixed at the click coords,
   // clamped into the viewport, dismissed by Escape or a mousedown outside.
   //
-  // V32 Phase G adds a fourth thing, above the actions: which injection
-  // controls are switched OFF for this tab, and which of the three levels
-  // decided each. That is the "why is this tab not latching?" question locked
-  // decision 16 requires answerable without reading code — and the badge is
-  // where a user looks first, long before Settings.
+  // V32 Phase G added a fourth thing above the actions: which injection
+  // controls were switched OFF for this tab, and which of the three levels
+  // decided each. That was the "why is this tab not latching?" question locked
+  // decision 16 requires answerable without reading code.
+  //
+  // **V39 turns that read-only list into the CONTROL.** The app-wide levels ship
+  // fully on and a newly created tab ships every tab-scoped cell `off`, so the
+  // per-tab row is where protection is actually engaged — and this popover, one
+  // click from the tab's own shield, is where it is engaged from. Settings keeps
+  // the full matrix (every scope at once, the app-wide levels, the numerics);
+  // this is the per-tab half, reachable without leaving the window you are
+  // working in.
+  //
+  // Three rules the list follows, each of them a cross-module invariant rather
+  // than a styling choice:
+  //
+  //   * every row is the BACKEND's resolved row (`injection_status`). The
+  //     effective word, the label, `spawn_baked` and `master_gated` all come
+  //     from there; nothing here re-resolves the hierarchy, or the popover and
+  //     the Settings matrix could disagree about the same tab.
+  //   * a toggle writes `'on'` or `'off'` — never `'inherit'`. This surface has
+  //     two states to offer and a tri-state control it cannot explain in a
+  //     popover; leaving `inherit` writable here would let a click land on a
+  //     value whose meaning depends on a level this window does not show.
+  //   * one click ⇒ one `applySettings` with the whole Settings object, and
+  //     "Enable all" / "Disable all" are ONE write each, not N. There is
+  //     deliberately no `set_injection_override` IPC (`ipc/commands.rs`): a
+  //     side-channel write would race the full-object save.
   import { onMount } from 'svelte';
   import {
     applyLatchOverride,
+    applyTabInjectionOverrides,
+    effectiveWord,
     featureStateWord,
+    protectionSummary,
+    setAllOverrides,
     type FeatureState,
     type LatchAction,
     type LatchRow,
   } from './latch';
+  import { openSettingsWindowToSection, requestTabRestart } from './settings/ipc';
   import { latchAlsoHoldsMemory } from './timeline';
 
   let {
@@ -68,6 +96,8 @@
     y,
     row,
     reduced = [],
+    protection = [],
+    masterOn = true,
     onDismiss,
     onApplied,
   }: {
@@ -78,10 +108,18 @@
     /// publishes it as `can_flip_local` / `can_unlatch`; re-deriving it here
     /// from the label would put the state machine in two places).
     row: LatchRow;
-    /// V32 Phase G: this tab's injection controls that resolve OFF, each
-    /// carrying the level that decided it. Empty on a fully protected tab, in
-    /// which case the section renders nothing at all.
+    /// This tab's reduced-protection rows — since V39 that means rows off for a
+    /// reason OTHER than this tab's own cell (an app-wide flip, the master, or
+    /// the synthetic signature-health row, which is a fact about the rules
+    /// directory rather than a switch). The toggle list below covers the cells.
     reduced?: FeatureState[];
+    /// V39: this tab's tab-scoped SWITCHES, resolved by the backend, in
+    /// `Feature::ALL` order (`tabProtectionRows`). One toggle each.
+    protection?: FeatureState[];
+    /// The L1 master's value. Master-gated toggles are disabled while it is off
+    /// — writing a cell the master overrides would be a control that does
+    /// nothing — and the one control the master does not reach stays live.
+    masterOn?: boolean;
     onDismiss: () => void;
     /// Fired after a successful override so the caller can refresh its
     /// snapshot without waiting for the next poll tick.
@@ -95,6 +133,20 @@
   let confirmingClear = $state(false);
   let busy = $state(false);
   let error = $state<string | null>(null);
+
+  /// V39: spawn-baked cells this popover has moved.
+  ///
+  /// A spawn-baked control is written into a tab at LAUNCH, so flipping one here
+  /// does not reach the running tab — it needs a restart, and a surface that
+  /// lets you flip it without saying so is a switch that appears to do nothing.
+  ///
+  /// Tracked per popover session rather than read from a backend signal, and
+  /// deliberately: the backend's `ai-tab-restart-hint` is emitted per CONSUMER
+  /// ("claude" / "opencode"), which cannot name which tab the user is standing
+  /// on, and `App.svelte` already renders it as a toast for the app-wide case.
+  /// What this set knows is narrower and exactly right for this button — cells
+  /// *this tab* just had moved, by *this* popover.
+  let restartOwed = $state<Set<string>>(new Set());
 
   // svelte-ignore state_referenced_locally
   let posX = $state(x);
@@ -144,6 +196,71 @@
       default:
         return 'switched off app-wide';
     }
+  }
+
+  /// Whether a row's toggle is writable right now.
+  ///
+  /// The master short-circuits every control it is ABOUT (`master_gated`), so a
+  /// cell written under it would resolve off anyway — the click would look like
+  /// it failed. The one control it does not reach (V38's managed-tool steering,
+  /// a token-efficiency nudge rather than a containment control) stays live,
+  /// which is the whole reason the backend publishes `master_gated` per row.
+  function rowEnabled(f: FeatureState): boolean {
+    return !busy && (masterOn || !f.master_gated);
+  }
+
+  /// Write one cell. `'on'` / `'off'` explicitly — never `'inherit'`.
+  async function setOne(f: FeatureState, on: boolean): Promise<void> {
+    if (busy) return;
+    busy = true;
+    error = null;
+    try {
+      await applyTabInjectionOverrides(row.tab, { [f.feature]: on ? 'on' : 'off' });
+      if (f.spawn_baked) restartOwed = new Set(restartOwed).add(f.feature);
+      onApplied?.();
+    } catch (e) {
+      error = typeof e === 'string' ? e : ((e as { message?: string })?.message ?? String(e));
+    }
+    busy = false;
+  }
+
+  /// Every writable cell at once, as ONE settings write.
+  ///
+  /// Rows the master has closed are skipped rather than written: the write would
+  /// be honest (the cell would say `on`) and the result would not (it resolves
+  /// off), and a bulk action that leaves the user with controls reading `on`
+  /// while nothing is enforced is the worst shape this surface can take.
+  async function setAll(on: boolean): Promise<void> {
+    if (busy) return;
+    const rows = protection.filter(rowEnabled);
+    if (rows.length === 0) return;
+    busy = true;
+    error = null;
+    try {
+      await applyTabInjectionOverrides(row.tab, setAllOverrides(rows, on ? 'on' : 'off'));
+      const next = new Set(restartOwed);
+      for (const f of rows) if (f.spawn_baked) next.add(f.feature);
+      restartOwed = next;
+      onApplied?.();
+    } catch (e) {
+      error = typeof e === 'string' ? e : ((e as { message?: string })?.message ?? String(e));
+    }
+    busy = false;
+  }
+
+  async function restart(): Promise<void> {
+    if (busy) return;
+    busy = true;
+    error = null;
+    try {
+      await requestTabRestart(row.tab);
+      restartOwed = new Set();
+      onDismiss();
+      return;
+    } catch (e) {
+      error = typeof e === 'string' ? e : ((e as { message?: string })?.message ?? String(e));
+    }
+    busy = false;
   }
 
   async function run(action: LatchAction): Promise<void> {
@@ -216,9 +333,69 @@
     {/if}
   {/if}
 
+  {#if protection.length > 0}
+    <div class="separator"></div>
+    <div class="head">Injection protection — {protectionSummary(protection)}</div>
+    {#if !masterOn}
+      <!-- Decision 9: the master is off, so every control it reaches resolves
+           off whatever these cells say. The toggles are disabled rather than
+           hidden, because a hidden switch reads as "no such control" and the
+           user's next move is to look for it. -->
+      <div class="state warn">
+        The global master switch is off, so these controls are inert for this
+        tab. Turn it back on with the ⛨ chip in the status bar, or in
+        <button type="button" class="link" onclick={() => void openSettingsWindowToSection('injection')}>
+          Settings → Injection protection</button
+        >.
+      </div>
+    {/if}
+    <div class="row">
+      <button type="button" class="entry" disabled={busy} onclick={() => void setAll(true)}>
+        Enable all
+      </button>
+      <button type="button" class="entry" disabled={busy} onclick={() => void setAll(false)}>
+        Disable all
+      </button>
+    </div>
+    <ul class="toggles">
+      {#each protection as f (f.feature)}
+        <li>
+          <label class:disabled={!rowEnabled(f)}>
+            <input
+              type="checkbox"
+              checked={f.effective}
+              disabled={!rowEnabled(f)}
+              onchange={(e) => void setOne(f, (e.currentTarget as HTMLInputElement).checked)}
+            />
+            <span class="name">{f.label}</span>
+            <span class="why">{effectiveWord(f)}</span>
+          </label>
+          {#if f.spawn_baked}
+            <!-- Written into the tab at launch, so a running tab keeps whatever
+                 it started with until it is restarted. Marked on the row rather
+                 than only in the button below, because the user needs it BEFORE
+                 the click, not after. -->
+            <span class="baked" title="Applied when the tab starts — restart the tab for a change here to take effect."
+              >restart to apply</span
+            >
+          {/if}
+        </li>
+      {/each}
+    </ul>
+    {#if restartOwed.size > 0}
+      <div class="state warn">
+        {restartOwed.size === 1 ? 'One control you just changed is' : 'Controls you just changed are'}
+        applied when this tab starts. Restart it for the change to take effect.
+      </div>
+      <button type="button" class="entry" disabled={busy} onclick={() => void restart()}>
+        Restart tab
+      </button>
+    {/if}
+  {/if}
+
   {#if reduced.length > 0}
     <div class="separator"></div>
-    <div class="state warn">Injection protection is reduced for this tab:</div>
+    <div class="state warn">Protection is reduced for this tab beyond its own settings:</div>
     <ul class="reduced">
       {#each reduced as f (f.feature)}
         <!-- "off" for a switch, "unknown" for a state cImp could not read
@@ -227,7 +404,12 @@
              smaller lie than rendering it as protected, but it is still a lie:
              it points the user at a switch to flip. The word comes from
              `featureStateWord` and the sentence from the row's own `reason`, so
-             this list cannot describe a row differently from the tab tooltip. -->
+             this list cannot describe a row differently from the tab tooltip.
+
+             Since V39 this list is NOT the tab's own cells — those are the
+             toggles above. What reaches here is what this tab lost from
+             somewhere else: an app-wide flip, the master, or the signature
+             layer's rules directory. -->
         <li class:unknown={f.unknown}>
           {f.label} — {featureStateWord(f)}
           <span class="why">({whyOff(f)})</span>
@@ -398,6 +580,57 @@
   }
   .why {
     color: var(--text-tertiary);
+  }
+  /* V39: the per-tab toggle list. Dense, because it is ten rows in a popover
+     and the user is scanning for one of them. */
+  .toggles {
+    margin: 0;
+    padding: 0 var(--space-3) 6px;
+    list-style: none;
+    font-size: var(--font-size-sm);
+    color: var(--text-secondary);
+  }
+  .toggles li {
+    display: flex;
+    align-items: center;
+    gap: var(--space-1);
+    justify-content: space-between;
+  }
+  .toggles label {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex: 1 1 auto;
+    min-width: 0;
+    cursor: pointer;
+    padding: 2px 0;
+  }
+  .toggles label.disabled {
+    cursor: default;
+    color: var(--text-disabled);
+  }
+  .toggles .name {
+    flex: 1 1 auto;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  /* The restart marker is a caveat, not an alarm: the control IS set, it just
+     reaches the tab on its next launch. */
+  .baked {
+    color: var(--text-tertiary);
+    font-size: var(--font-size-sm);
+    white-space: nowrap;
+  }
+  .link {
+    appearance: none;
+    border: none;
+    background: transparent;
+    padding: 0;
+    font: inherit;
+    color: var(--accent);
+    cursor: pointer;
+    text-decoration: underline;
   }
   .state code {
     font-family: var(--font-mono, monospace);

@@ -307,10 +307,16 @@ export interface AiToolTabConfig {
   /// synthesized values.
   use_local_provider: boolean;
   /// V32 Phase G (locked decision 16): this tab's **L3** row — a tri-state per
-  /// injection-protection feature, defaulting to `'inherit'` so an untouched
-  /// tab behaves exactly as before. Only the features that HAVE a tab scope
-  /// have a cell; the worker-only canary and the app-wide terminal-escape
-  /// hygiene are structurally absent.
+  /// injection-protection feature. Only the features that HAVE a tab scope have
+  /// a cell; the worker-only canary and the app-wide terminal-escape hygiene are
+  /// structurally absent.
+  ///
+  /// **V39: a newly created tab ships every cell `'off'`**
+  /// ([`allOffInjectionOverrides`]) — the app-wide levels are all on, and this
+  /// row is where protection is actually engaged, from the tab's shield badge.
+  /// A cell *absent from a settings file* still reads `'inherit'`, which is a
+  /// different question and deliberately unchanged: the 34 → 35 schema step
+  /// writes the word into every pre-V39 tab so an upgrade changes no posture.
   injection_overrides: TabInjectionOverrides;
 }
 
@@ -334,9 +340,45 @@ export interface TabInjectionOverrides {
   /// The managed-tool steering paragraph — injected beside the hygiene one, so
   /// it carries the same per-tab row.
   tool_steering: InjectionOverride;
-  /// V32 Phase H: the OpenCode native-tool gate. `'on'` here is the per-tab way
-  /// to enable it over its app-wide default `off`.
+  /// V32 Phase H: the OpenCode native-tool gate. Its app-wide default was
+  /// `off` until V39; the opt-in now lives in this row like every other cell.
   opencode_native_gate: InjectionOverride;
+}
+
+/// Every per-tab override cell, in the order the backend's `Feature::ALL`
+/// publishes them — which is the order the badge popover and the Settings matrix
+/// render.
+///
+/// `satisfies readonly (keyof TabInjectionOverrides)[]` and used by
+/// [`allOffInjectionOverrides`] below, so a cell added to the interface without
+/// being added here is a compile error at the constructor rather than a control
+/// that silently ships missing from a new tab.
+export const TAB_INJECTION_FEATURES = [
+  'taint_latch',
+  'spotlighting',
+  'detection',
+  'ssrf_guard',
+  'fetch_budgets',
+  'memory_quarantine',
+  'native_web',
+  'consumer_hygiene',
+  'tool_steering',
+  'opencode_native_gate',
+] as const satisfies readonly (keyof TabInjectionOverrides)[];
+
+/// V39: the row a NEWLY CREATED AI tab carries — every cell explicitly `'off'`.
+///
+/// Mirror of Rust `TabInjectionOverrides::all_off`. The app-wide levels (L1 and
+/// every L2) ship on; this row is where protection is actually engaged, per tab,
+/// from the tab's shield badge.
+///
+/// **Not the same thing as an absent row.** A cell missing from a settings file
+/// still reads `'inherit'` on both sides — that is what keeps an upgraded
+/// install's posture unchanged (schema step 34 → 35 writes the word explicitly).
+export function allOffInjectionOverrides(): TabInjectionOverrides {
+  return Object.fromEntries(
+    TAB_INJECTION_FEATURES.map((f) => [f, 'off' as InjectionOverride]),
+  ) as unknown as TabInjectionOverrides;
 }
 
 /// V32 Phase G: the `offload-worker` pseudo-scope's override row (mirror of
@@ -2140,19 +2182,9 @@ export function defaultSettings(): Settings {
         theme_override: null,
         background_override: null,
         use_local_provider: false,
-        // V32 Phase G: an untouched tab inherits every injection control.
-        injection_overrides: {
-          taint_latch: "inherit",
-          spotlighting: "inherit",
-          detection: "inherit",
-          ssrf_guard: "inherit",
-          fetch_budgets: "inherit",
-          memory_quarantine: "inherit",
-          native_web: "inherit",
-          consumer_hygiene: "inherit",
-          tool_steering: "inherit",
-          opencode_native_gate: "inherit",
-        },
+        // V39: a new tab ships every tab-scoped injection control OFF —
+        // mirror of Rust `schema::default_claude_tab`.
+        injection_overrides: allOffInjectionOverrides(),
       },
       {
         kind: 'ai_tool',
@@ -2180,19 +2212,9 @@ export function defaultSettings(): Settings {
         theme_override: null,
         background_override: null,
         use_local_provider: true,
-        // V32 Phase G: an untouched tab inherits every injection control.
-        injection_overrides: {
-          taint_latch: "inherit",
-          spotlighting: "inherit",
-          detection: "inherit",
-          ssrf_guard: "inherit",
-          fetch_budgets: "inherit",
-          memory_quarantine: "inherit",
-          native_web: "inherit",
-          consumer_hygiene: "inherit",
-          tool_steering: "inherit",
-          opencode_native_gate: "inherit",
-        },
+        // V39: a new tab ships every tab-scoped injection control OFF —
+        // mirror of Rust `schema::default_claude_tab`.
+        injection_overrides: allOffInjectionOverrides(),
       },
     ],
     processing: { stability_timeout_ms: 200, max_hold_ms: 500 },

@@ -18,14 +18,33 @@
 //!   is a token-efficiency preference rather than a security posture and has
 //!   its own L2/L3 switches instead (see that predicate for the why).
 //! - **L2 — per feature, app-wide.** One `<feature>_enabled` flag per
-//!   [`Feature`] (default `true`), with two deliberate exceptions:
-//!   [`Feature::NativeWeb`], whose L2 is a tri-mode rather than a boolean (see
-//!   *Native-web reconciliation* below), and [`Feature::OpencodeNativeGate`],
-//!   whose default is **`false`** (V32 Phase H, locked decision 17 — see
-//!   [`Feature::default_enabled`], and note what that means for
-//!   [`protection_reduced`]).
+//!   [`Feature`], **all defaulting `true`** since the V39 posture decision
+//!   ("master on, every sub-protection on"). One deliberate shape exception
+//!   remains: [`Feature::NativeWeb`], whose L2 is a tri-mode rather than a
+//!   boolean (see *Native-web reconciliation* below).
 //! - **L3 — per scope.** A tri-state [`Override`] (`Inherit` | `On` | `Off`,
 //!   default `Inherit`) stored per scope, per feature.
+//!
+//! # Where the posture actually lives now (V39)
+//!
+//! L1 and L2 ship fully on, and **a newly created AI tab's L3 row ships all
+//! `Off`** ([`TabInjectionOverrides::all_off`]). The per-tab row is therefore
+//! the switch the user actually reaches for, from the tab's shield badge, and
+//! the app-wide levels are the ceiling above it rather than the thing that has
+//! to be edited per install.
+//!
+//! Two consequences are load-bearing and stated where they are enforced:
+//!
+//! - **`Override::default()` is still `Inherit`.** The all-off row is a
+//!   *tab-creation* default, not a serde default: a cell absent from a settings
+//!   file must keep resolving to L2, or an upgrade would silently change the
+//!   posture of every existing tab. Schema step 34 → 35 writes an explicit
+//!   `inherit` into every absent cell of every existing AI tab for exactly that
+//!   reason, so the new all-off default applies only to tabs created afterwards.
+//! - **A tab cell that is `Off` is the tab BASELINE, not reduced protection.**
+//!   [`protection_reduced`] therefore ignores a tab row that is off *because of
+//!   the tab's own cell* — see that function for the exact predicate and for why
+//!   it does not ignore the whole tab scope.
 //!
 //! # The locked resolution rule
 //!
@@ -221,11 +240,18 @@ pub enum Feature {
     /// `tool.execute.before` handler *denying* the harness's own native tools
     /// against the tab's taint latch, rather than only beaconing on them.
     ///
-    /// **The one feature whose L2 default is `false`** — see
-    /// [`Feature::default_enabled`]. Spawn-baked (the flag is compiled into the
-    /// generated plugin) and tab-scoped only: it is delivered by an OpenCode
-    /// plugin, so the offload worker has no row for it and neither does any
-    /// non-OpenCode consumer.
+    /// **Its L2 default was `false` until V39** — decision 17's reasoning was
+    /// that whole-surface denial of `bash`/`read`/`edit` materially changes
+    /// everyday tab UX and is an opt-in posture. That reasoning is kept as
+    /// history on [`Feature::default_enabled`]; the V39 posture decision
+    /// ("master on and every sub-protection on") supersedes the *default*, and
+    /// the opt-in now lives one level down — a new tab's L3 row ships all `Off`
+    /// ([`TabInjectionOverrides::all_off`]), so nothing is denied until the user
+    /// enables it from the tab's shield badge.
+    ///
+    /// Spawn-baked (the flag is compiled into the generated plugin) and
+    /// tab-scoped only: it is delivered by an OpenCode plugin, so the offload
+    /// worker has no row for it and neither does any non-OpenCode consumer.
     OpencodeNativeGate,
     /// Stripping terminal control sequences out of external text cImp composes
     /// into non-HTML sinks. App-wide: TTS and toasts are global surfaces.
@@ -274,26 +300,36 @@ impl Feature {
     /// This feature's **L2 default** — the value an untouched settings file
     /// resolves it to.
     ///
+    /// **Every control ships on** since the V39 posture decision: the master is
+    /// on and so is every sub-protection, and the per-install tailoring happens
+    /// one level down, where a newly created AI tab's L3 row ships all `Off`
+    /// ([`TabInjectionOverrides::all_off`]).
+    ///
+    /// # Why the predicate still exists (the Phase H history)
+    ///
     /// Every V32 control before Phase H defaulted `true`, and one predicate read
     /// that as a law: "any feature resolving off means protection is REDUCED"
     /// ([`protection_reduced`], and its frontend twin `reducedFeaturesFor`).
-    /// [`Feature::OpencodeNativeGate`] breaks it — locked decision 17 ships it
+    /// [`Feature::OpencodeNativeGate`] broke it — locked decision 17 shipped it
     /// **default off**, because whole-surface denial of `bash`/`read`/`edit`
     /// materially changes everyday tab UX and is an opt-in posture, not a
-    /// baseline. Without this predicate a fresh install would raise the
+    /// baseline. Without this predicate a fresh install would have raised the
     /// reduced-protection chip on every tab out of the box, which is how an
     /// indicator stops being read.
     ///
-    /// So "reduced" is measured against the DEFAULT, not against `true`: a
-    /// default-off control that is off is the baseline, and one switched on is
-    /// *more* protection, never less.
+    /// V39 keeps that *rationale* and moves the *mechanism*: the gate is opt-in
+    /// per tab now, not app-wide, so its L2 joins the others at `true` while the
+    /// rule this predicate encodes is unchanged. "Reduced" is still measured
+    /// against the DEFAULT, not against `true` — a default-off control that is
+    /// off is a baseline and one switched on is *more* protection — and the
+    /// moment a future control ships off, that reading is already in place
+    /// rather than something to rediscover.
     ///
     /// An exhaustive `match` rather than a `matches!` (#47): a new control's
     /// shipping default is a decision, and falling through to `true` would let
     /// it be taken by omission.
     pub fn default_enabled(self) -> bool {
         match self {
-            Feature::OpencodeNativeGate => false,
             Feature::TaintLatch
             | Feature::Spotlighting
             | Feature::Detection
@@ -304,6 +340,7 @@ impl Feature {
             | Feature::NativeWeb
             | Feature::ConsumerHygiene
             | Feature::ToolSteering
+            | Feature::OpencodeNativeGate
             | Feature::TerminalEscapeHygiene => true,
         }
     }
@@ -690,8 +727,17 @@ impl From<Override> for String {
 /// Only the features that have a tab scope have a field, so a per-tab canary
 /// override is not a thing a settings file can express — the illegal state is
 /// unrepresentable rather than merely untested. Additive `#[serde(default)]`:
-/// an untouched config deserializes to all-`Inherit`, i.e. exactly today's
-/// behaviour.
+/// an untouched config deserializes to all-`Inherit`, i.e. exactly the
+/// pre-Phase-G behaviour.
+///
+/// **`Default` is NOT the tab-creation default (V39).** A tab created today
+/// gets [`TabInjectionOverrides::all_off`]; a cell *absent from a file* still
+/// reads `Inherit`. The two must stay different, because they answer different
+/// questions: "what does a new tab want?" and "what did a user who never wrote
+/// this cell mean?". Collapsing them — by moving the serde default, or by
+/// changing [`Override::default`] — would silently switch every existing tab's
+/// posture on upgrade, which is precisely what the 34 → 35 schema step exists to
+/// prevent.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TabInjectionOverrides {
@@ -713,6 +759,36 @@ pub struct TabInjectionOverrides {
 }
 
 impl TabInjectionOverrides {
+    /// **The row a newly created AI tab gets** (V39): every tab-scoped cell
+    /// explicitly `Off`.
+    ///
+    /// The user decision behind it: L1 and every L2 ship on, and the per-tab row
+    /// is where protection is actually turned on, from the tab's shield badge —
+    /// so a new tab starts with nothing engaged and the user opts in per control
+    /// per tab, without opening Settings at all.
+    ///
+    /// Written out cell by cell rather than looped over [`Feature::ALL`]: the
+    /// struct's fields are what a settings file carries, and a constructor that
+    /// enumerates them fails to compile when a tab-scoped feature is added —
+    /// which is the moment someone has to decide whether the new control joins
+    /// the all-off baseline.
+    ///
+    /// Deliberately **not** `Default` — see the type docs.
+    pub(in crate::settings) fn all_off() -> Self {
+        Self {
+            taint_latch: Override::Off,
+            spotlighting: Override::Off,
+            detection: Override::Off,
+            ssrf_guard: Override::Off,
+            fetch_budgets: Override::Off,
+            memory_quarantine: Override::Off,
+            native_web: Override::Off,
+            consumer_hygiene: Override::Off,
+            tool_steering: Override::Off,
+            opencode_native_gate: Override::Off,
+        }
+    }
+
     /// This row's cell for `feature`, or [`Override::Inherit`] for a feature
     /// that has no tab scope — the honest answer, since there is no cell to
     /// read and inheriting is what "no override" means.
@@ -934,6 +1010,19 @@ pub fn effective(feature: Feature, scope: Scope<'_>, s: &Settings) -> bool {
 /// The L3 cell for `feature` at `scope`, or [`Override::Inherit`] when the scope
 /// has no row for it (an app scope, an unknown tab id, a worker-only feature
 /// asked about a tab).
+///
+/// # An unknown tab id inherits, and that is unchanged by V39
+///
+/// A `Scope::Tab` whose id matches no configured AI tab falls to
+/// `unwrap_or_default()` — an all-`Inherit` row — so it resolves at L2. V39
+/// makes a *created* tab's row all-`Off` ([`TabInjectionOverrides::all_off`]),
+/// and it is worth saying explicitly that this case did **not** follow it: an
+/// unknown id is a tab cImp cannot describe (a stale registry entry, a caller
+/// naming an id that has since been deleted), not a tab that shipped with the
+/// new baseline. Resolving it to `Off` would silently disarm a caller we failed
+/// to identify, which is the fail-open-into-unprotected direction
+/// [`Scope::for_tab`] refuses; resolving it at L2 keeps the app-wide answer,
+/// which is the same thing every other unidentified caller gets.
 fn scope_override(feature: Feature, scope: Scope<'_>, s: &Settings) -> Override {
     match scope {
         // Neither app-level scope has a cell: the baseline has nothing to
@@ -1498,6 +1587,27 @@ pub fn report(s: &Settings, scope: Scope<'_>) -> Vec<FeatureState> {
 /// protection; and a scope that switches that gate ON has more protection than
 /// the default, never less.
 ///
+/// **A tab's own `Off` cell is the tab BASELINE and does not count** (V39). A
+/// newly created AI tab ships every tab-scoped cell `Off`
+/// ([`TabInjectionOverrides::all_off`]) and the user arms them from the tab's
+/// shield badge, so counting those cells would raise the indicator on every tab
+/// of every fresh install — the exact "an indicator nobody reads" failure the
+/// `default_enabled` clause above exists to prevent, one level down.
+///
+/// The tab pass is **narrowed, not dropped**: a tab row that is off because L2
+/// is off still counts. Dropping the pass outright would have opened a real
+/// hole, because three master-gated, ships-on controls have a tab row and *no*
+/// other row — memory quarantine, native-web visibility and consumer hygiene —
+/// so [`Scope::AppWide`] and [`Scope::OffloadWorker`] between them can never see
+/// them. Switching one of those off app-wide would then be invisible to every
+/// surface, while a legacy tab (whose cells the 34 → 35 step wrote as explicit
+/// `inherit`) really did lose the protection. So the filter is on *who decided*,
+/// not on which scope asked: `!effective && decided_by == Scope` at a tab is the
+/// user's per-tab baseline; anything else off at a tab is a reduction.
+///
+/// Its frontend twin `isReducedRow` in `latch.ts` takes the scope key for the
+/// same reason and applies the same two-part rule.
+///
 /// This is the predicate behind the out-of-Settings indicator (locked decision
 /// 16: "a reduced-protection state … is visible outside Settings too … so
 /// protection cannot be off and forgotten"). Deliberately global rather than
@@ -1528,30 +1638,39 @@ pub fn protection_reduced(s: &Settings) -> bool {
     if !s.offload.injection.protection {
         return true;
     }
-    let any_off = |scope: Scope<'_>| {
+    // `count_tab_baseline = false` is the V39 narrowing: at a TAB scope, a row
+    // switched off by the tab's own cell is the baseline the tab shipped with,
+    // not a reduction. Everything else about the predicate is unchanged, and the
+    // two app-level scopes pass `true` because their rows have no per-tab cell
+    // to be a baseline in the first place.
+    let any_off = |scope: Scope<'_>, count_tab_baseline: bool| {
         Feature::ALL.iter().any(|f| {
             // Only controls the master switch is ABOUT can reduce protection:
             // managed-tool steering switched off costs tokens, not posture, and
             // counting it would raise the ⛨ chip for a preference. The frontend
             // twin (`isReducedRow` in `latch.ts`) filters on the same bit,
             // published per row as `master_gated`.
-            f.master_gated()
-                && f.default_enabled()
-                && feature_in_scope(*f, scope)
-                && !effective(*f, scope, s)
+            if !(f.master_gated() && f.default_enabled() && feature_in_scope(*f, scope)) {
+                return false;
+            }
+            let d = decide(*f, scope, s);
+            !d.effective && (count_tab_baseline || d.decided_by != DecidedBy::Scope)
         })
     };
     // `AppWide`, not `UnknownCaller` (#48, F-35), and the two are provably equal
     // here: `feature_in_scope` admits only features with no tab row, and only a
     // tab row can carry the N-1 elevation.
-    if any_off(Scope::AppWide) || any_off(Scope::OffloadWorker) {
+    if any_off(Scope::AppWide, true) || any_off(Scope::OffloadWorker, true) {
         return true;
     }
     s.tabs.iter().any(|t| match t {
-        TabConfig::AiTool(c) => any_off(Scope::Tab {
-            agent: "",
-            tab: &c.id,
-        }),
+        TabConfig::AiTool(c) => any_off(
+            Scope::Tab {
+                agent: "",
+                tab: &c.id,
+            },
+            false,
+        ),
         _ => false,
     })
 }
@@ -1675,9 +1794,41 @@ mod tests {
     /// carries an EMPTY tab list (the builtins are materialized by the load-time
     /// integrity check, not by `Default`) and a per-tab override has to have a
     /// tab to attach to.
+    ///
+    /// **The tab is all-`Inherit`, not the V39 shipping tab.** Almost every test
+    /// below is about the RESOLUTION RULE, and a fixture whose L3 row is already
+    /// all-`Off` answers every one of them "off, decided at L3" before the rule
+    /// under test is reached. All-`Inherit` is also a real, common shape: it is
+    /// exactly what the 34 → 35 step writes into every tab that existed before
+    /// V39, i.e. what every upgraded install carries. The shipping shape has its
+    /// own fixture ([`fresh_install`]) and its own tests.
     fn settings() -> Settings {
         Settings {
-            tabs: vec![super::super::schema::default_claude_tab()],
+            tabs: vec![inheriting_tab()],
+            ..Settings::default()
+        }
+    }
+
+    /// [`schema::default_claude_tab`] with its L3 row reset to all-`Inherit` —
+    /// the post-migration shape of a tab that predates V39. Built from the
+    /// builtin rather than hand-rolled so it keeps every other field the real
+    /// tab has (id, command, consumer).
+    fn inheriting_tab() -> TabConfig {
+        let mut tab = super::super::schema::default_claude_tab();
+        if let TabConfig::AiTool(c) = &mut tab {
+            c.injection_overrides = TabInjectionOverrides::default();
+        }
+        tab
+    }
+
+    /// A FRESH-INSTALL snapshot: the builtin tabs exactly as
+    /// `schema::default_*_tab` ships them, i.e. with the V39 all-`Off` L3 row.
+    fn fresh_install() -> Settings {
+        Settings {
+            tabs: vec![
+                super::super::schema::default_claude_tab(),
+                super::super::schema::default_opencode_tab(),
+            ],
             ..Settings::default()
         }
     }
@@ -1769,65 +1920,176 @@ mod tests {
         }
         // The default-off set, named rather than counted: adding a feature here
         // is a product decision, and it should read like one in the diff.
-        let default_off: Vec<_> = Feature::ALL
+        //
+        // **Empty since V39** — master on, every sub-protection on. It was
+        // `[OpencodeNativeGate]` under locked decision 17; that opt-in moved a
+        // level down (a new tab's L3 row ships all `Off`), and the machinery
+        // that makes a default-off control possible stays in place so the next
+        // one costs a `match` arm rather than a redesign.
+        let default_off: Vec<&Feature> = Feature::ALL
             .iter()
             .filter(|f| !f.default_enabled())
             .collect();
-        assert_eq!(default_off, vec![&Feature::OpencodeNativeGate]);
-        // And a fresh install does NOT report reduced protection because of it.
+        assert!(default_off.is_empty(), "{default_off:?} ships off");
+        // And an all-inherit install does NOT report reduced protection.
         assert!(!protection_reduced(&s));
     }
 
-    /// V32 Phase H: the default-off feature, end to end through the hierarchy.
+    /// V39: the feature that USED to ship off, end to end through the hierarchy.
     ///
-    /// The interesting property is the one that made `default_enabled` necessary:
-    /// a control that ships off, and is off, is the BASELINE — it must not light
-    /// the reduced-protection indicator — while switching it on is *more*
-    /// protection and must not light it either.
+    /// Locked decision 17 shipped [`Feature::OpencodeNativeGate`] with its L2
+    /// `false`, because whole-surface denial of `bash`/`read`/`edit` changes
+    /// everyday tab UX. V39 keeps that judgement and relocates it: the app-wide
+    /// level is on with every other sub-protection, and the opt-in is the tab's
+    /// own row, which a new tab ships all-`Off`. The properties worth pinning
+    /// are the ones that changed and the ones that must not have:
+    ///
+    /// - its L2 is now on, and the report publishes `default_on: true`;
+    /// - a FRESH INSTALL still denies nothing and still reports no reduction —
+    ///   the same end state decision 17 wanted, reached one level lower;
+    /// - a tab that opts IN gets it, and its neighbours do not.
     #[test]
-    fn the_opencode_native_gate_ships_off_without_reading_as_reduced_protection() {
-        let mut s = settings();
-        let id = a_tab(&s);
+    fn the_opencode_native_gate_is_now_app_wide_on_and_opted_into_per_tab() {
         let f = Feature::OpencodeNativeGate;
-        assert!(!f.default_enabled());
+        assert!(f.default_enabled(), "V39: every sub-protection ships on");
         assert!(f.spawn_baked(), "its flag is baked into the plugin");
         assert!(f.has_tab_scope());
         assert!(!f.has_worker_scope(), "the worker is not a harness");
 
-        // Default: off everywhere, and nothing reads as reduced.
-        assert!(!effective(f, tab_scope(&id), &s));
-        assert!(!protection_reduced(&s));
+        // A fresh install: the app-wide level is on, every tab's own cell is
+        // off, so nothing is denied anywhere and nothing reads as reduced.
+        let fresh = fresh_install();
+        for t in &fresh.tabs {
+            let TabConfig::AiTool(c) = t else { continue };
+            assert!(
+                !effective(f, tab_scope(&c.id), &fresh),
+                "{}: a new tab denies nothing until the user opts in",
+                c.id
+            );
+        }
+        assert!(!protection_reduced(&fresh));
 
-        // An L3 `On` over the app-wide `off` — the shape decision 17 expects
-        // most users to reach for — enables exactly one tab…
+        // One tab opts in — the shape decision 17 always expected users to reach
+        // for, now reachable from that tab's shield badge.
+        let mut s = fresh_install();
+        let id = a_tab(&s);
         set_tab_override(&mut s, &id, f, Override::On);
         assert!(effective(f, tab_scope(&id), &s));
-        assert!(!effective(f, tab_scope("some-other-tab"), &s));
-        // …and MORE protection than the default is still not "reduced".
+        for t in &s.tabs {
+            let TabConfig::AiTool(c) = t else { continue };
+            if c.id == id {
+                continue;
+            }
+            assert!(!effective(f, tab_scope(&c.id), &s), "{} was not opted in", c.id);
+        }
+        // …and MORE protection than the baseline is still not "reduced".
         assert!(!protection_reduced(&s));
 
-        // The app-wide L2 works the same way, and the master still wins.
-        let mut s = settings();
-        s.offload.injection.opencode_native_gate_enabled = true;
-        assert!(effective(f, tab_scope(&id), &s));
-        assert!(!protection_reduced(&s));
-        s.offload.injection.protection = false;
+        // The master still wins over everything, and it always counts.
+        s.set_master_for_test(false);
         assert!(!effective(f, tab_scope(&id), &s));
         assert!(protection_reduced(&s), "the master switch always counts");
 
         // The report publishes the default so the frontend need not mirror it.
-        let rows = report(&settings(), tab_scope(&id));
+        let inheriting = settings();
+        let tab = a_tab(&inheriting);
+        let rows = report(&inheriting, tab_scope(&tab));
         let row = rows
             .iter()
             .find(|r| r.feature == "opencode_native_gate")
             .expect("the feature has a row");
-        assert!(!row.default_on);
-        assert!(!row.effective);
+        assert!(row.default_on);
+        assert!(row.effective, "an inheriting tab takes the app-wide `on`");
         assert!(row.in_scope);
-        assert!(
-            rows.iter().filter(|r| !r.default_on).count() == 1,
-            "exactly one default-off row"
+        assert_eq!(
+            rows.iter().filter(|r| !r.default_on).count(),
+            0,
+            "no control ships off"
         );
+    }
+
+    /// **V39, decision 2: a NEWLY CREATED AI tab has every tab-scoped cell
+    /// `Off`.**
+    ///
+    /// Stated against the builtins the app actually seeds
+    /// (`schema::default_*_tab`, which is also what `ai_tool_tab_defaults` hands
+    /// the Settings window's "Reset to default"), and against the FEATURE table
+    /// rather than the field list — a tab-scoped control added without a cell in
+    /// `all_off` fails here rather than shipping silently on.
+    #[test]
+    fn a_newly_created_ai_tab_ships_every_tab_scoped_control_off() {
+        let s = fresh_install();
+        for t in &s.tabs {
+            let TabConfig::AiTool(c) = t else { continue };
+            for f in Feature::ALL.iter().filter(|f| f.has_tab_scope()) {
+                assert_eq!(
+                    c.injection_overrides.get(*f),
+                    Override::Off,
+                    "{}: {f:?} must ship Off on a new tab",
+                    c.id
+                );
+                let d = decide(*f, tab_scope(&c.id), &s);
+                assert!(!d.effective, "{}: {f:?}", c.id);
+                assert_eq!(d.decided_by, DecidedBy::Scope, "{}: {f:?}", c.id);
+            }
+            // A feature with no tab row has no cell to be off — it still
+            // resolves at L2, and the report marks it out of scope.
+            for f in Feature::ALL.iter().filter(|f| !f.has_tab_scope()) {
+                assert_eq!(c.injection_overrides.get(*f), Override::Inherit, "{f:?}");
+            }
+        }
+        // The whole point of the baseline: a fresh install is not "reduced".
+        assert!(!protection_reduced(&s));
+        // And `Override::default()` did NOT move — an absent cell in a file
+        // still means "inherit", which is what keeps the 34 → 35 step honest.
+        assert_eq!(Override::default(), Override::Inherit);
+        for f in Feature::ALL.iter().filter(|f| f.has_tab_scope()) {
+            assert_eq!(
+                TabInjectionOverrides::default().get(*f),
+                Override::Inherit,
+                "{f:?}: the SERDE default must stay neutral"
+            );
+        }
+    }
+
+    /// **V39, decision 4: an unknown tab id still INHERITS.**
+    ///
+    /// `scope_override` falls to an all-`Inherit` row for a `Scope::Tab` whose
+    /// id matches no configured AI tab, so it resolves at L2 — unchanged, and
+    /// worth pinning precisely because the *created*-tab default moved to
+    /// all-`Off` around it. An unknown id is a tab cImp cannot describe (a stale
+    /// registry entry, a caller naming a deleted id), not a tab that shipped
+    /// with the new baseline; answering `Off` for it would silently disarm a
+    /// caller we merely failed to identify.
+    #[test]
+    fn an_unknown_tab_id_inherits_rather_than_taking_the_new_tab_baseline() {
+        // Deliberately the FRESH-INSTALL fixture: its real tabs are all-`Off`,
+        // so a bug that answered "the tab baseline" for an id it could not find
+        // would be invisible against an all-`Inherit` fixture.
+        let s = fresh_install();
+        for f in Feature::ALL.iter().filter(|f| f.has_tab_scope()) {
+            let d = decide(*f, tab_scope("no-such-tab"), &s);
+            assert_eq!(
+                d,
+                Decision {
+                    effective: f.default_enabled(),
+                    decided_by: DecidedBy::Feature
+                },
+                "{f:?} at an unknown tab id must resolve at L2"
+            );
+            // …and it tracks L2 rather than being pinned to the default.
+            let mut off = s.clone();
+            off.set_l2_for_test(*f, false);
+            assert!(!effective(*f, tab_scope("no-such-tab"), &off), "{f:?}");
+        }
+        // The report says the same thing, cell and all — a surface rendering an
+        // unknown id must not show a stored `off` that is not stored anywhere.
+        for row in report(&s, tab_scope("no-such-tab"))
+            .iter()
+            .filter(|r| r.in_scope)
+        {
+            assert_eq!(row.override_value, "inherit", "{}", row.feature);
+        }
     }
 
     /// The locked resolution table, exhaustively: every (L1, L2, L3) triple for
@@ -2144,11 +2406,15 @@ mod tests {
     /// One Claude tab and one OpenCode tab — the shape the per-consumer spawn
     /// signature has to tell apart (#48, F-x).
     fn settings_both_consumers() -> Settings {
+        let mut opencode = super::super::schema::default_opencode_tab();
+        if let TabConfig::AiTool(c) = &mut opencode {
+            c.injection_overrides = TabInjectionOverrides::default();
+        }
+        // All-`Inherit` rows, for the reason [`settings`] gives: these tests
+        // move ONE level at a time and read the signature back, which a fixture
+        // that already states every cell at L3 would flatten.
         Settings {
-            tabs: vec![
-                super::super::schema::default_claude_tab(),
-                super::super::schema::default_opencode_tab(),
-            ],
+            tabs: vec![inheriting_tab(), opencode],
             ..Settings::default()
         }
     }
@@ -2247,14 +2513,18 @@ mod tests {
             // not — and one that moves the CLAUDE signature is the F-x nag.
             (
                 "opencode-native-gate L2",
-                Box::new(|s: &mut Settings| s.set_l2_for_test(Feature::OpencodeNativeGate, true)),
+                // `false`, not `true`: V39 ships this L2 ON like every other, so
+                // writing `true` here would assert that a no-op flip moves a
+                // signature. The property under test is unchanged — one level of
+                // one control, and exactly which consumers may notice.
+                Box::new(|s: &mut Settings| s.set_l2_for_test(Feature::OpencodeNativeGate, false)),
                 &[Opencode],
             ),
             (
                 "opencode-native-gate L3",
                 Box::new(|s: &mut Settings| {
                     let id = tab_of(s, Opencode);
-                    set_tab_override(s, &id, Feature::OpencodeNativeGate, Override::On);
+                    set_tab_override(s, &id, Feature::OpencodeNativeGate, Override::Off);
                 }),
                 &[Opencode],
             ),
@@ -2510,8 +2780,13 @@ mod tests {
     }
 
     /// The reduced-protection predicate — the input to the out-of-Settings
-    /// indicator — fires for the master switch, an app-wide feature and a single
-    /// per-tab override alike.
+    /// indicator — fires for the master switch, an app-wide feature, the worker
+    /// row, and an app-wide flag a TAB is inheriting.
+    ///
+    /// **A tab's own `Off` cell no longer counts** (V39): a new tab ships every
+    /// tab-scoped cell off, so counting them would raise the chip on every tab
+    /// of every fresh install. The last two cases below are the narrowing and
+    /// the hole it deliberately leaves closed — see [`protection_reduced`].
     #[test]
     fn protection_reduced_sees_every_level() {
         assert!(!protection_reduced(&settings()));
@@ -2531,7 +2806,42 @@ mod tests {
         let mut s = settings();
         let id = a_tab(&s);
         set_tab_override(&mut s, &id, Feature::SsrfGuard, Override::Off);
-        assert!(protection_reduced(&s), "one tab's override counts");
+        assert!(
+            !protection_reduced(&s),
+            "a tab's own cell is the tab BASELINE since V39, not a reduction"
+        );
+        // …and a fresh install, every cell of which is exactly that, agrees.
+        assert!(!protection_reduced(&fresh_install()));
+
+        // THE HOLE THAT MUST STAY CLOSED. Consumer hygiene, memory quarantine
+        // and native-web visibility carry a tab row and no other row, so if the
+        // tab pass were dropped outright rather than narrowed, switching one of
+        // them off APP-WIDE would be invisible to every surface — while every
+        // inheriting tab really did lose it.
+        for f in Feature::ALL
+            .iter()
+            .filter(|f| f.master_gated() && f.has_tab_scope() && !f.has_worker_scope())
+        {
+            let mut s = settings();
+            s.set_l2_for_test(*f, false);
+            assert!(
+                protection_reduced(&s),
+                "{f:?} switched off app-wide must still count — no other scope has a row for it"
+            );
+        }
+        // The same flip on a fresh install is NOT reduced, and that is correct
+        // rather than a gap: those tabs state `off` themselves, so the app-wide
+        // flip took nothing away from them. Tab-ONLY controls, because a feature
+        // that also has a worker row is still lost there — the worker's cells
+        // are untouched by the per-tab baseline and its pass still counts them.
+        for f in Feature::ALL
+            .iter()
+            .filter(|f| f.has_tab_scope() && !f.has_worker_scope())
+        {
+            let mut s = fresh_install();
+            s.set_l2_for_test(*f, false);
+            assert!(!protection_reduced(&s), "{f:?}");
+        }
     }
 
     /// Keys are wire values: stable, unique, and matching the enum's serde form
@@ -2688,10 +2998,14 @@ mod tests {
     fn an_identity_less_call_honours_any_tabs_scope_on() {
         let mut s = settings();
         let id = a_tab(&s);
-        let f = Feature::OpencodeNativeGate; // L2 default off — decision 17's shape.
+        // Decision 17's shape: an L2 `off` with one tab hardened over it. Since
+        // V39 this L2 ships ON like every other, so the test states the `off`
+        // itself rather than borrowing a default that has moved.
+        let f = Feature::OpencodeNativeGate;
+        s.set_l2_for_test(f, false);
 
-        // Nothing overridden: the app-wide answer is the L2 default, decided at
-        // L2. The elevation must not fire on an untouched config.
+        // Nothing overridden: the app-wide answer is the L2 value, decided at
+        // L2. The elevation must not fire on a config nobody overrode.
         assert_eq!(
             decide(f, Scope::UnknownCaller, &s),
             Decision {

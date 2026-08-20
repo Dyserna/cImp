@@ -1,6 +1,13 @@
 import { invoke } from '@tauri-apps/api/core';
-import { writable, derived, type Readable } from 'svelte/store';
+import { writable, derived, get, type Readable } from 'svelte/store';
 import type { TabId } from './tabs/types';
+import {
+  TAB_INJECTION_FEATURES,
+  type InjectionOverride,
+  type Settings,
+  type TabInjectionOverrides,
+} from './settings/types';
+import { applySettings, settings } from './settings/store';
 import { fetchDetectionStatus, rulesHealth, type RulesHealth } from './offload';
 import {
   normalizeHexColor,
@@ -177,10 +184,18 @@ export interface InjectionScope {
 export interface InjectionStatus {
   /// The L1 master switch.
   protection: boolean;
-  /// True when the master is off OR any feature that SHIPS ON resolves off at
-  /// any scope — the predicate behind the out-of-Settings indicator, so
-  /// protection cannot be off and forgotten. Measured against each feature's
-  /// default (V32 Phase H), never against `true`.
+  /// True when the master is off OR any feature that SHIPS ON resolves off at a
+  /// scope that has a row for it. Measured against each feature's default (V32
+  /// Phase H), never against `true`.
+  ///
+  /// **V39: a TAB row switched off by that tab's own cell does not count.** A
+  /// newly created AI tab ships every tab-scoped cell off, so counting them
+  /// would raise this on every tab of every fresh install. A tab row off because
+  /// the app-wide flag is off still counts — see `isReducedRow`, and Rust's
+  /// `protection_reduced`, which the two halves are pinned against each other on.
+  ///
+  /// It is no longer what makes the status chip VISIBLE (the chip is permanent
+  /// now and shows the master's value); it is what makes the chip say `reduced`.
   reduced: boolean;
   scopes: InjectionScope[];
 }
@@ -243,7 +258,19 @@ export const protectionReduced: Readable<boolean> = derived(
   ($s) => !!$s?.reduced,
 );
 
-/// Whether one report row counts as REDUCED protection.
+/// The two scope keys that are not a tab. Mirrors Rust `APP_SCOPE_KEY` /
+/// `WORKER_SCOPE_KEY`; every other scope in the report is an AI tab id.
+export const APP_SCOPE_KEY = 'app';
+export const WORKER_SCOPE_KEY = 'offload-worker';
+
+/// Whether a report scope key names an AI TAB rather than one of the two
+/// app-level pseudo-scopes. The backend keys tab scopes by the tab id itself
+/// (`loopback::injection_status`), so this is the whole test.
+export function isTabScope(scope: string): boolean {
+  return scope !== APP_SCOPE_KEY && scope !== WORKER_SCOPE_KEY;
+}
+
+/// Whether one report row counts as REDUCED protection **at `scope`**.
 ///
 /// **The one definition, exported because there were three** (#48, G-2). The
 /// backend's `protection_reduced` owns the rule; this is its frontend reading,
@@ -251,7 +278,19 @@ export const protectionReduced: Readable<boolean> = derived(
 /// than restate it — the status chip restated it without the `default_on` clause
 /// and disagreed with the tab badge beside it, in the same viewport.
 ///
-/// Four filters, all structural rather than cosmetic:
+/// **V39 adds the scope, and it is not decoration.** A newly created AI tab
+/// ships every tab-scoped cell `Off` and the user arms them from the tab's
+/// shield badge, so a tab row switched off by the tab's OWN cell is the
+/// baseline, not a reduction — counting it would raise the chip on every tab of
+/// every fresh install. The filter is on *who decided*, not on which scope
+/// asked: a tab row that is off because L2 is off still counts, because three
+/// ships-on controls (memory quarantine, native-web visibility, consumer
+/// hygiene) have a tab row and no other row, so nothing else would ever see
+/// them. Rust's `protection_reduced` narrows its tab pass by exactly this
+/// predicate.
+///
+/// Five filters, all structural rather than cosmetic:
+/// - at a TAB, not a row the tab's own cell switched off (the V39 baseline);
 /// - only rows the scope actually HAS — a tab is not "reduced" because the
 ///   worker-only canary does not apply to it;
 /// - only rows that are actually off;
@@ -272,17 +311,151 @@ export const protectionReduced: Readable<boolean> = derived(
 /// The synthetic signature-health row passes: it is `in_scope`, off, and ships
 /// on. It is a reduction — it just is not a *switch*, which is what `reason`
 /// says and what [`reducedSummary`] counts separately.
-export function isReducedRow(f: FeatureState): boolean {
+export function isReducedRow(f: FeatureState, scope: string): boolean {
+  if (isTabScope(scope) && !f.effective && f.decided_by === 'scope') return false;
   return f.in_scope && !f.effective && f.default_on && f.master_gated;
 }
 
-/// The features resolved OFF for one tab, for the tab badge and its popover.
+/// The features resolved OFF for one tab **for reasons other than that tab's
+/// own cell** — the tab badge's tooltip and the status chip's per-tab share.
+///
+/// Since V39 this is usually empty even on a tab with every control off, which
+/// is the point: that posture is the tab's baseline. What it still reports is a
+/// tab losing a control it was inheriting — an app-wide flip, the master, or the
+/// synthetic signature-health row, which is a fact about the rules directory and
+/// not a switch anybody flipped.
 export function reducedFeaturesFor(
   status: InjectionStatus | null,
   tab: TabId,
 ): FeatureState[] {
   const scope = status?.scopes.find((s) => s.scope === tab);
-  return (scope?.features ?? []).filter(isReducedRow);
+  return (scope?.features ?? []).filter((f) => isReducedRow(f, tab));
+}
+
+// ── V39 — the tab shield badge as a standing control ───────────────────────
+
+/// A tab's tab-scoped rows that are **switches**, in the order the backend
+/// publishes them (`Feature::ALL`).
+///
+/// The single source for the badge tint, the badge tooltip and the popover's
+/// toggle list, so none of them can describe the tab differently — and it is the
+/// backend's RESOLVED report, never a re-resolution of the hierarchy here.
+///
+/// Two filters. `in_scope` is the backend's own answer to "does this control
+/// have a cell here?". The second one drops the synthetic signature-health row
+/// [`withSignatureHealth`] adds: it is `in_scope` and it is a real
+/// reduced-protection fact, but it is a fact about a directory on disk with no
+/// cell behind it — rendering it as a toggle would offer the user a switch that
+/// cannot be written, and counting it in "7 of 9 on" would mix a measurement
+/// into a count of settings. It keeps reaching the badge tooltip through
+/// [`reducedFeaturesFor`], which is where facts-that-are-not-switches belong.
+export function tabProtectionRows(
+  status: InjectionStatus | null,
+  tab: TabId,
+): FeatureState[] {
+  const scope = status?.scopes.find((s) => s.scope === tab);
+  const cells = new Set<string>(TAB_INJECTION_FEATURES);
+  return (scope?.features ?? []).filter((f) => f.in_scope && cells.has(f.feature));
+}
+
+/// How much of a tab's protection is engaged. Drives the badge's colour.
+///
+/// - `protected` — every tab-scoped control resolves on;
+/// - `partial` — some do;
+/// - `off` — none do (the shape a newly created tab ships in);
+/// - `unknown` — there is no report for this tab yet, so nothing may be claimed.
+///   Distinct from `off` for the reason every other epistemic state here is:
+///   "we have not looked" must never render as "we looked and it is off".
+export type ProtectionTint = 'protected' | 'partial' | 'off' | 'unknown';
+
+export function protectionTint(rows: FeatureState[]): ProtectionTint {
+  if (rows.length === 0) return 'unknown';
+  const on = rows.filter((f) => f.effective).length;
+  if (on === rows.length) return 'protected';
+  return on === 0 ? 'off' : 'partial';
+}
+
+/// The one-line summary the badge tooltip opens with: `Protection: 7 of 9 on`.
+export function protectionSummary(rows: FeatureState[]): string {
+  if (rows.length === 0) return 'Protection: not known yet';
+  return `Protection: ${rows.filter((f) => f.effective).length} of ${rows.length} on`;
+}
+
+/// One row's effective state as the popover words it.
+export function effectiveWord(f: FeatureState): 'on' | 'off' {
+  return f.effective ? 'on' : 'off';
+}
+
+// ── V39 — writing L3 cells from the main window ────────────────────────────
+
+/// Clone `current` with `changes` applied to one AI tab's L3 injection row.
+///
+/// **Clone-and-patch, never mutate.** The store holds the object the rest of the
+/// window is rendering from; editing it in place would move every subscriber's
+/// view before the backend had accepted anything, and `applySettings`'s rollback
+/// would then have nothing to roll back to.
+///
+/// A pure function so the "Enable all" / "Disable all" property — ONE settings
+/// object carrying every cell, not N writes — is testable without a backend.
+export function withTabInjectionOverrides(
+  current: Settings,
+  tab: TabId,
+  changes: Partial<TabInjectionOverrides>,
+): Settings {
+  return {
+    ...current,
+    tabs: current.tabs.map((t) =>
+      t.kind === 'ai_tool' && t.id === tab
+        ? { ...t, injection_overrides: { ...t.injection_overrides, ...changes } }
+        : t,
+    ),
+  };
+}
+
+/// The patch that sets every row in `rows` to `value`.
+///
+/// Keyed off the BACKEND's rows rather than a TypeScript list of features, so
+/// "all" means the controls this tab actually has — a control added in Rust is
+/// covered the day it is declared, and one the scope does not carry is never
+/// written into a cell that does not exist.
+export function setAllOverrides(
+  rows: FeatureState[],
+  value: InjectionOverride,
+): Partial<TabInjectionOverrides> {
+  const out: Record<string, InjectionOverride> = {};
+  for (const f of rows) out[f.feature] = value;
+  return out as Partial<TabInjectionOverrides>;
+}
+
+/// Write one tab's L3 cells through the ordinary full-object save path.
+///
+/// There is deliberately no `set_injection_override` IPC (see
+/// `ipc/commands.rs`): an L3 cell is an ordinary settings field, and a
+/// side-channel command would give the app a second write path that can race the
+/// full-object save. One call ⇒ one `applySettings`, however many cells moved.
+export async function applyTabInjectionOverrides(
+  tab: TabId,
+  changes: Partial<TabInjectionOverrides>,
+): Promise<void> {
+  await applySettings(withTabInjectionOverrides(get(settings), tab, changes));
+}
+
+/// Flip the L1 master switch, as one full-object write.
+///
+/// Pure patch + thin caller for the same reason as above: the status-bar chip is
+/// a control now, not a link, and what it writes has to be testable.
+export function withMasterProtection(current: Settings, on: boolean): Settings {
+  return {
+    ...current,
+    offload: {
+      ...current.offload,
+      injection: { ...current.offload.injection, protection: on },
+    },
+  };
+}
+
+export async function applyMasterProtection(on: boolean): Promise<void> {
+  await applySettings(withMasterProtection(get(settings), on));
 }
 
 /// What the status chip says it found, as the chip's tooltip phrases it.
@@ -329,7 +502,7 @@ export function reducedCounts(status: InjectionStatus | null): ReducedCounts {
   const partial = new Set<string>();
   for (const scope of status?.scopes ?? []) {
     for (const f of scope.features) {
-      if (!isReducedRow(f)) continue;
+      if (!isReducedRow(f, scope.scope)) continue;
       (f.unknown ? unreadable : f.partial ? partial : f.reason ? inert : switched).add(f.feature);
     }
   }
@@ -362,22 +535,44 @@ export function reducedSummary(status: InjectionStatus | null): string {
   return parts.join(', ') || 'something is off';
 }
 
-/// The word the status chip wears, and what it means.
+/// The word the status chip wears: the L1 master switch's own value.
 ///
-/// - `unknown` — the hierarchy poll itself has been failing: we cannot see ANY
-///   of it (#48, G-3).
-/// - `off` — the L1 master switch is off.
-/// - `unverified` — everything we CAN read is on, and something we cannot read
-///   is the signature layer's armed-ness (#48, H-10). Not `reduced`: nobody
-///   turned anything off, and not silence either.
-/// - `reduced` — at least one thing is really off.
-export type InjectionChipLabel = 'unknown' | 'off' | 'unverified' | 'reduced';
+/// **V39 made the chip a CONTROL rather than a warning light.** It used to be
+/// silent while everything was on and to name what was wrong when it was not
+/// (`reduced` / `off` / `unknown` / `unverified`). That satisfied locked
+/// decision 16 only as long as the user knew a missing chip meant "protected" —
+/// which is the same "absence reads as fine" assumption #48's G-3 found to be
+/// false in practice. It is permanent and colour-coded now, it says which way
+/// the master is set, and clicking it flips the master. The four states it used
+/// to wear as WORDS are still all rendered — they moved to [`note`], as
+/// modifiers on top of the on/off it now shows.
+export type InjectionChipLabel = 'on' | 'off';
+
+/// What the chip knows BESIDES the master's value.
+///
+/// - `null` — everything readable is on and readable.
+/// - `reduced` — at least one control that ships on really is off somewhere.
+/// - `unverified` — everything we CAN read is on and the one thing we cannot is
+///   the signature layer's armed-ness (#48, H-10). Not `reduced`: nobody turned
+///   anything off.
+/// - `unknown` — the hierarchy poll itself has been failing, so we cannot see
+///   any of it (#48, G-3).
+///
+/// Kept separate from [`InjectionChipLabel`] deliberately: the master's value is
+/// a setting the app always knows (it is in the settings store), while these
+/// three are claims about what cImp could observe. Collapsing them back into one
+/// word is what made "off" and "we cannot tell" indistinguishable before.
+export type InjectionChipNote = null | 'reduced' | 'unverified' | 'unknown';
 
 export interface InjectionChipState {
-  /// Whether the chip renders at all. Silence means "everything on, and we can
-  /// see that it is" — it must never mean "we did not look".
+  /// Kept for callers, and now always `true`: the chip is a standing control.
+  /// Silence would mean "there is no such switch", which is the one thing this
+  /// surface must never say.
   visible: boolean;
   label: InjectionChipLabel;
+  /// The master switch's value — what a click will invert.
+  on: boolean;
+  note: InjectionChipNote;
   /// Whether the chip wears the dashed "this is not a confident claim"
   /// treatment. True for both epistemic states.
   degraded: boolean;
@@ -390,33 +585,43 @@ export interface InjectionChipState {
 /// [`reducedSummary`]: `.svelte` files have no test harness in this repo, and
 /// the chip's job is to not lie.
 ///
-/// F-18: every tooltip below names its destination, because the badge now
+/// F-18: every tooltip below names its destination, because the badge
 /// deep-links to the "Injection protection" section rather than opening Settings
-/// on whatever section it happens to land on. The path in the words and the
-/// target of the click have to agree, so changing one means changing the other.
+/// on whatever section it happens to land on. Since V39 the PRIMARY click flips
+/// the master instead, so each tooltip states both gestures — a control whose
+/// click does something other than what its tooltip says is worse than one that
+/// only links.
 export function injectionChipState(
   status: InjectionStatus | null,
   pollUnknown: boolean,
 ): InjectionChipState {
   const counts = reducedCounts(status);
   const summary = reducedSummary(status);
+  // The master's value comes from the report, which is the same resolver every
+  // other surface reads. Before the first poll lands there is nothing to claim,
+  // and `pollUnknown` below is what says so; `true` is the shipping value and
+  // the only honest placeholder for one tick.
+  const on = status?.protection ?? true;
+  const settingsHint = 'Right-click to open Settings → Injection protection.';
+  const flip = on
+    ? 'Click to turn it OFF (every containment control goes inert — the taint latch, the spotlighting envelope, the SSRF guard, memory quarantine; managed-tool steering is not a containment control and keeps running).'
+    : 'Click to turn it back ON.';
+  // A running AI tab keeps the posture it launched with: the master is
+  // spawn-baked, so the backend's `ai-tab-restart-hint` fires on the save and
+  // the main window toasts it. Said here too, because the toast is gone in eight
+  // seconds and this tooltip is not.
+  const restart = 'Tabs already running keep their launch posture until restarted.';
+  const base = on
+    ? `Injection protection is ON. ${flip} ${restart} ${settingsHint}`
+    : `Injection protection is OFF — every V32 containment control is disabled, for every tab and the offload worker. ${flip} ${restart} ${settingsHint}`;
   if (pollUnknown) {
     return {
       visible: true,
-      label: 'unknown',
+      label: on ? 'on' : 'off',
+      on,
+      note: 'unknown',
       degraded: true,
-      title:
-        'Injection protection state is UNKNOWN — cImp has not been able to read it for several polls, so this app cannot tell you what is switched on. Check the console. Click to open Settings → Injection protection.',
-    };
-  }
-  const visible = !!status?.reduced;
-  if (status && !status.protection) {
-    return {
-      visible,
-      label: 'off',
-      degraded: false,
-      title:
-        'Injection protection is OFF — every V32 control is disabled, for every tab and the offload worker. Click to open Settings → Injection protection.',
+      title: `${base} cImp has not been able to READ the protection state for several polls, so what is switched on beneath the master cannot be shown. Check the console.`,
     };
   }
   const unreadable = counts.unreadable > 0;
@@ -426,15 +631,29 @@ export function injectionChipState(
   // understate a real loss of coverage.
   const onlyUnreadable =
     unreadable && counts.switched === 0 && counts.inert === 0 && counts.partial === 0;
+  // With the master off the report already says everything is off; a `reduced`
+  // note beside an `off` label would be the same fact twice, in a weaker word.
+  const note: InjectionChipNote = !on
+    ? null
+    : onlyUnreadable
+      ? 'unverified'
+      : status?.reduced
+        ? 'reduced'
+        : null;
   return {
-    visible,
-    label: onlyUnreadable ? 'unverified' : 'reduced',
-    degraded: unreadable,
-    title: onlyUnreadable
-      ? `Injection protection cannot be verified — ${summary}. It is not switched off; cImp cannot currently tell whether it is working. Click to open Settings → Injection protection.`
-      : unreadable
-        ? `Injection protection is reduced, and part of it cannot be verified — ${summary}. Click to open Settings → Injection protection.`
-        : `Injection protection is reduced — ${summary}. Click to open Settings → Injection protection.`,
+    visible: true,
+    label: on ? 'on' : 'off',
+    on,
+    note,
+    degraded: on && unreadable,
+    title:
+      note === 'unverified'
+        ? `${base} Part of it cannot be verified — ${summary}. It is not switched off; cImp cannot currently tell whether it is working.`
+        : note === 'reduced'
+          ? unreadable
+            ? `${base} Beneath it, protection is reduced and part of it cannot be verified — ${summary}.`
+            : `${base} Beneath it, protection is reduced — ${summary}.`
+          : base,
   };
 }
 

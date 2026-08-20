@@ -15,6 +15,7 @@
   import NoteButton from './status/NoteButton.svelte';
   import WorkbenchDiffBadge from './status/WorkbenchDiffBadge.svelte';
   import InjectionBadge from './status/InjectionBadge.svelte';
+  import SandboxBadge from './status/SandboxBadge.svelte';
   import { settings } from './settings/store';
 </script>
 
@@ -26,10 +27,6 @@
     <ToolLaunchButton tool="rustnet" glyph="🌐" label="New rustnet tab" />
     <NoteButton />
     <WorkbenchDiffBadge />
-    <!-- V32 Phase G: silent while every injection control is on; a ⛨ chip when
-         the master switch or any feature is off, so a reduced-protection state
-         cannot be off and forgotten (locked decision 16). -->
-    <InjectionBadge />
     {#if $settings.stt.enabled}
       <span class="sep" aria-hidden="true"></span>
       <RecordButton />
@@ -45,6 +42,24 @@
       <MuteButton />
       <AnnouncementsButton />
     {/if}
+    <!-- V39 — the SECURITY section: the three switches that decide what a
+         running agent may do, in the order they take effect.
+
+         ⛨ injection protection (L1) — what content may reach a model and what a
+         latched session may call. ▣ sandboxing — whether the processes cImp
+         starts for the agent are confined by the OS. ⇅ sandbox network —
+         whether those confined processes get egress.
+
+         They are a section of their own, bracketed like the visibility/settings
+         group, because they are permanent CONTROLS rather than conditional
+         indicators: each states its value and each flips on click. That is a
+         change from the pre-V39 shield, which was silent while everything was on
+         — see `InjectionBadge.svelte` for why a surface that goes quiet when it
+         is happy cannot be told apart from one that is broken. -->
+    <span class="sep" aria-hidden="true"></span>
+    <InjectionBadge />
+    <SandboxBadge kind="sandbox" />
+    <SandboxBadge kind="network" />
     <span class="sep" aria-hidden="true"></span>
     <TabVisibilityButton />
     <SettingsButton />

@@ -278,6 +278,53 @@ mod frontend_mirrors {
         assert!(empty.is_err(), "an empty parse must panic, not return []");
     }
 
+    // ── Tripwire 2b: TAB_INJECTION_FEATURES ─────────────────────────────────
+
+    /// **V39.** `TAB_INJECTION_FEATURES` is the frontend's list of per-tab L3
+    /// cells, and three surfaces now depend on it being exactly
+    /// `Feature::has_tab_scope`:
+    ///
+    /// * `allOffInjectionOverrides` builds the row a NEW tab ships with — a key
+    ///   missing here means a control that silently stays inherited on every tab
+    ///   the app creates, i.e. on rather than off;
+    /// * `tabProtectionRows` filters the badge tint, the badge tooltip's
+    ///   "n of m on" and the popover's toggle list by it — a missing key hides a
+    ///   real control from the only surface that can reach it;
+    /// * `setAllOverrides` / "Enable all" would silently skip it.
+    ///
+    /// Rust growing a tab-scoped feature is the direction TypeScript cannot
+    /// catch, which is what this half is for. Set comparison both ways, like
+    /// tripwire 2.
+    #[test]
+    fn tab_injection_feature_mirror_is_current_in_both_directions() {
+        let rust: Vec<&'static str> = Feature::ALL
+            .iter()
+            .filter(|f| f.has_tab_scope())
+            .map(|f| f.key())
+            .collect();
+        assert!(
+            !rust.is_empty(),
+            "no feature reports has_tab_scope() — the predicate, not the mirror, is broken"
+        );
+        let ts = ts_members(TS_TYPES, "TAB_INJECTION_FEATURES");
+        let (missing, extra) = set_diff(&rust, &ts);
+        assert!(
+            missing.is_empty() && extra.is_empty(),
+            "src/lib/settings/types.ts `TAB_INJECTION_FEATURES` has drifted from \
+             `Feature::has_tab_scope`. Missing from TypeScript: {missing:?}; present only in \
+             TypeScript: {extra:?}. A missing member ships a control ON for every newly \
+             created tab and hides it from the tab badge popover."
+        );
+        // Order matters too: it is the order a new tab's row is written in and
+        // the order the popover renders, and `Feature::ALL` is declared
+        // cheapest-first / spawn-baked-last on purpose.
+        assert_eq!(
+            rust,
+            ts.iter().map(String::as_str).collect::<Vec<_>>(),
+            "`TAB_INJECTION_FEATURES` must be in `Feature::ALL` order"
+        );
+    }
+
     // ── Tripwire 2: SPAWN_BAKED_INJECTION_FEATURES ──────────────────────────
 
     /// The spawn-baked feature keys, from the predicate rather than a list:

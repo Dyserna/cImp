@@ -160,7 +160,7 @@ pub const SHELL_BROOT_TAB_ID: &str = "shell-broot";
 /// Files that pre-date V1.10 lack the field entirely; the cascade still
 /// uses the `looks_v1_X` predicates for those, falling through to a final
 /// step that stamps the field with the current value.
-pub const CURRENT_SCHEMA_VERSION: u8 = 34;
+pub const CURRENT_SCHEMA_VERSION: u8 = 35;
 
 fn current_schema_version() -> u8 {
     CURRENT_SCHEMA_VERSION
@@ -2105,11 +2105,14 @@ pub struct OffloadSettings {
 /// contradictory state representable. See
 /// [`injection`](crate::settings::injection) for the full reconciliation.
 ///
-/// Every default is `true` — except V32 Phase H's
-/// [`opencode_native_gate_enabled`](Self::opencode_native_gate_enabled), which
-/// ships `false` — so an untouched (or pre-Phase-G) settings file resolves
-/// exactly as the app behaved before this block existed. That is the
-/// migration-safety property, pinned by a test in the resolver.
+/// **Every default is `true`** since the V39 posture decision — master on, and
+/// every sub-protection on. V32 Phase H's
+/// [`opencode_native_gate_enabled`](Self::opencode_native_gate_enabled) was the
+/// one exception until then; its opt-in nature now lives one level down, on a
+/// new tab's all-`Off` L3 row
+/// ([`injection::TabInjectionOverrides::all_off`](crate::settings::injection::TabInjectionOverrides)).
+/// An untouched settings file therefore resolves every app-wide level on, which
+/// is the ceiling the per-tab rows sit under.
 ///
 /// # Why every field is `pub(in crate::settings)` (#44)
 ///
@@ -2165,10 +2168,12 @@ pub struct InjectionSettings {
     /// only beaconing on the web ones. Spawn-baked (the flag is compiled into
     /// the generated plugin).
     ///
-    /// **The one L2 flag that defaults `false`**, by user decision: whole-surface
+    /// **It defaulted `false` until V39**, by locked decision 17: whole-surface
     /// denial of `bash`/`read`/`edit` under an EXTERNAL latch changes everyday
-    /// tab UX materially, so it is opt-in. Consequences of that asymmetry are
-    /// handled in `settings::injection` (`Feature::default_enabled`), not here.
+    /// tab UX materially, so it had to be opt-in. V39 keeps the opt-in and moves
+    /// it down a level — a new tab's L3 row ships all `Off` — so this L2 joins
+    /// the others at `true`. See `settings::injection`
+    /// (`Feature::default_enabled`) for the full history.
     pub(in crate::settings) opencode_native_gate_enabled: bool,
     /// L2: stripping terminal control sequences out of external text cImp
     /// composes into non-HTML sinks. App-wide — no per-scope row, because TTS
@@ -2200,9 +2205,9 @@ impl Default for InjectionSettings {
             memory_quarantine_enabled: true,
             consumer_hygiene_enabled: true,
             tool_steering_enabled: true,
-            // V32 Phase H: the deliberate exception — see the field's docs and
+            // V39: no longer the exception — see the field's docs and
             // `injection::Feature::default_enabled`.
-            opencode_native_gate_enabled: false,
+            opencode_native_gate_enabled: true,
             terminal_escape_hygiene_enabled: true,
             worker: Default::default(),
         }
@@ -4080,9 +4085,13 @@ pub fn default_claude_tab() -> TabConfig {
         theme_override: None,
         background_override: None,
         use_local_provider: false,
-        // V32 Phase G: no per-tab injection overrides on a fresh builtin — the
-        // whole hierarchy inherits, which is exactly the pre-Phase-G behaviour.
-        injection_overrides: Default::default(),
+        // V39: a newly created AI tab starts with every tab-scoped injection
+        // control explicitly OFF. L1 and every L2 ship on; the per-tab row is
+        // the switch the user reaches for, from this tab's shield badge. NOT
+        // `Default::default()` — that is all-`Inherit`, which is what an
+        // ABSENT cell in an existing settings file must keep meaning (schema
+        // step 34 → 35).
+        injection_overrides: crate::settings::injection::TabInjectionOverrides::all_off(),
     })
 }
 
@@ -4109,8 +4118,8 @@ pub fn default_claude_local_tab() -> TabConfig {
         theme_override: None,
         background_override: None,
         use_local_provider: true,
-        // V32 Phase G: see `default_claude_tab`.
-        injection_overrides: Default::default(),
+        // V39: see `default_claude_tab`.
+        injection_overrides: crate::settings::injection::TabInjectionOverrides::all_off(),
     })
 }
 
@@ -4142,10 +4151,38 @@ pub fn default_opencode_tab() -> TabConfig {
         theme_override: None,
         background_override: None,
         use_local_provider: false,
-        // V32 Phase G: no per-tab injection overrides on a fresh builtin — the
-        // whole hierarchy inherits, which is exactly the pre-Phase-G behaviour.
-        injection_overrides: Default::default(),
+        // V39: a newly created AI tab starts with every tab-scoped injection
+        // control explicitly OFF. L1 and every L2 ship on; the per-tab row is
+        // the switch the user reaches for, from this tab's shield badge. NOT
+        // `Default::default()` — that is all-`Inherit`, which is what an
+        // ABSENT cell in an existing settings file must keep meaning (schema
+        // step 34 → 35).
+        injection_overrides: crate::settings::injection::TabInjectionOverrides::all_off(),
     })
+}
+
+/// **TEST-ONLY**: one of the builtin AI tabs with its L3 injection row reset to
+/// all-`Inherit`.
+///
+/// V39 ships a newly created tab with every tab-scoped injection cell `Off`
+/// (`injection::TabInjectionOverrides::all_off`), which is the right posture for
+/// a real tab and the wrong fixture for a test about the RESOLUTION RULE: a row
+/// that already states every cell answers "off, decided at L3" before the rule
+/// under test is reached. All-`Inherit` is also a real shape — it is exactly
+/// what schema step 34 → 35 writes into every tab that predates V39, i.e. what
+/// every upgraded install carries.
+///
+/// Lives here because `AiToolTabConfig::injection_overrides` is
+/// `pub(in crate::settings)`: a test in `tabs::config` or `offload::loopback`
+/// cannot reach the field, and the boundary that makes that true is worth more
+/// than the convenience of a local fixture.
+#[cfg(test)]
+pub(crate) fn ai_tab_inheriting_injection(tab: TabConfig) -> TabConfig {
+    let mut tab = tab;
+    if let TabConfig::AiTool(c) = &mut tab {
+        c.injection_overrides = crate::settings::injection::TabInjectionOverrides::default();
+    }
+    tab
 }
 
 /// Look up the default `TabConfig` for a reserved AI tab id. Used by

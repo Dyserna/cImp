@@ -2,6 +2,14 @@ import { describe, it, expect } from 'vitest';
 import {
   reducedFeaturesFor,
   isReducedRow,
+  isTabScope,
+  tabProtectionRows,
+  protectionTint,
+  protectionSummary,
+  effectiveWord,
+  withTabInjectionOverrides,
+  setAllOverrides,
+  withMasterProtection,
   reducedSummary,
   reducedCounts,
   reducedTabLine,
@@ -21,6 +29,12 @@ import {
 } from './latch';
 import type { RulesHealth } from './offload';
 import type { TabId } from './tabs/types';
+import {
+  allOffInjectionOverrides,
+  defaultSettings,
+  TAB_INJECTION_FEATURES,
+  type Settings,
+} from './settings/types';
 
 /// The three readings the backend can hand us, named (#48, M-25).
 ///
@@ -114,7 +128,9 @@ describe('reducedFeaturesFor', () => {
       feature({ feature: 'tool_steering', effective: false, master_gated: false }),
       feature({ feature: 'consumer_hygiene', effective: false }),
     ];
-    expect(rows.filter(isReducedRow).map((f) => f.feature)).toEqual(['consumer_hygiene']);
+    expect(rows.filter((f) => isReducedRow(f, TAB)).map((f) => f.feature)).toEqual([
+      'consumer_hygiene',
+    ]);
     expect(reducedFeaturesFor(status(rows), TAB).map((f) => f.feature)).toEqual([
       'consumer_hygiene',
     ]);
@@ -141,8 +157,205 @@ describe('reducedFeaturesFor', () => {
       feature({ feature: 'canary', effective: false, in_scope: false }),
       feature({ feature: 'spotlighting' }),
     ];
-    expect(rows.filter(isReducedRow).map((f) => f.feature)).toEqual(['taint_latch']);
-    expect(reducedFeaturesFor(status(rows), TAB)).toEqual(rows.filter(isReducedRow));
+    expect(rows.filter((f) => isReducedRow(f, TAB)).map((f) => f.feature)).toEqual([
+      'taint_latch',
+    ]);
+    expect(reducedFeaturesFor(status(rows), TAB)).toEqual(
+      rows.filter((f) => isReducedRow(f, TAB)),
+    );
+  });
+
+  /// **V39, decision 5 — a tab's own `Off` cell is the tab BASELINE.**
+  ///
+  /// A newly created AI tab ships every tab-scoped cell off and the user arms
+  /// them from the tab's shield badge. Counting those cells would raise the
+  /// status chip and the muted badge on every tab of every fresh install, which
+  /// is how an indicator stops being read — the same argument Phase H made for
+  /// `default_on`, one level down.
+  ///
+  /// Backend twin: `protection_reduced`'s narrowed tab pass, and
+  /// `protection_reduced_sees_every_level` in `injection.rs`.
+  it('ignores a tab row switched off by the TAB’S OWN cell', () => {
+    const own = feature({
+      feature: 'taint_latch',
+      effective: false,
+      decided_by: 'scope',
+      override_value: 'off',
+    });
+    expect(isReducedRow(own, TAB)).toBe(false);
+    expect(reducedFeaturesFor(status([own]), TAB)).toEqual([]);
+  });
+
+  /// The other half of the narrowing, and the reason it is a narrowing rather
+  /// than "ignore tab scope": three master-gated, ships-on controls (memory
+  /// quarantine, native-web visibility, consumer hygiene) have a tab row and NO
+  /// other row. Dropping the tab pass outright would make an app-wide flip of
+  /// one of them invisible to every surface — while an upgraded tab, whose cells
+  /// schema step 34 → 35 wrote as explicit `inherit`, really did lose it.
+  it('still counts a tab row that is off because the APP-WIDE flag is off', () => {
+    const inherited = feature({
+      feature: 'consumer_hygiene',
+      label: 'Consumer hygiene',
+      effective: false,
+      decided_by: 'feature',
+      override_value: 'inherit',
+    });
+    expect(isReducedRow(inherited, TAB)).toBe(true);
+    expect(reducedFeaturesFor(status([inherited]), TAB).map((f) => f.feature)).toEqual([
+      'consumer_hygiene',
+    ]);
+    // …and one the master closed, which is the loudest case of all.
+    const mastered = feature({
+      feature: 'taint_latch',
+      effective: false,
+      decided_by: 'global',
+      override_value: 'inherit',
+    });
+    expect(isReducedRow(mastered, TAB)).toBe(true);
+  });
+
+  /// The WORKER's L3 cells are not a baseline — its row still defaults to
+  /// `inherit`, so an `off` there is a switch someone flipped. The narrowing
+  /// must not leak onto it, which is why the predicate takes a scope key rather
+  /// than a boolean.
+  it('does not extend the tab baseline to the offload worker or the app scope', () => {
+    const own = feature({
+      feature: 'canary',
+      label: 'Canary (offload worker)',
+      effective: false,
+      decided_by: 'scope',
+      override_value: 'off',
+    });
+    expect(isReducedRow(own, 'offload-worker')).toBe(true);
+    expect(isTabScope('offload-worker')).toBe(false);
+    expect(isTabScope('app')).toBe(false);
+    expect(isTabScope('claude')).toBe(true);
+  });
+});
+
+/// V39 — the tab shield badge is a standing control, so its tint and its
+/// tooltip are derived rather than conditional.
+describe('tabProtectionRows / protectionTint / protectionSummary', () => {
+  const on = (key: string) => feature({ feature: key, effective: true });
+  const off = (key: string) =>
+    feature({ feature: key, effective: false, decided_by: 'scope', override_value: 'off' });
+
+  it('takes the tab-scoped SWITCHES the backend published, in its order', () => {
+    const rows = [
+      on('taint_latch'),
+      off('spotlighting'),
+      feature({ feature: 'canary', effective: false, in_scope: false }),
+    ];
+    expect(tabProtectionRows(status(rows), TAB).map((f) => f.feature)).toEqual([
+      'taint_latch',
+      'spotlighting',
+    ]);
+  });
+
+  /// The synthetic signature-health row is `in_scope` and is a real reduction,
+  /// but it has no cell behind it: rendering it as a toggle would offer a switch
+  /// that cannot be written, and counting it in "n of m on" would mix a
+  /// measurement into a count of settings. It stays on the badge tooltip via
+  /// `reducedFeaturesFor`.
+  it('drops the synthetic signature-health row, which is not a switch', () => {
+    const s = withSignatureHealth(
+      status([feature({ feature: 'detection', label: 'Injection detection' })]),
+      INERT,
+    );
+    expect(tabProtectionRows(s, TAB).map((f) => f.feature)).toEqual(['detection']);
+    expect(reducedFeaturesFor(s, TAB).map((f) => f.feature)).toEqual([SIGNATURE_RULES_FEATURE]);
+  });
+
+  it('tints protected / partial / off, and unknown before the first report', () => {
+    expect(protectionTint([on('a'), on('b')])).toBe('protected');
+    expect(protectionTint([on('a'), off('b')])).toBe('partial');
+    expect(protectionTint([off('a'), off('b')])).toBe('off');
+    // No rows is NOT "off": we have not looked. The distinction is the same one
+    // `unknown` carries everywhere else in this file.
+    expect(protectionTint([])).toBe('unknown');
+    expect(protectionTint(tabProtectionRows(null, TAB))).toBe('unknown');
+  });
+
+  it('summarises as a count, and says so plainly when it has none', () => {
+    expect(protectionSummary([on('a'), off('b'), on('c')])).toBe('Protection: 2 of 3 on');
+    expect(protectionSummary([])).toBe('Protection: not known yet');
+    expect(effectiveWord(on('a'))).toBe('on');
+    expect(effectiveWord(off('a'))).toBe('off');
+  });
+});
+
+/// V39 — what the badge popover WRITES.
+///
+/// The properties are the ones the locked decisions are about: clone-and-patch
+/// (never a mutation of the store's object), one settings object per action
+/// however many cells moved, and only the tab that was clicked.
+describe('withTabInjectionOverrides / setAllOverrides', () => {
+  const base = (): Settings => defaultSettings();
+
+  it('patches one tab’s cell without touching the object it was given', () => {
+    const before = base();
+    const snapshot = JSON.stringify(before);
+    const after = withTabInjectionOverrides(before, 'claude' as TabId, { taint_latch: 'on' });
+    expect(JSON.stringify(before)).toBe(snapshot);
+    expect(after).not.toBe(before);
+    const tab = after.tabs.find((t) => t.kind === 'ai_tool' && t.id === 'claude');
+    expect(tab?.kind === 'ai_tool' && tab.injection_overrides.taint_latch).toBe('on');
+    // Every other cell of that tab, and every other tab, is untouched.
+    expect(tab?.kind === 'ai_tool' && tab.injection_overrides.spotlighting).toBe('off');
+    const other = after.tabs.find((t) => t.kind === 'ai_tool' && t.id !== 'claude');
+    expect(other?.kind === 'ai_tool' && other.injection_overrides.taint_latch).toBe('off');
+  });
+
+  /// "Enable all" / "Disable all" are ONE write each, not N: the patch carries
+  /// every cell and `applySettings` is called once. Asserted as the shape of the
+  /// patch, because that is what makes the single write possible.
+  it('enable-all / disable-all produce ONE settings object with every cell set', () => {
+    const rows = TAB_INJECTION_FEATURES.map((f) => feature({ feature: f }));
+    const all = setAllOverrides(rows, 'on');
+    expect(Object.keys(all).sort()).toEqual([...TAB_INJECTION_FEATURES].sort());
+    expect(Object.values(all).every((v) => v === 'on')).toBe(true);
+
+    const after = withTabInjectionOverrides(base(), 'claude' as TabId, all);
+    const tab = after.tabs.find((t) => t.kind === 'ai_tool' && t.id === 'claude');
+    expect(tab?.kind === 'ai_tool' && Object.values(tab.injection_overrides)).toEqual(
+      TAB_INJECTION_FEATURES.map(() => 'on'),
+    );
+
+    const offAgain = withTabInjectionOverrides(after, 'claude' as TabId, setAllOverrides(rows, 'off'));
+    const back = offAgain.tabs.find((t) => t.kind === 'ai_tool' && t.id === 'claude');
+    expect(back?.kind === 'ai_tool' && back.injection_overrides).toEqual(
+      allOffInjectionOverrides(),
+    );
+  });
+
+  /// Keyed off the BACKEND's rows, so "all" means the controls this scope
+  /// actually has — never a cell the tab does not carry.
+  it('writes only the rows it was handed', () => {
+    const partial = setAllOverrides([feature({ feature: 'detection' })], 'off');
+    expect(partial).toEqual({ detection: 'off' });
+  });
+
+  it('is a no-op for a tab id nothing carries', () => {
+    const before = base();
+    const after = withTabInjectionOverrides(before, 'nope' as TabId, { taint_latch: 'on' });
+    expect(after.tabs).toEqual(before.tabs);
+  });
+});
+
+/// V39 — the status chip is a control, so what it writes is a pure patch too.
+describe('withMasterProtection', () => {
+  it('flips L1 without mutating the object it was given', () => {
+    const before = defaultSettings();
+    const snapshot = JSON.stringify(before);
+    expect(before.offload.injection.protection).toBe(true);
+    const after = withMasterProtection(before, false);
+    expect(JSON.stringify(before)).toBe(snapshot);
+    expect(after.offload.injection.protection).toBe(false);
+    // …and nothing else in the block moved with it.
+    expect(after.offload.injection.taint_latch_enabled).toBe(
+      before.offload.injection.taint_latch_enabled,
+    );
+    expect(withMasterProtection(after, true).offload.injection.protection).toBe(true);
   });
 });
 
@@ -264,7 +477,9 @@ describe('withSignatureHealth', () => {
     const s = withSignatureHealth(status([detection()]), LIVE);
     expect(s?.reduced).toBe(false);
     expect(reducedFeaturesFor(s, TAB)).toEqual([]);
-    expect(injectionChipState(s, false).visible).toBe(false);
+    // V39: the chip is permanent, so "silence" is now an empty NOTE beside an
+    // `on` label rather than a hidden chip.
+    expect(injectionChipState(s, false).note).toBe(null);
   });
 
   /// The finding itself, phrased as the user sees it.
@@ -272,7 +487,7 @@ describe('withSignatureHealth', () => {
     const s = withSignatureHealth(status([detection()]), PARTIAL);
     // Silence is what full protection looks like here, and this state is not it.
     expect(s?.reduced).toBe(true);
-    expect(injectionChipState(s, false).visible).toBe(true);
+    expect(injectionChipState(s, false).note).toBe('reduced');
     const rows = reducedFeaturesFor(s, TAB);
     expect(rows.map((f) => f.feature)).toEqual([SIGNATURE_RULES_FEATURE]);
     // Nothing anywhere may claim the layer is intact…
@@ -358,8 +573,8 @@ describe('withSignatureHealth', () => {
     expect(reducedSummary(unread)).toBe('1 layer whose state could not be read');
     expect(reducedSummary(disarmed)).toBe('1 layer switched on but inert');
     // …and the chip says two different words.
-    expect(injectionChipState(unread, false).label).toBe('unverified');
-    expect(injectionChipState(disarmed, false).label).toBe('reduced');
+    expect(injectionChipState(unread, false).note).toBe('unverified');
+    expect(injectionChipState(disarmed, false).note).toBe('reduced');
   });
 
   /// #48, M-25 — the same argument one state along. A fix that made "not
@@ -399,7 +614,7 @@ describe('withSignatureHealth', () => {
     const chip = injectionChipState(partial, false);
     // A read fact about a real loss of coverage: the confident word, and never
     // `unverified` — nobody failed to read anything here.
-    expect(chip.label).toBe('reduced');
+    expect(chip.note).toBe('reduced');
     expect(chip.degraded).toBe(false);
     expect(chip.title).toContain('1 layer only partly loaded');
     expect(chip.title).not.toMatch(/\d+ controls? switched off/);
@@ -415,7 +630,7 @@ describe('withSignatureHealth', () => {
     expect(reducedCounts(s)).toEqual({ switched: 1, inert: 0, unreadable: 0, partial: 1 });
     expect(reducedSummary(s)).toBe('1 control switched off, 1 layer only partly loaded');
     const chip = injectionChipState(s, false);
-    expect(chip.label).toBe('reduced');
+    expect(chip.note).toBe('reduced');
     // Nothing here is unread, so the chip stays a confident claim.
     expect(chip.degraded).toBe(false);
     // …and the tab tooltip keeps them in separate sentences.
@@ -436,7 +651,7 @@ describe('withSignatureHealth', () => {
         false,
       );
       expect(s?.reduced).toBe(false);
-      expect(injectionChipState(s, false).visible).toBe(false);
+      expect(injectionChipState(s, false).note).toBe(null);
     }
   });
 });
@@ -522,35 +737,59 @@ describe('recordSignatureRead', () => {
   });
 });
 
-/// #48, G-3 + H-10 — the status chip, as a value.
+/// #48, G-3 + H-10, and V39 — the status chip, as a value.
 ///
 /// The chip is the one surface a user sees without opening anything, so each of
 /// its words is asserted here rather than left to a `.svelte` file no harness
 /// can render.
+///
+/// **V39 made it a standing CONTROL**: it is always visible, its label is the L1
+/// master's own value (`on` / `off`) because that is what a click inverts, and
+/// the four words it used to wear moved to `note` as modifiers. The properties
+/// that mattered before still matter — "off" and "we cannot tell" must never
+/// render alike — they are just asserted on `note` now.
 describe('injectionChipState', () => {
   const detection = (over: Partial<FeatureState> = {}) =>
     feature({ feature: 'detection', label: 'Injection detection', ...over });
 
-  it('is silent only when everything is on AND we can see that it is', () => {
+  it('is always visible and says which way the master is set', () => {
     const healthy = withSignatureHealth(status([detection()]), LIVE);
     const chip = injectionChipState(healthy, false);
-    expect(chip.visible).toBe(false);
+    expect(chip).toMatchObject({ visible: true, label: 'on', on: true, note: null });
     expect(chip.degraded).toBe(false);
-    // …and "everything is on" means the whole rule set, not merely a rule set
-    // that can match something (#48, M-25).
-    expect(injectionChipState(withSignatureHealth(status([detection()]), PARTIAL), false).visible)
-      .toBe(true);
+    // The tooltip must promise what the click does, and name the other gesture.
+    expect(chip.title).toContain('Click to turn it OFF');
+    expect(chip.title).toContain('Right-click to open Settings');
+    // A spawn-baked flip does not reach a running tab; say so where it lasts.
+    expect(chip.title).toContain('until restarted');
   });
 
-  it('shows UNVERIFIED — not silence, not "reduced" — when only the read failed', () => {
+  it('renders the master OFF as its own label, with the consequence named', () => {
+    const s: InjectionStatus = { ...status([detection()]), protection: false, reduced: true };
+    const chip = injectionChipState(s, false);
+    expect(chip).toMatchObject({ visible: true, label: 'off', on: false, degraded: false });
+    expect(chip.title).toContain('every V32 containment control is disabled');
+    expect(chip.title).toContain('Click to turn it back ON');
+    // With the master off, "reduced" beneath it is the same fact in a weaker
+    // word — the label already says everything is off.
+    expect(chip.note).toBe(null);
+  });
+
+  it('notes REDUCED when something beneath an ON master is off', () => {
+    const s = withSignatureHealth(status([detection()]), PARTIAL);
+    const chip = injectionChipState(s, false);
+    expect(chip).toMatchObject({ visible: true, label: 'on', note: 'reduced' });
+    expect(chip.title).toContain('protection is reduced');
+  });
+
+  it('notes UNVERIFIED — not "reduced" — when only the read failed', () => {
     const chip = injectionChipState(withSignatureHealth(status([detection()]), 'unknown'), false);
-    expect(chip.visible).toBe(true);
-    expect(chip.label).toBe('unverified');
+    expect(chip.label).toBe('on');
+    expect(chip.note).toBe('unverified');
     expect(chip.degraded).toBe(true);
     expect(chip.title).toContain('cannot be verified');
     expect(chip.title).toContain('could not be read');
-    // It must not tell the user a control was switched off — it explicitly
-    // says the opposite, and sends them to Settings to LOOK, not to flip.
+    // It must not tell the user a control was switched off.
     expect(chip.title).toContain('It is not switched off');
     expect(chip.title).not.toMatch(/\d+ controls? switched off/);
   });
@@ -561,26 +800,21 @@ describe('injectionChipState', () => {
       'unknown',
     );
     const chip = injectionChipState(s, false);
-    expect(chip.label).toBe('reduced');
+    expect(chip.note).toBe('reduced');
     expect(chip.degraded).toBe(true);
     expect(chip.title).toContain('1 control switched off');
     expect(chip.title).toContain('cannot be verified');
   });
 
-  it('a blind hierarchy poll outranks everything — we cannot see any of it', () => {
+  it('a blind hierarchy poll outranks every note — we cannot see any of it', () => {
     for (const s of [null, status([]), withSignatureHealth(status([detection()]), 'unknown')]) {
       const chip = injectionChipState(s, true);
-      expect(chip).toMatchObject({ visible: true, label: 'unknown', degraded: true });
+      expect(chip).toMatchObject({ visible: true, note: 'unknown', degraded: true });
+      // The MASTER is still reported: it comes from the settings the chip is
+      // about to write, not from the poll that failed.
+      expect(chip.label).toBe(s?.protection === false ? 'off' : 'on');
+      expect(chip.title).toContain('has not been able to READ');
     }
-  });
-
-  it('renders the master switch as OFF rather than as one reduction among many', () => {
-    const s: InjectionStatus = { ...status([detection()]), protection: false, reduced: true };
-    expect(injectionChipState(s, false)).toMatchObject({
-      visible: true,
-      label: 'off',
-      degraded: false,
-    });
   });
 });
 

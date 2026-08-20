@@ -2623,9 +2623,9 @@ mod tests {
         let plan = rt.block_on(plan(
             &cfg,
             SEAM_RUN_COMMAND,
-            Path::new("C:/x/y.exe"),
+            &fxp("C:/x/y.exe"),
             &GrantHints::default(),
-            Path::new("C:/proj"),
+            &fxp("C:/proj"),
             &[],
         ));
         match plan {
@@ -2734,9 +2734,9 @@ mod tests {
         let plan = rt.block_on(plan(
             &SandboxCfg::disabled(),
             SEAM_RUN_COMMAND,
-            Path::new("C:/x/git.exe"),
+            &fxp("C:/x/git.exe"),
             &GrantHints::default(),
-            Path::new("C:/proj"),
+            &fxp("C:/proj"),
             &[],
         ));
         match plan {
@@ -2777,7 +2777,7 @@ mod tests {
             let plan = rt.block_on(plan(
                 &cfg,
                 SEAM_RUN_CHECK,
-                Path::new("C:/x/cmd.exe"),
+                &fxp("C:/x/cmd.exe"),
                 &GrantHints::default(),
                 Path::new(root),
                 &[],
@@ -2849,20 +2849,79 @@ mod tests {
     // fixture would make `file_name()` answer the whole string on the Linux CI
     // runner and these tests would pass locally and fail there. The `C:\`-shaped
     // cases live in their own `cfg(windows)` test.
+    //
+    // Forward slashes are not enough on their own, though: the DRIVE PREFIX is
+    // what roots a path, and `C:/x` has no root on Linux, so every derived
+    // grant would be refused there and the assertions would be about nothing.
+    // Every fixture path therefore goes through [`fx`] (and back through
+    // [`unfx`] where an assertion compares one) — see its doc comment.
+
+    /// A drive-lettered fixture path, given a root the RUNNING OS recognizes.
+    ///
+    /// The rows below encode Windows conventions (`…\.cargo`, `…\Scripts`, a
+    /// JDK on its own volume) and the fixtures are written that way on
+    /// purpose — but every path the table derives passes
+    /// [`extra_grant_refusal`], whose first rule refuses a path with no root,
+    /// and `C:/x` has NO root on Linux (there is no drive prefix there; it is
+    /// just a directory called `C:`). Without this the whole runtime table
+    /// would silently produce zero grants on the Linux runner and the
+    /// assertions would be about nothing.
+    ///
+    /// So: identity on Windows (the drive letter is the real shape there), and
+    /// on Linux the WSL spelling — `C:/Users/me` → `/c/Users/me`. Same
+    /// components, same rules fire, same assertions, both platforms.
+    /// [`unfx`] is the inverse, applied where an assertion compares against
+    /// the Windows spelling.
+    fn fx(p: &str) -> String {
+        let b = p.as_bytes();
+        if cfg!(windows)
+            || !(b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':')
+        {
+            return p.to_string();
+        }
+        format!("/{}/{}", (b[0] as char).to_ascii_lowercase(), p[2..].trim_start_matches(['/', '\\']))
+    }
+
+    /// [`fx`] as a `PathBuf`, for the program paths a test drives.
+    fn fxp(p: &str) -> PathBuf {
+        PathBuf::from(fx(p))
+    }
+
+    /// The inverse of [`fx`]: `/c/Users/me` → `C:/Users/me` on Linux, identity
+    /// on Windows. Lets the assertions keep the Windows spelling they document.
+    fn unfx(p: &str) -> String {
+        if cfg!(windows) {
+            return p.to_string();
+        }
+        let rest = match p.strip_prefix('/') {
+            Some(r) => r,
+            None => return p.to_string(),
+        };
+        let (head, tail) = rest.split_once('/').unwrap_or((rest, ""));
+        let mut it = head.chars();
+        match (it.next(), it.next()) {
+            (Some(c), None) if c.is_ascii_alphabetic() => {
+                format!("{}:/{tail}", c.to_ascii_uppercase())
+            }
+            _ => p.to_string(),
+        }
+    }
 
     /// "These directories exist, nothing else does."
     fn dirs_exist(list: &'static [&'static str]) -> impl Fn(&Path) -> bool {
-        move |p: &Path| list.iter().any(|d| Path::new(d) == p)
+        let dirs: Vec<PathBuf> = list.iter().map(|d| fxp(d)).collect();
+        move |p: &Path| dirs.iter().any(|d| d == p)
     }
 
     /// "These variables are set, nothing else is."
     fn env_of(
         list: &'static [(&'static str, &'static str)],
     ) -> impl Fn(&str) -> Option<std::ffi::OsString> {
+        let vars: Vec<(&str, String)> = list.iter().map(|(k, v)| (*k, fx(v))).collect();
         move |name: &str| {
-            list.iter()
+            vars.iter()
                 .find(|(k, _)| k.eq_ignore_ascii_case(name))
-                .map(|(_, v)| std::ffi::OsString::from(*v))
+                .map(|(_, v)| std::ffi::OsString::from(v.clone()))
         }
     }
 
@@ -2880,10 +2939,11 @@ mod tests {
             .needs
     }
 
+    /// The granted directories, back in the Windows spelling the fixtures use.
     fn granted_dirs(n: &RuntimeNeeds) -> Vec<String> {
         n.grants
             .iter()
-            .map(|g| g.dir.to_string_lossy().replace('\\', "/"))
+            .map(|g| unfx(&g.dir.to_string_lossy().replace('\\', "/")))
             .collect()
     }
 
@@ -2908,7 +2968,7 @@ mod tests {
             env: &env,
             is_dir: &is_dir,
         };
-        let program = Path::new("C:/tools/acme/acme.exe");
+        let program = &fxp("C:/tools/acme/acme.exe");
 
         // Inference: nothing. A path convention is all it has, and there is none.
         assert!(inferred_runtime_ids(program, &m).is_empty());
@@ -2921,7 +2981,7 @@ mod tests {
 
         // `none` is the positive statement "single static binary": no row, ever,
         // even for a program inference WOULD have matched.
-        let stub = Path::new("C:/Users/me/AppData/Local/Programs/Python/Scripts/acme.exe");
+        let stub = &fxp("C:/Users/me/AppData/Local/Programs/Python/Scripts/acme.exe");
         assert_eq!(inferred_runtime_ids(stub, &m), vec!["python"]);
         assert!(runtime_matches(&RuntimeSelect::None, stub, &m).is_empty());
 
@@ -2959,7 +3019,7 @@ mod tests {
             env: &env,
             is_dir: &is_dir,
         };
-        let got = runtime_needs(Path::new("C:/Users/me/.cargo/bin/cargo.exe"), &m);
+        let got = runtime_needs(&fxp("C:/Users/me/.cargo/bin/cargo.exe"), &m);
         assert_eq!(runtime_ids(&got), vec!["rust"]);
         let n = only(&got, "rust");
         assert_eq!(
@@ -2968,11 +3028,11 @@ mod tests {
         );
         assert_eq!(
             env_named(n, "CARGO_HOME"),
-            Some(&RuntimeEnv::Dir(PathBuf::from("C:/Users/me/.cargo")))
+            Some(&RuntimeEnv::Dir(fxp("C:/Users/me/.cargo")))
         );
         assert_eq!(
             env_named(n, "RUSTUP_HOME"),
-            Some(&RuntimeEnv::Dir(PathBuf::from("C:/Users/me/.rustup")))
+            Some(&RuntimeEnv::Dir(fxp("C:/Users/me/.rustup")))
         );
         assert!(n.gaps.is_empty(), "{:?}", n.gaps);
 
@@ -2987,7 +3047,7 @@ mod tests {
             env: &env,
             is_dir: &is_dir,
         };
-        let got = runtime_needs(Path::new("C:/Users/me/.cargo/bin/cargo.exe"), &m);
+        let got = runtime_needs(&fxp("C:/Users/me/.cargo/bin/cargo.exe"), &m);
         assert_eq!(
             granted_dirs(only(&got, "rust")),
             vec!["C:/Users/me/.cargo", "D:/rust/toolchains"]
@@ -3001,7 +3061,7 @@ mod tests {
             env: &env,
             is_dir: &is_dir,
         };
-        let n = &runtime_needs(Path::new("C:/Users/me/.cargo/bin/cargo.exe"), &m)[0].needs;
+        let n = &runtime_needs(&fxp("C:/Users/me/.cargo/bin/cargo.exe"), &m)[0].needs;
         assert_eq!(granted_dirs(n), vec!["C:/Users/me/.cargo"]);
         assert_eq!(env_named(n, "RUSTUP_HOME"), None);
     }
@@ -3022,7 +3082,7 @@ mod tests {
         };
         // The live shape, and the case-insensitivity Windows paths need.
         let got = runtime_needs(
-            Path::new("C:/Users/me/AppData/Local/Python/pythoncore-3.14-64/Scripts/semgrep.exe"),
+            &fxp("C:/Users/me/AppData/Local/Python/pythoncore-3.14-64/Scripts/semgrep.exe"),
             &m,
         );
         assert_eq!(
@@ -3037,7 +3097,7 @@ mod tests {
             env: &env,
             is_dir: &is_dir,
         };
-        let got = runtime_needs(Path::new("C:/Python314/python3.14.exe"), &m);
+        let got = runtime_needs(&fxp("C:/Python314/python3.14.exe"), &m);
         let n = only(&got, "python");
         assert!(n.grants.is_empty(), "{:?}", n.grants);
         assert!(n.gaps.is_empty(), "{:?}", n.gaps);
@@ -3056,7 +3116,7 @@ mod tests {
             env: &env,
             is_dir: &is_dir,
         };
-        let got = runtime_needs(Path::new("C:/py/venv/scripts/ruff.exe"), &m);
+        let got = runtime_needs(&fxp("C:/py/venv/scripts/ruff.exe"), &m);
         let n = only(&got, "python");
         assert_eq!(granted_dirs(n), vec!["C:/py/venv"]);
         assert_eq!(n.gaps.len(), 1, "{:?}", n.gaps);
@@ -3075,7 +3135,7 @@ mod tests {
             "/usr/bin/env",
         ] {
             assert!(
-                !runtime_ids(&runtime_needs(Path::new(narrow), &m)).contains(&"python"),
+                !runtime_ids(&runtime_needs(&fxp(narrow), &m)).contains(&"python"),
                 "{narrow} must not widen the boundary"
             );
         }
@@ -3103,7 +3163,7 @@ mod tests {
             env: &env,
             is_dir: &is_dir,
         };
-        let got = runtime_needs(Path::new("C:/proj/node_modules/.bin/eslint.cmd"), &m);
+        let got = runtime_needs(&fxp("C:/proj/node_modules/.bin/eslint.cmd"), &m);
         let n = only(&got, "node");
         assert_eq!(granted_dirs(n), vec!["C:/nvm4w/nodejs"]);
         assert_eq!(
@@ -3126,7 +3186,7 @@ mod tests {
             env: &env,
             is_dir: &is_dir,
         };
-        let got = runtime_needs(Path::new("C:/proj/node_modules/.bin/knip.cmd"), &m);
+        let got = runtime_needs(&fxp("C:/proj/node_modules/.bin/knip.cmd"), &m);
         let n = only(&got, "node");
         assert!(n.grants.is_empty(), "{:?}", n.grants);
         assert_eq!(n.gaps.len(), 1);
@@ -3134,7 +3194,7 @@ mod tests {
 
         // `node.exe` itself needs no extra grant: its own directory is what the
         // engine already grants.
-        let got = runtime_needs(Path::new("C:/nvm4w/nodejs/node.exe"), &m);
+        let got = runtime_needs(&fxp("C:/nvm4w/nodejs/node.exe"), &m);
         let n = only(&got, "node");
         assert!(n.grants.is_empty() && n.gaps.is_empty(), "{n:?}");
     }
@@ -3150,12 +3210,12 @@ mod tests {
             env: &env,
             is_dir: &is_dir,
         };
-        let got = runtime_needs(Path::new("P:/WorkSync/JavaJDK/bin/java.exe"), &m);
+        let got = runtime_needs(&fxp("P:/WorkSync/JavaJDK/bin/java.exe"), &m);
         let n = only(&got, "java");
         assert_eq!(granted_dirs(n), vec!["P:/WorkSync/JavaJDK"]);
         assert_eq!(
             env_named(n, "JAVA_HOME"),
-            Some(&RuntimeEnv::Dir(PathBuf::from("P:/WorkSync/JavaJDK")))
+            Some(&RuntimeEnv::Dir(fxp("P:/WorkSync/JavaJDK")))
         );
 
         // The script: JAVA_HOME comes from the environment, never from the
@@ -3165,7 +3225,7 @@ mod tests {
             env: &env,
             is_dir: &is_dir,
         };
-        let got = runtime_needs(Path::new("C:/tools/pmd-bin-7.0.0/bin/pmd.bat"), &m);
+        let got = runtime_needs(&fxp("C:/tools/pmd-bin-7.0.0/bin/pmd.bat"), &m);
         assert_eq!(granted_dirs(only(&got, "java")), vec!["P:/WorkSync/JavaJDK"]);
 
         // …and with no JAVA_HOME anywhere, the JVM it starts is a stated gap.
@@ -3175,7 +3235,7 @@ mod tests {
             env: &env,
             is_dir: &is_dir,
         };
-        let got = runtime_needs(Path::new("C:/tools/pmd-bin-7.0.0/bin/pmd.bat"), &m);
+        let got = runtime_needs(&fxp("C:/tools/pmd-bin-7.0.0/bin/pmd.bat"), &m);
         let n = only(&got, "java");
         assert!(n.grants.is_empty());
         assert_eq!(n.gaps[0].what, "JAVA_HOME");
@@ -3197,14 +3257,12 @@ mod tests {
             is_dir: &is_dir,
         };
 
-        let got = runtime_needs(Path::new("C:/Program Files/dotnet/dotnet.exe"), &m);
+        let got = runtime_needs(&fxp("C:/Program Files/dotnet/dotnet.exe"), &m);
         let n = only(&got, "dotnet");
         assert_eq!(granted_dirs(n), vec!["C:/Users/me/.nuget/packages"]);
         assert_eq!(
             env_named(n, "NUGET_PACKAGES"),
-            Some(&RuntimeEnv::Dir(PathBuf::from(
-                "C:/Users/me/.nuget/packages"
-            )))
+            Some(&RuntimeEnv::Dir(fxp("C:/Users/me/.nuget/packages")))
         );
         assert_eq!(
             env_named(n, "DOTNET_CLI_HOME"),
@@ -3215,7 +3273,7 @@ mod tests {
             Some(&RuntimeEnv::Literal("1"))
         );
 
-        let got = runtime_needs(Path::new("C:/Program Files/Go/bin/go.exe"), &m);
+        let got = runtime_needs(&fxp("C:/Program Files/Go/bin/go.exe"), &m);
         let n = only(&got, "go");
         assert_eq!(
             granted_dirs(n),
@@ -3230,7 +3288,7 @@ mod tests {
         }
         assert_eq!(
             env_named(n, "GOMODCACHE"),
-            Some(&RuntimeEnv::Dir(PathBuf::from("C:/Users/me/go/pkg/mod")))
+            Some(&RuntimeEnv::Dir(fxp("C:/Users/me/go/pkg/mod")))
         );
 
         // A Go TOOL with no toolchain in sight says so; it never derives a
@@ -3241,7 +3299,7 @@ mod tests {
             env: &env,
             is_dir: &is_dir,
         };
-        let got = runtime_needs(Path::new("C:/tools/golangci-lint.exe"), &m);
+        let got = runtime_needs(&fxp("C:/tools/golangci-lint.exe"), &m);
         let n = only(&got, "go");
         assert!(n.grants.is_empty(), "{:?}", n.grants);
         assert_eq!(n.gaps[0].what, "GOROOT");
@@ -3261,7 +3319,7 @@ mod tests {
             is_dir: &is_dir,
         };
         let got = runtime_needs(
-            Path::new("C:/Users/me/AppData/Local/Microsoft/WindowsApps/python.exe"),
+            &fxp("C:/Users/me/AppData/Local/Microsoft/WindowsApps/python.exe"),
             &m,
         );
         let n = only(&got, "windows-store-alias");
@@ -3337,8 +3395,8 @@ mod tests {
             env: &env,
             is_dir: &is_dir,
         };
-        let matches = runtime_needs(Path::new("C:/Users/me/.cargo/bin/cargo.exe"), &m);
-        let root = Path::new("S:/");
+        let matches = runtime_needs(&fxp("C:/Users/me/.cargo/bin/cargo.exe"), &m);
+        let root = &fxp("S:/");
         let composed = compose_env_overrides(root, &matches);
         let names: Vec<&str> = composed.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(&names[..4], &["TEMP", "TMP", "HOME", "USERPROFILE"]);
@@ -3359,19 +3417,19 @@ mod tests {
             composed
                 .iter()
                 .find(|(k, _)| k == name)
-                .map(|(_, v)| v.to_string_lossy().replace('\\', "/"))
+                .map(|(_, v)| unfx(&v.to_string_lossy().replace('\\', "/")))
                 .unwrap()
         };
         assert_eq!(value("USERPROFILE"), "S:/");
         assert_eq!(value("CARGO_HOME"), "C:/Users/me/.cargo");
 
         // Scratch resolves INSIDE the root, under one obvious directory.
-        let matches = runtime_needs(Path::new("C:/Program Files/Go/bin/go.exe"), &m);
+        let matches = runtime_needs(&fxp("C:/Program Files/Go/bin/go.exe"), &m);
         let composed = compose_env_overrides(root, &matches);
         let gocache = composed
             .iter()
             .find(|(k, _)| k == "GOCACHE")
-            .map(|(_, v)| v.to_string_lossy().replace('\\', "/"))
+            .map(|(_, v)| unfx(&v.to_string_lossy().replace('\\', "/")))
             .expect("GOCACHE");
         assert_eq!(gocache, format!("S:/{SANDBOX_SCRATCH_DIR}/gocache"));
     }
@@ -3449,9 +3507,9 @@ mod tests {
             "C:/tools/.bin/thing.exe",
         ] {
             assert!(
-                runtime_needs(Path::new(near_miss), &m).is_empty(),
+                runtime_needs(&fxp(near_miss), &m).is_empty(),
                 "{near_miss} matched {:?}",
-                runtime_ids(&runtime_needs(Path::new(near_miss), &m))
+                runtime_ids(&runtime_needs(&fxp(near_miss), &m))
             );
         }
         // A program with no directory at all cannot be matched against any
@@ -3634,9 +3692,13 @@ mod tests {
         let detail = silent_exit_detail("semgrep.exe", &["scan".into()], Some(1), &cfg);
         assert!(detail.contains("produced NOTHING on either stream"), "{detail}");
         assert!(detail.contains("interpreter"), "{detail}");
-        // It records a shape, never a verdict.
+        // It records a shape, never a verdict. Only the NARRATIVE half is
+        // checked: the `Posture:` tail is a capability inventory, and on Linux
+        // it legitimately says "TCP bind+connect denied" about the boundary —
+        // which is not the row calling this child's exit a denial.
+        let narrative = detail.split("Posture:").next().unwrap();
         assert!(
-            !detail.contains("denied"),
+            !narrative.contains("denied"),
             "a silent exit is not evidence of a denial: {detail}"
         );
         // A child with no exit code at all is still describable.
@@ -3896,7 +3958,7 @@ mod tests {
     #[test]
     fn invocation_summary_is_bounded() {
         let args: Vec<String> = (0..10).map(|i| format!("--flag-{i}")).collect();
-        let got = summarize_invocation(&program_subject(Path::new("C:/bin/git.exe")), &args);
+        let got = summarize_invocation(&program_subject(&fxp("C:/bin/git.exe")), &args);
         assert!(got.starts_with("git.exe --flag-0 --flag-1 --flag-2"), "{got}");
         assert!(got.contains("(+7 more)"), "{got}");
         assert!(!got.contains("--flag-3"), "{got}");
@@ -3917,7 +3979,7 @@ mod tests {
     #[test]
     fn every_row_type_puts_the_program_in_the_target_column() {
         assert_eq!(
-            state_target("sandboxed", &program_subject(Path::new("C:/bin/git.exe"))),
+            state_target("sandboxed", &program_subject(&fxp("C:/bin/git.exe"))),
             "sandboxed — git.exe"
         );
         assert_eq!(
@@ -3950,7 +4012,7 @@ mod tests {
         let cfg = SandboxCfg {
             enabled: true,
             allow_network: true,
-            extra_grant_dirs: vec![PathBuf::from("C:/tools")],
+            extra_grant_dirs: vec![fxp("C:/tools")],
         };
         assert!(
             posture(&cfg).starts_with("network=on, extra grants=1"),

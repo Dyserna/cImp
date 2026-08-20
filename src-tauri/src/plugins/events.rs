@@ -243,6 +243,23 @@ mod tests {
     use super::*;
     use crate::plugins::loader::PluginError;
 
+    /// A plugin file path spelled the way the RUNNING OS spells one.
+    ///
+    /// The behaviour these fixtures drive — sourcing a row by its file NAME —
+    /// is cross-platform, so the fixture has to be too: `C:\cimp\plugins\a.json`
+    /// is a single opaque file name on Linux (a backslash is an ordinary
+    /// character there), so `file_name()` answers the whole string and the
+    /// assertion would be about nothing. Built with `join` from the temp
+    /// directory instead, it is a real, native, absolute path on both.
+    fn plugin_file(name: &str) -> String {
+        std::env::temp_dir()
+            .join("cimp")
+            .join("plugins")
+            .join(name)
+            .to_string_lossy()
+            .into_owned()
+    }
+
     fn err(kind: PluginErrorKind, paths: &[&str], key: Option<&str>, reason: &str) -> PluginError {
         PluginError {
             kind,
@@ -362,9 +379,10 @@ mod tests {
     /// sourced by file name rather than by a guessed one.
     #[test]
     fn an_unidentified_file_is_sourced_by_its_file_name() {
+        let broken = plugin_file("broken.json");
         let e = err(
             PluginErrorKind::Invalid,
-            ["C:\\cimp\\plugins\\broken.json"].as_slice(),
+            [broken.as_str()].as_slice(),
             None,
             "not a valid manifest",
         );
@@ -375,9 +393,10 @@ mod tests {
     /// full paths are, not just the truncated headline.
     #[test]
     fn a_conflict_row_names_every_offending_file() {
+        let (a, b) = (plugin_file("a.json"), plugin_file("b.json"));
         let e = err(
             PluginErrorKind::Conflict,
-            ["C:\\cimp\\plugins\\a.json", "C:\\cimp\\plugins\\b.json"].as_slice(),
+            [a.as_str(), b.as_str()].as_slice(),
             Some("acme@1.0.0"),
             "2 files declare the plugin `acme@1.0.0`",
         );

@@ -1507,8 +1507,13 @@ mod tests {
         // it is here to make.
         match cached_probe() {
             Err(e) => skip_or_fail("the_posture_note_states_the_network_truth", e),
+            // The two shapes `network_clause` can produce, spelled the way it
+            // spells them. A kernel at ABI 4+ (both CI runners) takes the first;
+            // WSL2's ABI 3 kernel takes the second, and the needle for it used
+            // to read "below ABI 4" while the sentence says "below Landlock ABI
+            // 4" — a stale needle that made this test kernel-dependent.
             Ok(_) => assert!(
-                note.contains("UDP") || note.contains("below ABI 4"),
+                note.contains("UDP") || note.contains("below Landlock ABI 4"),
                 "the note must state which network confinement this kernel gives: {note}"
             ),
         }

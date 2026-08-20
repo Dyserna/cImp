@@ -851,7 +851,7 @@ dependencies = [
 
 [[package]]
 name = "cimp"
-version = "0.53.0-rc.4"
+version = "0.53.0-rc.5"
 dependencies = [
  "anyhow",
  "async-trait",

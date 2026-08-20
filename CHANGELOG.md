@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.53.0-rc.5] — 2026-08-20
+
+### Fixed
+
+- **Tier-2 provider tools honour their own timeout.** The MCP host applied its
+  45 s request cap to every `tools/call`, so a provider scan that legitimately
+  ran longer could never finish and was reported as an HTTP failure. The audit
+  fan-out now passes the tool's configured timeout down to the transport
+  (model-facing calls keep the 45 s default), and a deadline that expires reads
+  "timed out after Ns waiting for the server".
+- **Refused and cancelled audit tools no longer read as failures.** A provider
+  whose server is switched off counts under *disabled* with the refusal as
+  detail; a tool stopped by the user now carries a *cancelled* status (chip,
+  summary count, report), and the `audit` Events rows say
+  `cancelled · 0 findings` / `timed out · 0 findings` / `failed · 0 findings`
+  instead of a bare count.
+- **Timeline rows on git 2.43.** The checkpoint listing asked git for six
+  trailer keys in one format; git 2.43 (stock Ubuntu 24.04) printed the union of
+  all keys for each, so every row showed `Manual`, a garbled agent/tab/session
+  and zero files. The listing now reads the whole trailer block once and
+  resolves keys locally, on any git version.
+- **Linux build and tests.** The Landlock spawn path in the audit runner
+  compiles again, and nine tests that assumed Windows drive-letter paths run on
+  both platforms — `test-linux` is green for the first time since rc.2.
+
 ## [0.53.0-rc.4] — 2026-08-20
 
 ### Added

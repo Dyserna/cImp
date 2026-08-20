@@ -2092,7 +2092,7 @@ async fn spawn_and_capture(
     // running it with the boundary quietly missing (decision D3).
     #[cfg(target_os = "linux")]
     if let crate::sandbox::Plan::Sandboxed(prepared) = &plan {
-        if let Err(e) = prepared.apply(&mut cmd, &base_env, env.iter().map(|(k, v)| (*k, *v))) {
+        if let Err(e) = prepared.apply(&mut cmd, &base_env, env.iter().map(|(k, v)| (k.as_str(), v.as_str()))) {
             return Capture {
                 stdout: String::new(),
                 stdout_truncated: false,

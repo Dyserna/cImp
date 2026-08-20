@@ -19,7 +19,7 @@ pub fn open_or_focus_settings(app: &AppHandle) -> AppResult<()> {
     let built =
         WebviewWindowBuilder::new(app, SETTINGS_LABEL, WebviewUrl::App("settings.html".into()))
             .title("cImp — Settings")
-            .inner_size(970.0, 750.0)
+            .inner_size(1210.0, 750.0)
             .min_inner_size(560.0, 480.0)
             .resizable(true)
             // Created hidden, same as the main window (tauri.conf.json

@@ -8644,9 +8644,10 @@
     padding: 16px 20px 32px;
     box-sizing: border-box;
   }
+  /* No width cap: a horizontally enlarged window widens every section and
+     its inputs instead of leaving a fixed 720px column centred in space. */
   .inner {
-    max-width: 720px;
-    margin: 0 auto;
+    width: 100%;
   }
   .loading {
     padding: var(--space-6);

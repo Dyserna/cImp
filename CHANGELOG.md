@@ -51,6 +51,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Windows directory are refused with an Events row, while the remaining grants
   still apply.
 
+## [0.53.0-rc.3] — 2026-08-20
+
+### Added
+
+- **Managed-tool steering.** AI tabs now launch with one fixed paragraph in
+  their session guidance asking the harness to prefer cImp's `run_check` and
+  `run_command` MCP tools over running the same commands in its own shell —
+  structured, deduplicated diagnostics instead of raw build dumps, and the
+  exact user-pinned binary instead of PATH resolution. The paragraph names no
+  check, binary or path (the tools' own enums are self-describing and update
+  live), so editing the tool registry never stales it and never nags a tab to
+  restart. Its `run_command` half is written only when that tool is exposed to
+  the harness; the whole paragraph is a per-tab injection feature
+  ("Managed-tool steering", default on) beside the hygiene paragraph, and it
+  applies to any harness that supports instruction injection.
+
+### Fixed
+
+- **A slow check is no longer reported as "cImp is not reachable."** The MCP
+  proxy child waited at most 30 s for any `run_check`/`run_command` answer;
+  a check that legitimately runs longer (a real `cargo build` or test suite)
+  was abandoned mid-flight and answered with a headless refusal claiming the
+  app was down — while the check completed fine inside the app (this was also
+  the cause of the long-standing `cargo-test` "not reachable" quirk). The
+  child now separates "is anything listening" (2 s connect probe — genuine
+  outages fail faster than before) from "how long may an execution run"
+  (30 min backstop for tools that execute; the app's own per-run timeout
+  remains the real bound), and if the cap is ever hit anyway the answer says
+  honestly that the outcome is unknown and the work may still be finishing —
+  it is never re-run on the fallback path and never blamed on reachability.
+- **A rapid burst of Settings edits no longer silently loses one.** The
+  Settings window's draft was replaced by every incoming settings broadcast,
+  including the echoes of its own saves; an echo landing mid-burst could
+  revert the draft and the next edit then persisted the reverted state —
+  permanently erasing an earlier change (observed live: a tool path filled by
+  Detect vanished). Broadcasts are now held back while the window's own save
+  is in flight and replayed once it settles, so cross-window changes still
+  arrive and no edit in a burst is lost.
+
 ## [0.53.0-rc.2] — 2026-08-19
 
 ### Added

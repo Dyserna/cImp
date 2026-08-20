@@ -353,7 +353,8 @@ mod frontend_mirrors {
 
         // M-3's own defect: `spotlighting` dropped from the mirror.
         const STALE: &str = "export const SPAWN_BAKED_INJECTION_FEATURES = [\n  'native_web',\n  \
-                             'consumer_hygiene',\n  'opencode_native_gate',\n] as const satisfies \
+                             'consumer_hygiene',\n  'tool_steering',\n  \
+                             'opencode_native_gate',\n] as const satisfies \
                              readonly (keyof TabInjectionOverrides)[];\n";
         let (missing, extra) = set_diff(&rust_spawn_baked(), &ts_members(STALE, "SPAWN"));
         assert_eq!(

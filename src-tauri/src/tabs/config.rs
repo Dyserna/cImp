@@ -525,6 +525,27 @@ pub(crate) fn consumer_hygiene_for(s: &Settings, agent: &str, tab: &str) -> bool
     )
 }
 
+/// Whether the managed-tool steering paragraph applies to one tab.
+///
+/// The sibling of [`consumer_hygiene_for`] — same channel, same spawn-baked
+/// shape, same per-tab resolution — so the two switches are read the same way
+/// and neither can drift into a raw settings read.
+///
+/// `baked_at_spawn` is const-asserted because this value is written into a
+/// system-prompt addendum at launch: if the feature ever stopped reporting
+/// `spawn_baked()`, `spawn_inject_sig` would stop moving for it and a tab
+/// toggled mid-session would keep (or keep lacking) the paragraph with no
+/// restart hint. That is a BUILD error here rather than a review finding.
+pub(crate) fn tool_steering_for(s: &Settings, agent: &str, tab: &str) -> bool {
+    const STEERING_AT_SPAWN: crate::settings::injection::Feature =
+        crate::settings::injection::Feature::ToolSteering.baked_at_spawn();
+    crate::settings::injection::effective(
+        STEERING_AT_SPAWN,
+        crate::settings::injection::Scope::Tab { agent, tab },
+        s,
+    )
+}
+
 /// V32 Phase H (locked decision 17): whether the generated OpenCode plugin
 /// should carry its native-tool GATE, for one tab.
 ///
@@ -796,6 +817,20 @@ pub(crate) fn compose_capability_guidance(cfg: &AiToolTabConfig, settings: &Sett
     if injection_hygiene_applies(cfg, settings) {
         addendum.push_str(&injection_hygiene_guidance());
     }
+    // Managed-tool steering, beside the hygiene paragraph and through the same
+    // channel. Gated per tab, and its `run_command` half gated additionally on
+    // this consumer's exposure flag — the flag decides whether that tool is
+    // advertised at all, and a paragraph recommending a tool the session cannot
+    // see is worse than no paragraph.
+    let agent = tab_consumer(cfg);
+    if tool_steering_for(settings, agent, &cfg.id) {
+        if !addendum.is_empty() {
+            addendum.push_str("\n\n");
+        }
+        addendum.push_str(&tool_steering_guidance(
+            settings.tool_plugins.commands_exposed_to(agent),
+        ));
+    }
     if settings.offload.enabled && settings.offload.inject_guidance {
         if !addendum.is_empty() {
             addendum.push_str("\n\n");
@@ -822,7 +857,6 @@ pub(crate) fn compose_capability_guidance(cfg: &AiToolTabConfig, settings: &Sett
             .cwd
             .clone()
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-        let agent = tab_consumer(cfg);
         if let Some(block) = fact_promotion_block(&root, settings, agent, &cfg.id) {
             if !addendum.is_empty() {
                 addendum.push_str("\n\n");
@@ -1075,6 +1109,66 @@ re-attempt the same action through a different tool or through the shell, and do
 to disable the boundary — report what was refused and continue with the rest of the task.",
         markers = crate::offload::spotlight::marker_vocabulary(),
     )
+}
+
+/// The `run_check` half of the managed-tool steering paragraph — always present
+/// when [`Feature::ToolSteering`](crate::settings::injection::Feature::ToolSteering)
+/// resolves on for the tab.
+const TOOL_STEERING_CHECKS: &str = "Managed tooling (cImp): prefer the `run_check` MCP tool over \
+running this project's build, typecheck, lint or test commands in the shell. It runs the same \
+commands the user configured and returns deduplicated, structured diagnostics at a fraction of the \
+output tokens; its `name` enum is the list of what this project has.";
+
+/// The `run_command` half — written only when this consumer's
+/// `tool_plugins.expose_commands_*` flag is on at spawn, because that flag is
+/// what advertises the tool in the first place.
+const TOOL_STEERING_COMMANDS: &str = " For any binary listed in the `run_command` tool's `tool` \
+enum, prefer `run_command` over invoking that binary through the shell: it runs the exact \
+executable the user pinned for that entry, argv-only, with no shell parsing in between.";
+
+/// The closing sentence, in both shapes — the paragraph is guidance, and the
+/// shell stays legitimate for everything the enums do not cover.
+const TOOL_STEERING_TAIL: &str = " This is a preference, not a restriction: the shell remains \
+available and is the right choice for anything these tools do not cover.";
+
+/// The **managed-tool steering** addendum: prefer cImp's `run_check` /
+/// `run_command` MCP tools over running the equivalent commands in the
+/// harness's own built-in shell.
+///
+/// # Fixed and GENERIC, by design
+///
+/// It names no check, no binary, no path — only the two MCP tools, and it points
+/// at their own `name` / `tool` enums for the contents. Three reasons, and the
+/// first is the one that makes this a rule rather than a style preference:
+///
+/// - **The enums are live; a prompt is not.** Since V38 the native tool surface
+///   re-advertises itself to a RUNNING tab (`graph::mcp`'s pulse) whenever a
+///   check is enabled, a binary is detected or a path is repointed. An enumerated
+///   paragraph is written once, at spawn, and would start lying the first time
+///   the user touched the registry — while the tool's own schema stayed correct.
+/// - **It would move the spawn signature on every registry edit.** Anything the
+///   paragraph names is a spawn-baked input, so it must ride
+///   [`spawn_inject_sig`] (that is the whole point of
+///   [`Feature::spawn_baked`](crate::settings::injection::Feature::spawn_baked)).
+///   Naming the registry would therefore nag every open tab to restart for a
+///   change that already reached it live — the exact way a restart hint stops
+///   being read.
+/// - **Token cost.** This rides every session beside the hygiene, offload and
+///   graph nudges, and a list that grows with the user's plugin directory would
+///   push the useful ones out of attention.
+///
+/// `commands_exposed` is the tab consumer's `tool_plugins.expose_commands_*`
+/// flag as resolved at spawn. Off ⇒ the `run_command` sentence is absent
+/// **entirely** rather than softened: with the flag off the tool is not
+/// advertised, and steering a session toward a tool it cannot call is worse than
+/// staying quiet.
+fn tool_steering_guidance(commands_exposed: bool) -> String {
+    let mut out = String::from(TOOL_STEERING_CHECKS);
+    if commands_exposed {
+        out.push_str(TOOL_STEERING_COMMANDS);
+    }
+    out.push_str(TOOL_STEERING_TAIL);
+    out
 }
 
 fn build_extra_args(
@@ -3066,7 +3160,11 @@ mod tests {
     /// consumer-hygiene control itself (asserted below).
     #[test]
     fn injection_hygiene_rides_a_tab_with_no_cimp_tools_at_all() {
-        let settings = Settings::default(); // offload/graph/audit all off
+        let mut settings = Settings::default(); // offload/graph/audit all off
+        // …and the OTHER always-on addendum off, so this test keeps asserting
+        // what it says it asserts — "the contract paragraph, and nothing else".
+        // Managed-tool steering has its own test below.
+        settings.set_l2_for_test(crate::settings::injection::Feature::ToolSteering, false);
         for cfg in [claude_cfg(), opencode_cfg()] {
             assert_eq!(
                 compose_capability_guidance(&cfg, &settings),
@@ -3083,6 +3181,156 @@ mod tests {
         assert!(args[i + 1].contains("UNTRUSTED-DATA"), "{:?}", args[i + 1]);
     }
 
+    // ── Managed-tool steering ─────────────────────────────────────────────
+
+    /// The three gating states, for both consumers: feature off ⇒ nothing;
+    /// feature on + `run_command` exposed ⇒ both parts; feature on + exposed off
+    /// ⇒ the `run_check` part ALONE, with the `run_command` sentence absent
+    /// entirely rather than softened.
+    #[test]
+    fn tool_steering_renders_run_command_only_when_that_tool_is_exposed() {
+        use crate::settings::injection::Feature;
+        for cfg in [claude_cfg(), opencode_cfg()] {
+            let agent = tab_consumer(&cfg);
+
+            // Off: no paragraph at all, and (with every other feature off) no
+            // addendum from this source.
+            let mut off = Settings::default();
+            off.set_l2_for_test(Feature::ToolSteering, false);
+            let text = compose_capability_guidance(&cfg, &off);
+            assert!(
+                !text.contains("Managed tooling"),
+                "{agent}: steering off must inject nothing: {text}"
+            );
+
+            // On, `run_command` exposed (the shipped default): both parts.
+            let on = Settings::default();
+            assert!(on.tool_plugins.commands_exposed_to(agent), "the default is on");
+            let text = compose_capability_guidance(&cfg, &on);
+            assert!(text.contains(TOOL_STEERING_CHECKS), "{agent}: {text}");
+            assert!(text.contains(TOOL_STEERING_COMMANDS), "{agent}: {text}");
+            assert!(text.contains(TOOL_STEERING_TAIL), "{agent}: {text}");
+
+            // On, exposure off for THIS consumer: the run_check half only.
+            let mut hidden = Settings::default();
+            hidden.tool_plugins.expose_commands_claude = false;
+            hidden.tool_plugins.expose_commands_opencode = false;
+            let text = compose_capability_guidance(&cfg, &hidden);
+            assert!(text.contains(TOOL_STEERING_CHECKS), "{agent}: {text}");
+            assert!(
+                !text.contains("run_command"),
+                "{agent}: the run_command half must be ABSENT, not softened: {text}"
+            );
+            assert!(text.contains(TOOL_STEERING_TAIL), "{agent}: {text}");
+
+            // …and the flags are per consumer: hiding the OTHER consumer's
+            // commands must not touch this one's paragraph.
+            let mut other_hidden = Settings::default();
+            if agent == "claude" {
+                other_hidden.tool_plugins.expose_commands_opencode = false;
+            } else {
+                other_hidden.tool_plugins.expose_commands_claude = false;
+            }
+            assert!(
+                compose_capability_guidance(&cfg, &other_hidden).contains(TOOL_STEERING_COMMANDS),
+                "{agent}: the other consumer's exposure flag is none of this tab's business"
+            );
+        }
+    }
+
+    /// It sits beside the hygiene paragraph, in the same addendum, for both
+    /// consumers — and Claude's `--append-system-prompt` actually carries it.
+    #[test]
+    fn tool_steering_rides_beside_the_hygiene_paragraph_for_both_consumers() {
+        let settings = Settings::default();
+        for cfg in [claude_cfg(), opencode_cfg()] {
+            let text = compose_capability_guidance(&cfg, &settings);
+            let hygiene = text
+                .find("Untrusted-content handling")
+                .expect("the hygiene paragraph leads");
+            let steering = text.find("Managed tooling").expect("the steering paragraph follows");
+            assert!(hygiene < steering, "{}: {text}", cfg.command);
+        }
+        let args = build_pre_args(&claude_cfg(), &settings, "claude", Some(&hook_endpoint()));
+        let i = args
+            .iter()
+            .position(|a| a == "--append-system-prompt")
+            .expect("guidance produces an --append-system-prompt");
+        assert!(args[i + 1].contains("Managed tooling"), "{:?}", args[i + 1]);
+    }
+
+    /// **The core of the approved design: the paragraph is FIXED and generic.**
+    ///
+    /// It names the two MCP tools and nothing else — no check name, no binary,
+    /// no path. The tools' own enums are self-describing and update live; an
+    /// injected prompt cannot, and anything the paragraph named would have to
+    /// join the spawn signature and nag every open tab on every registry edit.
+    ///
+    /// Asserted the strong way: the rendered text is byte-identical across two
+    /// settings whose check list and tool registry could not be more different.
+    #[test]
+    fn tool_steering_never_names_a_configured_check_or_command() {
+        let plain = Settings::default();
+        let mut loaded = Settings {
+            checks: vec![
+                crate::checks::CheckDef {
+                    name: "zzcheckname".to_string(),
+                    cmd: "zzcheckcmd --json".to_string(),
+                    ..Default::default()
+                },
+                crate::checks::CheckDef {
+                    name: "zzothercheck".to_string(),
+                    cmd: "zzothercmd".to_string(),
+                    ..Default::default()
+                },
+            ],
+            ..Settings::default()
+        };
+        loaded
+            .tool_plugins
+            .global_paths
+            .insert("zzplugin@9/zztool".to_string(), "C:\\zzbin\\zztool.exe".to_string());
+        loaded.tool_plugins.plugins.insert(
+            "zzplugin@9".to_string(),
+            crate::settings::PluginState::default(),
+        );
+
+        for cfg in [claude_cfg(), opencode_cfg()] {
+            let a = compose_capability_guidance(&cfg, &plain);
+            let b = compose_capability_guidance(&cfg, &loaded);
+            assert_eq!(
+                a, b,
+                "{}: the addendum must not vary with the check list or the tool registry",
+                cfg.command
+            );
+            for planted in [
+                "zzcheckname",
+                "zzothercheck",
+                "zzcheckcmd",
+                "zzothercmd",
+                "zzplugin",
+                "zztool",
+                "zzbin",
+            ] {
+                assert!(!b.contains(planted), "{}: `{planted}` leaked into: {b}", cfg.command);
+            }
+        }
+
+        // …and the two literal MCP tool names ARE allowed — they are the whole
+        // point, and they are the only names in it.
+        let both = tool_steering_guidance(true);
+        assert!(both.contains("`run_check`") && both.contains("`run_command`"), "{both}");
+        // …pointing at the enums, which is what makes the no-enumeration rule
+        // workable: the list lives in the schema, which updates live.
+        assert!(both.contains("`name` enum"), "{both}");
+        assert!(both.contains("`tool` enum"), "{both}");
+        // Tight enough to survive being read: one paragraph, no headings.
+        assert!(!both.contains('\n'), "must stay a single paragraph: {both}");
+        assert!(both.len() < 800, "too long to ride every session: {}", both.len());
+        // Guidance, not prohibition — the shell stays legitimate.
+        assert!(both.contains("not a restriction"), "{both}");
+    }
+
     /// The escape hatch is still the escape hatch: switching consumer hygiene
     /// off leaves a feature-less tab with no addendum at all, so Phase F did not
     /// quietly make the paragraph unavoidable.
@@ -3093,6 +3341,9 @@ mod tests {
             crate::settings::injection::Feature::ConsumerHygiene,
             false,
         );
+        // The steering paragraph is the second unconditional addendum; its own
+        // switch is its own escape hatch (asserted below), so it is off here.
+        settings.set_l2_for_test(crate::settings::injection::Feature::ToolSteering, false);
         for cfg in [claude_cfg(), opencode_cfg()] {
             assert_eq!(
                 compose_capability_guidance(&cfg, &settings),
@@ -6014,12 +6265,15 @@ console.log("OK: the swap reached neither the gate nor the beacon");
         // V37 Phase F: default settings are no longer a no-guidance case — the
         // injection-hygiene contract paragraph rides every tab now (see
         // `injection_hygiene_applies`), so the empty case is "hygiene off, every
-        // feature off", which is what this asserts.
+        // feature off", which is what this asserts. The managed-tool steering
+        // paragraph is the second always-on addendum and has to be switched off
+        // here for the same reason.
         let mut settings = Settings::default();
         settings.set_l2_for_test(
             crate::settings::injection::Feature::ConsumerHygiene,
             false,
         );
+        settings.set_l2_for_test(crate::settings::injection::Feature::ToolSteering, false);
         let config = build_opencode_config(&opencode_cfg(), &settings, "opencode");
         assert!(
             config.get("instructions").is_none(),

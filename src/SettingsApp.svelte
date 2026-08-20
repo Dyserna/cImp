@@ -601,6 +601,9 @@
     consumer_hygiene: {
       hint: 'The pinned OpenCode permission block and the data-not-instructions paragraph in the session guidance. Off: OpenCode inherits its upstream defaults and the session is never told how to read cImp’s markers.',
     },
+    tool_steering: {
+      hint: 'One fixed paragraph in the session guidance asking the harness to prefer the `run_check` and `run_command` MCP tools over running the same commands in its own shell. It names no check, binary or path — it points at the tools’ own enums, which update live — so editing the tool registry never changes it. The `run_command` half is written only when that tool is exposed to this consumer (Tool Plugins → advertise commands). Off: nothing is injected and the harness reaches for its shell as it would without cImp.',
+    },
     opencode_native_gate: {
       hint: 'OFF BY DEFAULT — the only control here that does. With it on, an OpenCode tab that has read external content is refused its OWN bash/read/edit/write/patch/glob/grep for the rest of the session (and, having gone local first, its own webfetch/websearch instead). Whole-surface by design: a partial gate is routed around. Policy, not containment — it runs inside OpenCode’s process, so a nested ungated `opencode`, OPENCODE_PURE=1, a user-typed !shell and the raw terminal all bypass it. A per-tab override is the usual way in; it does nothing on Claude tabs.',
     },
@@ -6788,7 +6791,10 @@
             arguments the model passes (no shell) in the project root. Hidden
             while no command tool is runnable. OpenCode caches its tool list at
             connect, so a change here shows up there only after a tab restart
-            (Tabs → Restart).
+            (Tabs → Restart). A change here also rewrites the managed-tool
+            steering paragraph a tab is launched with (Injection protection →
+            Managed-tool steering), which is spawn-baked on both harnesses — so
+            open tabs are owed a restart either way.
           </small>
           <label class="checkbox">
             <input

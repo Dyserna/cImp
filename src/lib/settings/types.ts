@@ -331,6 +331,9 @@ export interface TabInjectionOverrides {
   memory_quarantine: InjectionOverride;
   native_web: InjectionOverride;
   consumer_hygiene: InjectionOverride;
+  /// The managed-tool steering paragraph — injected beside the hygiene one, so
+  /// it carries the same per-tab row.
+  tool_steering: InjectionOverride;
   /// V32 Phase H: the OpenCode native-tool gate. `'on'` here is the per-tab way
   /// to enable it over its app-wide default `off`.
   opencode_native_gate: InjectionOverride;
@@ -369,6 +372,10 @@ export interface InjectionSettings {
   canary_enabled: boolean;
   memory_quarantine_enabled: boolean;
   consumer_hygiene_enabled: boolean;
+  /// The managed-tool steering paragraph: prefer cImp's `run_check` /
+  /// `run_command` MCP tools over the harness's own shell. Spawn-baked, same
+  /// guidance channel as the hygiene paragraph.
+  tool_steering_enabled: boolean;
   /// V32 Phase H (locked decision 17): the OpenCode plugin denying the harness's
   /// OWN native tools against the tab's taint latch. **The one L2 flag that
   /// defaults `false`** — whole-surface denial of `bash`/`read`/`edit` is an
@@ -410,6 +417,7 @@ export const SPAWN_BAKED_INJECTION_FEATURES = [
   'spotlighting',
   'native_web',
   'consumer_hygiene',
+  'tool_steering',
   'opencode_native_gate',
 ] as const satisfies readonly (keyof TabInjectionOverrides)[];
 
@@ -431,6 +439,7 @@ const SPAWN_BAKED_L2: Record<
   spotlighting: (o) => o.injection.spotlighting_enabled,
   native_web: (o) => o.native_web_visibility,
   consumer_hygiene: (o) => o.injection.consumer_hygiene_enabled,
+  tool_steering: (o) => o.injection.tool_steering_enabled,
   opencode_native_gate: (o) => o.injection.opencode_native_gate_enabled,
 };
 
@@ -2141,6 +2150,7 @@ export function defaultSettings(): Settings {
           memory_quarantine: "inherit",
           native_web: "inherit",
           consumer_hygiene: "inherit",
+          tool_steering: "inherit",
           opencode_native_gate: "inherit",
         },
       },
@@ -2180,6 +2190,7 @@ export function defaultSettings(): Settings {
           memory_quarantine: "inherit",
           native_web: "inherit",
           consumer_hygiene: "inherit",
+          tool_steering: "inherit",
           opencode_native_gate: "inherit",
         },
       },
@@ -2316,6 +2327,7 @@ export function defaultSettings(): Settings {
         canary_enabled: true,
         memory_quarantine_enabled: true,
         consumer_hygiene_enabled: true,
+        tool_steering_enabled: true,
         // V32 Phase H: the deliberate exception — ships OFF (locked decision 17).
         opencode_native_gate_enabled: false,
         terminal_escape_hygiene_enabled: true,

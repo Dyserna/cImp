@@ -198,6 +198,19 @@ pub enum Feature {
     /// The pinned OpenCode permission block + the injection-hygiene guidance
     /// addendum. Both spawn-baked.
     ConsumerHygiene,
+    /// V38 follow-up — the **managed-tool steering paragraph**: one fixed,
+    /// generic nudge in the same guidance channel as
+    /// [`Feature::ConsumerHygiene`]'s, asking the harness to prefer cImp's
+    /// `run_check` / `run_command` MCP tools over running the same commands in
+    /// its own built-in shell.
+    ///
+    /// Spawn-baked (it is written into `--append-system-prompt` / the managed
+    /// instructions file at launch) and read by both consumers. Deliberately
+    /// **not** an enumeration of check or binary names: the tools' own enums are
+    /// self-describing and update live, an injected prompt cannot, and a
+    /// paragraph that listed them would move the spawn signature on every
+    /// registry edit.
+    ToolSteering,
     /// V32 Phase H (locked decision 17): the OpenCode plugin's
     /// `tool.execute.before` handler *denying* the harness's own native tools
     /// against the tab's taint latch, rather than only beaconing on them.
@@ -228,6 +241,7 @@ impl Feature {
             Feature::MemoryQuarantine => "memory_quarantine",
             Feature::NativeWeb => "native_web",
             Feature::ConsumerHygiene => "consumer_hygiene",
+            Feature::ToolSteering => "tool_steering",
             Feature::OpencodeNativeGate => "opencode_native_gate",
             Feature::TerminalEscapeHygiene => "terminal_escape_hygiene",
         }
@@ -245,6 +259,7 @@ impl Feature {
             Feature::MemoryQuarantine => "Memory quarantine",
             Feature::NativeWeb => "Native-web visibility",
             Feature::ConsumerHygiene => "Consumer hygiene",
+            Feature::ToolSteering => "Managed-tool steering",
             Feature::OpencodeNativeGate => "OpenCode native-tool gating",
             Feature::TerminalEscapeHygiene => "Terminal escape hygiene",
         }
@@ -282,6 +297,7 @@ impl Feature {
             | Feature::MemoryQuarantine
             | Feature::NativeWeb
             | Feature::ConsumerHygiene
+            | Feature::ToolSteering
             | Feature::TerminalEscapeHygiene => true,
         }
     }
@@ -299,6 +315,7 @@ impl Feature {
             | Feature::MemoryQuarantine
             | Feature::NativeWeb
             | Feature::ConsumerHygiene
+            | Feature::ToolSteering
             | Feature::OpencodeNativeGate => true,
             Feature::Canary | Feature::TerminalEscapeHygiene => false,
         }
@@ -324,6 +341,7 @@ impl Feature {
             Feature::MemoryQuarantine
             | Feature::NativeWeb
             | Feature::ConsumerHygiene
+            | Feature::ToolSteering
             | Feature::OpencodeNativeGate
             | Feature::TerminalEscapeHygiene => false,
         }
@@ -369,6 +387,9 @@ impl Feature {
         match self {
             Feature::NativeWeb
             | Feature::ConsumerHygiene
+            // The steering paragraph is written into the launch addendum beside
+            // the hygiene one, so it owes the same restart hint.
+            | Feature::ToolSteering
             | Feature::OpencodeNativeGate
             // #48 (M-3): baked by `fact_promotion_block` into the launch
             // addendum. Also live at the proxy — see the note above.
@@ -631,6 +652,9 @@ pub struct TabInjectionOverrides {
     pub(in crate::settings) memory_quarantine: Override,
     pub(in crate::settings) native_web: Override,
     pub(in crate::settings) consumer_hygiene: Override,
+    /// The managed-tool steering paragraph. Tab-scoped exactly like
+    /// `consumer_hygiene`, which it is injected beside.
+    pub(in crate::settings) tool_steering: Override,
     /// V32 Phase H. An `On` here is the per-tab way to enable the gate over its
     /// app-wide default `off` — the shape locked decision 17 expects most users
     /// to reach for first (one hardened OpenCode tab, everything else as it was).
@@ -651,6 +675,7 @@ impl TabInjectionOverrides {
             Feature::MemoryQuarantine => self.memory_quarantine,
             Feature::NativeWeb => self.native_web,
             Feature::ConsumerHygiene => self.consumer_hygiene,
+            Feature::ToolSteering => self.tool_steering,
             Feature::OpencodeNativeGate => self.opencode_native_gate,
             Feature::Canary | Feature::TerminalEscapeHygiene => Override::Inherit,
         }
@@ -674,6 +699,7 @@ impl TabInjectionOverrides {
             Feature::MemoryQuarantine => self.memory_quarantine = value,
             Feature::NativeWeb => self.native_web = value,
             Feature::ConsumerHygiene => self.consumer_hygiene = value,
+            Feature::ToolSteering => self.tool_steering = value,
             Feature::OpencodeNativeGate => self.opencode_native_gate = value,
             Feature::Canary | Feature::TerminalEscapeHygiene => return None,
         }
@@ -708,6 +734,7 @@ impl WorkerInjectionOverrides {
             Feature::MemoryQuarantine
             | Feature::NativeWeb
             | Feature::ConsumerHygiene
+            | Feature::ToolSteering
             | Feature::OpencodeNativeGate
             | Feature::TerminalEscapeHygiene => Override::Inherit,
         }
@@ -727,6 +754,7 @@ impl WorkerInjectionOverrides {
             Feature::MemoryQuarantine
             | Feature::NativeWeb
             | Feature::ConsumerHygiene
+            | Feature::ToolSteering
             | Feature::OpencodeNativeGate
             | Feature::TerminalEscapeHygiene => return None,
         }
@@ -880,6 +908,7 @@ fn feature_l2(feature: Feature, s: &Settings) -> bool {
         Feature::Canary => inj.canary_enabled,
         Feature::MemoryQuarantine => inj.memory_quarantine_enabled,
         Feature::ConsumerHygiene => inj.consumer_hygiene_enabled,
+        Feature::ToolSteering => inj.tool_steering_enabled,
         Feature::OpencodeNativeGate => inj.opencode_native_gate_enabled,
         Feature::TerminalEscapeHygiene => inj.terminal_escape_hygiene_enabled,
         // No boolean of its own — the tri-mode IS the L2 (module docs).
@@ -1135,6 +1164,18 @@ impl Consumer {
         }
     }
 
+    /// This consumer in the normalized agent vocabulary the rest of the crate
+    /// keys on (`tabs::config::tab_consumer`,
+    /// `ToolPluginsSettings::commands_exposed_to`, the latch registry). One
+    /// spelling, so a per-consumer settings lookup cannot disagree with the
+    /// scope the same tab resolves through.
+    pub fn agent(self) -> &'static str {
+        match self {
+            Consumer::Claude => "claude",
+            Consumer::Opencode => "opencode",
+        }
+    }
+
     /// Whether `feature`'s spawn-baked value reaches this consumer's launch at
     /// all.
     ///
@@ -1152,6 +1193,10 @@ impl Consumer {
             // OpenCode's managed instructions file; the pinned permission block
             // is OpenCode's alone.
             Feature::ConsumerHygiene => true,
+            // The steering paragraph rides the SAME channel as the hygiene one,
+            // for both consumers — `compose_capability_guidance` composes them
+            // one after the other.
+            Feature::ToolSteering => true,
             // Phase H's gate exists only inside the generated OpenCode plugin.
             // This is the row the shared blob was nagging Claude tabs about.
             Feature::OpencodeNativeGate => self == Consumer::Opencode,
@@ -1205,7 +1250,9 @@ impl Consumer {
 /// The resolved native-web MODE rides alongside the switches deliberately:
 /// `sensor` and `deny` both resolve the feature "on" but launch a tab very
 /// differently, so a signature built from booleans alone would miss a mode
-/// change.
+/// change. [`Feature::ToolSteering`]'s `tool_plugins.expose_commands_*` flag
+/// rides for the same reason and is scoped the same way — see the comment at
+/// its site below, including why the tool REGISTRY deliberately stays out.
 pub fn spawn_sig(s: &Settings, consumer: Consumer) -> serde_json::Value {
     // The spawn-baked features this consumer reads, in `Feature::ALL` order.
     // Driven by `Feature::spawn_baked` rather than by a hand-written pair, so a
@@ -1216,13 +1263,16 @@ pub fn spawn_sig(s: &Settings, consumer: Consumer) -> serde_json::Value {
         .copied()
         .filter(|f| f.spawn_baked() && consumer.reads(*f))
         .collect();
-    let rows: Vec<serde_json::Value> = s
+    let consumer_tabs: Vec<_> = s
         .tabs
         .iter()
         .filter_map(|t| match t {
             TabConfig::AiTool(c) if Consumer::for_command(&c.command) == consumer => Some(c),
             _ => None,
         })
+        .collect();
+    let rows: Vec<serde_json::Value> = consumer_tabs
+        .iter()
         .map(|c| {
             let scope = Scope::tab_only(&c.id);
             let resolved: Vec<serde_json::Value> = features
@@ -1232,6 +1282,29 @@ pub fn spawn_sig(s: &Settings, consumer: Consumer) -> serde_json::Value {
             serde_json::json!([c.id, native_web_mode(s, scope).as_str(), resolved])
         })
         .collect();
+    // [`Feature::ToolSteering`]'s rendered paragraph has a second input that is
+    // not a switch in this hierarchy: `tool_plugins.expose_commands_*` decides
+    // whether the `run_command` half of it is written at all. Same reasoning as
+    // the native-web MODE below — a signature built from the feature booleans
+    // alone would miss it, and the paragraph is baked at spawn, so a flip owes
+    // the user a restart hint.
+    //
+    // Two properties this shape buys, both deliberate:
+    //
+    // * **`None` when no tab of this consumer actually renders the paragraph.**
+    //   With steering resolved off everywhere the flag cannot change what a
+    //   fresh tab writes, and nagging for it is how a restart hint stops being
+    //   read. A later `On` at any level moves the `l2`/`tabs` entries anyway, so
+    //   nothing is lost by staying quiet until then.
+    // * **The FLAG, never the registry.** Detecting a binary, enabling a plugin
+    //   check or repointing a path changes the tools' own enums, which are LIVE
+    //   (`graph::mcp`'s native pulse re-advertises them to a running tab). The
+    //   paragraph names none of them, so none of them belongs in a spawn
+    //   signature.
+    let commands_exposed = consumer_tabs
+        .iter()
+        .any(|c| effective(Feature::ToolSteering, Scope::tab_only(&c.id), s))
+        .then(|| s.tool_plugins.commands_exposed_to(consumer.agent()));
     // The app-wide L2 input for each of those features. The native-web entry is
     // the tri-mode string — that IS its L2 (the module docs' reconciliation
     // note), and it carries `sensor` vs `deny`, which a boolean would lose.
@@ -1253,6 +1326,9 @@ pub fn spawn_sig(s: &Settings, consumer: Consumer) -> serde_json::Value {
         "master": s.offload.injection.protection,
         "l2": l2,
         "tabs": rows,
+        // `null` while no tab of this consumer renders the steering paragraph —
+        // see the note above.
+        "commands_exposed": commands_exposed,
     })
 }
 
@@ -1437,6 +1513,7 @@ impl Settings {
             Feature::Canary => inj.canary_enabled = on,
             Feature::MemoryQuarantine => inj.memory_quarantine_enabled = on,
             Feature::ConsumerHygiene => inj.consumer_hygiene_enabled = on,
+            Feature::ToolSteering => inj.tool_steering_enabled = on,
             Feature::OpencodeNativeGate => inj.opencode_native_gate_enabled = on,
             Feature::TerminalEscapeHygiene => inj.terminal_escape_hygiene_enabled = on,
             Feature::NativeWeb => {
@@ -1938,6 +2015,21 @@ mod tests {
                 }),
                 &[Claude],
             ),
+            // The managed-tool steering paragraph rides the same channel as the
+            // hygiene one, for both consumers.
+            (
+                "tool-steering L2",
+                Box::new(|s: &mut Settings| s.set_l2_for_test(Feature::ToolSteering, false)),
+                &[Claude, Opencode],
+            ),
+            (
+                "tool-steering L3 on the Claude tab",
+                Box::new(|s: &mut Settings| {
+                    let id = tab_of(s, Claude);
+                    set_tab_override(s, &id, Feature::ToolSteering, Override::Off);
+                }),
+                &[Claude],
+            ),
             // V32 Phase H: both levels of the OpenCode native gate. Its flag is
             // compiled into the generated plugin, so a flip that does not move
             // the OpenCode signature is a gate the user believes is on and is
@@ -2020,6 +2112,130 @@ mod tests {
                     "{name} must not move the {c:?} spawn signature"
                 );
             }
+        }
+    }
+
+    /// [`Feature::ToolSteering`]'s second input, and the thing that must stay
+    /// OUT of the signature.
+    ///
+    /// The paragraph's `run_command` half is written only when this consumer's
+    /// `tool_plugins.expose_commands_*` flag is on at spawn, so that flag is a
+    /// spawn-baked input like the native-web mode — and per-consumer, so
+    /// flipping Claude's must not nag OpenCode tabs.
+    ///
+    /// The other half is the one that would make the paragraph unusable: a
+    /// Detect, an enable/disable or a path change in the TOOL REGISTRY must NOT
+    /// move it. Those inputs are LIVE — `graph::mcp`'s native pulse
+    /// re-advertises the `run_check` `name` / `run_command` `tool` enums to a
+    /// tab that is already running — and the paragraph deliberately names none
+    /// of them, so a restart hint for a registry edit would fire constantly and
+    /// mean nothing.
+    #[test]
+    fn tool_steering_rides_the_expose_flag_but_not_the_tool_registry() {
+        use Consumer::{Claude, Opencode};
+        let base = settings_both_consumers();
+        let claude_before = spawn_sig(&base, Claude);
+        let opencode_before = spawn_sig(&base, Opencode);
+
+        let mut s = settings_both_consumers();
+        s.tool_plugins.expose_commands_claude = false;
+        assert_ne!(
+            spawn_sig(&s, Claude),
+            claude_before,
+            "hiding `run_command` from Claude changes the paragraph a fresh Claude tab is \
+             launched with"
+        );
+        assert_eq!(
+            spawn_sig(&s, Opencode),
+            opencode_before,
+            "…and cannot reach an OpenCode tab, so it must not nag one"
+        );
+
+        let mut s = settings_both_consumers();
+        s.tool_plugins.expose_commands_opencode = false;
+        assert_ne!(spawn_sig(&s, Opencode), opencode_before);
+        assert_eq!(spawn_sig(&s, Claude), claude_before);
+
+        // With the feature resolved off for every tab, the flag cannot change
+        // what any fresh tab writes — and a nag for a change with no effect is
+        // how a restart hint stops being read.
+        let mut off = settings_both_consumers();
+        off.set_l2_for_test(Feature::ToolSteering, false);
+        let claude_off = spawn_sig(&off, Claude);
+        let opencode_off = spawn_sig(&off, Opencode);
+        off.tool_plugins.expose_commands_claude = false;
+        off.tool_plugins.expose_commands_opencode = false;
+        assert_eq!(spawn_sig(&off, Claude), claude_off, "steering off ⇒ the flag is inert");
+        assert_eq!(spawn_sig(&off, Opencode), opencode_off);
+
+        // The registry itself: none of these may move either object.
+        type Mutate = Box<dyn Fn(&mut Settings)>;
+        let registry_edits: Vec<(&str, Mutate)> = vec![
+            (
+                "a machine-wide path (what Detect writes)",
+                Box::new(|s: &mut Settings| {
+                    s.tool_plugins
+                        .global_paths
+                        .insert("demo@1/rg".to_string(), "C:\\bin\\rg.exe".to_string());
+                }),
+            ),
+            (
+                "a per-project path override",
+                Box::new(|s: &mut Settings| {
+                    s.tool_plugins.project_paths.insert(
+                        "P:\\proj".to_string(),
+                        [("demo@1/rg".to_string(), "D:\\rg.exe".to_string())]
+                            .into_iter()
+                            .collect(),
+                    );
+                }),
+            ),
+            (
+                "disabling a plugin",
+                Box::new(|s: &mut Settings| {
+                    s.tool_plugins.plugins.insert(
+                        "demo@1".to_string(),
+                        crate::settings::schema::PluginState {
+                            enabled: false,
+                            tools: Default::default(),
+                        },
+                    );
+                }),
+            ),
+            (
+                "disabling one tool inside a plugin",
+                Box::new(|s: &mut Settings| {
+                    s.tool_plugins.plugins.insert(
+                        "demo@1".to_string(),
+                        crate::settings::schema::PluginState {
+                            enabled: true,
+                            tools: [(
+                                "rg".to_string(),
+                                crate::settings::schema::ToolState {
+                                    enabled: false,
+                                    ..Default::default()
+                                },
+                            )]
+                            .into_iter()
+                            .collect(),
+                        },
+                    );
+                }),
+            ),
+        ];
+        for (name, mutate) in registry_edits {
+            let mut s = settings_both_consumers();
+            mutate(&mut s);
+            assert_eq!(
+                spawn_sig(&s, Claude),
+                claude_before,
+                "{name} is a LIVE surface change — it must not move the Claude spawn signature"
+            );
+            assert_eq!(
+                spawn_sig(&s, Opencode),
+                opencode_before,
+                "{name} is a LIVE surface change — it must not move the OpenCode spawn signature"
+            );
         }
     }
 

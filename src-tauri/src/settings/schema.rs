@@ -2155,6 +2155,11 @@ pub struct InjectionSettings {
     /// L2: the pinned OpenCode permission block + the injection-hygiene
     /// guidance addendum. Spawn-baked.
     pub(in crate::settings) consumer_hygiene_enabled: bool,
+    /// L2: the managed-tool steering paragraph — a fixed, generic nudge to
+    /// prefer cImp's `run_check` / `run_command` MCP tools over the harness's
+    /// own shell. Written into the same guidance channel as the hygiene
+    /// paragraph, so it is spawn-baked too.
+    pub(in crate::settings) tool_steering_enabled: bool,
     /// L2: V32 Phase H (locked decision 17) — the OpenCode plugin denying the
     /// harness's OWN native tools against the tab's taint latch, rather than
     /// only beaconing on the web ones. Spawn-baked (the flag is compiled into
@@ -2194,6 +2199,7 @@ impl Default for InjectionSettings {
             canary_enabled: true,
             memory_quarantine_enabled: true,
             consumer_hygiene_enabled: true,
+            tool_steering_enabled: true,
             // V32 Phase H: the deliberate exception — see the field's docs and
             // `injection::Feature::default_enabled`.
             opencode_native_gate_enabled: false,

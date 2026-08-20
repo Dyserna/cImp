@@ -94,9 +94,17 @@ describe('SPAWN_BAKED_INJECTION_FEATURES (Rust mirror)', () => {
     expect(SPAWN_BAKED_INJECTION_FEATURES).toContain('spotlighting');
   });
 
-  test('the spawn-baked set is exactly the four Rust features', () => {
+  test('the spawn-baked set is exactly the five Rust features', () => {
     expect([...SPAWN_BAKED_INJECTION_FEATURES].sort()).toEqual(
-      ['consumer_hygiene', 'native_web', 'opencode_native_gate', 'spotlighting'].sort(),
+      [
+        'consumer_hygiene',
+        'native_web',
+        'opencode_native_gate',
+        'spotlighting',
+        // The managed-tool steering paragraph, written into the same guidance
+        // channel as `consumer_hygiene`'s at launch.
+        'tool_steering',
+      ].sort(),
     );
   });
 
@@ -131,6 +139,7 @@ describe('spawnBakedInjectionL2', () => {
         (o.injection.consumer_hygiene_enabled = !o.injection.consumer_hygiene_enabled),
       opencode_native_gate: (o) =>
         (o.injection.opencode_native_gate_enabled = !o.injection.opencode_native_gate_enabled),
+      tool_steering: (o) => (o.injection.tool_steering_enabled = !o.injection.tool_steering_enabled),
     };
     const base = JSON.stringify(spawnBakedInjectionL2(offload()));
     for (const f of SPAWN_BAKED_INJECTION_FEATURES) {

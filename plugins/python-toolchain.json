@@ -2,7 +2,7 @@
   "manifest_version": 1,
   "name": "python-toolchain",
   "version": "1.0.0",
-  "label": "Python toolchain",
+  "label": "Python",
   "description": "pytest as a check and the interpreter as a command. Point them at the binaries inside the virtualenv you actually use — cImp never picks an interpreter for you.",
   "categories": [
     {

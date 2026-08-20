@@ -2,7 +2,7 @@
   "manifest_version": 1,
   "name": "js-ts-toolchain",
   "version": "1.0.0",
-  "label": "JavaScript / TypeScript toolchain",
+  "label": "JavaScript / TypeScript",
   "description": "The type checker and the test runner as checks, plus npm and node as commands. Point each one at the binary you use — a node_modules/.bin shim is a normal answer.",
   "categories": [
     {

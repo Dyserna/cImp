@@ -2,7 +2,7 @@
   "manifest_version": 1,
   "name": "dotnet-toolchain",
   "version": "1.0.0",
-  "label": ".NET toolchain",
+  "label": ".NET",
   "description": "The dotnet CLI as a build check, a test check and a command. Run the build check for compiler diagnostics and the test check for failing tests — the two read different output and neither substitutes for the other.",
   "categories": [
     {

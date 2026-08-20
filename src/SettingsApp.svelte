@@ -7150,9 +7150,11 @@
                          moved into the detail. The one piece of state that
                          cannot wait for a click is "off", because a list that
                          looks uniform while half of it is inert is a lie. -->
+                    <!-- `icon` opts out of the TUI themes' `[ … ]` bracket framing:
+                         these are list entries, not actions. -->
                     <button
                       type="button"
-                      class="plugin-list-entry"
+                      class="plugin-list-entry icon"
                       class:active={pluginActive?.key === p.key}
                       class:off={!p.enabled}
                       onclick={() => (pluginSelected = p.key)}

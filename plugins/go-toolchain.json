@@ -2,7 +2,7 @@
   "manifest_version": 1,
   "name": "go-toolchain",
   "version": "1.0.0",
-  "label": "Go toolchain",
+  "label": "Go",
   "description": "The go tool, as a build check, a vet check, a test check and a command. Each tool takes the package pattern as a variable, so a large module can be checked one directory at a time.",
   "categories": [
     {

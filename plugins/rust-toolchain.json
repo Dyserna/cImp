@@ -2,7 +2,7 @@
   "manifest_version": 1,
   "name": "rust-toolchain",
   "version": "1.0.0",
-  "label": "Rust toolchain",
+  "label": "Rust",
   "description": "cargo, as a build check, a test check, a lint check and a command. Nothing runs until you point each tool at a binary in Settings -> Tool Plugins.",
   "categories": [
     {

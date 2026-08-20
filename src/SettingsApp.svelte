@@ -617,6 +617,12 @@
     key: string;
     label: string;
     spawnBaked: boolean;
+    /// Whether the master switch above reaches this control at all
+    /// (`Feature::master_gated`). The one row that says `false` today —
+    /// managed-tool steering, a token-efficiency nudge rather than a
+    /// containment control — must stay EDITABLE while the master is off, or the
+    /// window would show a greyed checkbox for a switch that is in force.
+    masterGated: boolean;
     /// `null` ⇒ no boolean L2 to bind; the checkbox is read-only.
     field: keyof InjectionSettings | null;
     hint: string;
@@ -647,6 +653,7 @@
           key: f.feature,
           label: f.label,
           spawnBaked: f.spawn_baked,
+          masterGated: f.master_gated,
           field: injectionL2Field(f.feature),
           hint: INJECTION_FEATURE_META[f.feature]?.hint ?? '',
         });
@@ -5147,7 +5154,10 @@
             a per-feature switch app-wide, and a per-scope override. A control is
             on when the master is on <em>and</em> either the scope says so or the
             feature does. An override can re-enable a feature its app-wide switch
-            disabled; nothing re-enables anything past the master.
+            disabled; nothing re-enables a containment control past the master.
+            (<em>Managed-tool steering</em> below is not a containment control —
+            it is a token-efficiency nudge — so the master switch does not reach
+            it; its own two switches still do.)
           </small>
           <label class="checkbox">
             <input
@@ -5165,14 +5175,21 @@
           </label>
           {#if !snapshot.offload.injection.protection}
             <small class="hint down">
-              ⚠ <strong>Every V32 control is off</strong> — for every tab and the
-              offload worker. No taint latch, no spotlighting envelope, no SSRF
-              screen, no fetch budgets, no canary, no memory quarantine, no
+              ⚠ <strong>Every containment control is off</strong> — for every tab
+              and the offload worker. No taint latch, no spotlighting envelope, no
+              SSRF screen, no fetch budgets, no canary, no memory quarantine, no
               native-web visibility, no consumer hygiene, no escape stripping.
               Fetched pages reach the model as raw text and a research session can
               read your files and call out to the web in the same turn. This is the
               documented escape hatch for when a control misfires on real work; the
               per-feature switches below are the smaller instrument.
+              <br />
+              <em>Managed-tool steering</em> is the one row below this switch does
+              not touch: it injects no protection, only a paragraph asking the
+              harness to prefer cImp's <code>run_check</code> / <code>run_command</code>
+              tools over its own shell. This switch reduces your security posture; a
+              token-budget preference is not posture, so that row stays live and
+              keeps its own switches.
             </small>
           {/if}
           {#if injectionAppRestartRequired}
@@ -5185,9 +5202,10 @@
               no way to tell from here that they all have been.
             -->
             <small class="hint down">
-              ⚠ Spawn-baked changes are pending. The master switch, the native
-              web tools mode, consumer hygiene and OpenCode native-tool gating
-              are baked into an AI tab when it launches, so every running tab
+              ⚠ Spawn-baked changes are pending. The master switch, the
+              spotlighting envelope, the native web tools mode, consumer hygiene,
+              managed-tool steering and OpenCode native-tool gating are baked
+              into an AI tab when it launches, so every running tab
               keeps the posture it started with — restart them (Settings → Tabs
               → Restart) for these to apply.
             </small>
@@ -5205,7 +5223,8 @@
               <label class="checkbox">
                 <input
                   type="checkbox"
-                  disabled={!snapshot.offload.injection.protection || f.field === null}
+                  disabled={(f.masterGated && !snapshot.offload.injection.protection) ||
+                    f.field === null}
                   checked={injectionL2On(f)}
                   onchange={(e) => {
                     // A feature with no boolean L2 (native-web: its L2 IS the

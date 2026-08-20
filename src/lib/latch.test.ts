@@ -50,6 +50,7 @@ function feature(over: Partial<FeatureState>): FeatureState {
     in_scope: true,
     default_on: true,
     spawn_baked: false,
+    master_gated: true,
     ...over,
   };
 }
@@ -88,6 +89,35 @@ describe('reducedFeaturesFor', () => {
       }),
     ]);
     expect(reducedFeaturesFor(s, TAB)).toEqual([]);
+  });
+
+  /// V38: managed-tool steering is in the injection hierarchy for its switches
+  /// only — it is a token-efficiency nudge, not a containment control, so the
+  /// master switch does not close it and switching it off is not a reduction.
+  /// `default_on` cannot express that (it ships ON), which is why the backend
+  /// publishes `master_gated` and this side filters on it. The backend twin is
+  /// `tool_steering_never_counts_as_reduced_protection` in `injection.rs`.
+  it('ignores a non-master-gated feature that is switched off', () => {
+    const s = status([
+      feature({
+        feature: 'tool_steering',
+        label: 'Managed-tool steering',
+        effective: false,
+        master_gated: false,
+      }),
+    ]);
+    expect(reducedFeaturesFor(s, TAB)).toEqual([]);
+  });
+
+  it('still counts every master-gated row beside it', () => {
+    const rows = [
+      feature({ feature: 'tool_steering', effective: false, master_gated: false }),
+      feature({ feature: 'consumer_hygiene', effective: false }),
+    ];
+    expect(rows.filter(isReducedRow).map((f) => f.feature)).toEqual(['consumer_hygiene']);
+    expect(reducedFeaturesFor(status(rows), TAB).map((f) => f.feature)).toEqual([
+      'consumer_hygiene',
+    ]);
   });
 
   it('ignores rows the scope does not have', () => {

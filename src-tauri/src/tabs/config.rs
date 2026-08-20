@@ -3259,6 +3259,70 @@ mod tests {
         assert!(args[i + 1].contains("Managed tooling"), "{:?}", args[i + 1]);
     }
 
+    /// **The steering paragraph survives the injection MASTER switch.**
+    ///
+    /// The live finding: a project whose `.cimp/config.json` carries
+    /// `protection: false` lost the `run_check` / `run_command` nudge, because
+    /// the master switch closed every [`Feature`] alike. It is a
+    /// TOKEN-EFFICIENCY nudge, not a containment control — flipping the master
+    /// says "reduce my security posture", and this is not posture — so
+    /// [`Feature::master_gated`] takes it out of L1's reach and it resolves
+    /// through L3 → L2 as before.
+    ///
+    /// The hygiene paragraph beside it is the control: it IS posture, so it
+    /// still goes with the master switch.
+    #[test]
+    fn tool_steering_still_renders_with_the_injection_master_switch_off() {
+        use crate::settings::injection::{Feature, Override};
+        for cfg in [claude_cfg(), opencode_cfg()] {
+            let agent = tab_consumer(&cfg);
+
+            let mut s = Settings::default();
+            s.set_master_for_test(false);
+            let text = compose_capability_guidance(&cfg, &s);
+            assert!(
+                text.contains(TOOL_STEERING_CHECKS) && text.contains(TOOL_STEERING_COMMANDS),
+                "{agent}: the master switch is a security control, not a token budget: {text}"
+            );
+            assert!(
+                !text.contains("Untrusted-content handling"),
+                "{agent}: …while the hygiene paragraph beside it still goes with it: {text}"
+            );
+
+            // Its OWN switches still work with the master off — L2…
+            let mut l2_off = Settings::default();
+            l2_off.set_master_for_test(false);
+            l2_off.set_l2_for_test(Feature::ToolSteering, false);
+            assert!(
+                !compose_capability_guidance(&cfg, &l2_off).contains("Managed tooling"),
+                "{agent}: the app-wide switch is the escape hatch, and it still closes"
+            );
+
+            // …and this tab's L3, which must reach only this tab.
+            let mut l3_off = Settings {
+                tabs: vec![TabConfig::AiTool(cfg.clone())],
+                ..Settings::default()
+            };
+            l3_off.set_master_for_test(false);
+            l3_off
+                .set_tab_override_for_test(&cfg.id, Feature::ToolSteering, Override::Off)
+                .expect("steering carries a per-tab cell");
+            assert!(
+                !compose_capability_guidance(&cfg, &l3_off).contains("Managed tooling"),
+                "{agent}: a per-tab Off still closes it with the master off"
+            );
+
+            // …and the `run_command` half is still gated on the exposure flag.
+            let mut hidden = Settings::default();
+            hidden.set_master_for_test(false);
+            hidden.tool_plugins.expose_commands_claude = false;
+            hidden.tool_plugins.expose_commands_opencode = false;
+            let text = compose_capability_guidance(&cfg, &hidden);
+            assert!(text.contains(TOOL_STEERING_CHECKS), "{agent}: {text}");
+            assert!(!text.contains("run_command"), "{agent}: {text}");
+        }
+    }
+
     /// **The core of the approved design: the paragraph is FIXED and generic.**
     ///
     /// It names the two MCP tools and nothing else — no check name, no binary,
@@ -4448,7 +4512,14 @@ mod tests {
     }
 
     /// V32 Phase G: the master switch alone restores the pre-V32 spawn posture —
-    /// no beacon hook, no permission denial, no pinned block, no paragraph.
+    /// no beacon hook, no permission denial, no pinned block, no hygiene
+    /// paragraph.
+    ///
+    /// "No hygiene paragraph", not "no paragraph": V38's managed-tool steering
+    /// nudge is deliberately outside the master switch
+    /// ([`Feature::master_gated`](crate::settings::injection::Feature::master_gated)),
+    /// because that switch reduces security posture and the nudge is a token
+    /// budget. Asserted below so this test cannot be read as claiming otherwise.
     #[test]
     fn the_master_switch_restores_the_pre_v32_spawn_posture() {
         let mut s = Settings {
@@ -4468,7 +4539,12 @@ mod tests {
             overlay.is_none_or(|o| o["permissions"].is_null() && o["hooks"]["PreToolUse"].is_null()),
             "no denial and no beacon hook with the master off"
         );
-        assert!(!compose_capability_guidance(claude, &s).contains("Untrusted-content handling"));
+        let guidance = compose_capability_guidance(claude, &s);
+        assert!(!guidance.contains("Untrusted-content handling"));
+        assert!(
+            guidance.contains("Managed tooling"),
+            "the steering nudge is not a containment control and does not ride L1"
+        );
 
         let TabConfig::AiTool(oc) = &s.tabs[1] else {
             unreachable!()

@@ -11,8 +11,12 @@
 //! one place that resolves them".
 //!
 //! - **L1 — the global master.** [`InjectionSettings::protection`] (default
-//!   `true`). Off disables every V32 control everywhere: all tabs AND the
-//!   offload worker. It is the one switch nothing overrides upward.
+//!   `true`). Off disables every V32 **containment** control everywhere: all
+//!   tabs AND the offload worker. It is the one switch nothing overrides
+//!   upward. Its reach is [`Feature::master_gated`], and exactly one feature is
+//!   outside it — [`Feature::ToolSteering`], the V38 managed-tool nudge, which
+//!   is a token-efficiency preference rather than a security posture and has
+//!   its own L2/L3 switches instead (see that predicate for the why).
 //! - **L2 — per feature, app-wide.** One `<feature>_enabled` flag per
 //!   [`Feature`] (default `true`), with two deliberate exceptions:
 //!   [`Feature::NativeWeb`], whose L2 is a tri-mode rather than a boolean (see
@@ -26,13 +30,15 @@
 //! # The locked resolution rule
 //!
 //! ```text
-//! if !L1 { false } else { match L3 { On => true, Off => false, Inherit => L2 } }
+//! if master_gated && !L1 { false }
+//! else { match L3 { On => true, Off => false, Inherit => L2 } }
 //! ```
 //!
 //! An L3 `On` CAN re-enable a feature its L2 default disabled — that is what an
 //! override means. NOTHING re-enables past an L1 `off` — that is what a master
-//! switch means. [`decide`] is the single implementation; [`effective`] is the
-//! boolean-only shorthand.
+//! switch means, for everything the master switch is *about*
+//! ([`Feature::master_gated`]). [`decide`] is the single implementation;
+//! [`effective`] is the boolean-only shorthand.
 //!
 //! # The cross-module invariant
 //!
@@ -298,6 +304,51 @@ impl Feature {
             | Feature::NativeWeb
             | Feature::ConsumerHygiene
             | Feature::ToolSteering
+            | Feature::TerminalEscapeHygiene => true,
+        }
+    }
+
+    /// Whether the **L1 master switch** ([`InjectionSettings::protection`]) can
+    /// switch this feature off.
+    ///
+    /// `true` for every V32 containment control — that is what a master switch
+    /// means, and [`decide`] short-circuits on it.
+    ///
+    /// `false` for exactly one feature today: [`Feature::ToolSteering`]. The
+    /// master switch is the documented escape hatch for *"a containment control
+    /// is misfiring on my real work"* — flipping it says **"reduce my security
+    /// posture"**. Managed-tool steering is not posture: it is a
+    /// TOKEN-EFFICIENCY nudge, one paragraph asking the harness to prefer
+    /// `run_check` / `run_command` over its own shell. It denies nothing, it
+    /// screens nothing, and it cannot misfire in the way the escape hatch
+    /// exists for. Riding L1 made a project that had turned protection off in
+    /// its `.cimp/config.json` silently lose the nudge — a token regression
+    /// caused by a security switch, which is a switch doing something its label
+    /// does not say.
+    ///
+    /// The consequence for the rest of the hierarchy is stated where it
+    /// matters: a non-master-gated feature resolves through the unchanged
+    /// L3 → L2 path, and [`protection_reduced`] (with its frontend twin
+    /// `reducedFeaturesFor`, via the report's `master_gated` field) never counts
+    /// one — "reduced protection" is a claim about protection, and this is not
+    /// one of those controls.
+    ///
+    /// An exhaustive `match` rather than a `matches!` (#47): whether a new
+    /// control answers to the master switch is a decision, and defaulting to
+    /// either answer would let it be taken by omission.
+    pub fn master_gated(self) -> bool {
+        match self {
+            Feature::ToolSteering => false,
+            Feature::TaintLatch
+            | Feature::Spotlighting
+            | Feature::Detection
+            | Feature::SsrfGuard
+            | Feature::FetchBudgets
+            | Feature::Canary
+            | Feature::MemoryQuarantine
+            | Feature::NativeWeb
+            | Feature::ConsumerHygiene
+            | Feature::OpencodeNativeGate
             | Feature::TerminalEscapeHygiene => true,
         }
     }
@@ -795,8 +846,13 @@ pub struct Decision {
 /// The single source of truth for every V32 enforcement site.
 ///
 /// See the module docs for the locked rule — L1 short-circuits, then L3, then
-/// L2 — which is unchanged. Two subtleties in the code below:
+/// L2 — which is unchanged. Three subtleties in the code below:
 ///
+/// - the L1 short-circuit applies to the features L1 is *for*
+///   ([`Feature::master_gated`]). [`Feature::ToolSteering`] is not one: it is a
+///   token-efficiency nudge, and the master switch means "reduce my security
+///   posture". It resolves through the same L3 → L2 path with L1 simply not
+///   consulted, so it never reports [`DecidedBy::Global`];
 /// - [`Feature::NativeWeb`]'s L2 is derived from the tri-mode rather than stored
 ///   as a boolean ([`native_web_l2`]);
 /// - at [`Scope::UnknownCaller`] an L3 `On` stated by **any** configured tab is
@@ -811,7 +867,12 @@ pub struct Decision {
 ///   resolution order for a known scope does not move.
 pub fn decide(feature: Feature, scope: Scope<'_>, s: &Settings) -> Decision {
     let inj = &s.offload.injection;
-    if !inj.protection {
+    // L1 short-circuits — for every feature the master switch is ALLOWED to
+    // close ([`Feature::master_gated`]). The one that is not (managed-tool
+    // steering, a token nudge rather than a containment control) falls straight
+    // through to the unchanged L3 → L2 path below, so an install with
+    // protection off keeps it.
+    if feature.master_gated() && !inj.protection {
         return Decision {
             effective: false,
             decided_by: DecidedBy::Global,
@@ -1366,6 +1427,18 @@ pub struct FeatureState {
     /// now renders from this report, so a V33 control appears in Settings with
     /// its restart hint the day it is declared.
     pub spawn_baked: bool,
+    /// [`Feature::master_gated`] — whether the L1 master switch reaches this
+    /// control at all.
+    ///
+    /// Published for the same reason as `default_on`: the "is protection
+    /// REDUCED here?" rule must have ONE definition. [`protection_reduced`]
+    /// skips non-master-gated features (a token nudge switched off is not less
+    /// protection), and `latch.ts`'s `isReducedRow` has to skip exactly the same
+    /// rows — which it could not derive from `default_on`, since managed-tool
+    /// steering ships ON. The Settings matrix reads it too: its L2 checkbox is
+    /// disabled while the master is off, and a row the master cannot reach must
+    /// stay editable and say so.
+    pub master_gated: bool,
 }
 
 /// Whether `scope` carries a row for `feature` at all — the structural question
@@ -1404,13 +1477,20 @@ pub fn report(s: &Settings, scope: Scope<'_>) -> Vec<FeatureState> {
                 in_scope: feature_in_scope(*f, scope),
                 default_on: f.default_enabled(),
                 spawn_baked: f.spawn_baked(),
+                master_gated: f.master_gated(),
             }
         })
         .collect()
 }
 
 /// Whether protection is REDUCED anywhere the user can see — the master is off,
-/// or any feature that ships ON resolves off at a scope that has a row for it.
+/// or any master-gated feature that ships ON resolves off at a scope that has a
+/// row for it.
+///
+/// **Only master-gated controls count** ([`Feature::master_gated`]). V38's
+/// managed-tool steering lives in this hierarchy for its switches, not because
+/// it protects anything; switching it off is a token-budget choice, and a
+/// security indicator that lights for it is an indicator that stops being read.
 ///
 /// **"Reduced" is measured against each feature's default**
 /// ([`Feature::default_enabled`]), not against `true`. Phase H's OpenCode native
@@ -1450,7 +1530,15 @@ pub fn protection_reduced(s: &Settings) -> bool {
     }
     let any_off = |scope: Scope<'_>| {
         Feature::ALL.iter().any(|f| {
-            f.default_enabled() && feature_in_scope(*f, scope) && !effective(*f, scope, s)
+            // Only controls the master switch is ABOUT can reduce protection:
+            // managed-tool steering switched off costs tokens, not posture, and
+            // counting it would raise the ⛨ chip for a preference. The frontend
+            // twin (`isReducedRow` in `latch.ts`) filters on the same bit,
+            // published per row as `master_gated`.
+            f.master_gated()
+                && f.default_enabled()
+                && feature_in_scope(*f, scope)
+                && !effective(*f, scope, s)
         })
     };
     // `AppWide`, not `UnknownCaller` (#48, F-35), and the two are provably equal
@@ -1808,12 +1896,135 @@ mod tests {
                 }
             );
         }
-        // And with the master off EVERY feature is off, at every scope.
-        for f in Feature::ALL {
+        // And with the master off every feature the master is ABOUT is off, at
+        // every scope — locked decision (b). The exception is named rather than
+        // skipped silently: a second one appearing by accident fails here.
+        for f in Feature::ALL.iter().filter(|f| f.master_gated()) {
             for scope in [tab_scope(&id), Scope::OffloadWorker, Scope::AppWide] {
                 assert!(!effective(*f, scope, &s), "{f:?} at {scope:?}");
             }
         }
+        let ungated: Vec<_> = Feature::ALL.iter().filter(|f| !f.master_gated()).collect();
+        assert_eq!(ungated, vec![&Feature::ToolSteering]);
+    }
+
+    /// **Locked decision: the managed-tool steering nudge is NOT master-gated.**
+    ///
+    /// The live finding this closes: a project with `protection: false` in its
+    /// `.cimp/config.json` lost the `run_check` / `run_command` paragraph, so a
+    /// SECURITY escape hatch silently made the session more expensive. The
+    /// master switch means "reduce my security posture"; a token nudge is not
+    /// posture.
+    ///
+    /// (a) With L1 off the feature resolves through the unchanged L3 → L2 path,
+    /// and it never reports [`DecidedBy::Global`] — there is no level above L2
+    /// for it to name.
+    #[test]
+    fn tool_steering_is_not_closed_by_the_master_switch() {
+        let f = Feature::ToolSteering;
+        assert!(!f.master_gated());
+        let mut s = settings();
+        let id = a_tab(&s);
+        s.set_master_for_test(false);
+
+        // L2 default: on, decided by the feature level.
+        for scope in [tab_scope(&id), Scope::AppWide, Scope::UnknownCaller] {
+            assert_eq!(
+                decide(f, scope, &s),
+                Decision {
+                    effective: true,
+                    decided_by: DecidedBy::Feature
+                },
+                "{scope:?}"
+            );
+        }
+
+        // L2 off, through the sanctioned test-only writer.
+        let mut off = s.clone();
+        off.set_l2_for_test(f, false);
+        assert_eq!(
+            decide(f, tab_scope(&id), &off),
+            Decision {
+                effective: false,
+                decided_by: DecidedBy::Feature
+            }
+        );
+
+        // L3 Off wins over the L2 `on`…
+        let mut l3_off = s.clone();
+        set_tab_override(&mut l3_off, &id, f, Override::Off);
+        assert_eq!(
+            decide(f, tab_scope(&id), &l3_off),
+            Decision {
+                effective: false,
+                decided_by: DecidedBy::Scope
+            }
+        );
+        // …and only for that tab.
+        assert!(effective(f, tab_scope("some-other-tab"), &l3_off));
+
+        // …and L3 On wins over an L2 `off`.
+        let mut l3_on = off.clone();
+        set_tab_override(&mut l3_on, &id, f, Override::On);
+        assert_eq!(
+            decide(f, tab_scope(&id), &l3_on),
+            Decision {
+                effective: true,
+                decided_by: DecidedBy::Scope
+            }
+        );
+    }
+
+    /// (c) The reduced-protection predicate ignores managed-tool steering
+    /// entirely — with protection ON and the nudge off at any level, nothing is
+    /// reduced. Its frontend twin (`isReducedRow` in `latch.ts`) filters on the
+    /// `master_gated` bit the report publishes, and (d) below pins that the bit
+    /// says what [`Feature::master_gated`] says.
+    #[test]
+    fn tool_steering_never_counts_as_reduced_protection() {
+        let f = Feature::ToolSteering;
+        let base = settings();
+        assert!(!protection_reduced(&base));
+        assert!(f.default_enabled(), "it ships on, so `default_on` cannot filter it");
+
+        let mut l2 = settings();
+        l2.set_l2_for_test(f, false);
+        assert!(
+            !protection_reduced(&l2),
+            "a token nudge switched off app-wide is not less protection"
+        );
+
+        let mut l3 = settings();
+        let id = a_tab(&l3);
+        set_tab_override(&mut l3, &id, f, Override::Off);
+        assert!(!protection_reduced(&l3), "…nor is one tab opting out of it");
+
+        // The master switch still counts, exactly as before.
+        let mut master = settings();
+        master.set_master_for_test(false);
+        assert!(protection_reduced(&master));
+    }
+
+    /// (d) The cross-module invariant, backend half: every report row's
+    /// `master_gated` is [`Feature::master_gated`]'s answer, so the frontend
+    /// twin can filter on it instead of restating the rule in TypeScript.
+    #[test]
+    fn every_report_row_publishes_its_master_gating() {
+        let s = settings();
+        let id = a_tab(&s);
+        for scope in [tab_scope(&id), Scope::OffloadWorker, Scope::AppWide] {
+            for (row, f) in report(&s, scope).iter().zip(Feature::ALL) {
+                assert_eq!(row.master_gated, f.master_gated(), "{}", f.key());
+            }
+        }
+        assert_eq!(
+            report(&s, Scope::AppWide)
+                .iter()
+                .filter(|r| !r.master_gated)
+                .map(|r| r.feature)
+                .collect::<Vec<_>>(),
+            vec!["tool_steering"]
+        );
     }
 
     /// The worker pseudo-scope carries its own row, independent of every tab's.
@@ -2765,7 +2976,7 @@ mod tests {
             .expect("detection has a worker row");
         set_tab_override(&mut s, &id, f, Override::On);
         s.set_master_for_test(false);
-        for feature in Feature::ALL {
+        for feature in Feature::ALL.iter().filter(|f| f.master_gated()) {
             assert!(
                 !armed_anywhere(*feature, &s),
                 "{feature:?} — the master switch always wins"
@@ -2823,6 +3034,7 @@ mod tests {
             assert_eq!(row.label, f.label());
             assert_eq!(row.default_on, f.default_enabled());
             assert_eq!(row.spawn_baked, f.spawn_baked(), "{}", f.key());
+            assert_eq!(row.master_gated, f.master_gated(), "{}", f.key());
         }
         let by = |k: &str| rows.iter().find(|r| r.feature == k).unwrap();
         assert_eq!(by("detection").decided_by, DecidedBy::Feature);
@@ -2835,6 +3047,14 @@ mod tests {
 
         s.offload.injection.protection = false;
         for r in report(&s, tab_scope(&id)) {
+            if !r.master_gated {
+                // The master switch is not above this row, so it cannot be the
+                // level that decided it — L2/L3 still is, and it is still ON.
+                assert_eq!(r.feature, "tool_steering");
+                assert_eq!(r.decided_by, DecidedBy::Feature);
+                assert!(r.effective);
+                continue;
+            }
             assert_eq!(r.decided_by, DecidedBy::Global, "{}", r.feature);
             assert!(!r.effective);
         }

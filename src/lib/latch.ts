@@ -124,6 +124,13 @@ export interface FeatureState {
   /// the backend's `Feature::spawn_baked` instead of a hand-kept TypeScript
   /// copy of it.
   spawn_baked: boolean;
+  /// Whether the L1 master switch reaches this control at all. Mirror of Rust
+  /// `Feature::master_gated`, published for the same reason as `default_on`:
+  /// "is protection reduced here?" must have ONE definition. V38's managed-tool
+  /// steering is a token-efficiency nudge rather than a containment control, so
+  /// the master switch does not close it and switching it off is not a
+  /// reduction — and `default_on` cannot express that, since it ships ON.
+  master_gated: boolean;
   /// Why this row is off, when `decided_by` cannot say.
   ///
   /// Absent on every row the backend publishes — those are settings, and the
@@ -244,7 +251,7 @@ export const protectionReduced: Readable<boolean> = derived(
 /// than restate it — the status chip restated it without the `default_on` clause
 /// and disagreed with the tab badge beside it, in the same viewport.
 ///
-/// Three filters, all structural rather than cosmetic:
+/// Four filters, all structural rather than cosmetic:
 /// - only rows the scope actually HAS — a tab is not "reduced" because the
 ///   worker-only canary does not apply to it;
 /// - only rows that are actually off;
@@ -253,12 +260,20 @@ export const protectionReduced: Readable<boolean> = derived(
 ///   badge on every tab of a fresh install — which is how a badge stops being
 ///   read. Uses the backend's own `default_on` rather than a second list of
 ///   defaults in TypeScript.
+/// - only features the master switch is ABOUT (`master_gated`). V38's
+///   managed-tool steering lives in the same hierarchy for its switches, but it
+///   is a token-efficiency nudge: switching it off costs tokens, not
+///   protection, and a security indicator that lights for it stops being read.
+///   The backend's `protection_reduced` skips exactly these rows — this is the
+///   cross-module invariant the two halves are pinned on, in
+///   `injection.rs`'s `tool_steering_never_counts_as_reduced_protection` and in
+///   `latch.test.ts` beside it.
 ///
 /// The synthetic signature-health row passes: it is `in_scope`, off, and ships
 /// on. It is a reduction — it just is not a *switch*, which is what `reason`
 /// says and what [`reducedSummary`] counts separately.
 export function isReducedRow(f: FeatureState): boolean {
-  return f.in_scope && !f.effective && f.default_on;
+  return f.in_scope && !f.effective && f.default_on && f.master_gated;
 }
 
 /// The features resolved OFF for one tab, for the tab badge and its popover.
@@ -625,6 +640,9 @@ export function withSignatureHealth(
     // Nothing to bake into a spawn: this row is a fact about the rules
     // directory, not a switch. It never reaches the Settings matrix.
     spawn_baked: false,
+    // It IS a protection fact — the signature layer not matching is less
+    // containment — so it stays inside `isReducedRow`'s master-gated filter.
+    master_gated: true,
     unknown: unreadable,
     partial,
     reason,

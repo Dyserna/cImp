@@ -7470,7 +7470,8 @@
           <label class="field">
             <span>Extra readable tool directories</span>
             <textarea
-              rows="3"
+              class="sandbox-dirs"
+              rows="5"
               disabled={!snapshot.sandbox.enabled}
               value={snapshot.sandbox.extra_grant_dirs.join('\n')}
               onchange={(e) =>
@@ -8494,6 +8495,21 @@
   }
   /* Multiline, word-wrapping Server command field so every argument of a long
      llama-server invocation stays visible without horizontal scrolling. */
+  /* Extra readable tool directories: one path per line, so it wants the full
+     column width and enough rows to show a handful without scrolling. */
+  textarea.sandbox-dirs {
+    width: 100%;
+    box-sizing: border-box;
+    resize: vertical;
+    background: var(--surface-sunken);
+    border: 1px solid var(--border-default);
+    color: var(--text-primary);
+    padding: 6px var(--space-2);
+    border-radius: var(--radius-md);
+    font-family: var(--font-mono, monospace);
+    font-size: var(--font-size-sm);
+    line-height: 1.4;
+  }
   textarea.server-command {
     width: 100%;
     box-sizing: border-box;

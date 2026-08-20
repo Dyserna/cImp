@@ -577,9 +577,13 @@ fn truncate_label(label: &str) -> String {
 ///   character of a multi-line value — split the commit's last paragraph so
 ///   git stops recognizing it as a trailer block at all;
 /// - the `\u{1e}` / `\u{1f}` record/field separators [`list`] parses on would
-///   fragment the `for-each-ref` record and shift every field after this one,
-///   which is the failure mode that makes a checkpoint *silently vanish* from
-///   the Timeline;
+///   fragment the `for-each-ref` record — a `\u{1e}` splits one checkpoint into
+///   two half-rows, which is the failure mode that makes a checkpoint *silently
+///   vanish* from the Timeline. (Since the trailer block became the record's
+///   LAST field, a `\u{1f}` no longer shifts the fields before it, and [`list`]
+///   rejoins the pieces past it rather than truncating the block — but a value
+///   that has to be repaired to be read is still not the value that was
+///   asserted, so it stays rejected here.)
 /// - any other control character, on the same "not a value, a framing hazard"
 ///   footing (this is the rule [`truncate_label`] already applies to labels);
 /// - an implausibly long value ([`MAX_IDENTITY_LEN`]).
@@ -621,6 +625,77 @@ fn trailer_identity(raw: Option<&str>) -> &str {
 fn identity_field(raw: Option<&str>) -> Option<String> {
     let value = raw?.trim();
     (!value.is_empty() && value != IDENTITY_ABSENT).then(|| value.to_string())
+}
+
+/// One checkpoint commit's trailer block — the `Key: value` lines git emitted
+/// for a single ref via `%(trailers:unfold)` — parsed **locally**, in Rust.
+///
+/// # Why this exists at all
+///
+/// [`list`] used to let git split the block for it, with one
+/// `%(trailers:key=…,valueonly)` atom per field. That is broken on git 2.43.0
+/// (stock Ubuntu 24.04; Debian 12 ships 2.39): with more than one trailer atom
+/// in a format string, EVERY atom prints the union of all the requested keys'
+/// values. Asking for the whole block once — a single atom, correct on every
+/// git — and keying it apart here is correct without sniffing a git version.
+/// See [`list`] for the symptom that produced.
+///
+/// # Parsing rules (all asserted by `tests::trailer_block_parsing_rules`)
+///
+/// 1. The block is split on `\n`; one trailing `\r` per line is stripped, so a
+///    commit message stored with CRLF parses the same as one stored with LF.
+/// 2. A line is a trailer iff it contains a `:` and the text before the FIRST
+///    `:` is non-empty and free of whitespace. The key is that text; the value
+///    is everything after that `:`, trimmed.
+/// 3. A line that does not match — a blank line, a non-trailer line git
+///    included because `%(trailers)` was not asked for `only`, or a folded
+///    continuation line (which begins with whitespace, so rule 2 rejects it) —
+///    is IGNORED, not treated as a key. `unfold` normally joins continuation
+///    lines onto their trailer's line before we ever see them; this rule is
+///    what makes the parser correct if it ever does not, and is also what stops
+///    a folded value from forging a key of its own.
+/// 4. Keys are matched **case-insensitively** (ASCII), which is what
+///    `%(trailers:key=…)` did.
+/// 5. A duplicate key resolves to the **first** occurrence. Our writer emits
+///    each key exactly once, so a duplicate means a hand-made or tampered
+///    commit — and since a trailer can only be appended AFTER the ones
+///    [`snapshot`] wrote, first-wins is the occurrence we actually authored.
+///    (git's `key=` atom concatenated all matches instead, which is strictly
+///    worse: two values fused into one string.)
+/// 6. A key that is not in the block is `None`, exactly as an absent field was
+///    before — that is what keeps pre-V33 checkpoints listing.
+struct TrailerBlock<'a> {
+    /// In block order, first occurrence of a key first. Small (single digits),
+    /// so a linear scan beats a map and keeps the "first wins" rule visible.
+    entries: Vec<(&'a str, &'a str)>,
+}
+
+impl<'a> TrailerBlock<'a> {
+    fn parse(block: &'a str) -> Self {
+        let mut entries = Vec::new();
+        for line in block.split('\n') {
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            let Some((key, value)) = line.split_once(':') else {
+                continue; // not a trailer line
+            };
+            if key.is_empty() || key.chars().any(char::is_whitespace) {
+                // Leading whitespace (a folded continuation line) or an empty
+                // key: not a trailer, and deliberately not a key we will match.
+                continue;
+            }
+            entries.push((key, value.trim()));
+        }
+        Self { entries }
+    }
+
+    /// The value for `key`, or `None` if the commit does not carry it. See the
+    /// type's rules 4–6 for case-insensitivity, duplicates, and absence.
+    fn get(&self, key: &str) -> Option<&'a str> {
+        self.entries
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(key))
+            .map(|(_, v)| *v)
+    }
 }
 
 /// `true` if `id` is a well-formed checkpoint tag name (`cp-<digits>`). The one
@@ -1005,6 +1080,64 @@ async fn snapshot_inner(
     Ok(SnapshotOutcome::Created(tag))
 }
 
+/// Record separator for [`list_format`]: a literal
+/// [record separator](https://en.wikipedia.org/wiki/C0_and_C1_control_codes)
+/// (U+001E) rather than `\n`, because the trailer block is printed as-is —
+/// newlines and all — so splitting records on `\n` would fragment a single
+/// ref's output into several pieces. `%x00` is NOT recognized as a hex escape
+/// by `for-each-ref --format` (verified against git 2.54: it comes through as
+/// the four literal characters `%x00`, not a NUL byte), which is why the
+/// separator is embedded literally in the format string — for-each-ref prints
+/// it as-is since it isn't part of any `%(...)` atom. `\n` only ever shows up
+/// embedded WITHIN the trailing trailer-block field after this, plus git's own
+/// automatic end-of-line newline trailing the RS, which [`list`]'s whole-record
+/// and per-field `.trim()`s strip.
+const REC_SEP: char = '\u{1e}';
+
+/// The `for-each-ref --format` [`list`] reads every checkpoint's metadata with.
+///
+/// **One `%(trailers)` atom, keyed apart locally by [`TrailerBlock`]** —
+/// deliberately NOT the six `%(trailers:key=…,valueonly)` atoms this read
+/// used before. On git 2.43.0 (stock Ubuntu 24.04; Debian 12 ships 2.39)
+/// every trailer atom in a MULTI-atom format prints the UNION of all the
+/// requested keys' values instead of its own, so all six fields came back as
+/// the same concatenated blob: every Timeline row read `trigger: Manual`
+/// (the [`Trigger::parse`] fallback), a garbage `agent`/`session`/`tab`/
+/// `source`, and `files_changed: 0`. Newer gits (2.54 verified) get it
+/// right, and one atom is correct on both — which is the whole point:
+/// requesting the WHOLE block once and doing the key lookup in Rust is
+/// version-independent BY CONSTRUCTION, so nothing here sniffs a git
+/// version, and it is still one subprocess for the entire listing rather
+/// than a per-ref fan-out. (`unfold` asks git to join a folded multi-line
+/// trailer value back onto one line; [`TrailerBlock::parse`] does not depend
+/// on it having done so.)
+///
+/// The trailer block is the LAST field of the record because it is the only
+/// field that can contain newlines.
+///
+/// Backward compatibility is mandatory here: a user's `.cimp/shadow.git` is
+/// full of checkpoints whose commit messages carry only the three Phase C
+/// trailers, and an upgrade that emptied their Timeline would be a
+/// data-loss-shaped bug. A key the commit does not have is simply absent
+/// from the block and reads back as `None` (or the field's default), and the
+/// record's field COUNT no longer depends on which trailers a checkpoint
+/// carries at all — so no missing trailer can shift a field, and adding a
+/// seventh trailer some day cannot either. That is asserted against a real
+/// repo of hand-built old-format commits by
+/// `tests::old_eight_field_checkpoints_still_list_after_the_identity_fields`
+/// rather than assumed.
+///
+/// Built here rather than inline in [`list`] so
+/// `tests::the_listing_format_asks_for_the_whole_trailer_block_once` can pin
+/// that property directly, without needing git.
+fn list_format() -> String {
+    format!(
+        "%(objectname){sep}%(creatordate:unix){sep}%(creatordate:iso-strict){sep}%(contents:subject){sep}%(refname:short){sep}%(trailers:unfold){rec_sep}",
+        sep = FIELD_SEP,
+        rec_sep = REC_SEP
+    )
+}
+
 /// Every checkpoint, oldest first, read back from `refs/tags/cp-*` via
 /// `for-each-ref` (no separate metadata store — see [`snapshot`]'s doc
 /// comment). Returns an empty list (not an error) when the shadow repo has
@@ -1016,46 +1149,7 @@ pub async fn list(root: &Path) -> AppResult<Vec<Checkpoint>> {
         return Ok(Vec::new());
     }
     let ctx = shadow_ctx(root);
-    // `%(trailers:...)` tokens each carry their OWN trailing newline as part
-    // of the field's value (documented git behavior, not an artifact) —
-    // splitting records on `\n` would therefore fragment a single ref's
-    // formatted line into several pieces. `%x00` is NOT recognized as a hex
-    // escape by `for-each-ref --format` (verified against git 2.54: it comes
-    // through as the four literal characters `%x00`, not a NUL byte) — so
-    // terminate each record with a literal record-separator control
-    // character (U+001E) instead, which for-each-ref prints as-is since it
-    // isn't part of any `%(...)` atom. `\n` only ever shows up embedded
-    // WITHIN a field after this (trailer values, plus git's own automatic
-    // end-of-line newline trailing the RS), which the whole-record `.trim()`
-    // and per-field `.trim()` below both strip.
-    const REC_SEP: char = '\u{1e}';
-    // The `Session`/`Tab`/`Source` identity fields are APPENDED after
-    // `%(refname:short)` rather than slotted in beside `Agent`, and the guard
-    // below is `< CORE_FIELDS` rather than an exact count. Both are the same
-    // backward-compatibility decision, and it is a mandatory one: a user's
-    // `.cimp/shadow.git` is full of checkpoints whose commit messages carry
-    // only the three Phase C trailers, and an upgrade that emptied their
-    // Timeline would be a data-loss-shaped bug.
-    //
-    // `%(trailers:key=…)` expands to nothing for a key the commit does not
-    // have, while the literal separators around it are printed regardless — so
-    // an old checkpoint yields a full-width record with EMPTY trailing
-    // fields, which [`identity_field`] reads as `None`. That is asserted
-    // against a real repo of hand-built old-format commits by
-    // `tests::old_eight_field_checkpoints_still_list_after_the_identity_fields`
-    // rather than assumed, because it is a claim about git's behaviour and not
-    // about ours.
-    //
-    // The tail placement plus the tolerant guard makes the reader correct under
-    // the other possible behaviour too: were a missing trailer ever to swallow
-    // its separators, the record would be SHORT rather than SHIFTED, every
-    // field the old format defined would still be at its old index, and the row
-    // would list with the identity absent instead of vanishing.
-    let format = format!(
-        "%(objectname){sep}%(creatordate:unix){sep}%(creatordate:iso-strict){sep}%(contents:subject){sep}%(trailers:key=Trigger,valueonly){sep}%(trailers:key=Agent,valueonly){sep}%(trailers:key=Files-Changed,valueonly){sep}%(refname:short){sep}%(trailers:key=Session,valueonly){sep}%(trailers:key=Tab,valueonly){sep}%(trailers:key=Source,valueonly){rec_sep}",
-        sep = FIELD_SEP,
-        rec_sep = REC_SEP
-    );
+    let format = list_format();
     let fmt_arg = format!("--format={format}");
     let out = git::run(
         &ctx,
@@ -1081,20 +1175,28 @@ pub async fn list(root: &Path) -> AppResult<Vec<Checkpoint>> {
             continue;
         }
         let fields: Vec<&str> = record.split(FIELD_SEP).collect();
-        // The count that must be present for a row to mean anything — the eight
-        // fields every checkpoint has carried since Phase C. Fields past this
-        // are read through `get`, so adding one can never turn "a field I don't
-        // have" into "skip this row", which is how a schema addition silently
+        // The count that must be present for a row to mean anything: the five
+        // git-native fields, which every checkpoint has regardless of which
+        // trailers it carries. The trailer block past them is read through
+        // `get`, so a format widening can never turn "a field I don't have"
+        // into "skip this row" — which is how a schema addition silently
         // empties a Timeline.
-        const CORE_FIELDS: usize = 8;
+        const CORE_FIELDS: usize = 5;
         if fields.len() < CORE_FIELDS {
             continue; // malformed row (shouldn't happen) — skip, don't panic
         }
-        let tag = fields[7].trim().to_string();
+        let tag = fields[4].trim().to_string();
         let seq = tag
             .strip_prefix("cp-")
             .and_then(|n| n.parse::<u32>().ok())
             .unwrap_or(0);
+        // Everything from index 5 on is the trailer block. It is joined back
+        // together rather than read as `fields[5]`: `FIELD_SEP` cannot reach a
+        // trailer through [`trailer_identity`], but a hand-made commit could
+        // still carry one, and truncating the block at it would silently drop
+        // every trailer after it instead of mangling one value.
+        let block = fields[CORE_FIELDS..].join(FIELD_SEP);
+        let trailers = TrailerBlock::parse(&block);
         checkpoints.push(Checkpoint {
             id: tag,
             seq,
@@ -1102,16 +1204,17 @@ pub async fn list(root: &Path) -> AppResult<Vec<Checkpoint>> {
             ts_unix: fields[1].trim().parse().unwrap_or(0),
             ts: fields[2].trim().to_string(),
             label: fields[3].trim().to_string(),
-            trigger: Trigger::parse(fields[4].trim()),
-            agent: identity_field(fields.get(5).copied()),
-            files_changed: fields[6].trim().parse().unwrap_or(0),
-            session: identity_field(fields.get(8).copied()),
-            tab: identity_field(fields.get(9).copied()),
-            // V33 Phase F, index 10 — the tail slot, read through `get` like
-            // its two neighbours. `CORE_FIELDS` stays 8 and the guard stays
-            // `<`: a checkpoint written before this field existed is a
-            // 10-field record and must still list, with `source: None`.
-            source: identity_field(fields.get(10).copied()),
+            trigger: Trigger::parse(trailers.get("Trigger").unwrap_or("")),
+            agent: identity_field(trailers.get("Agent")),
+            files_changed: trailers
+                .get("Files-Changed")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+            session: identity_field(trailers.get("Session")),
+            tab: identity_field(trailers.get("Tab")),
+            // V33 Phase F — like its two neighbours, absent (not empty, not
+            // `"-"`) on a checkpoint written before the field existed.
+            source: identity_field(trailers.get("Source")),
         });
     }
     checkpoints.sort_by_key(|c| c.seq);
@@ -1788,7 +1891,11 @@ mod tests {
     /// used to assert exactly (`!= 8`), so widening the format without widening
     /// the guard makes every pre-existing checkpoint fail the arity check and
     /// disappear from the Timeline *silently* — no error, just an empty
-    /// history.
+    /// history. (The record's arity no longer depends on which trailers a
+    /// checkpoint carries — the whole block is one trailing field, keyed apart
+    /// by [`TrailerBlock`] — so this now guards the read END to end: legacy
+    /// commits must still yield their `Trigger`/`Agent`/`Files-Changed` and an
+    /// absent identity, whichever way the fields are laid out.)
     ///
     /// This asserts against genuinely old-format commits (see
     /// [`write_legacy_checkpoint`]), not against a re-serialized `None`.
@@ -2431,6 +2538,118 @@ mod tests {
         assert_eq!(identity_field(Some(IDENTITY_ABSENT)), None); // placeholder
         assert_eq!(identity_field(Some("  ")), None);
         assert_eq!(identity_field(Some(" claude-2 ")), Some("claude-2".into()));
+    }
+
+    /// **The local trailer parser, rule by rule.** This is the half of the
+    /// 2026-08-20 fix that has to be correct on its own: git no longer splits
+    /// the block for us (it cannot be trusted to — see [`list_format`]), so
+    /// every "which key holds which value" decision is made here.
+    ///
+    /// **What it would still pass with:** a parser that only ever sees blocks
+    /// our own writer produced — which is why the hostile shapes (a duplicate
+    /// key, an indented continuation line, a non-trailer line, an unknown key)
+    /// are in here rather than only the happy path.
+    #[test]
+    fn trailer_block_parsing_rules() {
+        // A full, current-format block: every key readable, in any order.
+        let block = "Trigger: tool\nAgent: claude\nFiles-Changed: 7\n\
+                     Session: sess-1\nTab: claude-2\nSource: claude:Edit\n";
+        let t = TrailerBlock::parse(block);
+        assert_eq!(t.get("Trigger"), Some("tool"));
+        assert_eq!(t.get("Agent"), Some("claude"));
+        assert_eq!(t.get("Files-Changed"), Some("7"));
+        assert_eq!(t.get("Session"), Some("sess-1"));
+        assert_eq!(t.get("Tab"), Some("claude-2"));
+        assert_eq!(t.get("Source"), Some("claude:Edit"), "a `:` in the VALUE \
+             belongs to the value — only the FIRST colon splits");
+        // A key the commit does not carry is absent, not empty — this is what
+        // keeps a pre-V33 checkpoint listing instead of vanishing.
+        let legacy = TrailerBlock::parse("Trigger: manual\nAgent: -\nFiles-Changed: 3\n");
+        assert_eq!(legacy.get("Session"), None);
+        assert_eq!(legacy.get("Tab"), None);
+        assert_eq!(legacy.get("Source"), None);
+        assert_eq!(legacy.get("Files-Changed"), Some("3"));
+        // Order is irrelevant, and a key is matched case-insensitively (which
+        // is what `%(trailers:key=…)` did).
+        let shuffled = TrailerBlock::parse("source: x\nagent: claude\nTRIGGER: burst\n");
+        assert_eq!(shuffled.get("Trigger"), Some("burst"));
+        assert_eq!(shuffled.get("Agent"), Some("claude"));
+        assert_eq!(shuffled.get("Source"), Some("x"));
+        // Duplicate key: the FIRST occurrence wins — the one our writer emitted,
+        // since anything tampered with can only be appended after it.
+        let dup = TrailerBlock::parse("Tab: mine\nTab: theirs\n");
+        assert_eq!(dup.get("Tab"), Some("mine"));
+        // An unfolded multi-line value (what `unfold` hands us) is one value…
+        let unfolded = TrailerBlock::parse("Agent: claude with a long note\nTab: t\n");
+        assert_eq!(unfolded.get("Agent"), Some("claude with a long note"));
+        assert_eq!(unfolded.get("Tab"), Some("t"));
+        // …and a value that arrived FOLDED anyway keeps its first line, with the
+        // indented continuation ignored rather than read as a key of its own.
+        let folded = TrailerBlock::parse("Agent: claude\n  Tab: forged\nSession: s\n");
+        assert_eq!(folded.get("Agent"), Some("claude"));
+        assert_eq!(
+            folded.get("Tab"),
+            None,
+            "an indented continuation line must not forge a trailer"
+        );
+        assert_eq!(folded.get("Session"), Some("s"));
+        // Lines that are not trailers at all (blank lines, prose git printed
+        // because `%(trailers)` was not asked for `only`, a bare key with no
+        // colon) are ignored, and do not stop the real trailers being read.
+        let noisy = TrailerBlock::parse(
+            "some prose line\n\nTrigger: prompt\nnot-a-trailer\n: novalue\nAgent: claude\n",
+        );
+        assert_eq!(noisy.get("Trigger"), Some("prompt"));
+        assert_eq!(noisy.get("Agent"), Some("claude"));
+        assert_eq!(noisy.get(""), None, "an empty key is never a key");
+        // A commit message stored with CRLF parses identically to LF.
+        let crlf = TrailerBlock::parse("Trigger: prompt\r\nAgent: claude\r\n");
+        assert_eq!(crlf.get("Trigger"), Some("prompt"));
+        assert_eq!(crlf.get("Agent"), Some("claude"));
+        // An empty block (a commit git found no trailer paragraph on) yields
+        // nothing at all rather than a bogus key.
+        assert_eq!(TrailerBlock::parse("").get("Trigger"), None);
+        assert_eq!(TrailerBlock::parse("   ").get("Trigger"), None);
+        // A present-but-blank value is `Some("")`, which every identity field
+        // then reads as absent — the three ways of being absent stay
+        // indistinguishable (see `identity_field`).
+        let blank = TrailerBlock::parse("Tab:\nSession:   \n");
+        assert_eq!(blank.get("Tab"), Some(""));
+        assert_eq!(identity_field(blank.get("Session")), None);
+    }
+
+    /// **The regression guard for the 2026-08-20 git-version bug.** Two or more
+    /// `%(trailers:key=…)` atoms in ONE `for-each-ref --format` are broken on
+    /// git 2.43.0 (every atom prints the union of all the requested keys'
+    /// values), so the listing format must ask for the whole block exactly once
+    /// and let [`TrailerBlock`] key it apart.
+    ///
+    /// A format-string-level assertion is normally the weak kind, but here it
+    /// is the only one that fires on a machine whose git is NOT affected —
+    /// which includes CI and this project's Windows dev box. The behavioural
+    /// half is covered by every round-trip test in this module, which reads
+    /// real identity fields back through the real git.
+    #[test]
+    fn the_listing_format_asks_for_the_whole_trailer_block_once() {
+        let format = list_format();
+        assert_eq!(
+            format.matches("%(trailers").count(),
+            1,
+            "more than one trailer atom in one format string is the bug: {format}"
+        );
+        assert!(
+            !format.contains("key="),
+            "no per-key trailer atom may come back: {format}"
+        );
+        assert!(
+            format.contains("%(trailers:unfold)"),
+            "the whole block, unfolded: {format}"
+        );
+        // The block is last, so its newlines can never shift another field.
+        assert!(
+            format.ends_with(&format!("%(trailers:unfold){REC_SEP}")),
+            "the trailer block must be the final field of the record: {format}"
+        );
     }
 
     /// `Origin::new` normalizes blank fields to `None` so `""`/`"   "` — the

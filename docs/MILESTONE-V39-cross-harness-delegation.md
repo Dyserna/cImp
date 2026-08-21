@@ -111,7 +111,13 @@ adds the **read-only tab mode** that makes a driven tab safe to leave open.
    Enforcement is in the backend write path (`pty_write` refuses with
    `AppError::ReadOnly { tab, reason }` — *read-only (user)* vs *driven by <tab>*), the
    xterm widget is only a courtesy gate (input swallowed + toast naming the
-   reason). Engine writes bypass the lock by construction (they do not enter
+   reason). **Exempt from the lock** (both sides, shared fixtures): terminal
+   protocol replies xterm sends on the program's behalf (cursor-position
+   reports, device attributes, focus in/out — refusing them wedges a TUI
+   waiting for one, exactly while a delegation drives it) and **mouse wheel**
+   reports (scrolling is reading). Mouse clicks/drags, bracketed paste and
+   every keystroke are refused. Both sources coexist in one entry
+   (`{user, driven_by}`), `Driven` wins; clearing one never lifts the other. Engine writes bypass the lock by construction (they do not enter
    through `pty_write`). A user read-only tab **can** still be a worker —
    read-only governs the user's keyboard, not the engine.
 5. **Permission and question prompts unlock the keyboard.** When a driven
@@ -339,8 +345,17 @@ adds the **read-only tab mode** that makes a driven tab safe to leave open.
 
 ### Read-only + UI
 
-- `TabState.read_only: Option<ReadOnlySource>` (`User | Driven { by }`);
-  `pty_write` checks it before any side effect; IPC `tab_set_read_only`.
+- `ReadOnlyTabs` — a shared `Arc<RwLock<HashMap<TabId, ReadOnlyEntry>>>`
+  handle in `AppState` (the `InputLengths` precedent: `TabState` lives inside
+  the state-manager actor with no query path, so the write path cannot read
+  it synchronously); `ReadOnlySource { User | Driven { by } }` in
+  `state/manager.rs`. `pty_write` checks it before any side effect; the
+  runtime map is re-synced from the persisted `read_only` flags on every
+  settings broadcast (`sync_users`), so a Settings-window or overlay change
+  cannot leave a second source of truth; `Driven` rows are untouched by that
+  sync. IPC `tab_set_read_only`. Shipped in Phase A (`656e32a..b086f73`): no
+  schema bump (additive fields under container-level `serde(default)`);
+  `delegation` rides the project overlay like `offload`/`graph`.
 - `Tab.svelte`: the communication glyph per decision 7; click →
   `DelegationPopover.svelte` (role radio, access radio, Remote-offload knobs,
   Take over); state derived in `src/lib/delegation.ts` (pure, tested:

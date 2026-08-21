@@ -2695,6 +2695,32 @@ pub(super) enum LatchRoute {
     /// configured checks, or hand back repo source text, on behalf of a
     /// conversation that has ingested untrusted content.
     Hook,
+    /// **V39 Phase B: a cross-harness delegation** (`POST /delegate`).
+    ///
+    /// The third point in the route space, and it needs its own variant
+    /// because it is the one combination the other three cannot express:
+    ///
+    /// | | name comes from | may be REFUSED | may MOVE the latch |
+    /// |---|---|---|---|
+    /// | [`Proxied`](Self::Proxied) | the model | yes | yes |
+    /// | [`Native`](Self::Native) | the model | yes | yes |
+    /// | [`Hook`](Self::Hook) | **cImp** | yes | **no** |
+    /// | `Delegation` | **cImp** | yes | **yes** |
+    ///
+    /// *Name from cImp*, like a hook: the model names `delegate_task_<harness>`
+    /// on the child, which resolves the harness id and forwards THAT — the
+    /// route states its own class-table identity ([`DELEGATE_TOOL`]) and takes
+    /// no tool name from the request. So M-2's "in the table but not
+    /// dispatchable" wave-through must not apply here, exactly as it must not
+    /// on `Hook`: the name is the route, not a hallucination dispatch will
+    /// reject.
+    ///
+    /// *Elective, unlike a hook*: a hook fires automatically over work the
+    /// harness already permitted, which is why it must not latch. A
+    /// `delegate_task_*` call is the conversation choosing to hand work to a
+    /// peer and take its answer back — as elective as `offload_task`, and
+    /// latching for the same reason.
+    Delegation,
 }
 
 impl LatchRoute {
@@ -2702,8 +2728,9 @@ impl LatchRoute {
     /// use: a namespaced `<server>__<tool>` id is proxied, a bare name is
     /// native (`agent.rs::HostRouter::call`, `mcp_host::call_for_consumer`).
     ///
-    /// Never answers [`LatchRoute::Hook`]: that is a property of the ROUTE and
-    /// not of the name, so the three hook handlers state it themselves.
+    /// Never answers [`LatchRoute::Hook`] or [`LatchRoute::Delegation`]: both
+    /// are properties of the ROUTE and not of the name, so those handlers state
+    /// it themselves.
     pub(super) fn of_tool(name: &str) -> Self {
         if name.contains("__") {
             LatchRoute::Proxied
@@ -2717,7 +2744,9 @@ impl LatchRoute {
     /// `false` only on [`LatchRoute::Hook`] — see that variant. A separate axis
     /// from [`external_is_content`](Self::external_is_content), deliberately: a
     /// hook has to be classified and gated (so it can be refused) without being
-    /// elective (so it must not latch).
+    /// elective (so it must not latch). [`LatchRoute::Delegation`] shares the
+    /// hook's *name-from-cImp* property and not this one, which is exactly why
+    /// it is a fourth variant rather than a reuse of either neighbour.
     pub(super) fn engages(self) -> bool {
         self != LatchRoute::Hook
     }
@@ -2725,8 +2754,8 @@ impl LatchRoute {
     /// Whether an [`ToolClass::External`] classification on this route really
     /// means **external content**.
     ///
-    /// `false` on [`LatchRoute::Native`] and [`LatchRoute::Hook`] is the whole
-    /// rule, and it is not a
+    /// `false` on [`LatchRoute::Native`], [`LatchRoute::Hook`] and
+    /// [`LatchRoute::Delegation`] is the whole rule, and it is not a
     /// weakening of the unknown-⇒-EXTERNAL invariant: every proxied id contains
     /// `__` by construction, so the restrictive default still governs every
     /// name that can carry external content. What it excludes is the name that
@@ -5835,6 +5864,61 @@ const HOOK_TOOL_SHOULD_READ: &str = "hook_should_read";
 /// The class-table name `POST /context/compaction` gates under. TRUSTED, so
 /// this gate admits every call today — see the row.
 const HOOK_TOOL_COMPACTION: &str = "hook_compaction";
+
+/// V39 Phase B: the class-table name `POST /delegate` gates under.
+///
+/// The route's own identity, not a name from the request — the model names
+/// `delegate_task_<harness>` on the child, which resolves the harness id and
+/// forwards only that. LOCAL-CAPABILITY, so a conversation that has ingested
+/// untrusted content is REFUSED here, exactly as it is on `offload_task`
+/// (V32 C-1c): both hand a task to a fresh, permissive executor, and this one's
+/// executor is a whole peer harness.
+const DELEGATE_TOOL: &str = "delegate_task";
+
+/// The taint decision `POST /delegate` takes before any tab is touched — the
+/// [`hook_admit`] shape, for the same two reasons: a handler cannot reach the
+/// capability without passing through it, and the decision is testable without
+/// a `TcpStream` or an `AppHandle`.
+///
+/// `Err(refusal)` means *this conversation may not delegate*. Unlike a hook,
+/// the refusal is returned to the caller verbatim: this IS a tool call the
+/// model made, so the model is the right audience for the reason — the same
+/// treatment `/run` gives a refused `offload_task`.
+///
+/// [`LatchRegistry::gate`] writes the `Screen::LatchRefusal` row, so the
+/// refusal has its user-visible consumer without this function minting one.
+fn delegate_admit(
+    reg: &LatchRegistry,
+    // The class-table identity to gate under — always `DELEGATE_TOOL`.
+    // Passed rather than hardcoded, exactly as `hook_admit` takes its `tool`:
+    // the name a route gates under has to be readable AT the route, or "which
+    // boundary is this handler behind" becomes a question you answer by
+    // following a call.
+    tool: &'static str,
+    agent: &'static str,
+    tab: Option<&str>,
+    scope_of: impl FnOnce(&'static str, Option<&str>) -> LatchScoping,
+    policy_of: impl FnOnce(Option<&LatchScope>) -> GatePolicy,
+) -> Result<(), &'static str> {
+    let scoping = scope_of(agent, tab);
+    let scope = scoping.scope();
+    let policy = policy_of(scope);
+    // `CallProvenance::http()`, like the hooks and unlike `/run`: this is a
+    // POST from a local process holding a launch token that anything running as
+    // this user can read, so it is never evidence that cImp itself decided the
+    // call (#45's reasoning for the beacon route). It reaches no row today —
+    // provenance is read only for an admitted EXTERNAL call and this name is
+    // LOCAL-CAPABILITY — but stating it is how the wrong origin avoids being
+    // inherited later.
+    reg.gate(
+        scope,
+        LatchRoute::Delegation,
+        tool,
+        policy,
+        CallProvenance::http(),
+    )
+    .map(|_| ())
+}
 
 /// The taint decision the three `/context/*` hook routes take before they reach
 /// [`crate::graph::GraphService`], as one function taking its dependencies as
@@ -12177,6 +12261,131 @@ mod tests {
         }
     }
 
+
+    // ── V39 Phase B: delegation rides the taint latch ───────────────────────
+
+    /// **A contaminated driver tab may not delegate.**
+    ///
+    /// The same refusal `offload_task` gets under V32 C-1c, and for the same
+    /// reason: both hand a task to a fresh, permissive executor, and this one's
+    /// executor is a whole peer harness with its own tools. "The user asked for
+    /// it" does not launder the request — the task text is model-authored.
+    ///
+    /// Asserted on [`delegate_admit`] rather than through the route, because
+    /// that IS the decision: the handler cannot reach a tab without passing
+    /// through it.
+    #[test]
+    fn a_contaminated_tab_is_refused_a_delegation_and_a_clean_one_is_not() {
+        let s = scope("claude-deleg", Some("ses"));
+        // `LatchScope` is not `Clone`, so the closure rebuilds the same scope
+        // rather than capturing one — the scope KEY is what the registry joins
+        // on, and building it twice from the same inputs is the honest way to
+        // say two calls are the same scope.
+        let admit = |reg: &LatchRegistry| {
+            delegate_admit(
+                reg,
+                DELEGATE_TOOL,
+                "claude",
+                Some("claude-deleg"),
+                |_, _| LatchScoping::Scoped(scope("claude-deleg", Some("ses"))),
+                |_| ON,
+            )
+        };
+
+        // A clean conversation may delegate…
+        let reg = LatchRegistry::default();
+        assert!(admit(&reg).is_ok(), "an unlatched tab may delegate");
+        // …and delegating LATCHED it to Local, exactly as `offload_task` does.
+        // The call is elective, so it moves the latch — this is the whole
+        // difference between `LatchRoute::Delegation` and `LatchRoute::Hook`.
+        assert_eq!(reg.snapshot()[0].latch(), "local");
+
+        // A contaminated one may not.
+        let reg2 = LatchRegistry::default();
+        assert!(reg2
+            .gate(Some(&s), LatchRoute::Proxied, "ddg__fetch_content", ON, NO_CONTENT)
+            .is_ok());
+        assert_eq!(reg2.snapshot()[0].latch(), "external");
+        let refusal = admit(&reg2).expect_err("a contaminated tab must be refused");
+        assert!(
+            !refusal.trim().is_empty(),
+            "a refusal with no reason is not one the model can act on"
+        );
+        // The SAME user-visible refusal `offload_task` produces — compared
+        // rather than restated, so the two can never come to differ.
+        let same = reg2
+            .gate(Some(&s), LatchRoute::Native, "offload_task", ON, NO_CONTENT)
+            .expect_err("offload_task is refused here too");
+        assert_eq!(
+            refusal, same,
+            "delegation must be refused in exactly the shape `offload_task` is"
+        );
+        // Named, not just compared: an EXTERNAL latch is what blocks the
+        // LOCAL-CAPABILITY side, so this is the local-blocked refusal — the
+        // same sentence a latched tab gets for `read_file`.
+        assert_eq!(refusal, REFUSAL_LOCAL_BLOCKED);
+    }
+
+    /// **The gate runs before anything is driven.**
+    ///
+    /// A refused delegation must leave the worker tab exactly as it was: no
+    /// slot claimed, no read-only lock engaged, no `start` Events row, and not
+    /// one byte typed. All of that follows from ORDER inside `handle_delegate`,
+    /// so the order is what is asserted — on the source, because the property
+    /// is about what the handler can do rather than about what one run did.
+    #[test]
+    fn the_delegate_gate_runs_before_anything_is_driven() {
+        let src = include_str!("loopback.rs");
+        let body = handler_body(src, "handle_delegate");
+        let gate_at = body
+            .find("delegate_admit(")
+            .expect("handle_delegate must gate");
+        let drive_at = body
+            .find("delegation::drive(")
+            .expect("handle_delegate must drive");
+        assert!(
+            gate_at < drive_at,
+            "the taint gate must precede the drive call, or a refused delegation has already \
+             locked the worker's keyboard and minted a `start` row"
+        );
+        // …and nothing that touches the worker happens before it either.
+        let before = &body[..gate_at];
+        for touches in ["delegation::drive", "set_driven", "record_row"] {
+            assert!(
+                !before.contains(touches),
+                "`{touches}` runs before the taint gate in handle_delegate"
+            );
+        }
+    }
+
+    /// **`LatchRoute::Delegation` is the fixed-name/elective corner**, and the
+    /// two properties that put it there are asserted rather than assumed.
+    ///
+    /// If it ever inherited `Hook`'s non-engaging rule, a tab could delegate
+    /// unboundedly without ever latching; if it inherited `Native`'s
+    /// dispatchable rule, the gate would silently become a no-op (the bare name
+    /// is `unrouted` by design), which is precisely the gap this commit closes.
+    #[test]
+    fn the_delegation_route_both_refuses_and_latches() {
+        let cls = toolclass::classify;
+        assert!(
+            LatchRoute::Delegation.can_execute(DELEGATE_TOOL, cls(DELEGATE_TOOL)),
+            "the route states its own name, so M-2's not-dispatchable wave-through must not \
+             apply — it would turn this gate back into a no-op"
+        );
+        assert!(
+            !LatchRoute::Native.can_execute(DELEGATE_TOOL, cls(DELEGATE_TOOL)),
+            "…while the bare name on a NATIVE route still reaches no dispatcher"
+        );
+        assert!(
+            LatchRoute::Delegation.engages(),
+            "a delegation is elective — unlike a hook, it must move the latch"
+        );
+        assert!(!LatchRoute::Hook.engages());
+        assert!(!LatchRoute::Delegation.external_is_content());
+        assert_eq!(cls(DELEGATE_TOOL), cls("offload_task"));
+    }
+
     // ── V32 Phase G — the two switches over this gate ──────────────────────
 
     /// The taint latch OFF: nothing latches, nothing is refused, and — because
@@ -17358,37 +17567,31 @@ mod tests {
         ),
         // ── V39 Phase B: cross-harness delegation ───────────────────────────
         //
-        // **This row states a KNOWN GAP, not a finding that there is nothing to
-        // gate**, and it is written that way on purpose — the table's contract
-        // is that a reviewer has to disagree with the claim in order to add a
-        // route here, so the claim has to be the true one.
+        // **Closed, not declared.** The first cut of this phase left the route
+        // ungated and said so here, because the generated `delegate_task_<id>`
+        // names cannot be classified by a static table and a gate keyed on them
+        // would have been a silent no-op. That framing was the mistake: the
+        // name the GATE needs was never the one the model types. The child
+        // resolves the harness id and forwards it; the route states its own
+        // class-table identity (`DELEGATE_TOOL`), exactly as the three
+        // `/context/*` hooks do — which makes this a fixed-tool route, and the
+        // per-harness naming a non-problem.
         //
-        // What the route does: it hands a task to ANOTHER harness's tab, which
-        // then works with its own tools, its own permissions and its own
-        // (uncontaminated) latch. That is the same shape as the `offload_task`
-        // laundering V32 C-1c closed by demoting those tools to
-        // LOCAL-CAPABILITY — a contaminated tab reaching a fresh, permissive
-        // executor — so by that precedent this route SHOULD gate.
-        //
-        // Why it does not, yet: `LatchRegistry::gate` classifies by tool NAME
-        // through `toolclass::TABLE`, and `LatchRoute::Native::can_execute`
-        // requires the name to be `dispatchable` there. The generated names are
-        // per harness (`delegate_task_<id>`), so they are unknown to a static
-        // table and a gate keyed on them is a silent no-op. Closing it means
-        // either a canonical class-table row plus a `DISPATCH_SITES` entry that
-        // `table_matches_the_native_dispatch_surface` can scan for a PREFIX
-        // dispatcher, or a decision that a user-directed hand-off is outside
-        // the latch's threat model (the user asked for it by name, and every
-        // use is visible on the tab, in the glyph and in the Events lane).
-        // V39's design document takes neither position, which is why this
-        // phase declares the gap instead of picking one silently.
+        // It gates as LOCAL-CAPABILITY, so a contaminated conversation is
+        // refused here for the same reason V32 C-1c refuses it `offload_task`:
+        // both hand a task to a fresh, permissive executor, and this one's is a
+        // whole peer harness with its own tools. "The user asked for it" does
+        // not launder the request — the task text is model-authored.
         route(
             "/delegate",
             "POST",
             "handle_delegate",
-            Containment::NoRegistry(
-                "V39 Phase B GAP, declared not decided: hands a task to another harness tab,                  whose own latch is fresh — the `offload_task` laundering shape — but the                  generated per-harness tool names cannot be classified by the static class                  table, so a gate keyed on them would be a no-op. See the note above this row",
-            ),
+            Containment::GatesFixedTool {
+                tool: DELEGATE_TOOL,
+                // Computed, not restated: LOCAL-CAPABILITY under an EXTERNAL
+                // latch is blocked, so a demotion of the row fails this test.
+                refused_under_external: true,
+            },
         ),
         route(
             "/session/tool_result",
@@ -17619,7 +17822,12 @@ mod tests {
             let reaches_registry = body.contains("latches()");
             let gates = body.contains("latches().gate(")
                 || body.contains("hook_admit(\n        latches(),")
-                || body.contains("audit_admit(\n        latches(),");
+                || body.contains("audit_admit(\n        latches(),")
+                // V39 Phase B: `/delegate`'s own admit funnel, same shape and same
+                // reason as the two above — the decision is a function so it can be
+                // unit-tested without a `TcpStream`, which means the handler body
+                // names the funnel rather than `latches().gate(`.
+                || body.contains("delegate_admit(\n        latches(),");
 
             match row.containment {
                 Containment::GatesRequestTool => assert!(
@@ -17676,6 +17884,7 @@ mod tests {
     /// has to look for the same thing a reader would.
     fn tool_const(tool: &str) -> &'static str {
         match tool {
+            "delegate_task" => "DELEGATE_TOOL",
             "hook_post_edit" => "HOOK_TOOL_POST_EDIT",
             "hook_should_read" => "HOOK_TOOL_SHOULD_READ",
             "hook_compaction" => "HOOK_TOOL_COMPACTION",
@@ -18788,6 +18997,25 @@ async fn handle_delegate(
             return write_json(stream, 200, &r).await;
         }
     };
+
+    // V39 Phase B: the taint gate, and it sits HERE on purpose — after every
+    // parse-boundary rejection (so a malformed request never engages a latch)
+    // and before the worker is resolved, the slot is claimed, the read-only
+    // lock is engaged or a single byte is typed. A refused delegation must
+    // leave the worker tab exactly as it was, and must mint no `start` row for
+    // a delegation that never began; both are true by this ordering, and
+    // `the_delegate_gate_runs_before_anything_is_driven` pins it.
+    if let Err(refusal) = delegate_admit(
+        latches(),
+        DELEGATE_TOOL,
+        agent,
+        body.tab.as_deref(),
+        |a, t| latch_scope(app, &settings, a, t),
+        |scope| GatePolicy::resolve(&settings, scope),
+    ) {
+        let r = DelegateResult::failed(refusal.to_string());
+        return write_json(stream, 200, &r).await;
+    }
 
     let harness = body.harness.trim();
     let Some(worker_id) = manual_tab_for(&settings, harness) else {

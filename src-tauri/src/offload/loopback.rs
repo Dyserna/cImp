@@ -1294,6 +1294,11 @@ async fn handle_conn(
         // lie. The `latch_override` IPC command is the only way in; falling
         // through to the 404 below is the intended behaviour for anything that
         // still tries this path.
+        // ── V39 Phase B: cross-harness delegation ───────────────────────────
+        //
+        // The app owns the tabs, so this is the only way in — the child has no
+        // self-contained fallback and says so rather than inventing one.
+        ("POST", "/delegate") => handle_delegate(&mut stream, &app, &req).await,
         ("POST", "/mcp/list") => handle_mcp_list(&mut stream, &service, &req).await,
         ("POST", "/mcp/call") => handle_mcp_call(&mut stream, &service, &app, &req).await,
         ("GET", "/describe") => {
@@ -17351,6 +17356,40 @@ mod tests {
                  latch",
             ),
         ),
+        // ── V39 Phase B: cross-harness delegation ───────────────────────────
+        //
+        // **This row states a KNOWN GAP, not a finding that there is nothing to
+        // gate**, and it is written that way on purpose — the table's contract
+        // is that a reviewer has to disagree with the claim in order to add a
+        // route here, so the claim has to be the true one.
+        //
+        // What the route does: it hands a task to ANOTHER harness's tab, which
+        // then works with its own tools, its own permissions and its own
+        // (uncontaminated) latch. That is the same shape as the `offload_task`
+        // laundering V32 C-1c closed by demoting those tools to
+        // LOCAL-CAPABILITY — a contaminated tab reaching a fresh, permissive
+        // executor — so by that precedent this route SHOULD gate.
+        //
+        // Why it does not, yet: `LatchRegistry::gate` classifies by tool NAME
+        // through `toolclass::TABLE`, and `LatchRoute::Native::can_execute`
+        // requires the name to be `dispatchable` there. The generated names are
+        // per harness (`delegate_task_<id>`), so they are unknown to a static
+        // table and a gate keyed on them is a silent no-op. Closing it means
+        // either a canonical class-table row plus a `DISPATCH_SITES` entry that
+        // `table_matches_the_native_dispatch_surface` can scan for a PREFIX
+        // dispatcher, or a decision that a user-directed hand-off is outside
+        // the latch's threat model (the user asked for it by name, and every
+        // use is visible on the tab, in the glyph and in the Events lane).
+        // V39's design document takes neither position, which is why this
+        // phase declares the gap instead of picking one silently.
+        route(
+            "/delegate",
+            "POST",
+            "handle_delegate",
+            Containment::NoRegistry(
+                "V39 Phase B GAP, declared not decided: hands a task to another harness tab,                  whose own latch is fresh — the `offload_task` laundering shape — but the                  generated per-harness tool names cannot be classified by the static class                  table, so a gate keyed on them would be a no-op. See the note above this row",
+            ),
+        ),
         route(
             "/session/tool_result",
             "POST",
@@ -18642,4 +18681,166 @@ mod tests {
         // an error and it changes nothing.
         assert!(reg.observe_all(&[]).is_empty());
     }
+}
+
+/// A `POST /delegate` body — one cross-harness delegation request (V39
+/// Phase B, locked decision 3).
+///
+/// `harness` rather than a tab id, and that is the whole shape of decision 3:
+/// at most one tab per harness holds the Manual role, so the driver names a
+/// harness and cImp resolves the tab. A tab argument would let a model drive
+/// any tab it could guess the id of.
+#[derive(Deserialize)]
+struct DelegateBody {
+    #[serde(default)]
+    harness: String,
+    #[serde(default)]
+    task: String,
+    #[serde(default)]
+    context: Option<String>,
+    #[serde(default)]
+    timeout_s: Option<u64>,
+    /// Which consumer this child serves — cImp-authored argv on the child side.
+    #[serde(default)]
+    consumer: Option<String>,
+    /// The calling tab. Unforgeable in practice (`--tab` is composed by cImp at
+    /// spawn), and REQUIRED: the acyclic check and the Events row both need it.
+    #[serde(default)]
+    tab: Option<String>,
+}
+
+/// A `POST /delegate` response — [`RunResult`]'s three fields plus the meta the
+/// child renders as the result footer, so a delegation result reads like an
+/// `offload_task` one (worker, duration, screening verdict).
+#[derive(Serialize)]
+struct DelegateResult {
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    worker: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    duration_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    screened: Option<bool>,
+}
+
+impl DelegateResult {
+    fn failed(msg: String) -> Self {
+        Self {
+            ok: false,
+            text: None,
+            error: Some(msg),
+            worker: None,
+            duration_ms: None,
+            screened: None,
+        }
+    }
+}
+
+/// `POST /delegate` — drive another harness's tab and return its answer.
+///
+/// The app owns the tabs, so this route is the only way in; the child has no
+/// self-contained fallback and says so rather than inventing one.
+///
+/// **Target resolution is a lookup, not a search** (locked decision 8): the
+/// harness id names the one tab whose `delegation_role == Manual` for that
+/// harness. If it moved or closed between `tools/list` and this call, the call
+/// is refused naming the condition — never silently retargeted.
+///
+/// Every other condition is the engine's: `delegation::drive` runs the whole of
+/// locked decision 12's preflight, so this handler deliberately re-checks
+/// nothing it could get wrong on its own.
+async fn handle_delegate(
+    stream: &mut TcpStream,
+    app: &AppHandle,
+    req: &Request,
+) -> AppResult<()> {
+    let body: DelegateBody = match serde_json::from_slice(&req.body) {
+        Ok(b) => b,
+        Err(e) => {
+            let r = DelegateResult::failed(format!("bad request body: {e}"));
+            return write_json(stream, 400, &r).await;
+        }
+    };
+    if body.task.trim().is_empty() {
+        let r = DelegateResult::failed("`task` must be non-empty".into());
+        return write_json(stream, 400, &r).await;
+    }
+
+    let settings = live_settings(app);
+    let agent = crate::graph::source_for_consumer(body.consumer.as_deref().unwrap_or("claude"));
+    // The calling tab must be a CONFIGURED tab of this consumer. An anonymous
+    // or unrecognized id is refused rather than fail-open: unlike a latch (where
+    // "we do not know who this is" degrades to no containment), delegation has
+    // nothing safe to do without a driver — the cycle check and the audit row
+    // are both keyed by it.
+    let driver = match tab_identity(&settings, agent, body.tab.as_deref()) {
+        TabIdentity::Configured(t) => crate::state::TabId::from_str(t),
+        TabIdentity::Anonymous | TabIdentity::Unknown(_) => {
+            let r = DelegateResult::failed(
+                "delegation needs to know which tab is asking, and this request names none that \
+                 is configured for this harness"
+                    .into(),
+            );
+            return write_json(stream, 200, &r).await;
+        }
+    };
+
+    let harness = body.harness.trim();
+    let Some(worker_id) = manual_tab_for(&settings, harness) else {
+        let r = DelegateResult::failed(format!(
+            "no tab currently holds the Manual delegation role for `{harness}` — it was set to \
+             None, moved, or the tab was closed since this tool was listed"
+        ));
+        return write_json(stream, 200, &r).await;
+    };
+
+    let reply = crate::delegation::drive(
+        app,
+        crate::delegation::DriveRequest {
+            worker: crate::state::TabId::from_str(&worker_id),
+            driver: Some(driver),
+            mode: crate::delegation::DelegationMode::Explicit,
+            task: body.task,
+            context: body.context,
+            timeout_s: body.timeout_s,
+        },
+    )
+    .await;
+
+    let r = match reply {
+        Ok(reply) => DelegateResult {
+            ok: true,
+            text: Some(reply.text),
+            error: None,
+            worker: Some(reply.worker),
+            duration_ms: Some(reply.duration_ms),
+            screened: Some(reply.screened),
+        },
+        // 200 with `ok:false`, like `/run`: a refusal, a timeout and a
+        // take-over are all task-level outcomes the model should read and adapt
+        // to, not transport errors.
+        Err(e) => DelegateResult::failed(e.to_string()),
+    };
+    write_json(stream, 200, &r).await
+}
+
+/// The tab id currently holding the Manual delegation role for `harness`.
+///
+/// `None` when nothing does — which is a real state, not an error: the role may
+/// have been cleared or moved between the `tools/list` that advertised the tool
+/// and this call (locked decision 8's move rule makes that a normal event).
+fn manual_tab_for(settings: &crate::settings::Settings, harness: &str) -> Option<String> {
+    settings.tabs.iter().find_map(|t| match t {
+        crate::settings::TabConfig::AiTool(c)
+            if c.delegation_role == crate::settings::DelegationRole::Manual
+                && crate::tabs::tab_consumer(c) == harness =>
+        {
+            Some(c.id.clone())
+        }
+        _ => None,
+    })
 }

@@ -395,6 +395,13 @@ async fn handle(method: &str, params: Value) -> Result<Value, (i64, String)> {
                 tools.push(offload_task_tool_live().await);
                 tools.push(offload_batch_tool());
             }
+            // V39 Phase B (locked decision 3): one `delegate_task_<harness>`
+            // per harness whose Manual tab exists, is not this child's own tab
+            // and passes the worker gate. NOT inside the `offload.enabled`
+            // guard: delegation drives a harness tab and needs no offload
+            // backend, so tying it to that switch would hide it for exactly the
+            // users who never configured a local model.
+            tools.extend(delegate_task_tools(tab()));
             // V9-01 code-knowledge-graph tools (present only when the graph
             // feature is enabled for this project).
             //
@@ -447,6 +454,12 @@ async fn handle(method: &str, params: Value) -> Result<Value, (i64, String)> {
                     Some(r) => r,
                     None => crate::graph::handle_mcp_call(&params, consumer(), tab()).await,
                 }
+            } else if name.starts_with(DELEGATE_TOOL_PREFIX) {
+                // V39 Phase B: the harness id is the suffix, resolved through
+                // the registry rather than by a literal match arm — which is
+                // also what keeps this file free of harness names.
+                let tool = name.to_string();
+                handle_delegate_tool(&tool, params).await
             } else if name == "offload_batch" {
                 handle_batch_tool(params).await
             } else if name.contains("__") {
@@ -3090,5 +3103,383 @@ mod tests {
         assert_eq!(parsed[1], Ok(Some(Profile::Code)));
         assert_eq!(parsed[2], Ok(None));
         assert!(parsed[3].is_err());
+    }
+}
+
+// ── V39 Phase B: the generated `delegate_task_<harness>` set ────────────────
+//
+// Locked decision 3. **No harness literal appears below**: the id set comes
+// from `harness::contract::harness_ids()` and the display names from
+// `Harness::display_name()`, so a third harness gets a tool by having registry
+// rows and an input profile — not by an edit here.
+
+/// The prefix every generated delegation tool carries. One spelling, shared by
+/// the generator, the dispatcher and the suffix parser, so a rename cannot
+/// leave a tool that lists but does not dispatch.
+const DELEGATE_TOOL_PREFIX: &str = "delegate_task_";
+
+/// **The pinned contract sentence** (locked decision 3), templated with the
+/// harness display name.
+///
+/// Every generated description opens with this, and
+/// `every_generated_delegate_tool_opens_with_the_pinned_sentence` asserts it.
+/// It is the whole distinction between this tool and `offload_task`: not *what
+/// the work is*, but **who decided to hand it off**. A model that read only the
+/// tool name would call this whenever it wanted help; the sentence is what
+/// makes it a user-directed instrument.
+fn delegate_tool_contract(display: &str) -> String {
+    format!(
+        "Hand a task to an open {display} tab and return its answer. Call this ONLY when the user \
+         explicitly asked for a task to be delegated to {display} (e.g. \"send this to \
+         {display}\"). Never call it on your own initiative — for work you decide to offload \
+         yourself, use `offload_task`, which you may call automatically whenever you judge it \
+         useful."
+    )
+}
+
+/// The full settings snapshot, read live from disk on every call.
+///
+/// The same read [`current_offload_settings`] makes, widened to the whole file
+/// because the delegation surface needs the tab list and the harness-version
+/// block as well as the offload block. Live by construction, which is what
+/// makes locked decision 15's "takes effect on the next turn without restarting
+/// either tab" true on this side — the child re-reads the file for every
+/// `tools/list`, so a role moved in the app is visible on the next turn with
+/// nothing spawn-baked in between.
+fn current_settings_full() -> crate::settings::Settings {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    crate::settings::load_readonly(&cwd)
+}
+
+/// Every harness id that should be advertised as a delegation target for a
+/// consumer whose own tab is `own_tab`, with its display name and the name of
+/// the Manual tab it drives.
+///
+/// The three conditions of locked decision 8, each a *no dead tool* rule rather
+/// than a permission check:
+///
+/// * the harness has a Manual tab (else there is nothing to name),
+/// * that tab is not the caller's own (a tab must never see a tool that drives
+///   itself),
+/// * the worker gate is clean (a harness whose input profile is recorded broken
+///   would take a truncated request).
+///
+/// A harness with no input profile never reaches here: `input_profile` answers
+/// `None` and it is skipped, which is the fail-closed half of decision 16.
+fn delegate_targets(
+    settings: &crate::settings::Settings,
+    own_tab: Option<&str>,
+) -> Vec<(&'static str, String, String)> {
+    use crate::settings::{DelegationRole, TabConfig};
+    if crate::harness::contract::gate(crate::harness::contract::CAP_DELEGATION_WORKER, settings)
+        .blocked
+    {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for id in crate::harness::contract::harness_ids() {
+        if crate::harness::input_profile(id).is_none() {
+            continue;
+        }
+        let Some(harness) = crate::harness::contract::Harness::from_id(id) else {
+            continue;
+        };
+        let manual = settings.tabs.iter().find_map(|t| match t {
+            TabConfig::AiTool(c)
+                if c.delegation_role == DelegationRole::Manual
+                    && crate::tabs::tab_consumer(c) == id =>
+            {
+                Some(c)
+            }
+            _ => None,
+        });
+        let Some(cfg) = manual else { continue };
+        if own_tab.is_some_and(|own| own == cfg.id) {
+            continue;
+        }
+        out.push((id, harness.display_name().to_string(), cfg.name.clone()));
+    }
+    out
+}
+
+/// The generated tool descriptors for this child.
+fn delegate_task_tools(own_tab: Option<&str>) -> Vec<Value> {
+    delegate_targets(&current_settings_full(), own_tab)
+        .into_iter()
+        .map(|(id, display, tab_name)| delegate_task_tool(id, &display, &tab_name))
+        .collect()
+}
+
+/// One `delegate_task_<id>` descriptor.
+fn delegate_task_tool(id: &str, display: &str, tab_name: &str) -> Value {
+    json!({
+        "name": format!("{DELEGATE_TOOL_PREFIX}{id}"),
+        "description": format!(
+            "{} The tab it drives right now is \"{tab_name}\". The request is typed into that \
+             tab exactly as you write it and its answer is read back off the same session, so \
+             everything you send is visible on screen and in that harness's own transcript. The \
+             worker keeps its own tools, permissions and sandbox; it is a peer, not a subprocess.",
+            delegate_tool_contract(display)
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "task": {
+                    "type": "string",
+                    "description": "The request, written the way you would type it to that harness yourself. It is sent VERBATIM - no header, no framing, nothing identifying you is added."
+                },
+                "context": {
+                    "type": "string",
+                    "description": "Optional extra context (paths, prior findings) appended to the task."
+                },
+                "timeout_s": {
+                    "type": "integer",
+                    "description": "How long to wait for the worker's turn to finish before giving up. Omit for the configured default. On a timeout the worker is NOT interrupted - it keeps running, visibly, in its own tab."
+                }
+            },
+            "required": ["task"]
+        }
+    })
+}
+
+/// Dispatch one `delegate_task_<id>` call: forward it to the app, which owns
+/// the tabs.
+///
+/// Unlike `offload_task` there is **no self-contained fallback**. There cannot
+/// be: the worker is a tab in the app's process, so an unreachable app does not
+/// mean "do it here", it means there is no worker at all. Saying so is the only
+/// honest answer.
+async fn handle_delegate_tool(name: &str, params: Value) -> Result<Value, (i64, String)> {
+    let Some(harness) = name
+        .strip_prefix(DELEGATE_TOOL_PREFIX)
+        .filter(|h| !h.is_empty())
+    else {
+        return Err((-32602, format!("unknown tool: {name}")));
+    };
+    let args = params.get("arguments").cloned().unwrap_or(Value::Null);
+    let task = args
+        .get("task")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if task.trim().is_empty() {
+        return Ok(tool_error(&format!("{name} requires a non-empty `task`")));
+    }
+    let context = args
+        .get("context")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let timeout_s = args.get("timeout_s").and_then(|v| v.as_u64());
+    let Some(own_tab) = tab() else {
+        // The engine's preflight refuses this too; answering here as well saves
+        // a headless child a round trip to be told the same thing. Both halves
+        // exist because either can be reached first (a facade route in Phase C
+        // does not come through this file at all).
+        return Ok(tool_error(
+            "delegation is not available to a headless consumer: cImp needs to know which tab is \
+             asking, and this process was not started for one",
+        ));
+    };
+    match proxy_delegate(harness, &task, context.as_deref(), timeout_s, own_tab).await {
+        Some(Ok(text)) => Ok(json!({ "content": [{ "type": "text", "text": text }] })),
+        Some(Err(msg)) => Ok(tool_error(&msg)),
+        None => Ok(tool_error(
+            "cImp is not reachable, so no tab can be driven. Delegation runs inside the app that \
+             owns the tabs - there is no local fallback for it.",
+        )),
+    }
+}
+
+/// `POST /delegate` - forward one delegation to the app.
+///
+/// `None` means the app is unreachable. `Some(Err)` means the app answered, and
+/// its answer is the refusal/timeout text, surfaced verbatim.
+async fn proxy_delegate(
+    harness: &str,
+    task: &str,
+    context: Option<&str>,
+    timeout_s: Option<u64>,
+    own_tab: &str,
+) -> Option<Result<String, String>> {
+    let (base, token) = proxy_base()?;
+    // Connect timeout only, no overall request timeout: a delegation is a whole
+    // model turn on another harness and legitimately runs for minutes. The
+    // engine's own deadline is what bounds it. A second, shorter bound here
+    // would abandon a live worker and report a failure the app knows nothing
+    // about - the defect `c8d1619` fixed for `run_check`, which this must not
+    // reintroduce.
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(8))
+        .pool_max_idle_per_host(0)
+        .build()
+        .ok()?;
+    let body = json!({
+        "harness": harness,
+        "task": task,
+        "context": context,
+        "timeout_s": timeout_s,
+        "consumer": consumer(),
+        "tab": own_tab,
+    });
+    let resp = client
+        .post(format!("{base}/delegate"))
+        .bearer_auth(&token)
+        .json(&body)
+        .send()
+        .await
+        .ok()?;
+    let v: Value = resp.json().await.ok()?;
+    if v.get("ok").and_then(Value::as_bool) == Some(true) {
+        let text = v
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let worker = v.get("worker").and_then(Value::as_str).unwrap_or("");
+        let ms = v.get("duration_ms").and_then(Value::as_u64).unwrap_or(0);
+        let screened = v.get("screened").and_then(Value::as_bool).unwrap_or(false);
+        // The meta footer mirrors what an `offload_task` result carries - which
+        // worker, how long, and whether the text crossed the screening boundary
+        // - so harness-side guidance needs no special casing for this tool.
+        let verdict = if screened { "screened" } else { "unscreened" };
+        Some(Ok(format!(
+            "{text}\n\n[delegated to {worker} - {ms} ms - {verdict}]"
+        )))
+    } else {
+        Some(Err(v
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("delegation failed")
+            .to_string()))
+    }
+}
+
+#[cfg(test)]
+mod delegate_tool_tests {
+    use super::*;
+    use crate::settings::{DelegationRole, Settings, TabConfig};
+
+    fn settings_with_manual(role_tab: &str) -> Settings {
+        let mut s = Settings::default();
+        s.tabs.push(crate::settings::default_claude_tab());
+        s.tabs.push(crate::settings::default_opencode_tab());
+        for t in s.tabs.iter_mut() {
+            if let TabConfig::AiTool(c) = t {
+                if c.id == role_tab {
+                    c.delegation_role = DelegationRole::Manual;
+                }
+            }
+        }
+        s
+    }
+
+    /// **The pinned sentence is on every generated tool** (locked decision 3).
+    ///
+    /// It is the only thing that distinguishes this tool from `offload_task` to
+    /// a model reading the list, so a description that lost it would turn a
+    /// user-directed instrument into one the model may reach for on its own.
+    #[test]
+    fn every_generated_delegate_tool_opens_with_the_pinned_sentence() {
+        let ids = crate::harness::contract::harness_ids();
+        assert!(!ids.is_empty());
+        for id in ids {
+            let display = crate::harness::contract::Harness::from_id(id)
+                .expect("registry harness")
+                .display_name();
+            let tool = delegate_task_tool(id, display, "api-work");
+            let desc = tool["description"].as_str().expect("a description");
+            assert!(
+                desc.starts_with(&delegate_tool_contract(display)),
+                "`delegate_task_{id}` does not open with the pinned contract sentence:\n{desc}"
+            );
+            assert!(
+                desc.contains("Never call it on your own initiative"),
+                "the who-decides clause is the whole contract: {desc}"
+            );
+            assert!(
+                desc.contains("offload_task"),
+                "the description must point at the tool the model MAY call itself: {desc}"
+            );
+            assert!(
+                desc.contains("api-work"),
+                "the description must name the tab it drives: {desc}"
+            );
+            assert_eq!(tool["name"], json!(format!("delegate_task_{id}")));
+            let schema = &tool["inputSchema"];
+            assert_eq!(schema["required"], json!(["task"]));
+            for prop in ["task", "context", "timeout_s"] {
+                assert!(
+                    schema["properties"].get(prop).is_some(),
+                    "missing `{prop}` in the input schema"
+                );
+            }
+            assert_eq!(schema["properties"]["timeout_s"]["type"], json!("integer"));
+            // No tab argument, by decision 3: tool = harness = tab.
+            assert!(schema["properties"].get("tab").is_none());
+        }
+    }
+
+    /// A harness with no Manual tab gets no tool - **no dead tools**.
+    #[test]
+    fn only_harnesses_with_a_manual_tab_are_advertised() {
+        let none = Settings::default();
+        assert!(delegate_targets(&none, None).is_empty(), "no tabs, no tools");
+
+        let s = settings_with_manual(crate::settings::CLAUDE_TAB_ID);
+        let ids: Vec<&str> = delegate_targets(&s, None)
+            .iter()
+            .map(|(id, _, _)| *id)
+            .collect();
+        assert_eq!(ids.len(), 1, "exactly the harness that has a Manual tab");
+    }
+
+    /// **A tab never sees a tool that drives itself** (locked decision 3, and
+    /// live-verify 6's second clause).
+    #[test]
+    fn a_tab_is_not_offered_a_tool_that_drives_itself() {
+        let s = settings_with_manual(crate::settings::CLAUDE_TAB_ID);
+        assert_eq!(delegate_targets(&s, None).len(), 1);
+        assert!(
+            delegate_targets(&s, Some(crate::settings::CLAUDE_TAB_ID)).is_empty(),
+            "the Manual tab itself must not be offered its own delegation tool"
+        );
+        assert_eq!(
+            delegate_targets(&s, Some(crate::settings::OPENCODE_TAB_ID)).len(),
+            1,
+            "…while a different tab still sees it"
+        );
+    }
+
+    /// **A blocked worker gate removes the whole set** - the fail-closed half
+    /// of locked decision 16, observed where the model would see it.
+    #[test]
+    fn a_blocked_worker_gate_advertises_nothing() {
+        let mut s = settings_with_manual(crate::settings::CLAUDE_TAB_ID);
+        assert_eq!(delegate_targets(&s, None).len(), 1);
+        s.harness_versions.input_profile_status = "fail".to_string();
+        assert!(
+            delegate_targets(&s, None).is_empty(),
+            "a recorded input-profile failure must remove every delegation tool, not just refuse \
+             at call time"
+        );
+    }
+
+    /// The prefix round-trips: what the generator names is what the dispatcher
+    /// claims, and the suffix is the registry's own harness id.
+    #[test]
+    fn the_tool_name_prefix_round_trips_to_a_registry_harness_id() {
+        for id in crate::harness::contract::harness_ids() {
+            let name = format!("{DELEGATE_TOOL_PREFIX}{id}");
+            assert!(name.starts_with(DELEGATE_TOOL_PREFIX));
+            assert_eq!(name.strip_prefix(DELEGATE_TOOL_PREFIX), Some(id));
+            assert!(crate::harness::contract::Harness::from_id(id).is_some());
+        }
+        // A bare prefix names no harness and must not dispatch.
+        assert_eq!(
+            DELEGATE_TOOL_PREFIX
+                .strip_prefix(DELEGATE_TOOL_PREFIX)
+                .filter(|h: &&str| !h.is_empty()),
+            None
+        );
     }
 }

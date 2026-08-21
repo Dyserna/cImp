@@ -2526,6 +2526,7 @@ export function defaultSettings(): Settings {
       opencode_last_seen: '',
       e1_status: 'unverified',
       d0_status: 'unverified',
+      input_profile_status: 'unverified',
     },
     code_audit: {
       enabled: false,

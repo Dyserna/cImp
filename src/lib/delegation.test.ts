@@ -4,7 +4,9 @@ import {
   drivenReason,
   glyphState,
   hasCommIcon,
+  isMouseWheel,
   isTerminalReply,
+  readOnlyExempt,
   readOnlyReason,
   readOnlyRefusalMessage,
   withTabReadOnly,
@@ -178,6 +180,85 @@ describe('isTerminalReply', () => {
   it('does not pass anything a person typed', () => {
     for (const keys of ['\x1b[A', '\x1b', '\r', 'y', '\x1b[200~pasted\x1b[201~', '']) {
       expect(isTerminalReply(keys)).toBe(false);
+    }
+  });
+});
+
+/// The same fixture table the Rust side asserts on
+/// (`mouse_wheel_passes_the_lock_under_either_source` and its two neighbours).
+/// The courtesy gate and the enforcement point must agree about every row, or
+/// one of them refuses a scroll the other allowed.
+const WHEEL_REPORTS = [
+  '\x1b[<64;10;5M', // wheel up (SGR)
+  '\x1b[<65;10;5M', // wheel down
+  '\x1b[<66;1;1M', // wheel left
+  '\x1b[<67;1;1M', // wheel right
+  '\x1b[<80;3;4M', // ctrl+wheel up (64 + modifier 16)
+  '\x1b[<68;3;4M', // shift+wheel up (64 + modifier 4)
+  '\x1b[M`!!', // wheel up, legacy X10 encoding
+  '\x1b[Ma!!', // wheel down, legacy X10 encoding
+  '\x1b[<64;1;1M\x1b[<64;1;1M', // a fast scroll, coalesced
+];
+
+const CLICKS_AND_PASTES = [
+  '\x1b[<0;10;5M', // left press
+  '\x1b[<0;10;5m', // left release
+  '\x1b[<1;1;1M', // middle press
+  '\x1b[<2;1;1M', // right press
+  '\x1b[<32;5;5M', // drag with button 0 held (motion bit)
+  '\x1b[<35;5;5M', // bare motion
+  '\x1b[M !!', // left press, legacy X10 encoding
+  '\x1b[M#!!', // release, legacy X10 encoding
+  '\x1b[200~x\x1b[201~', // a bracketed paste
+];
+
+const SMUGGLED = [
+  '\x1b[<64;1;1My', // wheel then a keystroke
+  'y\x1b[<64;1;1M', // keystroke then wheel
+  '\x1b[<64;1;1M\r', // wheel then Enter
+  '\x1b[<64;1;1M\x1b[<0;1;1M', // wheel then a click
+  '\x1b[<64;1;1', // truncated: no terminator
+  '\x1b[M`!', // truncated X10: two coord bytes
+  '',
+];
+
+describe('isMouseWheel', () => {
+  it('passes the wheel — scrolling is reading, and a read-only tab is for watching', () => {
+    for (const wheel of WHEEL_REPORTS) {
+      expect(isMouseWheel(wheel), wheel).toBe(true);
+      expect(readOnlyExempt(wheel), wheel).toBe(true);
+    }
+  });
+
+  it('refuses clicks, drags and pastes — those activate controls', () => {
+    for (const click of CLICKS_AND_PASTES) {
+      expect(isMouseWheel(click), click).toBe(false);
+      expect(readOnlyExempt(click), click).toBe(false);
+    }
+  });
+
+  it('cannot carry a passenger: a wheel report plus anything else is refused', () => {
+    for (const smuggled of SMUGGLED) {
+      expect(isMouseWheel(smuggled), smuggled).toBe(false);
+      expect(readOnlyExempt(smuggled), smuggled).toBe(false);
+    }
+  });
+
+  it('leaves isTerminalReply alone — the wheel is not an automatic reply', () => {
+    for (const wheel of WHEEL_REPORTS) {
+      expect(isTerminalReply(wheel), wheel).toBe(false);
+    }
+  });
+
+  it('still exempts the terminal replies it always did', () => {
+    for (const reply of ['\x1b[24;80R', '\x1b[?1;2c', '\x1b[0n', '\x1b[I', '\x1b[O']) {
+      expect(readOnlyExempt(reply), reply).toBe(true);
+    }
+  });
+
+  it('refuses ordinary keyboard input', () => {
+    for (const keys of ['\x1b[A', '\x1b', '\r', 'y']) {
+      expect(readOnlyExempt(keys), keys).toBe(false);
     }
   });
 });

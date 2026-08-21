@@ -320,10 +320,90 @@ fn read_only_refusal(
     input: &str,
     driver_name: Option<&str>,
 ) -> Option<String> {
-    if is_automatic_terminal_response(input) {
+    if read_only_exempt(input) {
         return None;
     }
     Some(source.reason(driver_name))
+}
+
+/// Everything the read-only lock lets through. **Only** `read_only_refusal`
+/// asks this — `is_automatic_terminal_response` keeps its own, unchanged
+/// meaning for the keystroke/submit bookkeeping, which must go on treating a
+/// wheel report as the non-typing event it always was.
+///
+/// Two exemptions, for two different reasons:
+///
+/// 1. The terminal answering the running program (see `read_only_refusal`).
+/// 2. **Wheel reports: scrolling is reading.** A read-only tab exists so the
+///    user can watch it, and in an alt-screen TUI the wheel is not local
+///    scrollback — it is forwarded to the program as a mouse report, so a
+///    swallowed wheel means a tab the user is allowed to watch but not scroll.
+///    Mouse *clicks* stay refused: a click activates a control (choosing a
+///    permission option, for one), which is exactly the input the lock is for.
+fn read_only_exempt(input: &str) -> bool {
+    is_automatic_terminal_response(input) || is_mouse_wheel(input)
+}
+
+/// Whether `input` is *nothing but* mouse-wheel reports.
+///
+/// Whole-input, and repeat-until-exhausted rather than "starts with": a chunk
+/// that is a wheel report followed by typed text is refused, so the exemption
+/// cannot be used to smuggle a keystroke past the lock. Repeats are allowed
+/// because a fast scroll can arrive as several reports in one chunk, and
+/// letting only the first through would drop the rest silently.
+fn is_mouse_wheel(input: &str) -> bool {
+    let mut rest = input;
+    let mut seen = false;
+    while !rest.is_empty() {
+        match take_wheel_report(rest) {
+            Some(next) => {
+                seen = true;
+                rest = next;
+            }
+            None => return false,
+        }
+    }
+    seen
+}
+
+/// Consume one leading wheel report, returning what follows it.
+///
+/// Handles both encodings xterm can emit: SGR (`ESC [ < Cb ; Cx ; Cy M`) and
+/// the legacy X10/normal one (`ESC [ M` + three bytes, each offset by 32 —
+/// read as `char`s so xterm's UTF-8 extended coordinates don't split).
+///
+/// SGR wheel reports end in `M` only; xterm emits no release for a wheel, so a
+/// `…m` form is not recognized and is refused like any other click release.
+fn take_wheel_report(s: &str) -> Option<&str> {
+    if let Some(body) = s.strip_prefix("\x1b[<") {
+        let end = body.find('M')?;
+        let (params, after) = body.split_at(end);
+        let rest = &after['M'.len_utf8()..];
+        let mut parts = params.split(';');
+        let cb: u32 = parts.next()?.parse().ok()?;
+        let _x: u32 = parts.next()?.parse().ok()?;
+        let _y: u32 = parts.next()?.parse().ok()?;
+        if parts.next().is_some() {
+            return None;
+        }
+        return is_wheel_button(cb).then_some(rest);
+    }
+    if let Some(body) = s.strip_prefix("\x1b[M") {
+        let mut chars = body.chars();
+        let cb = (chars.next()? as u32).checked_sub(32)?;
+        let _x = chars.next()?;
+        let _y = chars.next()?;
+        return is_wheel_button(cb).then(|| chars.as_str());
+    }
+    None
+}
+
+/// The wheel bit is 64 (buttons 64/65 vertical, 66/67 horizontal). Bit 32 is
+/// motion, which a wheel never sets and a drag always does, so it must be
+/// clear. Modifier bits (shift 4, meta 8, ctrl 16) may be set — ctrl+wheel is
+/// still a wheel. Nothing at or above 128 is a mouse button.
+fn is_wheel_button(cb: u32) -> bool {
+    cb < 128 && (cb & 0b110_0000) == 0b100_0000
 }
 
 /// V39 Phase A: set or clear a tab's **user** read-only lock (locked
@@ -3718,6 +3798,108 @@ mod tests {
                 None,
                 "the terminal's own answer was refused: {reply:?}"
             );
+        }
+    }
+
+    /// **Scrolling is reading.** A read-only tab exists so the user can WATCH
+    /// it, and in an alt-screen TUI the wheel is forwarded to the program as a
+    /// mouse report rather than scrolling xterm's own buffer — so a swallowed
+    /// wheel means a tab one may watch but not scroll.
+    ///
+    /// The fixture table is duplicated verbatim in
+    /// `src/lib/delegation.test.ts`: the courtesy gate and this enforcement
+    /// point must agree about every one of these, or one of them refuses a
+    /// scroll the other allowed.
+    #[test]
+    fn mouse_wheel_passes_the_lock_under_either_source() {
+        let driven = ReadOnlySource::Driven {
+            by: TabId::OpenCode,
+        };
+        for wheel in [
+            "\x1b[<64;10;5M",              // wheel up (SGR)
+            "\x1b[<65;10;5M",              // wheel down
+            "\x1b[<66;1;1M",               // wheel left
+            "\x1b[<67;1;1M",               // wheel right
+            "\x1b[<80;3;4M",               // ctrl+wheel up (64 + modifier 16)
+            "\x1b[<68;3;4M",               // shift+wheel up (64 + modifier 4)
+            "\x1b[M`!!",                   // wheel up, legacy X10 encoding
+            "\x1b[Ma!!",                   // wheel down, legacy X10 encoding
+            "\x1b[<64;1;1M\x1b[<64;1;1M",  // a fast scroll, coalesced
+        ] {
+            assert!(
+                super::is_mouse_wheel(wheel),
+                "fixture must be a wheel report: {wheel:?}"
+            );
+            for source in [&ReadOnlySource::User, &driven] {
+                assert_eq!(
+                    read_only_refusal(source, wheel, Some("api-work")),
+                    None,
+                    "a locked tab refused a scroll ({source:?}): {wheel:?}"
+                );
+            }
+        }
+    }
+
+    /// **A click is input.** It activates whatever control is under it — a
+    /// permission option, for one — which is the whole reason the lock exists.
+    /// Drag and motion go with it: a drag is a held button.
+    #[test]
+    fn mouse_clicks_drags_and_pastes_are_still_refused() {
+        for click in [
+            "\x1b[<0;10;5M",   // left press
+            "\x1b[<0;10;5m",   // left release
+            "\x1b[<1;1;1M",    // middle press
+            "\x1b[<2;1;1M",    // right press
+            "\x1b[<32;5;5M",   // drag with button 0 held (motion bit)
+            "\x1b[<35;5;5M",   // bare motion
+            "\x1b[M !!",       // left press, legacy X10 encoding
+            "\x1b[M#!!",       // release, legacy X10 encoding
+            "\x1b[200~x\x1b[201~", // a bracketed paste
+        ] {
+            assert!(
+                !super::is_mouse_wheel(click),
+                "fixture must not be a wheel report: {click:?}"
+            );
+            assert!(
+                read_only_refusal(&ReadOnlySource::User, click, None).is_some(),
+                "mouse/paste input slipped through the lock: {click:?}"
+            );
+        }
+    }
+
+    /// **The exemption cannot carry a passenger.** A chunk that is a wheel
+    /// report *plus* typed text is not a wheel report — otherwise the lock
+    /// would be one concatenation away from open.
+    #[test]
+    fn a_wheel_report_with_anything_else_attached_is_refused() {
+        for smuggled in [
+            "\x1b[<64;1;1My",              // wheel then a keystroke
+            "y\x1b[<64;1;1M",              // keystroke then wheel
+            "\x1b[<64;1;1M\r",             // wheel then Enter
+            "\x1b[<64;1;1M\x1b[<0;1;1M",   // wheel then a click
+            "\x1b[<64;1;1",                // truncated: no terminator
+            "\x1b[M`!",                    // truncated X10: two coord bytes
+            "",
+        ] {
+            assert!(
+                !super::is_mouse_wheel(smuggled),
+                "fixture must not be a wheel report: {smuggled:?}"
+            );
+            assert!(
+                read_only_refusal(&ReadOnlySource::User, smuggled, None).is_some(),
+                "input smuggled past the lock behind a wheel report: {smuggled:?}"
+            );
+        }
+    }
+
+    /// The wheel exemption is `read_only_refusal`'s alone: the keystroke and
+    /// submit bookkeeping still sees a wheel report exactly as it always did
+    /// (not an automatic terminal response), so nothing about avatar state or
+    /// echo suppression moved with this.
+    #[test]
+    fn the_wheel_exemption_did_not_change_the_automatic_reply_predicate() {
+        for wheel in ["\x1b[<64;10;5M", "\x1b[M`!!"] {
+            assert!(!auto_reply(wheel), "{wheel:?}");
         }
     }
 

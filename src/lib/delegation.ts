@@ -160,6 +160,77 @@ export function isTerminalReply(data: string): boolean {
   return true;
 }
 
+/// Whether `data` is *nothing but* mouse-wheel reports.
+///
+/// **Scrolling is reading.** A read-only tab exists so the user can watch it,
+/// and in an alt-screen TUI the wheel is not local scrollback — xterm forwards
+/// it to the program as a mouse report, so a swallowed wheel leaves a tab one
+/// may watch but not scroll. Mouse *clicks* stay refused: a click activates
+/// whatever control is under it (a permission option, for one), which is the
+/// input the lock exists for. Drag goes with the click — a drag is a held
+/// button.
+///
+/// Whole-input and repeat-until-exhausted, never "starts with": a wheel report
+/// followed by typed text is refused, so the exemption cannot smuggle a
+/// keystroke past the lock. Repeats pass because a fast scroll can arrive as
+/// several reports in one chunk.
+///
+/// Mirrors `ipc::commands::is_mouse_wheel`; both sides assert the same
+/// fixture table.
+export function isMouseWheel(data: string): boolean {
+  let rest = data;
+  let seen = false;
+  while (rest.length > 0) {
+    const next = takeWheelReport(rest);
+    if (next === null) return false;
+    seen = true;
+    rest = next;
+  }
+  return seen;
+}
+
+/// Everything the read-only lock lets through: the terminal answering the
+/// running program, and the wheel. This is what the courtesy gate asks —
+/// `isTerminalReply` keeps its own narrower meaning.
+export function readOnlyExempt(data: string): boolean {
+  return isTerminalReply(data) || isMouseWheel(data);
+}
+
+/// Consume one leading wheel report, returning what follows it, or `null`.
+///
+/// Both encodings xterm can emit: SGR (`ESC [ < Cb ; Cx ; Cy M`) and the
+/// legacy X10/normal one (`ESC [ M` + three code points, each offset by 32).
+/// SGR wheel reports end in `M` only — xterm emits no release for a wheel, so
+/// a `…m` form is treated like any other click release and refused.
+function takeWheelReport(s: string): string | null {
+  if (s.startsWith('\x1b[<')) {
+    const body = s.slice(3);
+    const end = body.indexOf('M');
+    if (end < 0) return null;
+    const params = body.slice(0, end).split(';');
+    if (params.length !== 3) return null;
+    if (!params.every((p) => /^\d+$/.test(p))) return null;
+    return isWheelButton(Number(params[0])) ? body.slice(end + 1) : null;
+  }
+  if (s.startsWith('\x1b[M')) {
+    // Code points, not UTF-16 units: xterm's UTF-8 extended coordinates can
+    // exceed 127, and splitting one in half would misread the next report.
+    const rest = [...s.slice(3)];
+    if (rest.length < 3) return null;
+    const cb = (rest[0].codePointAt(0) ?? 0) - 32;
+    if (cb < 0) return null;
+    return isWheelButton(cb) ? rest.slice(3).join('') : null;
+  }
+  return null;
+}
+
+/// Bit 64 = wheel (64/65 vertical, 66/67 horizontal); bit 32 = motion, which a
+/// wheel never sets and a drag always does; modifier bits (shift 4, meta 8,
+/// ctrl 16) may be set — ctrl+wheel is still a wheel.
+function isWheelButton(cb: number): boolean {
+  return Number.isInteger(cb) && cb >= 0 && cb < 128 && (cb & 0b110_0000) === 0b100_0000;
+}
+
 /// Recognize the backend's read-only refusal in a rejected `pty_write`.
 ///
 /// `AppError` serializes to its `Display` string, so this matches the shape

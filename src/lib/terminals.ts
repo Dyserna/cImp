@@ -78,7 +78,7 @@ import { perTabClosedState } from './avatarState';
 import { openConfigureTabDialog } from './dialog/store';
 import { clearTabError, setTabError } from './tabs/errorState';
 import { isShellTab, isAppRenderedTab, type TabId } from './tabs/types';
-import { isTerminalReply, readOnlyReason, readOnlyRefusalMessage } from './delegation';
+import { readOnlyExempt, readOnlyReason, readOnlyRefusalMessage } from './delegation';
 import { showToast } from './toast';
 
 /// V39 Phase A: when each tab last told the user its keyboard is locked.
@@ -982,8 +982,11 @@ export function createTerminal(
     // Terminal protocol replies are exempt for the same reason the backend
     // exempts them: they are the terminal answering the running program, and a
     // TUI waiting for a cursor-position report would hang on a swallowed one.
+    // Mouse WHEEL reports are exempt too — scrolling is reading, and under an
+    // alt-screen TUI the wheel goes to the program rather than to xterm's own
+    // buffer. Clicks and drags are not: they activate controls.
     const lockReason = readOnlyReason(get(settingsStore), tabId);
-    if (lockReason && !isTerminalReply(data)) {
+    if (lockReason && !readOnlyExempt(data)) {
       noteReadOnlyRefusal(tabId, `This tab is ${lockReason}.`);
       return;
     }

@@ -105,5 +105,5 @@ pub mod reader;
 pub mod render;
 pub mod verify;
 
-pub use input::{input_profile, InputProfile, PasteMode};
+pub use input::{input_profile, InputProfile};
 pub use reader::{spawn, OobContext, OobSpec};

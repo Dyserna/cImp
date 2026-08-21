@@ -35,6 +35,11 @@
 //! [`Dep::Behavior`]: crate::harness::contract::Dep::Behavior
 
 /// How a multi-line request is handed to a TUI.
+// `Raw` is unconstructed on purpose — see its own doc comment: it exists so a
+// future harness can DECLARE that it has no bracketed-paste path, rather than
+// be forced to claim support it does not have. A variant that only appears once
+// someone needs it is a variant nobody can find.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PasteMode {
     /// Wrap the text in the bracketed-paste markers (`ESC [ 200 ~` …
@@ -131,18 +136,6 @@ pub fn input_profile(id: &str) -> Option<InputProfile> {
     }
 }
 
-/// Every harness id that declares an input profile, in registry order.
-///
-/// The generated `delegate_task_<id>` tool set is built from this rather than
-/// from a literal list, so a harness that gains an `input.rs` becomes
-/// delegable without an edit above the seam.
-pub fn harnesses_with_input_profiles() -> Vec<&'static str> {
-    super::contract::harness_ids()
-        .into_iter()
-        .filter(|id| input_profile(id).is_some())
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,7 +217,6 @@ mod tests {
                  delegation worker, and the gate must be the thing that says so"
             );
         }
-        assert_eq!(harnesses_with_input_profiles(), ids);
         for unknown in ["", "aider", "Claude", "claude.exe", "opencode-2"] {
             assert!(
                 input_profile(unknown).is_none(),

@@ -44,7 +44,7 @@ use std::sync::{Mutex, OnceLock};
 use crate::activity::{ActivityEntry, ActivityKind, ActivityRecord, Attribution};
 use crate::state::TabId;
 
-pub use engine::{drive, DriveRequest, Reply};
+pub use engine::{drive, DriveRequest};
 
 // ── vocabulary ──────────────────────────────────────────────────────────────
 
@@ -56,11 +56,19 @@ pub use engine::{drive, DriveRequest, Reply};
 pub enum DelegationMode {
     /// `delegate_task_<harness>` — the model was told to, by the user.
     Explicit,
-    /// A `HarnessTab` offload backend the router picked (Phase C).
+    /// A `HarnessTab` offload backend the router picked. **Constructed in
+    /// Phase C**, which is the phase that adds the router side — declared now
+    /// because the Events row's `mode` column, the status view and the wire
+    /// shape all carry it, and a variant that arrives with its consumer would
+    /// change three serialized shapes at once.
+    #[allow(dead_code)]
     Facade,
 }
 
 impl DelegationMode {
+    /// The wire/log spelling. Used by the Phase C router's own logging and by
+    /// anything that needs the mode as a bare token rather than as JSON.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn as_str(self) -> &'static str {
         match self {
             DelegationMode::Explicit => "explicit",
@@ -83,7 +91,10 @@ pub mod transition {
     pub const WORKER_EXITED: &str = "worker_exited";
     pub const ROLE_MOVED: &str = "role_moved";
 
-    /// Every transition this build can mint, in lifecycle order.
+    /// Every transition this build can mint, in lifecycle order. The list the
+    /// tests check the writers against, and the list B2's `rowMeta` branch is
+    /// written from.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub const ALL: &[&str] = &[
         START,
         DONE,
@@ -160,6 +171,9 @@ impl std::fmt::Display for DelegationError {
 /// of the data structure rather than of a check someone has to remember.
 #[derive(Clone, Debug)]
 struct InFlight {
+    /// Monotonic per-process id. Not a key (the worker tab is), and not on the
+    /// wire — it exists so two flights on the same worker in the same second
+    /// are distinguishable in the log.
     id: u64,
     driver: TabId,
     /// The driver tab's display name at start. Snapshotted because the refusal
@@ -348,6 +362,13 @@ fn claim(
         }
         r.next_id = r.next_id.wrapping_add(1);
         let id = r.next_id;
+        tracing::info!(
+            delegation = id,
+            worker = %worker.as_str(),
+            driver = %driver.as_str(),
+            mode = mode.as_str(),
+            "delegation: slot claimed"
+        );
         // A stale completion from before this delegation existed must never be
         // claimed by it. Dropping the slot here (rather than only comparing
         // timestamps later) makes that true even if a clock jumps.
@@ -374,7 +395,15 @@ fn claim(
 /// Release the worker's slot and drop any unclaimed completion.
 fn release(worker: &TabId) {
     registry(|r| {
-        r.in_flight.remove(worker);
+        if let Some(f) = r.in_flight.remove(worker) {
+            tracing::info!(
+                delegation = f.id,
+                worker = %worker.as_str(),
+                driver = %f.driver.as_str(),
+                ms = crate::activity::now_ms().saturating_sub(f.started_ms),
+                "delegation: slot released"
+            );
+        }
         r.completions.remove(worker);
     });
 }

@@ -471,6 +471,205 @@ pub async fn tab_set_read_only(state: State<'_, AppState>, tab: TabId, on: bool)
     Ok(())
 }
 
+/// V39 Phase B: what `tab_set_delegation_role` did, for the UI's toast.
+///
+/// `displaced` is the id of the tab that LOST the Manual role to this call
+/// (locked decision 8's move rule) — `None` when nothing moved. Returned rather
+/// than only recorded because the losing tab may not be visible, and a role
+/// that moved silently is a `delegate_task_*` tool that started driving a
+/// different tab with nothing on screen saying so.
+#[derive(serde::Serialize)]
+pub struct RoleChange {
+    pub tab: String,
+    pub role: crate::settings::DelegationRole,
+    pub displaced: Option<String>,
+}
+
+/// V39 Phase B (locked decision 8): set a tab's delegation role, enforcing
+/// **at most one Manual tab per harness**.
+///
+/// The move rule, and why it is a move rather than a refusal: the user is
+/// choosing which tab `delegate_task_<harness>` drives, and there is exactly
+/// one answer per harness. A refusal ("tab A already holds it") would make the
+/// user go and clear A first for no reason anyone benefits from — so this is a
+/// radio button whose group spans tabs. The previous holder drops to `None`,
+/// both writes land in ONE settings mutation (so no broadcast can observe two
+/// Manual tabs of one harness), an Events row records the move, and the
+/// displaced id comes back for the toast.
+///
+/// Refusals, each naming its condition: a reserved dashboard (no PTY, no
+/// harness), a tab that is not a configured AI tab, and a harness with no input
+/// profile (it could never be driven, so a role on it would be a control that
+/// does nothing).
+///
+/// **Not spawn-baked** (decision 15). The persisted write broadcasts
+/// `settings-changed`, which is also what asks the offload service for a
+/// `tools/list_changed` pulse — `graph::native_surface_sig` now hashes the
+/// Manual set, so the gate sees the move and every live session re-lists on its
+/// next turn without a restart.
+#[tauri::command]
+pub async fn tab_set_delegation_role(
+    state: State<'_, AppState>,
+    tab: TabId,
+    role: crate::settings::DelegationRole,
+) -> AppResult<RoleChange> {
+    use crate::settings::DelegationRole;
+
+    if tab.is_reserved_dashboard() {
+        return Err(AppError::Ipc(format!(
+            "tab `{}` is an app-rendered dashboard, not a harness tab; it has no delegation role",
+            tab.as_str()
+        )));
+    }
+    if tab.kind() != TabKind::AiTool {
+        return Err(AppError::Ipc(format!(
+            "tab `{}` is not an AI tab; delegation roles apply to AI tabs only",
+            tab.as_str()
+        )));
+    }
+    let settings = state.settings.current();
+    let Some(TabConfig::AiTool(cfg)) = settings.find_tab(tab.as_str()) else {
+        return Err(AppError::Ipc(format!("unknown AI tab `{}`", tab.as_str())));
+    };
+    let agent = crate::tabs::tab_consumer(cfg);
+    if crate::harness::input_profile(agent).is_none() {
+        return Err(AppError::Ipc(format!(
+            "tab `{}` runs a harness with no input profile, so cImp could never type a turn into \
+             it — it cannot hold a delegation role",
+            tab.as_str()
+        )));
+    }
+
+    // Who currently holds Manual for this harness, if anyone. Read before the
+    // mutation so the row and the return value name the same tab the mutation
+    // is about to clear.
+    let displaced: Option<(String, String)> = if role == DelegationRole::Manual {
+        settings.tabs.iter().find_map(|t| match t {
+            TabConfig::AiTool(c)
+                if c.delegation_role == DelegationRole::Manual
+                    && c.id != tab.as_str()
+                    && crate::tabs::tab_consumer(c) == agent =>
+            {
+                Some((c.id.clone(), c.name.clone()))
+            }
+            _ => None,
+        })
+    } else {
+        None
+    };
+
+    let id = tab.as_str().to_string();
+    let losing = displaced.as_ref().map(|(id, _)| id.clone());
+    let agent_for_mutate = agent;
+    state.settings.mutate(move |snap| {
+        // ONE mutation for both writes: a snapshot in which two tabs of one
+        // harness hold Manual must never be observable by a broadcast reader.
+        for t in snap.tabs.iter_mut() {
+            let TabConfig::AiTool(c) = t else { continue };
+            if c.id == id {
+                c.delegation_role = role;
+            } else if role == DelegationRole::Manual
+                && c.delegation_role == DelegationRole::Manual
+                && crate::tabs::tab_consumer(c) == agent_for_mutate
+            {
+                c.delegation_role = DelegationRole::None;
+            }
+        }
+    });
+
+    if let Some((lost_id, lost_name)) = &displaced {
+        let taker = {
+            let registry = state.tabs.lock().await;
+            registry
+                .name_of(&tab)
+                .unwrap_or_else(|| tab.as_str().to_string())
+        };
+        crate::delegation::record_row(
+            crate::delegation::transition::ROLE_MOVED,
+            lost_name,
+            Some(&format!(
+                "the Manual role for this harness moved to `{taker}`"
+            )),
+            agent,
+            Some(tab.as_str()),
+            true,
+            0,
+            String::new(),
+            String::new(),
+        );
+        tracing::info!(from = %lost_id, to = %tab.as_str(), harness = %agent, "delegation: Manual role moved");
+    }
+
+    Ok(RoleChange {
+        tab: tab.as_str().to_string(),
+        role,
+        displaced: losing,
+    })
+}
+
+/// V39 Phase B (locked decision 6): **take over** a driven tab.
+///
+/// Stops the driver waiting; the worker keeps running, visibly. Sends the
+/// worker NOTHING — no Escape, no interrupt. The engine's own path releases the
+/// read-only lock and mints the `cancelled` row on its way out, so this command
+/// deliberately does neither: two owners of a teardown is how one of them ends
+/// up running twice.
+///
+/// Returns whether a delegation was actually in flight, so the UI can tell "I
+/// cancelled it" from "it had already finished".
+#[tauri::command]
+pub async fn delegation_take_over(state: State<'_, AppState>, tab: TabId) -> AppResult<bool> {
+    let Some(v) = crate::delegation::take_over(&tab) else {
+        return Ok(false);
+    };
+    // TWO rows for one event, and they are not duplicates (#87's transition
+    // list names both): `takeover` is the USER's action on the worker tab,
+    // minted here where it happened; `cancelled` is what the DRIVER was told,
+    // minted by the engine on its way out. A reader of the feed wants both —
+    // "who stopped this" and "what the asking side received" are different
+    // questions, and a single row would answer only one of them.
+    let worker_name = {
+        let registry = state.tabs.lock().await;
+        registry
+            .name_of(&tab)
+            .unwrap_or_else(|| tab.as_str().to_string())
+    };
+    crate::delegation::record_row(
+        crate::delegation::transition::TAKEOVER,
+        &worker_name,
+        Some(&format!(
+            "the user took the tab back from `{}`",
+            v.driver_name
+        )),
+        &v.driver_agent,
+        Some(v.driver.as_str()),
+        true,
+        crate::activity::now_ms().saturating_sub(v.started_ms),
+        String::new(),
+        String::new(),
+    );
+    Ok(true)
+}
+
+/// V39 Phase B: what is driving `tab` right now, if anything — the glyph's
+/// *driven* state and the worker-tab banner.
+///
+/// A pull to pair with the `delegation-changed` push: the event carries every
+/// edge, and this is what a view that mounts mid-flight asks so it paints the
+/// right thing before the next edge arrives.
+#[tauri::command]
+pub async fn delegation_status(tab: TabId) -> AppResult<Option<crate::delegation::InFlightView>> {
+    Ok(crate::delegation::status(&tab))
+}
+
+/// V39 Phase B: every in-flight delegation, keyed by worker tab id — the
+/// status-bar chip's count and the initial paint of every tab's glyph, in one
+/// call rather than one per tab.
+#[tauri::command]
+pub async fn delegation_statuses() -> AppResult<Vec<(String, crate::delegation::InFlightView)>> {
+    Ok(crate::delegation::statuses())
+}
+
 fn contains_enter(input: &str) -> bool {
     input.chars().any(|c| c == '\r' || c == '\n')
 }

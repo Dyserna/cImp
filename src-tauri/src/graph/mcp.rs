@@ -442,6 +442,19 @@ struct SurfaceFingerprint {
     /// ignored the other half would leave an OpenCode session's surface moving
     /// with nothing to notice it.
     commands_sig: u64,
+    /// **V39 Phase B** — the generated `delegate_task_<harness>` set: the tab
+    /// roles that decide which of those tools exists, plus the worker gate's
+    /// verdict.
+    ///
+    /// Same rule as `commands_sig`: ONE component for one advertised group,
+    /// hashed from every input that moves it, so this type stays a fingerprint
+    /// rather than a mirror of the settings. Without it, moving the Manual role
+    /// from one tab to another would change what a child advertises while the
+    /// pulse gate saw no move and every live session kept the old tool list
+    /// until its next restart — which is exactly what locked decision 15
+    /// promises does NOT happen ("takes effect on the next turn without
+    /// restarting either tab").
+    delegation_sig: u64,
 }
 
 impl SurfaceFingerprint {
@@ -453,8 +466,36 @@ impl SurfaceFingerprint {
             lean_tools: settings.graph.lean_tools,
             checks_sig: checks_sig(settings),
             commands_sig: commands_sig(settings),
+            delegation_sig: delegation_sig(settings),
         }
     }
+}
+
+/// Hash what decides the `delegate_task_*` set: the worker gate's verdict, and
+/// every AI tab holding the Manual role with the harness it belongs to.
+///
+/// The gate is in here because a `"fail"` recorded against the input-profile
+/// spike removes the whole group, and that is a surface move like any other.
+/// Process-local memo key only, like [`checks_sig`].
+fn delegation_sig(settings: &crate::settings::Settings) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    crate::harness::contract::gate(
+        crate::harness::contract::CAP_DELEGATION_WORKER,
+        settings,
+    )
+    .blocked
+    .hash(&mut h);
+    for cfg in &settings.tabs {
+        if let crate::settings::TabConfig::AiTool(c) = cfg {
+            if c.delegation_role == crate::settings::DelegationRole::Manual {
+                crate::tabs::tab_consumer(c).hash(&mut h);
+                c.id.hash(&mut h);
+                c.name.hash(&mut h);
+            }
+        }
+    }
+    h.finish()
 }
 
 /// Hash the EFFECTIVE check names, in order — every input [`run_check_spec`]

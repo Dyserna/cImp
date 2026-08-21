@@ -175,6 +175,127 @@ impl ReadOnlyTabs {
     }
 }
 
+/// V39 Phase B — **the readable mirror of the three `TabState` flags the
+/// delegation engine's preflight and wait loop need**, kept beside
+/// [`ReadOnlyTabs`] and for the identical reason.
+///
+/// `TabState` lives inside the state-manager actor task and is reachable only
+/// by *sending* a [`StateSignal`]; nothing can read it. Preflight (locked
+/// decision 12) has to answer "is this worker idle, and is a prompt standing?"
+/// **before** it types, and the wait loop has to notice a prompt appearing
+/// *during* a flight (decision 5: relax the lock, extend the deadline). An
+/// actor round-trip in front of either would be a race with a message queue in
+/// the middle of it.
+///
+/// So the state manager writes the three edges it already computes into this
+/// shared map as it handles them, and readers above the seam get a
+/// synchronous, lock-free-ish answer. **One writer, many readers**: nothing
+/// outside [`note_signal`](Self::note_signal) may set a flag, which is what
+/// keeps this a mirror rather than a second source of truth.
+///
+/// [`StateSignal`]: crate::state::StateSignal
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TabActivityFlags {
+    /// A permission prompt is standing on this tab
+    /// (`PermissionPromptDetected` … `PermissionPromptResolved`).
+    pub awaiting_permission: bool,
+    /// An AskUserQuestion-style prompt is standing (the same pair, for
+    /// questions). Tracked separately because the two can stand at once and
+    /// each clears on its own edge.
+    pub awaiting_question: bool,
+    /// Output is streaming right now (`ClaudeOutputStarted` …
+    /// `ClaudeOutputStopped`) — i.e. a turn is in flight. Preflight refuses to
+    /// type into a tab mid-burst: the request would land in the middle of
+    /// someone else's turn.
+    pub output_running: bool,
+    /// The tab's subprocess has exited. Latched: nothing in this mirror clears
+    /// it, because nothing but a restart can — and a restart re-seeds the row
+    /// through `TabAdded`.
+    pub exited: bool,
+}
+
+impl TabActivityFlags {
+    /// Whether a prompt of either kind is standing — the predicate decision 5
+    /// is written in terms of.
+    pub fn awaiting_prompt(&self) -> bool {
+        self.awaiting_permission || self.awaiting_question
+    }
+}
+
+/// Shared, runtime-mutable per-tab activity flags — see [`TabActivityFlags`].
+#[derive(Clone, Default)]
+pub struct TabActivity {
+    inner: Arc<RwLock<HashMap<TabId, TabActivityFlags>>>,
+}
+
+impl TabActivity {
+    /// This tab's flags. An unknown tab reads as all-false, which is the
+    /// honest answer: nothing has been observed about it.
+    ///
+    /// Note what that means for `exited` — a tab the mirror has never seen is
+    /// NOT reported as exited. Liveness is the tab registry's answer
+    /// (`TabRegistry::is_started`); this flag only records an exit that was
+    /// observed, and the engine checks both.
+    pub fn flags(&self, tab: &TabId) -> TabActivityFlags {
+        let map = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        map.get(tab).copied().unwrap_or_default()
+    }
+
+    /// Fold one state signal into the mirror. **The only writer.**
+    ///
+    /// Called from the state manager's loop with every signal, before any of
+    /// its `continue`-guarded branches, so a signal handled by an early return
+    /// still updates the mirror. Deliberately total over the signal set with a
+    /// catch-all: a new signal that says nothing about these four facts must
+    /// not need an edit here.
+    pub fn note_signal(&self, signal: &StateSignal) {
+        let (tab, apply): (&TabId, fn(&mut TabActivityFlags)) = match signal {
+            StateSignal::PermissionPromptDetected { tab } => (tab, |f| f.awaiting_permission = true),
+            StateSignal::PermissionPromptResolved { tab } => {
+                (tab, |f| f.awaiting_permission = false)
+            }
+            StateSignal::QuestionPromptDetected { tab } => (tab, |f| f.awaiting_question = true),
+            StateSignal::QuestionPromptResolved { tab } => (tab, |f| f.awaiting_question = false),
+            StateSignal::ClaudeOutputStarted { tab } => (tab, |f| f.output_running = true),
+            StateSignal::ClaudeOutputStopped { tab } => (tab, |f| f.output_running = false),
+            StateSignal::SubprocessExited { tab, .. } => (tab, |f| {
+                f.exited = true;
+                // A dead process is not mid-burst and holds no prompt. Left
+                // set, `output_running` would make every later preflight
+                // refuse a tab the user has since restarted, for a burst that
+                // ended when the process did.
+                f.output_running = false;
+                f.awaiting_permission = false;
+                f.awaiting_question = false;
+            }),
+            // A user keystroke or submit clears a standing prompt in the state
+            // manager's own bookkeeping, so it clears here too — otherwise a
+            // prompt the user answered by typing would hold the deadline open
+            // for the rest of the flight.
+            StateSignal::UserSubmit { tab } => (tab, |f| {
+                f.awaiting_permission = false;
+                f.awaiting_question = false;
+            }),
+            _ => return,
+        };
+        let mut map = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        apply(map.entry(tab.clone()).or_default());
+    }
+
+    /// Seed (or re-seed) a tab with clean flags — a fresh or restarted
+    /// subprocess. Clears a latched `exited`.
+    pub fn reset(&self, tab: &TabId) {
+        let mut map = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        map.insert(tab.clone(), TabActivityFlags::default());
+    }
+
+    /// Drop a closed tab's row, beside the other per-tab map cleanups.
+    pub fn forget(&self, tab: &TabId) {
+        let mut map = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        map.remove(tab);
+    }
+}
+
 /// Identifier for one of the multi-tab subprocesses cimp owns. Four
 /// reserved AI variants cover the V14 builtins (subscription / local
 /// pairs for Claude Code and Aider); `Shell(id)` carries the
@@ -808,6 +929,10 @@ pub fn spawn_state_manager(
     rx: mpsc::Receiver<StateSignal>,
     state_events: broadcast::Sender<StateEvent>,
     input_lengths: InputLengths,
+    // V39 Phase B: the readable mirror of the prompt/burst/exit flags. Handed
+    // in rather than owned here for the same reason `input_lengths` is — the
+    // IPC layer and the delegation engine hold the other end.
+    activity: TabActivity,
     tab_metas: Vec<TabMeta>,
     initial_active: TabId,
     ai_tts_suppressed: crate::tts::AiTtsSuppressed,
@@ -818,6 +943,7 @@ pub fn spawn_state_manager(
             rx,
             state_events,
             input_lengths,
+            activity,
             tab_metas,
             initial_active,
             ai_tts_suppressed,
@@ -831,6 +957,7 @@ async fn run(
     mut rx: mpsc::Receiver<StateSignal>,
     state_events: broadcast::Sender<StateEvent>,
     input_lengths: InputLengths,
+    activity: TabActivity,
     tab_metas: Vec<TabMeta>,
     initial_active: TabId,
     ai_tts_suppressed: crate::tts::AiTtsSuppressed,
@@ -875,6 +1002,14 @@ async fn run(
             maybe = rx.recv() => {
                 let Some(signal) = maybe else { break };
 
+                // V39 Phase B: mirror the prompt / output-burst / exit edges
+                // FIRST, ahead of every `continue` below, so a signal handled
+                // by an early return still reaches the readers above the seam
+                // (`crate::delegation`'s preflight and wait loop). Read-only
+                // fold, no side effects, cannot reject a signal — the loop
+                // behaves identically whether this line runs or not.
+                activity.note_signal(&signal);
+
                 // Runtime tab lifecycle (TabAdded / TabRemoved /
                 // TabRenameRequested) is handled before the per-tab
                 // transition routing because (a) the target TabState may
@@ -894,6 +1029,10 @@ async fn run(
                             g.entry(meta.id.clone())
                                 .or_insert_with(|| Arc::new(AtomicI32::new(0)));
                         }
+                        // V39 Phase B: a fresh subprocess starts with clean
+                        // flags — this is also what clears a latched `exited`
+                        // when a tab is restarted into the same id.
+                        activity.reset(&meta.id);
                         info!(tab = ?meta.id, position, "tab added");
                         emit_state(&app, &state_events, meta.id.clone(), AvatarState::Idle);
                         emit_tab_created(
@@ -924,6 +1063,7 @@ async fn run(
                                 active = next;
                             }
                         }
+                        activity.forget(&tab);
                         info!(?tab, "tab removed");
                         emit_tab_closed_event(&app, &state_events, tab);
                     }

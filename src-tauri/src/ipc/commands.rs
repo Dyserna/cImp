@@ -208,6 +208,31 @@ pub async fn pty_write(state: State<'_, AppState>, tab: TabId, input: String) ->
         }
     }
 
+    write_through_pipeline(&state, &tab, input).await
+}
+
+/// **The one input pipeline** (V39 cross-module invariant): every byte that
+/// reaches a tab's PTY passes through here — the TTS-marker pre-registration,
+/// the typed-input accumulator, the keystroke/submit state signals, and the
+/// registry write, in that order and under one registry lock.
+///
+/// Split out of [`pty_write`] in V39 Phase B so the delegation engine can reuse
+/// it. What the engine skips is **only** the read-only check above, and only
+/// because that check is about the *user's keyboard*: the engine holds the
+/// `Driven` lock itself, so entering through `pty_write` would have it refuse
+/// its own write. Everything else it must not skip — a delegated turn that
+/// bypassed the TTS-marker registration would have the worker's echo of the
+/// task spoken aloud, and one that bypassed `UserSubmit` would leave the
+/// avatar in the wrong state for a turn that really did start.
+///
+/// Takes `&AppState` rather than `State<'_, AppState>` so both a Tauri command
+/// and a plain async caller reach the same body.
+pub(crate) async fn write_through_pipeline(
+    state: &AppState,
+    tab: &TabId,
+    input: String,
+) -> AppResult<()> {
+    let tab = tab.clone();
     // Pre-register any TTS markers in the user's input so they don't fire
     // when echoed back by the TUI. Content-based; no per-tab scoping needed.
     // The set stores whitespace-normalized content so a width-driven echo

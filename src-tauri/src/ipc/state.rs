@@ -6,7 +6,7 @@ use tokio::sync::{mpsc, Mutex as TokioMutex};
 
 use crate::audio::AudioOutput;
 use crate::settings::SettingsHandle;
-use crate::state::{InputLengths, ReadOnlyTabs, StateSignal, TabId};
+use crate::state::{InputLengths, ReadOnlyTabs, StateSignal, TabActivity, TabId};
 use crate::tabs::TabRegistryHandle;
 use crate::tts::{AiTtsSuppressed, SpeakSession, TtsRequest};
 
@@ -55,6 +55,13 @@ pub struct AppState {
     /// broadcast. See [`crate::state::ReadOnlyTabs`] for why it is a shared
     /// map rather than a field on the state manager's `TabState`.
     pub read_only: ReadOnlyTabs,
+    /// V39 Phase B: the readable mirror of the per-tab prompt / output-burst /
+    /// exit flags the state manager owns. The delegation engine's preflight
+    /// (locked decision 12) and its wait loop (decision 5) read it
+    /// synchronously — an actor round-trip in front of an idleness check is a
+    /// race with a message queue in the middle of it. See
+    /// [`crate::state::TabActivity`].
+    pub tab_activity: TabActivity,
     pub settings: SettingsHandle,
     pub audio: Arc<RwLock<Option<Arc<AudioOutput>>>>,
     /// V1.4-07 A: pending deep-link target for the Settings window.

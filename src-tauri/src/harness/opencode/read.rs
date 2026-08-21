@@ -1080,6 +1080,13 @@ impl Tracker {
         }
         if !out.trim().is_empty() {
             trace!(tab = ?ctx.tab, "OpenCode OOB: speaking assistant message (reasoning excluded)");
+            // V39 Phase B: delegation's completion signal. This reader is
+            // OpenCode's DECLARED path for `assistant_text` (the plugin says
+            // `cannot`, by design D6), so for an OpenCode worker this call —
+            // not the CHP push core — is what ends a delegation's wait. Beside
+            // `speak` rather than inside it: `speak` is gated by the per-tab
+            // TTS toggle, and a delegation must complete on a silent tab.
+            ctx.note_turn_text(&out);
             ctx.speak(&out).await;
         }
     }

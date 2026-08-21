@@ -672,6 +672,11 @@ async fn drain_new_lines(
             for (key, text) in assistant_texts(&obj) {
                 if seen.insert(key) && !pushed {
                     trace!(tab = ?ctx.tab, "Claude OOB: speaking assistant block");
+                    // V39 Phase B: the same arbitrated branch feeds delegation's
+                    // completion signal. Beside `speak`, not inside it — `speak`
+                    // is gated by the per-tab TTS toggle and a delegation must
+                    // complete on a silent tab.
+                    ctx.note_turn_text(&text);
                     ctx.speak(&text).await;
                 }
             }

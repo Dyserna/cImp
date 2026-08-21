@@ -578,6 +578,19 @@ impl PtyManager {
         Ok(())
     }
 
+    /// V39 Phase B: whether this tab has a live PTY handle right now.
+    ///
+    /// The same condition [`Self::write_input`] would fail on
+    /// (`AppError::NotStarted`), asked *before* writing rather than discovered
+    /// by writing. The delegation engine's preflight needs it: "the worker's
+    /// process is alive" is a refusal condition (locked decision 12), and a
+    /// refusal that only surfaces as a failed write has already engaged the
+    /// read-only lock and minted a `start` row for a delegation that never
+    /// began.
+    pub async fn is_started(&self) -> bool {
+        self.inner.lock().await.is_some()
+    }
+
     pub async fn write_input(&self, bytes: Vec<u8>) -> AppResult<()> {
         let writer = {
             let guard = self.inner.lock().await;

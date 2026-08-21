@@ -120,6 +120,24 @@ const SANDBOX_CAP: usize = 60;
 /// per session and so needs no depth, and far smaller than the per-call lanes,
 /// which this is not.
 const PLUGIN_CAP: usize = 100;
+/// V39 Phase B (locked decision 14): cross-harness **delegation** transitions —
+/// one row per `start` / `done` / `refused` / `timeout` / `cancelled` /
+/// `takeover` / `worker_exited` / `role_moved`.
+///
+/// Its own window, chosen on purpose rather than left on the graph fallback,
+/// and for the reason `offload_server` has one: a delegation row is the durable
+/// record of **who asked whom to do what** — the only place the attribution
+/// survives (decision 2a keeps it out of the worker's transcript entirely, and
+/// the on-tab banner dies with the flight). Those rows are rare and
+/// explanatory while the feed around them is chatty, so the graph lane would
+/// evict exactly the history a user goes looking for.
+///
+/// 100, matching `OFFLOAD_CAP`, because the volumes match by construction: a
+/// worker is single-slot (decision 9), so delegations are serialized per tab
+/// and a run mints at most two rows (`start` + one terminal transition). A
+/// refusal loop is bounded the same way — it cannot outrun the model calling
+/// the tool.
+const DELEGATION_CAP: usize = 100;
 /// V32: security denials (SSRF screen, fetch budgets, canary hits, taint-latch
 /// refusals, quarantines, detection flags). Retained **per screen**, not per
 /// kind — this is the window ONE screen's rows get.
@@ -164,6 +182,7 @@ const TOTAL_CAPACITY: usize = GRAPH_CAP
     + MCP_HEALTH_CAP
     + SANDBOX_CAP
     + PLUGIN_CAP
+    + DELEGATION_CAP
     + INJECTION_FLAG_TOTAL_CAP;
 /// Appends between compactions once the ring is full. Compaction rewrites the
 /// whole file (and re-reads it first, to merge a child's lines), so this is the
@@ -259,6 +278,23 @@ pub enum ActivityKind {
     /// exist so a rejected plugin is visible both where it happened and where
     /// it gets fixed.
     Plugin,
+    /// V39 Phase B (locked decision 14): one cross-harness **delegation**
+    /// transition — a tab was asked to drive another tab, and what came of it.
+    ///
+    /// Which transition it was lives in `tool` (`start` / `done` / `refused` /
+    /// `timeout` / `cancelled` / `takeover` / `worker_exited` / `role_moved`),
+    /// the worker tab (plus the reason, on a refusal) in `target`, the driver
+    /// HARNESS in `source` and the driver TAB in the attribution — so a reader
+    /// can answer "who asked" without the worker's own transcript containing
+    /// the answer, which by decision 2a it deliberately does not.
+    ///
+    /// **A facade run mints two rows by design, not one**, and they are not
+    /// duplicates: the driver side already writes an [`ActivityKind::Offload`]
+    /// row for every completed `offload_task` regardless of backend kind (its
+    /// `source` is the backend NAME, so it reads `lan-worker-2` and the facade
+    /// holds here too), while these rows are the worker side. Same split as
+    /// `offload` vs `offload_server`: the task, versus what carried it.
+    Delegation,
 }
 
 impl ActivityKind {
@@ -273,6 +309,7 @@ impl ActivityKind {
             ActivityKind::InjectionFlag => "injection_flag",
             ActivityKind::Sandbox => "sandbox",
             ActivityKind::Plugin => "plugin",
+            ActivityKind::Delegation => "delegation",
         }
     }
 }
@@ -305,6 +342,8 @@ fn kind_cap(kind: &str) -> usize {
         SANDBOX_CAP
     } else if kind == ActivityKind::Plugin.as_str() {
         PLUGIN_CAP
+    } else if kind == ActivityKind::Delegation.as_str() {
+        DELEGATION_CAP
     } else {
         GRAPH_CAP
     }

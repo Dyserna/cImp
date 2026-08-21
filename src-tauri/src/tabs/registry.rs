@@ -428,6 +428,17 @@ impl TabRegistry {
         }
     }
 
+    /// V39 Phase B: whether `tab` exists AND has a live PTY. `false` for an
+    /// unknown tab and for a known tab whose subprocess is not running — the
+    /// two are one answer here because the caller (delegation preflight) acts
+    /// identically on both: refuse, naming the tab.
+    pub async fn is_started(&self, tab: &TabId) -> bool {
+        match self.managers.get(tab) {
+            Some(m) => m.is_started().await,
+            None => false,
+        }
+    }
+
     pub async fn write(&self, tab: TabId, bytes: Vec<u8>) -> AppResult<()> {
         let manager = self
             .managers

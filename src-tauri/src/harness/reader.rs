@@ -112,10 +112,56 @@ pub struct OobContext {
     pub pushes: Option<Arc<crate::offload::service::PushRegistry>>,
 }
 
+/// The tabs that currently have a fallback reader attached.
+///
+/// V39 Phase B, and it exists for exactly one question: **is there a
+/// completion signal for this tab at all?** Locked decision 12 refuses a
+/// delegation into a worker cImp cannot read back from, and for a harness that
+/// declares `cannot` for CHP `assistant_text` — OpenCode does, by design (D6) —
+/// the reader IS the signal. Without this, "the tab has a reader" would be
+/// inferred from its command, which is a guess about a task that may never have
+/// started.
+///
+/// A `BTreeSet` behind a plain `Mutex`: the write path is two tab-lifecycle
+/// edges, the read path is one preflight.
+static LIVE_READERS: std::sync::Mutex<Option<std::collections::BTreeSet<String>>> =
+    std::sync::Mutex::new(None);
+
+fn live_readers<T>(f: impl FnOnce(&mut std::collections::BTreeSet<String>) -> T) -> T {
+    let mut g = LIVE_READERS.lock().unwrap_or_else(|e| e.into_inner());
+    f(g.get_or_insert_with(Default::default))
+}
+
+/// Whether `tab` has a fallback reader attached right now.
+///
+/// **"Attached", not "healthy".** A reader whose source has gone silent (a 401
+/// on the SSE tap, a transcript that never appears) still answers `true` here,
+/// and that is the honest bound of what this can know from outside: the
+/// difference between a slow turn and a dead tap is a timeout, which is what
+/// the engine's deadline is for. What it does rule out is the case worth
+/// ruling out — a tab that never had a reader and never will.
+pub fn has_live_reader(tab: &crate::state::TabId) -> bool {
+    live_readers(|s| s.contains(tab.as_str()))
+}
+
 /// Spawn the adapter described by `spec`, tied to `ctx.cancel`. Non-blocking:
 /// returns immediately, the adapter runs until the token is cancelled (tab
 /// exit) or the source ends.
 pub fn spawn(spec: OobSpec, ctx: OobContext) {
+    // V39 Phase B: register this tab's reader for the lifetime of the token
+    // that owns the adapter below. Deregistration rides the SAME token the
+    // adapter does, so the two cannot disagree about whether a reader is
+    // attached — a separate "on tab close" call site could be forgotten by the
+    // next lifecycle path, and this one cannot.
+    {
+        let tab = ctx.tab.as_str().to_string();
+        live_readers(|s| s.insert(tab.clone()));
+        let cancel = ctx.cancel.clone();
+        tauri::async_runtime::spawn(async move {
+            cancel.cancelled().await;
+            live_readers(|s| s.remove(&tab));
+        });
+    }
     match spec {
         OobSpec::ClaudeTranscript {
             project_dir,
@@ -152,6 +198,29 @@ impl OobContext {
     /// [`crate::harness::chp::served`] for the three properties of the rule.
     pub fn pushed(&self, agent: &str, event: &str) -> bool {
         crate::harness::chp::served(agent, self.tab.as_str(), event)
+    }
+
+    /// V39 Phase B — **hand one completed assistant message to whatever is
+    /// waiting for this tab's turn to end**, beside speaking it.
+    ///
+    /// The read half of delegation (locked decision 16) is CHP
+    /// `assistant_text`, arbitrated: a tab whose hello declares it is served by
+    /// the push core in `offload::loopback`, and a tab that does not is served
+    /// by its reader — this call. Exactly one of the two fires per message,
+    /// because this is invoked from the same arbitrated branch as
+    /// [`Self::speak`].
+    ///
+    /// Deliberately NOT folded into `speak`: `speak` runs through
+    /// `tts::speak_prose`, which is gated by the per-tab TTS toggle, and a
+    /// delegation must complete on a tab with TTS switched off. Two consumers,
+    /// two calls, one arbitration decision above them.
+    ///
+    /// Routed through this context rather than called directly from the L1
+    /// readers so that `crate::delegation` — an L4 capability — is named in one
+    /// file under `harness/` (this one, already `UPWARD_EXEMPT`) instead of in
+    /// each harness's reader.
+    pub fn note_turn_text(&self, text: &str) {
+        crate::delegation::note_assistant_text(&self.tab, text);
     }
 
     /// Speak one block of assistant prose from THIS reader.

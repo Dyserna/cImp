@@ -7339,13 +7339,31 @@ async fn assistant_text_core(app: &AppHandle, agent: &'static str, tab: &str, te
         // and speaking here too is the double-speak this phase must not ship.
         return false;
     }
+    let tab_id = crate::state::TabId::from_str(tab);
+    // V39 Phase B — **delegation is a SECOND consumer of this core** (locked
+    // decision 16's read half). It sits inside the `served` gate, above the
+    // empty-text return and above the TTS toggle, and each of those three
+    // positions is deliberate:
+    //
+    // * inside the gate, because arbitration decides which of the push core
+    //   and the fallback reader produces this datum, and both call the same
+    //   completion feed — a delegation must be told exactly once;
+    // * above the empty-text return, because locked decision 13 needs to tell
+    //   "the worker said nothing" (an error, now) from "the worker never
+    //   answered" (a timeout, minutes later) — and it can only do that if an
+    //   empty turn is reported as a completion;
+    // * above the TTS path, because a delegation must complete on a tab with
+    //   speech switched off.
+    //
+    // Additive: nothing below this line changed, so the existing TTS behaviour
+    // is exactly what it was.
+    crate::delegation::note_assistant_text(&tab_id, text);
     if text.trim().is_empty() {
         return false;
     }
     let Some(state) = app.try_state::<crate::ipc::AppState>() else {
         return false;
     };
-    let tab_id = crate::state::TabId::from_str(tab);
     crate::tts::speak_prose(
         &tab_id,
         &state.tts_segments,

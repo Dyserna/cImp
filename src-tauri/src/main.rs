@@ -7,6 +7,7 @@ mod audio;
 mod audit;
 mod checks;
 mod content;
+mod delegation;
 mod error;
 mod fsutil;
 mod graph;
@@ -497,6 +498,12 @@ fn main() {
     // startup: that source is never persisted.
     let read_only_tabs = ReadOnlyTabs::seeded(user_read_only_tabs(&settings_handle.current()));
 
+    // V39 Phase B: the readable mirror of the per-tab prompt / output-burst /
+    // exit flags. Written only by the state manager (which owns the edges),
+    // read by `pty_write`'s siblings and by the delegation engine's preflight —
+    // the same shape and the same reason as `read_only_tabs` above.
+    let tab_activity = crate::state::TabActivity::default();
+
     let audio_slot: Arc<RwLock<Option<Arc<AudioOutput>>>> = Arc::new(RwLock::new(None));
 
     // Detection patterns. Lives next to settings.json on disk; auto-seeded
@@ -585,6 +592,7 @@ fn main() {
         state_signals: state_tx.clone(),
         input_lengths: input_lengths.clone(),
         read_only: read_only_tabs.clone(),
+        tab_activity: tab_activity.clone(),
         settings: settings_handle.clone(),
         audio: audio_slot.clone(),
         pending_settings_deep_link: Arc::new(Mutex::new(None)),
@@ -599,6 +607,7 @@ fn main() {
     let audio_state_tx = state_tx.clone();
     let input_lengths_for_setup = input_lengths.clone();
     let read_only_for_setup = read_only_tabs.clone();
+    let tab_activity_for_setup = tab_activity.clone();
     let settings_for_setup = settings_handle.clone();
     let settings_for_notifications = settings_handle.clone();
     let tts_active_for_setup = tts_active.clone();
@@ -650,6 +659,7 @@ fn main() {
                     rx,
                     state_events_for_setup.clone(),
                     input_lengths_for_setup.clone(),
+                    tab_activity_for_setup.clone(),
                     tab_metas.clone(),
                     initial_active_for_state,
                     ai_tts_suppressed_for_state.clone(),

@@ -14,7 +14,7 @@
 //!       │
 //!    (claim slot, engage auto lock, THEN write)
 //!       ▼
-//!     typed ──▶ waiting ◀──┐ prompt standing: relax lock, extend deadline
+//!     typed ──▶ waiting ◀──┐ prompt raised: relax lock, grant one extension
 //!                 │        └── prompt resolved: re-engage lock
 //!                 ├──▶ done | (done, no text)
 //!                 ├──▶ timeout        (deadline; NO key is sent)
@@ -59,9 +59,22 @@ use super::{
 /// independent things (a completion, a prompt edge, a take-over flag and the
 /// worker's process), only one of which is a stream. Four subscriptions plus a
 /// deadline is four ways to miss an edge; one tick that re-reads state is one.
-/// 200 ms is invisible against a turn measured in seconds-to-minutes, and it is
-/// also the granularity of the prompt-driven deadline extension below.
+/// 200 ms is invisible against a turn measured in seconds-to-minutes.
 const POLL: Duration = Duration::from_millis(200);
+
+/// How much extra time ONE standing prompt buys the delegation.
+///
+/// Per prompt, on the rising edge — never per poll tick. See
+/// [`super::note_prompt`] for why that distinction is the whole of locked
+/// decision 5's compatibility with the failure-mode table: a per-tick grant
+/// advances the deadline as fast as the clock, and a prompt nobody answers
+/// would hang the driver forever instead of timing out and saying why.
+///
+/// Five minutes is the shape of the thing being waited for — a person noticing
+/// a notification, switching to the tab and reading a permission prompt — not a
+/// measurement. A worker that raises prompt after prompt is making real
+/// progress between them, so each new one legitimately buys its own grant.
+const PROMPT_GRACE: Duration = Duration::from_secs(300);
 
 /// The Tauri event the frontend binds to for the *driven* glyph state, the
 /// worker-tab banner and the status-bar chip.
@@ -584,7 +597,7 @@ async fn run_flight(
         // extension is applied per tick, so a prompt nobody answers still runs
         // out — it buys time, it does not stop the clock.
         let awaiting = flags.awaiting_prompt();
-        let (_, changed) = note_prompt(worker, awaiting, POLL.as_millis() as u64);
+        let (_, changed) = note_prompt(worker, awaiting, PROMPT_GRACE.as_millis() as u64);
         if changed && auto_lock {
             if awaiting {
                 state.read_only.set_driven(worker, None);

@@ -487,26 +487,35 @@ fn is_taken_over(worker: &TabId) -> bool {
     registry(|r| r.in_flight.get(worker).is_some_and(|f| f.taken_over))
 }
 
-/// Fold the worker's current prompt state into the in-flight record, extending
-/// the deadline for as long as a prompt stands (locked decision 5).
+/// Fold the worker's current prompt state into the in-flight record, granting
+/// the deadline one bounded extension per prompt (locked decision 5).
 ///
 /// Returns `(awaiting_now, just_changed)`. `just_changed` is what the engine
-/// turns into the two edge actions — relax the lock and notify on the rising
-/// edge, re-engage on the falling one — so the caller never has to keep its own
-/// copy of the previous value.
-fn note_prompt(worker: &TabId, awaiting: bool, extend_ms: u64) -> (bool, bool) {
+/// turns into the two edge actions — relax the lock on the rising edge,
+/// re-engage on the falling one — so the caller never has to keep its own copy
+/// of the previous value.
+///
+/// # The extension is per PROMPT, not per tick, and that is the whole subtlety
+///
+/// Decision 5 says the wait is extended while the prompt stands; the
+/// adversarial failure-mode table says a prompt nobody answers must still hit
+/// the deadline and report `timeout (worker awaiting permission)`. Those two
+/// are only compatible if the extension is bounded — an extension applied on
+/// every poll tick would advance the deadline exactly as fast as the clock and
+/// the delegation would hang forever, which is the failure the table names.
+///
+/// So the grant is made **on the rising edge only**: one prompt buys one
+/// `grant_ms` of human thinking time, and a worker that raises prompt after
+/// prompt is genuinely making progress each time.
+fn note_prompt(worker: &TabId, awaiting: bool, grant_ms: u64) -> (bool, bool) {
     registry(|r| {
         let Some(f) = r.in_flight.get_mut(worker) else {
             return (false, false);
         };
         let changed = f.awaiting_prompt != awaiting;
         f.awaiting_prompt = awaiting;
-        if awaiting {
-            // EXTEND, never reset: a prompt standing forever must still hit
-            // the deadline (the failure-mode table's "worker stalls on a
-            // permission prompt nobody answers"), so the extension is bounded
-            // by the poll interval it is applied on rather than by the prompt.
-            f.deadline_ms = f.deadline_ms.saturating_add(extend_ms);
+        if awaiting && changed {
+            f.deadline_ms = f.deadline_ms.saturating_add(grant_ms);
         }
         (awaiting, changed)
     })
@@ -757,23 +766,39 @@ mod tests {
         });
     }
 
-    /// A standing prompt EXTENDS the deadline; it never resets it. A prompt
-    /// nobody answers must still time out (the adversarial failure-mode table).
+    /// **A prompt buys ONE bounded extension, not a stalled clock.**
+    ///
+    /// This is the test for the tension between locked decision 5 ("the wait is
+    /// extended while the prompt stands") and the adversarial failure-mode
+    /// table ("a prompt nobody answers still hits the deadline"). Granting per
+    /// poll tick would advance the deadline exactly as fast as time passes, and
+    /// the delegation would hang forever — so the grant rides the rising edge.
     #[test]
-    fn a_standing_prompt_extends_the_deadline_and_reports_the_edge() {
+    fn a_prompt_grants_one_bounded_extension_not_a_stalled_clock() {
         with_clean_registry(|| {
             claim_one(&worker(), &driver(), 100).expect("claim");
             let before = deadline_of(&worker()).expect("deadline");
             assert_eq!(note_prompt(&worker(), true, 500), (true, true), "rising edge");
             assert_eq!(deadline_of(&worker()), Some(before + 500));
-            assert_eq!(note_prompt(&worker(), true, 500), (true, false), "no new edge");
-            assert_eq!(deadline_of(&worker()), Some(before + 1000), "extends again");
+            // Every subsequent poll while the SAME prompt stands must not move
+            // it again — this is the clause that makes the timeout reachable.
+            for _ in 0..50 {
+                assert_eq!(note_prompt(&worker(), true, 500), (true, false));
+            }
+            assert_eq!(
+                deadline_of(&worker()),
+                Some(before + 500),
+                "one prompt, one grant — a per-tick grant would be an infinite wait"
+            );
             assert_eq!(note_prompt(&worker(), false, 500), (false, true), "falling edge");
             assert_eq!(
                 deadline_of(&worker()),
-                Some(before + 1000),
-                "a resolved prompt does not claw the extension back"
+                Some(before + 500),
+                "a resolved prompt does not claw the grant back"
             );
+            // A NEW prompt is new progress, and buys its own grant.
+            assert_eq!(note_prompt(&worker(), true, 500), (true, true));
+            assert_eq!(deadline_of(&worker()), Some(before + 1000));
         });
     }
 

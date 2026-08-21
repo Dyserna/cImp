@@ -83,16 +83,73 @@ use crate::advisor::{
 use crate::settings::Settings;
 
 /// Which harness serves a capability.
-// `Any` is unconstructed on purpose: no seeded row is harness-neutral yet, and
-// CHP (milestone decision 9) is what will produce the first one.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Harness {
     Claude,
     OpenCode,
-    /// Harness-neutral — served by whatever adapter is attached. No seeded row
-    /// is neutral yet; CHP (milestone decision 9) is what will produce them.
+    /// Harness-neutral — served by whatever adapter is attached.
+    ///
+    /// **Constructed since V39 Phase B**, by exactly one row: `delegation.worker`
+    /// (locked decision 16). Phase A of V35 predicted CHP would produce the
+    /// first neutral row and left this variant under an `#[allow(dead_code)]`;
+    /// what actually produced it is the first capability whose contract is
+    /// *"whatever harness this tab runs, it must serve `assistant_text` and
+    /// accept an input profile"* — a requirement stated about a tab, not about
+    /// a vendor. The `allow` is gone with the prediction.
     Any,
+}
+
+impl Harness {
+    /// The CHP `agent` discriminator for a concrete harness — the SAME
+    /// two-word vocabulary [`crate::tabs::tab_consumer`] classifies a tab's
+    /// command into, so a tab's id and its rows join without a translation
+    /// table. `None` for [`Harness::Any`], which names no vendor.
+    pub fn id(self) -> Option<&'static str> {
+        match self {
+            Harness::Claude => Some("claude"),
+            Harness::OpenCode => Some("opencode"),
+            Harness::Any => None,
+        }
+    }
+
+    /// What a human (and a generated tool description) calls this harness.
+    ///
+    /// Lives here rather than in a frontend string table because the
+    /// `delegate_task_<id>` descriptions are rendered in Rust, above the seam,
+    /// from the registry — L4 must be able to say "Claude Code" without
+    /// containing the word.
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Harness::Claude => "Claude Code",
+            Harness::OpenCode => "OpenCode",
+            Harness::Any => "any harness",
+        }
+    }
+
+    /// The harness whose CHP agent id is `id`, if any.
+    pub fn from_id(id: &str) -> Option<Harness> {
+        [Harness::Claude, Harness::OpenCode]
+            .into_iter()
+            .find(|h| h.id() == Some(id))
+    }
+}
+
+/// Every concrete harness id the registry has rows for, in declaration order.
+///
+/// **The list `delegate_task_*` is generated from** (locked decision 3): a tool
+/// exists per harness id, so nothing above the seam holds a literal set of
+/// harness names. Derived from [`CAPABILITIES`] rather than from a const array
+/// so a harness that gains rows is delegable by that fact alone.
+pub fn harness_ids() -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = Vec::new();
+    for cap in CAPABILITIES {
+        if let Some(id) = cap.harness.id() {
+            if !out.contains(&id) {
+                out.push(id);
+            }
+        }
+    }
+    out
 }
 
 /// The seam a dependency sits in. See the module docs for what each predicts.
@@ -270,6 +327,22 @@ pub const CONTROL_CHECKPOINT_PRE_MUTATION_CLAUDE: &str = "checkpoint.pre_mutatio
 /// mirrors the string as `CAP_PRETOOLUSE_DENY` in `src/lib/settings/types.ts`,
 /// pinned by [`tests::the_gated_capability_ids_reach_the_frontend`]).
 pub const CAP_PRETOOLUSE_DENY: &str = "claude.hook.pretooluse_deny";
+
+/// V39 Phase B, locked decision 16 — **the worker gate**, spelled once.
+///
+/// The registry's first [`Harness::Any`] row: "this tab's harness serves
+/// `assistant_text` for the session's final message (or has a live fallback
+/// reader) and accepts an [`InputProfile`]". A harness that is not gate-clean
+/// is **not a valid worker** — it gets no `delegate_task_*` tool, its
+/// Remote-offload tabs are not routed to, and preflight refuses naming the
+/// gate's reason.
+///
+/// Mirrored to the frontend as `CAP_DELEGATION_WORKER` in
+/// `src/lib/settings/types.ts`, like [`CAP_PRETOOLUSE_DENY`] and pinned by the
+/// same test.
+///
+/// [`InputProfile`]: crate::harness::InputProfile
+pub const CAP_DELEGATION_WORKER: &str = "delegation.worker";
 
 /// Every control id that is declared somewhere in [`CAPABILITIES`]. Each must
 /// appear exactly once — see [`tests::tcb_controls_are_declared_exactly_once`].
@@ -1460,6 +1533,81 @@ pub const CAPABILITIES: &[Capability] = &[
         ],
         drift_token: None,
     },
+    // ── V39 Phase B: cross-harness delegation (Tier D) ──────────────────────
+    //
+    // Three rows, one seam. `delegation.worker` is the harness-NEUTRAL
+    // requirement the engine gates on; the two `*.input.profile` rows are the
+    // per-harness half it is made of. They are separate rows rather than one
+    // because they break differently and are fixed in different files: the
+    // neutral one loses its READ half (a completion signal), the per-harness
+    // ones lose their PUSH half (a paste that no longer yields one turn).
+    Capability {
+        id: CAP_DELEGATION_WORKER,
+        harness: Harness::Any,
+        tier: Seam::D,
+        contract: "A tab may be driven as a delegation worker: its harness serves CHP                    `assistant_text` for the turn's final assistant message (or has a live                    fallback reader that does), and it declares an input profile whose paste +                    submit encoding yields exactly one turn. Harness-neutral by construction —                    the requirement is stated about a tab, not about a vendor.",
+        depends_on: &[Dep::Behavior(
+            "a completion signal exists for this tab (pushed `assistant_text`, or the harness's              declared fallback reader) AND the harness declares an input profile — a worker cImp              can type into but cannot read back from would silently swallow the task",
+        )],
+        wired_in: &[
+            "src-tauri/src/delegation/mod.rs",
+            "src-tauri/src/delegation/engine.rs",
+            "src-tauri/src/harness/input.rs",
+        ],
+        degradation: Degradation::FailClosed,
+        drift_rule: &[],
+        canary: None,
+        probe: None,
+        waiver: Some(
+            "No fixture and no automatable probe: proving a worker completes needs a REAL turn on              a real TUI, which is the same class as the E1/D0 spikes. Covered meanwhile by (a)              the fail-closed gate itself — preflight refuses a tab with no completion signal and              no input profile rather than typing into it, (b) the recorded spike outcome in              `harness_versions.input_profile_status`, which this row's gate reads, and (c) V39              live-verify recipes 1, 2 and 10. Owner: whoever closes V39 Phase D.",
+        ),
+        controls: &[],
+        drift_token: None,
+    },
+    Capability {
+        id: "claude.input.profile",
+        harness: Harness::Claude,
+        tier: Seam::D,
+        contract: "Claude Code's TUI accepts a bracketed paste (`ESC [ 200 ~` … `ESC [ 201 ~`) as                    ONE literal insertion — embedded newlines land in the composer as newlines,                    not as submits — and a CR written after it submits that buffer as exactly one                    turn.",
+        depends_on: &[Dep::Behavior(
+            "multi-line bracketed paste + submit yields exactly one turn",
+        )],
+        wired_in: &[
+            "src-tauri/src/harness/claude/input.rs",
+            "src-tauri/src/harness/input.rs",
+        ],
+        degradation: Degradation::FailClosed,
+        drift_rule: &[],
+        canary: None,
+        probe: None,
+        waiver: Some(
+            "A `Dep::Behavior` no payload reveals: a TUI that split a paste into two turns would              corrupt the task SILENTLY, which is why the row fails closed instead of degrading.              Verification is the input-profile spike recorded in              `harness_versions.input_profile_status` (recipe in MAINTENANCE.md); a recorded              `\"fail\"` blocks `delegation.worker` for every harness. Owner: V39 Phase D.",
+        ),
+        controls: &[],
+        drift_token: None,
+    },
+    Capability {
+        id: "opencode.input.profile",
+        harness: Harness::OpenCode,
+        tier: Seam::D,
+        contract: "OpenCode's TUI accepts a bracketed paste (`ESC [ 200 ~` … `ESC [ 201 ~`) as                    ONE literal insertion, and a CR written after it submits that buffer as                    exactly one turn.",
+        depends_on: &[Dep::Behavior(
+            "multi-line bracketed paste + submit yields exactly one turn",
+        )],
+        wired_in: &[
+            "src-tauri/src/harness/opencode/input.rs",
+            "src-tauri/src/harness/input.rs",
+        ],
+        degradation: Degradation::FailClosed,
+        drift_rule: &[],
+        canary: None,
+        probe: None,
+        waiver: Some(
+            "Same class as `claude.input.profile`, same spike, same recorded outcome. Owner: V39              Phase D.",
+        ),
+        controls: &[],
+        drift_token: None,
+    },
 ];
 
 // `all()` lived here from Phase A as the accessor the seeded consumers would
@@ -1518,7 +1666,7 @@ pub const UNKNOWN_CAPABILITY: &str = "(unknown capability)";
 /// keeps it honest in both directions — an entry here that no `match` arm can
 /// ever block is a gate that does not exist, and a `match` arm not listed here
 /// is a gate no UI can see.
-pub const GATED: &[&str] = &[CAP_PRETOOLUSE_DENY];
+pub const GATED: &[&str] = &[CAP_PRETOOLUSE_DENY, CAP_DELEGATION_WORKER];
 
 /// Whether a recorded spike status BLOCKS its capability.
 ///
@@ -1578,6 +1726,43 @@ pub fn gate(id: &str, settings: &Settings) -> Gate {
                          The hook is not installed regardless of the toggle. Re-run the check in \
                          MAINTENANCE.md → harness contracts after the next Claude Code update, \
                          and record the outcome in `harness_versions.e1_status`."
+                    ),
+                }
+            } else {
+                Gate::available(cap.id)
+            }
+        }
+        // V39 Phase B, locked decision 16: the delegation worker gate. Its
+        // input is the recorded outcome of the **input-profile spike** — the
+        // `Dep::Behavior` shared by both `*.input.profile` rows, which no
+        // payload reveals and no fixture can settle. Same posture as E1
+        // (`spike_status_blocks`: opt-in until proven broken, and anything
+        // unrecognized blocks), and deliberately the same *reader*: two spike
+        // fields interpreted by two different rules is how one of them ends up
+        // meaning something nobody wrote down.
+        //
+        // ONE gate for both harnesses, on purpose. A TUI that split a paste
+        // into two turns would corrupt the task silently, and the recorded
+        // status is a human's judgement about "typing a turn works here" — not
+        // a per-vendor measurement cImp can take. Per-harness availability is
+        // still expressed, one layer up: a harness with no `input.rs` has no
+        // profile, so `harness::input_profile` answers `None` and that harness
+        // is not a worker regardless of this verdict.
+        CAP_DELEGATION_WORKER => {
+            let status = settings.harness_versions.input_profile_status.trim();
+            if spike_status_blocks(status) {
+                Gate {
+                    id: cap.id,
+                    blocked: true,
+                    reason: format!(
+                        "The input-profile contract check is recorded as {status:?}: a harness \
+                         TUI on this machine does not accept a pasted multi-line request as one \
+                         turn, so a delegated task would be typed in truncated or split across \
+                         turns — and the worker would answer the wrong question without anything \
+                         failing. Delegation is off: no `delegate_task_*` tool is advertised and \
+                         no tab can be driven. Re-run the check in MAINTENANCE.md -> harness \
+                         contracts and record the outcome in \
+                         `harness_versions.input_profile_status`."
                     ),
                 }
             } else {
@@ -1680,7 +1865,7 @@ mod tests {
 
     /// Prefixes a capability id can start with. Used to tell registry ids apart
     /// from the many other backticked tokens in the same table cells.
-    const ID_PREFIXES: [&str; 3] = ["claude.", "opencode.", "perm."];
+    const ID_PREFIXES: [&str; 4] = ["claude.", "opencode.", "perm.", "delegation."];
 
     /// Every backtick-delimited token in `line`. Scans for pairs, so an unmatched
     /// trailing backtick yields nothing rather than swallowing the rest.
@@ -1941,6 +2126,14 @@ mod tests {
         s
     }
 
+    /// V39 Phase B: settings with the input-profile spike outcome set, and
+    /// nothing else touched — the delegation gate's one input.
+    fn settings_with_input_profile(status: &str) -> Settings {
+        let mut s = Settings::default();
+        s.harness_versions.input_profile_status = status.to_string();
+        s
+    }
+
     /// Every [`GATED`] id is a real capability, and every one of them can
     /// actually answer `blocked` for SOME settings.
     ///
@@ -1959,6 +2152,7 @@ mod tests {
             });
             let blocking = match cap.id {
                 CAP_PRETOOLUSE_DENY => settings_with_e1("fail"),
+                CAP_DELEGATION_WORKER => settings_with_input_profile("fail"),
                 other => panic!(
                     "`{other}` is in `GATED` but this test has no input that trips it. Add one, \
                      or drop the entry — a gate nothing can trip is not a gate."
@@ -1978,7 +2172,12 @@ mod tests {
     /// is a feature that switches itself off with no list any UI can render.
     #[test]
     fn no_gate_blocks_outside_the_declared_list() {
-        let inputs = [settings_with_e1("fail"), settings_with_e1("nonsense")];
+        let inputs = [
+            settings_with_e1("fail"),
+            settings_with_e1("nonsense"),
+            settings_with_input_profile("fail"),
+            settings_with_input_profile("nonsense"),
+        ];
         for c in CAPABILITIES {
             for s in &inputs {
                 if gate(c.id, s).blocked {
@@ -2025,6 +2224,65 @@ mod tests {
         assert!(!gate(CAP_PRETOOLUSE_DENY, &Settings::default()).blocked);
     }
 
+    /// **V39 Phase B: the delegation gate fails closed on the same table.**
+    ///
+    /// Deliberately the same statuses and the same expectations as the E1 test
+    /// above, because both read `spike_status_blocks`: two spike fields
+    /// interpreted by two different rules is how one of them ends up meaning
+    /// something nobody wrote down. The default install must NOT block —
+    /// delegation ships available, and a recorded `"fail"` is what turns it
+    /// off.
+    #[test]
+    fn the_delegation_worker_gate_fails_closed_on_anything_unrecognized() {
+        for ok in ["", "  ", "unverified", "UNVERIFIED", " pass ", "Pass"] {
+            assert!(
+                !gate(CAP_DELEGATION_WORKER, &settings_with_input_profile(ok)).blocked,
+                "{ok:?} must NOT block delegation"
+            );
+        }
+        for bad in ["fail", "Fail", " fail ", "FAILED", "failed", "wat", "0"] {
+            let g = gate(CAP_DELEGATION_WORKER, &settings_with_input_profile(bad));
+            assert!(g.blocked, "unrecognized status {bad:?} must fail CLOSED");
+            assert!(
+                g.reason.contains(bad.trim()),
+                "the reason must quote the status actually recorded ({bad:?}), got: {}",
+                g.reason
+            );
+        }
+        assert!(!gate(CAP_DELEGATION_WORKER, &Settings::default()).blocked);
+        // …and the two spikes are independent: a failed E1 must not switch
+        // delegation off, nor the reverse. They gate different features.
+        assert!(!gate(CAP_DELEGATION_WORKER, &settings_with_e1("fail")).blocked);
+        assert!(!gate(CAP_PRETOOLUSE_DENY, &settings_with_input_profile("fail")).blocked);
+    }
+
+    /// **The registry's first `Harness::Any` row exists and is the one meant.**
+    ///
+    /// `Any` carried an `#[allow(dead_code)]` from V35 Phase A with a comment
+    /// predicting CHP would construct it. This pins what actually did — and
+    /// pins that a neutral row names no vendor, which is the property L4
+    /// depends on when it looks a harness up by id.
+    #[test]
+    fn the_neutral_row_is_the_delegation_worker_and_names_no_vendor() {
+        let neutral: Vec<&str> = CAPABILITIES
+            .iter()
+            .filter(|c| c.harness == Harness::Any)
+            .map(|c| c.id)
+            .collect();
+        assert_eq!(neutral, vec![CAP_DELEGATION_WORKER]);
+        assert_eq!(Harness::Any.id(), None, "a neutral row has no agent id");
+        for id in harness_ids() {
+            assert_eq!(
+                Harness::from_id(id).and_then(Harness::id),
+                Some(id),
+                "`{id}` must round-trip through the registry's harness vocabulary"
+            );
+            assert!(!Harness::from_id(id).unwrap().display_name().is_empty());
+        }
+        assert_eq!(harness_ids(), vec!["claude", "opencode"]);
+        assert_eq!(Harness::from_id("aider"), None);
+    }
+
     /// A gate that blocks always says why, and one that does not never
     /// pretends there is something to say (global principle 5 — "empty is not
     /// absent" applied to the reason string).
@@ -2034,6 +2292,8 @@ mod tests {
             Settings::default(),
             settings_with_e1("fail"),
             settings_with_e1("wat"),
+            settings_with_input_profile("fail"),
+            settings_with_input_profile("wat"),
         ] {
             for g in gates(&s) {
                 assert_eq!(

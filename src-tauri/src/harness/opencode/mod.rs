@@ -13,6 +13,7 @@
 //! [`tools`] is a change to a security control, not to a data pipe.
 
 pub mod config;
+pub mod input;
 pub mod plugin;
 pub mod read;
 pub mod tools;

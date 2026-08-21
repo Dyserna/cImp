@@ -351,6 +351,19 @@ const DECLARED_UNPROBED: &[(&str, &str)] = &[
          functional. Manual OpenCode-veto spike; Phase I's `chp` handshake at least makes a STALE \
          plugin a mismatch instead of a mystery",
     ),
+    // ── V39 Phase B: delegation (locked decision 16) ─────────────────────────
+    (
+        "delegation.worker",
+        "no probe can settle it: the property is that a REAL turn typed into a REAL TUI comes          back readable, which needs a live worker tab and a live model call — the scripted-turn          class, doubled. Covered meanwhile by the fail-closed gate itself (preflight refuses a          tab with no completion signal rather than typing into it), by the recorded          input-profile spike the gate reads, and by V39 live-verify recipes 1/2/10",
+    ),
+    (
+        "claude.input.profile",
+        "no probe can settle it: whether a bracketed paste plus a submit yields exactly ONE turn          is a `Dep::Behavior` visible only as a real turn in a real TUI. Manual input-profile          spike, outcome in `harness_versions.input_profile_status` — the same class as D0/E1, and          `Mark verified` survives for exactly these",
+    ),
+    (
+        "opencode.input.profile",
+        "no probe can settle it — same behaviour, same spike, same recorded outcome as          `claude.input.profile`",
+    ),
 ];
 
 /// The ids this module drives — the L2 half of the registry join key, consumed

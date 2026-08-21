@@ -967,6 +967,11 @@ export interface HarnessVersions {
   e1_status: string;
   /// D0 spike outcome (informational — the feature degrades to a no-op).
   d0_status: string;
+  /// V39 Phase B: input-profile spike outcome (`"unverified" | "pass" |
+  /// "fail"`) — does a harness TUI here accept a pasted multi-line request as
+  /// ONE turn? Raw INPUT to a gate, never interpreted here: read
+  /// `CapabilityGate.blocked` for `CAP_DELEGATION_WORKER` instead.
+  input_profile_status: string;
   /// V35 Phase F: the last automatic verification run for Claude Code — the
   /// embedded L1 canaries plus the L2 live probes, run in the background when
   /// `claude_last_seen` changes. Absent until the first run completes, which is
@@ -1175,6 +1180,13 @@ export const OUTCOME_NO_FAILURE = 'no_failure';
 /// `harness::contract::tests::the_gated_capability_ids_reach_the_frontend`,
 /// which fails the Rust build if this string is missing from this file.
 export const CAP_PRETOOLUSE_DENY = 'claude.hook.pretooluse_deny';
+
+/// V39 Phase B: the capability id cross-harness delegation is gated on — the
+/// registry's first harness-NEUTRAL row (`Harness::Any`). Shared verbatim with
+/// Rust's `contract::CAP_DELEGATION_WORKER` and pinned by the same test. A
+/// blocked verdict means no tab can be driven and no `delegate_task_*` tool is
+/// advertised; the reason string says which spike recorded what.
+export const CAP_DELEGATION_WORKER = 'delegation.worker';
 
 /// Whether `status` says a capability is gated off. A lookup, deliberately not
 /// a rule: the verdict was computed by `harness::contract::gate` against the

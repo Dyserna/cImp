@@ -882,6 +882,22 @@ pub struct HarnessVersions {
     /// compaction prompt): `"unverified" | "pass" | "fail"`. Informational —
     /// a fail warns (the feature degrades to a no-op, it can't misbehave).
     pub d0_status: String,
+    /// V39 Phase B: outcome of the **input-profile spike** —
+    /// `"unverified" | "pass" | "fail"`.
+    ///
+    /// The question it records: *does a harness TUI on this machine accept a
+    /// pasted multi-line request as ONE turn?* No payload reveals it and no
+    /// fixture can settle it (the same class as [`Self::e1_status`] and
+    /// [`Self::d0_status`]), and getting it wrong is silent — a split paste
+    /// makes the worker answer a truncated question perfectly.
+    ///
+    /// **Input to a gate, not a gate.** The one query that interprets it is
+    /// [`crate::harness::contract::gate`] keyed by `delegation.worker`; a
+    /// recorded `"fail"` (or anything unrecognized —
+    /// `contract::spike_status_blocks` fails closed) turns cross-harness
+    /// delegation off entirely: no `delegate_task_*` tool is advertised and no
+    /// tab can be driven.
+    pub input_profile_status: String,
     /// V35 Phase F: the last **automatic** verification run for Claude Code —
     /// the L1 embedded canaries plus the L2 live probes, run in the background
     /// when [`Self::claude_last_seen`] changes and once at startup when it does
@@ -910,6 +926,7 @@ impl Default for HarnessVersions {
             opencode_last_seen: String::new(),
             e1_status: "unverified".to_string(),
             d0_status: "unverified".to_string(),
+            input_profile_status: "unverified".to_string(),
             claude_auto_verify: None,
         }
     }
@@ -1585,6 +1602,74 @@ pub struct AiToolTabConfig {
     /// flipping it never asks for a tab restart (`spawn_inject_sig` has no
     /// slot for it, and a test pins that).
     pub read_only: bool,
+    /// V39 Phase B (locked decision 8): what this tab is **for** in the
+    /// delegation surface — the single source of truth for both driver modes.
+    ///
+    /// Persisted and restored at startup (in-flight state never is), and
+    /// exclusive by construction: the roles are one enum, not two flags, so a
+    /// tab cannot be both a `delegate_task_*` target and a facade backend.
+    ///
+    /// **Not spawn-baked** (decision 15): the `delegate_task_*` set rides the
+    /// child proxy's live `tools/list` plus the V37 `list_changed` pulse, and
+    /// the facade rides `offload_task`'s live description — so changing a role
+    /// takes effect on the next turn without restarting either tab, and
+    /// `spawn_inject_sig` has no slot for it (a test pins that).
+    pub delegation_role: DelegationRole,
+    /// V39 (locked decision 8): the per-backend knobs a
+    /// [`DelegationRole::RemoteOffload`] tab is synthesized into
+    /// `effective_backends()` with.
+    ///
+    /// Declared in Phase B and **consumed in Phase C**: the fields' defaults
+    /// are already decided, and a container that arrives with the role it
+    /// belongs to is one schema shape rather than two. Meaningless while the
+    /// role is anything else — deliberately not enforced, because a user who
+    /// sets a backend name, switches the role away and switches it back should
+    /// find the name where they left it.
+    pub delegation_backend: DelegationBackend,
+}
+
+/// V39 Phase B, locked decision 8 — **one exclusive role per tab**.
+///
+/// `None` is the default and the answer for every tab that has never been
+/// touched: a tab becomes reachable by another harness only by an explicit user
+/// action, on that tab.
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DelegationRole {
+    /// Not a delegation target. The default.
+    #[default]
+    None,
+    /// The target of `delegate_task_<harness>` for this tab's harness.
+    ///
+    /// **At most one Manual tab per harness** — setting Manual on a second tab
+    /// of the same harness MOVES the role (the previous holder drops to
+    /// `None`), which is enforced in `ipc::commands::tab_set_delegation_role`
+    /// rather than by this type: an enum cannot express a cross-tab
+    /// uniqueness rule, and a settings file hand-edited into two Manual tabs
+    /// must load rather than fail.
+    Manual,
+    /// A facade offload backend (Phase C): the requesting harness sees a
+    /// backend name, never a tab. **Any number** per harness.
+    RemoteOffload,
+}
+
+/// V39, locked decision 8 — the per-tab knobs a `RemoteOffload` tab carries
+/// into the offload backend list. Phase C reads them.
+#[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct DelegationBackend {
+    /// The name the requesting harness sees (`lan-worker-2`), NEVER the tab
+    /// name — decision 3's facade half is only a facade if the tab does not
+    /// leak through it. `None` ⇒ Phase C falls back to the tab's display name,
+    /// which is the honest default for a user who has not chosen one.
+    pub name: Option<String>,
+    /// Router bias, exactly as a configured HTTP backend carries it.
+    pub tier: BackendTier,
+    /// The worker's usable context window, in tokens, if the user knows it.
+    /// `None` ⇒ Phase C uses a generous default: a facade whose context is
+    /// under-declared is routed away from work it could have done, and one
+    /// that is over-declared fails visibly on the worker's own side.
+    pub declared_context: Option<u32>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Default)]
@@ -4153,6 +4238,10 @@ pub fn default_claude_tab() -> TabConfig {
         // V39 Phase A: a fresh tab accepts the keyboard. The read-only lock
         // is a deliberate user action, never a default.
         read_only: false,
+        // V39 Phase B: a fresh tab is nobody's delegation target. Both roles
+        // are opt-in, per tab, from that tab's own popover.
+        delegation_role: DelegationRole::None,
+        delegation_backend: DelegationBackend::default(),
         // V39: a newly created AI tab starts with every tab-scoped injection
         // control explicitly OFF. L1 and every L2 ship on; the per-tab row is
         // the switch the user reaches for, from this tab's shield badge. NOT
@@ -4189,6 +4278,10 @@ pub fn default_claude_local_tab() -> TabConfig {
         // V39 Phase A: a fresh tab accepts the keyboard. The read-only lock
         // is a deliberate user action, never a default.
         read_only: false,
+        // V39 Phase B: a fresh tab is nobody's delegation target. Both roles
+        // are opt-in, per tab, from that tab's own popover.
+        delegation_role: DelegationRole::None,
+        delegation_backend: DelegationBackend::default(),
         // V39: see `default_claude_tab`.
         injection_overrides: crate::settings::injection::TabInjectionOverrides::all_off(),
     })
@@ -4225,6 +4318,10 @@ pub fn default_opencode_tab() -> TabConfig {
         // V39 Phase A: a fresh tab accepts the keyboard. The read-only lock
         // is a deliberate user action, never a default.
         read_only: false,
+        // V39 Phase B: a fresh tab is nobody's delegation target. Both roles
+        // are opt-in, per tab, from that tab's own popover.
+        delegation_role: DelegationRole::None,
+        delegation_backend: DelegationBackend::default(),
         // V39: a newly created AI tab starts with every tab-scoped injection
         // control explicitly OFF. L1 and every L2 ship on; the per-tab row is
         // the switch the user reaches for, from this tab's shield badge. NOT

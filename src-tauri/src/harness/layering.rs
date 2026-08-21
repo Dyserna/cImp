@@ -553,7 +553,20 @@ fn every_harness_dir_declares_its_capabilities() {
 /// The L4 capabilities. A harness module reaching for one of these has put
 /// capability logic in the wrong layer (design § 2: L4 speaks only cImp domain
 /// types; L1 speaks the harness).
-const CAPABILITY_MODULES: &[&str] = &["crate::graph", "crate::tts", "crate::usage", "crate::workbench"];
+const CAPABILITY_MODULES: &[&str] = &[
+    "crate::graph",
+    "crate::tts",
+    "crate::usage",
+    "crate::workbench",
+    // V39 Phase B. `crate::delegation` is an L4 capability like the four above,
+    // and it needs one thing from L1: the moment a turn ended. That arrives
+    // through `OobContext::note_turn_text` — so the readers themselves name
+    // nothing above the seam, and the ONE file that does is `harness/reader.rs`,
+    // which owns the readers' spawn context and is already exempt. Listing the
+    // module here is what keeps that true: without it, the next harness reader
+    // could call the engine directly and no test would notice.
+    "crate::delegation",
+];
 
 /// Harness modules that DO still import upward, with the reason — **a shrinking
 /// list, not an escape hatch**.

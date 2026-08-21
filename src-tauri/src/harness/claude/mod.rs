@@ -15,6 +15,7 @@
 //! is adding a sibling of this directory — see `harness/README.md`.
 
 pub mod hook;
+pub mod input;
 pub mod overlay;
 pub mod read;
 pub mod statusline;

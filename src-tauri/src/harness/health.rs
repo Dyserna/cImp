@@ -45,12 +45,23 @@ use crate::harness::probe::{harness_name, tier_name};
 use crate::harness::verify::{self, RunSummary};
 use crate::settings::{AutoVerify, Settings};
 
-/// The harnesses the panel shows, in display order, with the name a user
+/// The panels the view shows, in display order, with the name a user
 /// recognizes. Deliberately not derived from the registry's distinct
 /// `Capability::harness` values: a harness with zero rows must still get a
-/// header saying so, and [`Harness::Any`] is a *neutral* marker rather than a
-/// product with a version of its own.
-const PANELS: &[(Harness, &str)] = &[(Harness::Claude, "Claude Code"), (Harness::OpenCode, "OpenCode")];
+/// header saying so.
+///
+/// **V39 Phase B added the third, and it is not a product.** [`Harness::Any`]
+/// marks a row whose contract is stated about a *tab* rather than about a
+/// vendor — `delegation.worker` is the first — so it has no version, no
+/// installed CLI and no auto-verify record, and every one of those fields
+/// renders empty for it by construction. It gets a panel anyway because it
+/// carries a **gate**: a capability the user can be blocked by and cannot see
+/// is exactly the thing this panel exists to end.
+const PANELS: &[(Harness, &str)] = &[
+    (Harness::Claude, "Claude Code"),
+    (Harness::OpenCode, "OpenCode"),
+    (Harness::Any, "Cross-harness"),
+];
 
 // ── outcome vocabulary ──────────────────────────────────────────────────────
 

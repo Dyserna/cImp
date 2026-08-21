@@ -512,3 +512,18 @@ Commits `6f73787..80b640f` + follow-ups. Facts that refine the design above:
   mode, started_ms, awaiting_prompt }`); `HarnessVersions.input_profile_status`;
   `CAP_DELEGATION_WORKER = "delegation.worker"`. Health panel gained a
   `Cross-harness` panel for the first `Harness::Any` row.
+- **Latch gating (`d14cc89`)**: `/delegate` is a *fixed-tool route* — the
+  child resolves the harness id and forwards `{harness}`; the app route never
+  sees the model-typed name. Canonical unrouted row `delegate_task`
+  (`ToolClass::LocalCapability`, same class as `offload_task`), admitted via
+  `delegate_admit` (the `hook_admit` shape) *before* the worker is resolved,
+  the slot claimed, the lock engaged or a byte typed. **New
+  `LatchRoute::Delegation`** — the first cImp-named *elective* call in the
+  V32 model (cImp-named like `Hook`, but may MOVE the latch like `Native`);
+  reusing `Hook` would have let a tab delegate unboundedly without latching,
+  reusing `Native` would have made the gate a silent no-op. `ROUTE_CONTAINMENT`
+  now `GatesFixedTool { refused_under_external: true }`, computed from
+  `toolclass`. Refusal text is byte-identical to `offload_task`'s.
+- **Take-over = one `takeover` row** minted by the engine on its way out
+  (`d252b21`); `DelegationError` `Display` carries no transition prefix so the
+  driver's tool result and the row reason are one string.

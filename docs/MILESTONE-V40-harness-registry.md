@@ -1,7 +1,8 @@
 # V40 — Harness registry and the V35 leftovers (everything harness-specific moves behind the plugin)
 
-**Status:** DRAFT for approval (2026-08-21) — implementation not started.
-GitHub: not filed yet (umbrella + phase issues on approval).
+**Status:** APPROVED DESIGN (2026-08-22) — implementation not started.
+GitHub: umbrella #101, milestone 14; phases A #93 · B #94 · C #95 · D #96 ·
+E #97 · F #98 · G #99 · H #100.
 **Sequencing:** after V39 ships and is live-verified. **V41 — Codex CLI** is
 the consumer: it is the first harness added *through* this registry, and it
 does not start until V40 is merged, released and the live-verify below is
@@ -591,7 +592,7 @@ briefed with the relevant decisions and ledger sections. This is roughly
 three times the original registry-only scope; the phase split keeps each
 run reviewable.
 
-- **A — Registry + identity (backend, no schema change).** `registry.rs`,
+- **A (#93) — Registry + identity (backend, no schema change).** `registry.rs`,
   `HarnessId`, `HarnessDescriptor`, `HarnessPlugin` trait with both impls
   moved verbatim from `tabs/config.rs` / `sandbox/tabs.rs`; the ten "which
   harness" functions collapse to registry lookups; the six Claude fallbacks
@@ -602,44 +603,44 @@ run reviewable.
   the trait (decisions 15–17). Test 10(b) lands here; 10(a) lands with an
   allowlist naming every survivor, so it is green and the survivors are the
   worklist for every later phase (the ledger, by section).
-- **B — Settings map (schema 36) + plugin-owned `ext` + spawn-sig map.**
+- **B (#94) — Settings map (schema 36) + plugin-owned `ext` + spawn-sig map.**
   Decisions 5, 6 and 8, the migration (core pairs → map, Claude/OpenCode-only
   fields → their plugin's `ext`), `health.rs`/`verify.rs`/`probe.rs` read the
   map, the restart-hint consumer iterates it, the spawn-sig JSON-equality
   regression test. `Feature::OpencodeNativeGate` becomes a plugin-scoped
   feature. `pricing/` seam split out (decision 29). `types.ts` mirror
   collapses.
-- **C — Hook ingress + permission grammar + drift advisor** (decisions 21,
+- **C (#95) — Hook ingress + permission grammar + drift advisor** (decisions 21,
   22, 23, 30). The `handle_claude_*` bodies, converters and
   `PermissionEventBody` move into `harness/claude/hook.rs`; neutral
   `HookReply`, `PermissionEdge`, `HarnessDriftSignals`; pattern rows →
   `prompts.rs` + `_retired/aider.rs`; CHP minor bump with the new events;
   `TOOL_CHECKPOINT_BUDGET` derived. `loopback.rs` leaves `LITERAL_ALLOWLIST`.
-- **D — Activity + usage + session identity** (decisions 18, 19, 20).
+- **D (#96) — Activity + usage + session identity** (decisions 18, 19, 20).
   `ActivitySource`, the tuning move, `HarnessOutput*` rename; `usage/` +
   `statusline/` → `harness/claude/statusline.rs`; `QuotaWindow`,
   `ContextReading`, `TokenKinds`, `TurnOrigin`; `SessionKey`;
   `harness_usage(HarnessId)`; `endpoint_poll` deleted; `--statusline` via
   `subcommands()`.
-- **E — Model-visible text, MCP client specifics, CLI vocab, config
+- **E (#97) — Model-visible text, MCP client specifics, CLI vocab, config
   writers** (decisions 24, 25 remainder, 26). `instructions()`,
   `GRAPH_GUIDANCE` templating, `decorate_initialize()` et al.,
   `session_selector_flags()`, `accepts_passthrough_argv()`, `preflight()`,
   `needs_tree_reap()`, `config_writer()`, the boot/poisoned-lock fallbacks.
-- **F — Frontend over IPC** (decisions 7, 11, 27 and the frontend halves of
+- **F (#98) — Frontend over IPC** (decisions 7, 11, 27 and the frontend halves of
   19/23). `harness_list` + `HarnessAffordances`, `registry.json` fixture +
   vitest parity test, `src/lib/harness.ts`, every site in decision 7 and 27
   rewritten; the generic `HarnessExtForm`; `UsageMeter`/`usageMath`/
   `contextMeter` over declared windows/categories/origins; feature-mounted
   panels. Allowlist 10(a) shrinks to the decision-29 set.
-- **G — Fixtures + docs truth pass** (decisions 12, 28). Fixture moves,
+- **G (#99) — Fixtures + docs truth pass** (decisions 12, 28). Fixture moves,
   `harness/<id>/README.md` with the parity test repointed, `CHP.md` /
   `ARCHITECTURE.md` / `MAINTENANCE.md` / `DESIGN.md` / `README.md` /
   `FEATURES.md` rewrites, stale doc-comment paths, `MAINTENANCE.md` gains a
   "registry" drift row pointing at the two tests. The appendix ledger is
   deleted in this phase (its rows are now either moved or allowlisted with
   a reason).
-- **H — Live-verify** (regression pass, below), RC, then V41 opens.
+- **H (#100) — Live-verify** (regression pass, below), RC, then V41 opens.
 
 ## What a new harness is (the truthful README list, post-V40)
 

@@ -74,21 +74,21 @@ adds the **read-only tab mode** that makes a driven tab safe to leave open.
      generic `delegate_task`**: one way to do it. *Why per-harness:* the
      user delegates *to a harness* ("send this to Claude Code"), and a model
      selects a tool by name far more reliably than it fills an enum argument.
-     Each description names that harness's currently eligible tabs (live,
-     via `GET /describe`, like `offload_task`) and is for **user-directed**
+     Each description names that harness's Manual tab (live, via
+     `GET /describe`, like `offload_task`) and is for **user-directed**
      delegation only. The pinned description opens with this contract (a
      test asserts the sentence is present for every generated tool):
      > *Hand a task to an open <Harness name> tab and return its answer.
      > Call this ONLY when the user explicitly asked for a task to be
-     > delegated to <Harness name> or to a specific tab (e.g. "send this to
+     > delegated to <Harness name> (e.g. "send this to
      > Claude Code", "use the OpenCode tab for this"). Never call it on your
      > own initiative — for work you decide to offload yourself, use
      > `offload_task`, which you may call automatically whenever you judge
      > it useful.*
      The tools are thereby distinguished from `offload_task` by **who
      decides**: the user (`delegate_task_*`) vs the harness (`offload_task`,
-     including facade backends). The requesting harness sees a harness, and
-     within it a tab by name.
+     including facade backends). The requesting harness sees a harness; the
+     tab behind it is named in the description.
    - **Facade (automatic):** a worker tab registered as a **third offload
      backend kind**, `OffloadBackendKind::HarnessTab { tab }`. It appears in
      `offload_task`'s backend prose under a **user-chosen backend name**
@@ -100,17 +100,19 @@ adds the **read-only tab mode** that makes a driven tab safe to leave open.
      chooses the worker (model-by-name vs router).
 4. **Read-only tab mode, enforced server-side.** A per-tab `ReadOnly` state
    with two sources:
-   - `Manual` — user toggles via the tab context menu ("Read-only"); sticky;
-     persisted in `AiToolTabConfig.read_only: bool` (default false).
+   - `User` — set via the communication-icon popover's Access radio
+     (decision 7); sticky; persisted in `AiToolTabConfig.read_only: bool`
+     (default false). (Named `User`, not `Manual`, so it cannot be confused
+     with the Manual *role* of decision 8.)
    - `Auto` — set by the engine when a delegation starts on the tab, cleared
      when it ends; controlled by the global setting
      `delegation.auto_read_only` (default **on**), exposed as a checkbox in
      Settings.
    Enforcement is in the backend write path (`pty_write` refuses with
-   `AppError::ReadOnly { tab, reason }` — *manual* vs *driven by <tab>*), the
+   `AppError::ReadOnly { tab, reason }` — *read-only (user)* vs *driven by <tab>*), the
    xterm widget is only a courtesy gate (input swallowed + toast naming the
    reason). Engine writes bypass the lock by construction (they do not enter
-   through `pty_write`). A manual read-only tab **can** still be a worker —
+   through `pty_write`). A user read-only tab **can** still be a worker —
    read-only governs the user's keyboard, not the engine.
 5. **Permission and question prompts unlock the keyboard.** When a driven
    tab raises `awaiting_permission` / `awaiting_question` (`state/manager.rs`
@@ -120,8 +122,9 @@ adds the **read-only tab mode** that makes a driven tab safe to leave open.
    path. *Why:* answering a prompt the worker addressed to the user is not
    "using the tab by mistake" — it is the only way the delegation completes.
    The lock re-engages on `PermissionPromptResolved`.
-6. **Take-over is always available.** Context menu on a driven tab offers
-   "Take over (cancel delegation)": the engine stops waiting, the driver
+6. **Take-over is always available.** The popover (decision 7) and, as a
+   mirror, the tab context menu offer "Take over (cancel delegation)" on a
+   driven tab: the engine stops waiting, the driver
    receives `cancelled: user took over`, the lock clears. cImp never sends
    Escape or any other key into the worker on cancel/timeout — the worker
    finishes what it is doing, visibly.
@@ -206,8 +209,7 @@ adds the **read-only tab mode** that makes a driven tab safe to leave open.
     tab's existing per-call logging gets `delegation` as a tool class.
 15. **No new spawn-baked setting.** the `delegate_task_*` set rides the child proxy's
     live `tools/list` (+ V37 `list_changed` pulse); the facade rides
-    `offload_task`'s live description. Toggling a target or adding a facade
-    backend takes effect on the next turn without restarting either tab.
+    `offload_task`'s live description. Changing a tab's role takes effect on the next turn without restarting either tab.
     `spawn_inject_sig` is untouched — a test pins that.
 16. **Delegation goes through the harness plugin layer; the engine is
     harness-agnostic.** Per `docs/HARNESS-PLUGIN-LAYER.md`: the engine is an
@@ -280,9 +282,9 @@ adds the **read-only tab mode** that makes a driven tab safe to leave open.
 
 ### Explicit tool
 
-- `offload/mcp.rs` `tools/list`: one `delegate_task_<id>` per harness id that
-  has ≥1 eligible target tab other than the consumer's own tab; each
-  description lists that harness's eligible tabs by name, rendered live from
+- `offload/mcp.rs` `tools/list`: one `delegate_task_<id>` per harness id
+  whose Manual tab exists, is not the consumer's own tab, and passes the
+  worker gate; each description names that tab, rendered live from
   `GET /describe`. Dispatch matches the `delegate_task_` prefix and resolves
   the harness id from the suffix via the registry (no literal match arms).
 - Target resolution is a lookup, not a search: the harness id from the tool
@@ -316,7 +318,7 @@ adds the **read-only tab mode** that makes a driven tab safe to leave open.
 
 ### Read-only + UI
 
-- `TabState.read_only: Option<ReadOnlySource>` (`Manual | Driven { by }`);
+- `TabState.read_only: Option<ReadOnlySource>` (`User | Driven { by }`);
   `pty_write` checks it before any side effect; IPC `tab_set_read_only`.
 - `Tab.svelte`: the communication glyph per decision 7; click →
   `DelegationPopover.svelte` (role radio, access radio, Remote-offload knobs,
@@ -344,7 +346,7 @@ adds the **read-only tab mode** that makes a driven tab safe to leave open.
 - **Model invokes a `delegate_task_*` tool unprompted**: the description restricts it
   to user-directed use, and the tab glyph + Events row make every use
   visible. Accepted residual — same class as any tool the model may
-  over-call; the opt-in per target bounds the blast radius.
+  over-call; the per-tab role opt-in bounds the blast radius.
 - **Two drivers race for one worker**: registry insert is atomic; the loser
   is refused `busy`. Facade: the router sees in-flight=1 and routes
   elsewhere or returns `NoBackendReady`.
@@ -354,9 +356,14 @@ adds the **read-only tab mode** that makes a driven tab safe to leave open.
 - **Completion signal regresses** (hook not installed, reader dead): caught
   by preflight — refused, not hung. A mid-flight loss surfaces as timeout.
 - **App restart mid-delegation**: nothing persists; on start no tab is
-  `Driven`; manual read-only is restored from settings.
+  `Driven`; user read-only and tab roles are restored from settings.
 - **Worker is itself exposed to its driver as a facade and loops**: the
   acyclic check (decision 9) refuses at start and names the chain.
+- **Role changed mid-flight** (Manual moved to another tab, or set to
+  None/Remote while driven): the in-flight delegation completes under the
+  role it started with (the V37 "toggle during in-flight call" rule); the
+  new role applies from the next `tools/list` / route. Closing the driven
+  tab is the `worker_exited` path.
 
 ## Out of scope
 
@@ -368,19 +375,24 @@ adds the **read-only tab mode** that makes a driven tab safe to leave open.
 
 ## Phases
 
-- **A — Read-only mode + glyph**: `ReadOnlySource`, server-side refusal in
-  `pty_write`, context-menu toggle, persisted manual flag,
-  `delegation.auto_read_only` setting, glyph + chip (`locked` state only).
+- **A — Read-only mode + icon**: `ReadOnlySource`, server-side refusal in
+  `pty_write`, the communication icon + popover with the Access radio only
+  (the Role radio arrives in B), persisted `read_only`,
+  `delegation.auto_read_only` setting, glyph *off* / *lock* states, chip.
   *(Independently shippable; useful on its own.)*
 - **B — Engine + explicit tool**: `delegation/` module, preflight, write +
   completion correlation for both harnesses, screening, Events lane,
-  the generated `delegate_task_*` set in the proxy, `driven`/`exposed` glyph states, take-over.
+  the generated `delegate_task_*` set in the proxy, the Role radio (None /
+  Manual) + one-Manual-per-harness move rule, `manual`/`driven` glyph
+  states, banner + local echo, take-over.
   Plus the plugin-layer half: `InputProfile` for Claude and OpenCode, the
   `delegation.worker` (Any) and `*.input.profile` registry rows, their L2
   probes, the `CAP_DELEGATION_WORKER` gate + frontend mirror, MAINTENANCE.md
   drift-table rows.
-- **C — Facade backend**: `HarnessTab` kind, `Backend` impl, router/agent
-  bypass, health integration, backend editor UI.
+- **C — Facade backend**: `HarnessTab` kind synthesized from tab roles,
+  `Backend` impl, router/agent bypass, health integration, the Remote offload
+  role + knobs in the popover, read-only listing in the backend editor,
+  `remote` glyph state.
 - **D — Live-verify** (fresh tabs not required — decision 15 — but one
   fresh-tab pass confirms that claim).
 
@@ -391,25 +403,32 @@ adds the **read-only tab mode** that makes a driven tab safe to leave open.
    attribution banner + local-echo line naming the OpenCode tab, the typed
    request (verbatim, no header — confirm in the Claude transcript JSONL) and
    its answer; OpenCode receives the answer; Events row
-   `done`; glyph went *driven* → *exposed*; keyboard refused during flight
+   `done`; glyph went *driven* → *manual*; keyboard refused during flight
    with the reason toast.
 2. Same in reverse (Claude → OpenCode).
 3. Facade: on a second Claude tab set Role: Remote offload, backend name
    "lan-worker-2"; the offload backend list shows it read-only; from
-   OpenCode call `offload_task` (quality tier). Claude tab performs it;
+   OpenCode call `offload_task` (quality tier). The Remote-offload Claude tab
+   performs it;
    OpenCode's result names `lan-worker-2`, never the tab.
 4. Permission prompt during a delegation: notification arrives, keyboard
    accepted for the prompt, lock re-engages, delegation completes.
 5. Take over mid-flight: driver gets `cancelled`, worker keeps running.
-6. Cycle: make the worker a target of itself via the driver → refused with
-   the chain named.
+6. Cycle: OpenCode tab A is Manual, Claude tab B is Manual; from A delegate
+   to B a task that says "delegate this back to OpenCode" → B's call is
+   refused with the chain named (A is driving). Also: a tab never sees a
+   `delegate_task_*` for its own tab.
 7. Timeout: `default_timeout_s=30` against a long task → `timeout`, worker
    finishes visibly, no keys sent.
-8. Manual read-only survives app restart; `Driven` does not.
+8. User read-only and tab roles survive app restart; `Driven` does not.
 9. Set the Manual Claude tab back to None → `delegate_task_claude` gone next
    turn without a restart;
    spawn_inject_sig unchanged (test + the save-time restart hint must NOT
    fire).
 10. Gate: break a harness's input profile probe (or point a tab at a harness
-    dir without `input.rs`) → the tab is absent from its `delegate_task_*` target
-    list (the tool vanishes if it was the last) and from the facade router, and preflight names the gate reason.
+    dir without `input.rs`) → that harness's `delegate_task_*` tool is absent, its Remote-offload tabs
+    are unhealthy backends, and preflight names the gate reason.
+11. One-Manual-per-harness: with Claude tab A Manual, set Claude tab B to
+    Manual → A drops to None with a toast + Events row; the popover on A
+    names B; `delegate_task_claude` now drives B. Setting B to Remote offload
+    while Manual → it is Remote only (never both).

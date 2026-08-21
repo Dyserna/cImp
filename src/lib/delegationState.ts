@@ -1,0 +1,112 @@
+// V39 Phase B — the live in-flight delegation mirror, and the two things that
+// have to happen the moment a flight starts.
+//
+// Kept OUT of `delegation.ts` on purpose: that file is the pure, tested half
+// (the glyph table, the attribution line, the role rules) and importing the
+// Tauri event API into it would put a transport in every test that only wanted
+// a string. This file is the transport; everything it decides, it decides by
+// calling into `delegation.ts`.
+
+import { get, readable, writable, type Readable, type Writable } from 'svelte/store';
+import { listen } from '@tauri-apps/api/event';
+import { delegationStatuses } from './ipc';
+import { writeLocalEcho, type DelegationChanged, type InFlightView } from './delegation';
+import { getTerminal } from './terminals';
+import type { TabId } from './tabs/types';
+
+/// The Tauri event the backend publishes on every delegation edge. Spelled
+/// verbatim from Rust's `delegation::engine::EVENT_DELEGATION_CHANGED`.
+const EVENT_DELEGATION_CHANGED = 'delegation-changed';
+
+/// Every in-flight delegation, keyed by WORKER tab id.
+///
+/// **Replaced wholesale on every event, never merged.** The backend's payload
+/// is the entire in-flight set by design (its own doc comment says why: the set
+/// is tiny, and a delta stream has to be replayed from a known start, so a
+/// window that opens late or reloads would paint a stale glyph until the next
+/// edge). Merging deltas into this map would reintroduce exactly the state the
+/// snapshot exists to make impossible — an entry for a flight that ended while
+/// nobody was listening.
+export const delegationInFlight: Writable<Record<string, InFlightView>> = writable({});
+
+/// Whether `tab` is being driven right now, from a snapshot.
+export function drivenBy(
+  inFlight: Record<string, InFlightView>,
+  tabId: string,
+): InFlightView | null {
+  return inFlight[tabId] ?? null;
+}
+
+let initialized = false;
+let seenFirstSnapshot = false;
+
+function apply(rows: [string, InFlightView][]): void {
+  const next: Record<string, InFlightView> = {};
+  for (const [tab, view] of rows) next[tab] = view;
+  const previous = get(delegationInFlight);
+  delegationInFlight.set(next);
+
+  // Locked decision 2a's local echo. Fired here rather than in a component
+  // because it must happen ONCE per flight, on the edge — a component that
+  // wrote it from a reactive statement would repeat the line on every re-render
+  // and on every tab attach.
+  //
+  // Skipped for the FIRST snapshot: a window that mounts (or reloads) mid-flight
+  // is not watching a turn begin, and echoing then would stamp the line into the
+  // middle of output the worker had already produced.
+  if (!seenFirstSnapshot) {
+    seenFirstSnapshot = true;
+    return;
+  }
+  for (const [tab, view] of Object.entries(next)) {
+    if (previous[tab]) continue;
+    const term = getTerminal(tab as TabId);
+    // Display only — `writeLocalEcho` writes to the xterm widget. There is no
+    // path from here to `pty_write`, and the worker model never sees this line.
+    if (term) writeLocalEcho(term, view.driver_agent, view.driver_name);
+  }
+}
+
+/// Subscribe to `delegation-changed` and take the opening snapshot.
+///
+/// Idempotent. The listener is registered BEFORE the initial pull so an edge
+/// landing mid-pull is not lost; the pull then only fills in if no event has
+/// arrived, the `initSettings` convention.
+export async function initDelegation(): Promise<void> {
+  if (initialized) return;
+  initialized = true;
+  let gotEvent = false;
+  try {
+    await listen<DelegationChanged>(EVENT_DELEGATION_CHANGED, (e) => {
+      gotEvent = true;
+      apply(e.payload?.in_flight ?? []);
+    });
+  } catch (e) {
+    // A failed subscribe leaves the flag set deliberately: retrying a listener
+    // that threw once per app start is noise, and every surface this feeds
+    // degrades to "nothing is in flight", which is the safe reading.
+    console.warn('delegation-changed subscribe failed', e);
+  }
+  try {
+    const initial = await delegationStatuses();
+    if (!gotEvent) apply(initial);
+  } catch (e) {
+    console.warn('delegation_statuses failed; assuming nothing in flight', e);
+  }
+}
+
+/// A once-a-second clock for the delegation banner's elapsed counter.
+///
+/// **Its own gate, and the gate is subscription.** Svelte's `readable` runs its
+/// start function only while something is subscribed and tears it down on the
+/// last unsubscribe, so the interval exists exactly while a banner is on screen
+/// — the banner renders only for a pane's ACTIVE tab and only while that tab is
+/// driven, so a detached or idle pane costs nothing. This is the same rule
+/// `appViews.ts` states for the keep-alive views (anything periodic in a view
+/// gates on `appViewVisibility`), applied where it actually bites: the banner is
+/// not one of the registry's views, it is unmounted rather than detached, and a
+/// second visibility store would be a gate on a timer that no longer exists.
+export const delegationClock: Readable<number> = readable(Date.now(), (set) => {
+  const id = setInterval(() => set(Date.now()), 1000);
+  return () => clearInterval(id);
+});

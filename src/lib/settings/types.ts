@@ -324,6 +324,40 @@ export interface AiToolTabConfig {
   /// user's hands, not cImp's. The engine's transient `Driven` lock is runtime
   /// state and never appears here. Mirror of Rust `AiToolTabConfig::read_only`.
   read_only: boolean;
+  /// V39 Phase B (locked decision 8): what this tab is **for** in the
+  /// delegation surface. Mirror of Rust `AiToolTabConfig::delegation_role`,
+  /// whose serde is `snake_case` — so the wire words are `none` / `manual` /
+  /// `remote_offload`, not the glyph's shorter `remote`.
+  ///
+  /// Exclusive by construction (one enum, not two flags) and cross-tab unique
+  /// for `manual`: **at most one Manual tab per harness**, enforced by the
+  /// `tab_set_delegation_role` IPC, which MOVES the role rather than refusing.
+  /// Never written straight into a settings save — the move rule lives in the
+  /// backend, and a save that set the field directly would let two tabs of one
+  /// harness hold it.
+  delegation_role: DelegationRole;
+  /// V39 (locked decision 8): the per-backend knobs a `remote_offload` tab is
+  /// synthesized into the offload backend list with (Phase C reads them).
+  /// Edited in the tab's communication popover and persisted through the
+  /// ordinary settings save, unlike the role beside it.
+  delegation_backend: DelegationBackend;
+}
+
+/// V39 Phase B: one tab's delegation role. Mirror of Rust `DelegationRole`
+/// (`#[serde(rename_all = "snake_case")]`).
+export type DelegationRole = 'none' | 'manual' | 'remote_offload';
+
+/// V39: the per-tab facade-backend knobs. Mirror of Rust `DelegationBackend`.
+/// Every field is optional-by-default so a tab that has never held the Remote
+/// offload role still round-trips: `name: null` means "fall back to the tab's
+/// display name", `declared_context: null` means "Phase C picks a generous
+/// default". Kept even while the role is something else — a user who sets a
+/// name, switches the role away and switches it back should find it where they
+/// left it.
+export interface DelegationBackend {
+  name: string | null;
+  tier: BackendTier;
+  declared_context: number | null;
 }
 
 /// V32 Phase G: one L3 cell. `'inherit'` takes the app-wide per-feature value;
@@ -2226,6 +2260,10 @@ export function defaultSettings(): Settings {
         // V39 Phase A: a fresh tab accepts the keyboard; the lock is a
         // deliberate user action, never a default.
         read_only: false,
+        // V39 Phase B: a tab becomes reachable by another harness only by an
+        // explicit user action on that tab.
+        delegation_role: 'none',
+        delegation_backend: { name: null, tier: 'quality', declared_context: null },
       },
       {
         kind: 'ai_tool',
@@ -2259,6 +2297,10 @@ export function defaultSettings(): Settings {
         // V39 Phase A: a fresh tab accepts the keyboard; the lock is a
         // deliberate user action, never a default.
         read_only: false,
+        // V39 Phase B: a tab becomes reachable by another harness only by an
+        // explicit user action on that tab.
+        delegation_role: 'none',
+        delegation_backend: { name: null, tier: 'quality', declared_context: null },
       },
     ],
     processing: { stability_timeout_ms: 200, max_hold_ms: 500 },

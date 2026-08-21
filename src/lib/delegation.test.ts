@@ -1,15 +1,25 @@
 import { describe, it, expect } from 'vitest';
 import {
   accessOf,
+  attributionLine,
+  backendOf,
+  displacedToast,
   drivenReason,
+  elapsedLabel,
   glyphState,
+  harnessLabel,
   hasCommIcon,
   isMouseWheel,
   isTerminalReply,
+  manualHolderFor,
   readOnlyExempt,
   readOnlyReason,
   readOnlyRefusalMessage,
+  roleOf,
+  tabHarness,
+  withTabBackend,
   withTabReadOnly,
+  writeLocalEcho,
   READ_ONLY_USER_REASON,
   type DelegationRole,
   type TabAccess,
@@ -62,7 +72,7 @@ describe('glyphState', () => {
   });
 
   it('wears the lock whenever access is read-only, in every role', () => {
-    for (const role of ['none', 'manual', 'remote'] as DelegationRole[]) {
+    for (const role of ['none', 'manual', 'remote_offload'] as DelegationRole[]) {
       expect(glyphState({ role, access: 'ro', inFlight: false }).locked).toBe(true);
       expect(glyphState({ role, access: 'rw', inFlight: false }).locked).toBe(false);
     }
@@ -70,42 +80,51 @@ describe('glyphState', () => {
 
   it('shows the role while idle', () => {
     expect(glyphState({ role: 'manual', access: 'rw', inFlight: false }).state).toBe('manual');
-    expect(glyphState({ role: 'remote', access: 'rw', inFlight: false }).state).toBe('remote');
+    expect(glyphState({ role: 'remote_offload', access: 'rw', inFlight: false }).state).toBe('remote');
   });
 
   it('lets driven win over every role while a delegation is in flight', () => {
-    for (const role of ['none', 'manual', 'remote'] as DelegationRole[]) {
+    for (const role of ['none', 'manual', 'remote_offload'] as DelegationRole[]) {
       for (const access of ['rw', 'ro'] as TabAccess[]) {
         expect(glyphState({ role, access, inFlight: true }).state).toBe('driven');
       }
     }
   });
 
+  /// Phase B: the in-flight title IS the attribution line of locked decision
+  /// 2a — the same sentence the banner and the local echo carry, so the three
+  /// surfaces cannot drift into three paraphrases of one fact.
   it('names the driver in the in-flight title, and never leaves it blank', () => {
     expect(
-      glyphState({ role: 'none', access: 'rw', inFlight: true, driverName: 'api-work' }).title,
-    ).toContain('driven by api-work');
+      glyphState({
+        role: 'none',
+        access: 'rw',
+        inFlight: true,
+        driverAgent: 'opencode',
+        driverName: 'api-work',
+      }).title,
+    ).toContain('[delegated by OpenCode \u00b7 tab "api-work" \u00b7 via cImp]');
     expect(glyphState({ role: 'none', access: 'rw', inFlight: true }).title).toContain(
-      'driven by another tab',
+      'tab "another tab"',
     );
     expect(
       glyphState({ role: 'none', access: 'rw', inFlight: true, driverName: '  ' }).title,
-    ).toContain('driven by another tab');
+    ).toContain('tab "another tab"');
   });
 
   it('names the backend of a remote-offload tab when there is one', () => {
     expect(
-      glyphState({ role: 'remote', access: 'rw', inFlight: false, backendName: 'lan-worker-2' })
+      glyphState({ role: 'remote_offload', access: 'rw', inFlight: false, backendName: 'lan-worker-2' })
         .title,
     ).toContain('lan-worker-2');
     // …and reads cleanly when there is not.
-    expect(glyphState({ role: 'remote', access: 'rw', inFlight: false }).title).not.toContain(
+    expect(glyphState({ role: 'remote_offload', access: 'rw', inFlight: false }).title).not.toContain(
       '""',
     );
   });
 
   it('always says what the state is and what a click does', () => {
-    for (const role of ['none', 'manual', 'remote'] as DelegationRole[]) {
+    for (const role of ['none', 'manual', 'remote_offload'] as DelegationRole[]) {
       for (const access of ['rw', 'ro'] as TabAccess[]) {
         for (const inFlight of [false, true]) {
           const { title } = glyphState({ role, access, inFlight });
@@ -278,5 +297,176 @@ describe('readOnlyRefusalMessage', () => {
     expect(readOnlyRefusalMessage(new Error('unknown tab'))).toBeNull();
     expect(readOnlyRefusalMessage(null)).toBeNull();
     expect(readOnlyRefusalMessage({ kind: 'whatever' })).toBeNull();
+  });
+});
+
+// ── V39 Phase B ─────────────────────────────────────────────────────────────
+
+describe('harnessLabel + attributionLine', () => {
+  it('names the two harnesses cImp ships with', () => {
+    expect(harnessLabel('claude')).toBe('Claude Code');
+    expect(harnessLabel('opencode')).toBe('OpenCode');
+  });
+
+  it('renders an unknown harness as its own id, never as a guess', () => {
+    // A harness added after this build must read as itself, not as "unknown"
+    // and not as one of the two above.
+    expect(harnessLabel('aider')).toBe('aider');
+    expect(harnessLabel('')).toBe('another harness');
+    expect(harnessLabel(null)).toBe('another harness');
+  });
+
+  it('is the decision-2a line, exactly', () => {
+    expect(attributionLine('opencode', 'api-work')).toBe(
+      '[delegated by OpenCode \u00b7 tab "api-work" \u00b7 via cImp]',
+    );
+  });
+
+  it('never renders an empty tab name', () => {
+    expect(attributionLine('claude', '   ')).toContain('tab "another tab"');
+    expect(attributionLine('claude', null)).toContain('tab "another tab"');
+  });
+});
+
+describe('writeLocalEcho', () => {
+  /// **The invariant of locked decision 2a.** The attribution is client-side
+  /// display: it goes to the xterm widget the user is looking at, and there is
+  /// no path from it to the PTY. The test is the whole point — a helper that
+  /// one day reached for `pty_write` would put provenance text into the worker
+  /// model's context, which is exactly what 2a forbids.
+  it('writes to the terminal object and calls nothing else', () => {
+    const written: string[] = [];
+    const term = {
+      writeln(data: string) {
+        written.push(data);
+      },
+    };
+    writeLocalEcho(term, 'opencode', 'api-work');
+    expect(written).toHaveLength(1);
+    expect(written[0]).toContain('[delegated by OpenCode \u00b7 tab "api-work" \u00b7 via cImp]');
+  });
+
+  it('styles the line dim italic and resets, so nothing leaks into PTY output', () => {
+    const written: string[] = [];
+    writeLocalEcho({ writeln: (d: string) => written.push(d) }, 'claude', 'main');
+    expect(written[0]).toContain('\x1b[2;3m');
+    expect(written[0].endsWith('\x1b[0m')).toBe(true);
+  });
+});
+
+describe('elapsedLabel', () => {
+  it('counts seconds under a minute', () => {
+    expect(elapsedLabel(1_000, 1_000)).toBe('0s');
+    expect(elapsedLabel(1_000, 10_400)).toBe('9s');
+    expect(elapsedLabel(0, 59_999)).toBe('59s');
+  });
+
+  it('switches to minutes so a long flight stays readable', () => {
+    expect(elapsedLabel(0, 60_000)).toBe('1m 00s');
+    expect(elapsedLabel(0, 247_000)).toBe('4m 07s');
+  });
+
+  it('never goes backwards when the clock does', () => {
+    expect(elapsedLabel(10_000, 1_000)).toBe('0s');
+  });
+});
+
+describe('roles', () => {
+  /// The fixture's two builtin AI tabs both run `claude`, so a second harness
+  /// has to be added by hand — which is the case that matters: the Manual rule
+  /// is per harness, not per app.
+  function withRoles(roles: Record<string, DelegationRole>): Settings {
+    const s = settingsWith();
+    s.tabs = [
+      ...s.tabs,
+      {
+        ...(s.tabs.find((t) => t.kind === 'ai_tool') as Extract<
+          Settings['tabs'][number],
+          { kind: 'ai_tool' }
+        >),
+        id: 'opencode',
+        name: 'OpenCode',
+        command: 'opencode',
+      },
+    ];
+    for (const t of s.tabs) {
+      if (t.kind === 'ai_tool' && roles[t.id]) t.delegation_role = roles[t.id];
+    }
+    return s;
+  }
+
+  it('reads the persisted role, and gives a non-AI tab none', () => {
+    expect(roleOf(withRoles({ claude: 'manual' }), 'claude')).toBe('manual');
+    expect(roleOf(withRoles({}), 'claude')).toBe('none');
+    expect(roleOf(withRoles({}), 'shell-default-1')).toBe('none');
+    expect(roleOf(withRoles({}), 'no-such-tab')).toBe('none');
+  });
+
+  it('classifies a tab by harness the way tab_consumer does', () => {
+    const s = withRoles({});
+    const claude = s.tabs.find((t) => t.id === 'claude');
+    const opencode = s.tabs.find((t) => t.id === 'opencode');
+    expect(claude && claude.kind === 'ai_tool' && tabHarness(claude)).toBe('claude');
+    expect(opencode && opencode.kind === 'ai_tool' && tabHarness(opencode)).toBe('opencode');
+  });
+
+  it('matches on the file stem, case-insensitively, like command_is', () => {
+    const base = settingsWith().tabs.find((t) => t.kind === 'ai_tool') as Extract<
+      Settings['tabs'][number],
+      { kind: 'ai_tool' }
+    >;
+    expect(tabHarness({ ...base, command: 'C:\\bin\\Claude.EXE' })).toBe('claude');
+    expect(tabHarness({ ...base, command: '/usr/bin/claude' })).toBe('claude');
+    // A wrapper is `opencode` to BOTH ends — deliberately the same answer Rust
+    // gives, not a better one: the popover must not name a tab the backend
+    // would never have displaced.
+    expect(tabHarness({ ...base, command: 'claude-code.cmd' })).toBe('opencode');
+    expect(tabHarness({ ...base, command: '' })).toBe('opencode');
+  });
+
+  it('names the tab that currently holds Manual for this tab s harness', () => {
+    const s = withRoles({ claude: 'manual', opencode: 'manual' });
+    // `claude-local` also runs `claude`, so its Manual holder is the Claude tab.
+    expect(manualHolderFor(s, 'claude-local')).toMatchObject({ id: 'claude' });
+    // The holder itself is not its own holder.
+    expect(manualHolderFor(s, 'claude')).toBeNull();
+    // …and the OpenCode tab's holder is never a Claude tab: one Manual PER
+    // HARNESS, so the two roles coexist.
+    expect(manualHolderFor(s, 'opencode')).toBeNull();
+  });
+
+  it('has no holder to name when nobody holds it, or the tab is not an AI tab', () => {
+    expect(manualHolderFor(withRoles({}), 'claude-local')).toBeNull();
+    expect(manualHolderFor(withRoles({ claude: 'manual' }), 'shell-default-1')).toBeNull();
+  });
+
+  it('says what moved, in the displaced tab s own words', () => {
+    expect(displacedToast('api-work', 'claude', 'review')).toBe(
+      '\u201capi-work\u201d is no longer the Manual Claude Code tab \u2014 moved to \u201creview\u201d.',
+    );
+  });
+});
+
+describe('withTabBackend', () => {
+  it('clones rather than mutating, and patches only the named tab', () => {
+    const before = settingsWith();
+    const snapshot = JSON.stringify(before);
+    const after = withTabBackend(before, 'claude', { name: 'lan-worker-2', tier: 'fast' });
+    expect(JSON.stringify(before)).toBe(snapshot);
+    expect(backendOf(after, 'claude')).toEqual({
+      name: 'lan-worker-2',
+      tier: 'fast',
+      declared_context: null,
+    });
+    // Untouched tabs keep their identity, so an unrelated re-render is skipped.
+    expect(after.tabs[1]).toBe(before.tabs[1]);
+  });
+
+  it('gives an unknown tab the documented defaults rather than throwing', () => {
+    expect(backendOf(settingsWith(), 'no-such-tab')).toEqual({
+      name: null,
+      tier: 'quality',
+      declared_context: null,
+    });
   });
 });

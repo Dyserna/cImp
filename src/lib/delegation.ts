@@ -10,11 +10,24 @@
 /// because nothing sets a role or starts a delegation yet. The whole table
 /// from locked decision 7 is implemented anyway — it is the same function in
 /// every phase, and a table half-written now is a table re-litigated later.
-import type { Settings, TabConfig } from './settings/types';
+import type {
+  AiToolTabConfig,
+  DelegationBackend,
+  DelegationRole,
+  Settings,
+  TabConfig,
+} from './settings/types';
 
-/// A tab's delegation role (locked decision 8). Phase A always passes
-/// `'none'`; the Role radio that can move it lands in Phase B.
-export type DelegationRole = 'none' | 'manual' | 'remote';
+/// A tab's delegation role (locked decision 8) — re-exported from the settings
+/// mirror rather than spelled again here.
+///
+/// **Phase B corrects Phase A's spelling.** Phase A declared its own
+/// `'none' | 'manual' | 'remote'` because nothing persisted a role yet; the
+/// persisted field's serde is `snake_case` over Rust's `RemoteOffload`, so the
+/// wire word is `remote_offload`. One spelling, and it is the wire's — a UI
+/// enum that disagrees with the field it is bound to is a bug that only shows
+/// up on the one path nobody tests by hand.
+export type { DelegationRole };
 
 /// Whether the *user's* keyboard reaches the tab. Not a statement about the
 /// engine: a read-only tab is still a valid delegation worker — the lock
@@ -35,6 +48,10 @@ export interface GlyphInput {
   /// The driving tab's display name, for the in-flight attribution. Phase B
   /// supplies it; absent it the title says "another tab" rather than nothing.
   driverName?: string | null;
+  /// The driving tab's HARNESS id (`InFlightView.driver_agent`), which is what
+  /// the attribution line names first — "delegated by OpenCode" is the fact the
+  /// user needs; the tab name only disambiguates which of that harness's tabs.
+  driverAgent?: string | null;
   /// The user-chosen backend name of a Remote-offload tab (Phase C).
   backendName?: string | null;
 }
@@ -72,16 +89,18 @@ export function glyphState(input: GlyphInput): GlyphState {
     ? 'driven'
     : input.role === 'manual'
       ? 'manual'
-      : input.role === 'remote'
+      : input.role === 'remote_offload'
         ? 'remote'
         : 'off';
 
-  const driver = (input.driverName ?? '').trim() || 'another tab';
   const backend = (input.backendName ?? '').trim();
 
   const base =
     state === 'driven'
-      ? `cImp is using this tab — ${drivenReason(driver)}. Take over from the popover to stop waiting; no keys are ever sent to cancel it.`
+      ? // Locked decision 2a: the glyph title REPEATS the attribution line, so
+        // the banner, the local echo and this tooltip say one sentence rather
+        // than three paraphrases of it.
+        `${attributionLine(input.driverAgent, input.driverName)} cImp is using this tab. Take over from the popover to stop waiting; no keys are ever sent to cancel it.`
       : state === 'manual'
         ? 'This tab is the delegation target for its harness (Role: Manual).'
         : state === 'remote'
@@ -249,4 +268,213 @@ function aiTabConfig(
 ): (TabConfig & { kind: 'ai_tool' }) | null {
   const found = settings.tabs.find((t) => t.id === tabId);
   return found && found.kind === 'ai_tool' ? found : null;
+}
+
+// ── V39 Phase B: roles, harnesses, attribution ──────────────────────────────
+
+/// The in-flight delegation on one worker tab. Mirror of Rust
+/// `delegation::InFlightView` (plain `serde::Serialize`, so the field names are
+/// the Rust ones verbatim).
+export interface InFlightView {
+  /// Driver tab id.
+  driver: string;
+  /// Driver tab display name, snapshotted when the flight started — it keeps
+  /// naming the tab the user saw even if that tab is renamed or closed.
+  driver_name: string;
+  /// Driver HARNESS id (`claude` / `opencode`).
+  driver_agent: string;
+  mode: 'explicit' | 'facade';
+  started_ms: number;
+  /// A permission/question prompt is standing on the worker right now: the
+  /// keyboard is relaxed for it and the deadline has one bounded extension
+  /// (locked decision 5).
+  awaiting_prompt: boolean;
+}
+
+/// The `delegation-changed` payload: **the whole in-flight set, every time**.
+/// A snapshot, never a delta — the store REPLACES its state with it.
+export interface DelegationChanged {
+  in_flight: [string, InFlightView][];
+}
+
+/// What `tab_set_delegation_role` did, for the toast. Mirror of Rust
+/// `ipc::commands::RoleChange`. `displaced` is the tab that LOST Manual to this
+/// call — `null` when nothing moved.
+export interface RoleChange {
+  tab: string;
+  role: DelegationRole;
+  displaced: string | null;
+}
+
+/// Harness id → the name a person uses for it.
+///
+/// **The one mapping this phase adds, and it is added here deliberately.** The
+/// only other spelling of it in the frontend is inline inside App.svelte's
+/// `ai-tab-restart-hint` listener, which is neither exported nor reachable — so
+/// there was nothing to reuse. Everything V39 renders reads this one: the
+/// banner, the local echo, the glyph title and the popover. An id with no entry
+/// falls through to itself rather than to a guess, which is also how a harness
+/// added after this build renders (its id, never "unknown").
+const HARNESS_LABELS: Readonly<Record<string, string>> = {
+  claude: 'Claude Code',
+  opencode: 'OpenCode',
+};
+
+/// The display name for a harness id. Unknown ids render as themselves.
+export function harnessLabel(id: string | null | undefined): string {
+  const key = (id ?? '').trim();
+  if (key.length === 0) return 'another harness';
+  return HARNESS_LABELS[key] ?? key;
+}
+
+/// The attribution line of locked decision 2a, spelled ONCE.
+///
+/// `[delegated by OpenCode · tab "api-work" · via cImp]`
+///
+/// **Client-side only.** It is rendered in the banner, echoed into the xterm
+/// widget and repeated in the glyph title — and it never reaches the PTY: the
+/// worker model receives the task verbatim, with no header and no marker, so
+/// nothing here can be read by it as provenance. Nothing in this module calls
+/// `pty_write`, and a test pins that the local-echo helper writes to a terminal
+/// object rather than through `invoke`.
+export function attributionLine(
+  driverAgent: string | null | undefined,
+  driverName: string | null | undefined,
+): string {
+  const who = (driverName ?? '').trim();
+  const tab = who.length > 0 ? who : 'another tab';
+  return `[delegated by ${harnessLabel(driverAgent)} · tab "${tab}" · via cImp]`;
+}
+
+/// Elapsed time for the banner, as a short human string. Seconds under a
+/// minute, `Nm SSs` above it — a delegation that has been running for four
+/// minutes must not read as "247s", which nobody parses at a glance.
+export function elapsedLabel(startedMs: number, nowMs: number): string {
+  const secs = Math.max(0, Math.floor((nowMs - startedMs) / 1000));
+  if (secs < 60) return `${secs}s`;
+  const m = Math.floor(secs / 60);
+  const s = secs % 60;
+  return `${m}m ${String(s).padStart(2, '0')}s`;
+}
+
+/// The minimum of an xterm `Terminal` the local echo needs. A structural type
+/// so the helper is testable with a two-line fake, and so it can never reach
+/// for anything else on the real object.
+export interface LocalEchoTarget {
+  writeln(data: string): void;
+}
+
+/// Write the attribution line into a tab's terminal WIDGET (locked decision
+/// 2a).
+///
+/// This is display, not input: it goes to the xterm instance the user is
+/// looking at, never through `pty_write` and never into the backend scrollback
+/// ring, so no harness — the worker's least of all — ever sees it. Styled dim
+/// italic with SGR so it cannot be mistaken for the harness's own output, and
+/// reset immediately so the sequence cannot leak into the next line the PTY
+/// writes.
+///
+/// **Accepted residual:** a local echo does NOT survive a scrollback re-seed.
+/// Rebinding a tab (a renderer flip, a restart) repaints from the backend ring,
+/// which by construction never held this line — so it disappears. The banner
+/// holds for the whole flight and the Events row is the durable record; this
+/// line's job is to mark the spot in the visible transcript where the turn
+/// began.
+export function writeLocalEcho(
+  term: LocalEchoTarget,
+  driverAgent: string | null | undefined,
+  driverName: string | null | undefined,
+): void {
+  term.writeln(`\r\n\x1b[2;3m${attributionLine(driverAgent, driverName)}\x1b[0m`);
+}
+
+/// This tab's persisted delegation role, read from the settings mirror.
+/// A tab with no AI config has no role — `'none'`, never a guess.
+export function roleOf(settings: Settings, tabId: string): DelegationRole {
+  return aiTabConfig(settings, tabId)?.delegation_role ?? 'none';
+}
+
+/// This tab's persisted facade-backend knobs, or the defaults.
+export function backendOf(settings: Settings, tabId: string): DelegationBackend {
+  return (
+    aiTabConfig(settings, tabId)?.delegation_backend ?? {
+      name: null,
+      tier: 'quality',
+      declared_context: null,
+    }
+  );
+}
+
+/// Which HARNESS a configured AI tab runs.
+///
+/// Mirror of Rust `tabs::config::tab_consumer` — `command_is(command,
+/// "claude") ? claude : opencode`, compared on the file stem so `claude`,
+/// `claude.exe` and a full path all answer `claude`. The frontend needs it
+/// because "at most one Manual tab per harness" is a rule ABOUT this grouping,
+/// and the popover has to name the tab that currently holds it before the user
+/// clicks.
+///
+/// A wrapper command is `opencode` to both ends, exactly as Rust classifies it —
+/// deliberately the same answer, not a better one: the two must agree, or the
+/// popover names a tab the backend would not have displaced.
+export function tabHarness(cfg: AiToolTabConfig): string {
+  const command = cfg.command ?? '';
+  const last = command.split(/[\\/]/).pop() ?? '';
+  const stem = last.replace(/\.[^.]*$/, '');
+  return stem.toLowerCase() === 'claude' ? 'claude' : 'opencode';
+}
+
+/// The tab that currently holds `Manual` for `tabId`'s harness, other than
+/// `tabId` itself — `null` when this tab holds it, or nobody does.
+///
+/// Read from the settings mirror rather than from the backend, because it is
+/// wanted BEFORE the click: the popover says which tab holds Manual so the user
+/// knows the radio will MOVE it rather than be refused.
+export function manualHolderFor(
+  settings: Settings,
+  tabId: string,
+): { id: string; name: string } | null {
+  const self = aiTabConfig(settings, tabId);
+  if (!self) return null;
+  const harness = tabHarness(self);
+  for (const t of settings.tabs) {
+    if (t.kind !== 'ai_tool' || t.id === tabId) continue;
+    if (t.delegation_role === 'manual' && tabHarness(t) === harness) {
+      return { id: t.id, name: t.name };
+    }
+  }
+  return null;
+}
+
+/// The toast the DISPLACED tab gets when Manual moves off it (locked decision
+/// 8): the losing tab may not even be visible, and a role that moved silently
+/// is a `delegate_task_*` tool that started driving somewhere else with nothing
+/// on screen saying so.
+export function displacedToast(
+  displacedName: string,
+  harness: string,
+  takerName: string,
+): string {
+  return `“${displacedName}” is no longer the Manual ${harnessLabel(harness)} tab — moved to “${takerName}”.`;
+}
+
+/// Clone `settings` with one AI tab's facade-backend knobs changed.
+///
+/// The knobs go through the ORDINARY settings save (`applySettings`), unlike
+/// the role beside them: the role carries a cross-tab uniqueness rule that only
+/// `tab_set_delegation_role` enforces, and writing it here would let two tabs
+/// of one harness hold Manual.
+export function withTabBackend(
+  settings: Settings,
+  tabId: string,
+  patch: Partial<DelegationBackend>,
+): Settings {
+  return {
+    ...settings,
+    tabs: settings.tabs.map((t) =>
+      t.kind === 'ai_tool' && t.id === tabId
+        ? { ...t, delegation_backend: { ...t.delegation_backend, ...patch } }
+        : t,
+    ),
+  };
 }

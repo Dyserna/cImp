@@ -318,6 +318,12 @@ export interface AiToolTabConfig {
   /// different question and deliberately unchanged: the 34 → 35 schema step
   /// writes the word into every pre-V39 tab so an upgrade changes no posture.
   injection_overrides: TabInjectionOverrides;
+  /// V39 Phase A: the user's sticky read-only lock on this tab. `true` means
+  /// `pty_write` refuses the keyboard with *read-only (user)*; the tab keeps
+  /// running, and it is still a valid delegation worker — the lock governs the
+  /// user's hands, not cImp's. The engine's transient `Driven` lock is runtime
+  /// state and never appears here. Mirror of Rust `AiToolTabConfig::read_only`.
+  read_only: boolean;
 }
 
 /// V32 Phase G: one L3 cell. `'inherit'` takes the app-wide per-feature value;
@@ -831,6 +837,8 @@ export interface Settings {
   /// OS layer ONLY — job objects, the minimal environment and the
   /// injection-layer controls stay on regardless.
   sandbox: SandboxSettings;
+  /// V39: cross-harness delegation (one tab drives another).
+  delegation: DelegationSettings;
   /// V12 Phase A: project checker commands the `run_check` MCP tool can run
   /// (mirror of Rust `Vec<CheckDef>`). Lives at the root, not inside
   /// `GraphSettings` — independent of the code graph. Empty by default. Edited
@@ -1514,6 +1522,24 @@ export interface SandboxSettings {
   extra_grant_dirs: string[];
 }
 
+/// V39: the global cross-harness delegation knobs. Mirror of Rust
+/// `DelegationSettings`. The per-tab half (the read-only lock, and in later
+/// phases the tab's role) lives on the tab config, not here.
+export interface DelegationSettings {
+  /// Lock a worker tab's keyboard for the duration of a delegation, then
+  /// release it. Default **on** — while cImp is typing into a tab, a stray
+  /// keystroke lands in the middle of someone else's turn. A courtesy lock
+  /// over the user's own hands, not a security boundary.
+  auto_read_only: boolean;
+  /// Seconds the engine waits for a worker's reply when the caller named no
+  /// timeout. On expiry the driver is told `timeout`; no keys are ever sent to
+  /// the worker to cancel it.
+  default_timeout_s: number;
+  /// How deep delegations may nest. `1` = a tab being driven may not itself
+  /// drive.
+  max_depth: number;
+}
+
 /// V13 §0.4: the Workbench feature's settings. Mirror of Rust
 /// `WorkbenchSettings`. `enabled` is the master switch for the reserved tab
 /// itself (default true — the tab is cheap; each section gates its own
@@ -2185,6 +2211,9 @@ export function defaultSettings(): Settings {
         // V39: a new tab ships every tab-scoped injection control OFF —
         // mirror of Rust `schema::default_claude_tab`.
         injection_overrides: allOffInjectionOverrides(),
+        // V39 Phase A: a fresh tab accepts the keyboard; the lock is a
+        // deliberate user action, never a default.
+        read_only: false,
       },
       {
         kind: 'ai_tool',
@@ -2215,6 +2244,9 @@ export function defaultSettings(): Settings {
         // V39: a new tab ships every tab-scoped injection control OFF —
         // mirror of Rust `schema::default_claude_tab`.
         injection_overrides: allOffInjectionOverrides(),
+        // V39 Phase A: a fresh tab accepts the keyboard; the lock is a
+        // deliberate user action, never a default.
+        read_only: false,
       },
     ],
     processing: { stability_timeout_ms: 200, max_hold_ms: 500 },
@@ -2448,6 +2480,11 @@ export function defaultSettings(): Settings {
       tabs: false,
       allow_network: false,
       extra_grant_dirs: [],
+    },
+    delegation: {
+      auto_read_only: true,
+      default_timeout_s: 600,
+      max_depth: 1,
     },
     checks: [],
     checks_auto_configure: false,

@@ -280,6 +280,12 @@ pub struct Settings {
     /// decisions 16-17). Off by default; additive `#[serde(default)]` at the
     /// container level, so old settings files load with the layer off.
     pub sandbox: SandboxSettings,
+    /// V39: cross-harness delegation (one tab drives another). Phase A ships
+    /// only [`DelegationSettings::auto_read_only`]'s consumer-to-be plus the
+    /// read-only lock itself; the timeout and depth bounds are declared here
+    /// now so the engine phases add behaviour, not schema. Additive
+    /// `#[serde(default)]` at the container level.
+    pub delegation: DelegationSettings,
     /// V12 Phase A: project checker commands (`cargo check`, `tsc`, `eslint`,
     /// `pytest`, …) the `run_check` MCP tool can run. Lives at the root, not
     /// inside `GraphSettings` — it's project tooling, independent of the code
@@ -480,6 +486,7 @@ impl Default for Settings {
             graph: GraphSettings::default(),
             workbench: WorkbenchSettings::default(),
             sandbox: SandboxSettings::default(),
+            delegation: DelegationSettings::default(),
             checks: Vec::new(),
             checks_auto_configure: false,
             checks_suggestion_dismissed: false,
@@ -501,6 +508,47 @@ impl Default for Settings {
             harness_versions: HarnessVersions::default(),
             code_audit: CodeAuditSettings::default(),
             tool_plugins: ToolPluginsSettings::default(),
+        }
+    }
+}
+
+/// V39: cross-harness delegation — the global knobs that are not per tab.
+///
+/// All three are declared in Phase A even though only the first has a UI in
+/// Phase A, because the alternative is touching the schema again in B and C
+/// for fields whose defaults are already decided. New fields with correct
+/// defaults need no migration step (the container is `#[serde(default)]`), so
+/// declaring them early costs nothing and keeps the on-disk shape stable.
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(default)]
+pub struct DelegationSettings {
+    /// Lock the worker tab's keyboard for the duration of a delegation
+    /// (`ReadOnlySource::Driven`), then release it.
+    ///
+    /// Default **on**: while cImp is typing into a tab, a stray keystroke of
+    /// the user's lands in the middle of someone else's turn. This is a
+    /// courtesy lock over the user's own hands, not a security boundary —
+    /// permission and question prompts relax it (decision 5) and "Take over"
+    /// clears it outright.
+    pub auto_read_only: bool,
+    /// How long the engine waits for a worker's reply before giving up, when
+    /// the caller did not pass a `timeout_s`. On expiry the driver is told
+    /// `timeout`; **no keys are ever sent to the worker** to cancel it — it
+    /// finishes visibly.
+    pub default_timeout_s: u64,
+    /// How deep delegations may nest. Default **1** = a tab that is being
+    /// driven may not itself drive (the acyclic check refuses and names the
+    /// chain). Raising it is the knob that opens nesting later without a
+    /// redesign.
+    pub max_depth: u8,
+}
+
+impl Default for DelegationSettings {
+    fn default() -> Self {
+        Self {
+            auto_read_only: true,
+            default_timeout_s: 600,
+            max_depth: 1,
         }
     }
 }
@@ -1520,6 +1568,23 @@ pub struct AiToolTabConfig {
     /// compile error. Test code outside `crate::settings` writes cells through
     /// `Settings::set_tab_override_for_test`.
     pub(in crate::settings) injection_overrides: crate::settings::injection::TabInjectionOverrides,
+    /// V39 Phase A (locked decision 4): the user's sticky **read-only** lock
+    /// on this tab — the keyboard is refused, the tab keeps running.
+    ///
+    /// Only the `User` source is persisted. The engine's transient `Driven`
+    /// lock lives in `state::ReadOnlyTabs` and is deliberately absent here:
+    /// after a crash mid-delegation nothing is in flight, so a persisted
+    /// `Driven` would be a lock with no owner to lift it.
+    ///
+    /// Additive `#[serde(default)]` (container level) ⇒ every existing
+    /// settings file loads with the tab writable, which is the pre-V39
+    /// behaviour. Read-only governs the *user's* keyboard only: a locked tab
+    /// is still a valid delegation worker.
+    ///
+    /// **Not spawn-baked** — it is enforced per write in `pty_write`, so
+    /// flipping it never asks for a tab restart (`spawn_inject_sig` has no
+    /// slot for it, and a test pins that).
+    pub read_only: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Default)]
@@ -4085,6 +4150,9 @@ pub fn default_claude_tab() -> TabConfig {
         theme_override: None,
         background_override: None,
         use_local_provider: false,
+        // V39 Phase A: a fresh tab accepts the keyboard. The read-only lock
+        // is a deliberate user action, never a default.
+        read_only: false,
         // V39: a newly created AI tab starts with every tab-scoped injection
         // control explicitly OFF. L1 and every L2 ship on; the per-tab row is
         // the switch the user reaches for, from this tab's shield badge. NOT
@@ -4118,6 +4186,9 @@ pub fn default_claude_local_tab() -> TabConfig {
         theme_override: None,
         background_override: None,
         use_local_provider: true,
+        // V39 Phase A: a fresh tab accepts the keyboard. The read-only lock
+        // is a deliberate user action, never a default.
+        read_only: false,
         // V39: see `default_claude_tab`.
         injection_overrides: crate::settings::injection::TabInjectionOverrides::all_off(),
     })
@@ -4151,6 +4222,9 @@ pub fn default_opencode_tab() -> TabConfig {
         theme_override: None,
         background_override: None,
         use_local_provider: false,
+        // V39 Phase A: a fresh tab accepts the keyboard. The read-only lock
+        // is a deliberate user action, never a default.
+        read_only: false,
         // V39: a newly created AI tab starts with every tab-scoped injection
         // control explicitly OFF. L1 and every L2 ship on; the per-tab row is
         // the switch the user reaches for, from this tab's shield badge. NOT
@@ -5743,6 +5817,73 @@ mod tests {
             "src/lib/settings/types.ts still declares `code_audit.tools`, which schema v34 \
              moved into `tool_plugins`"
         );
+    }
+
+    /// **V39 Phase A: the new fields need no migration step.** A settings file
+    /// written before V39 has neither `delegation` nor a per-tab `read_only`;
+    /// both containers are `#[serde(default)]`, so it loads at the current
+    /// schema version with the tab writable and delegation's own defaults —
+    /// which is why schema 35 is not bumped for this phase.
+    #[test]
+    fn delegation_and_read_only_default_when_absent() {
+        let s: Settings = serde_json::from_value(json!({})).expect("empty settings deserialize");
+        assert!(
+            s.delegation.auto_read_only,
+            "the courtesy lock while a tab is driven ships ON"
+        );
+        assert_eq!(s.delegation.default_timeout_s, 600);
+        assert_eq!(s.delegation.max_depth, 1, "no nesting by default");
+
+        let pre_v39 = json!({
+            "tabs": [{
+                "kind": "ai_tool",
+                "id": "claude",
+                "name": "Claude",
+                "command": "claude",
+            }],
+        });
+        let s: Settings = serde_json::from_value(pre_v39).expect("pre-V39 settings deserialize");
+        match s.find_tab("claude") {
+            Some(TabConfig::AiTool(c)) => assert!(
+                !c.read_only,
+                "an existing tab must load writable — the lock is a user action"
+            ),
+            other => panic!("expected the AI tab, got {other:?}"),
+        }
+    }
+
+    /// **The user's read-only lock survives a restart** — it is persisted, and
+    /// it round-trips through the file rather than living only in memory.
+    #[test]
+    fn a_user_read_only_lock_round_trips_through_settings() {
+        let mut s = Settings::default();
+        // `Settings::default()` carries no tabs — the integrity check seeds the
+        // builtins at load time — so the fixture supplies the one it locks.
+        s.tabs.push(default_claude_tab());
+        let id = match s.tabs.iter_mut().find_map(|t| match t {
+            TabConfig::AiTool(c) => Some(c),
+            _ => None,
+        }) {
+            Some(c) => {
+                c.read_only = true;
+                c.id.clone()
+            }
+            None => panic!("Settings::default() seeds at least one AI tab"),
+        };
+        let json = serde_json::to_value(&s).expect("serialize");
+        assert_eq!(
+            json["tabs"]
+                .as_array()
+                .and_then(|a| a.iter().find(|t| t["id"] == json!(id)))
+                .map(|t| t["read_only"].clone()),
+            Some(json!(true)),
+            "the lock must reach the file"
+        );
+        let back: Settings = serde_json::from_value(json).expect("deserialize");
+        match back.find_tab(&id) {
+            Some(TabConfig::AiTool(c)) => assert!(c.read_only),
+            other => panic!("expected the AI tab, got {other:?}"),
+        }
     }
 
     #[test]

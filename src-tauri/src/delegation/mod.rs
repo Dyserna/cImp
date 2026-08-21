@@ -86,6 +86,17 @@ pub mod transition {
     pub const DONE: &str = "done";
     pub const REFUSED: &str = "refused";
     pub const TIMEOUT: &str = "timeout";
+    /// **Reserved, and unreachable today.** A take-over is recorded as
+    /// [`TAKEOVER`] — one row for one event, minted where the user acted, with
+    /// the driver-facing wording in its reason. This name is kept for a
+    /// DRIVER-side cancel (the asking tab withdrawing a request it had made),
+    /// which no surface offers: the driver is blocked inside its own tool call
+    /// for the whole flight, so there is nowhere for it to ask.
+    ///
+    /// Kept rather than deleted because the vocabulary is a contract shared
+    /// with the Events tab and with #87: a transition that once existed and now
+    /// does not is a fact a reader of old rows still needs — a `cancelled` row
+    /// written by an earlier build must still render.
     pub const CANCELLED: &str = "cancelled";
     pub const TAKEOVER: &str = "takeover";
     pub const WORKER_EXITED: &str = "worker_exited";
@@ -121,6 +132,11 @@ pub enum DelegationError {
     /// The deadline passed with no completion. The worker was NOT interrupted.
     Timeout(String),
     /// The user took the tab over mid-flight (locked decision 6).
+    ///
+    /// Recorded under [`transition::TAKEOVER`], not `CANCELLED`: **one event,
+    /// one row.** The user's action is the fact; what the driver was told is
+    /// the same fact seen from the other end, and it rides this variant's
+    /// reason into the row rather than minting a second one.
     Cancelled(String),
     /// The worker's subprocess exited while the turn was in flight.
     WorkerExited(String),
@@ -139,7 +155,9 @@ impl DelegationError {
             DelegationError::NoText(_) => transition::DONE,
             DelegationError::Refused(_) => transition::REFUSED,
             DelegationError::Timeout(_) => transition::TIMEOUT,
-            DelegationError::Cancelled(_) => transition::CANCELLED,
+            // See the variant, and `transition::CANCELLED`: a take-over is ONE
+            // row, minted where the user acted.
+            DelegationError::Cancelled(_) => transition::TAKEOVER,
             DelegationError::WorkerExited(_) => transition::WORKER_EXITED,
         }
     }
@@ -159,8 +177,16 @@ impl DelegationError {
 }
 
 impl std::fmt::Display for DelegationError {
+    /// **The reason, and only the reason.**
+    ///
+    /// It used to prefix the transition (`"timeout: worker tab …"`), which was
+    /// noise: every reason below is already a self-describing sentence, and the
+    /// driver reads this string as a tool result. Dropping the prefix also
+    /// makes ONE string serve both audiences — what the driver is told and what
+    /// the Events row records — so the two cannot come to say different things
+    /// about the same outcome.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}: {}", self.transition(), self.reason())
+        f.write_str(self.reason())
     }
 }
 
@@ -876,7 +902,62 @@ mod tests {
                 "{} is not a declared transition",
                 e.transition()
             );
-            assert!(e.to_string().contains(e.reason()));
+            assert_eq!(
+                e.to_string(),
+                e.reason(),
+                "the driver's string and the row's reason are ONE string"
+            );
+        }
+        // **A take-over is one event and one row** — the user's action, minted
+        // where it happened. `cancelled` stays in the vocabulary for a
+        // driver-side cancel that no surface offers today.
+        assert_eq!(
+            DelegationError::Cancelled("cancelled: user took over".into()).transition(),
+            transition::TAKEOVER
+        );
+    }
+
+    /// **`transition::CANCELLED` is reserved and unreachable, and nothing mints
+    /// it.**
+    ///
+    /// Asserted on the tree rather than on this module, because the failure it
+    /// guards against is a SECOND writer appearing elsewhere — which is exactly
+    /// how the take-over came to mint two rows in the first cut of this phase.
+    /// If a driver-side cancel is ever built, this test is the one that has to
+    /// be changed deliberately.
+    #[test]
+    fn nothing_mints_a_cancelled_row() {
+        let files = [
+            ("delegation/mod.rs", include_str!("mod.rs")),
+            ("delegation/engine.rs", include_str!("engine.rs")),
+            ("ipc/commands.rs", include_str!("../ipc/commands.rs")),
+            ("offload/loopback.rs", include_str!("../offload/loopback.rs")),
+        ];
+        for (name, src) in files {
+            let src = src.replace('\r', "");
+            let code = crate::rustsrc::code_of(name, &src);
+            let mut body = String::new();
+            let mut at = 0usize;
+            for (start, end) in crate::rustsrc::test_regions(&code) {
+                let (start, end) = (start.min(src.len()), end.min(src.len()));
+                if start > at {
+                    body.push_str(&src[at..start]);
+                }
+                at = end.max(at);
+            }
+            if at < src.len() {
+                body.push_str(&src[at..]);
+            }
+            // Comments explaining the reservation are wanted; a CALL is not.
+            let uses: Vec<&str> = body
+                .lines()
+                .filter(|l| l.contains("transition::CANCELLED"))
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect();
+            assert!(
+                uses.is_empty(),
+                "`{name}` mints a `cancelled` delegation row — a take-over is ONE row                  (`takeover`), and `cancelled` is reserved for a driver-side cancel that does                  not exist: {uses:#?}"
+            );
         }
     }
 

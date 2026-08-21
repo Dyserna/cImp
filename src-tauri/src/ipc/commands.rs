@@ -610,45 +610,21 @@ pub async fn tab_set_delegation_role(
 /// V39 Phase B (locked decision 6): **take over** a driven tab.
 ///
 /// Stops the driver waiting; the worker keeps running, visibly. Sends the
-/// worker NOTHING — no Escape, no interrupt. The engine's own path releases the
-/// read-only lock and mints the `cancelled` row on its way out, so this command
-/// deliberately does neither: two owners of a teardown is how one of them ends
-/// up running twice.
+/// worker NOTHING — no Escape, no interrupt.
+///
+/// **Sets a flag, and that is all it does.** The engine's own path releases the
+/// read-only lock and mints the single `takeover` Events row on its way out —
+/// two owners of a teardown is how one of them ends up running twice, which is
+/// exactly what happened in this phase's first cut: this command minted a
+/// `takeover` row and the engine minted a `cancelled` one, two rows for one
+/// event. One event, one row, minted where the flight ends and the timings are
+/// known.
 ///
 /// Returns whether a delegation was actually in flight, so the UI can tell "I
 /// cancelled it" from "it had already finished".
 #[tauri::command]
-pub async fn delegation_take_over(state: State<'_, AppState>, tab: TabId) -> AppResult<bool> {
-    let Some(v) = crate::delegation::take_over(&tab) else {
-        return Ok(false);
-    };
-    // TWO rows for one event, and they are not duplicates (#87's transition
-    // list names both): `takeover` is the USER's action on the worker tab,
-    // minted here where it happened; `cancelled` is what the DRIVER was told,
-    // minted by the engine on its way out. A reader of the feed wants both —
-    // "who stopped this" and "what the asking side received" are different
-    // questions, and a single row would answer only one of them.
-    let worker_name = {
-        let registry = state.tabs.lock().await;
-        registry
-            .name_of(&tab)
-            .unwrap_or_else(|| tab.as_str().to_string())
-    };
-    crate::delegation::record_row(
-        crate::delegation::transition::TAKEOVER,
-        &worker_name,
-        Some(&format!(
-            "the user took the tab back from `{}`",
-            v.driver_name
-        )),
-        &v.driver_agent,
-        Some(v.driver.as_str()),
-        true,
-        crate::activity::now_ms().saturating_sub(v.started_ms),
-        String::new(),
-        String::new(),
-    );
-    Ok(true)
+pub async fn delegation_take_over(tab: TabId) -> AppResult<bool> {
+    Ok(crate::delegation::take_over(&tab).is_some())
 }
 
 /// V39 Phase B: what is driving `tab` right now, if anything — the glyph's

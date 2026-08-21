@@ -580,9 +580,14 @@ async fn run_flight(
                 // the two must agree even if this path is reached first.
                 state.read_only.set_driven(worker, None);
             }
-            return Err(DelegationError::Cancelled(format!(
-                "user took over worker tab `{worker_name}`"
-            )));
+            // Decision 6's own words, and the ONE string this outcome has: the
+            // driver reads it as its tool result and the `takeover` row
+            // records it as its reason, so `target` reads
+            // "<worker> — cancelled: user took over".
+            let _ = worker_name;
+            return Err(DelegationError::Cancelled(
+                "cancelled: user took over".to_string(),
+            ));
         }
 
         // TWO ways a worker can go away, and they need two checks: the

@@ -63,12 +63,12 @@ adds the **read-only tab mode** that makes a driven tab safe to leave open.
      `delegate_task_<harness-id>` — `delegate_task_claude`,
      `delegate_task_opencode`, and one more for every future harness — on the
      single `cimp-offload` server. Arguments: `task`, `context?`,
-     `timeout_s?`, and `target_tab?` (a tab name, required only when more
-     than one tab of that harness is an eligible target; omitted → the single
-     eligible tab, else a refusal listing the candidates). The tool **set**
+     `timeout_s?`. No tab argument: **at most one tab per harness holds the
+     Manual role** (decision 8), so tool = harness = tab. The tool **set**
      is generated from the registry's harness ids (`harness/contract.rs`
      `Harness`, the CHP `agent` discriminator) — a tool exists iff that
-     harness has ≥1 eligible target tab for this consumer — so the engine
+     harness's Manual tab exists, is not the consumer's own tab, and passes
+     the worker gate — so the engine
      names no harness literal, and the tool list itself tells the model
      which harnesses are available right now. There is deliberately **no
      generic `delegate_task`**: one way to do it. *Why per-harness:* the
@@ -125,25 +125,45 @@ adds the **read-only tab mode** that makes a driven tab safe to leave open.
    receives `cancelled: user took over`, the lock clears. cImp never sends
    Escape or any other key into the worker on cancel/timeout — the worker
    finishes what it is doing, visibly.
-7. **Tab icon, tri-state, next to the shield.** A lock-style glyph on AI
-   tabs with `title` + click → context menu, derived in testable TS
-   (`latch.ts::protectionTint` precedent):
-   - *exposed* — tab is a registered delegation target / facade backend,
-     idle (outline glyph);
-   - *driven* — a delegation is in flight (filled glyph, accent colour; the
-     title names the driver tab);
-   - *locked* — manual read-only (filled glyph, neutral colour).
-   A tab that is both manually locked and exposed shows *locked* with
-   "exposed" in the title; *driven* always wins while in flight. Status-bar
-   gets one chip, `delegation`, counting in-flight delegations
-   (`sandboxChip.ts` precedent).
-8. **Opt-in per tab, both directions.** A tab is a valid target only if the
-   user enabled it: `AiToolTabConfig.delegation_target: bool` (explicit
-   mode) and/or a `HarnessTab` backend entry referencing it (facade mode).
-   Neither a `delegate_task_*` tool nor the facade backend exists for a tab
-   the user did not mark. A tab with no target tabs configured does not get
-   any `delegate_task_*` tool in `tools/list` at all (no dead tool); a harness
-   with no eligible tab gets no tool either.
+7. **The tab communication icon — the one control surface.** Every AI tab
+   carries a communication glyph next to the shield. **Click opens a
+   popover** (the rc.4 shield-popover precedent) with two controls:
+   - **Role** (radio): *None* · *Manual* · *Remote offload* — decision 8.
+   - **Access** (radio): *Read/write* · *Read-only* — the manual lock of
+     decision 4 (the auto lock while driven is shown here as a disabled
+     "Read-only (driven by <tab>)" state, with a **Take over** button).
+   Glyph state is derived in testable TS (`latch.ts::protectionTint`
+   precedent) from `(role, access, in-flight)`:
+   - *off* — role None, read/write (dim glyph);
+   - *manual* / *remote* — role set, idle (outline glyph; title names the
+     role, and for Remote the backend name);
+   - *driven* — a delegation is in flight (filled glyph, accent colour; title
+     = the attribution line of 2a);
+   - a *lock* overlay on any of the above when access is Read-only.
+   *Driven* always wins while in flight. Status-bar gets one chip,
+   `delegation`, counting in-flight delegations (`sandboxChip.ts`
+   precedent). The tab context menu mirrors only **Take over** (so it is
+   reachable without the popover); role and access are set in the popover.
+8. **Tab role: None | Manual | Remote offload — exclusive, persisted.**
+   `AiToolTabConfig.delegation_role: DelegationRole` (default `None`) is the
+   **single source of truth** for both modes:
+   - **Manual** — the tab is the target of `delegate_task_<harness>`.
+     **At most one Manual tab per harness.** Choosing Manual on a second
+     tab of the same harness **moves** the role (the previous tab drops to
+     None, with a toast on it and an Events row) — a radio across tabs, not
+     a refusal; the popover names the tab that currently holds it.
+   - **Remote offload** — the tab is a facade backend. **Any number** per
+     harness. The `HarnessTab` backend entry is **synthesized from the tab
+     role** (the `effective_backends()` precedent that synthesizes the local
+     backend) — there is no separate "add backend" step and no second place
+     that can disagree. Per-backend knobs (`backend_name`, defaulting to the
+     tab name; `tier`; `declared_context`) live on the tab config next to
+     the role and are editable in the same popover.
+   - A tab is never both: the roles are one enum, not two flags.
+   A harness whose Manual tab is absent, is the consumer's own tab, or fails
+   the worker gate gets no `delegate_task_*` tool (no dead tool). A Remote
+   offload tab that is closed is an unhealthy backend (V37 health rows), not
+   a deleted one — reopening the tab restores it.
 9. **One delegation per worker at a time; no nesting by default.** A worker
    is single-slot (`slots = 1`, in-flight tracked like `RemoteBackend`);
    a second request gets the router's "no free slot" / the explicit tool's
@@ -265,16 +285,22 @@ adds the **read-only tab mode** that makes a driven tab safe to leave open.
   description lists that harness's eligible tabs by name, rendered live from
   `GET /describe`. Dispatch matches the `delegate_task_` prefix and resolves
   the harness id from the suffix via the registry (no literal match arms).
-- `target_tab` resolves by exact tab name within the tool's harness; omitted
-  with exactly one eligible tab → that tab; omitted with several → refusal
-  listing candidates.
+- Target resolution is a lookup, not a search: the harness id from the tool
+  suffix → the one tab whose `delegation_role == Manual` for that harness.
+  If it vanished between `tools/list` and the call (role moved, tab closed),
+  the call is refused naming the condition.
 - Result shape mirrors `offload_task` (text + meta: worker, duration,
   screening verdict) so harness-side guidance needs no special casing.
 
 ### Facade backend
 
 - `OffloadBackendKind::HarnessTab { tab: String }` alongside `Local`/`Remote`
-  (`settings/schema.rs:3592`); `Backend` impl (`offload/mod.rs:78`):
+  (`settings/schema.rs:3592`) — **never written by the user**: entries are
+  synthesized in `effective_backends()` from every AI tab whose
+  `delegation_role == RemoteOffload`, carrying the tab's `backend_name` /
+  `tier` / `declared_context`. The existing backend editor lists them
+  read-only with a "configured on the tab" note. `Backend` impl
+  (`offload/mod.rs:78`):
   `is_ready` = preflight conditions minus idleness (idle is "free slot"),
   `n_ctx` = declared_context or a generous default, `slots = 1`,
   `tool_scope = All`. New match arms at the sites the survey listed
@@ -292,12 +318,15 @@ adds the **read-only tab mode** that makes a driven tab safe to leave open.
 
 - `TabState.read_only: Option<ReadOnlySource>` (`Manual | Driven { by }`);
   `pty_write` checks it before any side effect; IPC `tab_set_read_only`.
-- `TabContextMenu.svelte`: "Read-only" (checkbox), "Take over" (only while
-  driven), "Delegation target" (checkbox, AI tabs). `Tab.svelte`: the glyph
-  per decision 7, state derived in `src/lib/delegation.ts` (pure, tested).
+- `Tab.svelte`: the communication glyph per decision 7; click →
+  `DelegationPopover.svelte` (role radio, access radio, Remote-offload knobs,
+  Take over); state derived in `src/lib/delegation.ts` (pure, tested:
+  `(role, access, inFlight) → glyph state`, and the one-Manual-per-harness
+  move rule). IPC: `tab_set_delegation_role`, `tab_set_read_only`,
+  `delegation_take_over`. `TabContextMenu.svelte` gains only "Take over".
 - Settings → Tools: `delegation.auto_read_only`, `delegation.default_timeout_s`
-  (default 600), `delegation.max_depth`; facade backends are created in the
-  existing offload backend editor by choosing kind "Harness tab" and a tab.
+  (default 600), `delegation.max_depth`. No backend creation UI — roles are
+  set on tabs.
 
 ## Failure modes (adversarial)
 
@@ -357,7 +386,7 @@ adds the **read-only tab mode** that makes a driven tab safe to leave open.
 
 ## Live-verify
 
-1. Mark Claude tab "Delegation target"; in an OpenCode tab ask "send this to
+1. Click the Claude tab's communication icon → Role: Manual; in an OpenCode tab ask "send this to
    Claude Code: summarise src/lib/latch.ts". Claude tab shows the
    attribution banner + local-echo line naming the OpenCode tab, the typed
    request (verbatim, no header — confirm in the Claude transcript JSONL) and
@@ -365,7 +394,8 @@ adds the **read-only tab mode** that makes a driven tab safe to leave open.
    `done`; glyph went *driven* → *exposed*; keyboard refused during flight
    with the reason toast.
 2. Same in reverse (Claude → OpenCode).
-3. Facade: add backend "lan-worker-2" kind Harness tab → Claude tab; from
+3. Facade: on a second Claude tab set Role: Remote offload, backend name
+   "lan-worker-2"; the offload backend list shows it read-only; from
    OpenCode call `offload_task` (quality tier). Claude tab performs it;
    OpenCode's result names `lan-worker-2`, never the tab.
 4. Permission prompt during a delegation: notification arrives, keyboard
@@ -376,7 +406,8 @@ adds the **read-only tab mode** that makes a driven tab safe to leave open.
 7. Timeout: `default_timeout_s=30` against a long task → `timeout`, worker
    finishes visibly, no keys sent.
 8. Manual read-only survives app restart; `Driven` does not.
-9. Toggle the only Claude target off → `delegate_task_claude` gone next turn without a restart;
+9. Set the Manual Claude tab back to None → `delegate_task_claude` gone next
+   turn without a restart;
    spawn_inject_sig unchanged (test + the save-time restart hint must NOT
    fire).
 10. Gate: break a harness's input profile probe (or point a tab at a harness

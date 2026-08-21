@@ -120,6 +120,23 @@ export interface ActivityEntry {
   /// (`MCP_HEALTH_CAP` backend-side). Steady states mint nothing: only
   /// transitions are written, so a healthy pool is silent rather than a
   /// heartbeat feed.
+  ///
+  /// `delegation` = one TRANSITION of a cross-harness delegation (V39, locked
+  /// decision 14): a tab drove another tab, and this is the durable record of
+  /// who asked. `tool` is the transition (`start` / `done` / `refused` /
+  /// `timeout` / `takeover` / `worker_exited` / `role_moved`), `target` is the
+  /// worker tab (plus the reason on anything that is not a plain success),
+  /// `source` is the DRIVER's harness and the attribution is the driver TAB —
+  /// so a row answers both ends of "who used my Claude tab". `request` /
+  /// `response` carry the verbatim task and the screened reply on `done` rows
+  /// only; every other transition has no payload at all, which is why
+  /// `rowMeta` must not print "0 chars" for one. Its own retention lane
+  /// (`DELEGATION_CAP`) backend-side, like `offload_server`.
+  ///
+  /// A facade run mints TWO rows by design, not one: the driver side already
+  /// mints an `offload` row under the backend NAME (so the facade holds here
+  /// too), and the worker side adds these. Same split as `offload` vs
+  /// `offload_server` — the task, versus what carried it.
   kind:
     | 'graph'
     | 'offload'
@@ -129,7 +146,8 @@ export interface ActivityEntry {
     | 'mcp_health'
     | 'injection_flag'
     | 'sandbox'
-    | 'plugin';
+    | 'plugin'
+    | 'delegation';
   /// The project this row belongs to, canonicalized backend-side
   /// (`activity::root_key`). Lets a per-project consumer filter out other
   /// projects' activity.
@@ -283,6 +301,21 @@ export const CANARY_SOURCES = new Set(['read_advisor', 'harness']);
 /// - `ready` — it answered `/health`; the window and slot count were read.
 /// - `stopped` — cImp stopped it deliberately (see the row's target for which
 ///   intent: user, restart, or app shutdown). Not a failure.
+///
+/// …and three `delegation` transitions that are not call outcomes at all, and
+/// so cannot borrow one. Under the plain `ok`/`failed` fallthrough a `start`
+/// row read "Call succeeded" before anything had happened, a `takeover` — the
+/// user reclaiming their own tab — read "Call failed", and a `role_moved` row,
+/// which is a configuration change, read as a call. Each is one fact and gets
+/// one word (the `plugin` lane's rule, applied in the direction it points: a
+/// kind whose outcomes really are two gets no synonyms; a kind whose rows are
+/// not outcomes gets its own words rather than a borrowed claim).
+/// - `driving` — cImp typed the request and began waiting. The row that says
+///   how it ended is the next one for that worker.
+/// - `takeover` — the user took the tab back mid-flight. Deliberate, and the
+///   worker kept running: never a failure.
+/// - `moved` — the Manual role for a harness moved off this tab. Configuration,
+///   not traffic.
 /// - `down` — it never came up, or it ended without cImp stopping it.
 export type RowStatus =
   | 'ok'
@@ -292,6 +325,9 @@ export type RowStatus =
   | 'ready'
   | 'stopped'
   | 'down'
+  | 'driving'
+  | 'takeover'
+  | 'moved'
   | 'denied'
   | 'flagged'
   | 'unscreened'
@@ -448,6 +484,24 @@ export function rowStatus(e: ActivityEntry): RowStatus {
         return e.ok ? 'recorded' : 'denied';
     }
   }
+  // V39 locked decision 14. Keyed on `tool` (the transition), like
+  // `offload_server`, `sandbox` and `mcp_health` and for the same reason: `ok`
+  // here is the transition's own outcome, so it cannot also carry the verb.
+  // Only the rows that are NOT call outcomes are named; `done`, `refused`,
+  // `timeout` and `worker_exited` fall through, where `ok`/`failed` say exactly
+  // what happened and a synonym would dilute the vocabulary.
+  if (e.kind === 'delegation') {
+    switch (e.tool) {
+      case 'start':
+        return 'driving';
+      case 'takeover':
+        return 'takeover';
+      case 'role_moved':
+        return 'moved';
+      default:
+        break;
+    }
+  }
   // V37 C9, and BEFORE the generic `ok` fallthrough on purpose: these rows are
   // minted `ok: false` in the `mcp` lane, so without this branch a withheld tool
   // renders as "Call failed" — a claim about a call that never happened.
@@ -468,6 +522,12 @@ export const STATUS_TITLE: Record<RowStatus, string> = {
     'The offload server answered /health. Its duration is time-to-healthy, model load included.',
   stopped:
     'cImp stopped this offload server deliberately — the row says which (user, restart, or app shutdown), and its duration is how long the server had been up. Not a failure.',
+  driving:
+    'A delegation started: cImp typed the request into this worker tab and began waiting. It says nothing about the outcome — the next `delegation` row for that tab does. The task it typed is on this row, verbatim, exactly as the worker received it.',
+  takeover:
+    'You took this tab back while a delegation was running. The driver was told `cancelled`; the worker was sent nothing — no Escape, no interrupt — so it finished its turn visibly. A deliberate act, never a failure.',
+  moved:
+    'The Manual role for this harness moved to another tab, so the tab named here dropped to None and `delegate_task_<harness>` now drives the other one. A configuration change, not a call.',
   down: 'The offload server did not come up, or it ended without cImp stopping it. Open the row for the reason.',
   denied: 'Blocked by an injection-containment screen',
   flagged: 'Delivered, but a detection screen flagged it — nothing was blocked',

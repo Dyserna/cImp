@@ -6,7 +6,7 @@ use tokio::sync::{mpsc, Mutex as TokioMutex};
 
 use crate::audio::AudioOutput;
 use crate::settings::SettingsHandle;
-use crate::state::{InputLengths, StateSignal, TabId};
+use crate::state::{InputLengths, ReadOnlyTabs, StateSignal, TabId};
 use crate::tabs::TabRegistryHandle;
 use crate::tts::{AiTtsSuppressed, SpeakSession, TtsRequest};
 
@@ -48,6 +48,13 @@ pub struct AppState {
     /// Listening → Idle. The map grows/shrinks at runtime — IPC handlers
     /// must clone the counter Arc out before relying on it across awaits.
     pub input_lengths: InputLengths,
+    /// V39 Phase A: which tabs currently refuse the user's keyboard, and why.
+    /// Read by `pty_write` before it does anything else — the enforcement
+    /// point for locked decision 4 — seeded at startup from the persisted
+    /// `AiToolTabConfig::read_only` flags and re-synced on every settings
+    /// broadcast. See [`crate::state::ReadOnlyTabs`] for why it is a shared
+    /// map rather than a field on the state manager's `TabState`.
+    pub read_only: ReadOnlyTabs,
     pub settings: SettingsHandle,
     pub audio: Arc<RwLock<Option<Arc<AudioOutput>>>>,
     /// V1.4-07 A: pending deep-link target for the Settings window.

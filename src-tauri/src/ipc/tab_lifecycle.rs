@@ -700,6 +700,12 @@ pub async fn close_tab(
         buf.remove(&tab);
     }
 
+    // V39 Phase A: and its read-only row. The settings entry is dropped just
+    // below, so the next broadcast would clear a `User` lock anyway; this also
+    // drops a `Driven` row (which settings never describes) and keeps the map
+    // from holding one entry per closed tab for the rest of the session.
+    state.read_only.forget(&tab);
+
     // Remove the settings entry. Drop the active_tab_id pointer if it
     // referenced this tab — the frontend will set a new one on its next
     // tab-switch event. Atomic mutate so a concurrent save_layout /
@@ -1474,6 +1480,9 @@ async fn remove_ai_builtin_tab(
     if let Ok(mut buf) = state.user_input_buf.lock() {
         buf.remove(&tab);
     }
+
+    // V39 Phase A: same for its read-only row (mirrors `close_tab`).
+    state.read_only.forget(&tab);
 
     state.settings.mutate(|snap| {
         snap.tabs.retain(|t| t.id() != tab.as_str());

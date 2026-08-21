@@ -77,7 +77,8 @@ use crate::ipc::commands::{
     open_settings_window_to_tab, pty_get_scrollback, pty_rebind_channel, pty_resize, pty_restart,
     pty_start, pty_write, request_tab_restart, restart_shell_tab, set_active_tab,
     set_window_square_corners, settings_get, settings_update, stt_cancel, stt_list_input_devices,
-    stt_list_models, stt_start_recording, stt_stop_recording, tab_activate, tts_set_paused,
+    stt_list_models, stt_start_recording, stt_stop_recording, tab_activate, tab_set_read_only,
+    tts_set_paused,
     tts_speak, tts_speak_selection, tts_stop, tts_test, workbench_checkpoint_diff,
     workbench_checkpoint_now, workbench_checkpoints, workbench_commit_diff, workbench_diff_file,
     workbench_diff_summary, workbench_git_graph, workbench_restore, workbench_revert_hunk,
@@ -104,7 +105,9 @@ use crate::settings::{
     LayoutNodePersisted, LayoutPersisted, LogLevel, LogRetention, Settings, SettingsHandle,
     TabConfig,
 };
-use crate::state::{spawn_state_manager, StateEvent, StateSignal, TabId, TabKind, TabMeta};
+use crate::state::{
+    spawn_state_manager, ReadOnlyTabs, StateEvent, StateSignal, TabId, TabKind, TabMeta,
+};
 use crate::stt::SttHandle;
 use crate::tabs::{TabRegistry, TabRegistryHandle};
 use crate::tts::{spawn_tts_worker, ActiveTab, AiTtsSuppressed, SpeakSession, TtsRequest};
@@ -487,6 +490,13 @@ fn main() {
     // layer reads counter Arcs by tab id.
     let input_lengths = crate::tabs::registry::make_input_lengths(&seed_tabs);
 
+    // V39 Phase A: the per-tab read-only locks `pty_write` enforces. Seeded
+    // from the persisted `AiToolTabConfig::read_only` flags — a user lock is
+    // sticky across restarts — and kept in step with later settings writes by
+    // the broadcast watcher in `spawn_settings_watcher`. No tab is `Driven` at
+    // startup: that source is never persisted.
+    let read_only_tabs = ReadOnlyTabs::seeded(user_read_only_tabs(&settings_handle.current()));
+
     let audio_slot: Arc<RwLock<Option<Arc<AudioOutput>>>> = Arc::new(RwLock::new(None));
 
     // Detection patterns. Lives next to settings.json on disk; auto-seeded
@@ -574,6 +584,7 @@ fn main() {
         user_input_buf: Arc::new(Mutex::new(HashMap::new())),
         state_signals: state_tx.clone(),
         input_lengths: input_lengths.clone(),
+        read_only: read_only_tabs.clone(),
         settings: settings_handle.clone(),
         audio: audio_slot.clone(),
         pending_settings_deep_link: Arc::new(Mutex::new(None)),
@@ -587,6 +598,7 @@ fn main() {
     let state_events_for_notifications = state_event_tx.clone();
     let audio_state_tx = state_tx.clone();
     let input_lengths_for_setup = input_lengths.clone();
+    let read_only_for_setup = read_only_tabs.clone();
     let settings_for_setup = settings_handle.clone();
     let settings_for_notifications = settings_handle.clone();
     let tts_active_for_setup = tts_active.clone();
@@ -940,7 +952,11 @@ fn main() {
                 }
             }
 
-            spawn_settings_broadcast(app.handle().clone(), settings_for_setup.clone());
+            spawn_settings_broadcast(
+                app.handle().clone(),
+                settings_for_setup.clone(),
+                read_only_for_setup.clone(),
+            );
 
             // V32 Phase C3 (locked decision 13): keep the detection data fresh
             // — a debounced launch check plus a periodic due-ness poll, per
@@ -1001,6 +1017,7 @@ fn main() {
             pty_rebind_channel,
             pty_get_scrollback,
             pty_write,
+            tab_set_read_only,
             pty_resize,
             tts_test,
             tts_speak,
@@ -1358,6 +1375,21 @@ fn layout_focused_active_tab_id(layout: &LayoutPersisted) -> Option<String> {
     find(&layout.tree, &layout.focused_pane_id).and_then(|opt| opt.clone())
 }
 
+/// V39 Phase A: the tabs whose persisted `read_only` flag is set — the
+/// `ReadOnlySource::User` locks, as the settings file currently states them.
+/// One helper for both the startup seed and the per-broadcast re-sync so the
+/// two can never disagree about what "the file says locked" means.
+fn user_read_only_tabs(settings: &Settings) -> Vec<TabId> {
+    settings
+        .tabs
+        .iter()
+        .filter_map(|cfg| match cfg {
+            TabConfig::AiTool(c) if c.read_only => Some(TabId::from_str(&c.id)),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Build the launch-seed `Vec<TabMeta>` from a settings snapshot.
 /// Reserved AI ids map to their corresponding `TabId` variants;
 /// everything else is a Shell tab. The integrity check has already
@@ -1431,7 +1463,7 @@ fn init_tts_pipeline(
     );
 }
 
-fn spawn_settings_broadcast(app: AppHandle, settings: SettingsHandle) {
+fn spawn_settings_broadcast(app: AppHandle, settings: SettingsHandle, read_only: ReadOnlyTabs) {
     tauri::async_runtime::spawn(async move {
         let mut rx = settings.subscribe();
         let initial = settings.current();
@@ -1443,6 +1475,13 @@ fn spawn_settings_broadcast(app: AppHandle, settings: SettingsHandle) {
         loop {
             match rx.recv().await {
                 Ok(s) => {
+                    // V39 Phase A: `read_only` is a persisted per-tab field, so
+                    // it can move through the Settings window, a project-overlay
+                    // switch or a hand edit as well as through
+                    // `tab_set_read_only`. Re-syncing here keeps the runtime map
+                    // `pty_write` enforces from becoming a second source of
+                    // truth that drifts from the file.
+                    read_only.sync_users(user_read_only_tabs(&s));
                     if s.logging.level != current_log_level {
                         current_log_level = s.logging.level;
                         logging::set_level(current_log_level);
@@ -1468,4 +1507,71 @@ fn spawn_settings_broadcast(app: AppHandle, settings: SettingsHandle) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod read_only_seed_tests {
+    use super::*;
+    use crate::settings::TabConfig;
+    use crate::state::ReadOnlySource;
+
+    /// `Settings::default()` carries no tabs (the integrity check seeds the
+    /// builtins at load time), so the fixtures supply one.
+    fn settings_with_ai_tab() -> Settings {
+        let mut s = Settings::default();
+        s.tabs.push(crate::settings::default_claude_tab());
+        s.tabs.push(crate::settings::default_claude_local_tab());
+        s
+    }
+
+    fn lock_first_ai_tab(s: &mut Settings) -> TabId {
+        for cfg in s.tabs.iter_mut() {
+            if let TabConfig::AiTool(c) = cfg {
+                c.read_only = true;
+                return TabId::from_str(&c.id);
+            }
+        }
+        panic!("Settings::default() seeds at least one AI tab");
+    }
+
+    /// **V39 Phase A: a user read-only lock survives an app restart.** This is
+    /// the restart path itself — the persisted flag, read at startup, becomes
+    /// the runtime lock `pty_write` enforces.
+    #[test]
+    fn startup_seeds_the_user_locks_from_settings() {
+        let mut s = settings_with_ai_tab();
+        let locked = lock_first_ai_tab(&mut s);
+        let ro = crate::state::ReadOnlyTabs::seeded(user_read_only_tabs(&s));
+        assert_eq!(ro.read_only(&locked), Some(ReadOnlySource::User));
+        for cfg in &s.tabs {
+            let id = TabId::from_str(cfg.id());
+            if id != locked {
+                assert_eq!(ro.read_only(&id), None, "only the locked tab is locked");
+            }
+        }
+    }
+
+    /// …and nothing is `Driven` at startup: that source is never persisted, so
+    /// a crash mid-delegation cannot leave a lock with no owner to lift it.
+    #[test]
+    fn startup_never_seeds_a_driven_lock() {
+        let mut s = settings_with_ai_tab();
+        let locked = lock_first_ai_tab(&mut s);
+        let ro = crate::state::ReadOnlyTabs::seeded(user_read_only_tabs(&s));
+        assert!(matches!(
+            ro.read_only(&locked),
+            Some(ReadOnlySource::User)
+        ));
+    }
+
+    /// A Shell tab can never carry the flag — it is a field on
+    /// `AiToolTabConfig` only, and the seed walks that variant alone.
+    #[test]
+    fn the_seed_only_looks_at_ai_tabs() {
+        let mut s = settings_with_ai_tab();
+        let _ = lock_first_ai_tab(&mut s);
+        for tab in user_read_only_tabs(&s) {
+            assert_eq!(tab.kind(), TabKind::AiTool, "{tab:?} is not an AI tab");
+        }
+    }
 }

@@ -10,7 +10,7 @@ use crate::settings::{
     default_claude_local_tab, default_claude_tab, default_opencode_tab, AiToolTabConfig, Settings,
     TabConfig, CLAUDE_LOCAL_TAB_ID, CLAUDE_TAB_ID, OPENCODE_TAB_ID,
 };
-use crate::state::{StateSignal, TabId};
+use crate::state::{ReadOnlySource, StateSignal, TabId, TabKind};
 
 /// V1.4-04 D: pty_start now returns the persisted-scrollback bytes
 /// from the previous session (if any). The frontend writes them to the
@@ -171,6 +171,43 @@ pub async fn pty_write(state: State<'_, AppState>, tab: TabId, input: String) ->
     if tab.is_reserved_dashboard() {
         return Ok(());
     }
+
+    // V39 Phase A (locked decision 4): the read-only refusal. It sits here,
+    // ahead of EVERY side effect below — the TTS-marker registration, the
+    // typed-input accumulator, the keystroke/submit state signals — because a
+    // refused keystroke must leave no trace: an input that never reached the
+    // PTY must not have moved the avatar to Listening or armed a TTS-echo
+    // suppression for text the model never saw. This is the enforcement point;
+    // the xterm widget's own gate is a courtesy that keeps the round trip out
+    // of the common case, and is not what makes the lock hold.
+    //
+    // **Terminal protocol replies are exempt.** xterm answers the *program's*
+    // own queries (cursor-position reports, device attributes, focus in/out)
+    // on this same channel; they are the terminal talking to the TUI, not the
+    // user typing, and refusing them wedges a harness that is waiting for one
+    // — precisely while a delegation is driving it. Same predicate the
+    // keystroke bookkeeping below uses, so the two can't disagree about what
+    // counts as user input.
+    if let Some(source) = state.read_only.read_only(&tab) {
+        // The driver's *name* (not its id) is what the refusal says, and names
+        // live in the tab registry. Looked up only on the `Driven` branch so a
+        // plain user lock costs no registry lock.
+        let driver_name = match &source {
+            ReadOnlySource::User => None,
+            ReadOnlySource::Driven { by } => {
+                let registry = state.tabs.lock().await;
+                registry.name_of(by)
+            }
+        };
+        if let Some(reason) = read_only_refusal(&source, &input, driver_name.as_deref()) {
+            tracing::debug!(?tab, %reason, "pty_write refused: tab is read-only");
+            return Err(AppError::ReadOnly {
+                tab: tab.as_str().to_string(),
+                reason,
+            });
+        }
+    }
+
     // Pre-register any TTS markers in the user's input so they don't fire
     // when echoed back by the TUI. Content-based; no per-tab scoping needed.
     // The set stores whitespace-normalized content so a width-driven echo
@@ -262,6 +299,71 @@ pub async fn pty_write(state: State<'_, AppState>, tab: TabId, input: String) ->
     }
 
     registry.write(tab, input.into_bytes()).await
+}
+
+/// V39 Phase A: the read-only decision for one write, as a value.
+///
+/// `Some(reason)` refuses; `None` lets the write through. Two rules, and the
+/// second is the one worth pinning in a test:
+///
+/// 1. A locked tab refuses the user's input, naming the source.
+/// 2. **Terminal protocol replies always pass.** xterm answers the running
+///    program's own queries — cursor-position reports, device attributes,
+///    focus in/out — over the same channel as keystrokes. Those are the
+///    terminal talking to the TUI, not a person typing; a harness that asked
+///    for the cursor position and never gets an answer can wedge, and it would
+///    wedge exactly while a delegation is driving it. The same predicate the
+///    keystroke bookkeeping uses decides this, so the two cannot disagree
+///    about what counts as user input.
+fn read_only_refusal(
+    source: &ReadOnlySource,
+    input: &str,
+    driver_name: Option<&str>,
+) -> Option<String> {
+    if is_automatic_terminal_response(input) {
+        return None;
+    }
+    Some(source.reason(driver_name))
+}
+
+/// V39 Phase A: set or clear a tab's **user** read-only lock (locked
+/// decision 4's `ReadOnlySource::User`) — the Access radio in the tab's
+/// communication popover.
+///
+/// Does two things, in this order: takes the runtime lock (so it is in force
+/// before this call returns, with no window in which the UI shows "read-only"
+/// and the PTY still accepts keys), then persists the flag so it survives a
+/// restart. The persisted write broadcasts `settings-changed`, which is how
+/// the frontend learns the new state — there is no separate event.
+///
+/// Only ever sets `User`. The engine's `Driven` lock is not reachable from
+/// here: it belongs to a delegation's lifetime, and "Take over" (Phase B), not
+/// a radio button, is what ends one.
+#[tauri::command]
+pub async fn tab_set_read_only(state: State<'_, AppState>, tab: TabId, on: bool) -> AppResult<()> {
+    if tab.kind() != TabKind::AiTool {
+        return Err(AppError::Ipc(format!(
+            "tab `{}` is not an AI tab; the read-only lock applies to AI tabs only",
+            tab.as_str()
+        )));
+    }
+    if !matches!(
+        state.settings.current().find_tab(tab.as_str()),
+        Some(TabConfig::AiTool(_))
+    ) {
+        return Err(AppError::Ipc(format!(
+            "unknown AI tab `{}`",
+            tab.as_str()
+        )));
+    }
+    state.read_only.set_user(&tab, on);
+    let id = tab.as_str().to_string();
+    state.settings.mutate(move |snap| {
+        if let Some(TabConfig::AiTool(cfg)) = snap.find_tab_mut(&id) {
+            cfg.read_only = on;
+        }
+    });
+    Ok(())
 }
 
 fn contains_enter(input: &str) -> bool {
@@ -3574,7 +3676,66 @@ pub async fn restart_shell_tab(app: AppHandle, tab: TabId) -> AppResult<()> {
 mod tests {
     use super::apply_incoming_settings;
     use super::is_automatic_terminal_response as auto_reply;
+    use super::read_only_refusal;
     use crate::settings::{PromptTemplate, Settings};
+    use crate::state::{ReadOnlySource, TabId};
+
+    /// **V39 Phase A: a refusal always names why.** The frontend shows this
+    /// string verbatim in a toast, so an empty or generic one leaves the user
+    /// staring at a tab that has silently stopped accepting keys.
+    #[test]
+    fn a_read_only_write_is_refused_with_the_reason_named() {
+        assert_eq!(
+            read_only_refusal(&ReadOnlySource::User, "hello", None).as_deref(),
+            Some("read-only (user)")
+        );
+        assert_eq!(
+            read_only_refusal(
+                &ReadOnlySource::Driven {
+                    by: TabId::OpenCode
+                },
+                "hello",
+                Some("api-work"),
+            )
+            .as_deref(),
+            Some("driven by api-work")
+        );
+    }
+
+    /// **The lock is on the user's keyboard, not on the terminal protocol.**
+    /// A TUI that queried the cursor position must still get its answer while
+    /// the tab is locked — otherwise the very tab a delegation is driving is
+    /// the one that wedges.
+    #[test]
+    fn terminal_protocol_replies_are_not_refused_by_the_lock() {
+        for reply in ["\x1b[24;80R", "\x1b[?1;2c", "\x1b[0n", "\x1b[I", "\x1b[O"] {
+            assert!(
+                auto_reply(reply),
+                "fixture must be an automatic reply: {reply:?}"
+            );
+            assert_eq!(
+                read_only_refusal(&ReadOnlySource::User, reply, None),
+                None,
+                "the terminal's own answer was refused: {reply:?}"
+            );
+        }
+    }
+
+    /// …and the exemption is narrow: an escape sequence a *person* produced
+    /// (arrow keys, Esc, a bracketed paste) is still input, and still refused.
+    #[test]
+    fn keyboard_escape_sequences_are_still_refused() {
+        for keys in ["\x1b[A", "\x1b", "\r", "y", "\x1b[200~pasted\x1b[201~"] {
+            assert!(
+                !auto_reply(keys),
+                "fixture must not be an automatic reply: {keys:?}"
+            );
+            assert!(
+                read_only_refusal(&ReadOnlySource::User, keys, None).is_some(),
+                "user input slipped through the lock: {keys:?}"
+            );
+        }
+    }
 
     /// **#48 (M-21): the manual buttons' refusal names the layer that is off.**
     ///

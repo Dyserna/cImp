@@ -16,6 +16,165 @@ use tracing::{debug, info, warn};
 /// keystroke per tab); a plain RwLock is simpler than a third dependency.
 pub type InputLengths = Arc<RwLock<HashMap<TabId, Arc<AtomicI32>>>>;
 
+/// V39 Phase A (locked decision 4): why a tab's keyboard is locked.
+///
+/// Two sources, deliberately not collapsed into one flag — they have
+/// different lifetimes and different owners:
+///
+/// * [`ReadOnlySource::User`] — the sticky lock the user sets from the tab's
+///   communication popover. Persisted in `AiToolTabConfig::read_only` and
+///   restored into [`ReadOnlyTabs`] at app start.
+/// * [`ReadOnlySource::Driven`] — the transient lock the delegation engine
+///   holds while it drives the tab (Phase B). **Never persisted** — after a
+///   restart no tab is `Driven`.
+///
+/// Named `User`, not `Manual`: `Manual` is a tab *role* in Phase B and the two
+/// must not read as the same concept.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "source", rename_all = "kebab-case")]
+pub enum ReadOnlySource {
+    User,
+    Driven { by: TabId },
+}
+
+impl ReadOnlySource {
+    /// The human reason every refusal carries. A block with a blank reason is
+    /// not a block the user can act on, so this is the ONE place the two
+    /// strings are spelled — the IPC error, the toast and the popover all
+    /// render what this returns.
+    ///
+    /// `driver_name` is the *display name* of the driving tab (Phase B passes
+    /// it; names live in the tab registry, not here). Falls back to the
+    /// driver's tab id, never to an empty string.
+    pub fn reason(&self, driver_name: Option<&str>) -> String {
+        match self {
+            ReadOnlySource::User => "read-only (user)".to_string(),
+            ReadOnlySource::Driven { by } => {
+                let who = driver_name
+                    .map(str::trim)
+                    .filter(|n| !n.is_empty())
+                    .unwrap_or_else(|| by.as_str());
+                format!("driven by {who}")
+            }
+        }
+    }
+}
+
+/// One tab's row in [`ReadOnlyTabs`]. Both sources are held side by side so
+/// that clearing the engine's lock at the end of a delegation cannot silently
+/// clear the user's sticky lock — they are set by different actors, and a
+/// single last-writer-wins slot would lose one of them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ReadOnlyEntry {
+    user: bool,
+    driven_by: Option<TabId>,
+}
+
+impl ReadOnlyEntry {
+    /// `Driven` wins over `User` while both hold: it is the more specific
+    /// answer to "why did my keystroke bounce", and it names who to take over
+    /// from.
+    fn source(&self) -> Option<ReadOnlySource> {
+        match (&self.driven_by, self.user) {
+            (Some(by), _) => Some(ReadOnlySource::Driven { by: by.clone() }),
+            (None, true) => Some(ReadOnlySource::User),
+            (None, false) => None,
+        }
+    }
+
+    fn is_clear(&self) -> bool {
+        !self.user && self.driven_by.is_none()
+    }
+}
+
+/// Shared, runtime-mutable per-tab read-only state — the map `pty_write` asks
+/// before it does anything else (locked decision 4: enforcement is
+/// server-side, and it runs ahead of every side effect of a write).
+///
+/// **Why this is a shared map and not a field on [`TabState`]:** `TabState`
+/// lives inside the state-manager actor task and is reachable only by sending
+/// a [`StateSignal`], so an IPC command cannot read it at all, let alone
+/// synchronously — an enforcement check that has to round-trip through an
+/// actor has a race window in front of it. This handle has exactly the shape
+/// of [`InputLengths`] directly above (shared, held by `AppState`, mutated on
+/// tab-lifecycle edges, read on the write path under one `RwLock`), which is
+/// the repo's existing answer to "the write path needs per-tab runtime state".
+/// The state manager can take a clone of this handle when Phase B needs the
+/// permission-prompt relaxation (decision 5) — one map, one owner per source,
+/// no mirror to keep in sync.
+#[derive(Clone, Default)]
+pub struct ReadOnlyTabs {
+    inner: Arc<RwLock<HashMap<TabId, ReadOnlyEntry>>>,
+}
+
+impl ReadOnlyTabs {
+    /// Seed the user locks from persisted `AiToolTabConfig::read_only` at app
+    /// start. `Driven` is never seeded — nothing is in flight at startup.
+    pub fn seeded(user_locked: impl IntoIterator<Item = TabId>) -> Self {
+        let this = Self::default();
+        this.sync_users(user_locked);
+        this
+    }
+
+    /// The effective lock on `tab`, or `None` when the keyboard is free.
+    pub fn read_only(&self, tab: &TabId) -> Option<ReadOnlySource> {
+        let map = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        map.get(tab).and_then(ReadOnlyEntry::source)
+    }
+
+    /// Set or clear the sticky user lock (the popover's Access radio).
+    pub fn set_user(&self, tab: &TabId, on: bool) {
+        self.mutate(tab, |e| e.user = on);
+    }
+
+    /// Make the user locks match `user_locked` exactly — the tabs whose
+    /// persisted `read_only` is currently `true`.
+    ///
+    /// Called on every settings broadcast, not just at startup: `read_only`
+    /// is a persisted field, so the Settings window, a project-overlay switch
+    /// and a hand-edited settings file can all move it without going through
+    /// [`Self::set_user`]. Without this the runtime map would be a second
+    /// source of truth that silently drifts from the file. `Driven` rows are
+    /// untouched — settings has no opinion about them.
+    pub fn sync_users(&self, user_locked: impl IntoIterator<Item = TabId>) {
+        let wanted: std::collections::HashSet<TabId> = user_locked.into_iter().collect();
+        let mut map = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        for tab in &wanted {
+            map.entry(tab.clone()).or_default().user = true;
+        }
+        map.retain(|tab, entry| {
+            if !wanted.contains(tab) {
+                entry.user = false;
+            }
+            !entry.is_clear()
+        });
+    }
+
+    /// Set or clear the engine's transient lock. Phase B's engine calls this
+    /// *before* it writes, so the "user types during the paste window" race is
+    /// closed by ordering rather than by timing.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn set_driven(&self, tab: &TabId, by: Option<TabId>) {
+        self.mutate(tab, |e| e.driven_by = by);
+    }
+
+    /// Drop a closed tab's row. Called from `close_tab` next to the other
+    /// per-tab map cleanups.
+    pub fn forget(&self, tab: &TabId) {
+        let mut map = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        map.remove(tab);
+    }
+
+    fn mutate(&self, tab: &TabId, f: impl FnOnce(&mut ReadOnlyEntry)) {
+        let mut map = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        let entry = map.entry(tab.clone()).or_default();
+        f(entry);
+        if entry.is_clear() {
+            map.remove(tab);
+        }
+    }
+}
+
 /// Identifier for one of the multi-tab subprocesses cimp owns. Four
 /// reserved AI variants cover the V14 builtins (subscription / local
 /// pairs for Claude Code and Aider); `Shell(id)` carries the
@@ -1837,5 +1996,120 @@ mod tests {
         assert!(!is_error_edge(&UserKeystroke { tab: tab() }));
         assert!(!is_error_edge(&UserSubmit { tab: tab() }));
         assert!(!is_error_edge(&TtsPlaybackStarted { tab: tab() }));
+    }
+
+    // ---- V39 Phase A: per-tab read-only state -------------------------------
+
+    fn other() -> TabId {
+        TabId::OpenCode
+    }
+
+    #[test]
+    fn read_only_is_absent_until_something_sets_it() {
+        let ro = ReadOnlyTabs::default();
+        assert_eq!(ro.read_only(&tab()), None);
+    }
+
+    #[test]
+    fn the_user_lock_is_seeded_from_the_persisted_set() {
+        let ro = ReadOnlyTabs::seeded([tab()]);
+        assert_eq!(ro.read_only(&tab()), Some(ReadOnlySource::User));
+        assert_eq!(ro.read_only(&other()), None);
+    }
+
+    #[test]
+    fn the_user_lock_toggles_both_ways() {
+        let ro = ReadOnlyTabs::default();
+        ro.set_user(&tab(), true);
+        assert_eq!(ro.read_only(&tab()), Some(ReadOnlySource::User));
+        ro.set_user(&tab(), false);
+        assert_eq!(ro.read_only(&tab()), None);
+    }
+
+    /// The two sources are independent: ending a delegation must not lift a
+    /// lock the user set by hand (and vice versa).
+    #[test]
+    fn clearing_the_driven_lock_leaves_the_user_lock_standing() {
+        let ro = ReadOnlyTabs::default();
+        ro.set_user(&tab(), true);
+        ro.set_driven(&tab(), Some(other()));
+        assert_eq!(
+            ro.read_only(&tab()),
+            Some(ReadOnlySource::Driven { by: other() }),
+            "driven wins while both hold"
+        );
+        ro.set_driven(&tab(), None);
+        assert_eq!(
+            ro.read_only(&tab()),
+            Some(ReadOnlySource::User),
+            "the user's own lock survived the delegation"
+        );
+    }
+
+    #[test]
+    fn clearing_the_user_lock_leaves_a_running_delegation_locked() {
+        let ro = ReadOnlyTabs::default();
+        ro.set_driven(&tab(), Some(other()));
+        ro.set_user(&tab(), false);
+        assert_eq!(
+            ro.read_only(&tab()),
+            Some(ReadOnlySource::Driven { by: other() })
+        );
+    }
+
+    /// `read_only` is a persisted field, so it can also move through the
+    /// Settings window / a project overlay / a hand edit. The runtime map
+    /// follows the file rather than becoming a second source of truth.
+    #[test]
+    fn sync_users_follows_settings_in_both_directions() {
+        let ro = ReadOnlyTabs::seeded([tab()]);
+        ro.sync_users([other()]);
+        assert_eq!(ro.read_only(&tab()), None, "unticked in settings, unlocked");
+        assert_eq!(ro.read_only(&other()), Some(ReadOnlySource::User));
+    }
+
+    #[test]
+    fn sync_users_does_not_disturb_a_driven_tab() {
+        let ro = ReadOnlyTabs::default();
+        ro.set_driven(&tab(), Some(other()));
+        ro.sync_users(std::iter::empty());
+        assert_eq!(
+            ro.read_only(&tab()),
+            Some(ReadOnlySource::Driven { by: other() }),
+            "settings has no opinion about the engine's transient lock"
+        );
+    }
+
+    #[test]
+    fn forgetting_a_closed_tab_drops_its_row() {
+        let ro = ReadOnlyTabs::seeded([tab()]);
+        ro.forget(&tab());
+        assert_eq!(ro.read_only(&tab()), None);
+    }
+
+    /// Every refusal names a reason the user can act on — never an empty
+    /// string, and never a bare tab id when a display name is known.
+    #[test]
+    fn every_read_only_source_has_a_reason() {
+        assert_eq!(ReadOnlySource::User.reason(None), "read-only (user)");
+        let driven = ReadOnlySource::Driven { by: other() };
+        assert_eq!(driven.reason(Some("api-work")), "driven by api-work");
+        assert_eq!(
+            driven.reason(None),
+            format!("driven by {}", other().as_str()),
+            "no name available falls back to the id, not to nothing"
+        );
+        assert_eq!(
+            driven.reason(Some("   ")),
+            format!("driven by {}", other().as_str()),
+            "a blank name is not a name"
+        );
+        for reason in [
+            ReadOnlySource::User.reason(None),
+            driven.reason(Some("api-work")),
+            driven.reason(None),
+        ] {
+            assert!(!reason.trim().is_empty());
+        }
     }
 }

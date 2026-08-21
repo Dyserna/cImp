@@ -1,20 +1,42 @@
 <script lang="ts">
-  // V39 Phase A — the tab communication popover (locked decision 7).
+  // V39 — the tab communication popover (locked decision 7).
   //
   // The glyph next to the shield is the ONE control surface for delegation, so
-  // this popover is where a tab's access is set. Phase A ships only the Access
-  // radio; the Role radio (None / Manual / Remote offload) and the Remote
-  // knobs land in Phases B and C, in this same popover.
+  // this popover is where a tab's role and access are set. Phase A shipped the
+  // Access radio; Phase B adds the Role radio (None / Manual / Remote offload),
+  // the Remote-offload knobs, and a live "driven" state with a working
+  // Take over.
   //
   // Modelled on `TaintMenu.svelte`, deliberately: same fixed-position anchor
   // with a viewport clamp, same deferred mousedown + Escape dismissal, same
   // "derive state from the store, never snapshot it at click time" rule — a
   // radio rendered from a click-time copy would show the pre-click value right
-  // after the user's own write landed.
+  // after the user's own write landed. Every value below arrives as a prop that
+  // TabBar `$derived` from the settings store and the in-flight mirror, so an
+  // open popover follows the tab rather than freezing.
+  //
+  // **Two writes, two paths, and the split is not incidental.** The ROLE goes
+  // through `tab_set_delegation_role`, because "at most one Manual tab per
+  // harness" is a cross-tab rule only the backend can enforce — it MOVES the
+  // role in one settings mutation, so no broadcast reader can ever observe two
+  // Manual tabs of one harness. The Remote-offload KNOBS are ordinary per-tab
+  // fields and ride the ordinary settings save.
   import { onMount } from 'svelte';
-  import { tabSetReadOnly } from './ipc';
-  import { glyphState, type TabAccess } from './delegation';
+  import { delegationTakeOver, tabSetDelegationRole, tabSetReadOnly } from './ipc';
+  import {
+    attributionLine,
+    displacedToast,
+    glyphState,
+    harnessLabel,
+    tabHarness,
+    withTabBackend,
+    type DelegationRole,
+    type InFlightView,
+    type TabAccess,
+  } from './delegation';
+  import { applySettings, settings } from './settings/store';
   import { showToast } from './toast';
+  import type { DelegationBackend } from './settings/types';
   import type { TabId } from './tabs/types';
 
   let {
@@ -23,11 +45,21 @@
     tab,
     tabName,
     access,
-    /// The tab is being driven by a delegation right now. Always `false` in
-    /// Phase A — nothing sets it yet — but the state it renders is written
-    /// here so Phase B adds an engine, not a UI.
-    driven = false,
-    driverName = null,
+    /// This tab's persisted role. Phase A always passed `'none'`.
+    role = 'none' as DelegationRole,
+    /// This tab's persisted facade-backend knobs — meaningless while the role
+    /// is not Remote offload, and deliberately kept anyway: a user who sets a
+    /// name, switches the role away and switches it back should find it where
+    /// they left it.
+    backend = { name: null, tier: 'quality', declared_context: null } as DelegationBackend,
+    /// The delegation driving this tab right now, or `null`. Phase A had a
+    /// `driven` boolean with nothing to set it; this is the real snapshot row,
+    /// so the popover can name the driver AND end the flight.
+    inFlight = null as InFlightView | null,
+    /// The tab that currently holds Manual for this tab's harness, when it is
+    /// not this one. Named in the hint below so the user knows the click will
+    /// MOVE the role rather than be refused.
+    manualHolder = null as { id: string; name: string } | null,
     onDismiss,
   }: {
     x: number;
@@ -35,14 +67,18 @@
     tab: TabId;
     tabName: string;
     access: TabAccess;
-    driven?: boolean;
-    driverName?: string | null;
+    role?: DelegationRole;
+    backend?: DelegationBackend;
+    inFlight?: InFlightView | null;
+    manualHolder?: { id: string; name: string } | null;
     onDismiss: () => void;
   } = $props();
 
   let menuEl: HTMLDivElement | undefined = $state();
   let busy = $state(false);
   let err = $state<string | null>(null);
+
+  const driven = $derived(inFlight !== null);
 
   // svelte-ignore state_referenced_locally
   let posX = $state(x);
@@ -63,8 +99,56 @@
   });
 
   const glyph = $derived(
-    glyphState({ role: 'none', access, inFlight: driven, driverName }),
+    glyphState({
+      role,
+      access,
+      inFlight: driven,
+      driverName: inFlight?.driver_name ?? null,
+      driverAgent: inFlight?.driver_agent ?? null,
+      backendName: backend.name,
+    }),
   );
+
+  /// This tab's harness, for the Role labels. Read from the same settings
+  /// mirror the backend's own rule reads, so the two cannot disagree about
+  /// which tabs are in one Manual group.
+  const harness = $derived.by(() => {
+    const cfg = $settings.tabs.find((t) => t.kind === 'ai_tool' && t.id === tab);
+    return cfg && cfg.kind === 'ai_tool' ? tabHarness(cfg) : '';
+  });
+
+  /// The backend name the requesting harness would actually see. `null` falls
+  /// back to the tab's display name (Phase C's rule), so the placeholder states
+  /// the effective value rather than leaving the field looking unset.
+  const effectiveBackendName = $derived((backend.name ?? '').trim() || tabName);
+
+  async function setRole(next: DelegationRole): Promise<void> {
+    if (busy || next === role || driven) return;
+    busy = true;
+    err = null;
+    try {
+      const change = await tabSetDelegationRole(tab, next);
+      if (change.displaced) {
+        // Locked decision 8: the losing tab may not be visible, and a role that
+        // moved silently is a `delegate_task_*` tool that started driving a
+        // different tab with nothing on screen saying so.
+        const lostName =
+          manualHolder && manualHolder.id === change.displaced
+            ? manualHolder.name
+            : change.displaced;
+        showToast(displacedToast(lostName, harness, tabName), 6000);
+      }
+    } catch (e) {
+      // In the popover, not only the console: the radio would otherwise appear
+      // to have taken while the tab holds no role at all. The backend's refusal
+      // names its own condition (a reserved dashboard, a non-AI tab, a harness
+      // with no input profile) and is shown VERBATIM — a generic sentence in its
+      // place would drop the only part the user can act on.
+      err = String(e);
+    } finally {
+      busy = false;
+    }
+  }
 
   async function setAccess(next: TabAccess): Promise<void> {
     if (busy || next === access || driven) return;
@@ -78,8 +162,38 @@
           : `“${tabName}” accepts your keyboard again.`,
       );
     } catch (e) {
-      // Say it in the popover, not only in the console: the radio would
-      // otherwise appear to have taken while the tab still accepts keys.
+      err = String(e);
+    } finally {
+      busy = false;
+    }
+  }
+
+  /// Persist one Remote-offload knob through the ordinary settings save. The
+  /// store applies optimistically and rolls back on refusal, so there is no
+  /// second copy of the value here to drift.
+  async function patchBackend(patch: Partial<DelegationBackend>): Promise<void> {
+    err = null;
+    try {
+      await applySettings(withTabBackend($settings, tab, patch));
+    } catch (e) {
+      err = String(e);
+    }
+  }
+
+  async function takeOver(): Promise<void> {
+    if (busy) return;
+    busy = true;
+    err = null;
+    try {
+      const wasRunning = await delegationTakeOver(tab);
+      showToast(
+        wasRunning
+          ? `You took “${tabName}” back. The driver was told the delegation was cancelled; the worker keeps running — cImp sends it no keys.`
+          : `“${tabName}” was not being driven any more — the delegation had already finished.`,
+        6000,
+      );
+      onDismiss();
+    } catch (e) {
       err = String(e);
     } finally {
       busy = false;
@@ -124,6 +238,126 @@
   <div class="state">{glyph.title}</div>
 
   <div class="separator"></div>
+  <div class="head">Role</div>
+  <ul class="choices">
+    <li>
+      <label class:disabled={driven || busy}>
+        <input
+          type="radio"
+          name="delegation-role-{tab}"
+          checked={role === 'none'}
+          disabled={driven || busy}
+          onchange={() => void setRole('none')}
+        />
+        <span class="name">None</span>
+      </label>
+    </li>
+    <li>
+      <label class:disabled={driven || busy}>
+        <input
+          type="radio"
+          name="delegation-role-{tab}"
+          checked={role === 'manual'}
+          disabled={driven || busy}
+          onchange={() => void setRole('manual')}
+        />
+        <span class="name">Manual — the {harnessLabel(harness)} delegation target</span>
+      </label>
+    </li>
+    <li>
+      <label class:disabled={driven || busy}>
+        <input
+          type="radio"
+          name="delegation-role-{tab}"
+          checked={role === 'remote_offload'}
+          disabled={driven || busy}
+          onchange={() => void setRole('remote_offload')}
+        />
+        <span class="name">Remote offload — a backend the router may pick</span>
+      </label>
+    </li>
+  </ul>
+  <!--
+    Locked decision 8's move rule, said BEFORE the click. A radio whose group
+    spans tabs is not something a user can see, so the one fact that makes the
+    click predictable — it moves the role off that tab rather than being refused
+    — has to be written down here.
+  -->
+  {#if manualHolder && role !== 'manual'}
+    <small class="hint">
+      Manual for {harnessLabel(harness)} is on “{manualHolder.name}”. Choosing it
+      here moves it — that tab drops to None.
+    </small>
+  {:else if role === 'manual'}
+    <small class="hint">
+      <code>delegate_task_{harness}</code> drives this tab. Other tabs see the tool
+      on their next turn; nothing restarts.
+    </small>
+  {/if}
+
+  {#if role === 'remote_offload'}
+    <!--
+      The facade's knobs (decision 8). They live on the tab, next to the role,
+      because there is no "add backend" step — Phase C SYNTHESIZES the backend
+      entry from this row, so there is no second place that can disagree.
+    -->
+    <div class="knobs">
+      <label class="field">
+        <span>Backend name</span>
+        <input
+          type="text"
+          value={backend.name ?? ''}
+          placeholder={tabName}
+          disabled={busy}
+          onchange={(e) => {
+            const v = (e.currentTarget as HTMLInputElement).value.trim();
+            void patchBackend({ name: v.length > 0 ? v : null });
+          }}
+        />
+      </label>
+      <small class="hint">
+        What the requesting harness sees — never the tab. Empty falls back to the
+        tab name (“{effectiveBackendName}”).
+      </small>
+      <label class="field">
+        <span>Tier</span>
+        <select
+          value={backend.tier}
+          disabled={busy}
+          onchange={(e) =>
+            void patchBackend({
+              tier: (e.currentTarget as HTMLSelectElement).value as DelegationBackend['tier'],
+            })}
+        >
+          <option value="fast">fast</option>
+          <option value="quality">quality</option>
+        </select>
+      </label>
+      <label class="field">
+        <span>Declared context</span>
+        <input
+          type="number"
+          min="0"
+          step="1024"
+          value={backend.declared_context ?? ''}
+          placeholder="(a generous default)"
+          disabled={busy}
+          onchange={(e) => {
+            const raw = (e.currentTarget as HTMLInputElement).value.trim();
+            const n = Math.max(0, Math.round(Number(raw) || 0));
+            void patchBackend({ declared_context: raw.length > 0 && n > 0 ? n : null });
+          }}
+        />
+      </label>
+      <small class="hint">
+        Tokens this worker can actually use. Under-declared and the router sends
+        it away from work it could have done; over-declared and it fails visibly,
+        in its own tab.
+      </small>
+    </div>
+  {/if}
+
+  <div class="separator"></div>
   <div class="head">Access</div>
   <ul class="choices">
     <li>
@@ -155,26 +389,34 @@
       hiding the radio: a control that vanishes reads as "there is no such
       setting", and the user's next move is to go looking for it. Take over is
       how this one ends — a radio button never lifts a lock a delegation owns.
-      Nothing sets `driven` in Phase A; the markup exists so Phase B wires an
-      engine to a UI that already says the right thing.
     -->
-    {#if driven}
+    {#if inFlight}
       <li>
         <label class="disabled">
           <input type="radio" name="delegation-access-{tab}" checked disabled />
-          <span class="name">Read-only (driven by {driverName?.trim() || 'another tab'})</span>
+          <span class="name">Read-only (driven by {inFlight.driver_name || 'another tab'})</span>
         </label>
       </li>
     {/if}
   </ul>
 
-  {#if driven}
+  {#if inFlight}
+    <div class="state driven-line">
+      {attributionLine(inFlight.driver_agent, inFlight.driver_name)}
+      {#if inFlight.awaiting_prompt}
+        <br />This tab is waiting for your permission — the keyboard is relaxed for
+        the prompt, and the driver's wait was extended once.
+      {/if}
+    </div>
     <div class="row">
-      <!-- Phase B: cancels the delegation, leaves the worker running. -->
-      <button type="button" class="entry" disabled title="Available in a later phase">
+      <button type="button" class="entry" disabled={busy} onclick={() => void takeOver()}>
         Take over (cancel delegation)
       </button>
     </div>
+    <small class="hint">
+      Stops cImp waiting and unlocks your keyboard. The worker is sent nothing —
+      no Escape, no interrupt — so it finishes its turn visibly.
+    </small>
   {/if}
 
   {#if err}
@@ -205,8 +447,21 @@
     color: var(--text-secondary);
     line-height: 1.4;
   }
+  /* The attribution line, in the popover's own voice: it is the one piece of
+     text here that describes what is happening RIGHT NOW rather than what is
+     configured. */
+  .driven-line {
+    color: var(--accent);
+  }
   .err {
     color: var(--text-danger-soft);
+  }
+  .hint {
+    display: block;
+    padding: 0 var(--space-3) 6px;
+    font-size: var(--font-size-sm);
+    color: var(--text-tertiary);
+    line-height: 1.35;
   }
   .choices {
     margin: 0;
@@ -237,6 +492,33 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  .knobs {
+    padding: 0 var(--space-3);
+  }
+  .field {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    padding: 2px 0;
+    font-size: var(--font-size-sm);
+    color: var(--text-secondary);
+  }
+  .field > span {
+    flex: 0 0 auto;
+    min-width: 106px;
+  }
+  .field input,
+  .field select {
+    flex: 1 1 auto;
+    min-width: 0;
+    background: var(--surface-2);
+    color: var(--text-primary);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-sm);
+    padding: 2px 4px;
+    font-family: inherit;
+    font-size: var(--font-size-sm);
   }
   .row {
     display: flex;

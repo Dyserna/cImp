@@ -3,7 +3,10 @@
   import TabContextMenu from './TabContextMenu.svelte';
   import TaintMenu from './TaintMenu.svelte';
   import DelegationPopover from './DelegationPopover.svelte';
-  import { accessOf, glyphState, hasCommIcon } from './delegation';
+  import { accessOf, backendOf, glyphState, hasCommIcon, manualHolderFor, roleOf } from './delegation';
+  import { delegationInFlight } from './delegationState';
+  import { delegationTakeOver } from './ipc';
+  import { showToast } from './toast';
   import {
     fetchLatchStatus,
     injectionStatus,
@@ -105,6 +108,35 @@
   const commMenuName = $derived(
     (commMenu ? $tabs.find((m) => m.id === commMenu?.tab)?.name : null) ?? commMenu?.tab ?? '',
   );
+  /// V39 Phase B. All four DERIVED, never copied at click time (M-22): a role
+  /// the user just moved, a flight that just ended, and a Manual holder that
+  /// just changed all have to reach an open popover — it is the surface whose
+  /// entire job is to say what is in force right now.
+  const commMenuRole = $derived(commMenu ? roleOf($settings, commMenu.tab) : 'none');
+  const commMenuBackend = $derived(
+    commMenu ? backendOf($settings, commMenu.tab) : { name: null, tier: 'quality' as const, declared_context: null },
+  );
+  const commMenuInFlight = $derived(commMenu ? ($delegationInFlight[commMenu.tab] ?? null) : null);
+  const commMenuManualHolder = $derived(commMenu ? manualHolderFor($settings, commMenu.tab) : null);
+
+  /// Locked decision 6's mirror: "Take over" is also on the tab context menu so
+  /// it is reachable without finding the glyph. Role and access stay in the
+  /// popover — one control surface — but ENDING a delegation someone else
+  /// started must not require a hunt.
+  async function onTakeOver(tab: TabId): Promise<void> {
+    const name = $tabs.find((m) => m.id === tab)?.name ?? tab;
+    try {
+      const wasRunning = await delegationTakeOver(tab);
+      showToast(
+        wasRunning
+          ? `You took “${name}” back. The driver was told the delegation was cancelled; the worker keeps running — cImp sends it no keys.`
+          : `“${name}” was not being driven any more — the delegation had already finished.`,
+        6000,
+      );
+    } catch (e) {
+      showToast(`Take over failed: ${String(e)}`, 6000);
+    }
+  }
 
   /// Open the communication popover, closing anything else that is open — two
   /// popovers anchored at neighbouring glyphs would overlap.
@@ -390,7 +422,14 @@
             protection={tabProtectionRows($injectionStatus, id)}
             ontaint={(e) => onTaintBadge(id, latchRow, e)}
             comm={hasCommIcon($settings, id)
-              ? glyphState({ role: 'none', access: accessOf($settings, id), inFlight: false })
+              ? glyphState({
+                  role: roleOf($settings, id),
+                  access: accessOf($settings, id),
+                  inFlight: $delegationInFlight[id] !== undefined,
+                  driverName: $delegationInFlight[id]?.driver_name ?? null,
+                  driverAgent: $delegationInFlight[id]?.driver_agent ?? null,
+                  backendName: backendOf($settings, id).name,
+                })
               : null}
             oncomm={(e) => onCommGlyph(id, e)}
             bind:renaming={
@@ -487,6 +526,7 @@
     onClose={t ? () => onCloseTab(t.id) : undefined}
     onNewWorktreeTab={t && !isShell && !isPreview ? () => openNewWorktreeTabDialog(t.id, pane.id) : undefined}
     onNewPreviewTab={onNewPreviewTabAction}
+    onTakeOver={t && $delegationInFlight[t.id] ? () => void onTakeOver(t.id) : undefined}
     onDismiss={dismissMenu}
   />
 {/if}
@@ -502,6 +542,10 @@
     tab={commMenu.tab}
     tabName={commMenuName}
     access={commMenuAccess}
+    role={commMenuRole}
+    backend={commMenuBackend}
+    inFlight={commMenuInFlight}
+    manualHolder={commMenuManualHolder}
     onDismiss={() => (commMenu = null)}
   />
 {/if}

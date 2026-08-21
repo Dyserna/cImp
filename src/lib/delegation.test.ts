@@ -13,6 +13,7 @@ import {
   isTerminalReply,
   manualHolderFor,
   readOnlyExempt,
+  readOnlyAdvice,
   readOnlyReason,
   readOnlyRefusalMessage,
   roleOf,
@@ -354,6 +355,49 @@ describe('writeLocalEcho', () => {
   });
 });
 
+/// **Locked decision 2a, as a structural guard.** The attribution is
+/// client-side display: the worker model receives the task verbatim, with no
+/// header and no marker, so a path from any of this text to the backend would
+/// be the one defect 2a exists to prevent. A behavioural test can only show
+/// that TODAY's helper does not call `invoke`; this shows the module has no way
+/// to. Raw-source mechanism per `activity.test.ts`'s StatusChip scan: Vite's
+/// glob, not node:fs.
+const DELEGATION_SOURCE = import.meta.glob('/src/lib/delegation.ts', {
+  query: '?raw',
+  import: 'default',
+  eager: true,
+}) as Record<string, string>;
+
+describe('the attribution never reaches the backend', () => {
+  it('leaves delegation.ts with no transport at all', () => {
+    const src = Object.values(DELEGATION_SOURCE)[0] ?? '';
+    expect(src.length).toBeGreaterThan(0);
+    // Strip comments first: `pty_write` and `invoke` are NAMED in the doc
+    // comments on purpose (they say what must not happen), and a scan that
+    // could not tell prose from code would either fail on the documentation or
+    // force it to be deleted.
+    const code = src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+    expect(code).not.toMatch(/\binvoke\s*[<(]/);
+    expect(code).not.toMatch(/\bpty_write\b/);
+    expect(code).not.toMatch(/from '\.\/ipc'/);
+    expect(code).not.toMatch(/from '@tauri-apps/);
+  });
+
+  it('writes the echo through the passed terminal and nowhere else', () => {
+    // The helper takes its target as an argument, so there is no module-level
+    // handle it could reach for instead.
+    const calls: string[] = [];
+    const target = {
+      writeln(d: string) {
+        calls.push(d);
+      },
+    };
+    writeLocalEcho(target, 'opencode', 'api-work');
+    expect(calls).toHaveLength(1);
+    expect(Object.keys(target)).toEqual(['writeln']);
+  });
+});
+
 describe('elapsedLabel', () => {
   it('counts seconds under a minute', () => {
     expect(elapsedLabel(1_000, 1_000)).toBe('0s');
@@ -444,6 +488,23 @@ describe('roles', () => {
     expect(displacedToast('api-work', 'claude', 'review')).toBe(
       '\u201capi-work\u201d is no longer the Manual Claude Code tab \u2014 moved to \u201creview\u201d.',
     );
+  });
+});
+
+describe('readOnlyAdvice', () => {
+  /// The two locks end differently, so they must not give the same advice: the
+  /// Access radio is DISABLED for the whole flight, and Take over is what ends
+  /// one.
+  it('sends a driven tab to Take over, not to the access radio', () => {
+    const advice = readOnlyAdvice('tab `claude` is driven by api-work');
+    expect(advice).toContain('Take over');
+    expect(advice).not.toContain('allow input again');
+  });
+
+  it('sends a user-locked tab to the glyph', () => {
+    const advice = readOnlyAdvice('tab `claude` is read-only (user)');
+    expect(advice).toContain('allow input again');
+    expect(advice).not.toContain('Take over');
   });
 });
 

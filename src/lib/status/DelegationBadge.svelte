@@ -1,18 +1,20 @@
 <script lang="ts">
-  // V39 Phase A — the `delegation` chip in the status bar's security section.
+  // V39 — the `delegation` chip in the status bar's security section.
   //
-  // Counts the tabs whose keyboard is currently refused. Hidden at zero: the
-  // states it reports are transient, and a permanent "RO 0" in an already busy
-  // bar is noise. It is NOT a toggle — unlike the sandbox chips, there is no
-  // single global switch it could flip; the lock is per tab and is set from the
-  // tab's own ⇄ glyph, which is what the tooltip says.
+  // Counts the tabs another harness is driving RIGHT NOW (Phase B; Phase A
+  // counted read-only tabs, which was the placeholder its own comment said it
+  // was). Hidden at zero: a delegation is transient, and a permanent "DLG 0" in
+  // an already busy bar is noise. It is NOT a toggle — there is no global
+  // switch it could flip; a flight ends from the driven tab's own ⇄ popover
+  // or its context menu, which is what the tooltip says.
   //
   // The count itself is derived in `delegationChip.ts` (pure, tested), for the
   // reason that file's header gives.
   import { settings } from '../settings/store';
+  import { delegationInFlight } from '../delegationState';
   import { delegationChipState } from './delegationChip';
 
-  const chip = $derived(delegationChipState($settings));
+  const chip = $derived(delegationChipState($delegationInFlight, $settings));
 </script>
 
 {#if chip.visible}

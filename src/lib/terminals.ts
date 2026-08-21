@@ -78,7 +78,12 @@ import { perTabClosedState } from './avatarState';
 import { openConfigureTabDialog } from './dialog/store';
 import { clearTabError, setTabError } from './tabs/errorState';
 import { isShellTab, isAppRenderedTab, type TabId } from './tabs/types';
-import { readOnlyExempt, readOnlyReason, readOnlyRefusalMessage } from './delegation';
+import {
+  readOnlyAdvice,
+  readOnlyExempt,
+  readOnlyReason,
+  readOnlyRefusalMessage,
+} from './delegation';
 import { showToast } from './toast';
 
 /// V39 Phase A: when each tab last told the user its keyboard is locked.
@@ -96,7 +101,10 @@ function noteReadOnlyRefusal(tabId: TabId, message: string): void {
   const last = lastReadOnlyToastAt.get(tabId) ?? 0;
   if (now - last < READ_ONLY_TOAST_GAP_MS) return;
   lastReadOnlyToastAt.set(tabId, now);
-  showToast(`${message} Use the ⇄ icon on the tab to allow input again.`);
+  // V39 Phase B: the ADVICE follows the reason. A tab refused because a
+  // delegation is driving it is not unlocked by the access radio — pointing
+  // its owner there would name a disabled control (`readOnlyAdvice`).
+  showToast(`${message} ${readOnlyAdvice(message)}`);
 }
 
 const OFFSCREEN_ID = 'terminal-offscreen';

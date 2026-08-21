@@ -24,6 +24,7 @@
   import { closeTab as closeTabIpc } from './lib/ipc';
   import { showToast } from './lib/toast';
   import { startLatchPolling } from './lib/latch';
+  import { initDelegation } from './lib/delegationState';
   import {
     seedPerTabEntries,
     startAvatarStateListener,
@@ -208,6 +209,11 @@
       // AppHandle to emit from — and the read is an in-process mutex over a
       // handful of entries, so the cost is nil.
       stopLatchPoll = startLatchPolling();
+      // V39 Phase B: mirror the in-flight delegation set. Evented, not polled —
+      // the engine holds an AppHandle and publishes the whole set on every edge
+      // — plus one opening pull, so a window that starts mid-flight paints the
+      // driven glyph and the worker's banner before the next edge arrives.
+      void initDelegation();
       // V6-01: register the STT event listeners (state + transcript →
       // compose overlay). Idempotent; safe even when STT is disabled —
       // the backend simply never emits until the user records.

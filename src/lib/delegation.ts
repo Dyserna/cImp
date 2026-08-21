@@ -388,6 +388,25 @@ export function writeLocalEcho(
   term.writeln(`\r\n\x1b[2;3m${attributionLine(driverAgent, driverName)}\x1b[0m`);
 }
 
+/// The follow-up sentence a read-only refusal toast carries.
+///
+/// **The two locks do not end the same way, so they must not give the same
+/// advice.** A user lock is lifted by the Access radio in the ⇄ popover. The
+/// ENGINE's lock is not: a radio never lifts a lock a delegation owns (locked
+/// decisions 4 and 6) — that radio is disabled for the whole flight, and "Take
+/// over" is the control that ends it. Sending a driven tab's owner to the radio
+/// would point them at a disabled control and say nothing about the flight they
+/// are actually waiting on.
+///
+/// Keyed on the refusal MESSAGE (the backend's own sentence, which names the
+/// driving tab) rather than on a second lookup, so the advice cannot disagree
+/// with the reason it is appended to.
+export function readOnlyAdvice(message: string): string {
+  return /\bdriven by /.test(message)
+    ? 'Take over from the tab’s ⇄ popover or its context menu — the worker is never sent any keys.'
+    : 'Use the ⇄ icon on the tab to allow input again.';
+}
+
 /// This tab's persisted delegation role, read from the settings mirror.
 /// A tab with no AI config has no role — `'none'`, never a guess.
 export function roleOf(settings: Settings, tabId: string): DelegationRole {

@@ -59,22 +59,36 @@ adds the **read-only tab mode** that makes a driven tab safe to leave open.
    does not survive a scrollback re-seed on tab rebind; the banner and the
    Events row do.)
 3. **Two driver modes, one engine:**
-   - **Explicit (user-initiated):** a new proxy tool `delegate_task`
-     (`target`, `task`, `context?`, `timeout_s?`) on the single
-     `cimp-offload` server. Its description names the currently available
-     worker tabs (live, via `GET /describe`, like `offload_task`) and states
-     it is for **user-directed** delegation only. The pinned description
-     opens with this contract (a test asserts the sentence is present):
-     > *Hand a task to another open harness tab and return its answer.
+   - **Explicit (user-initiated): one proxy tool per worker harness,**
+     `delegate_task_<harness-id>` — `delegate_task_claude`,
+     `delegate_task_opencode`, and one more for every future harness — on the
+     single `cimp-offload` server. Arguments: `task`, `context?`,
+     `timeout_s?`, and `target_tab?` (a tab name, required only when more
+     than one tab of that harness is an eligible target; omitted → the single
+     eligible tab, else a refusal listing the candidates). The tool **set**
+     is generated from the registry's harness ids (`harness/contract.rs`
+     `Harness`, the CHP `agent` discriminator) — a tool exists iff that
+     harness has ≥1 eligible target tab for this consumer — so the engine
+     names no harness literal, and the tool list itself tells the model
+     which harnesses are available right now. There is deliberately **no
+     generic `delegate_task`**: one way to do it. *Why per-harness:* the
+     user delegates *to a harness* ("send this to Claude Code"), and a model
+     selects a tool by name far more reliably than it fills an enum argument.
+     Each description names that harness's currently eligible tabs (live,
+     via `GET /describe`, like `offload_task`) and is for **user-directed**
+     delegation only. The pinned description opens with this contract (a
+     test asserts the sentence is present for every generated tool):
+     > *Hand a task to an open <Harness name> tab and return its answer.
      > Call this ONLY when the user explicitly asked for a task to be
-     > delegated to another tab or harness (e.g. "send this to Claude Code",
-     > "use the OpenCode tab for this"). Never call it on your own
-     > initiative — for work you decide to offload yourself, use
+     > delegated to <Harness name> or to a specific tab (e.g. "send this to
+     > Claude Code", "use the OpenCode tab for this"). Never call it on your
+     > own initiative — for work you decide to offload yourself, use
      > `offload_task`, which you may call automatically whenever you judge
      > it useful.*
-     The two tools are thereby distinguished by **who decides**: the user
-     (`delegate_task`) vs the harness (`offload_task`, including facade
-     backends). The requesting harness sees a harness tab, by name.
+     The tools are thereby distinguished from `offload_task` by **who
+     decides**: the user (`delegate_task_*`) vs the harness (`offload_task`,
+     including facade backends). The requesting harness sees a harness, and
+     within it a tab by name.
    - **Facade (automatic):** a worker tab registered as a **third offload
      backend kind**, `OffloadBackendKind::HarnessTab { tab }`. It appears in
      `offload_task`'s backend prose under a **user-chosen backend name**
@@ -126,9 +140,10 @@ adds the **read-only tab mode** that makes a driven tab safe to leave open.
 8. **Opt-in per tab, both directions.** A tab is a valid target only if the
    user enabled it: `AiToolTabConfig.delegation_target: bool` (explicit
    mode) and/or a `HarnessTab` backend entry referencing it (facade mode).
-   Neither the `delegate_task` tool nor the facade backend exists for a tab
+   Neither a `delegate_task_*` tool nor the facade backend exists for a tab
    the user did not mark. A tab with no target tabs configured does not get
-   `delegate_task` in `tools/list` at all (no dead tool).
+   any `delegate_task_*` tool in `tools/list` at all (no dead tool); a harness
+   with no eligible tab gets no tool either.
 9. **One delegation per worker at a time; no nesting by default.** A worker
    is single-slot (`slots = 1`, in-flight tracked like `RemoteBackend`);
    a second request gets the router's "no free slot" / the explicit tool's
@@ -169,7 +184,7 @@ adds the **read-only tab mode** that makes a driven tab safe to leave open.
     (start / done / refused / timeout / cancelled / takeover / worker-exited),
     each row naming driver tab, worker tab, mode, and duration. The Tools
     tab's existing per-call logging gets `delegation` as a tool class.
-15. **No new spawn-baked setting.** `delegate_task` rides the child proxy's
+15. **No new spawn-baked setting.** the `delegate_task_*` set rides the child proxy's
     live `tools/list` (+ V37 `list_changed` pulse); the facade rides
     `offload_task`'s live description. Toggling a target or adding a facade
     backend takes effect on the next turn without restarting either tab.
@@ -245,11 +260,14 @@ adds the **read-only tab mode** that makes a driven tab safe to leave open.
 
 ### Explicit tool
 
-- `offload/mcp.rs` `tools/list`: `delegate_task` appended when the consumer's
-  tab has ≥1 enabled target tab other than itself; description lists
-  targets by tab name + harness kind, rendered live from `GET /describe`.
-- `target` resolves by exact tab name, then by harness kind when exactly one
-  target of that kind exists; ambiguity → refusal listing candidates.
+- `offload/mcp.rs` `tools/list`: one `delegate_task_<id>` per harness id that
+  has ≥1 eligible target tab other than the consumer's own tab; each
+  description lists that harness's eligible tabs by name, rendered live from
+  `GET /describe`. Dispatch matches the `delegate_task_` prefix and resolves
+  the harness id from the suffix via the registry (no literal match arms).
+- `target_tab` resolves by exact tab name within the tool's harness; omitted
+  with exactly one eligible tab → that tab; omitted with several → refusal
+  listing candidates.
 - Result shape mirrors `offload_task` (text + meta: worker, duration,
   screening verdict) so harness-side guidance needs no special casing.
 
@@ -294,7 +312,7 @@ adds the **read-only tab mode** that makes a driven tab safe to leave open.
   completion as usual.
 - **Worker replies with injection**: screened (decision 11); a blocking
   verdict returns the V32 refusal envelope, not the text.
-- **Model invokes `delegate_task` unprompted**: the description restricts it
+- **Model invokes a `delegate_task_*` tool unprompted**: the description restricts it
   to user-directed use, and the tab glyph + Events row make every use
   visible. Accepted residual — same class as any tool the model may
   over-call; the opt-in per target bounds the blast radius.
@@ -327,7 +345,7 @@ adds the **read-only tab mode** that makes a driven tab safe to leave open.
   *(Independently shippable; useful on its own.)*
 - **B — Engine + explicit tool**: `delegation/` module, preflight, write +
   completion correlation for both harnesses, screening, Events lane,
-  `delegate_task` in the proxy, `driven`/`exposed` glyph states, take-over.
+  the generated `delegate_task_*` set in the proxy, `driven`/`exposed` glyph states, take-over.
   Plus the plugin-layer half: `InputProfile` for Claude and OpenCode, the
   `delegation.worker` (Any) and `*.input.profile` registry rows, their L2
   probes, the `CAP_DELEGATION_WORKER` gate + frontend mirror, MAINTENANCE.md
@@ -358,9 +376,9 @@ adds the **read-only tab mode** that makes a driven tab safe to leave open.
 7. Timeout: `default_timeout_s=30` against a long task → `timeout`, worker
    finishes visibly, no keys sent.
 8. Manual read-only survives app restart; `Driven` does not.
-9. Toggle a target off → `delegate_task` gone next turn without a restart;
+9. Toggle the only Claude target off → `delegate_task_claude` gone next turn without a restart;
    spawn_inject_sig unchanged (test + the save-time restart hint must NOT
    fire).
 10. Gate: break a harness's input profile probe (or point a tab at a harness
-    dir without `input.rs`) → the tab is absent from `delegate_task`'s target
-    list and from the facade router, and preflight names the gate reason.
+    dir without `input.rs`) → the tab is absent from its `delegate_task_*` target
+    list (the tool vanishes if it was the last) and from the facade router, and preflight names the gate reason.

@@ -127,7 +127,12 @@ adds the **read-only tab mode** that makes a driven tab safe to leave open.
    is waiting for your permission") fires through the existing notifications
    path. *Why:* answering a prompt the worker addressed to the user is not
    "using the tab by mistake" — it is the only way the delegation completes.
-   The lock re-engages on `PermissionPromptResolved`.
+   The lock re-engages on `PermissionPromptResolved`. **The deadline does
+   not stall:** a prompt *rising edge* buys one bounded grant
+   (`PROMPT_GRACE` = 5 min, B1 decision) — a standing prompt polled 50× moves
+   the deadline once (test-pinned). Notification = the existing
+   `AwaitingPermissionChanged` announcement (no delegation-specific wording;
+   it would double-announce).
 6. **Take-over is always available.** The popover (decision 7) and, as a
    mirror, the tab context menu offer "Take over (cancel delegation)" on a
    driven tab: the engine stops waiting, the driver
@@ -192,9 +197,14 @@ adds the **read-only tab mode** that makes a driven tab safe to leave open.
     for the reply). The attribution (2a) is client-side display only;
     nothing typed into the worker is used as a correlation marker — the task
     text is typed verbatim.
-11. **Reply goes through V32 screening.** The worker's text is wrapped by
-    `detection::wrap_external_result` (`offload/detection/mod.rs:695`) with
-    the worker tab named as the source before it is returned to the driver —
+11. **Reply goes through V32 screening — and the call rides the V32 taint
+    latch.** The worker's text is wrapped by `detection::wrap_external_result`
+    (`offload/detection/mod.rs:695`) under the name `delegation__<worker tab
+    id>` (a bare tab name could collide with a trusted tool name and dodge
+    the screen) before it is returned to the driver; and a *latched*
+    (injection-flagged) driver tab is refused at `/delegate` exactly as it is
+    at `offload_task` (V32 C-1c) — a user-directed hand-off does not launder
+    model-authored task text —
     the same boundary every external tool result crosses. A harness's output
     is model-generated text entering another model's context; it is not
     trusted because it came from a sibling tab.
@@ -203,7 +213,9 @@ adds the **read-only tab mode** that makes a driven tab safe to leave open.
     progress, no pending permission/question prompt); has an empty input
     line (no partial user-typed text per `note_typed_input`); and has a
     completion signal available (`chp::served(agent, tab, EV_ASSISTANT_TEXT)`
-    or a live reader). Any failing condition → immediate structured refusal
+    or `harness::reader::has_live_reader(tab)` — OpenCode declares `cannot`
+    for `assistant_text` by design, so its reader IS the normal path). Any
+    failing condition → immediate structured refusal
     naming the condition; the engine never types into a tab it cannot read
     back from. *Why:* an unreadable worker would silently swallow the task.
 13. **Empty is not absent.** A completed turn whose extracted text is
@@ -215,7 +227,7 @@ adds the **read-only tab mode** that makes a driven tab safe to leave open.
     filter from the feed — the kind shows up by itself) and persist across
     restarts. One row per transition, the `offload_server` convention:
     `tool` = the transition (`start` / `done` / `refused` / `timeout` /
-    `cancelled` / `takeover` / `worker_exited`), `target` = the worker tab
+    `takeover` / `worker_exited` / `role_moved`; `cancelled` reserved), `target` = the worker tab
     name (+ reason on refusals), `source` = the driver harness, attribution
     = the driver tab, `ok` = outcome, `ms` = flight time, `request`/`response`
     = the verbatim task and the screened reply (`done` rows only). Needs its
@@ -374,9 +386,10 @@ adds the **read-only tab mode** that makes a driven tab safe to leave open.
   unlocks + notifies; the deadline still runs; on timeout the driver gets
   `timeout (worker awaiting permission)` and the prompt is left standing —
   never auto-answered.
-- **Driver tab closes while waiting**: the worker continues visibly; the
-  reply is dropped with a `done (driver gone)` row; lock clears on
-  completion as usual.
+- **Driver tab closes while waiting**: the worker continues visibly; a
+  normal `done` row is minted (the reply survives in the row's `response`)
+  but nothing receives it — the child's HTTP connection died with the tab;
+  lock clears on completion as usual.
 - **Worker replies with injection**: screened (decision 11); a blocking
   verdict returns the V32 refusal envelope, not the text.
 - **Model invokes a `delegate_task_*` tool unprompted**: the description restricts it
@@ -468,3 +481,34 @@ adds the **read-only tab mode** that makes a driven tab safe to leave open.
     Manual → A drops to None with a toast + Events row; the popover on A
     names B; `delegate_task_claude` now drives B. Setting B to Remote offload
     while Manual → it is Remote only (never both).
+
+## Implementation record (B1 — backend, 2026-08-21/22)
+
+Commits `6f73787..80b640f` + follow-ups. Facts that refine the design above:
+- **Prompt-state mirror** = `state::TabActivity` (the `ReadOnlyTabs` shape:
+  shared map in `AppState`, one writer — a `note_signal` fold at the top of
+  the state-manager loop, ahead of every `continue`). Fields
+  `awaiting_permission`, `awaiting_question`, `output_running`, `exited`.
+- **Wait loop** = one 200 ms poll over completion / prompt edge / take-over /
+  process liveness / deadline — not four subscriptions.
+- **Input profiles** (`harness/<id>/input.rs`): bracketed paste for both
+  (mode 2004 verified passed through in `terminals.ts`); `settle_ms` Claude
+  150 / OpenCode 80 and `max_paste_bytes` 64 KiB are floors, NOT
+  measurements; "one paste = one turn" is UNVERIFIED → rows sit in
+  `probe::DECLARED_UNPROBED` with waivers, and the gate reads a new spike
+  field `harness_versions.input_profile_status` via `spike_status_blocks`
+  (opt-in until proven broken; `"fail"` removes every `delegate_task_*` and
+  refuses preflight). Live-verify 1 & 2 are the spike.
+- **Tool set is generated child-side** from live settings per `tools/list`
+  (no `/describe` analogue needed — no app-only health to fetch). Role
+  changes reach the V37 pulse through a new `delegation_sig` component of
+  `graph::SurfaceFingerprint` (Manual set + gate verdict).
+- **Task composition** = `task` or `task + "\n\n" + context`; the blank line
+  is the only non-caller byte.
+- **IPC/event surface**: `tab_set_delegation_role(tab, role) → {tab, role,
+  displaced}`, `delegation_take_over(tab) → bool`, `delegation_status(tab)`,
+  `delegation_statuses()`, Tauri event `delegation-changed` carrying a full
+  `in_flight` snapshot (`InFlightView { driver, driver_name, driver_agent,
+  mode, started_ms, awaiting_prompt }`); `HarnessVersions.input_profile_status`;
+  `CAP_DELEGATION_WORKER = "delegation.worker"`. Health panel gained a
+  `Cross-harness` panel for the first `Harness::Any` row.

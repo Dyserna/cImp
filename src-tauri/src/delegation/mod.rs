@@ -193,6 +193,14 @@ struct InFlight {
     submit_ms: Option<u64>,
     /// Set by [`take_over`]. The wait loop notices and ends as `cancelled`.
     taken_over: bool,
+    /// Set by [`note_worker_gone`] when the worker TAB is closed.
+    ///
+    /// A separate flag from the state mirror's `exited`, and it has to be:
+    /// closing a tab drops its mirror row (`TabActivity::forget`), so the
+    /// mirror's answer for a closed tab is "nothing observed" — indistinguish-
+    /// able from a healthy idle tab. Without this the wait loop would sit out
+    /// the whole deadline on a tab that no longer exists.
+    worker_gone: bool,
     /// Mirrors "a prompt is standing on the worker right now", so the status
     /// view can say *why* a long flight is long without re-reading the state
     /// mirror.
@@ -385,6 +393,7 @@ fn claim(
                 deadline_ms,
                 submit_ms: None,
                 taken_over: false,
+                worker_gone: false,
                 awaiting_prompt: false,
             },
         );
@@ -485,6 +494,30 @@ pub fn take_over(worker: &TabId) -> Option<InFlightView> {
 /// Whether the user has taken this delegation over.
 fn is_taken_over(worker: &TabId) -> bool {
     registry(|r| r.in_flight.get(worker).is_some_and(|f| f.taken_over))
+}
+
+/// **The worker tab was closed.** Called from the tab-lifecycle paths, beside
+/// the other per-tab cleanups (`read_only.forget`, the input buffers).
+///
+/// It must be its own signal rather than a read of the state mirror: closing a
+/// tab REMOVES its mirror row, so a closed tab reads as "nothing observed",
+/// which is what a healthy idle tab reads as too. Left to the mirror, a
+/// delegation into a tab the user just closed would wait out its entire
+/// deadline before reporting anything.
+///
+/// A no-op when nothing is in flight, so the lifecycle paths can call it
+/// unconditionally.
+pub fn note_worker_gone(worker: &TabId) {
+    registry(|r| {
+        if let Some(f) = r.in_flight.get_mut(worker) {
+            f.worker_gone = true;
+        }
+    });
+}
+
+/// Whether the worker tab has gone away under this delegation.
+fn is_worker_gone(worker: &TabId) -> bool {
+    registry(|r| r.in_flight.get(worker).is_some_and(|f| f.worker_gone))
 }
 
 /// Fold the worker's current prompt state into the in-flight record, granting
@@ -763,6 +796,28 @@ mod tests {
             assert_eq!(v.driver, driver().as_str());
             assert_eq!(v.driver_name, "the driver");
             assert!(is_taken_over(&worker()));
+        });
+    }
+
+    /// **A closed worker tab is noticed immediately, not at the deadline.**
+    ///
+    /// The state mirror cannot answer this: closing a tab drops its row, so a
+    /// closed tab and a healthy idle one both read as "nothing observed". This
+    /// is the signal that tells them apart.
+    #[test]
+    fn a_closed_worker_tab_is_its_own_signal() {
+        with_clean_registry(|| {
+            note_worker_gone(&worker());
+            assert!(
+                !is_worker_gone(&worker()),
+                "a no-op when nothing is in flight, so the lifecycle paths can call it blind"
+            );
+            claim_one(&worker(), &driver(), 100).expect("claim");
+            assert!(!is_worker_gone(&worker()));
+            note_worker_gone(&worker());
+            assert!(is_worker_gone(&worker()));
+            release(&worker());
+            assert!(!is_worker_gone(&worker()), "released with the slot");
         });
     }
 

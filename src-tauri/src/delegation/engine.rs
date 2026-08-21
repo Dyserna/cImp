@@ -49,8 +49,9 @@ use crate::settings::{Settings, TabConfig};
 use crate::state::TabId;
 
 use super::{
-    chain_from, claim, depth_from, deadline_of, is_driven, is_driving, is_taken_over, mark_submitted,
-    note_prompt, record_row, release, take_completion, transition, DelegationError, DelegationMode,
+    chain_from, claim, deadline_of, depth_from, is_driven, is_driving, is_taken_over,
+    is_worker_gone, mark_submitted, note_prompt, record_row, release, take_completion, transition,
+    DelegationError, DelegationMode,
 };
 
 /// How often the wait loop re-reads the world.
@@ -584,10 +585,20 @@ async fn run_flight(
             )));
         }
 
+        // TWO ways a worker can go away, and they need two checks: the
+        // subprocess exiting (the mirror sees `SubprocessExited`) and the TAB
+        // being closed (which drops the mirror row entirely, so the mirror's
+        // answer becomes indistinguishable from a healthy idle tab — see
+        // `note_worker_gone`).
         let flags = state.tab_activity.flags(worker);
         if flags.exited {
             return Err(DelegationError::WorkerExited(format!(
                 "worker tab `{worker_name}` exited while the task was running"
+            )));
+        }
+        if is_worker_gone(worker) {
+            return Err(DelegationError::WorkerExited(format!(
+                "worker tab `{worker_name}` was closed while the task was running"
             )));
         }
 

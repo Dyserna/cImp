@@ -165,8 +165,8 @@ adds the **read-only tab mode** that makes a driven tab safe to leave open.
    - A tab is never both: the roles are one enum, not two flags.
    A harness whose Manual tab is absent, is the consumer's own tab, or fails
    the worker gate gets no `delegate_task_*` tool (no dead tool). A Remote
-   offload tab that is closed is an unhealthy backend (V37 health rows), not
-   a deleted one — reopening the tab restores it.
+   offload tab that is closed is a not-ready backend, not a deleted one —
+   reopening the tab restores it.
 9. **One delegation per worker at a time; no nesting by default.** A worker
    is single-slot (`slots = 1`, in-flight tracked like `RemoteBackend`);
    a second request gets the router's "no free slot" / the explicit tool's
@@ -203,10 +203,26 @@ adds the **read-only tab mode** that makes a driven tab safe to leave open.
 13. **Empty is not absent.** A completed turn whose extracted text is
     non-substantive (whitespace, or only tool-call scaffolding) is returned
     as `error: worker produced no text` — never as an empty success.
-14. **Every outcome is an Events row** in a new `delegation` lane
-    (start / done / refused / timeout / cancelled / takeover / worker-exited),
-    each row naming driver tab, worker tab, mode, and duration. The Tools
-    tab's existing per-call logging gets `delegation` as a tool class.
+14. **Every outcome is an Events-tab row.** A new `ActivityKind::Delegation`
+    (`"delegation"`) in the unified tool-activity store (`activity.rs`), so
+    rows appear in the **Events tab** (`EventsView.svelte` derives its Kind
+    filter from the feed — the kind shows up by itself) and persist across
+    restarts. One row per transition, the `offload_server` convention:
+    `tool` = the transition (`start` / `done` / `refused` / `timeout` /
+    `cancelled` / `takeover` / `worker_exited`), `target` = the worker tab
+    name (+ reason on refusals), `source` = the driver harness, attribution
+    = the driver tab, `ok` = outcome, `ms` = flight time, `request`/`response`
+    = the verbatim task and the screened reply (`done` rows only). Needs its
+    own retention lane (`kind_cap` → `DELEGATION_CAP`) — a kind without a
+    lane silently falls into the graph lane — a `rowMeta` branch in
+    `EventsView.svelte` (a transition row has no payload; do not print
+    "0 chars"), and the `activity.ts` kind union.
+    **Facade runs produce two rows by design, not one:** the driver side
+    already mints an `offload` row for every completed `offload_task` run
+    regardless of backend kind (`offload/service.rs:1561`, `source` = the
+    backend name, so it reads `lan-worker-2` — the facade holds on the
+    Events tab too); the worker side adds the `delegation` rows. Same split
+    as `offload` vs `offload_server`: the task vs what carried it.
 15. **No new spawn-baked setting.** the `delegate_task_*` set rides the child proxy's
     live `tools/list` (+ V37 `list_changed` pulse); the facade rides
     `offload_task`'s live description. Changing a tab's role takes effect on the next turn without restarting either tab.
@@ -313,8 +329,13 @@ adds the **read-only tab mode** that makes a driven tab safe to leave open.
   request; the worker's own tools do the work). The `schema`/`profile`
   options are honoured by appending the same format instruction the worker
   loop would have used.
-- Health checker (V37) treats a `HarnessTab` backend as healthy iff the tab
-  is open and readable; transitions mint the usual rows.
+- Readiness: `is_ready` is evaluated live from tab state (open + readable);
+  there is no health checker for offload backends — V37's checker and its
+  `mcp_health` rows cover MCP servers only, and today a *remote* offload
+  backend going down mints **no** row at all (`offload_server` lifecycle rows
+  come from the local supervisor alone — pre-existing gap, tracked
+  separately). A `HarnessTab` that is not ready is simply not routed to, and
+  an explicit call against it is a `refused` delegation row naming why.
 
 ### Read-only + UI
 
@@ -390,7 +411,7 @@ adds the **read-only tab mode** that makes a driven tab safe to leave open.
   probes, the `CAP_DELEGATION_WORKER` gate + frontend mirror, MAINTENANCE.md
   drift-table rows.
 - **C — Facade backend**: `HarnessTab` kind synthesized from tab roles,
-  `Backend` impl, router/agent bypass, health integration, the Remote offload
+  `Backend` impl, router/agent bypass, live readiness, the Remote offload
   role + knobs in the popover, read-only listing in the backend editor,
   `remote` glyph state.
 - **D — Live-verify** (fresh tabs not required — decision 15 — but one
@@ -427,7 +448,7 @@ adds the **read-only tab mode** that makes a driven tab safe to leave open.
    fire).
 10. Gate: break a harness's input profile probe (or point a tab at a harness
     dir without `input.rs`) → that harness's `delegate_task_*` tool is absent, its Remote-offload tabs
-    are unhealthy backends, and preflight names the gate reason.
+    are not routed to, and preflight names the gate reason.
 11. One-Manual-per-harness: with Claude tab A Manual, set Claude tab B to
     Manual → A drops to None with a toast + Events row; the popover on A
     names B; `delegate_task_claude` now drives B. Setting B to Remote offload

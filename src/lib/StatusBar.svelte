@@ -16,6 +16,7 @@
   import WorkbenchDiffBadge from './status/WorkbenchDiffBadge.svelte';
   import InjectionBadge from './status/InjectionBadge.svelte';
   import SandboxBadge from './status/SandboxBadge.svelte';
+  import DelegationBadge from './status/DelegationBadge.svelte';
   import { settings } from './settings/store';
 </script>
 
@@ -60,6 +61,7 @@
     <InjectionBadge />
     <SandboxBadge kind="sandbox" />
     <SandboxBadge kind="network" />
+    <DelegationBadge />
     <span class="sep" aria-hidden="true"></span>
     <TabVisibilityButton />
     <SettingsButton />

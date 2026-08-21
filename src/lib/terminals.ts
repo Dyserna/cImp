@@ -78,6 +78,26 @@ import { perTabClosedState } from './avatarState';
 import { openConfigureTabDialog } from './dialog/store';
 import { clearTabError, setTabError } from './tabs/errorState';
 import { isShellTab, isAppRenderedTab, type TabId } from './tabs/types';
+import { isTerminalReply, readOnlyReason, readOnlyRefusalMessage } from './delegation';
+import { showToast } from './toast';
+
+/// V39 Phase A: when each tab last told the user its keyboard is locked.
+///
+/// A refused keystroke is a per-KEY event and the notice is a per-INTENT one:
+/// without this, holding a key down would stack a hundred toasts for one
+/// misunderstanding. First refusal speaks immediately; repeats inside the
+/// window are silent (the input is still refused — only the notice is
+/// throttled).
+const READ_ONLY_TOAST_GAP_MS = 4000;
+const lastReadOnlyToastAt = new Map<TabId, number>();
+
+function noteReadOnlyRefusal(tabId: TabId, message: string): void {
+  const now = Date.now();
+  const last = lastReadOnlyToastAt.get(tabId) ?? 0;
+  if (now - last < READ_ONLY_TOAST_GAP_MS) return;
+  lastReadOnlyToastAt.set(tabId, now);
+  showToast(`${message} Use the ⇄ icon on the tab to allow input again.`);
+}
 
 const OFFSCREEN_ID = 'terminal-offscreen';
 
@@ -954,7 +974,30 @@ export function createTerminal(
       }
       return;
     }
-    ptyWrite(tabId, data).catch((e) => console.error('pty_write failed:', e));
+    // V39 Phase A: the read-only courtesy gate. The lock is enforced in the
+    // backend (`pty_write` refuses with the reason) — this only keeps the
+    // round trip out of the common case and gets the notice in front of the
+    // user on the FIRST refused keystroke rather than the last.
+    //
+    // Terminal protocol replies are exempt for the same reason the backend
+    // exempts them: they are the terminal answering the running program, and a
+    // TUI waiting for a cursor-position report would hang on a swallowed one.
+    const lockReason = readOnlyReason(get(settingsStore), tabId);
+    if (lockReason && !isTerminalReply(data)) {
+      noteReadOnlyRefusal(tabId, `This tab is ${lockReason}.`);
+      return;
+    }
+    ptyWrite(tabId, data).catch((e) => {
+      // …and surface the backend's own refusal if one arrives anyway — the
+      // gate above reads a store that can lag the lock (a tab locked from
+      // another window, or the engine's lock in a later phase).
+      const refusal = readOnlyRefusalMessage(e);
+      if (refusal) {
+        noteReadOnlyRefusal(tabId, refusal);
+        return;
+      }
+      console.error('pty_write failed:', e);
+    });
   });
 
   if (isShellTab(tabId)) {
@@ -1082,6 +1125,8 @@ export function destroyTerminal(tabId: TabId): void {
   const entry = entries.get(tabId);
   if (!entry) return;
   entries.delete(tabId);
+  // V39 Phase A: drop this tab's read-only notice timestamp with it.
+  lastReadOnlyToastAt.delete(tabId);
 
   // Cancel any pending background-toggle recreate so a tab close
   // mid-debounce doesn't resurrect the terminal a few hundred ms

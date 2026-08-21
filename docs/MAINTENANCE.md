@@ -106,7 +106,7 @@ orchestrating session.
 
 | Date | App version | Claude / OpenCode | Outcome |
 |---|---|---|---|
-| 2026-08-04 | v0.49.1 (develop) | 2.1.221 / 1.18.1 | First formalized run. Report: `docs/reviews/maintenance-run-2026-08-04.md` (10 contract-drift items, 8 adoption candidates, bump batches, 9 decisions). Doc split → `ARCHITECTURE.md`; inventory refreshed; ort/MSRV/schema facts corrected. *Verification tail open:* milestone 2 issues #4/#5/#9/#13/#14 (live-verifies) — amend this line when they land. |
+| 2026-08-04 | v0.49.1 (develop) | 2.1.221 / 1.18.1 | First formalized run. Report: `docs/reviews/maintenance-run-2026-08-04.md` (10 contract-drift items, 8 adoption candidates, bump batches, 9 decisions). Doc split → `ARCHITECTURE.md`; inventory refreshed; ort/MSRV/schema facts corrected. *Verification tail closed 2026-08-21:* milestone 2 issues #4/#5/#9/#13/#14 closed by owner decision after three RC cycles of daily use (#13 delivered as V28/V34, #14 shipped `381ddd4`, #5 hook-primary detection `9d969d6`; D0 spike and payload-shape capture left to ambient use). |
 
 Next run due **~2026-09-04** (monthly cadence), or sooner after any visible
 Claude Code / OpenCode update.

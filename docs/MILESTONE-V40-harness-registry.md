@@ -1,4 +1,4 @@
-# V40 — Harness registry (one descriptor drives every harness surface)
+# V40 — Harness registry and the V35 leftovers (everything harness-specific moves behind the plugin)
 
 **Status:** DRAFT for approval (2026-08-21) — implementation not started.
 GitHub: not filed yet (umbrella + phase issues on approval).
@@ -6,8 +6,19 @@ GitHub: not filed yet (umbrella + phase issues on approval).
 the consumer: it is the first harness added *through* this registry, and it
 does not start until V40 is merged, released and the live-verify below is
 green. V40 itself adds no harness and changes no behaviour for Claude Code or
-OpenCode; it is a refactor with one schema migration (35 → 36) and two new
-enforcing tests.
+OpenCode; it is a refactor with one schema migration (35 → 36), one CHP minor
+bump (new neutral events, decision 30), two new enforcing tests, and a
+row-level worklist in `docs/V40-harness-residue-ledger.md` (the appendix —
+retired when the milestone closes).
+
+**Scope (user ruling 2026-08-22):** not just "what a third harness touches"
+but **everything harness-specific V35 left in core** — the activity
+heuristic, the usage/statusline chain, permission-prompt grammar, hook
+bodies, the drift advisor, model-visible text, MCP client specifics,
+frontend payload mirrors, fixtures and docs. Two sweeps found it: the
+identity/settings/spawn inventory (decisions 1–17) and the residue ledger
+(decisions 18–30; ≈185 Rust production sites, ≈157 frontend sites, 30
+fixture/test sites, 26 doc sections).
 
 ## Motivation
 
@@ -284,6 +295,212 @@ harness by name — plus tests that make the README's claim true.
     iterate the registry. The `UPWARD_EXEMPT` entries for `canary.rs` and
     `probe.rs` are deleted once nothing harness-shaped remains in them.
 
+### The V35 leftovers (decisions 18–30)
+
+Each decision names the neutral core abstraction it introduces — the ledger's
+section (b) — because that is the real cost: the literal moves are mechanical,
+the abstractions are where design happens. Row-level targets are in the
+appendix; the decision is the contract.
+
+18. **"Is the harness busy?" is a plugin-declared `ActivitySource`.**
+    `HarnessPlugin::activity_source() -> ActivitySource::{OutOfBand,
+    TuiMarkers(ActivityTuning)}`. Claude declares `TuiMarkers` with *its*
+    tuning (`CLAUDE_BURST_MIN`, `CLAUDE_QUIET`, `CLAUDE_MARKER_GRACE`,
+    `CLAUDE_WORKING_STALE`, `AGENTS_STALL_TIMEOUT` — five constants sized to
+    Claude's spinner/footer repaint rate, `pty/tasks.rs:43-88`,
+    `state/manager.rs:272-284`); OpenCode declares `OutOfBand`. The
+    marker-vs-byte-burst arbitration loop (`pty/tasks.rs:386-556`) stays in
+    core as neutral machinery parameterised by the tuning;
+    `pty/manager.rs:518 oob_drives_activity = matches!(OobSpec::OpenCodeEvent)`
+    disappears. `StateSignal::ClaudeOutputStarted/Stopped` and
+    `claude_output_active` (~14 sites in `state/manager.rs`) are renamed
+    `HarnessOutput*` and become CHP events (decision 30);
+    `AgentsActiveChanged` becomes `SubagentsActiveChanged`, emitted by the
+    plugin's reader, not "by the transcript tail".
+19. **Usage, quota and context are neutral readings; the statusline is
+    Claude's.** New core types `QuotaWindow { id, label, used, resets_at }`
+    (a list, not `five_hour`/`seven_day` fields), `ContextReading`,
+    `TokenKinds` (the billing categories a harness declares —
+    input/cache_write/cache_read/output is Claude's set, absent categories
+    are *absent*, not zero), and `TurnOrigin` (the `session|agent` lane split
+    is Claude's sidechain model; plugins declare their origins). `usage/` and
+    `statusline/` move to `harness/claude/statusline.rs` behind
+    `HarnessPlugin::usage_source()`; `--statusline` becomes a
+    plugin-registered subcommand (`HarnessPlugin::subcommands()`); the IPC
+    command `get_claude_usage` becomes `harness_usage(HarnessId)`;
+    `usage/mod.rs:661-884 endpoint_poll` (dead, compiled, carries an
+    Anthropic OAuth URL and `~/.claude/.credentials.json`) is deleted. The
+    frontend `UsageMeter`, `usageMath.ts`, `contextMeter.ts`, `ipc.ts`
+    snapshot types and the CodeIntelligence donut/lane labels render from
+    the declared windows/categories/origins; `commandIsClaude` and
+    `claudePushTabActive` become a registry capability `usage_push`. The
+    44 px `.status-bar` height in `tui_theme.css:435` becomes a CSS variable
+    from `statusline_rows()`.
+20. **Session identity has a declared key space.** `HarnessPlugin::
+    session_key_space() -> SessionKey::{Tab, Session}` (Claude keys live
+    sessions by tab id, OpenCode by session id — today one map with two key
+    spaces, which is why `live_claude_tab_sessions`,
+    `mark_live_session_from_event` (`loopback.rs:9014`) and the C-2
+    collision guard exist). `GraphService::live_claude_sessions()` becomes
+    `live_sessions_for(HarnessId)`; the Datalog query with `agent ==
+    "claude"` in its string (`graph/index.rs:4214`) and the
+    `"<synthetic>"` model sentinel filters (`:3687, :3725`) move behind
+    `usage_source()` / `model_sentinels()`; `session_agent(..).unwrap_or
+    ("claude")` (`graph/service.rs:3056`) refuses instead.
+21. **Permission-prompt grammar is plugin data; the detector is core.**
+    `PermissionDetector` (`processing/permission.rs:263-438` — substring
+    matching, veto scoping, the per-kind edge machine) stays. The pattern
+    *rows* (`claude_permission`, `claude_permission_bare`, `claude_question`,
+    `claude_working`, the disabled `opencode_*` placeholders,
+    `CLAUDE_FOOTER`, the `_doc` header, `screen.rs`'s multibyte-glyph
+    rationale) move to `harness/<id>/prompts.rs` behind
+    `permission_patterns()`. The per-release snapshot table in
+    `patterns_file.rs:113-211` is reconstructed from
+    `legacy_permission_patterns(era)` per plugin **plus a data-only
+    `harness/_retired/aider.rs`** (no plugin, no descriptor — the rows exist
+    only so pristine-file reconciliation of files written before V19 keeps
+    comparing equal). Claude's `Notification` payload (`PermissionEventBody`,
+    the marker strings, `IGNORED_NOTIFICATION_TYPES`,
+    `classify_permission_event`, `resolve_permission_tab`,
+    `transcript_session_id`) moves into `harness/claude/hook.rs`; core
+    receives a neutral `PermissionEdge` via CHP
+    `PermissionPromptDetected/Resolved` (decision 30).
+22. **Hook ingress is the plugin's, end to end.** Decision 15 moved the route
+    *table*; the ~900 lines of `handle_claude_*` bodies
+    (`loopback.rs:6934-7853`), the `*_from_hook` converters, `claude_hook_tab`
+    / `claude_hook_cwd` / `parse_hook_input` / `report_hook_drift`, the
+    `X-CIMP-*` header identity special-case (`note_chp`,
+    `report_quiet_capabilities`, `loopback.rs:6372-6441`) and the
+    `DRIFT_SHIMS` token vocabulary move with them. Core gains: a neutral
+    `HookReply` (Claude answers hook-output JSON — `no_op`/`deny`/
+    `additional_context` — OpenCode answers `{ok:true}`; core must not know
+    either), `identity_of_request()`, `drift_vocabulary()`, and
+    `hook_reply_timeout()` from which core derives `TOOL_CHECKPOINT_BUDGET`
+    as `min(all plugins) − margin` instead of a hand-computed 1800 ms
+    coupled to two artifacts' timers. The 11 `unwrap_or("claude")` and 2
+    `unwrap_or("opencode")` defaults collapse to **one** named
+    `harness::DEFAULT_HARNESS` with the wire-compat rationale preserved in
+    its doc comment (they are promises to older shim builds, not "any
+    harness"); the opposite default on `/latch/state` (`:9805`) becomes an
+    explicit, commented policy line.
+23. **Drift signals are keyed by harness; every rule runs per harness.**
+    `advisor::Signals`' six `claude_*` scalars become `HarnessDriftSignals:
+    BTreeMap<HarnessId, DriftSignals>`; the same for the `detection_status`
+    IPC payload and `HarnessVersions` in `types.ts`. `version_signature()`
+    takes a harness; `drift.version.v1` evaluates for every registered
+    harness (today OpenCode has no version-drift path at all);
+    `harness_mark_verified` takes a `HarnessId`. The fix-pointer prose that
+    names Claude mechanisms (`PreToolUse`, `UserPromptSubmit`,
+    `message.usage`, `subagents/*.jsonl`, `BYPASS_HIGH`'s `cat`/`sed`
+    enumeration) comes from `Capability::drift_hint()` supplied by the
+    plugin; `CodeIntelligenceView`'s `ADVISOR_RULES_TOOLTIP` renders the
+    backend-published descriptions instead of repeating them.
+24. **Text that reaches the model is a declared seam.**
+    `HarnessPlugin::instructions() -> &[Instruction { slot, text }]`. Every
+    model-visible string in core is marked: `CHANNEL_INSTRUCTIONS`
+    (`offload/mcp.rs:2032`), the attachment instruction
+    (`compose/attachments.ts:55`), and `GRAPH_GUIDANCE` — which is sent to
+    *both* harnesses yet names Claude's capitalised `Read`/`Bash`
+    (`tabs/config.rs:1043`); it is templated with `native_tools()` names per
+    harness. Tool-arg aliasing (`file_path`/`filePath`/`notebook_path`,
+    `loopback.rs:9124`) comes from `native_tools().arg_names()`.
+25. **MCP client specifics belong to the client's plugin.** The channel
+    registration flag, `capabilities.experimental["claude/channel"]`, the
+    `notifications/claude/channel` method, the `PROTOCOL_VERSION` pin ("the
+    era where the client honours channels") and `session_push_enabled()`
+    become `decorate_initialize()`, `push_notification_method()`,
+    `mcp_protocol_version()`, `supports_session_push()`. A core
+    `PerHarness<T>` (registry-ordinal-keyed map) replaces every fixed-arity-2
+    structure: `AUDIT_CONSUMERS`, `UnscopedAudit`'s 2-slot array,
+    `SurfaceDigest{claude,opencode}`, `ServerSurface` access pair,
+    `Consumer::granted(claude, offload, opencode)`, `code_audit.expose_*`,
+    `tool_defs_for_claude/opencode` → `tool_defs_for(HarnessId)`, and the
+    frontend `newServer()`/`container()` seeds. The rule that `Offload` and
+    `Audit` consumers fold onto Claude's access flag stays in core as an
+    explicit `Consumer::conservative_grant()` — it is a security default,
+    not a harness fact (see *What stays*).
+26. **CLI vocabulary and config writers are the plugin's.**
+    `session_selector_flags()` (`--session-id`, `--resume`, `-r`,
+    `--continue`, `-c`, `--fork-session`, `--from-pr` —
+    `tabs/config.rs:1238`), `accepts_passthrough_argv()` (cImp as a drop-in
+    `claude` replacement, `main.rs:112-189`), `preflight()` (the
+    `OpencodeNotFound` probe in `tab_lifecycle.rs:1074`; Claude's "not
+    gated" becomes a declared `Ok`), `needs_tree_reap()` (`procutil.rs:126`,
+    Bun grandchildren), `config_writer()` (`derive_opencode_provider`,
+    `offload/server.rs:276`; `ClaudeLocalSettings` → `ANTHROPIC_*` env
+    synthesis). The boot/poisoned-lock fallbacks `TabId::Claude`
+    (`main.rs:508`, `notifications/manager.rs:399`, `audio/playback.rs:216`)
+    and the integrity repair that forces `enabled_ai_tabs = [claude]`
+    (`persistence.rs:2100`) become "first registered harness's default tab".
+27. **The frontend gets affordances, not prose.** `harness_list` (decision
+    7) also carries `HarnessAffordances`: `newSessionCommand` (the three
+    "run **/clear** in that tab" strings), `toolListRefresh` (the four
+    "OpenCode refreshes in-session, Claude on its next turn" sentences),
+    `webTools[]`, `stateDirs[]`, `installHint` + `docsUrl`
+    (`TabErrorOverlay`, the `opencode-not-found` copy), `attachmentFormat`,
+    `localProviderEnvPreview`, `statuslineRows`. The "Claude session usage"
+    and "Claude context bar" panels (`SettingsApp.svelte:3282-3502`) mount
+    through the decision-6 feature slots. `TabId` in `state/manager.rs`
+    becomes `Builtin(HarnessId, tab)` with its wire strings unchanged;
+    `activeTab = writable('claude')` and `GraphView`'s `isCloud` read the
+    registry (default tab; `tier`); `.esrc.claude/.esrc.opencode` CSS
+    becomes an accent token per harness; `CAP_PRETOOLUSE_DENY` moves behind
+    the registry *together with* the test that pins it
+    (`the_gated_capability_ids_reach_the_frontend`).
+28. **Fixtures and docs follow the code.** `fixtures/plugin-goldens/opencode/`
+    → `fixtures/harness/opencode/goldens/`; the Claude TUI scrapes in
+    `processing/permission.rs:753-1020` → `fixtures/harness/claude/<ver>/tui/`;
+    `docs/spikes/v20/*.ndjson|json|log` (raw payloads, unpinned, unread by any
+    canary) → fixtures or deleted; the inline statusline JSON in
+    `statusline/mod.rs` tests → the fixture that already exists. Docs:
+    `ARCHITECTURE.md`'s Claude hook routing table (§ V11), `CHP.md` § 4.5
+    (the 12-row Claude event→route table, "Minimum Claude Code 2.1.63",
+    `X-CIMP-Agent: always claude`) and § 6.2, and `MAINTENANCE.md`'s drift
+    table (14 rows + version pins) move into `harness/claude/README.md` and
+    `harness/opencode/README.md`, which the existing parity test then reads
+    instead of `MAINTENANCE.md`. `CHP.md`'s `agent` becomes "a registered
+    harness id", never a closed enum. `DESIGN.md` § *What we are building*,
+    `README.md`, `Cargo.toml`'s description and `FEATURES.md`'s
+    "via a Claude `PreCompact` hook"-style bullets are reworded to describe
+    capabilities, with mechanism detail linked to the plugin READMEs.
+    Stale `oob::claude::*` / `harness::claude_hook` paths in doc comments
+    (11 sites) are fixed in passing.
+29. **What stays in core, and why (the exemption list — each entry is a
+    `LITERAL_ALLOWLIST`/`IDENTITY_ALLOWLIST` row with this reason).**
+    - `spawn_ledger::LEDGER` rows: the tripwire scans every `.rs` under
+      `src/` and must keep matching the tree; the argv *strings* come from
+      `HarnessPlugin::spawn_sites()`, the rows stay.
+    - `offload/toolclass.rs` class rows: the single reviewed authority for
+      capability classification is a security decision and does not take
+      rows from harness code; the `hook_*` row *names* are neutralised.
+    - `Consumer::conservative_grant()`: a security default (decision 25).
+    - `TabId` wire strings and `ActivityEntry::source: String`: persisted
+      formats (settings JSON; the activity JSONL read back from disk).
+      Typing `source` as `HarnessId` would mis-read pre-split rows.
+    - `PermissionDetector` machinery, the `pty/tasks.rs` arbitration loop,
+      `terminals.ts` mouse-mode handling (must run in the webview against a
+      live xterm): neutral engines; only their data/tuning moves.
+    - `settings/migration.rs` fixtures (decision 14).
+    - **Not harness-specific, ruled so here:** the Anthropic price table
+      (`schema.rs:953`) is *provider* knowledge — an OpenCode session reports
+      `anthropic/claude-opus-4-8` too — and moves to its own `pricing/`
+      seam, not behind a harness plugin; `secret_anthropic_api_key` is a
+      vendor secret pattern; the `'OpenCode Grey'` palette and
+      `sprites/claudeSprites/` are a persisted-by-name palette and a brand
+      asset that depend on no harness (they are *named* after one, which is
+      allowed for assets; renaming would be a migration for no gain);
+      `segmenter.rs`'s character-class strip runs on any out-of-band prose
+      (V20 cut that coupling deliberately); `CANARY_SOURCES`; the
+      `sandbox/child_env.rs` node/npm rows.
+30. **CHP gains the neutral events the above need, as a minor version
+    bump.** `HarnessOutputStarted/Stopped`, `SubagentsActiveChanged`,
+    `PermissionPromptDetected/Resolved`, `turn.usage` carrying
+    `QuotaWindow`/`TokenKinds`/`TurnOrigin`, and a `drift` event for
+    reader-reported contract drift. Vocabulary additions only; every
+    existing event and route keeps its shape, so a stale artifact from the
+    previous CHP minor still speaks (D5). `docs/CHP.md` gets the rows;
+    `chp::EVENTS` is the authority.
+
 ## Architecture
 
 ```
@@ -295,8 +512,18 @@ harness/
   health.rs          PANELS = HARNESSES.iter()
   layering.rs        HARNESS_DIRS → view; + two tests (decision 10)
   claude/mod.rs      impl HarnessPlugin for Claude  (oob, env, args, overlay, spawn_sig,
-                     settings_schema, routes → hook.rs, native_tools, canaries, probe)
-  opencode/mod.rs    impl HarnessPlugin for OpenCode (same shape; plugin.js, tools.rs)
+                     settings_schema, routes → hook.rs, native_tools, canaries, probe,
+                     activity_source, usage_source → statusline.rs, permission_patterns
+                     → prompts.rs, instructions, session_key_space, subcommands, …)
+  claude/README.md   the hook route table, drift rows, version pins (from ARCHITECTURE/CHP/MAINTENANCE)
+  opencode/mod.rs    impl HarnessPlugin for OpenCode (same shape; plugin.js, tools.rs, config.rs)
+  opencode/README.md
+  _retired/aider.rs  data only: legacy permission-pattern rows for pristine-file reconciliation
+
+pricing/             provider price table (moved out of settings/schema.rs — not a harness seam)
+state/, pty/         neutral activity machinery parameterised by ActivitySource
+processing/          PermissionDetector engine; no pattern rows
+advisor.rs           rules over HarnessDriftSignals, hints from the plugin
 
 offload/loopback.rs  neutral routes only; plugin routes appended from the registry
 offload/toolclass.rs cImp's own tools only; native names resolved via the plugin
@@ -357,34 +584,62 @@ tab; it is never sandboxed as if it were Claude.
 
 ## Phases
 
+Each phase is independently mergeable and leaves both harnesses working.
+Phases run **sequentially in one tree** (the repo rule: no parallel agents
+on a shared tree); A first, then B–H in the order below, each one agent run
+briefed with the relevant decisions and ledger sections. This is roughly
+three times the original registry-only scope; the phase split keeps each
+run reviewable.
+
 - **A — Registry + identity (backend, no schema change).** `registry.rs`,
   `HarnessId`, `HarnessDescriptor`, `HarnessPlugin` trait with both impls
-  moved verbatim from `tabs/config.rs` / `sandbox/tabs.rs`; the ten
-  "which harness" functions collapse to registry lookups; the six Claude
-  fallbacks become `None`/refusals; `expects_chp`, `note_harness_version`,
-  `PANELS`, probe/capture loops, `AUDIT_CONSUMERS`, `UNSCOPED` iterate the
-  registry; `sandbox::tabs::Harness` deleted; loopback routes, native tool
-  tables, canaries and probes move behind the trait (decisions 15–17).
-  Test 10(b) lands here; 10(a)
-  lands with an allowlist naming every survivor, so it is green and the
-  survivors are the worklist for B/C.
+  moved verbatim from `tabs/config.rs` / `sandbox/tabs.rs`; the ten "which
+  harness" functions collapse to registry lookups; the six Claude fallbacks
+  become `None`/refusals; `DEFAULT_HARNESS` (decision 22); `PerHarness<T>`
+  (decision 25) replacing every fixed-arity-2 structure;
+  `sandbox::tabs::Harness` and `state::TabId`'s per-harness arms deleted;
+  loopback route table, native tool tables, canaries and probes move behind
+  the trait (decisions 15–17). Test 10(b) lands here; 10(a) lands with an
+  allowlist naming every survivor, so it is green and the survivors are the
+  worklist for every later phase (the ledger, by section).
 - **B — Settings map (schema 36) + plugin-owned `ext` + spawn-sig map.**
   Decisions 5, 6 and 8, the migration (core pairs → map, Claude/OpenCode-only
-  fields → their plugin's `ext`), `health.rs`/`verify.rs`/`probe.rs` read the map, the
-  `ipc/commands.rs` restart-hint consumer iterates it, the spawn-sig
-  JSON-equality regression test. `types.ts` mirror collapses.
-- **C — Frontend over IPC.** `harness_list` command, `registry.json`
-  fixture + vitest parity test (decision 11), `src/lib/harness.ts`, every
-  site in decision 7 rewritten to iterate; the generic `HarnessExtForm`
-  rendering plugin-declared fields; feature-mounted panels (decision 6). Allowlist 10(a) shrinks to the frozen-history set.
-- **D — Docs + README truth pass.** Decision 12; `MAINTENANCE.md` gains a
-  "registry" row in the drift table pointing at the two tests.
-- **E — Live-verify** (regression pass, below), RC, then V41 opens.
-
-Each phase is independently mergeable and leaves both harnesses working;
-A is the largest and should be one agent run with the 2026-08-21 inventory
-as its brief (it is recorded in the orchestrator's memory as
-`harness-descriptor-gap`).
+  fields → their plugin's `ext`), `health.rs`/`verify.rs`/`probe.rs` read the
+  map, the restart-hint consumer iterates it, the spawn-sig JSON-equality
+  regression test. `Feature::OpencodeNativeGate` becomes a plugin-scoped
+  feature. `pricing/` seam split out (decision 29). `types.ts` mirror
+  collapses.
+- **C — Hook ingress + permission grammar + drift advisor** (decisions 21,
+  22, 23, 30). The `handle_claude_*` bodies, converters and
+  `PermissionEventBody` move into `harness/claude/hook.rs`; neutral
+  `HookReply`, `PermissionEdge`, `HarnessDriftSignals`; pattern rows →
+  `prompts.rs` + `_retired/aider.rs`; CHP minor bump with the new events;
+  `TOOL_CHECKPOINT_BUDGET` derived. `loopback.rs` leaves `LITERAL_ALLOWLIST`.
+- **D — Activity + usage + session identity** (decisions 18, 19, 20).
+  `ActivitySource`, the tuning move, `HarnessOutput*` rename; `usage/` +
+  `statusline/` → `harness/claude/statusline.rs`; `QuotaWindow`,
+  `ContextReading`, `TokenKinds`, `TurnOrigin`; `SessionKey`;
+  `harness_usage(HarnessId)`; `endpoint_poll` deleted; `--statusline` via
+  `subcommands()`.
+- **E — Model-visible text, MCP client specifics, CLI vocab, config
+  writers** (decisions 24, 25 remainder, 26). `instructions()`,
+  `GRAPH_GUIDANCE` templating, `decorate_initialize()` et al.,
+  `session_selector_flags()`, `accepts_passthrough_argv()`, `preflight()`,
+  `needs_tree_reap()`, `config_writer()`, the boot/poisoned-lock fallbacks.
+- **F — Frontend over IPC** (decisions 7, 11, 27 and the frontend halves of
+  19/23). `harness_list` + `HarnessAffordances`, `registry.json` fixture +
+  vitest parity test, `src/lib/harness.ts`, every site in decision 7 and 27
+  rewritten; the generic `HarnessExtForm`; `UsageMeter`/`usageMath`/
+  `contextMeter` over declared windows/categories/origins; feature-mounted
+  panels. Allowlist 10(a) shrinks to the decision-29 set.
+- **G — Fixtures + docs truth pass** (decisions 12, 28). Fixture moves,
+  `harness/<id>/README.md` with the parity test repointed, `CHP.md` /
+  `ARCHITECTURE.md` / `MAINTENANCE.md` / `DESIGN.md` / `README.md` /
+  `FEATURES.md` rewrites, stale doc-comment paths, `MAINTENANCE.md` gains a
+  "registry" drift row pointing at the two tests. The appendix ledger is
+  deleted in this phase (its rows are now either moved or allowlisted with
+  a reason).
+- **H — Live-verify** (regression pass, below), RC, then V41 opens.
 
 ## What a new harness is (the truthful README list, post-V40)
 
@@ -451,6 +706,44 @@ artifacts are regenerated):
 11. `cargo test`: 10(a), 10(b) and the spawn-sig JSON-equality test are in
     the run; `vitest`: the registry parity test is in the run. Delete the
     OpenCode `spawn_sig` arm in a scratch build → 10(b) fails naming it.
+12. Activity (decision 18): on a Claude tab, the avatar/tab state cycles
+    idle → working → idle on a short turn and a fresh tab's welcome banner
+    does not ring the notification (echo suppression intact); on an OpenCode
+    tab the same states come from the OOB event stream with no TUI
+    heuristic running (log line absent). Timing constants unchanged
+    (golden test on the tuning struct).
+13. Permission prompt (decision 21): trigger a permission prompt in a Claude
+    tab → detected by both the TUI pattern path and the `Notification` hook
+    path, notification fires once, avatar "awaiting permission", resolved on
+    answer; `patterns.json` on disk is byte-identical to the pre-V40 seed
+    (pristine-file reconciliation still recognises v040/v063/v070/v022
+    files including the aider rows).
+14. Usage (decision 19): the usage meter shows the same two windows with the
+    same labels and numbers as the pre-V40 RC for the same session; the
+    statusline renders inside the Claude TUI; `harness_usage("opencode")`
+    returns "no usage source" (not zeros); the session-usage donut's
+    main-session / sub-agents split matches the previous RC on the same
+    transcript.
+15. Hook ingress (decision 22): every Claude hook route still answers (a
+    `PreToolUse` deny reaches the model, `additional_context` injection
+    arrives, checkpoint beacon lands) with the same reply bodies (golden
+    test on `HookReply` serialisation); `TOOL_CHECKPOINT_BUDGET` derived
+    value equals 1800 ms for the two shipped plugins (asserted).
+16. Drift (decision 23): the Harness health panel shows a version-drift row
+    for OpenCode as well as Claude; *Mark verified* takes the harness from
+    the row clicked; a drift card's fix hint names the mechanism supplied by
+    the plugin (compare text to the previous RC — identical for Claude).
+17. Model-visible text (decision 24): diff the MCP `instructions` string and
+    the `--append-system-prompt` blob a Claude tab receives against the
+    previous RC — identical; an OpenCode tab's `GRAPH_GUIDANCE` now says
+    `read`/`bash` (the one intended change).
+18. Affordances (decision 27): the three "/clear" strings, the four
+    refresh-semantics sentences, the install hints and the Claude-only
+    settings panels all still render, now from `harness_list`; no string in
+    `src/` names a harness except in `src/lib/harness.ts` tests (grep).
+19. CHP (decision 30): a tab spawned by the previous RC's artifact (stale
+    CHP minor) still talks to the new binary; the health panel marks it
+    stale by version, not broken.
 
 ## V41 preview — Codex CLI (not part of V40)
 

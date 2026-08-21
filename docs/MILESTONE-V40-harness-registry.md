@@ -75,8 +75,9 @@ Adding Codex CLI against this tree would be a ~150-site scavenger hunt where
 most misses are silent. A checklist document would rot within a milestone
 (the one we have already has). The fix is structural: **one production
 descriptor per harness that the settings, spawn, sandbox, loopback and UI
-layers consume**, plus tests that make the README's claim true, plus a short
-checklist for the residue that genuinely needs design per harness.
+layers consume through one `HarnessPlugin` interface**, so that everything
+harness-specific lives in `harness/<id>/` and nothing else in cImp knows a
+harness by name — plus tests that make the README's claim true.
 
 ## Locked decisions
 

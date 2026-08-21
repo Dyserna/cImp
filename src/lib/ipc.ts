@@ -54,6 +54,15 @@ export async function ptyWrite(tab: TabId, input: string): Promise<void> {
   await invoke('pty_write', { tab, input });
 }
 
+/// V39 Phase A: set or clear a tab's user read-only lock. Takes the runtime
+/// lock in the backend AND persists the flag, so the tab is refusing input by
+/// the time this resolves and is still refusing it after a restart. The new
+/// state reaches this window as a `settings-changed` broadcast — there is no
+/// separate event to listen for.
+export async function tabSetReadOnly(tab: TabId, on: boolean): Promise<void> {
+  await invoke('tab_set_read_only', { tab, on });
+}
+
 export async function ptyResize(tab: TabId, rows: number, cols: number): Promise<void> {
   await invoke('pty_resize', { tab, rows, cols });
 }

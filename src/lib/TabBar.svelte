@@ -2,6 +2,8 @@
   import Tab from './Tab.svelte';
   import TabContextMenu from './TabContextMenu.svelte';
   import TaintMenu from './TaintMenu.svelte';
+  import DelegationPopover from './DelegationPopover.svelte';
+  import { accessOf, glyphState, hasCommIcon } from './delegation';
   import {
     fetchLatchStatus,
     injectionStatus,
@@ -88,6 +90,30 @@
     tab: TabId;
   } | null>(null);
 
+  /// V39 Phase A: the communication popover. Anchored at the glyph, one at a
+  /// time, and holding only the anchor + tab id — everything it renders is
+  /// derived from `$settings` below, so a write made inside it is reflected by
+  /// the same broadcast that persists it (the M-22 rule the taint popover
+  /// already follows).
+  let commMenu = $state<{
+    x: number;
+    y: number;
+    tab: TabId;
+  } | null>(null);
+
+  const commMenuAccess = $derived(commMenu ? accessOf($settings, commMenu.tab) : 'rw');
+  const commMenuName = $derived(
+    (commMenu ? $tabs.find((m) => m.id === commMenu?.tab)?.name : null) ?? commMenu?.tab ?? '',
+  );
+
+  /// Open the communication popover, closing anything else that is open — two
+  /// popovers anchored at neighbouring glyphs would overlap.
+  function onCommGlyph(tab: TabId, e: MouseEvent): void {
+    menu = null;
+    taintMenu = null;
+    commMenu = { x: e.clientX, y: e.clientY, tab };
+  }
+
   /// The popover's LIVE row — re-read from `latchByTab` on every poll tick for
   /// as long as the popover is open (M-22).
   const taintMenuRow = $derived(
@@ -140,6 +166,7 @@
   /// about; it is deliberately not stored.
   function onTaintBadge(tab: TabId, _row: LatchRow | undefined, e: MouseEvent): void {
     menu = null;
+    commMenu = null;
     taintMenu = { x: e.clientX, y: e.clientY, tab };
   }
 
@@ -362,6 +389,10 @@
             reduced={reducedFeaturesFor($injectionStatus, id)}
             protection={tabProtectionRows($injectionStatus, id)}
             ontaint={(e) => onTaintBadge(id, latchRow, e)}
+            comm={hasCommIcon($settings, id)
+              ? glyphState({ role: 'none', access: accessOf($settings, id), inFlight: false })
+              : null}
+            oncomm={(e) => onCommGlyph(id, e)}
             bind:renaming={
               () => renamingTab === id,
               (v) => {
@@ -464,6 +495,17 @@
      so an open popover follows the tab's real state instead of freezing the
      instant it was opened. `TaintMenu` already renders entirely from its props,
      so it needed no change for this. -->
+{#if commMenu}
+  <DelegationPopover
+    x={commMenu.x}
+    y={commMenu.y}
+    tab={commMenu.tab}
+    tabName={commMenuName}
+    access={commMenuAccess}
+    onDismiss={() => (commMenu = null)}
+  />
+{/if}
+
 {#if taintMenu && taintMenuRow}
   <TaintMenu
     x={taintMenu.x}

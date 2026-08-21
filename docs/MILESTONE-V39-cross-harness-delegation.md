@@ -527,3 +527,26 @@ Commits `6f73787..80b640f` + follow-ups. Facts that refine the design above:
 - **Take-over = one `takeover` row** minted by the engine on its way out
   (`d252b21`); `DelegationError` `Display` carries no transition prefix so the
   driver's tool result and the row reason are one string.
+
+## Implementation record (B2 — UI, 2026-08-22)
+
+Commits `67a9a42 41d55af 831f998 bd62b5f e5159bf` (vitest 780, svelte-check
+0/0, no Rust). Facts:
+- Phase A's TS `DelegationRole` literal was `'remote'`; serde writes
+  `remote_offload` — fixed at the seam (glyph base state stays `'remote'`).
+- Two write paths on purpose: role → `tab_set_delegation_role` (backend owns
+  the one-Manual-per-harness move); Remote knobs → ordinary
+  `AiToolTabConfig` save via the store's `applySettings`.
+- `HARNESS_LABELS` in `src/lib/delegation.ts` is the ONE harness display-name
+  mapping in TS (none existed); `tabHarness` mirrors Rust `tab_consumer`.
+- Banner = overlay at the top of `.pane-content` (a real row would refit
+  xterm and resize the PTY mid-turn); renders only for the pane's active
+  driven tab. **Live-verify: it covers the terminal's top row.**
+- Elapsed clock = one `readable` whose interval exists only while subscribed.
+- Local echo fires once per flight on the flight's first edge, keyed on the
+  opening-paint baseline (`e5159bf`), via `getTerminal(tab).writeln`.
+- Events `rowStatus` gained `driving` / `takeover` / `moved` so a `start`
+  row no longer reads "Call succeeded".
+- `delegation.max_depth` deliberately NOT exposed (its only legal value is
+  the default while nesting is refused). `delegation_status(tab)` has no
+  frontend consumer (`delegation_statuses` + the event cover it).

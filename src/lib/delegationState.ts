@@ -38,7 +38,10 @@ export function drivenBy(
 }
 
 let initialized = false;
-let seenFirstSnapshot = false;
+/// Whether the opening paint is behind us — see [`initDelegation`]. Until it
+/// is, a snapshot is a BASELINE (what was already running when this window came
+/// up), not an edge, and nothing about it is echoed.
+let baselined = false;
 
 function apply(rows: [string, InFlightView][]): void {
   const next: Record<string, InFlightView> = {};
@@ -50,14 +53,7 @@ function apply(rows: [string, InFlightView][]): void {
   // because it must happen ONCE per flight, on the edge — a component that
   // wrote it from a reactive statement would repeat the line on every re-render
   // and on every tab attach.
-  //
-  // Skipped for the FIRST snapshot: a window that mounts (or reloads) mid-flight
-  // is not watching a turn begin, and echoing then would stamp the line into the
-  // middle of output the worker had already produced.
-  if (!seenFirstSnapshot) {
-    seenFirstSnapshot = true;
-    return;
-  }
+  if (!baselined) return;
   for (const [tab, view] of Object.entries(next)) {
     if (previous[tab]) continue;
     const term = getTerminal(tab as TabId);
@@ -72,6 +68,18 @@ function apply(rows: [string, InFlightView][]): void {
 /// Idempotent. The listener is registered BEFORE the initial pull so an edge
 /// landing mid-pull is not lost; the pull then only fills in if no event has
 /// arrived, the `initSettings` convention.
+///
+/// **`baselined` is set exactly once, here, when the opening sequence is over —
+/// not by whichever `apply` happened to run first.** The difference is a real
+/// defect the first cut had: keyed on "the first snapshot", a session in which
+/// nothing was in flight at startup would swallow the echo of the FIRST
+/// delegation the user ever ran, ten minutes later, because that flight's edge
+/// was the first snapshot this process saw. What must be suppressed is not the
+/// first snapshot but the BASELINE — a window that mounts (or reloads)
+/// mid-flight is not watching a turn begin, and echoing then would stamp the
+/// line into the middle of output the worker had already produced. It is set in
+/// `finally` so a failed pull cannot leave the echo switched off for the rest
+/// of the session.
 export async function initDelegation(): Promise<void> {
   if (initialized) return;
   initialized = true;
@@ -92,6 +100,8 @@ export async function initDelegation(): Promise<void> {
     if (!gotEvent) apply(initial);
   } catch (e) {
     console.warn('delegation_statuses failed; assuming nothing in flight', e);
+  } finally {
+    baselined = true;
   }
 }
 

@@ -1,7 +1,7 @@
 # V39 — Cross-harness delegation (tab drives tab)
 
-**Status:** DESIGN (2026-08-21) — awaiting user approval; no implementation
-before approval. GitHub: to be filed on approval.
+**Status:** APPROVED DESIGN (2026-08-21) — implementation not started.
+GitHub: umbrella #90, milestone 13; phases A #91 · B #87 · C #88 · D #89.
 **Sequencing:** builds on V30 (push bus + per-tab addressing), V32 (result
 screening), V35 (hook push / CHP), V37 (live `tools/list` propagation), V38
 (`offload_task` live description). Nothing here needs a schema migration step

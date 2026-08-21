@@ -63,9 +63,18 @@ adds the **read-only tab mode** that makes a driven tab safe to leave open.
      (`target`, `task`, `context?`, `timeout_s?`) on the single
      `cimp-offload` server. Its description names the currently available
      worker tabs (live, via `GET /describe`, like `offload_task`) and states
-     it is for **user-directed** delegation only ("use when the user asks
-     you to hand work to another tab"). The requesting harness sees a
-     harness tab, by name.
+     it is for **user-directed** delegation only. The pinned description
+     opens with this contract (a test asserts the sentence is present):
+     > *Hand a task to another open harness tab and return its answer.
+     > Call this ONLY when the user explicitly asked for a task to be
+     > delegated to another tab or harness (e.g. "send this to Claude Code",
+     > "use the OpenCode tab for this"). Never call it on your own
+     > initiative — for work you decide to offload yourself, use
+     > `offload_task`, which you may call automatically whenever you judge
+     > it useful.*
+     The two tools are thereby distinguished by **who decides**: the user
+     (`delegate_task`) vs the harness (`offload_task`, including facade
+     backends). The requesting harness sees a harness tab, by name.
    - **Facade (automatic):** a worker tab registered as a **third offload
      backend kind**, `OffloadBackendKind::HarnessTab { tab }`. It appears in
      `offload_task`'s backend prose under a **user-chosen backend name**

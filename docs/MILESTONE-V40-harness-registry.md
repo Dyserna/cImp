@@ -80,6 +80,20 @@ checklist for the residue that genuinely needs design per harness.
 
 ## Locked decisions
 
+0. **The principle: cImp core contains no harness-specific code or data.
+   Everything a harness needs reaches core through exactly two interfaces —
+   `HarnessPlugin` (L1, in-tree, at spawn/config time) and CHP (L2, on the
+   wire, at run time).** "Harness-specific" means anything that is true of
+   Claude Code or OpenCode and not of harnesses in general: a binary name, a
+   route path, a hook payload field, a native tool name, a settings field
+   only one harness has, a UI section only one harness shows, a grant row, a
+   probe. V35 Phase K moved the *readers* behind this line; V40 moves the
+   rest. The test for whether something belongs in core is: *would it still
+   make sense if both shipped harnesses were deleted?* If not, it belongs in
+   `harness/<id>/` and core consumes it through the interface. Decisions
+   1–17 are this principle applied surface by surface; decision 10 is what
+   enforces it.
+
 1. **One `HarnessDescriptor` registry in `harness/`, the single source of
    truth for harness identity.** `harness/registry.rs` declares
    `pub static HARNESSES: &[HarnessDescriptor]`, one entry per
@@ -139,13 +153,31 @@ checklist for the residue that genuinely needs design per harness.
    (`statusline`, `claude_local`, `offload.opencode_provider`,
    `injection.opencode_native_gate_enabled`) are **not** moved; they are
    declared (decision 6).
-6. **Feature declaration replaces id branching in the UI.** Each descriptor
-   carries `features: &[HarnessFeature]` — `Statusline`, `LocalProvider`,
-   `NativeToolGate`, `SessionUsage`, `ContextBar`, `Channels`, `Hooks`,
-   `Plugin`, `FileArtifact` (has goldens). The Settings UI shows a
-   Claude-only section because `features.contains(Statusline)`, never
-   because `id === 'claude'`. A new harness that has none of them gets a
-   correct, smaller Settings page with no UI work.
+6. **Harness-only settings are owned by the plugin, not by core.**
+   `statusline`, `claude_local`, `claude_auto_verify`,
+   `offload.opencode_provider(_auto)` and
+   `injection.opencode_native_gate_enabled` are today core `Settings` fields
+   that only one harness reads. They move to a per-harness namespace
+   `Settings.harness[<id>].ext`, a JSON object whose **schema, defaults,
+   validation and migration are declared by the plugin**
+   (`HarnessPlugin::settings_schema() -> &[SettingField]`, with
+   `SettingField { key, kind (bool|int|string|enum|path), label, hint,
+   default, spawn_baked }`). Core stores the object opaquely, validates it
+   against the plugin's declared fields at the parse boundary (declared ≠
+   enforced), and routes reads back through the plugin — core never names
+   a key. The Settings UI renders each harness's section from the declared
+   fields with one generic form component, so a harness with no `ext`
+   fields gets an empty section and no UI work. Features that need richer
+   UI than a form (Claude's session-usage and context-bar panels) are the
+   one exception: they stay as components but are mounted by a
+   `features: &[HarnessFeature]` declaration on the descriptor
+   (`SessionUsage`, `ContextBar`, `FileArtifact`), never by `id ===
+   'claude'`; their data arrives through CHP events, not through a
+   Claude-shaped IPC. The 35 → 36 migration moves each existing field into
+   its plugin's `ext` with the same value; a plugin's `spawn_sig` covers its
+   `spawn_baked` fields automatically, which closes the "spawn-baked setting
+   without a signature entry" class for good.
+
 7. **The frontend receives the registry over IPC and never re-declares it.**
    `harness_list` command returns `{ id, label, tab_ids, binaries, features,
    consumer }` per harness. `AI_TABS`, `RESERVED_AI_TAB_IDS`,
@@ -180,7 +212,11 @@ checklist for the residue that genuinely needs design per harness.
     files on `IDENTITY_ALLOWLIST` with a reason (expected survivors:
     `settings/schema.rs` tab-id consts until decision 3 lands,
     `main.rs` `--consumer` default, loopback route table, persistence
-    migrations — migrations are frozen history and always exempt).
+    migrations — migrations are frozen history and always exempt). The same test
+    forbids `HarnessId::Claude` / `HarnessId::OpenCode` *comparisons* and
+    `match` arms outside `harness/` — core may hold a `HarnessId` and pass
+    it to the registry; it may not branch on its value. The built-in
+    variants exist for persisted wire forms only.
     (b) `every_registry_entry_is_fully_wired`: for each descriptor, the
     directory exists, the registry has rows, a hello is declared, a
     `spawn_sig` slot exists, a sandbox grant table is non-empty, a health
@@ -212,6 +248,40 @@ checklist for the residue that genuinely needs design per harness.
     historical migrations is rewritten to use the registry; they describe
     old on-disk shapes and must keep their literals. They are allowlisted
     wholesale in test 10(a).
+15. **Loopback routes are registered by the plugin.** The twelve
+    `("POST", "/claude/hook/*")` arms in `offload/loopback.rs:1270-1289` and
+    their `handle_claude_*` bodies move to `harness/claude/hook.rs` (the
+    payload mechanics already live there since Phase J; only the dispatch
+    is still in core). `HarnessPlugin::routes() -> &[Route]` returns
+    `(method, path, handler)`; loopback's router appends every registered
+    plugin's routes after the CHP-neutral ones (`/session/hello`, `/mcp/*`,
+    the audit and push routes). Core keeps no harness path literal and
+    `loopback.rs` leaves `LITERAL_ALLOWLIST`. `classify_permission_event`
+    and the `unwrap_or("claude")` consumer defaults go the same way
+    (resolved from the hello's `agent`, never defaulted).
+16. **Native tool vocabulary is declared by the plugin.** `toolclass.rs`'s
+    `TABLE` keeps only cImp's *own* routed tools; the harness-native rows
+    (`Edit`/`Write`/`MultiEdit`/`NotebookEdit`/`Bash`/`WebFetch`… and
+    OpenCode's `edit`/`write`/`patch`/`bash`/`webfetch`…) move to
+    `harness/<id>/tools.rs` as `HarnessPlugin::native_tools() ->
+    &[NativeTool { name, class: ToolClass, mutates_fs, memory_kind }]`.
+    `classify`, `mutates_fs`, `tool_checkpoint_is_mutating`
+    (`loopback.rs:5604`) and `graph/memory.rs::memory_kind_of` (the
+    "FINDING, not a clean exemption" allowlist entry) look the name up via
+    the plugin that sent the event — so an unknown tool from an unknown
+    source classifies as *unknown/mutating* (fail closed), never as "not in
+    Claude's table, therefore safe". `docs/HARNESS-NATIVE-TOOLS.md` becomes
+    the human twin of those tables and a test checks them against each
+    other, as `MAINTENANCE.md` is checked against the registry today.
+17. **Canaries and probes are supplied by the plugin.**
+    `HarnessPlugin::canaries() -> &[Canary]` (fixture + assertion fn) and
+    `HarnessPlugin::probe(&ProbeCtx) -> ProbeReport` replace the five named
+    functions in `canary.rs:205-511`, the `drive` match in
+    `probe.rs:502-522` and the two literal `resolve_command` calls.
+    `canary.rs` and `probe.rs` keep the harness-neutral runner, the report
+    shape and the `cimp --harness-canary/--harness-capture` CLI; they
+    iterate the registry. The `UPWARD_EXEMPT` entries for `canary.rs` and
+    `probe.rs` are deleted once nothing harness-shaped remains in them.
 
 ## Architecture
 
@@ -223,12 +293,18 @@ harness/
   chp.rs             expects_chp() reads the registry
   health.rs          PANELS = HARNESSES.iter()
   layering.rs        HARNESS_DIRS → view; + two tests (decision 10)
-  claude/mod.rs      impl HarnessPlugin for Claude  (oob, env, args, overlay, spawn_sig)
-  opencode/mod.rs    impl HarnessPlugin for OpenCode (oob, env, args, plugin.js, spawn_sig)
+  claude/mod.rs      impl HarnessPlugin for Claude  (oob, env, args, overlay, spawn_sig,
+                     settings_schema, routes → hook.rs, native_tools, canaries, probe)
+  opencode/mod.rs    impl HarnessPlugin for OpenCode (same shape; plugin.js, tools.rs)
+
+offload/loopback.rs  neutral routes only; plugin routes appended from the registry
+offload/toolclass.rs cImp's own tools only; native names resolved via the plugin
+graph/memory.rs      memory_kind via plugin.native_tools
 
 tabs/config.rs       harness-neutral composer; calls descriptor.plugin.*
 sandbox/tabs.rs      grant rows come from descriptor.sandbox_grants
-settings/schema.rs   Settings.harness: BTreeMap<HarnessId, HarnessSettings>  (schema 36)
+settings/schema.rs   Settings.harness: BTreeMap<HarnessId, HarnessSettings { ..core, ext }>  (36)
+src/lib/settings/    one generic HarnessExtForm.svelte renders plugin-declared fields
 ipc/commands.rs      harness_list; restart hints iterate spawn_sig map
 src/lib/harness.ts   HarnessInfo[] from IPC; helpers replace AI_TABS et al.
 ```
@@ -272,8 +348,11 @@ tab; it is never sandboxed as if it were Claude.
 - `docs/HARNESS-NATIVE-TOOLS.md` restructuring — its per-harness sections
   stay; V41 adds a Codex section.
 - Making `statusline`, `claude_local`, `opencode_provider` or the OpenCode
-  native gate generic. They are real single-harness features and are
-  declared as such (decision 6), not generalised.
+  native gate *generic*. They stay single-harness features — they just move
+  into their plugin's `ext` settings (decision 6) instead of living in core.
+- Out-of-process plugins. `HarnessPlugin` is a Rust trait compiled into
+  the binary (D7); the interface is the decoupling, not the process
+  boundary.
 
 ## Phases
 
@@ -283,17 +362,20 @@ tab; it is never sandboxed as if it were Claude.
   "which harness" functions collapse to registry lookups; the six Claude
   fallbacks become `None`/refusals; `expects_chp`, `note_harness_version`,
   `PANELS`, probe/capture loops, `AUDIT_CONSUMERS`, `UNSCOPED` iterate the
-  registry; `sandbox::tabs::Harness` deleted. Test 10(b) lands here; 10(a)
+  registry; `sandbox::tabs::Harness` deleted; loopback routes, native tool
+  tables, canaries and probes move behind the trait (decisions 15–17).
+  Test 10(b) lands here; 10(a)
   lands with an allowlist naming every survivor, so it is green and the
   survivors are the worklist for B/C.
-- **B — Settings map (schema 36) + spawn-sig map.** Decision 5 and 8, the
-  migration, `health.rs`/`verify.rs`/`probe.rs` read the map, the
+- **B — Settings map (schema 36) + plugin-owned `ext` + spawn-sig map.**
+  Decisions 5, 6 and 8, the migration (core pairs → map, Claude/OpenCode-only
+  fields → their plugin's `ext`), `health.rs`/`verify.rs`/`probe.rs` read the map, the
   `ipc/commands.rs` restart-hint consumer iterates it, the spawn-sig
   JSON-equality regression test. `types.ts` mirror collapses.
 - **C — Frontend over IPC.** `harness_list` command, `registry.json`
   fixture + vitest parity test (decision 11), `src/lib/harness.ts`, every
-  site in decision 7 rewritten to iterate; feature-gated sections
-  (decision 6). Allowlist 10(a) shrinks to the frozen-history set.
+  site in decision 7 rewritten to iterate; the generic `HarnessExtForm`
+  rendering plugin-declared fields; feature-mounted panels (decision 6). Allowlist 10(a) shrinks to the frozen-history set.
 - **D — Docs + README truth pass.** Decision 12; `MAINTENANCE.md` gains a
   "registry" row in the drift table pointing at the two tests.
 - **E — Live-verify** (regression pass, below), RC, then V41 opens.
@@ -303,24 +385,29 @@ A is the largest and should be one agent run with the 2026-08-21 inventory
 as its brief (it is recorded in the orchestrator's memory as
 `harness-descriptor-gap`).
 
-## What a new harness still costs (the truthful README list, post-V40)
+## What a new harness is (the truthful README list, post-V40)
+
+All of it is `harness/<id>/` — the contents of one plugin. Nothing here is
+cImp-side work, and none of it can be made data, because it *is* the harness:
 
 1. `harness/<id>/mod.rs` with `impl HarnessPlugin` — OOB transport, env,
    args, artifact writer, `spawn_sig`. **Design work**; nothing can make a
    harness's wire shape data.
 2. One `HarnessDescriptor` entry — id, label, binaries, tab ids, consumer,
-   features, sandbox grant rows (**design**: what the harness needs on disk),
-   default tab template.
-3. A CHP hello (`serves`/`cannot`) and registry rows with `wired_in`.
-4. L1 canaries + fixtures under `fixtures/harness/<id>/<version>/` and the
-   L2 probe `drive` arm — **design**, per wire format.
-5. Goldens if the artifact is a file.
-6. `MAINTENANCE.md` drift rows, a `HARNESS-NATIVE-TOOLS.md` section (feeds
-   `toolclass.rs` — security-relevant), `CHP.md` route table if it pushes.
+   features, sandbox grant rows, default tab template.
+3. `settings_schema()` — the harness's own settings fields (decision 6);
+   `routes()` if it pushes (decision 15); `native_tools()` (decision 16).
+4. A CHP hello (`serves`/`cannot`) and registry rows with `wired_in`.
+5. `canaries()` + fixtures under `fixtures/harness/<id>/<version>/` and
+   `probe()` (decision 17); goldens if the artifact is a file.
+6. `MAINTENANCE.md` drift rows, a `HARNESS-NATIVE-TOOLS.md` section (checked
+   against `native_tools()`), `CHP.md` route table if it pushes.
 
-Everything else — settings, spawn sig, restart hints, sandbox selection,
-health panel, probes, audit consumers, Settings UI, tab naming, MCP
-exposure checkboxes — is derived, and tests 10(a)/10(b)/11 fail if it is not.
+Everything outside that directory — settings storage, spawn sig, restart
+hints, sandbox selection, loopback dispatch, tool classification, memory
+kinds, health panel, probe runner, audit consumers, Settings UI, tab
+naming, MCP exposure — is harness-neutral, consumes the plugin through the
+interface, and tests 10(a)/10(b)/11 fail if a harness literal reappears.
 
 ## Live-verify
 
@@ -347,11 +434,17 @@ artifacts are regenerated):
    in the message (decision 2).
 8. V39 regression: delegation Claude ↔ OpenCode still works; tool set
    identical to the pre-V40 RC (`tools/list` diff empty).
-9. Settings page: Claude-only sections (statusline, context bar, session
-   usage, local provider) show under Claude; OpenCode-only (provider,
-   native gate) under OpenCode — by feature flag, confirmed by temporarily
-   removing `Statusline` from the Claude descriptor in a dev build and
-   seeing the section disappear with no other edit.
+9. Settings page: Claude's `ext` fields (statusline, local provider,
+   auto-verify) render under Claude from its declared schema with migrated
+   values; OpenCode's (provider, native gate) under OpenCode. Confirm by
+   temporarily deleting one `SettingField` from a plugin's
+   `settings_schema()` in a dev build: the control disappears, the stored
+   value survives a save (opaque round-trip), no other edit needed.
+9a. Claude hook routes still arrive (permission prompt → notification,
+    taint beacon, checkpoint) with the dispatch now registered from
+    `harness/claude/hook.rs`; `toolclass::classify("Edit")` and `("edit")`
+    return the pre-V40 classes (golden test), and an invented tool name
+    from a hello-less source classifies as mutating/unknown.
 10. Downgrade test: write a settings file containing `harness.codex = {...}`
     by hand, launch → no error, key preserved on next save, not shown.
 11. `cargo test`: 10(a), 10(b) and the spawn-sig JSON-equality test are in

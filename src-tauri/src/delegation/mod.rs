@@ -246,7 +246,9 @@ pub struct InFlightView {
     pub mode: DelegationMode,
     pub started_ms: u64,
     /// A permission/question prompt is standing on the worker right now, so
-    /// the keyboard is relaxed and the deadline is being extended (decision 5).
+    /// the keyboard is relaxed for it and the deadline has been granted one
+    /// bounded extension (locked decision 5). The banner's "waiting for your
+    /// permission" state.
     pub awaiting_prompt: bool,
 }
 

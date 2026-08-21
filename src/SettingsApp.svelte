@@ -5104,6 +5104,66 @@
           <div class="button-row">
             <button type="button" onclick={addCommandPolicy}>Add command policy</button>
           </div>
+
+          <h3>Cross-harness delegation</h3>
+          <small class="hint top">
+            V39: one tab drives another — cImp types a request into an open
+            harness tab exactly as you would, waits for the turn to finish, and
+            hands the answer back to the tab that asked. Which tabs may be driven
+            is set per tab, from that tab's <code>⇄</code> icon; these are
+            the two knobs that are not per tab. Every run is a row in the Events
+            tab under <strong>delegation</strong>.
+          </small>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.delegation.auto_read_only}
+              onchange={(e) =>
+                patch(
+                  (s) =>
+                    (s.delegation.auto_read_only = (
+                      e.currentTarget as HTMLInputElement
+                    ).checked),
+                )}
+            />
+            <span>Lock a tab's keyboard while another harness is driving it</span>
+          </label>
+          <small class="hint">
+            On by default. While cImp is typing into a tab, a stray keystroke of
+            yours lands in the middle of someone else's turn. A courtesy lock over
+            your own hands, not a security boundary: a permission or question
+            prompt relaxes it for that prompt, and <strong>Take over</strong> — on
+            the tab's <code>⇄</code> popover and its context menu — clears it
+            outright and ends the delegation. Turning it off leaves the tab
+            writable throughout; the banner and the glyph still say it is being
+            driven.
+          </small>
+          <label>
+            <span>Default timeout (seconds)</span>
+            <input
+              type="number"
+              min="1"
+              max="86400"
+              step="1"
+              value={snapshot.delegation.default_timeout_s}
+              onchange={(e) =>
+                patch(
+                  (s) =>
+                    (s.delegation.default_timeout_s = Math.max(
+                      1,
+                      Math.round(+(e.currentTarget as HTMLInputElement).value || 600),
+                    )),
+                )}
+            />
+            <small class="hint">
+              How long cImp waits for a worker's reply when the caller named no
+              timeout of its own. On expiry the asking tab is told
+              <code>timeout</code> and <strong>no keys are ever sent</strong> to
+              cancel the worker — it finishes its turn visibly, in its own tab.
+              A standing permission prompt buys one bounded extension, so a run
+              waiting on you does not expire while you walk over to it.
+            </small>
+          </label>
           {/if}
 
           <hr class="card-divider lg" />

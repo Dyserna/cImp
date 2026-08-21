@@ -1,7 +1,7 @@
 # V40 — Harness registry and the V35 leftovers (everything harness-specific moves behind the plugin)
 
 **Status:** APPROVED DESIGN (2026-08-22) — implementation not started.
-GitHub: umbrella #101, milestone 14; phases A #93 · B #94 · C #95 · D #96 ·
+GitHub: umbrella #101, milestone 14; phases 0 #102 · A #93 · B #94 · C #95 · D #96 ·
 E #97 · F #98 · G #99 · H #100.
 **Sequencing:** after V39 ships and is live-verified. **V41 — Codex CLI** is
 the consumer: it is the first harness added *through* this registry, and it
@@ -586,12 +586,26 @@ tab; it is never sandboxed as if it were Claude.
 ## Phases
 
 Each phase is independently mergeable and leaves both harnesses working.
-Phases run **sequentially in one tree** (the repo rule: no parallel agents
+Phases run **sequentially in one tree**, Phase 0 first (the repo rule: no parallel agents
 on a shared tree); A first, then B–H in the order below, each one agent run
 briefed with the relevant decisions and ledger sections. This is roughly
 three times the original registry-only scope; the phase split keeps each
 run reviewable.
 
+- **0 (#102) — Sweep the V39 delegation implementation; re-baseline the
+  ledger.** Runs after V39 (#90) merges and live-verifies, before A. The two
+  sweeps predate V39, which adds harness-facing code of its own
+  (`harness/<id>/input.rs` `InputProfile`, `delegate_task_<id>` generation,
+  `OffloadBackendKind::HarnessTab`, `CAP_DELEGATION_WORKER` + frontend
+  mirror, `<id>.input.profile` rows + probes, the attribution banner text).
+  Deliverables: ledger section M with file:line rows on the post-V39 tree, a
+  re-baseline stamp per ledger section, amendment comments on #101 where V39
+  contradicts a decision (expected: `InputProfile` folds into
+  `HarnessPlugin` rather than a second trait — decision 4; its probe becomes
+  `probe()` — decision 17; `delegate_task_*` iterates the registry —
+  decision 9; banner labels come from `harness_list` — decision 27), the
+  A/C/E/F/G briefs updated with the V39 rows they own, and post-V39
+  baselines. Read-only; no code moves.
 - **A (#93) — Registry + identity (backend, no schema change).** `registry.rs`,
   `HarnessId`, `HarnessDescriptor`, `HarnessPlugin` trait with both impls
   moved verbatim from `tabs/config.rs` / `sandbox/tabs.rs`; the ten "which

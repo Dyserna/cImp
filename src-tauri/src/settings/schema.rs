@@ -1472,10 +1472,23 @@ impl LogRetention {
     }
 }
 
-/// One of the three reserved AI-tool tab ids. Wire format is the kebab-
+/// One of the reserved AI-tool tab ids. Wire format is the kebab-
 /// case tab-id string (`"claude"`, `"claude-local"`, `"opencode"`); the type
 /// exists so `enabled_ai_tabs` can be a strongly-typed `Vec<AiTabId>` instead
 /// of an untyped string list.
+///
+/// **This enum is still closed, and the registry is what fills it** (V40 review
+/// finding M-3). Locked decision 3 kept the wire encodings and turned the
+/// per-harness `match` arms into registry lookups; the arms below are the half
+/// that did not move, because `Vec<AiTabId>` on disk is a wire format and
+/// widening it to `Vec<String>` is a schema change, not a refactor. What DOES
+/// exist is the join: `layering::every_registry_entry_is_fully_wired` (10(b))
+/// fails, naming the id, if a descriptor declares a `tab_ids` entry that has no
+/// variant here, no `TabId::from_str` arm and no `default_ai_tab` arm — so a
+/// third harness cannot ship half-wired, silently dropped from
+/// [`canonical_ai_tab_order`] and un-enableable by the user. Closing it
+/// properly is `HarnessDescriptor::default_tab(tab_id)` plus a
+/// `Vec<String>` `enabled_ai_tabs`, and it is a recorded residual.
 ///
 /// V19 ships a single OpenCode tab (not a cloud/local pair like Claude):
 /// OpenCode addresses many providers as `provider/model`, switches between
@@ -1496,6 +1509,14 @@ pub enum AiTabId {
 }
 
 impl AiTabId {
+    /// Every variant, in declaration order.
+    ///
+    /// Hand-kept, and pinned in both directions by
+    /// `the_ai_tab_enum_and_the_registry_are_the_same_list`: a variant with no
+    /// descriptor and a descriptor with no variant both fail a test rather than
+    /// producing a tab nothing can enable.
+    pub const ALL: &'static [AiTabId] = &[Self::Claude, Self::ClaudeLocal, Self::OpenCode];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Claude => CLAUDE_TAB_ID,
@@ -1504,13 +1525,10 @@ impl AiTabId {
         }
     }
 
+    /// Over [`Self::ALL`] rather than a second literal table: the id spellings
+    /// live in [`Self::as_str`] once, so the two cannot drift.
     pub fn from_id(id: &str) -> Option<Self> {
-        match id {
-            CLAUDE_TAB_ID => Some(Self::Claude),
-            CLAUDE_LOCAL_TAB_ID => Some(Self::ClaudeLocal),
-            OPENCODE_TAB_ID => Some(Self::OpenCode),
-            _ => None,
-        }
+        Self::ALL.iter().copied().find(|t| t.as_str() == id)
     }
 
     /// True for the local-provider variants (`claude-local`). The integrity
@@ -1545,11 +1563,22 @@ impl AiTabId {
 /// so. The order is the descriptors' declaration order and each descriptor's own
 /// `tab_ids` order — so a harness owns where its tabs sit relative to its own,
 /// and the registry owns where harnesses sit relative to each other.
+///
+/// V40 review M-3: the `filter_map` **drops** a registered tab id that has no
+/// `AiTabId` variant, which is the one way a third harness could reach a shipped
+/// build with no canonical position and no way for the user to enable it. That
+/// cannot happen silently any more — 10(b) refuses the descriptor — and the
+/// assertion below is the runtime half, so a debug build says which id went
+/// missing rather than rendering a tab bar one entry short.
 pub fn canonical_ai_tab_order() -> Vec<AiTabId> {
-    crate::harness::registry::canonical_tab_ids()
-        .into_iter()
-        .filter_map(AiTabId::from_id)
-        .collect()
+    let declared = crate::harness::registry::canonical_tab_ids();
+    let out: Vec<AiTabId> = declared.iter().filter_map(|id| AiTabId::from_id(id)).collect();
+    debug_assert_eq!(
+        out.len(),
+        declared.len(),
+        "a registered reserved tab id has no `AiTabId` variant: {declared:?}"
+    );
+    out
 }
 
 impl Settings {
@@ -6918,6 +6947,61 @@ mod tests {
             );
             assert_eq!(variant.as_str(), id, "as_str {id}");
         }
+        // Every variant is covered above, so the serde wire format cannot gain
+        // an unpinned spelling.
+        assert_eq!(AiTabId::ALL.len(), 3);
+    }
+
+    /// **The tab enum and the registry are one list** (V40 review finding M-3).
+    ///
+    /// `AiTabId` is still closed while the harness set is data, so the two can
+    /// part company in either direction and neither failure is loud:
+    ///
+    /// * a descriptor tab id with no variant is dropped by
+    ///   `canonical_ai_tab_order()`, cannot be held by `enabled_ai_tabs`, has no
+    ///   `default_ai_tab` arm to seed it and falls through `TabId::from_str` to
+    ///   `Shell` while `TabId::kind()` calls it `AiTool`. That direction is
+    ///   caught by 10(b) (`every_registry_entry_is_fully_wired`), which names
+    ///   the id and the three places to add it;
+    /// * a VARIANT with no descriptor is a tab id the tab bar orders and the
+    ///   integrity check can restore, backed by no harness at all. That
+    ///   direction is this test.
+    ///
+    /// The variant count is read off the declaration so `ALL` cannot silently
+    /// stop being every variant. Newline-agnostic: CI checks this tree out with
+    /// CRLF.
+    #[test]
+    fn the_ai_tab_enum_and_the_registry_are_the_same_list() {
+        let from_enum: Vec<&str> = AiTabId::ALL.iter().map(|t| t.as_str()).collect();
+        assert_eq!(
+            from_enum,
+            crate::harness::registry::canonical_tab_ids(),
+            "`AiTabId::ALL` and the registry's canonical tab ids must be the same list, in the              same order — a variant with no descriptor is a tab the bar orders and nothing backs"
+        );
+
+        let src = include_str!("schema.rs");
+        let start = src
+            .find("pub enum AiTabId {")
+            .expect("`AiTabId` is gone — re-point this test");
+        let decl = &src[start..];
+        let decl = &decl[..decl.find("
+}").expect("the declaration closes")];
+        let variants = decl
+            .lines()
+            .filter(|l| {
+                let t = l.trim();
+                !t.is_empty()
+                    && !t.starts_with("//")
+                    && !t.starts_with('#')
+                    && !t.starts_with("pub enum")
+                    && t.ends_with(',')
+            })
+            .count();
+        assert_eq!(
+            variants,
+            AiTabId::ALL.len(),
+            "`AiTabId::ALL` is not every variant — add the new one to it, and give it a              `HarnessDescriptor` tab id, a `TabId::from_str` arm and a `default_ai_tab` arm"
+        );
     }
 
     #[test]

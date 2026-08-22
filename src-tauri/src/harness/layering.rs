@@ -589,6 +589,56 @@ fn every_registry_entry_is_fully_wired() {
         //    a consumer token, and a label a human reads.
         assert!(!d.binaries.is_empty(), "{dir}: no binary — nothing can classify its tabs");
         assert!(!d.tab_ids.is_empty(), "{dir}: no reserved tab id");
+
+        // 3a. **Every declared tab id must be REPRESENTABLE by the tab
+        //     machinery** (V40 review finding M-3).
+        //
+        //     `AiTabId`, `TabId` and `default_ai_tab` are still closed enums
+        //     keyed to the two shipped harnesses, and nothing joined them to the
+        //     registry. A third descriptor compiled, passed every other test —
+        //     and then `canonical_ai_tab_order()` dropped its tab (no canonical
+        //     position), `enabled_ai_tabs: Vec<AiTabId>` could not hold it (the
+        //     user could not enable it and `restore_enabled_ai_builtins` never
+        //     restored it), `default_ai_tab` had no arm to seed it from, and
+        //     `TabId::from_str` answered `Shell(..)` while `TabId::kind()` —
+        //     which asks the registry — called the same id `AiTool`: a `Shell`
+        //     variant claiming AI kind.
+        //
+        //     None of that failed loudly, which is the class this milestone
+        //     exists to delete. Until the enums are registry-driven, THIS is the
+        //     join: adding a descriptor without its variants fails here, naming
+        //     the id and the three places it has to be added.
+        for tab_id in d.tab_ids {
+            assert!(
+                crate::settings::AiTabId::from_id(tab_id).is_some(),
+                "{dir}: reserved tab id `{tab_id}` has no `AiTabId` variant — it would have no                  canonical tab-bar position, `enabled_ai_tabs` could not hold it, and the user                  could never enable it. Add the variant (with its `#[serde(rename)]` if the                  kebab-case default does not spell the tab id) and its `default_ai_tab` arm."
+            );
+            assert!(
+                !matches!(
+                    crate::state::TabId::from_str(tab_id),
+                    crate::state::TabId::Shell(_)
+                ),
+                "{dir}: reserved tab id `{tab_id}` falls through `TabId::from_str` to `Shell`                  while `TabId::kind()` reports `AiTool` for it — a Shell variant claiming AI                  kind. Add its arm to `TabId::from_str`/`as_str`."
+            );
+            assert!(
+                matches!(
+                    crate::settings::default_ai_tab(
+                        crate::settings::AiTabId::from_id(tab_id).expect("checked above")
+                    ),
+                    crate::settings::TabConfig::AiTool(_)
+                ),
+                "{dir}: `default_ai_tab({tab_id})` does not seed an AI-kind tab config"
+            );
+        }
+        // …and the join in the other direction: the canonical order the tab bar
+        // and the integrity repair read must carry EVERY registered tab id, not
+        // the subset that happens to have a variant. `canonical_ai_tab_order`
+        // `filter_map`s, so a dropped id is invisible at runtime.
+        assert_eq!(
+            crate::settings::canonical_ai_tab_order().len(),
+            crate::harness::registry::canonical_tab_ids().len(),
+            "`canonical_ai_tab_order()` dropped a registered tab id — see the assertions above"
+        );
         assert!(!d.consumer.is_empty(), "{dir}: no MCP consumer token");
         assert!(!d.label.is_empty(), "{dir}: no human label");
 

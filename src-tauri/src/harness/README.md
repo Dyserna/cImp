@@ -80,13 +80,34 @@ A new harness is one directory, one registry row and no changes above L2.
    what was emitted, so the declaration cannot claim something the artifact does
    not do. Use `chp::EV_*` ids. A capability absent from `serves` is
    *unavailable, with a reason*, never *nobody wrote it down*.
-4. **Registry rows** in `contract.rs` for anything this harness serves that no
-   row covers yet, with `wired_in` pointing at your files. `wired_in_paths_exist`
-   will hold you to it.
-5. **A fallback reader** (`<id>/read.rs`) only if the harness cannot push. Tier C
+4. **Capability rows** for anything this harness serves that no row covers yet,
+   with `wired_in` pointing at your files. A row whose contract is a sentence
+   about *your product* ("this TUI accepts a bracketed paste as one literal
+   insertion") belongs in your directory and is returned by
+   `HarnessPlugin::capabilities()`; only rows stated about a *tab* or about
+   cImp's own seam stay in `contract.rs`. `contract::capabilities()` is the
+   joined view every consumer reads, and `wired_in_paths_exist` will hold you to
+   the paths.
+5. **`native_tools()`** — the tools your harness serves ITSELF (`harness/<id>/tools.rs`),
+   one `NativeTool` row per name: its class, whether it can rewrite the tree, and
+   what memory event it is recorded as. cImp never routes these, so nothing can
+   block them, but three things need them, and **omitting a name is not
+   neutral**: `harness::native::mutates_fs` fails CLOSED, so an undeclared tool
+   is treated as mutating and takes a checkpoint before every call.
+6. **`canaries()`** — a committed fixture plus an assertion per capability whose
+   reader could rot silently (`harness/<id>/canary.rs`). They run every
+   `cargo test` AND in the shipped binary when your CLI's version changes. Each
+   needs a negative twin: the same fixture with one load-bearing field renamed,
+   proving the positive one is load-bearing. `_synthetic/` fixtures carry a
+   `MANIFEST.toml` like every other.
+7. **`probe()` / `declared_unprobed()`** — what can be driven against the
+   *installed* CLI (`harness/<id>/probe.rs`), and what cannot, each with the
+   reason. The runner in `probe.rs` iterates the registry; it spawns nothing
+   itself, so a spawn you add there needs a `spawn_ledger::LEDGER` row.
+8. **A fallback reader** (`<id>/read.rs`) only if the harness cannot push. Tier C
    stays possible; it is now contained and declared rather than ambient. If you
-   write one, it will need L4 types — add it to `layering.rs`'s `UPWARD_EXEMPT`
-   with the reason.
+   write one — or a canary or probe that speaks its types — it will need L4
+   types; add the file to `layering.rs`'s `UPWARD_EXEMPT` with the reason.
 
 What you must **not** need: a new enum variant outside `harness/`, a new match
 arm in `tabs/config.rs`, a bespoke gate constant, a frontend mirror. Since V40

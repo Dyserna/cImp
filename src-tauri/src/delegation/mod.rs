@@ -896,6 +896,21 @@ pub(crate) fn record_row(
 /// flake wearing an assertion's clothes.
 #[cfg(test)]
 pub(crate) mod testing {
+
+    /// **The harness a tab runs, from the registry** — never a literal.
+    ///
+    /// V39's tests paired `TabId::OpenCode` with the string `"opencode"` by
+    /// hand at nine sites, which is the shape V40 exists to end: a tab id and a
+    /// harness id are joined by a descriptor, and a test that hard-codes the
+    /// join asserts today's roster rather than the relation. `expect` rather
+    /// than a fallback: a reserved tab id with no descriptor is a registry
+    /// defect, and a test that quietly substituted a default would hide it.
+    pub(crate) fn agent_of(tab: &TabId) -> String {
+        crate::harness::HarnessId::from_tab_id(tab.as_str())
+            .unwrap_or_else(|| panic!("{} is a reserved tab id with no descriptor", tab.as_str()))
+            .token()
+            .to_string()
+    }
     use super::*;
 
     /// Run `f` with the registry emptied before and after, under the lock every
@@ -938,7 +953,7 @@ pub(crate) mod testing {
             worker,
             TabId::OpenCode,
             "the driver".to_string(),
-            "opencode".to_string(),
+            agent_of(&TabId::OpenCode),
             DelegationMode::Explicit,
             0,
             u64::MAX,
@@ -971,7 +986,7 @@ mod tests {
             w,
             d.clone(),
             "the driver".to_string(),
-            "opencode".to_string(),
+            testing::agent_of(d),
             DelegationMode::Explicit,
             now,
             now + 1000,
@@ -1141,7 +1156,7 @@ mod tests {
                             "the worker",
                             TabId::OpenCode,
                             "B".to_string(),
-                            "opencode".to_string(),
+                            testing::agent_of(&TabId::OpenCode),
                             DelegationMode::Explicit,
                             100,
                             1_000,
@@ -1158,7 +1173,7 @@ mod tests {
                             "the worker",
                             TabId::Claude,
                             "A".to_string(),
-                            "claude".to_string(),
+                            testing::agent_of(&TabId::Claude),
                             DelegationMode::Explicit,
                             100,
                             1_000,
@@ -1196,7 +1211,7 @@ mod tests {
                 "the worker",
                 driver(),
                 "A".to_string(),
-                "opencode".to_string(),
+                testing::agent_of(&driver()),
                 DelegationMode::Explicit,
                 100,
                 1_000,
@@ -1210,7 +1225,7 @@ mod tests {
                 "the second worker",
                 driver(),
                 "A".to_string(),
-                "opencode".to_string(),
+                testing::agent_of(&driver()),
                 DelegationMode::Explicit,
                 100,
                 1_000,

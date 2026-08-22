@@ -3196,7 +3196,15 @@ mod tests {
     fn a_facade_failure_names_the_backend_and_never_the_tab() {
         use crate::delegation::DelegationError as D;
         // The reasons carry everything that must not come out the other side.
-        let leaky = "worker tab `api-work` is driven by `main` (claude/opencode), delegation";
+        // The forbidden harness ids come from the REGISTRY, so a harness added
+        // later is covered by this test the day it is registered rather than the
+        // day somebody remembers to widen a literal list (V40 Phase G).
+        let ids: Vec<&str> = crate::harness::registry::harness_ids();
+        let leaky = format!(
+            "worker tab `api-work` is driven by `main` ({}), delegation",
+            ids.join("/")
+        );
+        let leaky = leaky.as_str();
         for e in [
             D::Refused(leaky.into()),
             D::Timeout(leaky.into()),
@@ -3211,9 +3219,10 @@ mod tests {
                     msg.contains("lan-worker-2"),
                     "{e:?}: the driver must be told WHICH backend: {msg}"
                 );
-                for leak in [
-                    "api-work", "main", "claude", "opencode", "tab", "driven", "delegat",
-                ] {
+                for leak in ["api-work", "main", "tab", "driven", "delegat"]
+                    .into_iter()
+                    .chain(ids.iter().copied())
+                {
                     assert!(
                         !msg.contains(leak),
                         "{e:?}: `{leak}` reached the driver: {msg}"
@@ -3454,12 +3463,22 @@ mod tests {
     /// Registration is explicit; deregistration is RAII — the entry goes away
     /// when the guard drops, which is what the SSE loop relies on for every one
     /// of its exit paths.
+    /// **The push registry addresses by OPAQUE keys**, so its tests use opaque
+    /// keys.
+    ///
+    /// V39 wrote them as `"claude"` / `"claude-2"` / `"opencode"`, which read as
+    /// if the registry knew what a harness was. It does not: `tab` and
+    /// `consumer` are strings it stores and compares, and the properties under
+    /// test (a sibling is not addressed, a tab-less child is unaddressed, an
+    /// unknown key delivers to nobody, the channels flag is respected) hold for
+    /// any keys at all. Naming a real harness here would have made a registry
+    /// change look like it could break addressing.
     #[test]
     fn push_registry_deregisters_on_guard_drop() {
         let reg = PushRegistry::new();
         assert_eq!(reg.subscriber_count(), 0);
-        let (g1, _rx1) = reg.register(Some("claude".into()), "claude".into(), true);
-        let (g2, _rx2) = reg.register(Some("claude-2".into()), "claude".into(), true);
+        let (g1, _rx1) = reg.register(Some("tab-a".into()), "harness-x".into(), true);
+        let (g2, _rx2) = reg.register(Some("tab-b".into()), "harness-x".into(), true);
         assert_eq!(reg.subscriber_count(), 2);
         drop(g1);
         assert_eq!(reg.subscriber_count(), 1);
@@ -3467,7 +3486,7 @@ mod tests {
         assert_eq!(reg.subscriber_count(), 0);
         // Ids are monotonic, so a re-registered tab can never collide with the
         // stale entry of a connection that is still unwinding.
-        let (g3, _rx3) = reg.register(Some("claude".into()), "claude".into(), true);
+        let (g3, _rx3) = reg.register(Some("tab-a".into()), "harness-x".into(), true);
         assert_eq!(g3.id, 2);
     }
 
@@ -3477,13 +3496,13 @@ mod tests {
     #[tokio::test]
     async fn push_to_tab_addresses_only_that_tab() {
         let reg = PushRegistry::new();
-        let (_g_a, mut rx_a) = reg.register(Some("claude".into()), "claude".into(), true);
-        let (_g_b, mut rx_b) = reg.register(Some("claude-2".into()), "claude".into(), true);
+        let (_g_a, mut rx_a) = reg.register(Some("tab-a".into()), "harness-x".into(), true);
+        let (_g_b, mut rx_b) = reg.register(Some("tab-b".into()), "harness-x".into(), true);
         let (_g_nochan, mut rx_nochan) =
-            reg.register(Some("claude-3".into()), "claude".into(), false);
-        let (_g_anon, mut rx_anon) = reg.register(None, "claude".into(), true);
+            reg.register(Some("tab-c".into()), "harness-x".into(), false);
+        let (_g_anon, mut rx_anon) = reg.register(None, "harness-x".into(), true);
 
-        assert!(reg.push_to_tab("claude", PushNotice::new("hi", &[], [("kind", "t")])));
+        assert!(reg.push_to_tab("tab-a", PushNotice::new("hi", &[], [("kind", "t")])));
         assert_eq!(rx_a.recv().await.map(|n| n.content().to_string()), Some("hi".to_string()));
         assert!(rx_b.try_recv().is_err(), "sibling tab must not receive it");
         assert!(
@@ -3492,7 +3511,7 @@ mod tests {
         );
 
         // The channels flag is respected even when the tab matches.
-        assert!(!reg.push_to_tab("claude-3", PushNotice::new("x", &[], [] as [(&str, &str); 0])));
+        assert!(!reg.push_to_tab("tab-c", PushNotice::new("x", &[], [] as [(&str, &str); 0])));
         assert!(rx_nochan.try_recv().is_err());
 
         // An unknown tab delivers to nobody and says so.
@@ -3504,9 +3523,9 @@ mod tests {
     #[tokio::test]
     async fn push_broadcast_counts_channel_subscribers() {
         let reg = PushRegistry::new();
-        let (_g_a, mut rx_a) = reg.register(Some("claude".into()), "claude".into(), true);
-        let (_g_anon, mut rx_anon) = reg.register(None, "claude".into(), true);
-        let (_g_nochan, mut rx_nochan) = reg.register(Some("oc".into()), "opencode".into(), false);
+        let (_g_a, mut rx_a) = reg.register(Some("tab-a".into()), "harness-x".into(), true);
+        let (_g_anon, mut rx_anon) = reg.register(None, "harness-x".into(), true);
+        let (_g_nochan, mut rx_nochan) = reg.register(Some("tab-d".into()), "harness-y".into(), false);
 
         assert_eq!(
             reg.push_broadcast(PushNotice::new("all", &[], [] as [(&str, &str); 0])),
@@ -3522,13 +3541,13 @@ mod tests {
     #[test]
     fn push_drops_when_the_subscriber_queue_is_full() {
         let reg = PushRegistry::new();
-        let (_g, _rx) = reg.register(Some("claude".into()), "claude".into(), true);
+        let (_g, _rx) = reg.register(Some("tab-a".into()), "harness-x".into(), true);
         let notice = || PushNotice::new("x", &[], [] as [(&str, &str); 0]);
         for i in 0..PUSH_QUEUE_CAP {
-            assert!(reg.push_to_tab("claude", notice()), "push {i} should queue");
+            assert!(reg.push_to_tab("tab-a", notice()), "push {i} should queue");
         }
         assert!(
-            !reg.push_to_tab("claude", notice()),
+            !reg.push_to_tab("tab-a", notice()),
             "the {}th push must drop, not block",
             PUSH_QUEUE_CAP + 1
         );

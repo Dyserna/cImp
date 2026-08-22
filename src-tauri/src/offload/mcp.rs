@@ -2890,13 +2890,16 @@ mod tests {
     /// meaningfully different from the pre-V30 child's absent param.
     #[test]
     fn events_query_carries_tab_consumer_and_channels() {
+        // Opaque keys: `events_query` percent-free-formats whatever it is
+        // handed, so naming a real harness here would read as if the query
+        // string knew what one was (V40 Phase G).
         assert_eq!(
-            events_query(Some("claude-2"), "claude", true),
-            "?tab=claude-2&consumer=claude&channels=1"
+            events_query(Some("tab-b"), "harness-x", true),
+            "?tab=tab-b&consumer=harness-x&channels=1"
         );
         assert_eq!(
-            events_query(None, "opencode", false),
-            "?consumer=opencode&channels=0"
+            events_query(None, "harness-y", false),
+            "?consumer=harness-y&channels=0"
         );
     }
 
@@ -2974,8 +2977,9 @@ mod tests {
     /// crash-restart after a settings toggle cannot desync the two halves.
     #[test]
     fn session_push_gate_is_argv_only() {
-        // Same process-wide statics as above; `consumer()` defaults to "claude"
-        // when `run` never set it, which is the case in tests.
+        // Same process-wide statics as above; `consumer()` falls back to
+        // `harness::DEFAULT_HARNESS` when `run` never set it, which is the case
+        // in tests.
         CHANNEL_PUSH_ARG.store(false, Ordering::Release);
         assert!(!session_push_enabled(), "no --channel-push ⇒ no declaration");
         CHANNEL_PUSH_ARG.store(true, Ordering::Release);
@@ -3550,7 +3554,14 @@ mod delegate_tool_tests {
     #[test]
     fn the_generated_delegate_tool_set_is_exactly_the_registrys() {
         use std::collections::BTreeSet;
-        for own in [None, Some("claude"), Some("opencode")] {
+        // The "own tab" perspectives come from the reserved tab ids the
+        // settings below actually create, not from literals.
+        let own_tabs = [
+            None,
+            Some(crate::settings::CLAUDE_TAB_ID),
+            Some(crate::settings::OPENCODE_TAB_ID),
+        ];
+        for own in own_tabs {
             let mut s = Settings::default();
             s.tabs.push(crate::settings::default_claude_tab());
             s.tabs.push(crate::settings::default_opencode_tab());
@@ -3611,13 +3622,24 @@ mod delegate_tool_tests {
         );
     }
 
+    /// The harness a reserved tab id runs, from the registry.
+    ///
+    /// V39's tests wrote `"claude"` beside `CLAUDE_TAB_ID` by hand. The two are
+    /// joined by a descriptor; a test that hard-codes the join asserts today's
+    /// roster instead of the relation under test (V40 Phase G, decision 28).
+    fn worker_harness(tab_id: &str) -> crate::harness::HarnessId {
+        crate::harness::HarnessId::from_tab_id(tab_id)
+            .unwrap_or_else(|| panic!("{tab_id} is a reserved tab id with no descriptor"))
+    }
+
     /// **A blocked worker gate removes that harness's tool** - the fail-closed
     /// half of locked decision 16, observed where the model would see it.
     #[test]
     fn a_blocked_worker_gate_advertises_nothing() {
         let mut s = settings_with_manual(crate::settings::CLAUDE_TAB_ID);
         assert_eq!(delegate_targets(&s, None).len(), 1);
-        s.harness_row("claude").input_profile_status = "fail".to_string();
+        s.harness_row(worker_harness(crate::settings::CLAUDE_TAB_ID).token())
+            .input_profile_status = "fail".to_string();
         assert!(
             delegate_targets(&s, None).is_empty(),
             "a recorded input-profile failure must remove that harness's delegation tool, not \
@@ -3647,19 +3669,25 @@ mod delegate_tool_tests {
         }));
         assert_eq!(delegate_targets(&s, None).len(), 2, "both are workers");
 
-        // Claude's spike failed; OpenCode's did not.
-        s.harness_row("claude").input_profile_status = "fail".to_string();
+        // The two harnesses come from the two tabs the settings hold, so this
+        // asserts the RELATION (a failure is scoped to the harness it names)
+        // rather than today's roster.
+        let a = worker_harness(crate::settings::CLAUDE_TAB_ID);
+        let b = worker_harness(crate::settings::OPENCODE_TAB_ID);
+
+        // `a`'s spike failed; `b`'s did not.
+        s.harness_row(a.token()).input_profile_status = "fail".to_string();
         let left = delegate_targets(&s, None);
         assert_eq!(left.len(), 1, "only the failing harness drops out: {left:?}");
-        assert_eq!(left[0].0.token(), "opencode");
+        assert_eq!(left[0].0, b);
 
-        // …and the reverse: Claude passing does not vouch for OpenCode.
+        // …and the reverse: `a` passing does not vouch for `b`.
         let mut s2 = s.clone();
-        s2.harness_row("claude").input_profile_status = "pass".to_string();
-        s2.harness_row("opencode").input_profile_status = "fail".to_string();
+        s2.harness_row(a.token()).input_profile_status = "pass".to_string();
+        s2.harness_row(b.token()).input_profile_status = "fail".to_string();
         let left = delegate_targets(&s2, None);
         assert_eq!(left.len(), 1, "{left:?}");
-        assert_eq!(left[0].0.token(), "claude");
+        assert_eq!(left[0].0, a);
     }
 
     // ── V39 Phase C — the facade in the tool prose ──────────────────────────
@@ -3691,7 +3719,15 @@ mod delegate_tool_tests {
 
         let desc = offload_task_description(&s);
         assert!(desc.contains("lan-worker-2"), "the backend name is advertised: {desc}");
-        for leak in ["worker-tab", "tab worker-tab", "claude", "Claude", "tab \""] {
+        // Every registered harness's id AND label, from the registry: a third
+        // harness must be covered by this leak check the day it is registered.
+        let mut leaks: Vec<String> =
+            vec!["worker-tab".into(), "tab worker-tab".into(), "tab \"".into()];
+        for h in crate::harness::registry::all() {
+            leaks.push(h.token().to_string());
+            leaks.push(h.label().to_string());
+        }
+        for leak in &leaks {
             assert!(
                 !desc.contains(leak),
                 "the facade leaked {leak:?} into the offload_task description: {desc}"

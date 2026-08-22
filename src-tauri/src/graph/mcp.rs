@@ -5001,6 +5001,35 @@ mod surface_tests {
             "checks emptiness must be in the fingerprint"
         );
 
+        // **V39 Phase C** — a Remote-offload tab changes what `offload_task`
+        // advertises (one more backend, under a name of the user's choosing), so
+        // setting the role, renaming the backend and re-tiering it must each
+        // move the fingerprint. Without this the pulse gate would see no move
+        // and every live session would keep the old backend list until its next
+        // restart, which is exactly what locked decision 15 promises does not
+        // happen.
+        let facade = |name: &str, tier| {
+            let mut s = base.clone();
+            let mut tab = crate::settings::facade_tab("t1", name);
+            if let crate::settings::TabConfig::AiTool(c) = &mut tab {
+                c.delegation_backend.tier = tier;
+            }
+            s.tabs.push(tab);
+            SurfaceFingerprint::of(&s)
+        };
+        let fp = facade("lan-worker-2", crate::settings::BackendTier::Quality);
+        assert_ne!(fp, base_fp, "a Remote-offload tab must be in the fingerprint");
+        assert_ne!(
+            fp,
+            facade("lan-worker-3", crate::settings::BackendTier::Quality),
+            "renaming a facade backend changes the advertised bytes"
+        );
+        assert_ne!(
+            fp,
+            facade("lan-worker-2", crate::settings::BackendTier::Fast),
+            "re-tiering a facade changes what the router is told about it"
+        );
+
         // A field that does NOT change the advertised surface must NOT move it —
         // otherwise the cache would recompute needlessly on unrelated edits.
         let mut s = base.clone();

@@ -2498,23 +2498,26 @@ impl OffloadService {
             // one backend with no way to ask "why did nothing happen?".
             OffloadBackendKind::HarnessTab { tab } => {
                 let tab_id = crate::state::TabId::from_str(tab);
-                let ready = self
-                    .harness_pool
-                    .lock()
-                    .await
-                    .get(&b.name)
-                    .is_some_and(|h| h.is_ready());
-                let in_flight_here = crate::delegation::is_driven(&tab_id) as u32;
+                // The warm handle's verdict when there is one (it was refreshed
+                // by the last route or health tick), and a live check when there
+                // is not. The fallback is what keeps a freshly started app from
+                // showing every facade as unreachable until the first 12s health
+                // tick builds the handles — and it costs nothing once they
+                // exist, which is within one tick of startup.
+                let ready = match self.harness_pool.lock().await.get(&b.name) {
+                    Some(h) => h.is_ready(),
+                    None => crate::delegation::worker_ready(&self.app, &tab_id)
+                        .await
+                        .is_ok(),
+                };
                 BackendDashboard {
                     name: b.name.clone(),
                     kind: "harness".into(),
-                    state: if in_flight_here > 0 {
-                        "ready".into()
-                    } else if ready {
-                        "ready".into()
-                    } else {
-                        "unreachable".into()
-                    },
+                    // A tab mid-delegation is READY, not busy-and-therefore-down:
+                    // the busy-ness is the `in_flight` figure beside it, and the
+                    // engine's own preflight (which `is_ready` runs) deliberately
+                    // leaves idleness out for exactly this reason.
+                    state: if ready { "ready".into() } else { "unreachable".into() },
                     metrics: ServerMetrics::status_only(1, b.declared_context, in_flight, cap),
                 }
             }

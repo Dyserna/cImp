@@ -1231,6 +1231,50 @@ mod tests {
     use super::*;
     use crate::activity::ActivityKind;
 
+    /// **V39 Phase C — a facade is nothing to start and nothing to stop.**
+    ///
+    /// The supervisor owns processes. A Remote-offload tab is a tab the user
+    /// started themselves, so it must never reach the spawn path — not at
+    /// autostart, not from the dashboard's Start button, and not through the
+    /// legacy `primary` shortcut. All three iterate [`local_backends`], so this
+    /// asserts on that one funnel: with a facade in the pool it returns only the
+    /// Local entries, and with ONLY a facade configured it returns nothing at
+    /// all (rather than, say, the facade with an empty command, which would be
+    /// spawned as a blank process).
+    #[test]
+    fn a_facade_backend_is_never_a_spawnable_local_backend() {
+        let mut s = crate::settings::Settings::default();
+        s.offload.backends = vec![OffloadBackend {
+            name: "main".to_string(),
+            kind: OffloadBackendKind::Local {
+                server_command: "llama-server --jinja".to_string(),
+                autostart: true,
+                show_command_on_start: false,
+                auth_token: String::new(),
+            },
+            ..Default::default()
+        }];
+        s.tabs.push(crate::settings::facade_tab("t1", "lan-worker-2"));
+        assert!(
+            s.effective_offload_backends()
+                .iter()
+                .any(|b| b.name == "lan-worker-2"),
+            "the fixture must actually have a facade in the pool"
+        );
+        let spawnable: Vec<String> = local_backends(&s.offload)
+            .into_iter()
+            .map(|b| b.name)
+            .collect();
+        assert_eq!(spawnable, vec!["main".to_string()]);
+
+        // …and a pool whose only member is a facade has nothing to spawn.
+        let mut only = crate::settings::Settings::default();
+        only.tabs.push(crate::settings::facade_tab("t1", "lan-worker-2"));
+        assert!(local_backends(&only.offload)
+            .iter()
+            .all(|b| !matches!(b.kind, OffloadBackendKind::HarnessTab { .. })));
+    }
+
     /// The four transitions must not collapse into "ok / not ok". A `stop` is
     /// an intended shutdown and a `fail` is not, and the Events tab picks its
     /// status word from `tool` — so a verb renamed here without the frontend

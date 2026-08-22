@@ -18,8 +18,18 @@
 
   const metrics = $derived(dash.metrics);
   const isLocal = $derived(dash.kind === 'local');
+  // V39 Phase C: `harness` is the facade — a Remote-offload tab. Named for what
+  // it IS here, because this dashboard is the user's own view of their own
+  // machine; the `LAN` disguise is for the requesting harness's tool prose, not
+  // for the person who configured the tab.
   const kindLabel = $derived(
-    dash.kind === 'local' ? 'local' : dash.kind === 'lan' ? 'LAN' : 'cloud',
+    dash.kind === 'local'
+      ? 'local'
+      : dash.kind === 'lan'
+        ? 'LAN'
+        : dash.kind === 'harness'
+          ? 'tab worker'
+          : 'cloud',
   );
 
   // The full live dashboard renders only when the backend is actively polled.
@@ -335,6 +345,9 @@
   }
   .badge.cloud {
     color: var(--accent, #58a6ff);
+  }
+  .badge.harness {
+    color: var(--warning, #d29922);
   }
   .status {
     color: var(--text-secondary, #8b949e);

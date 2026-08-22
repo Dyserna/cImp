@@ -1066,6 +1066,42 @@ mod tests {
         );
     }
 
+    /// **A restarted worker is a worker again** (V39 review HIGH-3).
+    ///
+    /// `TabActivity::exited` is latched — a dead process is not something the
+    /// mirror can un-observe — so the whole question is who clears it. Before
+    /// this fix, only `TabAdded` did, which a restart into an existing tab
+    /// never sends: the tab was refused "has no running process" forever.
+    #[test]
+    fn a_restarted_worker_stops_being_refused_as_exited() {
+        use crate::state::{StateSignal, TabActivity, TabId};
+        let mirror = TabActivity::default();
+        let tab = TabId::from_str("ai-restart-probe");
+        mirror.note_signal(&StateSignal::ClaudeOutputStarted { tab: tab.clone() });
+        mirror.note_signal(&StateSignal::SubprocessExited {
+            tab: tab.clone(),
+            code: Some(1),
+        });
+        let dead = mirror.flags(&tab);
+        assert!(dead.exited);
+        assert!(
+            worker_process(true, dead.exited, "api-work").is_err(),
+            "an exited worker is refused, which is right while it IS exited"
+        );
+
+        mirror.note_signal(&StateSignal::ShellRestarted { tab: tab.clone() });
+        let alive = mirror.flags(&tab);
+        assert_eq!(
+            alive,
+            crate::state::TabActivityFlags::default(),
+            "a restart re-seeds the whole row, not just `exited`"
+        );
+        assert!(
+            worker_process(true, alive.exited, "api-work").is_ok(),
+            "a restarted worker must be drivable again"
+        );
+    }
+
     /// **A task cannot break out of the paste** (V39 review HIGH-2).
     ///
     /// The markers are in-band, so this is the whole boundary: refuse at

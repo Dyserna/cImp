@@ -10,5 +10,5 @@ mod manager;
 
 pub use manager::{
     spawn_state_manager, AvatarState, InputLengths, ReadOnlySource, ReadOnlyTabs, StateEvent,
-    StateSignal, TabActivity, TabId, TabKind, TabKindWire, TabMeta,
+    StateSignal, TabActivity, TabActivityFlags, TabId, TabKind, TabKindWire, TabMeta,
 };

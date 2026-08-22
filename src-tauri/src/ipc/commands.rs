@@ -125,6 +125,18 @@ pub async fn pty_restart(
             settings,
         )
         .await;
+    // V39 review HIGH-3: re-seed the activity mirror for the fresh subprocess.
+    //
+    // `TabActivity::exited` is latched, and the two signals that clear it do
+    // not cover this path: `TabAdded` fires for a NEW tab, and `ShellRestarted`
+    // is emitted for Shell-kind tabs only (`TabRegistry::restart_tab`). An AI
+    // tab — the only kind a delegation can drive — therefore restarted into a
+    // row still marked `exited`, and preflight refused it forever with "has no
+    // running process". Only on success: a failed restart leaves no process,
+    // and clearing the flag would claim one.
+    if result.is_ok() {
+        state.tab_activity.reset(&tab);
+    }
     // V1.4-04 D.6: on user-initiated restart, the prior session's
     // scrollback is no longer relevant. Clear the in-memory ring so
     // the next graceful-exit persist doesn't include stale bytes from

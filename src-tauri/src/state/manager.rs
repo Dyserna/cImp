@@ -208,9 +208,12 @@ pub struct TabActivityFlags {
     /// type into a tab mid-burst: the request would land in the middle of
     /// someone else's turn.
     pub output_running: bool,
-    /// The tab's subprocess has exited. Latched: nothing in this mirror clears
-    /// it, because nothing but a restart can — and a restart re-seeds the row
-    /// through `TabAdded`.
+    /// The tab's subprocess has exited. Latched: only a restart clears it —
+    /// `TabAdded` (a fresh tab), `ShellRestarted` (a shell respawn) or
+    /// `pty_restart` (an AI tab respawn, which emits no signal of its own).
+    /// V39 review HIGH-3 is what happens when one of those is missing: the row
+    /// stays `exited` and every later preflight refuses the tab with "has no
+    /// running process", for a process that is running.
     pub exited: bool,
 }
 
@@ -268,6 +271,14 @@ impl TabActivity {
                 f.awaiting_permission = false;
                 f.awaiting_question = false;
             }),
+            // V39 review HIGH-3: a restarted subprocess is a CLEAN one. The
+            // mirror's `exited` is latched and was cleared only by `TabAdded`,
+            // which a restart into an existing tab never sends — so a worker
+            // that had exited once was refused forever, "has no running
+            // process", however many times it was restarted. Whole-row reset
+            // rather than clearing `exited` alone: every flag here describes
+            // the process that just went away.
+            StateSignal::ShellRestarted { tab } => (tab, |f| *f = TabActivityFlags::default()),
             // A user keystroke or submit clears a standing prompt in the state
             // manager's own bookkeeping, so it clears here too — otherwise a
             // prompt the user answered by typing would hold the deadline open

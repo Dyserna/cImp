@@ -1291,6 +1291,14 @@
     chartPreview[seg.key] = undefined;
   }
 
+  // V40 Phase C (locked decision 23): the three lines below used to name ONE
+  // harness's mechanisms — "Claude Code version", "≥2 Claude sessions", "the
+  // PreToolUse hook" — from the frontend, for rules that fire per registered
+  // harness now. The per-rule fix pointer is `Capability::drift_hint()` in Rust
+  // and reaches the card in its `rationale`; this tooltip is the THRESHOLD
+  // reference, so it states the condition and leaves the mechanism to the card
+  // that fires. Phase F replaces the whole block with backend-published
+  // descriptions (the rest of it still restates numbers `advisor.rs` owns).
   const ADVISOR_RULES_TOOLTIP =
     'advisor.raise_context_min_score.v1: ≥5 sessions, ≥200 injections, ≥70% never re-touched → raise context_min_score.\n' +
     'advisor.raise_read_advisor_min_lines.v1: ≥5 sessions, ≥20 reminders, ≥50% re-read anyway → raise read_advisor_min_lines.\n' +

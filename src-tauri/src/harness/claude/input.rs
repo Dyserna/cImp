@@ -42,7 +42,7 @@
 //! Nothing here is spawn-baked: the profile is read when a delegation runs, so
 //! changing it needs no tab restart (locked decision 15).
 
-use crate::harness::input::{InputProfile, PasteMode};
+use crate::harness::plugin::{InputProfile, PasteMode};
 
 /// Milliseconds between the paste and the submit. See the module docs — a
 /// floor, not a measurement.

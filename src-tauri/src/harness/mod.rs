@@ -96,14 +96,71 @@ pub mod chp;
 pub mod claude;
 pub mod contract;
 pub mod health;
-pub mod input;
+
 #[cfg(test)]
 mod layering;
 pub mod opencode;
+pub mod plugin;
 pub mod probe;
 pub mod reader;
+pub mod registry;
 pub mod render;
 pub mod verify;
 
-pub use input::{input_profile, InputProfile};
+pub use plugin::{HarnessPlugin, InputProfile};
 pub use reader::{spawn, OobContext, OobSpec};
+pub use registry::{HarnessId, PerHarness, DEFAULT_HARNESS, HARNESSES};
+
+/// **The harness-neutral input-profile lookup** (V39 locked decision 16, moved
+/// behind the plugin by V40 Phase A, amendment 0-a).
+///
+/// `id` is the CHP `agent` discriminator. `None` is a first-class answer, not an
+/// error: it is what makes "a harness without an `input.rs` is not a valid
+/// worker" a fail-closed property instead of a panic — and it is now also the
+/// answer for a harness nobody registered, which used to be OpenCode's.
+pub fn input_profile(id: &str) -> Option<InputProfile> {
+    HarnessId::from_id(id)?.plugin()?.input_profile()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use plugin::PasteMode;
+
+    /// **Every harness the registry knows has a profile, and an unknown id has
+    /// none.** The second half is the fail-closed direction: a tab pointed at
+    /// some other CLI must not inherit another harness's paste rules.
+    #[test]
+    fn every_registry_harness_declares_a_profile_and_nothing_else_does() {
+        let ids = registry::harness_ids();
+        assert!(!ids.is_empty(), "the registry names at least one harness");
+        for id in &ids {
+            assert!(
+                input_profile(id).is_some(),
+                "harness `{id}` has registry rows but no input profile — it cannot be a \
+                 delegation worker, and the gate must be the thing that says so"
+            );
+        }
+        for unknown in ["", "aider", "Claude", "claude.exe", "opencode-2"] {
+            assert!(
+                input_profile(unknown).is_none(),
+                "`{unknown}` resolved to a profile it must not have"
+            );
+        }
+    }
+
+    /// Both shipped profiles submit with CR and paste bracketed. Pinned because
+    /// the engine's write order (paste → settle → submit) is only correct for a
+    /// profile shaped this way; a future `Raw` harness needs the engine's
+    /// ordering test re-read, not just a new constant.
+    #[test]
+    fn the_shipped_profiles_are_bracketed_and_submit_with_cr() {
+        for id in registry::harness_ids() {
+            let p = input_profile(id).expect("declared above");
+            assert_eq!(p.paste, PasteMode::Bracketed, "{id}");
+            assert_eq!(p.submit, b"\r", "{id}");
+            assert!(p.settle_ms > 0, "{id}: a zero settle is the defect this field exists for");
+            assert!(p.max_paste_bytes >= 4096, "{id}: the bound must admit a real request");
+        }
+    }
+}

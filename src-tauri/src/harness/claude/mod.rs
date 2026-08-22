@@ -19,3 +19,7 @@ pub mod input;
 pub mod overlay;
 pub mod read;
 pub mod statusline;
+
+pub mod plugin;
+
+pub use plugin::PLUGIN;

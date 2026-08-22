@@ -13,7 +13,10 @@
 //! [`tools`] is a change to a security control, not to a data pipe.
 
 pub mod config;
+pub mod harness_plugin;
 pub mod input;
 pub mod plugin;
 pub mod read;
 pub mod tools;
+
+pub use harness_plugin::PLUGIN;

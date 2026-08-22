@@ -40,7 +40,7 @@
 //! degradation. The engine's preflight accepts either source; what it refuses
 //! is a tab with neither.
 
-use crate::harness::input::{InputProfile, PasteMode};
+use crate::harness::plugin::{InputProfile, PasteMode};
 
 /// Milliseconds between the paste and the submit. See the module docs.
 const SETTLE_MS: u64 = 80;

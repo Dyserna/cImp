@@ -1545,7 +1545,7 @@ pub const CAPABILITIES: &[Capability] = &[
         id: CAP_DELEGATION_WORKER,
         harness: Harness::Any,
         tier: Seam::D,
-        contract: "A tab may be driven as a delegation worker: its harness serves CHP                    `assistant_text` for the turn's final assistant message (or has a live                    fallback reader that does), and it declares an input profile whose paste +                    submit encoding yields exactly one turn. Harness-neutral by construction —                    the requirement is stated about a tab, not about a vendor.",
+        contract: "A tab may be driven as a delegation worker: its harness serves CHP                    `assistant_text` ONCE PER TURN, carrying that turn's final assistant                    message (or has a live fallback reader that derives the same boundary), and it declares an input profile whose paste +                    submit encoding yields exactly one turn. Harness-neutral by construction —                    the requirement is stated about a tab, not about a vendor.",
         depends_on: &[Dep::Behavior(
             "a completion signal exists for this tab (pushed `assistant_text`, or the harness's              declared fallback reader) AND the harness declares an input profile — a worker cImp              can type into but cannot read back from would silently swallow the task",
         )],

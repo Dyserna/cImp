@@ -800,6 +800,22 @@ pub(crate) struct Tracker {
     msg_parts: HashMap<String, Vec<String>>,
     /// messageIDs known to be assistant messages.
     assistant: HashSet<String>,
+    /// The same ids in first-seen order, so [`Tracker::flush_all`] speaks a
+    /// turn's messages in the order the stream produced them rather than in a
+    /// `HashSet`'s. V39 review HIGH-1 made that order load-bearing: the
+    /// delegation completion is the LAST message of the turn, and "last" has to
+    /// mean something.
+    assistant_order: Vec<String>,
+    /// **The turn's last flushed assistant text, held until the turn is over**
+    /// (V39 review HIGH-1).
+    ///
+    /// [`Tracker::flush`] runs per MESSAGE — a turn with a preamble, a tool
+    /// call and an answer flushes twice — and it used to hand each one straight
+    /// to `note_turn_text`. The delegation engine takes the first completion it
+    /// sees, so "I'll read that file first." was returned as the reply and the
+    /// worker's slot was released while it was still working. The text is
+    /// buffered here instead and filed once, from [`Tracker::close_turn`].
+    turn_last_text: Option<String>,
     /// messageIDs already spoken (don't double-flush on idle).
     flushed: HashSet<String>,
     /// Whether we've emitted ClaudeOutputStarted without a matching Stopped.
@@ -842,7 +858,9 @@ impl Tracker {
                 let info = props.get("info").unwrap_or(&Value::Null);
                 if info.get("role").and_then(Value::as_str) == Some("assistant") {
                     if let Some(id) = info.get("id").and_then(Value::as_str) {
-                        self.assistant.insert(id.to_string());
+                        if self.assistant.insert(id.to_string()) {
+                            self.assistant_order.push(id.to_string());
+                        }
                         self.set_working(ctx, true);
                         // Present-but-null must read as "not completed": a
                         // nullable-until-set `completed` field would otherwise
@@ -930,6 +948,23 @@ impl Tracker {
     /// `both_turn_over_signals_do_not_double_speak`.
     async fn close_turn(&mut self, ctx: &OobContext) {
         self.flush_all(ctx).await;
+        // V39 Phase B + review HIGH-1: delegation's completion signal, and the
+        // ONLY place this reader files one. It is filed HERE — after
+        // `flush_all`, on the turn-over edge — carrying the LAST assistant
+        // message of the turn, which is what `last_assistant_message` means on
+        // the pushed side (locked decision 16's read half must mean the same
+        // thing whichever half serves it). Last message rather than a
+        // concatenation of the turn's messages for the same reason: a preamble
+        // is not part of the answer, and gluing it on would hand the driver
+        // text the worker had already superseded.
+        //
+        // A turn that produced no text at all files nothing: `session.idle`
+        // also fires for turns this tab never spoke in, and minting an empty
+        // completion for one would report "the worker said nothing" for a turn
+        // the worker never started.
+        if let Some(text) = self.turn_last_text.take() {
+            ctx.note_turn_text(&text);
+        }
         self.set_working(ctx, false);
         // Turn over: whatever part state is still buffered belongs to
         // messages that will never flush (user echoes, tool parts).
@@ -1080,13 +1115,14 @@ impl Tracker {
         }
         if !out.trim().is_empty() {
             trace!(tab = ?ctx.tab, "OpenCode OOB: speaking assistant message (reasoning excluded)");
-            // V39 Phase B: delegation's completion signal. This reader is
-            // OpenCode's DECLARED path for `assistant_text` (the plugin says
-            // `cannot`, by design D6), so for an OpenCode worker this call —
-            // not the CHP push core — is what ends a delegation's wait. Beside
-            // `speak` rather than inside it: `speak` is gated by the per-tab
-            // TTS toggle, and a delegation must complete on a silent tab.
-            ctx.note_turn_text(&out);
+            // V39 Phase B + review HIGH-1: this reader is OpenCode's DECLARED
+            // path for `assistant_text` (the plugin says `cannot`, by design
+            // D6), so for an OpenCode worker it — not the CHP push core — is
+            // what ends a delegation's wait. But a message is not a turn:
+            // buffer it, and let `close_turn` file the last one. TTS is
+            // unchanged and deliberately so — speaking each message as it
+            // completes is what makes speech track the tab.
+            self.turn_last_text = Some(out.clone());
             ctx.speak(&out).await;
         }
     }
@@ -1094,7 +1130,7 @@ impl Tracker {
     /// Flush every not-yet-spoken assistant message (turn ended).
     async fn flush_all(&mut self, ctx: &OobContext) {
         let ids: Vec<String> = self
-            .assistant
+            .assistant_order
             .iter()
             .filter(|id| !self.flushed.contains(*id))
             .cloned()
@@ -1142,7 +1178,14 @@ mod tests {
         // true by default for opencode) is satisfied — Settings::default() ships
         // no tabs; the real app seeds them via persistence.
         let mut defaults = Settings::default();
-        defaults.tabs.push(crate::settings::default_opencode_tab());
+        let mut seeded = crate::settings::default_opencode_tab();
+        // The gate is keyed by TAB ID, so a test that uses an id of its own
+        // (to keep the process-global delegation registry to itself) still has
+        // to be able to speak.
+        if let crate::settings::TabConfig::AiTool(c) = &mut seeded {
+            c.id = tab.to_string();
+        }
+        defaults.tabs.push(seeded);
         let settings = SettingsHandle::new(defaults.clone(), defaults, std::env::temp_dir());
         let ctx = OobContext {
             tab: TabId::from_str(tab),
@@ -1190,6 +1233,87 @@ mod tests {
             Ok(TtsRequest::Synthesize { text, .. }) => assert_eq!(text, "Hello world."),
             other => panic!("expected synthesize, got {other:?}"),
         }
+    }
+
+    /// **V39 review HIGH-1: one completion per TURN, and it is the turn's LAST
+    /// assistant message.**
+    ///
+    /// The shape that broke it: a preamble message, a tool call, then the real
+    /// answer — one turn, two assistant messages. `flush` runs per message, so
+    /// the preamble used to be filed as the delegation's completion the moment
+    /// it completed; the engine takes the first completion it sees, so the
+    /// driver got "I'll read that file first." and the worker's slot was
+    /// released while it was still working.
+    ///
+    /// Asserted through the real registry (`delegation::testing`) rather than
+    /// on the tracker's field, because the property is about what the ENGINE
+    /// can observe, and the engine reads the registry.
+    #[tokio::test]
+    async fn a_turn_files_one_completion_and_it_is_the_final_message() {
+        // A tab id of this test's own, seeded into settings so the per-tab TTS
+        // gate still passes. The V35 canary suite runs a `Tracker` over the
+        // OpenCode SSE fixture in this same binary, and it files completions
+        // for the `opencode` tab — a claim on that id would be fed by it.
+        let (ctx, mut tts_rx, _sig) = ctx_with("ai-high1-worker");
+        let worker = TabId::from_str("ai-high1-worker");
+        // Held for the whole body: the registry is one process-global and this
+        // test drives it across `await`s, so the exclusion every other
+        // registry test takes has to be a guard rather than a closure.
+        let _registry = crate::delegation::testing::lock_registry();
+        crate::delegation::testing::claim_and_submit(&worker);
+        let mut t = Tracker::default();
+        let say = |mid: &str, pid: &str, text: &str| {
+            (
+                ev(&format!(
+                    r#"{{"type":"message.updated","properties":{{"info":{{"id":"{mid}","role":"assistant","time":{{"created":1}}}}}}}}"#
+                )),
+                ev(&format!(
+                    r#"{{"type":"message.part.updated","properties":{{"part":{{"id":"{pid}","type":"text","messageID":"{mid}","text":"{text}"}}}}}}"#
+                )),
+                ev(&format!(
+                    r#"{{"type":"message.updated","properties":{{"info":{{"id":"{mid}","role":"assistant","time":{{"created":1,"completed":2}}}}}}}}"#
+                )),
+            )
+        };
+        // Message 1: the preamble. It completes mid-turn — that is the whole
+        // bug — and it is spoken, which is wanted.
+        let (a, b, c) = say("m1", "p1", "I'll read that file first.");
+        t.handle(&a, &ctx).await;
+        t.handle(&b, &ctx).await;
+        t.handle(&c, &ctx).await;
+        assert!(
+            crate::delegation::testing::take(&worker).is_none(),
+            "a mid-turn message must NOT file a completion — the turn is not over"
+        );
+        // A tool call happens here; the tracker sees nothing it speaks.
+        // Message 2: the answer.
+        let (a, b, c) = say("m2", "p2", "The file exports three symbols.");
+        t.handle(&a, &ctx).await;
+        t.handle(&b, &ctx).await;
+        t.handle(&c, &ctx).await;
+        assert!(
+            crate::delegation::testing::take(&worker).is_none(),
+            "still mid-turn: nothing has said the turn is over"
+        );
+        // The turn-over edge.
+        t.handle(&ev(r#"{"type":"session.idle","properties":{}}"#), &ctx)
+            .await;
+        assert_eq!(
+            crate::delegation::testing::take(&worker).as_deref(),
+            Some("The file exports three symbols."),
+            "the completion is the turn's LAST assistant message"
+        );
+        assert!(
+            crate::delegation::testing::take(&worker).is_none(),
+            "filed exactly once"
+        );
+        // TTS is unchanged: both messages were spoken as they completed.
+        let spoken: Vec<String> = std::iter::from_fn(|| match tts_rx.try_recv() {
+            Ok(TtsRequest::Synthesize { text, .. }) => Some(text),
+            _ => None,
+        })
+        .collect();
+        assert_eq!(spoken.len(), 2, "both messages are still spoken: {spoken:?}");
     }
 
     #[tokio::test]

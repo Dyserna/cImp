@@ -9,7 +9,10 @@
 //!   `assistant_text`, arbitrated. A tab that pushes it is served by
 //!   `offload::loopback::assistant_text_core`; a tab that does not is served by
 //!   its declared fallback reader through `OobContext::note_turn_text`. Both
-//!   land in [`note_assistant_text`], and exactly one fires per message.
+//!   land in [`note_assistant_text`], and exactly one of them fires — **once
+//!   per TURN, carrying that turn's FINAL assistant message** (V39 review
+//!   HIGH-1). A mid-turn preamble is not a reply, and a completion minted from
+//!   one released the slot while the worker was still working.
 //! * **push half** (submitting a turn) = the per-harness
 //!   [`InputProfile`](crate::harness::InputProfile), reached through
 //!   `harness::input_profile(id)` keyed by the tab's harness id. `None` ⇒ that
@@ -454,10 +457,18 @@ fn mark_submitted(worker: &TabId, at_ms: u64) {
     });
 }
 
-/// **The completion feed** — one completed assistant message for `tab`.
+/// **The completion feed** — one completed TURN's final assistant message for
+/// `tab`.
 ///
 /// Called from both arbitrated halves of the read seam (the CHP push core and
-/// the fallback reader), so exactly one of them fires per message. A no-op
+/// the fallback reader), so exactly one of them fires per turn.
+///
+/// **Per turn, not per message** (V39 review HIGH-1). Both producers owe this
+/// contract: the CHP push core is fed by the harness's turn-over hook
+/// (`last_assistant_message`), and each fallback reader buffers its turn and
+/// files the last assistant text at the turn-over edge. A per-MESSAGE feed
+/// handed the driver a mid-turn preamble ("I'll read that file first.") as the
+/// reply and released the worker's slot while it was still working. A no-op
 /// unless a delegation is in flight on that tab: a tab nobody is driving needs
 /// no slot, and keeping one would turn this into an unbounded transcript
 /// buffer for every open tab.
@@ -641,8 +652,81 @@ pub(crate) fn record_row(
     });
 }
 
+/// **Test-only doors into the process-global registry.**
+///
+/// The completion feed's two producers live in `harness/` (the fallback
+/// readers), so the test that proves a reader files exactly one completion per
+/// TURN — V39 review HIGH-1 — has to claim a slot and read the slot back from
+/// another module. Rather than widen the shipped API for it, the doors are
+/// named here and compiled only under `cfg(test)`.
+///
+/// [`with_clean_registry`](testing::with_clean_registry) is the same guard this
+/// module's own tests take, and taking it is not optional for a caller: the
+/// registry is one process-global, `cargo test` runs its tests in parallel
+/// threads, and a test that cleared it while another held a claim would be a
+/// flake wearing an assertion's clothes.
+#[cfg(test)]
+pub(crate) mod testing {
+    use super::*;
+
+    /// Run `f` with the registry emptied before and after, under the lock every
+    /// registry-touching test shares.
+    pub(crate) fn with_clean_registry<T>(f: impl FnOnce() -> T) -> T {
+        let _g = lock_registry();
+        f()
+    }
+
+    /// The same exclusion as [`with_clean_registry`], as a guard — for a test
+    /// whose body `await`s (a reader's tracker), which a closure taking `&mut`
+    /// state cannot wrap. Clears on acquisition and again on drop.
+    pub(crate) fn lock_registry() -> RegistryGuard {
+        static GUARD: Mutex<()> = Mutex::new(());
+        let g = GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        clear();
+        RegistryGuard(g)
+    }
+
+    pub(crate) struct RegistryGuard(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+    impl Drop for RegistryGuard {
+        fn drop(&mut self) {
+            clear();
+        }
+    }
+
+    fn clear() {
+        registry(|r| {
+            r.in_flight.clear();
+            r.completions.clear();
+        });
+    }
+
+    /// Claim `worker`'s slot for a fake driver and mark it submitted at time 0,
+    /// so any completion recorded afterwards correlates with this delegation.
+    pub(crate) fn claim_and_submit(worker: &TabId) {
+        claim(
+            worker,
+            TabId::OpenCode,
+            "the driver".to_string(),
+            "opencode".to_string(),
+            DelegationMode::Explicit,
+            0,
+            u64::MAX,
+        )
+        .expect("the slot was free");
+        mark_submitted(worker, 0);
+    }
+
+    /// The completion filed for `worker`, consuming it — `None` when the reader
+    /// has filed nothing yet, which is the half HIGH-1 is about.
+    pub(crate) fn take(worker: &TabId) -> Option<String> {
+        take_completion(worker)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::testing::with_clean_registry;
     use super::*;
 
     fn worker() -> TabId {
@@ -650,25 +734,6 @@ mod tests {
     }
     fn driver() -> TabId {
         TabId::OpenCode
-    }
-
-    /// Every test in this module mutates one process-global registry, so they
-    /// share a lock and clean up after themselves. Cheaper and more honest than
-    /// threading a handle through six call sites for the sake of tests: the
-    /// singleton IS the single-slot property under test.
-    fn with_clean_registry<T>(f: impl FnOnce() -> T) -> T {
-        static GUARD: Mutex<()> = Mutex::new(());
-        let _g = GUARD.lock().unwrap_or_else(|e| e.into_inner());
-        registry(|r| {
-            r.in_flight.clear();
-            r.completions.clear();
-        });
-        let out = f();
-        registry(|r| {
-            r.in_flight.clear();
-            r.completions.clear();
-        });
-        out
     }
 
     fn claim_one(w: &TabId, d: &TabId, now: u64) -> Result<u64, String> {

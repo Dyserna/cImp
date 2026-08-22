@@ -1,6 +1,6 @@
 # CHP — the cImp Harness Protocol
 
-**Protocol version:** `chp = 1`
+**Protocol version:** `chp = 2`
 
 **Status:** declared V35 Phase I (2026-08-16), issue #66; extended additively by
 V35 Phase J (2026-08-17), issue #67 — § 4.5 — and again by V35 Phase L
@@ -491,6 +491,39 @@ not broken" means here, and OpenCode is the standing example (§ 4.6).
 **Optional, reserved:** `session.usage`, `session.context` — and both are
 reserved *permanently until upstream changes*, for the reason § 4.6 gives: no
 hook payload carries token counts or a context window.
+
+**Optional, reserved (V40 Phase C, `chp = 2`):** `harness.output_started`
+(`POST /session/output_started`), `harness.output_stopped`
+(`POST /session/output_stopped`), `subagents.active`
+(`POST /session/subagents_active`), `permission.detected`
+(`POST /permission/detected`), `permission.resolved`
+(`POST /permission/resolved`), `turn.usage` (`POST /session/turn_usage`) and
+`drift` (`POST /activity/drift`).
+
+Each names something cImp already knows, in a vocabulary that is currently one
+harness's:
+
+| Event | What it replaces |
+|---|---|
+| `harness.output_started` / `harness.output_stopped` | `StateSignal::ClaudeOutputStarted` / `…Stopped` — the core activity signal vocabulary, named after one product. The TUI-marker heuristic that produces it today stays as a declared `ActivitySource` (V40 locked decision 18). |
+| `subagents.active` | `AgentsActiveChanged`, documented as "the count of in-flight `Task` sub-agents … emitted by the transcript tail" — a Claude mechanism stated as a core signal. |
+| `permission.detected` / `permission.resolved` | The neutral half of prompt detection. Which notification type or TUI footer means a prompt is on screen is the harness's own grammar (`harness/<id>/prompts.rs`, `harness/claude/hook.rs`); what reaches core is an edge and a tab. `permission.event` above is unchanged and stays — it is the legacy `--notify-hook` transport, a Claude payload posted verbatim. |
+| `turn.usage` | One turn's reading, carrying the neutral `QuotaWindow` / `TokenKinds` / `TurnOrigin` types. Distinct from `session.usage`, which is the whole-session roll-up. |
+| `drift` | Contract drift a *reader* reports — today an Activity row core writes on the reader's behalf. |
+
+**Nothing serves them yet, and that is the `live` column doing its job.** The
+vocabulary is what L3 gates against, so it is one list rather than a live half
+plus a design document; V40 Phase D wires the producers. `is_push_route` answers
+`false` for every one of these routes, so a POST to one is a 404 today.
+
+### Why `chp` went to 2
+
+Vocabulary additions only. Every existing event, route and body keeps its shape,
+so an artifact written by a `chp = 1` build still speaks the whole of what it
+knew — nothing is refused, and § 6.1's staleness report is the entire
+consequence: a tab open across this upgrade reads as `old_plugin` until it is
+restarted, which is true (it cannot serve an event its generator had never heard
+of) and is precisely the mismatch the field exists to make legible.
 
 The table lives in code as `harness::chp::EVENTS` and is checked against this
 document by `harness::chp::tests::the_doc_documents_every_event`, so an id

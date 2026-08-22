@@ -10407,7 +10407,14 @@ mod tests {
             crate::activity::Attribution::Tab("opencode-1".to_string()),
             "the tab was validated against the configured list before this point"
         );
-        assert!(first.entry.target.contains("chp 1"), "{}", first.entry.target);
+        assert!(
+            first
+                .entry
+                .target
+                .contains(&format!("chp {}", crate::harness::chp::CHP_VERSION)),
+            "{}",
+            first.entry.target
+        );
         assert!(first.entry.target.contains("v1.18.13"), "{}", first.entry.target);
         assert!(first.entry.target.contains("serves 2"), "{}", first.entry.target);
         assert!(first.entry.target.contains("cannot 1"), "{}", first.entry.target);
@@ -10476,12 +10483,17 @@ mod tests {
         assert_eq!(crate::graph::source_for_consumer(env.agent_token()), "claude");
         assert_eq!(tab, "claude-1");
 
-        // …and the body the generated plugin now sends.
-        let (env, _) = crate::harness::chp::envelope(
-            "/latch/beacon",
-            br#"{"chp":1,"tab":"opencode-1","consumer":"opencode","tool":"webfetch"}"#,
-        )
-        .expect("the plugin's beacon body");
+        // …and the body the generated plugin now sends. The literal is built
+        // from `CHP_VERSION` rather than typed, because the point of this arm
+        // is that the observer reads whatever the generator baked in — a
+        // hard-coded number would turn every protocol bump into a red test
+        // about nothing.
+        let body = format!(
+            "{{\"chp\":{},\"tab\":\"opencode-1\",\"consumer\":\"opencode\",\"tool\":\"webfetch\"}}",
+            crate::harness::chp::CHP_VERSION
+        );
+        let (env, _) = crate::harness::chp::envelope("/latch/beacon", body.as_bytes())
+            .expect("the plugin's beacon body");
         assert_eq!(env.chp, Some(crate::harness::chp::CHP_VERSION));
         assert_eq!(
             crate::graph::source_for_consumer(env.agent_token()),

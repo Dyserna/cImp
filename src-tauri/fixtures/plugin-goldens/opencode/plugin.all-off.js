@@ -56,7 +56,7 @@ const CIMP_TOKEN = "deadbeef00";
 // It is ADDITIVE and TOLERATED-ABSENT in both directions: an app that predates
 // CHP ignores the field, and an app that postdates it treats a body without one
 // as pre-CHP. Nothing is ever refused over a version.
-const CIMP_CHP = 1;
+const CIMP_CHP = 2;
 const CIMP_INJECT_ENABLED = false;
 const CIMP_AUTO_CHECK_ENABLED = false;
 const CIMP_EDIT_TOOLS = new Set(["edit", "write", "patch"]);

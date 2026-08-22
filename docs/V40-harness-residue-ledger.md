@@ -1,6 +1,6 @@
 # V40 appendix — harness-specific residue outside `harness/` (the V35 leftovers ledger)
 
-**Status:** worklist for `docs/MILESTONE-V40-harness-registry.md` (sweep of 2026-08-21/22; line numbers are as of develop `79c2d9c`). Every row is something true of Claude Code or OpenCode specifically that still lives in cImp core. The milestone's decisions 18–29 say where each area goes; this file is the row-level brief for the implementation agents and is retired (deleted) when the milestone closes — the layering tests are the durable record.
+**Status:** worklist for `docs/MILESTONE-V40-harness-registry.md` (sweep of 2026-08-21/22; sections A–L line numbers are as of develop `79c2d9c` — see *Re-baseline* at the end for the `5e2d87d` deltas; section M is as of `5e2d87d`, post-V39). Every row is something true of Claude Code or OpenCode specifically that still lives in cImp core. The milestone's decisions 18–29 say where each area goes; this file is the row-level brief for the implementation agents and is retired (deleted) when the milestone closes — the layering tests are the durable record.
 
 Companion to the first inventory (identity enums, settings pairs, spawn composition, grant tables, `spawn_inject_sig`, hook route table, tool tables, canaries/probes, frontend mirrors), which the milestone's decisions 1–17 already cover and which is **not** repeated here.
 
@@ -81,7 +81,7 @@ Everything below **excludes** the V40 plan's list (identity enums/fns, settings 
 | file:line(s) | what | harness | kind | destination | difficulty |
 |---|---|---|---|---|---|
 | `loopback.rs:42` | Core imports `crate::harness::claude::hook as claude_hook` — **28 call sites** | claude | identity literal | dissolves with `routes()` | mechanical |
-| `loopback.rs:1406, 1451, 4653, 5884-5886, 6643, 7476, 8158, 9245, 9511, 9953-9955, 10017` | **11 × `unwrap_or("claude")`** consumer/agent defaults; each documented as a *wire-compat promise to an older shim build* | claude | identity literal | one named `harness::DEFAULT_HARNESS` | mechanical |
+| `loopback.rs:1406, 1451, 4653, 5884-5886, 6643, 7476, 8158, 9245, 9511, 9953-9955, 10017` | **13 × `unwrap_or("claude")`** (re-counted on `5e2d87d`: `1411, 1456, 4687, 4876, 5974, 6732, 7583, 8265, 9352, 9618, 10061, 10124` + the V39 `/delegate` route at `19027`) consumer/agent defaults; each documented as a *wire-compat promise to an older shim build* | claude | identity literal | one named `harness::DEFAULT_HARNESS` | mechanical |
 | `loopback.rs:9063, 9805` | 2 × `unwrap_or("opencode")` — the opposite default on two routes; the asymmetry is load-bearing | opencode | identity literal | plugin-owned route (9063); explicit policy (9805) | behaviour-bearing |
 | `loopback.rs:4826-4854` | `AUDIT_CONSUMERS: [&str; 2]` + refusal text hardcoding "(claude, opencode)" | both | identity literal | `PerHarness<T>` | needs a neutral type |
 | `loopback.rs:5573-5593` | `TOOL_CHECKPOINT_BUDGET = 1800ms` — hand-computed from **Claude's shim `REPLY_TIMEOUT` and OpenCode's `AbortSignal.timeout(2000)`**, asserted against both by a cross-file test | both | behaviour constant | `HarnessPlugin::hook_reply_timeout()`, core takes `min − margin` | behaviour-bearing |
@@ -252,7 +252,7 @@ Everything below **excludes** the V40 plan's list (identity enums/fns, settings 
 | Fixtures/tests outside `fixtures/harness/` | **30** (1 misplaced fixture dir, 18 Rust `#[cfg(test)]`, 8 frontend `.test.ts`, 5 loose data/prose files) |
 | Docs | **26 sections** across 6 named docs + **17** other `docs/` files by concentration |
 
-Clean (swept, nothing found): `workbench/*`, `sandbox/{child_env,windows,linux,mod}.rs`, `pty/{scrollback,resolve,sandboxed_conpty}.rs`, `offload/{router,agent,supervisor,metrics,remote,openai,backend_gate,spotlight,detection/*,tools/*}.rs`, `audit/{mod,census,golden,runnable,adapters}.rs`, `stt/*`, `tts/*` (V20 deliberately neutralised it), `graph/shellread.rs`, `fsutil.rs`, `logging.rs`, `attach.rs`, `spawn_gate.rs`, `mcp_stdio.rs`, `rustsrc.rs`, `preview/`, `plugins/`, `sysmon/`, `shell/`, `src/lib/{preview,dnd,stt,selectionTts,diffWords,format,errors,viewSection}`, `terminals.css` (zero hits). **No `src-tauri/tests/` exists.** **No V39 `delegation/` / `InputProfile` code in this tree** (it lives in the `../cctts-v39` worktree).
+Clean (swept, nothing found): `workbench/*`, `sandbox/{child_env,windows,linux,mod}.rs`, `pty/{scrollback,resolve,sandboxed_conpty}.rs`, `offload/{router,agent,supervisor,metrics,remote,openai,backend_gate,spotlight,detection/*,tools/*}.rs`, `audit/{mod,census,golden,runnable,adapters}.rs`, `stt/*`, `tts/*` (V20 deliberately neutralised it), `graph/shellread.rs`, `fsutil.rs`, `logging.rs`, `attach.rs`, `spawn_gate.rs`, `mcp_stdio.rs`, `rustsrc.rs`, `preview/`, `plugins/`, `sysmon/`, `shell/`, `src/lib/{preview,dnd,stt,selectionTts,diffWords,format,errors,viewSection}`, `terminals.css` (zero hits). **No `src-tauri/tests/` exists.** ~~No V39 `delegation/` / `InputProfile` code in this tree~~ — **obsolete since `2a7f1fe`; see section M.**
 
 ## (b) Where moving it requires a NEW neutral core abstraction
 
@@ -305,3 +305,152 @@ Clean (swept, nothing found): `workbench/*`, `sandbox/{child_env,windows,linux,m
 ---
 
 **Verification caveat:** rows in areas A–D and the counts above are ones I read directly. Areas E–L came from four parallel sweeps; I spot-verified a sample from each (`loopback.rs:4826/5573/5880/8337`, `mcp.rs:2032`, `outbound.rs:1425`, `permission.rs:119-145`, `patterns_file.rs:110`, `contextMeter.ts:60-110`, `ipc.ts:105-141`, `TabErrorOverlay.svelte:30-35`, `EventsView.svelte:521/1294`, `fixtures/plugin-goldens/opencode/`, `docs/spikes/v20/`) and every check matched. The remaining rows carry their reporter's line numbers unverified by me.
+
+---
+
+## M. V39 delegation
+
+### M.1 — `delegation/` (the engine): clean, and worth recording as clean
+
+The engine's **production** code contains **zero** harness literals. Every
+`claude`/`opencode` string in `delegation/engine.rs` and `delegation/mod.rs`
+is inside `#[cfg(test)]` (`engine.rs:1124+`, `mod.rs:897+ testing`, `mod.rs:958+ tests`).
+`harness/layering.rs:561-568` adds `"crate::delegation"` to `CAPABILITY_MODULES`,
+so the layering test now enforces it.
+
+| file:line(s) | what | harness | kind | destination | difficulty |
+|---|---|---|---|---|---|
+| `delegation/engine.rs:1-120`, `delegation/mod.rs:1-60` | The whole engine — preflight, atomic claim, wait loop, take-over, timeout, screening, Events row — speaks `TabId` / `&str agent` / `contract::gate` only | — | behaviour | **neutral ✔** (decision 4's L4 boundary held) | — |
+| `harness/layering.rs:561-568` | `CAPABILITY_MODULES += "crate::delegation"` — a harness reader may not call the engine | — | behaviour | **neutral ✔** — keep when `HARNESS_DIRS` becomes a registry view (decision 1) | mechanical |
+| `harness/reader.rs:261-269` | `OobContext::note_turn_text` / `note_turn_text_at` — the only seam the readers use to reach the engine | — | behaviour | **neutral ✔** | — |
+| `harness/claude/read.rs:758, 825, 851` · `harness/opencode/read.rs:822-832, 1018-1027, 1234, 1265-1289` | The R-2/R-3/R-7 turn-buffer fixes (`turn_last_text`, `is_turn_end`, SSE-close flush) — **all inside `harness/<id>/read.rs`**, none in `engine.rs` | claude / opencode | payload shape/parsing | **neutral ✔** — already plugin-local; folds under `HarnessPlugin` as-is (decision 4) | mechanical |
+| `offload/harness_tab.rs:1-252` | `HarnessTabBackend` + `impl Backend` — keyed on a **tab id string**, never a harness id | — | behaviour | **neutral ✔** | — |
+| `offload/service.rs:1824-1850` | The facade bypass (`Handle::HarnessTab` ⇒ `run_facade`, skipping tool surface / router / agent loop) | — | behaviour | **neutral ✔** | — |
+| `offload/router.rs:443, 502` | `HarnessTab` reaches the router as an ordinary `BackendView`; "not ready" ⇒ `NoBackendReady` | — | behaviour | **neutral ✔** | — |
+| `settings/schema.rs:3944-3960` `OffloadBackendKind::HarnessTab { tab }` · `:1386-1444 effective_offload_backends` · `:1446 facade_default_name` | Facade synthesis from tab roles | — | payload shape | **neutral ✔** | — |
+| `ipc/commands.rs:190-240, 415-450, 520` — the read-only path (`pty_write` refusal, `read_only_refusal`, `read_only_exempt`, `is_mouse_wheel`, `tab_set_read_only`) · `state/manager.rs:24-100 ReadOnlySource` | Server-side keyboard lock, terminal-reply and wheel exemptions | — | behaviour | **neutral ✔** — `ReadOnlySource::{User, Driven{by: TabId}}`; `TabId`'s per-harness arms are the pre-existing ledger row F/`state/manager.rs:34-105` | — |
+| `activity.rs:140, 185, 297, 312, 345` | `ActivityKind::Delegation` + `DELEGATION_CAP` retention lane | — | behaviour | **neutral ✔** | — |
+| `offload/toolclass.rs` `unrouted("delegate_task", LocalCapability, false)` (V39 row; test renamed `…documented_eight`) | Latch class for the delegation route — the **bare stem**, no harness id | — | identity literal | **neutral ✔** — stays in core per decision 29 | — |
+| `src/lib/settings/types.ts:1220-1223` `CAP_DELEGATION_WORKER = 'delegation.worker'` | Frontend mirror of the gate id, pinned by `the_gated_capability_ids_reach_the_frontend` | — | identity literal | **neutral ✔** — the id names no vendor (`Harness::Any`), unlike `CAP_PRETOOLUSE_DENY`; only the *pin test* grows | mechanical |
+
+### M.2 — Residue: harness-shaped code V39 added or newly depends on
+
+| file:line(s) | what | harness | kind | destination | difficulty |
+|---|---|---|---|---|---|
+| `harness/input.rs:131-137` | `input_profile(id) -> Option<InputProfile>` — **a hand-written `match id { "claude" ⇒ …, "opencode" ⇒ …, _ ⇒ None }`**. The 11th "which harness is this" function; inside `harness/`, but a per-harness list that does not iterate the registry | both | identity literal | fold into `HarnessPlugin` (decision 4) — `descriptor.plugin.input_profile()`; the lookup becomes `HARNESSES` iteration (decision 9) | mechanical |
+| `harness/input.rs:64-112` | `struct InputProfile { paste, submit, settle_ms, max_paste_bytes }` + `paste_bytes` / `fits` | both | behaviour | the *type* stays neutral in `harness/plugin.rs`; the *values* become `HarnessPlugin::input_profile()` | mechanical |
+| `harness/claude/input.rs:49, 54, 57-66` · `harness/opencode/input.rs:46, 49, 52-59` | The two profiles (`SETTLE_MS` 150/80, `MAX_PASTE_BYTES` 64 KiB, `PasteMode::Bracketed`, `submit = b"\r"`) | claude / opencode | behaviour constant | `harness/<id>/mod.rs` `impl HarnessPlugin` — a **pure move**, files stay where they are | mechanical |
+| `tabs/config.rs:443-449` `tab_consumer` — `if command_is(command,"claude") {"claude"} else {"opencode"}` | **V39 added 7 new call sites** to this fixed-arity-2 classifier: `delegation/engine.rs:265`, `graph/mcp.rs:495`, `ipc/commands.rs:606, 623, 645`, `offload/loopback.rs:19153`, `offload/mcp.rs:3212`. A Codex tab classifies as **`opencode`**, becomes eligible for the OpenCode Manual slot, and is typed into with OpenCode's paste profile | both | identity literal | `HarnessId::from_command` returning `Option` (decisions 1, 2) — all 7 sites propagate `None` | needs a neutral type |
+| `offload/mcp.rs:3178-3225 delegate_targets` | Generates the `delegate_task_*` set. Iterates `contract::harness_ids()` ✔ but joins it to tabs through `tab_consumer` (above) and resolves labels through `Harness::from_id` | both | identity literal | `HARNESSES.iter()` + `HarnessId::from_command` (decisions 1, 9) | mechanical once decision 1 lands |
+| `harness/contract.rs:121-127 display_name()` | `match self { Claude ⇒ "Claude Code", OpenCode ⇒ "OpenCode", Any ⇒ "any harness" }` — the label table the `delegate_task_*` descriptions render from | both | UI string | `HarnessDescriptor.label` (decision 1) | mechanical |
+| `harness/contract.rs:130-134 from_id()` · `:143-153 harness_ids()` | Two more registry-shaped lookups derived from `CAPABILITIES` rather than from a descriptor table | both | identity literal | `HARNESSES` (decision 1); `harness_ids()` becomes a view | mechanical |
+| `harness/contract.rs:1618-1638` `claude.input.profile` row · `:1640-1658` `opencode.input.profile` row | Two per-harness registry rows, hand-written, one per shipped harness | claude / opencode | payload shape | contributed by the plugin (decision 1/4); `every_registry_entry_is_fully_wired` should assert one per descriptor (decision 10b) | mechanical |
+| `harness/contract.rs:1593-1616` `delegation.worker` row (`Harness::Any`) · `:340-345 CAP_DELEGATION_WORKER` · `:1719 GATED` | The registry's first harness-neutral row | — | — | **neutral ✔** | — |
+| `harness/contract.rs:1801-1815` | The `CAP_DELEGATION_WORKER` gate arm reads `settings.harness_versions.input_profile_status` — **one global scalar for all harnesses** | both | payload shape | per-harness spike outcome; `HarnessDriftSignals` (decision 23) or `Settings.harness[<id>]` (decision 5) — see amendment (f) | needs a neutral type |
+| `settings/schema.rs:900` `harness_versions.input_profile_status: String` | Same scalar, on the settings struct | both | payload shape | as above | needs a neutral type |
+| `harness/health.rs:60-64` `PANELS` | Now **three** hand-written rows: `(Claude,"Claude Code"), (OpenCode,"OpenCode"), (Any,"Cross-harness")` | both + neutral | UI string | decision 9 says `PANELS = HARNESSES.iter()` — must now also emit a **non-harness** panel; see amendment (e) | needs a neutral type |
+| `harness/probe.rs:360-370` | `DECLARED_UNPROBED` gains `delegation.worker`, `claude.input.profile`, `opencode.input.profile` with per-row reason prose | both | identity literal | reasons come from `HarnessPlugin::probe()`/`canaries()` declarations (decision 17); the neutral rows stay | mechanical |
+| `harness/probe.rs:241` `IMPLEMENTED += "claude.transcript.stop_reason"` · `:1432, 1465, 1480` wiring · `:1692-1699 stop_reason_is_substantive` · `:1701-1770 stop_reason_outcome` | New **Claude-payload-shaped probe code** (`message.stop_reason`, `type:"assistant"`) in the shared `harness/probe.rs` | claude | payload shape/parsing | `harness/claude/` behind `HarnessPlugin::probe()` (decision 17) — extends the existing move | mechanical |
+| `harness/canary.rs:133, 153, 396-450` `claude_transcript_stop_reason()` + `check_…` | A **sixth** named Claude canary function in the shared `canary.rs` (decision 17 counted five at `:205-511`) | claude | fixture + parsing | `HarnessPlugin::canaries()` (decision 17) | mechanical |
+| `harness/verify.rs` (V39 hunk) | Test now asserts **"the five Claude canaries"** by count | claude | fixture | folds into `canaries()` iteration | mechanical |
+| `offload/loopback.rs:19027` | **A 12th `unwrap_or("claude")`** — the `/delegate` route's consumer default, added by V39 | claude | identity literal | `harness::DEFAULT_HARNESS` (decision 22) — the ledger's section-E row must be re-counted | mechanical |
+| `offload/loopback.rs:19149-19160 manual_tab_for` | Resolves the harness suffix of `delegate_task_<id>` to the Manual tab via `tab_consumer` | both | identity literal | registry lookup (decisions 1, 2) | mechanical |
+| `offload/mcp.rs:3152-3160 delegate_tool_contract` · `:3236-3260 delegate_task_tool` description | **Model-visible prompt text**, templated with `display_name()` — "Hand a task to an open {display} tab…", `"send this to {display}"` | both | prompt text | `HarnessPlugin::instructions()` / descriptor `label` (decision 24 + 27) | needs a neutral type |
+| `offload/agent.rs:653-658 SCHEMA_FINAL_INSTRUCTION` · `:684-713 facade_format_note` | New **model-visible text** appended to a delegated task on the facade path (profile note + schema instruction) | — | prompt text | neutral text, but decision 24 wants every model-visible string in core *marked* — add to the `instructions()` inventory | mechanical |
+| `delegation/engine.rs:1058-1080` | `injection::Scope::for_tab(driver_agent, …)` + `UnscopedAudit::for_agent(driver_agent)` — **new callers of the fixed-arity-2 `UnscopedAudit::slot`** (`offload/outbound.rs:1430`, `b"opencode"⇒1, _⇒0`) | both | identity literal | `PerHarness<ScopeLedger>` (decision 25) — the ledger's E row gains callers | needs a neutral type |
+| `state/manager.rs:248-252, 309-326` | The delegation-facing `TabActivity` mirror consumes `StateSignal::ClaudeOutputStarted/Stopped` → `output_running`; `delegation/engine.rs` preflight reads it | claude | identity literal | `HarnessOutput*` rename (decision 18/30) — **blast radius grew**: `state/manager.rs` + `delegation/` + `ipc/state.rs:tab_activity` | mechanical rename |
+| `activity.rs:558 ActivityEntry::source` (was `:511-518`) | V39 adds a **new writer** of a harness id into the persisted JSONL: `delegation/mod.rs:846-880` writes `driver_agent` as `source` on every `delegation` row | both | identity literal | unchanged verdict — stays `String` (decision 29, persisted format) | — |
+| `src/lib/EventsView.svelte:521-531, 1294-1299` | `KNOWN_SOURCES` / `.esrc.claude` / `.esrc.opencode` now also colour **delegation** rows (whose `source` is the driver's harness id); V39 added `.ekind.delegation { color: var(--accent) }` | both | CSS | registry accent token (decision 27) — the new `.ekind` class is neutral ✔ | mechanical |
+| `src/lib/delegation.ts:343-346 HARNESS_LABELS` | `{ claude: 'Claude Code', opencode: 'OpenCode' }` — **a new frontend label mirror**, read by the banner, the local echo, the glyph title and the popover | both | UI string | `harness_list().label` (decisions 7, 27) | mechanical |
+| `src/lib/delegation.ts:349-353 harnessLabel()` · `:365-372 attributionLine()` | `[delegated by ${harnessLabel(agent)} · tab "${tab}" · via cImp]` — the decision-2a banner / local-echo / glyph-title string | both | UI string | text template from `HarnessAffordances` (decision 27); the label lookup from `harness_list` | mechanical |
+| `src/lib/delegation.ts:455-469 tabHarness(cfg)` | **The 11th/12th "which harness" function, and the second in the frontend** — a hand-written mirror of Rust `tab_consumer`: `stem.toLowerCase() === 'claude' ? 'claude' : 'opencode'`. Its doc comment states the two-way agreement as a requirement with nothing enforcing it | both | identity literal | `harness_list().binaries` lookup (decisions 2, 7) — same fate as `contextMeter.ts:77 commandIsClaude` | behaviour-bearing |
+| `src/lib/DelegationPopover.svelte:122, 282, 306` | `tabHarness(cfg)`, `Manual — the {harnessLabel(harness)} delegation target`, `Manual for {harnessLabel(harness)} is on "…"` | both | UI string | as above | mechanical |
+| `docs/MAINTENANCE.md:575` `claude.transcript.stop_reason` row | Full Claude transcript grammar (`message.stop_reason`, `tool_use`/`end_turn`/`max_tokens`/`stop_sequence`, one API message ⇒ several transcript lines) | claude | payload shape | `harness/claude/README.md` (decision 28) | mechanical |
+| `docs/MAINTENANCE.md:576` `delegation.worker` row | Neutral contract, but the prose names both harnesses' completion mechanisms (Claude `Stop` hook, OpenCode `/event` SSE) | both | UI string | contract stays in the neutral table; mechanism halves split to the two plugin READMEs (decision 28) | mechanical |
+| `docs/MAINTENANCE.md:577` `claude.input.profile, opencode.input.profile` | **One row covering two harnesses** — bracketed-paste behaviour, settle floors, spike recipe naming both CLIs | both | payload shape | split into the two plugin READMEs; the parity test must accept a row per harness, not a combined row (decision 28) | mechanical |
+| `docs/HARNESS-PLUGIN-LAYER.md` (0 matches for "delegat") · `docs/CHP.md` (0) · `docs/ARCHITECTURE.md` (0) · `docs/FEATURES.md` (0) | **V39 wrote no developer-guide, CHP or ARCHITECTURE prose at all.** Guide B's "what a new harness costs" therefore omits `input.rs`, the `*.input.profile` row and the worker gate | both | doc | decision 12 rewrite must add them; V40's own §*What a new harness is* item 3 needs `input_profile()` | mechanical |
+| Rust tests: `delegation/mod.rs:939-1245`, `offload/mcp.rs:6045-6170`, `offload/service.rs:7941-8090`, `offload/loopback.rs:5179-5190`, `ipc/commands.rs:4047-4180`, `main.rs:4519-4520`, `settings/schema.rs:8956-9029` | V39 test fixtures built from `default_claude_tab()` / `default_opencode_tab()` / `CLAUDE_TAB_ID` / `OPENCODE_TAB_ID` / `TabId::Claude` | both | fixture | rewrite over the registry with the rest of section K (decision 28) | mechanical |
+| Frontend tests: `src/lib/delegation.test.ts:108-111, 152-182, 312-313, 325-356` | `harnessLabel('claude') === 'Claude Code'`, `attributionLine('opencode', …)`, `'claude'` tab ids | both | fixture | registry fixture `registry.json` (decision 11) | mechanical |
+| `src-tauri/fixtures/harness/claude/2.1.232/{MANIFEST.toml,transcript.stop-reason.jsonl}` · `_synthetic/stop-reason-renamed.jsonl` | New V39 canary fixtures | claude | fixture | **neutral ✔** — already under `fixtures/harness/<id>/<version>/`, the decision-28 target layout | — |
+
+---
+
+---
+
+## Re-baseline of sections A–L on `5e2d87d` (Phase 0, #102)
+
+Baseline was develop `79c2d9c`; deltas below are `79c2d9c → 5e2d87d`.
+
+| § | sampled rows | verdict |
+|---|---|---|
+| **A** `graph/` | `service.rs:953` ✔ exact (`fn live_claude_tab_sessions`); `service.rs:1871` ✔ exact (`pub fn live_claude_sessions`); `index.rs:4214` ✔ exact (`claude_tokenless_sessions`) | **lines unchanged** for `service.rs`/`index.rs`. **`graph/mcp.rs` shifted +~75** (V39 added `delegation_sig` at `:440-520`): row `mcp.rs:326` ✔ still exact, but row `mcp.rs:976` → **`:1051`**; the doc's `mcp.rs:611` pointer → `source_for_consumer` at **`:685`**. Stale-path row 29 still valid (`service.rs` 2, `loopback.rs` 5, `state/manager.rs` 1, `pty/tasks.rs` 1 hits) |
+| **B** `usage/`+`statusline/` | `usage/mod.rs:218` ✔ exact (`PUSH_FILE`); `statusline/mod.rs:57-64` → `launch_command` now at **`:64`** (+7); `ipc/commands.rs:567-573 get_claude_usage` → **`:1096`** (+529) | **`usage/` and `statusline/` unchanged**; **`ipc/commands.rs` shifted +~529** (V39 added 773 lines to it, mostly near the top). Every section-B/D row citing `ipc/commands.rs` needs re-locating |
+| **C** `settings/` | `schema.rs:953-1032 default_llm_pricing` → **`:1031`** (+78); `persistence.rs:2100-2104` ✔ exact; `injection.rs:223-255 Feature::OpencodeNativeGate` → **`:255`** (+32) | **`persistence.rs` unchanged**; **`settings/schema.rs` shifted +~78** for rows past `:288` (V39 inserted `DelegationSettings` at `:288`/`:524` and `input_profile_status` at `:900`); `injection.rs` +~32 |
+| **D** `tabs/`+`ipc/`+`main.rs` | `tabs/config.rs:1238 args_select_session` → **`:1247`** (+9); `ipc/tab_lifecycle.rs:1074 resolve_command("opencode")` → **`:1098`** (+24); `main.rs:508 unwrap_or(TabId::Claude)` → **`:549`** (+41) | **all three shifted**: `tabs/config.rs` +~9 (`:1009 CHANNEL_REGISTRATION_FLAG` ✔ exact, `:1043 GRAPH_GUIDANCE` → `:1038`), `tab_lifecycle.rs` +~24, `main.rs` +~41 |
+| **E** `offload/` | `loopback.rs:4826 AUDIT_CONSUMERS` → **`:4860`** (+34); `mcp.rs:2032 CHANNEL_INSTRUCTIONS` → **`:2059`** (+27); `outbound.rs:1425 UnscopedAudit::slot` → **`:1430`** (+5) | **shifted, non-uniformly**: `loopback.rs` +~34 below 5000, **+~90…110 above 6000** (`TOOL_CHECKPOINT_BUDGET` 5573→**5627**, `DRIFT_SHIMS` 6118→**6207**, `claude_hook_tab` 6733→**6822**, `PermissionEventBody` 8302→**8411**, `IGNORED_NOTIFICATION_TYPES` 8349→**8461**, `classify_permission_event` 8394→**8501**, `mark_live_session_from_event` 9014→**9121**, tool-arg aliasing 9124→**9229**); `mcp.rs` +~27; `mcp_host.rs` `tool_defs_for_claude` 1848→**1848** ✔; `audit/runner.rs:460 consumer_exposed` → **`:459`** ✔ |
+| **F** `state/`+`pty/` | `state/manager.rs:314-330 StateSignal::ClaudeOutput*` → the **enum** is now at `:692-695`, the new delegation mirror consumes it at **`:309-310`**; `pty/tasks.rs:43 CLAUDE_BURST_MIN` ✔ exact; `pty/manager.rs:518 oob_drives_activity` → **`:546`** (+28) | **`state/manager.rs` restructured** — V39 inserted `ReadOnlyTabs`/`TabActivity` (`:24-100`, `:221-330`) *above* the signal enum, so the whole file shifted **+~370**; `pty/tasks.rs` **unchanged**; `pty/manager.rs` +28. **Row F/`state/manager.rs:314-330` is now split**: `:309-326` is the new V39 mirror (a new consumer), `:692-695` is the signal declaration |
+| **G** `processing/` | `permission.rs:119` ✔ exact; `patterns_file.rs:110 CLAUDE_FOOTER` ✔ exact; `screen.rs:139-149` ✔ exact (multibyte rationale at `:145`) | **all lines unchanged** — V39 touched nothing in `processing/` |
+| **H** `advisor.rs` | `:413 claude_last_seen` ✔ exact; `:601-606` display-name match ✔ exact; `:799 drift.version.v1` ✔ exact | **all lines unchanged** — V39 touched nothing in `advisor.rs` |
+| **I** remaining core Rust | `activity.rs:390-450 Attribution::Headless` → **`:431-452`** (+~41); `notifications/manager.rs:399-412` → `TabId::Claude` fallback at **`:405-411`** (+~6); `theming/tui_theme.css:435-445` ✔ untouched | `activity.rs` **+~41/+47** (`ActivityEntry::source` 511→**558**); `notifications/manager.rs` +~6; `theming/*` unchanged |
+| **J** frontend `src/` | `ipc.ts:95-172 ContextSnapshot` → **`:170`** (+75); `contextMeter.ts:60-110 commandIsClaude` ✔ exact `:77`; `settings/types.ts:2161-2242 / :2458 enabled_ai_tabs` → **`:2549`** (+91) | **mixed**: `contextMeter.ts`, `EventsView.svelte:521`, `GraphView.svelte:1343`, `tabs/state.ts:12`, `TabErrorOverlay.svelte:30-35`→`:33` all **unchanged**; `ipc.ts` **+75**; `settings/types.ts` **+48…+91** (`CAP_PRETOOLUSE_DENY` 1169→**1216**); `SettingsApp.svelte` **+6** (`Claude session usage` 3282→**3288**); `graph.ts harnessMarkVerified` 826→**829** |
+| **K** fixtures/tests | `fixtures/plugin-goldens/opencode/` ✔ present, unchanged; `permission.rs:753-1020` ✔ exact; `tabs/config.rs:2652-4930` OpenCode plugin JS asserts → now **~2652-5020** (`CIMP_WEB_TOOLS` 4930→**4958**) | mostly unchanged; **`settings/schema.rs:5441-5476, 5569-5581` → `:5992-6027`** (+~551); `statusline/mod.rs:427-464` ✔ exact; `docs/spikes/v20/*` ✔ unchanged. **`loopback.rs:10118+` and `:11460-11493` shift with the file (+~90)** |
+| **L** docs | `ARCHITECTURE.md` § V11 at **`:350`** ✔ exact; `DESIGN.md` § What we are building at **`:15`** ✔ exact; `MAINTENANCE.md` drift table header at **`:542`** ✔ exact | **docs essentially unchanged**; the one delta is `MAINTENANCE.md`: the drift table **gained 3 rows at `:575-577`**, so everything after `:574` shifts **+3** (§ memory scoping, § usage taps, § open spikes, § live-verify recipes). `CHP.md § 4.5` ✔ exact at `:221` |
+
+### Ledger rows V39 made obsolete or moved
+
+1. **`(a) Counts`, final sentence (ledger:255)** — *"**No V39 `delegation/` / `InputProfile` code in this tree** (it lives in the `../cctts-v39` worktree)"* — **OBSOLETE**. It is all in this tree now; section M is its replacement.
+2. **Section E, row `loopback.rs:1406, 1451, …` "11 × `unwrap_or(\"claude\")`"** — **COUNT WRONG**. Current sites: `1411, 1456, 4687, 4876, 5974, 6732, 7583, 8265, 9352, 9618, 10061, 10124` **+ the V39 `/delegate` route at `19027`**. Re-state as 13 (or re-derive; the original list mixed single lines and 3-line ranges).
+3. **Section E, row `outbound.rs:1425-1437 UnscopedAudit::slot`** — still valid, **new caller** `delegation/engine.rs:1070`.
+4. **Section F, row `state/manager.rs:314-330`** — **split**. The signal enum moved to `:692-695`; a *new* consumer (`:248-252, 309-326`, the delegation `TabActivity` mirror) must be listed alongside it, and `ipc/state.rs`'s `tab_activity` field is a third.
+5. **Section I, row `activity.rs:511-518 ActivityEntry::source`** — line → `:558`; **new writer** `delegation/mod.rs:846-880`.
+6. **Section J, row `EventsView.svelte:521-531, 1294-1299`** — still valid, **new consumer** (the `delegation` lane's `source` is a harness id).
+7. **Decision 17's pointer `probe.rs:410-411` ("two literal `run_for`/`resolve_command` calls")** — **STALE on this tree**: the two `resolve_command` literals are at `harness/probe.rs:745` (`"opencode"`) and `:1178` (`"claude"`); the `drive` match is at `:517-566`, not `:502-522`.
+8. **Nothing moved *into* `harness/`** by V39 — the new harness-facing code was *born* there (`harness/input.rs`, `harness/<id>/input.rs`, `harness/reader.rs`'s `LIVE_READERS`, the `read.rs` turn buffers). No existing ledger row is retired by a V39 move.
+
+---
+
+---
+
+## Section M ownership by phase issue
+
+**#93 — Phase A (registry + identity)** — 13 rows
+- `harness/input.rs:131-137` (the two-arm lookup) → `HarnessPlugin::input_profile()`
+- `harness/input.rs:64-112` (`InputProfile` / `PasteMode` types) → `harness/plugin.rs`
+- `harness/claude/input.rs:49-66` · `harness/opencode/input.rs:46-59` (verbatim move into the impls)
+- `tabs/config.rs:443-449 tab_consumer` **+ its 7 new V39 call sites** (`delegation/engine.rs:265`, `graph/mcp.rs:495`, `ipc/commands.rs:606/623/645`, `offload/loopback.rs:19153`, `offload/mcp.rs:3212`)
+- `harness/contract.rs:121-127 display_name`, `:130-134 from_id`, `:143-153 harness_ids`
+- `harness/contract.rs:1618-1658` the two `*.input.profile` rows → descriptor-contributed; assert one per descriptor in 10(b)
+- `harness/health.rs:60-64 PANELS` (including the `Harness::Any` panel decision — amendment (e))
+- `harness/probe.rs:1692-1770` + `harness/canary.rs:396-450` (`stop_reason`) → `probe()` / `canaries()` (decision 17 lands in A)
+- `harness/probe.rs:360-370 DECLARED_UNPROBED` rows → `declared_unprobed()` (amendment (b))
+- `offload/mcp.rs:3199-3225 delegate_targets` → registry iteration (decision 9)
+- `offload/loopback.rs:19149-19160 manual_tab_for`
+- `delegation/engine.rs:1070` `UnscopedAudit::for_agent` → `PerHarness` (decision 25's A half)
+- `harness/layering.rs:561-568` — keep the `crate::delegation` entry when `HARNESS_DIRS` becomes a view
+
+**#95 — Phase C (hook ingress + permission grammar + drift advisor)** — 3 rows
+- `offload/loopback.rs:19027` — the 12th `unwrap_or("claude")` → `DEFAULT_HARNESS` (decision 22)
+- `settings/schema.rs:900` + `harness/contract.rs:1801-1815` — `input_profile_status` becomes per-harness (decision 23; **or Phase B #94 if it lands in the settings map instead** — see amendment (f), needs a ruling)
+- `state/manager.rs:248-252, 309-326` — the delegation `TabActivity` mirror renames with `StateSignal::HarnessOutput*` (decision 30's event vocabulary; the rename itself is Phase D #96, so **C publishes the CHP events, D does the rename** — this row is a D dependency to record in both briefs)
+
+**#97 — Phase E (model-visible text, MCP client, CLI vocab)** — 3 rows
+- `offload/mcp.rs:3152-3160 delegate_tool_contract` + `:3236-3260` the tool description → `instructions()` / descriptor label (decision 24)
+- `offload/agent.rs:653-658, 684-713` `SCHEMA_FINAL_INSTRUCTION` / `facade_format_note` → added to the decision-24 inventory
+- `offload/outbound.rs:1430` `UnscopedAudit::slot` remainder if not fully done in A (decision 25 remainder)
+
+**#98 — Phase F (frontend over IPC)** — 6 rows
+- `src/lib/delegation.ts:343-346 HARNESS_LABELS` → `harness_list().label`
+- `src/lib/delegation.ts:349-353 harnessLabel`, `:365-372 attributionLine` → `HarnessAffordances.attributionTemplate`
+- `src/lib/delegation.ts:455-469 tabHarness` → `harness_list().binaries` lookup (decision 2's frontend half)
+- `src/lib/DelegationPopover.svelte:122, 282, 306`
+- `src/lib/EventsView.svelte:521-531, 1294-1299` (delegation lane's `source` colouring) → registry accent token
+- `src/lib/settings/types.ts:1220-1223 CAP_DELEGATION_WORKER` — **keep in core** (neutral id), but extend the pin test alongside `CAP_PRETOOLUSE_DENY`'s move (decision 27)
+- Parity-test addition (decision 11): `tabHarness` vs `registry.json.binaries`
+
+**#99 — Phase G (fixtures + docs truth pass)** — 5 rows
+- `docs/MAINTENANCE.md:575` (`claude.transcript.stop_reason`) → `harness/claude/README.md`
+- `docs/MAINTENANCE.md:577` (the combined `claude.input.profile, opencode.input.profile` row) → **split** into two plugin READMEs; parity test must stop accepting a combined row
+- `docs/MAINTENANCE.md:576` (`delegation.worker`) — neutral contract stays; mechanism prose splits
+- `docs/HARNESS-PLUGIN-LAYER.md` guide B + `docs/ARCHITECTURE.md` + `docs/CHP.md` — **V39 added nothing**; the "what a new harness costs" list must gain `input.rs`, the `*.input.profile` row and the worker gate (decision 12 / V40 § *What a new harness is* item 3)
+- V39 test literals: `delegation/mod.rs:939-1245`, `offload/mcp.rs:6045-6170`, `offload/service.rs:7941-8090`, `offload/loopback.rs:5179-5190`, `ipc/commands.rs:4047-4180`, `settings/schema.rs:8956-9029`, `src/lib/delegation.test.ts:108-356` → registry-driven fixtures (decision 28)
+- ✔ no action: `src-tauri/fixtures/harness/claude/2.1.232/*` and `_synthetic/*` are already in the decision-28 target layout

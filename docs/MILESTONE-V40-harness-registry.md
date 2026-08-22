@@ -1,6 +1,6 @@
 # V40 — Harness registry and the V35 leftovers (everything harness-specific moves behind the plugin)
 
-**Status:** APPROVED DESIGN (2026-08-22) — implementation not started.
+**Status:** APPROVED DESIGN (2026-08-22) — Phase 0 (#102) DONE 2026-08-22 on develop `5e2d87d` (post-V39); amendments 0-a…0-g below folded into decisions 2, 4, 5, 9, 17, 24, 27. Phase A next.
 GitHub: umbrella #101, milestone 14; phases 0 #102 · A #93 · B #94 · C #95 · D #96 ·
 E #97 · F #98 · G #99 · H #100.
 **Sequencing:** after V39 ships and is live-verified. **V41 — Codex CLI** is
@@ -122,10 +122,19 @@ harness by name — plus tests that make the README's claim true.
    `default_tab(tab_id)`. *Why:* every "which harness" question today is
    answered by a different function with a different vocabulary and six of
    them default to Claude; one table with one lookup ends that.
-2. **Unknown is an error, never Claude.** `HarnessId::from_command`,
+2. **Unknown is an error, never *a shipped harness*.** `HarnessId::from_command`,
    `from_tab_id`, `from_consumer` return `Option`/`Result`. The six
    Claude-fallback sites are rewritten to propagate `None` (a shell tab) or
-   refuse (a consumer token nobody declared). The `--consumer` default in
+   refuse (a consumer token nobody declared). *(0-c)* The same applies to the
+   **OpenCode**-fallback classifier `tabs/config.rs:443 tab_consumer`
+   (`else { "opencode" }`), which V39 gave seven new callers
+   (`delegation/engine.rs:265`, `graph/mcp.rs:495`, `ipc/commands.rs:606/623/645`,
+   `offload/loopback.rs:19153`, `offload/mcp.rs:3212`) — today a `codex` tab
+   would be classified as OpenCode, become eligible for its Manual slot and
+   be typed into with OpenCode's paste profile. All seven propagate `None`:
+   an unrecognised command is not a delegation target and is never typed
+   into with another harness's rules. The frontend twin
+   `src/lib/delegation.ts:455 tabHarness` goes the same way (decision 27). The `--consumer` default in
    `main.rs:311-323`, `offload/mcp.rs:88`, `audit/mcp.rs:580` stays
    `"claude"` on the command line for backward compatibility — but it is
    resolved through the registry, so a typo fails the proxy start with the
@@ -153,7 +162,16 @@ harness by name — plus tests that make the README's claim true.
    and not pure data:* OOB transport, env composition and artifact writing
    are code, and design doc D1 ("the extension point is the protocol, not a
    Rust trait") is about L2 — this trait sits at L1, below it, and is
-   internal to the tree (D7: no third-party loading).
+   internal to the tree (D7: no third-party loading). *(0-a)* V39's
+   `InputProfile` is **not** a second trait: it is a `Copy` data struct
+   (`harness/input.rs:64-112`) plus a two-arm lookup
+   `input_profile(id) -> Option<InputProfile>` (`:131-137`). The trait gains
+   `fn input_profile(&self) -> Option<InputProfile> { None }` — **`Option`
+   with a `None` default**, because "a harness without `input.rs` is not a
+   valid worker" must keep failing closed (`engine.rs:316-330`). The
+   `InputProfile`/`PasteMode`/`paste_bytes`/`fits` types move to
+   `harness/plugin.rs` as neutral types; both `harness/<id>/input.rs` bodies
+   stay untouched and `harness/input.rs::input_profile` is deleted.
 5. **Per-harness settings become a map keyed by `HarnessId`.** Schema
    35 → 36. `Settings.harness: BTreeMap<HarnessId, HarnessSettings>` with
    `{ expose_commands, expose_code_audit, last_seen, last_verified,
@@ -165,7 +183,16 @@ harness by name — plus tests that make the README's claim true.
    whole point. Single-harness settings that are *features*, not identity
    (`statusline`, `claude_local`, `offload.opencode_provider`,
    `injection.opencode_native_gate_enabled`) are **not** moved; they are
-   declared (decision 6).
+   declared (decision 6). *(0-f)* `harness_versions.input_profile_status`
+   (`schema.rs:900`) — V39's manual-spike outcome for the paste contract —
+   is today **one scalar for all harnesses**: a `"fail"` removes every
+   `delegate_task_*` and refuses every delegation for every harness, and a
+   Claude pass would silently vouch for Codex. It joins the per-harness core
+   block (`Settings.harness[<id>].input_profile_status`), the 35 → 36
+   migration copies the single value into every existing key, and the
+   `CAP_DELEGATION_WORKER` gate (`contract.rs:1801-1815`) resolves it **for
+   the worker's harness only** — `gate_for(id, harness)` or the preflight
+   reading the per-harness row directly. Behaviour-bearing; Phase B.
 6. **Harness-only settings are owned by the plugin, not by core.**
    `statusline`, `claude_local`, `claude_auto_verify`,
    `offload.opencode_provider(_auto)` and
@@ -211,8 +238,17 @@ harness by name — plus tests that make the README's claim true.
    (decision 10) asserts every registry entry has a slot. *Why:* positional
    `[0]`/`[1]` is the one place where forgetting a harness disables a
    safety mechanism silently.
-9. **Every per-harness loop iterates the registry.** `probe.rs:410-411`,
-   `capture.rs:483`, `health.rs::PANELS`, `AUDIT_CONSUMERS`
+9. **Every per-harness loop iterates the registry.** `probe.rs:745/1178`
+   (the two literal `resolve_command` calls; `drive` at `:517-566`),
+   `capture.rs:483`, `health.rs::PANELS` — *(0-e)* which since V39 also
+   carries a **non-harness** `(Harness::Any, "Cross-harness")` row for the
+   `delegation.worker` gate; plain iteration would silently drop it and hide
+   a gate the user can be blocked by, so `PANELS` = the descriptors **plus
+   one neutral panel for `Harness::Any` rows** (an explicit second source,
+   never a pseudo-descriptor with empty binaries) and 10(b) asserts both —
+   `offload/mcp.rs:3199 delegate_targets` (already iterates
+   `harness_ids()` ✔ but joins through `tab_consumer`, decision 2),
+   `loopback.rs:19149 manual_tab_for`, `AUDIT_CONSUMERS`
    (`loopback.rs:4826`), `outbound.rs::UNSCOPED` (becomes a map keyed by
    `HarnessId`), `persistence.rs:1843` / `tab_lifecycle.rs:1096` canonical
    orders, `chp::expects_chp`, `note_harness_version`. None keeps a literal
@@ -288,9 +324,18 @@ harness by name — plus tests that make the README's claim true.
     other, as `MAINTENANCE.md` is checked against the registry today.
 17. **Canaries and probes are supplied by the plugin.**
     `HarnessPlugin::canaries() -> &[Canary]` (fixture + assertion fn) and
-    `HarnessPlugin::probe(&ProbeCtx) -> ProbeReport` replace the five named
-    functions in `canary.rs:205-511`, the `drive` match in
-    `probe.rs:502-522` and the two literal `resolve_command` calls.
+    `HarnessPlugin::probe(&ProbeCtx) -> ProbeReport` replace the **six**
+    named functions in `canary.rs` (`:214, 284, 349, 411, 460` + V39's
+    `claude_transcript_stop_reason` at `:396-450`), the `drive` match in
+    `probe.rs:517-566`, the two literal `resolve_command` calls
+    (`:745`, `:1178`) and V39's Claude-payload probe code
+    (`stop_reason_is_substantive` / `stop_reason_outcome`, `:1692-1770`).
+    *(0-b)* V39's `*.input.profile` rows have **no probe** — they are in
+    `probe.rs:358-370 DECLARED_UNPROBED` ("a REAL turn typed into a REAL
+    TUI") — so the trait also gains `declared_unprobed() ->
+    &[(CapabilityId, &str)]`, same shape as `canaries()`, and the per-row
+    reason prose moves with the plugin; the neutral `delegation.worker`
+    entry stays in the runner.
     `canary.rs` and `probe.rs` keep the harness-neutral runner, the report
     shape and the `cimp --harness-canary/--harness-capture` CLI; they
     iterate the registry. The `UPWARD_EXEMPT` entries for `canary.rs` and
@@ -404,7 +449,12 @@ appendix; the decision is the contract.
     *both* harnesses yet names Claude's capitalised `Read`/`Bash`
     (`tabs/config.rs:1043`); it is templated with `native_tools()` names per
     harness. Tool-arg aliasing (`file_path`/`filePath`/`notebook_path`,
-    `loopback.rs:9124`) comes from `native_tools().arg_names()`.
+    `loopback.rs:9124`) comes from `native_tools().arg_names()`. *(0-g)*
+    V39 added three more model-visible strings to the inventory:
+    `offload/mcp.rs:3152 delegate_tool_contract` + `:3236 delegate_task_tool`
+    description (templated with a harness label → descriptor `label`), and
+    `offload/agent.rs:653 SCHEMA_FINAL_INSTRUCTION` / `:684
+    facade_format_note` (neutral text, marked as model-visible).
 25. **MCP client specifics belong to the client's plugin.** The channel
     registration flag, `capabilities.experimental["claude/channel"]`, the
     `notifications/claude/channel` method, the `PROTOCOL_VERSION` pin ("the
@@ -439,7 +489,13 @@ appendix; the decision is the contract.
     "OpenCode refreshes in-session, Claude on its next turn" sentences),
     `webTools[]`, `stateDirs[]`, `installHint` + `docsUrl`
     (`TabErrorOverlay`, the `opencode-not-found` copy), `attachmentFormat`,
-    `localProviderEnvPreview`, `statuslineRows`. The "Claude session usage"
+    `localProviderEnvPreview`, `statuslineRows`, and *(0-d)*
+    `attributionTemplate` (`[delegated by {label} · tab "{tab}" · via cImp]`)
+    so V39's banner / local-echo / glyph-title string has one source;
+    `src/lib/delegation.ts:343 HARNESS_LABELS`, `:349 harnessLabel`, `:365
+    attributionLine`, `:455 tabHarness` and `DelegationPopover.svelte:122,
+    282, 306` read `harness_list`, and the decision-11 parity test asserts
+    `tabHarness` agrees with every descriptor's `binaries`. The "Claude session usage"
     and "Claude context bar" panels (`SettingsApp.svelte:3282-3502`) mount
     through the decision-6 feature slots. `TabId` in `state/manager.rs`
     becomes `Builtin(HarnessId, tab)` with its wire strings unchanged;
@@ -606,6 +662,15 @@ run reviewable.
   decision 9; banner labels come from `harness_list` — decision 27), the
   A/C/E/F/G briefs updated with the V39 rows they own, and post-V39
   baselines. Read-only; no code moves.
+  **DONE 2026-08-22** on `5e2d87d`: ledger section M (73 rows; engine,
+  `HarnessTab`, read-only path, `ActivityKind::Delegation` all neutral ✔ —
+  the R-2/R-3/R-7 turn buffers live in `harness/<id>/read.rs`), re-baseline
+  table for A–L (`processing/`, `advisor.rs`, `pty/tasks.rs`, docs
+  line-exact; `ipc/commands.rs` +529, `state/manager.rs` +~370,
+  `loopback.rs` +34/+~100, `settings/schema.rs` +78…+551), amendments
+  0-a…0-g folded into decisions 2/4/5/9/17/24/27, phase briefs #93/#95/#97/
+  #98/#99 updated. Baselines: vitest 792/792 (38 files), tsc clean;
+  cargo-test pending (link-locked test binary at run time).
 - **A (#93) — Registry + identity (backend, no schema change).** `registry.rs`,
   `HarnessId`, `HarnessDescriptor`, `HarnessPlugin` trait with both impls
   moved verbatim from `tabs/config.rs` / `sandbox/tabs.rs`; the ten "which
@@ -667,7 +732,10 @@ cImp-side work, and none of it can be made data, because it *is* the harness:
 2. One `HarnessDescriptor` entry — id, label, binaries, tab ids, consumer,
    features, sandbox grant rows, default tab template.
 3. `settings_schema()` — the harness's own settings fields (decision 6);
-   `routes()` if it pushes (decision 15); `native_tools()` (decision 16).
+   `routes()` if it pushes (decision 15); `native_tools()` (decision 16);
+   `input_profile()` if it can be a delegation worker (decision 4, V39) —
+   plus the `<id>.input.profile` row, its `declared_unprobed()` reason and
+   the manual paste spike recorded per harness (decision 5).
 4. A CHP hello (`serves`/`cannot`) and registry rows with `wired_in`.
 5. `canaries()` + fixtures under `fixtures/harness/<id>/<version>/` and
    `probe()` (decision 17); goldens if the artifact is a file.

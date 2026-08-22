@@ -46,12 +46,12 @@ export function clipboardHasImage(types: readonly string[]): boolean {
   return types.some((t) => t.startsWith('image/'));
 }
 
-/// Appends one `[image] <path>` line per attachment, followed by the harness's
-/// `attachment` instruction line, to `content`. Both Claude Code and OpenCode
-/// accept local image paths dropped straight into the prompt text as plain
-/// path text — no special markup needed (verified against both; milestone
-/// Decision 3). Returns `content` unchanged when there are no attachments,
-/// so a plain-text submit is byte-identical to before Phase B.
+/// Appends one attachment line per path, followed by the harness's
+/// `attachment` instruction line, to `content`. Every shipped harness accepts
+/// local image paths dropped straight into the prompt text as plain path text —
+/// no special markup needed (verified against both; milestone Decision 3).
+/// Returns `content` unchanged when there are no attachments, so a plain-text
+/// submit is byte-identical to before Phase B.
 ///
 /// V40 Phase E (locked decision 24): `instruction` is model-visible text and
 /// therefore comes from the backend's instruction inventory
@@ -59,16 +59,31 @@ export function clipboardHasImage(types: readonly string[]): boolean {
 /// that only the frontend knows is one nothing can enumerate. An EMPTY
 /// instruction appends nothing rather than an empty line: the paths still
 /// submit, which is the honest degradation when the backend could not be asked.
+///
+/// V40 Phase F (locked decision 27): the LINE SHAPE is the harness's declared
+/// `attachmentFormat`, with `{path}` as its only slot. Unlike the instruction
+/// it is not model-visible text in the decision-24 sense — the user reads it in
+/// their own compose box before it is sent — which is why it is an affordance
+/// and not an instruction slot.
 export function appendAttachments(
   content: string,
   attachments: string[],
   instruction: string,
+  format: string = DEFAULT_ATTACHMENT_FORMAT,
 ): string {
   if (attachments.length === 0) return content;
-  const lines = attachments.map((p) => `\n[image] ${p}`).join('');
+  // A declared format with no `{path}` slot would drop the path entirely — a
+  // submit that silently attaches nothing. Fall back rather than obey.
+  const shape = format.includes('{path}') ? format : DEFAULT_ATTACHMENT_FORMAT;
+  const lines = attachments.map((p) => `\n${shape.replace('{path}', p)}`).join('');
   const tail = instruction.trim() ? `\n${instruction.trim()}` : '';
   return `${content}${lines}${tail}`;
 }
+
+/// What an attachment line looks like when no harness declared a shape — the
+/// same default every plugin inherits, so a tab whose harness could not be
+/// resolved still submits a line the user recognises.
+export const DEFAULT_ATTACHMENT_FORMAT = '[image] {path}';
 
 /// Reads the system clipboard's image (via the Tauri plugin — never
 /// `navigator.clipboard`, which WebView2 denies) and re-encodes its raw RGBA

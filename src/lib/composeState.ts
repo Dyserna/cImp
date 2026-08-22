@@ -7,7 +7,8 @@ import { writable, get } from 'svelte/store';
 import { ptyWrite } from './ipc';
 import { activeTab } from './tabs/state';
 import { focusTerminal } from './terminalFocus';
-import { appendAttachments } from './compose/attachments';
+import { appendAttachments, DEFAULT_ATTACHMENT_FORMAT } from './compose/attachments';
+import { harnessForTab } from './harness';
 import { harnessInstruction } from './harnessText';
 
 export const composeOpen = writable<boolean>(false);
@@ -90,7 +91,12 @@ export async function submitCompose(): Promise<void> {
   // attachments, so an image-only draft (empty textarea, one pasted image)
   // still submits — only a truly empty draft (no text AND no attachments)
   // is a no-op.
-  const message = appendAttachments(content, attachments, instruction);
+  const message = appendAttachments(
+    content,
+    attachments,
+    instruction,
+    harnessForTab(tab)?.affordances.attachmentFormat ?? DEFAULT_ATTACHMENT_FORMAT,
+  );
   if (!message) {
     closeCompose();
     return;

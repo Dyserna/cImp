@@ -506,7 +506,7 @@ export function setSplitRatios(
 /// No-op when the focused pane is the root — there is nowhere for the
 /// tabs to go.
 ///
-/// Builtin tabs (Claude / Claude (local)) come along automatically because
+/// Builtin AI tabs come along automatically because
 /// they are normal entries in `tab_ids`; the close-tab IPC's
 /// `builtin-not-closable` guard doesn't apply here — we are moving the
 /// tab, not closing it.

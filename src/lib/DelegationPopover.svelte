@@ -117,9 +117,15 @@
   /// This tab's harness, for the Role labels. Read from the same settings
   /// mirror the backend's own rule reads, so the two cannot disagree about
   /// which tabs are in one Manual group.
+  ///
+  /// V40 Phase F: `''` covers both "not an AI tab" and "runs a harness this
+  /// build does not know" — `tabHarness` answers `null` for the latter now
+  /// rather than naming a harness it is not (locked decision 2). The Manual row
+  /// then reads "another harness", which is honest, instead of offering the tab
+  /// as somebody else's delegation target.
   const harness = $derived.by(() => {
     const cfg = $settings.tabs.find((t) => t.kind === 'ai_tool' && t.id === tab);
-    return cfg && cfg.kind === 'ai_tool' ? tabHarness(cfg) : '';
+    return (cfg && cfg.kind === 'ai_tool' ? tabHarness(cfg) : null) ?? '';
   });
 
   /// The backend name the requesting harness would actually see. Blank falls

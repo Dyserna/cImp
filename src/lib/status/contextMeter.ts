@@ -19,6 +19,13 @@
 // reported" and leaves the rendering of that to the caller, which shows "—" /
 // a hollow track rather than a confident 0%.
 
+import {
+  findHarness,
+  findHarnessByCommand,
+  harnessesWith,
+  reservedAiTabIds,
+  type HarnessInfo,
+} from '../harness';
 import type { UsageReading } from '../ipc';
 
 /// Compact a token count the way the terminal status line does: `940`, `12k`,
@@ -60,10 +67,6 @@ export function clampPct(p: number): number {
 
 // ---- who actually pushes -------------------------------------------------
 
-/// The reserved AI tab ids `enabled_ai_tabs` can gate. Any other AI-tool tab
-/// is user-created and simply exists (it has no enable checkbox).
-const RESERVED_AI_TAB_IDS = ['claude', 'claude-local', 'opencode'];
-
 /// A tab as far as the push question is concerned. Structural rather than
 /// `TabConfig` so the check is unit-testable without building whole configs
 /// (Preview tabs have no `command` at all, hence the optional field).
@@ -76,54 +79,56 @@ export interface PushCapableTab {
 /// The harness id whose usage source the widget polls, or `null` when no tab
 /// that can push one is running.
 ///
-/// **Phase F replaces this whole block** (locked decision 19: `commandIsClaude`
-/// / `claudePushTabActive` become a registry `usage_push` capability, and the
-/// reserved-id list comes from `harness_list`). Until then the literals stay
-/// where the V40 ledger's section J already tracks them, rather than being
-/// spread to a second file.
+/// **V40 Phase F (locked decision 19).** This block used to be three identity
+/// literals: a hand-written mirror of Rust's `command_is`, a reserved-id array,
+/// and a function that answered one harness's id verbatim. All three are the
+/// registry's now — the harness is found by its declared
+/// `binaries`, the reserved ids come from its `tab_ids`, and *whether a running
+/// tab pushes at all* is the declared `usage_push` feature rather than an
+/// inference from the product's name.
+///
+/// The rules that survive, because they are about tabs and not about a harness:
+///
+/// * the tab's COMMAND decides, not its id — the status-line overlay is
+///   injected per command, so a variant tab and any user-created tab running
+///   the same binary push exactly like the reserved one does (M15). Gating on
+///   `enabled_ai_tabs.includes(<reserved id>)` hid valid readings from every
+///   one of them;
+/// * a reserved id counts only while enabled; a user-created tab is always
+///   present, because it has no enable checkbox to be off;
+/// * registry order breaks a tie, so two pushing harnesses running at once give
+///   the widget one stable answer instead of one that flips per poll.
+///
+/// `null` is a first-class answer the widget renders as *nothing to poll* —
+/// never as a harness sitting at 0%.
 export function usagePushHarness(
+  list: readonly HarnessInfo[],
   tabs: readonly PushCapableTab[] | null | undefined,
   enabledAiTabs: readonly string[] | null | undefined,
 ): string | null {
-  return claudePushTabActive(tabs, enabledAiTabs) ? 'claude' : null;
-}
-
-/// Mirror of `tabs::config::command_is(command, "claude")`: match on the
-/// path's file stem, case-insensitively, so `claude`, `C:\bin\claude.exe` and
-/// `/usr/local/bin/claude.cmd` all count. Both separators are accepted
-/// because Windows is the primary platform and a config written there can be
-/// read anywhere.
-export function commandIsClaude(command: string | undefined | null): boolean {
-  if (!command) return false;
-  const base = command.trim().replace(/[\\/]+$/, '').split(/[\\/]/).pop() ?? '';
-  // `Path::file_stem` strips one trailing extension, and only when it isn't
-  // the whole name (".claude" has no stem to speak of).
-  const stem = base.replace(/(?!^)\.[^.]*$/, '');
-  return stem.toLowerCase() === 'claude';
-}
-
-/// True when at least one AI tab that is actually running invokes `claude` —
-/// i.e. when *something* can push a status-line reading into the usage file.
-///
-/// The statusline overlay is injected per tab by command (`command_is(…,
-/// "claude")` in `tabs::config`), not by tab id, so `claude-local` and any
-/// user-created claude-command tab push exactly like the subscription tab
-/// does. Gating the widget on `enabled_ai_tabs.includes('claude')` (as it used
-/// to) hid valid context readings from every one of them (M15).
-///
-/// Reserved ids only count while enabled; user-created tabs are always
-/// present. Quota display needs no gate of its own: `rate_limits` exists only
-/// under subscription auth, so a local/API-key tab simply pushes no quota.
-export function claudePushTabActive(
-  tabs: readonly PushCapableTab[] | null | undefined,
-  enabledAiTabs: readonly string[] | null | undefined,
-): boolean {
-  if (!tabs) return false;
+  if (!tabs) return null;
   const enabled = enabledAiTabs ?? [];
-  return tabs.some(
-    (t) =>
-      t.kind === 'ai_tool' &&
-      commandIsClaude(t.command) &&
-      (!RESERVED_AI_TAB_IDS.includes(t.id) || enabled.includes(t.id)),
-  );
+  const reserved = reservedAiTabIds(list);
+  for (const h of harnessesWith(list, 'usage_push')) {
+    const pushing = tabs.some(
+      (t) =>
+        t.kind === 'ai_tool' &&
+        findHarnessByCommand(list, t.command)?.id === h.id &&
+        (!reserved.includes(t.id) || enabled.includes(t.id)),
+    );
+    if (pushing) return h.id;
+  }
+  return null;
+}
+
+/// How many stacked rows the bottom strip must be tall enough for, given the
+/// harness currently feeding it — the declared `statuslineRows` (locked
+/// decision 19: the 44 px `.status-bar` height was two rows of one harness's
+/// quota pair, asserted in a stylesheet). `0` means "this harness declares no
+/// status-line widget", and the caller leaves the stylesheet's default alone.
+export function statuslineRowsFor(
+  list: readonly HarnessInfo[],
+  harness: string | null | undefined,
+): number {
+  return findHarness(list, harness)?.affordances.statuslineRows ?? 0;
 }

@@ -24,6 +24,7 @@
     graphUsage,
     graphSessionUsage,
     graphTabSession,
+    advisorRules,
     graphUsageAdvice,
     advisorDismiss,
     advisorMarkApplied,
@@ -105,6 +106,7 @@
     saveViewString,
   } from './viewSection';
   import { harnessMarkVerified } from './graph';
+  import { harnesses, harnessLabel } from './harness';
 
   // The graph_* tool reference list, the recent-calls activity feed, and the
   // graph index dashboard all moved to the Tool Activity tab
@@ -714,7 +716,7 @@
 
   // ── V34: follow the focused agent tab ────────────────────────────────
   // `usage.current` is "the session with the most recent activity across all
-  // agents" — with two Claude tabs open that is whichever tab last WROTE, not
+  // agents" — with two tabs of one harness open that is whichever tab last WROTE, not
   // the one being looked at, so the card appeared stuck on one tab's session.
   // The fix is to select the focused tab's session automatically, using the
   // same drill-in path a click uses.
@@ -1291,29 +1293,41 @@
     chartPreview[seg.key] = undefined;
   }
 
-  // V40 Phase C (locked decision 23): the three lines below used to name ONE
-  // harness's mechanisms — "Claude Code version", "≥2 Claude sessions", "the
-  // PreToolUse hook" — from the frontend, for rules that fire per registered
-  // harness now. The per-rule fix pointer is `Capability::drift_hint()` in Rust
-  // and reaches the card in its `rationale`; this tooltip is the THRESHOLD
-  // reference, so it states the condition and leaves the mechanism to the card
-  // that fires. Phase F replaces the whole block with backend-published
-  // descriptions (the rest of it still restates numbers `advisor.rs` owns).
-  const ADVISOR_RULES_TOOLTIP =
-    'advisor.raise_context_min_score.v1: ≥5 sessions, ≥200 injections, ≥70% never re-touched → raise context_min_score.\n' +
-    'advisor.raise_read_advisor_min_lines.v1: ≥5 sessions, ≥20 reminders, ≥50% re-read anyway → raise read_advisor_min_lines.\n' +
-    'advisor.lower_context_turn_budget_chars.v1: ≥5 sessions, ≥200 injections, ≥50 turns, ≥70% unread AND ≥50% turns maxed → lower context_turn_budget_chars.\n' +
-    'drift.harness_version.v1: Claude Code version ≠ last-verified → re-verify the hook contracts (Mark verified).\n' +
-    'drift.read_reason.v1: ≥15 reminders, ≥90% immediately re-read → the deny reason isn’t reaching the model; disable read_advisor.\n' +
-    'drift.read_hook_silent.v1: ≥3 sessions, ≥10 large re-reads (est.), 0 reminders → the PreToolUse hook isn’t firing.\n' +
-    'drift.injection_unseen.v1: ≥5 sessions, ≥30 injections, ≤2% follow → injected context likely never reaches the model.\n' +
-    'drift.usage_fields_gone.v1: ≥2 Claude sessions, all without token fields → the transcript usage schema changed.\n' +
-    'drift.payload.v1: any shim-reported payload missing required fields.\n' +
-    'drift.read_bypass.v1: ≥10 reminders, ≥40% answered via shell reads (est.) → disable read_advisor.\n' +
-    'surface.lean.v1: ≥10 sessions, 0 calls to any cold-tail graph tool (cycles, dead_exports, struct_search, path, architecture) → enable lean_tools (hide them from the advertised surface; they still answer if called).\n' +
-    'adopt.read_advisor.v1: ≥5 sessions, E1 verified (pass), ≥3 redundant large re-reads per session across ≥10 sessions (est.; external tools may have changed the file between reads) → enable read_advisor.\n' +
-    'adopt.read_advisor_substitute.v1: read_advisor on in advise mode, ≥20 reminders, ≤20% re-read anyway, low shell bypass → switch read_advisor_mode to substitute.\n' +
-    'After an Apply, that rule stays quiet for 3 further sessions so fresh post-change data can accumulate before it re-evaluates.';
+  // V40 Phase F (locked decision 23): the rule reference is PUBLISHED by the
+  // backend now. It used to be a hard-coded string here — a second copy of
+  // every threshold `advisor.rs` owns, which a tuning change left lying, with
+  // one harness's mechanisms named in it (a product's version, a named hook)
+  // for rules that fire per registered harness.
+  //
+  // What each card says about the FIX still comes from the card: the pointer is
+  // `Capability::drift_hint()`, supplied by the harness that raised it, so it
+  // can name that harness's mechanism where this reference cannot.
+  //
+  // Empty until the fetch lands (one paint): the tooltip is a reference, and an
+  // absent one is better than a stale one.
+  let advisorRulesTooltip = $state('');
+
+  /// How each harness receives an injected prompt, named by the harness (V40
+  /// Phase F, locked decision 27). The sentence used to enumerate the two
+  /// shipped harnesses and their mechanisms in markup here.
+  const injectMechanisms = $derived(
+    $harnesses
+      .filter((h) => h.affordances.injectMechanism)
+      .map((h) => `for ${h.label} via ${h.affordances.injectMechanism}`)
+      .join(', '),
+  );
+
+  async function loadAdvisorRules(): Promise<void> {
+    try {
+      const doc = await advisorRules();
+      advisorRulesTooltip = [
+        ...doc.rules.map((r) => `${r.id}: ${r.thresholds}`),
+        doc.footer,
+      ].join('\n');
+    } catch (e) {
+      console.error('advisor_rules failed:', e);
+    }
+  }
 
   // ── V16 Feature 8: tokens | est. cost toggle ─────────────────────────
   // Cost mode multiplies each bar segment by its $/MTok price before
@@ -1501,6 +1515,10 @@
   async function markVerified(p: AdvisorProposal): Promise<void> {
     advisorBusy = proposalKey(p);
     try {
+      // A `mark_verified` card always carries the harness it is about; a card
+      // without one has nothing to stamp, and stamping the default harness
+      // instead is exactly the misattribution Phase C's field removed.
+      if (!p.harness) return;
       await harnessMarkVerified(p.harness);
       dropProposal(p);
     } catch (e) {
@@ -1653,6 +1671,8 @@
   });
 
   onMount(async () => {
+    // Static backend data, once — see `loadAdvisorRules`.
+    void loadAdvisorRules();
     await refresh();
     // A light poll backstops the event for the section-gated fetches (memory,
     // usage) and the checks-suggestion readiness edge.
@@ -2241,7 +2261,7 @@
     <details class="card advisor" bind:open={advisorCardOpen}>
       <summary class="history-head">
         Budget-tuning advisor
-        <span class="muted" title={ADVISOR_RULES_TOOLTIP}>ⓘ rules</span>
+        <span class="muted" title={advisorRulesTooltip}>ⓘ rules</span>
       </summary>
       {#if advisorError}
         <p class="placeholder">{advisorError}</p>
@@ -2269,7 +2289,7 @@
                   <button
                     class="mini"
                     disabled={advisorBusy !== null}
-                    title="Stamp the currently-seen Claude Code version as verified — do this AFTER re-running the MAINTENANCE.md contract checks"
+                    title="Stamp the currently-seen {harnessLabel(p.harness)} version as verified — do this AFTER re-running the MAINTENANCE.md contract checks"
                     onclick={() => markVerified(p)}
                   >{advisorBusy === proposalKey(p) ? 'Marking…' : 'Mark verified'}</button>
                 {:else if !p.warn_only}
@@ -2546,7 +2566,7 @@
 
     {#if !memory || (memory.working_set.length === 0 && memory.notes.length === 0 && memory.sessions.length === 0)}
       <p class="placeholder">
-        No session memory yet. As Claude reads, edits, and queries files (with the
+        No session memory yet. As the agent reads, edits, and queries files (with the
         graph enabled), its working set and notes appear here.
       </p>
     {:else}
@@ -2584,7 +2604,7 @@
       <section class="card">
         <div class="history-head">Notes <span class="muted">({memory.notes.length})</span></div>
         {#if memory.notes.length === 0}
-          <p class="placeholder">No notes. Ask Claude to <code>context_note</code> a decision.</p>
+          <p class="placeholder">No notes. Ask the agent to <code>context_note</code> a decision.</p>
         {:else}
           <div class="rows">
             {#each memory.notes as n (n.note_id)}
@@ -2625,9 +2645,9 @@
         When enabled (Settings → Code Intelligence → Token efficiency → Context
         injection), cImp
         prepends a budget-bounded digest of the most relevant files to each
-        prompt — for Claude via a <code>UserPromptSubmit</code> hook, for OpenCode
-        via a generated plugin. Preview below shows what <em>would</em> be injected
-        for a prompt, regardless of the toggle.
+        prompt{injectMechanisms ? ` — ${injectMechanisms}` : ''}. Preview below
+        shows what <em>would</em> be injected for a prompt, regardless of the
+        toggle.
       </p>
 
       <section class="card">

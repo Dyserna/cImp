@@ -1,16 +1,19 @@
 <script lang="ts">
   // Inline harness usage tracker for the bottom status bar (right of Layouts).
-  // Shows one row per quota window the harness declares — for Claude Code, the
-  // session (5h) and weekly (7d) windows — each as a proportional bar, a
-  // rounded percentage, a live countdown to reset, and the local reset clock
-  // time. Every element is individually toggleable via `settings.usage`; the
-  // whole widget hides when disabled or when there is nothing to draw.
+  // Shows one row per quota window the harness declares — each as a
+  // proportional bar, a rounded percentage, a live countdown to reset, and the
+  // local reset clock time. Every element is individually toggleable via
+  // `settings.usage`; the whole widget hides when disabled or when there is
+  // nothing to draw.
   //
   // V40 Phase D: the windows, their labels and their durations come from the
   // BACKEND (`harness_usage` answers the harness's declared windows plus the
-  // readings), so this component no longer knows that Anthropic sells a 5-hour
-  // and a 7-day window. A harness with no usage source at all answers
-  // `source: null` and the widget stays hidden — never a row at 0%.
+  // readings), so this component knows no vendor's quota shape. A harness with
+  // no usage source at all answers `source: null` and the widget stays hidden —
+  // never a row at 0%.
+  //
+  // V40 Phase F: WHICH harness it polls comes from the registry too — the one
+  // that declares `usage_push` and has a running tab (see `usagePushHarness`).
   //
   // The widget ends at the reset clock: the live context/cache group that used
   // to sit to its right (NC-3) was retired, together with its `usage.show_context`
@@ -18,14 +21,13 @@
   // terminal status line still renders it — the app widget simply has no
   // consumer for that half any more, so nothing on the backend push path moved.
   //
-  // Data path: each `cimp --statusline` run inside a Claude tab persists the
-  // payload's `rate_limits` (5h/7d quota) to one push file; the backend
-  // `get_claude_usage` command reads that file — a local read, no network. We
-  // poll it on `usage.poll_interval_secs`; the countdown ticks locally between
-  // polls.
+  // Data path: a status-line run inside a harness tab persists its quota
+  // reading to one push file; the backend `harness_usage` command reads that
+  // file — a local read, no network. We poll it on `usage.poll_interval_secs`;
+  // the countdown ticks locally between polls.
   //
-  // Absence rule: every part is independently absent-able — `rate_limits`
-  // exists only for subscription auth after the first API response, and each
+  // Absence rule: every part is independently absent-able — a quota block
+  // exists only under subscription auth after the first API response, and each
   // field inside it can be missing. Missing renders as "—" / an empty
   // "unknown" track, NEVER as 0%.
   import { settings } from '../settings/store';
@@ -35,7 +37,8 @@
     type UsageReading,
     type UsageSourceInfo,
   } from '../ipc';
-  import { clampPct, hasQuotaData, usagePushHarness } from './contextMeter';
+  import { clampPct, hasQuotaData, statuslineRowsFor, usagePushHarness } from './contextMeter';
+  import { harnesses } from '../harness';
 
   // Floor on the poll cadence so a hand-edited tiny interval can't busy-poll.
   // The read is a local file, so this is UI hygiene rather than protection of
@@ -58,13 +61,17 @@
 
   const usage = $derived($settings.usage);
   // The widget is worth polling for whenever *some* running AI tab can push a
-  // status-line reading. That is decided by the tab's command, not its id:
-  // `claude-local` and any user-created claude-command tab get the same
-  // statusline injection as the subscription tab (M15). What is *drawn* is
-  // subscription-only and gates itself — API-key auth reports no
-  // `rate_limits`, so such a tab pushes context alone and the widget stays
-  // hidden (it used to show the context group for those; that group is gone).
-  const pushHarness = $derived(usagePushHarness($settings.tabs, $settings.enabled_ai_tabs));
+  // status-line reading. That is decided by the tab's command, not its id: a
+  // variant tab and any user-created tab running the same binary get the same
+  // status-line injection the reserved one does (M15). What is *drawn* can be
+  // narrower and gates itself — a tab authenticated by API key reports no quota
+  // block at all, so it pushes context alone and the widget stays hidden.
+  //
+  // `null` until the registry answers, which is one paint at most: guessing a
+  // harness here would poll an id this build may not have.
+  const pushHarness = $derived(
+    usagePushHarness($harnesses, $settings.tabs, $settings.enabled_ai_tabs),
+  );
   // Derive the individual primitives the effects depend on, rather than the
   // whole `usage` object. Svelte only re-runs an effect when a value it reads
   // actually changes, so this keeps the poll/tick effects from re-arming (and
@@ -99,10 +106,10 @@
 
   // Poll loop over the local push file (via the backend command).
   //   - fresh push → show snapshot undimmed, poll at pollMs.
-  //   - aging push (`stale`) → show snapshot dimmed; the Claude tab that fed
-  //     it has closed or gone quiet.
+  //   - aging push (`stale`) → show snapshot dimmed; the tab that fed it has
+  //     closed or gone quiet.
   //   - no data (snapshot null) → hide; poll at the normal cadence so the
-  //     widget appears within one interval of a Claude tab's first push.
+  //     widget appears within one interval of a tab's first push.
   //   - thrown transport / IPC error → keep last-good, back off exponentially.
   $effect(() => {
     if (!enabled || pushHarness === null) {
@@ -218,14 +225,16 @@
     })),
   );
 
-  // The bottom strip is as tall as the stacked usage rows it has to fit — two
-  // for Claude Code's 5h + 7d pair, which is where the pre-V40 hard-coded 44px
-  // came from. Declared rather than assumed, so a harness with three windows
-  // grows the strip instead of overflowing it. Left at the stylesheet's default
-  // when nothing declares windows: an empty strip is not a reason to reflow the
-  // whole window, and the registry-driven layout is Phase F's.
+  // The bottom strip is as tall as the stacked usage rows it has to fit — the
+  // two rows of one harness's quota pair are where the pre-V40 hard-coded 44px
+  // came from. V40 Phase F: the count is the polled harness's DECLARED
+  // `statuslineRows` (locked decision 19), with the readings it actually serves
+  // as the floor, so a harness that declares two windows and reports three
+  // still gets a strip tall enough for all of them. Left at the stylesheet's
+  // default when neither is known: an empty strip is not a reason to reflow the
+  // whole window.
   $effect(() => {
-    const rows = source?.windows.length ?? 0;
+    const rows = Math.max(statuslineRowsFor($harnesses, pushHarness), source?.windows.length ?? 0);
     if (rows > 0) {
       document.documentElement.style.setProperty('--status-bar-rows', String(rows));
     }

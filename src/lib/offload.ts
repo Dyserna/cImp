@@ -5,7 +5,7 @@
 import { writable, type Writable } from 'svelte/store';
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-import type { OpencodeLocalProvider, Settings } from './settings/types';
+import type { LocalProviderBlock, Settings } from './settings/types';
 
 /// Mirror of Rust `OffloadState` (serde tag = "state").
 export type OffloadState =
@@ -136,14 +136,15 @@ export async function offloadTest(instructions: string): Promise<string> {
   return invoke('offload_test', { instructions });
 }
 
-/// V21: derive the OpenCode `local-llama` provider from a Local backend's
-/// server command (the Settings "Add to OpenCode" button). Rejects with a
+/// V21: derive a harness's local-provider block from a Local backend's server
+/// command (the Settings *register this backend* button). Rejects with a
 /// message naming the missing `--port`/model flag when the command is
 /// incomplete; the caller persists the resolved snapshot via `settings_update`.
-export async function offloadDeriveOpencodeProvider(
+export async function offloadDeriveLocalProvider(
+  harness: string,
   serverCommand: string,
-): Promise<OpencodeLocalProvider> {
-  return invoke('offload_derive_opencode_provider', { serverCommand });
+): Promise<LocalProviderBlock> {
+  return invoke('offload_derive_local_provider', { harness, serverCommand });
 }
 
 /// V8-03: per-MCP-server health row (mirror of Rust `McpServerHealth`).
@@ -167,7 +168,7 @@ export interface McpServerHealth {
 
 /// V8-03: aggregate offload-service status (mirror of Rust `ServiceStatus`).
 /// `global_in_flight` is now honest — the long-lived app sees every offload
-/// across all Claude tabs, so the warm-pool spill/fail-over works.
+/// across all harness tabs, so the warm-pool spill/fail-over works.
 export interface ServiceStatus {
   global_in_flight: number;
   global_cap: number;

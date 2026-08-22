@@ -59,7 +59,7 @@
     /// When provided, the tab section renders. When null, only the
     /// pane section shows (right-click on the bar background).
     /// `kind` lets the menu show "Configure…" for builtin AI tabs
-    /// (Claude / Claude-local) where the parent routes Configure to
+    /// (a reserved AI builtin) where the parent routes Configure to
     /// the Settings window. Builtin shell tabs continue to hide it
     /// because their ConfigureTabDialog rejects builtin-shell edits.
     /// V14 Phase F: `'preview'` never shows "Configure…" or "New tab in
@@ -74,7 +74,7 @@
     onConfigure?: () => void;
     onRestart?: () => void;
     onClose?: () => void;
-    /// V13 Phase D D3: "New <Claude|OpenCode> tab in worktree…" — offered
+    /// V13 Phase D D3: "New <harness> tab in worktree…" — offered
     /// for any AI-tool tab (builtin or already-duplicated), same
     /// availability rule as `onConfigure`.
     onNewWorktreeTab?: () => void;

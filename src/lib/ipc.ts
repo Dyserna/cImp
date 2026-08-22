@@ -189,7 +189,7 @@ export interface ContextReading {
   /// Window size in tokens (200k, or 1M with extended context).
   context_window_size?: number | null;
   /// The latest turn's tokens, by declared category id (`input`,
-  /// `cache_write`, `cache_read`, `output` for Claude Code). A category the
+  /// `cache_write`, `cache_read`, `output` for one shipped harness). A category the
   /// harness did not report has no entry.
   tokens?: Record<string, number>;
   /// Session metadata the harness reported beside the numbers (session name,
@@ -235,13 +235,13 @@ export interface UsageSourceInfo {
 }
 
 /// One harness's usage answer. **Three distinguishable states** (V40 Phase D):
-///   - `source` null → this harness has NO usage source (OpenCode). Render as
+///   - `source` null → this harness has NO usage source. Render as
 ///     absence; a harness that cannot report quota must never render at 0%.
 ///   - `source` set, `reading` null → it has one and nothing has reported yet
 ///     (no tab of that harness has pushed, or the last push expired).
 ///   - both set → `reading.windows` holds the windows that have data.
 ///
-/// The data is local: a Claude tab's status line (`cimp --statusline`)
+/// The data is local: an AI tab's status line (a cImp subcommand the harness runs)
 /// persists the payload it is handed, and this reads that file back — no
 /// network is involved. M14: the quota and context halves are written by
 /// different tabs and age on their own clocks, so each carries its own
@@ -370,7 +370,7 @@ export async function createShellTab(input: CreateShellTabInput): Promise<TabId>
   return invoke<TabId>('create_shell_tab', input as unknown as Record<string, unknown>);
 }
 
-/// Spawn a duplicate of an existing AI tab (the `+` on a Claude/OpenCode
+/// Spawn a duplicate of an existing AI tab (the `+` on an AI
 /// builtin). `template` is the id of the tab to clone; the backend copies
 /// its live config, assigns a fresh `ai-<uuid>` id, and returns the new
 /// tab id. The new tab is closable (`builtin: false`) and persists across
@@ -379,7 +379,7 @@ export async function createAiTab(template: TabId): Promise<TabId> {
   return invoke<TabId>('create_ai_tab', { template });
 }
 
-/// V13 Phase D D3: "New <Claude|OpenCode> tab in worktree…" — creates a
+/// V13 Phase D D3: "New <harness> tab in worktree…" — creates a
 /// fresh cImp worktree (`.cimp/worktrees/<slug>`, branch `cimp/<slug>` cut
 /// from `HEAD`) then spawns a duplicate of `template`'s config with `cwd`
 /// pointed at it. Throws the same `TabLifecycleError` shape as

@@ -16,7 +16,8 @@ import { invoke } from '@tauri-apps/api/core';
 /// * `{ unrecognized }` — a non-empty id naming no configured tab. Rendering it
 ///   as a tab would attribute activity to a tab that does not exist, inside the
 ///   view whose whole job is attribution.
-/// * `'headless'` — positively no tab (`claude -p`, cron, worker tasks, cImp's
+/// * `'headless'` — positively no tab (a harness run non-interactively, cron,
+///   worker tasks, cImp's
 ///   own internal work). A fact about the caller, not missing data.
 /// * `'unattributed'` — the writer did not know, or the row predates #51.
 ///   "Nobody was on a tab" and "we weren't recording it" are different facts
@@ -127,7 +128,7 @@ export interface ActivityEntry {
   /// `timeout` / `takeover` / `worker_exited` / `role_moved`), `target` is the
   /// worker tab (plus the reason on anything that is not a plain success),
   /// `source` is the DRIVER's harness and the attribution is the driver TAB —
-  /// so a row answers both ends of "who used my Claude tab". `request` /
+  /// so a row answers both ends of "who used my AI tab". `request` /
   /// `response` carry the verbatim task and the screened reply on `done` rows
   /// only; every other transition has no payload at all, which is why
   /// `rowMeta` must not print "0 chars" for one. Its own retention lane
@@ -172,7 +173,7 @@ export interface ActivityEntry {
   /// is not showing. See [`FeedFilter`] for where that rule lands here, and
   /// `timeline.ts`'s `evidenceNotices` for the pattern that says it out loud.
   root: string;
-  /// Agent (claude/opencode/offload/read_advisor/auto_check) for graph
+  /// Agent (a registry harness id, or one of cImp's own services) for graph
   /// entries; the backend name for offload entries. For `injection_flag` rows
   /// it names the SCREEN that fired: `ssrf` / `budget` / `canary` /
   /// `latch_refusal` / `memory_quarantine` / `signature` / `classifier`, plus

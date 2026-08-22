@@ -26,7 +26,7 @@ import {
 /// One tab's containment state. Mirror of Rust `LatchStatus` + the flattened
 /// `LatchView` (`offload/loopback.rs`).
 export interface LatchRow {
-  /// `claude` / `opencode` — the normalized agent vocabulary.
+  /// A registry harness id — the normalized agent vocabulary.
   consumer: string;
   /// The cImp tab id this latch belongs to.
   tab: TabId;
@@ -71,7 +71,7 @@ export interface LatchRow {
   /// `LatchStatus` + `LatchView`, and a mirror that quietly drops a field is the
   /// defect M-21 was: a type that says it describes the wire, and does not.
   ///
-  /// **Nothing in this app renders it yet.** Its live consumer is the OpenCode
+  /// **Nothing in this app renders it yet.** Its live consumer is the generated
   /// plugin's web-direction refusal, which reads the same fact off
   /// `/latch/state` to pick the refusal whose cause it actually checked. A
   /// surface that wants to say *why* a tab is `local` should read this rather
@@ -123,7 +123,7 @@ export interface FeatureState {
   in_scope: boolean;
   /// V32 Phase H: this feature's app-wide DEFAULT. Published by the backend
   /// rather than mirrored here, so "is protection reduced?" has one definition:
-  /// a control that ships off (the OpenCode native gate) being off is the
+  /// a control that ships off (the harness native gate) being off is the
   /// baseline, not a reduction.
   default_on: boolean;
   /// Whether changing this control only takes effect on the next tab spawn.
@@ -294,7 +294,7 @@ export function isTabScope(scope: string): boolean {
 /// - only rows the scope actually HAS — a tab is not "reduced" because the
 ///   worker-only canary does not apply to it;
 /// - only rows that are actually off;
-/// - only features that ship ON (`default_on`). V32 Phase H's OpenCode native
+/// - only features that ship ON (`default_on`). V32 Phase H's harness native
 ///   gate defaults off by user decision, and counting it would raise the muted
 ///   badge on every tab of a fresh install — which is how a badge stops being
 ///   read. Uses the backend's own `default_on` rather than a second list of

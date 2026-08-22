@@ -126,7 +126,11 @@ export interface GraphCall {
   ts_ms: number;
   /// Canonicalized project root the call ran against.
   root: string;
-  source: 'claude' | 'opencode' | 'offload' | 'read_advisor' | 'auto_check';
+  /// Who made the call: a registry harness id (`harness_list`), or one of
+  /// cImp's own services. A bare `string` since V40 Phase F — the harness half
+  /// of this union was the frontend re-declaring the roster, and a call from a
+  /// harness this build has not heard of must render, not fail to type-check.
+  source: string;
   tool: string;
   target: string;
   chars: number;
@@ -134,7 +138,7 @@ export interface GraphCall {
   ok: boolean;
 }
 
-/// Recent graph tool calls (cloud Claude + offload worker), newest first.
+/// Recent graph tool calls (harness sessions + offload worker), newest first.
 /// The store spans every indexed root; pass `scoped: true` (with an optional
 /// `root`, default the launch directory) to see one project's calls only.
 /// `sinceTs` trims the response to entries newer than the caller's
@@ -656,7 +660,8 @@ export interface SessionUsageRow {
   cache_hit_ratio: number;
   /// True when this session recorded no real Turn tokens (all four token
   /// totals are zero) — the table's "est" badge. V24 Phase E: token-less
-  /// sessions (pre-V24 OpenCode) keep it; any session with real tokens loses it.
+  /// sessions (a harness that reported no tokens) keep it; any session with
+  /// real tokens loses it.
   est_only: boolean;
   /// Session start / last-activity timestamps (epoch ms).
   started_ms: number;
@@ -836,9 +841,31 @@ export function advisorMarkApplied(ruleId: string, root?: string): Promise<void>
 /// (the Advisor card's "Mark verified" — the user just re-ran the
 /// MAINTENANCE.md contract checks).
 ///
-/// V40 Phase C: pass the notice's own `harness`. Omitting it means the DEFAULT
-/// harness, which is the documented wire-compat default and what every caller
-/// before this phase meant.
-export function harnessMarkVerified(harness?: string | null): Promise<void> {
-  return invoke<void>('harness_mark_verified', { harness: harness ?? null });
+/// **The harness is REQUIRED** (V40 Phase F, locked decision 23). Phase C added
+/// the argument with a wire-compat default; the caller passes the id the button
+/// actually sits under now, so a card raised for one harness can never stamp
+/// another's row. The backend still accepts the absent form for older callers;
+/// there are none left in this window.
+export function harnessMarkVerified(harness: string): Promise<void> {
+  return invoke<void>('harness_mark_verified', { harness });
+}
+
+/// One rule's row in the Advisor's rule reference. Mirror of Rust
+/// `advisor::RuleReference`.
+export interface RuleReference {
+  id: string;
+  thresholds: string;
+}
+
+/// Mirror of Rust `ipc::commands::AdvisorRules`.
+export interface AdvisorRules {
+  rules: RuleReference[];
+  footer: string;
+}
+
+/// **The advisor's rule reference, from the backend** (V40 Phase F, locked
+/// decision 23). The panel used to restate every threshold — and one harness's
+/// mechanisms — in a hard-coded tooltip.
+export function advisorRules(): Promise<AdvisorRules> {
+  return invoke<AdvisorRules>('advisor_rules');
 }

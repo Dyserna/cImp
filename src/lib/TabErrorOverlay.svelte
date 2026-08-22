@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { TabId } from './tabs/types';
   import { tabErrors } from './tabs/errorState';
+  import { findHarnessByTabId, harnesses } from './harness';
 
   // Renders an in-tab error card over the terminal when the tab's spawn
   // (or mid-session subprocess) has failed. The host Terminal owns the
@@ -27,12 +28,19 @@
     }
   }
 
-  // V1.4-07: when a Claude tab fails to launch, the most common cause is
-  // that `claude` isn't on PATH yet (the user hasn't installed Claude Code
-  // CLI, or it's installed but not on this shell's PATH).
+  // V1.4-07: when an AI tab fails to launch, the most common cause is that its
+  // binary isn't on PATH yet (the harness isn't installed, or it is but not on
+  // this shell's PATH).
+  //
+  // V40 Phase F (locked decision 27): the hint and its docs link are the
+  // harness's — this component used to answer them only for one harness's two
+  // tab ids, with the URL inline, so every other harness's launch failure came
+  // with no hint at all. A harness that declares none still gets the raw error,
+  // which is the honest absence.
   const installHint = $derived.by(() => {
-    if (tabId !== 'claude' && tabId !== 'claude-local') return null;
-    return 'Make sure Claude Code is installed and on your PATH. Installation instructions: https://docs.anthropic.com/en/docs/claude-code/setup';
+    const a = findHarnessByTabId($harnesses, tabId)?.affordances;
+    if (!a?.installHint) return null;
+    return a.docsUrl ? `${a.installHint} ${a.docsUrl}` : a.installHint;
   });
 </script>
 

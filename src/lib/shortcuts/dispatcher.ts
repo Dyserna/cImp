@@ -44,7 +44,7 @@ export type ShortcutAction =
   /// shortcut. When a Ctrl+right-click selection read is active the key is
   /// consumed (it cancels the read and clears its highlight); otherwise the
   /// stop runs as a side effect and Esc still flows to the terminal/PTY so
-  /// Claude's own Escape handling keeps working.
+  /// the harness's own Escape handling keeps working.
   | 'stop_tts';
 
 /// A shortcut binding can be a bare function (always fires when matched) or
@@ -130,7 +130,7 @@ function onKeyDown(event: KeyboardEvent): void {
   // in-flight TTS (`stop_tts`). When a selection read is active (the handler's
   // `active()` guard) we consume the key so it cancels the read and clears its
   // highlight. Otherwise we still run the stop, but do NOT preventDefault —
-  // Escape continues to xterm/PTY so Claude's own Escape handling works.
+  // Escape continues to xterm/PTY so the harness's own Escape handling works.
   if (event.key === 'Escape') {
     const binding = handlers.stop_tts;
     if (binding) {

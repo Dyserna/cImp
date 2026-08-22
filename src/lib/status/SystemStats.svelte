@@ -1,5 +1,5 @@
 <script lang="ts">
-  // Inline system-monitor panel for the bottom status bar, right of the Claude
+  // Inline system-monitor panel for the bottom status bar, right of the
   // usage meter. Two lines on the (already two-line) bar:
   //   Top:    CPU % + sparkline + temperature(°C) + memory % + bar
   //   Bottom: GPU % + sparkline + VRAM % + bar + network sparkline + ↓/↑ speed

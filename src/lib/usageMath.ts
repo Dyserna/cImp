@@ -97,7 +97,7 @@ export interface PricingRow extends PriceRates {
 }
 
 /// V16 Feature 8: pick the pricing row whose `model_prefix` prefixes the
-/// transcript model id (e.g. prefix `"claude-opus-4-8"` matches the bare
+/// transcript model id (a vendor's model-id prefix matches the bare
 /// alias and any dated snapshot). Longest prefix wins; rows with an empty
 /// prefix never auto-match (manual-pick only). `null` when nothing matches —
 /// the caller renders token-mode with a hint rather than a made-up cost.

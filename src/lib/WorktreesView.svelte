@@ -237,7 +237,7 @@
     <p class="msg err">Couldn't load worktrees: {loadError}</p>
   {:else if worktrees.length === 0}
     <p class="msg placeholder">
-      No worktrees yet. Right-click a Claude/OpenCode tab and choose "New tab
+      No worktrees yet. Right-click an AI tab and choose "New tab
       in worktree…" to spin one up for a parallel, isolated task.
     </p>
   {:else}

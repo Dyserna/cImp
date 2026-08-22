@@ -1,5 +1,5 @@
 <script lang="ts">
-  // V13 Phase D D3 — "New <Claude|OpenCode> tab in worktree…". A name
+  // V13 Phase D D3 — "New <harness> tab in worktree…". A name
   // prompt: creates a fresh cImp worktree (`.cimp/worktrees/<slug>`, branch
   // `cimp/<slug>` cut from HEAD) and spawns a duplicate of the source AI
   // tab's config into it (`cwd` set to the worktree's path — D2). The new

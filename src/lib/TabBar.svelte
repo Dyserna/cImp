@@ -35,6 +35,7 @@
   import { openConfigureTabDialog, openNewShellTabDialog, openNewWorktreeTabDialog } from './dialog/store';
   import { openSettingsWindowToTab } from './settings/ipc';
   import { isPreviewTabId, isShellTab, type TabId } from './tabs/types';
+  import { findHarnessByTabId, harnesses } from './harness';
   import { tabMeta } from './tabs/store';
   import { cancelPlacement, requestTabIntoPane, setFocusedPane, setPaneActiveTab } from './layout/store';
   import { paneRegistry } from './layout/registry';
@@ -178,7 +179,9 @@
   function rowFor(tab: TabId, row: LatchRow | undefined): LatchRow {
     return (
       row ?? {
-        consumer: 'claude',
+        // The tab's own harness, or '' for one that runs none — never a
+        // harness picked because it is the first one (V40 Phase F).
+        consumer: findHarnessByTabId($harnesses, tab)?.id ?? '',
         tab,
         session: null,
         latch: 'open',
@@ -307,7 +310,7 @@
     });
   }
 
-  /// Spawn a duplicate of an AI builtin (the `+` on a Claude/OpenCode tab).
+  /// Spawn a duplicate of an AI builtin (the `+` on an AI tab).
   /// Routes the new tab into this pane via the same pending-placement
   /// cell the New Shell Tab `+` uses, so it lands next to its origin.
   function onSpawnAiTab(template: TabId): void {

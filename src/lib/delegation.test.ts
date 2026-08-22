@@ -21,7 +21,6 @@ import {
   readOnlyRefusalMessage,
   roleOf,
   tabHarness,
-  withTabBackend,
   withTabReadOnly,
   writeLocalEcho,
   READ_ONLY_USER_REASON,
@@ -642,21 +641,45 @@ describe('readOnlyAdvice', () => {
   });
 });
 
-describe('withTabBackend', () => {
-  it('clones rather than mutating, and patches only the named tab', () => {
-    const before = settingsWith();
-    const snapshot = JSON.stringify(before);
-    const after = withTabBackend(before, 'claude', { name: 'lan-worker-2', tier: 'fast' });
-    expect(JSON.stringify(before)).toBe(snapshot);
-    expect(backendOf(after, 'claude')).toEqual({
-      name: 'lan-worker-2',
-      tier: 'fast',
-      declared_context: null,
-    });
-    // Untouched tabs keep their identity, so an unrelated re-render is skipped.
-    expect(after.tabs[1]).toBe(before.tabs[1]);
+/// The popover's source, for the M-10 guard below. Same raw-glob mechanism as
+/// the banner scan above.
+const POPOVER_SOURCE = import.meta.glob('/src/lib/DelegationPopover.svelte', {
+  query: '?raw',
+  import: 'default',
+  eager: true,
+}) as Record<string, string>;
+
+describe('the facade knobs are a narrow write', () => {
+  /// **V39 review M-10.** The knobs used to be saved by cloning the whole
+  /// `Settings` and calling `applySettings` — a document written from a
+  /// snapshot taken before some other write landed silently reverts it (the
+  /// `40d2b32` class), and the write most likely to be racing it is the ROLE
+  /// radio one line above in this same popover, which has its own command
+  /// precisely because only the backend can enforce its cross-tab rule.
+  ///
+  /// Asserted on the source because a `.svelte` file has no test harness here,
+  /// and what must hold is that the whole-document path is not reachable from
+  /// this component at all.
+  it('leaves the popover with no whole-document settings save', () => {
+    const src = Object.values(POPOVER_SOURCE)[0] ?? '';
+    expect(src.length).toBeGreaterThan(0);
+    const code = src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+    expect(code).not.toMatch(/\bapplySettings\b/);
+    expect(code).toMatch(/\btabSetDelegationBackend\(/);
+    expect(code).toMatch(/\btabSetDelegationRole\(/);
   });
 
+  /// …and the helper that built such a document is gone, not merely unused: a
+  /// clone-the-document helper one import away is the same defect waiting for
+  /// the next component.
+  it('leaves no whole-document backend helper in delegation.ts', () => {
+    const src = Object.values(DELEGATION_SOURCE)[0] ?? '';
+    const code = src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+    expect(code).not.toMatch(/\bwithTabBackend\b/);
+  });
+});
+
+describe('backendOf', () => {
   it('gives an unknown tab the documented defaults rather than throwing', () => {
     expect(backendOf(settingsWith(), 'no-such-tab')).toEqual({
       name: null,

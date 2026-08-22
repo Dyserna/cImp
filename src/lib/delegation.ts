@@ -571,23 +571,8 @@ export function facadeBackends(settings: Settings): FacadeBackendRow[] {
   return rows;
 }
 
-/// Clone `settings` with one AI tab's facade-backend knobs changed.
-///
-/// The knobs go through the ORDINARY settings save (`applySettings`), unlike
-/// the role beside them: the role carries a cross-tab uniqueness rule that only
-/// `tab_set_delegation_role` enforces, and writing it here would let two tabs
-/// of one harness hold Manual.
-export function withTabBackend(
-  settings: Settings,
-  tabId: string,
-  patch: Partial<DelegationBackend>,
-): Settings {
-  return {
-    ...settings,
-    tabs: settings.tabs.map((t) =>
-      t.kind === 'ai_tool' && t.id === tabId
-        ? { ...t, delegation_backend: { ...t.delegation_backend, ...patch } }
-        : t,
-    ),
-  };
-}
+// V39 review M-10: `withTabBackend` — the clone-and-save helper the popover
+// used to build a whole-document `applySettings` from — is GONE, not deprecated.
+// The knobs now go through `tab_set_delegation_backend`, a command that writes
+// three fields under `settings.mutate`. Keeping a helper that produces a
+// whole-document save is keeping the lost-update shape one import away.

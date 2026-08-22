@@ -660,6 +660,75 @@ pub async fn tab_set_delegation_role(
     })
 }
 
+/// **Write one tab's facade-backend knobs, and nothing else** (V39 review
+/// M-10).
+///
+/// The popover used to save these through the ordinary whole-document
+/// `applySettings`: read the store, patch three fields, send the entire
+/// `Settings`. That is the `40d2b32` lost-update shape — a document written
+/// from a snapshot taken before some other write landed silently reverts it —
+/// and the write most likely to be in flight beside it is the ROLE radio one
+/// line above, which goes through `tab_set_delegation_role` precisely because
+/// only the backend can enforce its cross-tab rule. Typing a backend name
+/// could put the role back.
+///
+/// So: one command, three fields, `settings.mutate` (which composes with a
+/// concurrent mutation instead of overwriting the document).
+///
+/// **The role is deliberately not touched**, and neither is anything else on
+/// the tab: a user who sets a name, switches the role away and switches it
+/// back finds the knobs where they left them.
+#[tauri::command]
+pub async fn tab_set_delegation_backend(
+    state: State<'_, AppState>,
+    tab: TabId,
+    backend: crate::settings::DelegationBackend,
+) -> AppResult<()> {
+    if tab.kind() != TabKind::AiTool {
+        return Err(AppError::Ipc(format!(
+            "tab `{}` is not an AI tab; delegation backends are configured on AI tabs only",
+            tab.as_str()
+        )));
+    }
+    if !matches!(
+        state.settings.current().find_tab(tab.as_str()),
+        Some(TabConfig::AiTool(_))
+    ) {
+        return Err(AppError::Ipc(format!("unknown AI tab `{}`", tab.as_str())));
+    }
+    let backend = normalise_backend(backend);
+    let id = tab.as_str().to_string();
+    state.settings.mutate(move |snap| {
+        if let Some(TabConfig::AiTool(cfg)) = snap.find_tab_mut(&id) {
+            apply_backend_patch(cfg, backend);
+        }
+    });
+    Ok(())
+}
+
+/// The two "blank means unset" rules, at the parse boundary rather than at
+/// every reader: a cleared text field arrives as `""` and a cleared number
+/// field as `0`, and both mean "use the default".
+fn normalise_backend(
+    mut backend: crate::settings::DelegationBackend,
+) -> crate::settings::DelegationBackend {
+    backend.name = backend
+        .name
+        .map(|n| n.trim().to_string())
+        .filter(|n| !n.is_empty());
+    backend.declared_context = backend.declared_context.filter(|n| *n > 0);
+    backend
+}
+
+/// Write the knobs onto one tab's config. **Only** the knobs — separated out
+/// so a test can state that, since the command itself needs a running app.
+fn apply_backend_patch(
+    cfg: &mut crate::settings::AiToolTabConfig,
+    backend: crate::settings::DelegationBackend,
+) {
+    cfg.delegation_backend = backend;
+}
+
 /// V39 Phase B (locked decision 6): **take over** a driven tab.
 ///
 /// Stops the driver waiting; the worker keeps running, visibly. Sends the
@@ -4012,6 +4081,67 @@ mod tests {
     use super::read_only_refusal;
     use crate::settings::{PromptTemplate, Settings};
     use crate::state::{ReadOnlySource, TabId};
+
+    /// **The facade knobs are a NARROW write** (V39 review M-10).
+    ///
+    /// The popover's old path sent the whole `Settings` document, which can
+    /// revert a role change that landed after its snapshot was taken (the
+    /// `40d2b32` class). What replaces it must touch the three knobs and
+    /// nothing else — least of all `delegation_role`, whose cross-tab rule
+    /// only `tab_set_delegation_role` enforces.
+    #[test]
+    fn the_backend_patch_touches_the_knobs_and_nothing_else() {
+        use crate::settings::{BackendTier, DelegationBackend, DelegationRole, TabConfig};
+        let mut tab = crate::settings::default_claude_tab();
+        let TabConfig::AiTool(cfg) = &mut tab else {
+            panic!("an AI tab");
+        };
+        cfg.delegation_role = DelegationRole::Manual;
+        cfg.read_only = true;
+        cfg.name = "api-work".to_string();
+        let before = cfg.clone();
+
+        super::apply_backend_patch(
+            cfg,
+            DelegationBackend {
+                name: Some("lan-worker-2".to_string()),
+                tier: BackendTier::Fast,
+                declared_context: Some(128_000),
+            },
+        );
+
+        assert_eq!(cfg.delegation_backend.name.as_deref(), Some("lan-worker-2"));
+        assert_eq!(cfg.delegation_backend.tier, BackendTier::Fast);
+        assert_eq!(cfg.delegation_backend.declared_context, Some(128_000));
+        assert_eq!(
+            cfg.delegation_role, before.delegation_role,
+            "the role is the one field a knob write must never move"
+        );
+        assert_eq!(cfg.read_only, before.read_only);
+        assert_eq!(cfg.name, before.name);
+        assert_eq!(cfg.command, before.command);
+    }
+
+    /// Blank is unset, at the boundary: a cleared text field arrives as `""`
+    /// and a cleared number field as `0`.
+    #[test]
+    fn a_cleared_knob_is_stored_as_absent_not_as_blank() {
+        use crate::settings::DelegationBackend;
+        let out = super::normalise_backend(DelegationBackend {
+            name: Some("   ".to_string()),
+            declared_context: Some(0),
+            ..Default::default()
+        });
+        assert_eq!(out.name, None);
+        assert_eq!(out.declared_context, None);
+        let kept = super::normalise_backend(DelegationBackend {
+            name: Some("  lan-worker-2 ".to_string()),
+            declared_context: Some(64_000),
+            ..Default::default()
+        });
+        assert_eq!(kept.name.as_deref(), Some("lan-worker-2"));
+        assert_eq!(kept.declared_context, Some(64_000));
+    }
 
     /// **The keyboard's submit rule is unchanged, and it is the wrong rule for
     /// a paste** (V39 review L-1).

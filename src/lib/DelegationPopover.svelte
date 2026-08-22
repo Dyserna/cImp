@@ -22,7 +22,12 @@
   // Manual tabs of one harness. The Remote-offload KNOBS are ordinary per-tab
   // fields and ride the ordinary settings save.
   import { onMount } from 'svelte';
-  import { delegationTakeOver, tabSetDelegationRole, tabSetReadOnly } from './ipc';
+  import {
+    delegationTakeOver,
+    tabSetDelegationBackend,
+    tabSetDelegationRole,
+    tabSetReadOnly,
+  } from './ipc';
   import {
     attributionLine,
     defaultFacadeName,
@@ -30,12 +35,11 @@
     glyphState,
     harnessLabel,
     tabHarness,
-    withTabBackend,
     type DelegationRole,
     type InFlightView,
     type TabAccess,
   } from './delegation';
-  import { applySettings, settings } from './settings/store';
+  import { settings } from './settings/store';
   import { showToast } from './toast';
   import type { DelegationBackend } from './settings/types';
   import type { TabId } from './tabs/types';
@@ -171,13 +175,24 @@
     }
   }
 
-  /// Persist one Remote-offload knob through the ordinary settings save. The
-  /// store applies optimistically and rolls back on refusal, so there is no
-  /// second copy of the value here to drift.
+  /// Persist one Remote-offload knob.
+  ///
+  /// **V39 review M-10: a narrow IPC, not a whole-document save.** This used to
+  /// go through `applySettings(withTabBackend(...))`, i.e. read the store,
+  /// patch three fields, send the entire `Settings` — the `40d2b32`
+  /// lost-update shape, and the write most likely to be racing it is the ROLE
+  /// radio one line above, which has its own command precisely because only
+  /// the backend can enforce its cross-tab rule. Typing a backend name could
+  /// put the role back.
+  ///
+  /// The three knobs are sent together (the popover holds them all, live from
+  /// the store); the backend writes only those three fields, under
+  /// `settings.mutate`, which composes with a concurrent write instead of
+  /// overwriting the document.
   async function patchBackend(patch: Partial<DelegationBackend>): Promise<void> {
     err = null;
     try {
-      await applySettings(withTabBackend($settings, tab, patch));
+      await tabSetDelegationBackend(tab, { ...backend, ...patch });
     } catch (e) {
       err = String(e);
     }

@@ -2,6 +2,7 @@ import { invoke, Channel } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type { TabId, TabKind } from './tabs/types';
 import type { DelegationRole, InFlightView, RoleChange } from './delegation';
+import type { DelegationBackend } from './settings/types';
 
 export type BytesChannel = Channel<string>;
 
@@ -80,6 +81,20 @@ export async function tabSetDelegationRole(
   role: DelegationRole,
 ): Promise<RoleChange> {
   return invoke<RoleChange>('tab_set_delegation_role', { tab, role });
+}
+
+/// V39 review M-10: write one tab's facade-backend knobs, and nothing else.
+///
+/// A dedicated command rather than an `applySettings` of the whole document:
+/// a document written from a snapshot taken before some other write landed
+/// silently reverts it (the `40d2b32` class), and the write most likely to be
+/// in flight beside this one is the ROLE radio one line above in the same
+/// popover. Blank name / zero context are normalised to "unset" backend-side.
+export async function tabSetDelegationBackend(
+  tab: TabId,
+  backend: DelegationBackend,
+): Promise<void> {
+  await invoke('tab_set_delegation_backend', { tab, backend });
 }
 
 /// V39 Phase B (locked decision 6): take a driven tab back.

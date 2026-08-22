@@ -1780,8 +1780,9 @@ pub enum DelegationRole {
 pub struct DelegationBackend {
     /// The name the requesting harness sees (`lan-worker-2`), NEVER the tab
     /// name — decision 3's facade half is only a facade if the tab does not
-    /// leak through it. `None` ⇒ Phase C falls back to the tab's display name,
-    /// which is the honest default for a user who has not chosen one.
+    /// leak through it. `None` ⇒ [`facade_default_name`], an opaque per-tab
+    /// name; it used to fall back to the tab's DISPLAY name, which put the tab
+    /// into the asking model's prose (V39 review L-2).
     pub name: Option<String>,
     /// Router bias, exactly as a configured HTTP backend carries it.
     pub tier: BackendTier,

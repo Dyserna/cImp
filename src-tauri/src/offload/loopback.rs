@@ -229,6 +229,179 @@ fn is_ancestor_or_equal(root: &Path, hint: &Path) -> bool {
     })
 }
 
+// ── #104: an externally supplied cwd is never a project root by itself ──────
+
+/// The directory a configured `tab` launches in, or `None` when the id names no
+/// AI tab of this instance.
+///
+/// The **one legitimate root source** (#104 item 2): it comes from the user's
+/// own tab configuration through [`crate::tabs::ai_tab_dir`] — the same call the
+/// spawner makes — so it is a directory cImp itself chose, not one a caller
+/// asserted. `claude_hook_cwd` and [`external_project_root`] share it so the tab
+/// a hook claims resolves to the same place on both paths.
+fn hook_tab_root(
+    app: &AppHandle,
+    settings: &crate::settings::Settings,
+    tab: Option<&str>,
+) -> Option<PathBuf> {
+    let tab = tab.map(str::trim).filter(|t| !t.is_empty())?;
+    let launch = app
+        .try_state::<crate::ipc::AppState>()
+        .map(|s| s.launch.cwd.clone())
+        .or_else(|| std::env::current_dir().ok())?;
+    crate::tabs::ai_tab_dir(settings, tab, &launch)
+}
+
+/// The project root an externally supplied `cwd` names — `None` to refuse.
+///
+/// **#104.** Every `cwd` reaching this file came from a process cImp does not
+/// control: a Claude hook payload, the generated OpenCode plugin, an MCP call
+/// body. A sub-agent's shell keeps its cwd across calls, so one `cd` into
+/// `src-tauri/src/harness` made every later hook report that as its working
+/// directory — and the routes below took it as a project root, attributed their
+/// Activity rows to it and had the graph/workbench layer MINT per-project state
+/// there (`<db_subdir>/graph.db`, `<db_subdir>/shadow.git`). Ten such
+/// directories under one repo is the issue.
+///
+/// Three steps, in this order:
+///
+/// 1. **The tab's own configured directory wins** when the cwd is at or under
+///    it. A tab rooted at a sub-project inside a larger repo is a real project
+///    whose root only the tab configuration knows, and step 2's walk would
+///    otherwise attribute it to the enclosing repo.
+/// 2. **Otherwise walk UP** to the nearest marker
+///    ([`crate::fsutil::find_project_root`] — `.git`, dir or file, beats an
+///    existing `<db_subdir>`; nearest wins). A `<db_subdir>` found strictly
+///    below the answer is reported through [`report_stray_state`] and left
+///    alone.
+/// 3. **No marker anywhere** ⇒ the tab's directory if a tab is known, else
+///    `None`. `None` means REFUSED as a root: the caller records the row with an
+///    empty `root` (the honest "attributed to no project" value) and creates
+///    nothing. A genuinely new, un-VCS'd folder still gets its state, because a
+///    tab is configured for it and step 3 names it.
+///
+/// The answer is returned in the PLAIN spelling (no extended-length prefix), so
+/// `rel_path`'s root-prefix strip and `activity::root_key` see the same form the
+/// tab configuration and the indexer use.
+fn external_project_root(
+    app: &AppHandle,
+    settings: &crate::settings::Settings,
+    tab: Option<&str>,
+    cwd: Option<&str>,
+) -> Option<PathBuf> {
+    resolve_external_root(
+        hook_tab_root(app, settings, tab),
+        cwd,
+        &settings.graph.effective_db_subdir(),
+    )
+}
+
+/// [`external_project_root`]'s decision, with the two app-derived inputs already
+/// resolved — the tab's configured directory and the configured state
+/// subdirectory name.
+///
+/// Split out so the rule itself is unit-testable: the wrapper needs an
+/// `AppHandle`, which no test in this crate can construct, and #104 is a
+/// question about *which directory wins*, not about tauri state. Every branch
+/// below is exercised by `resolve_external_root_*` in this file's tests.
+fn resolve_external_root(
+    tab_root: Option<PathBuf>,
+    cwd: Option<&str>,
+    db_subdir: &str,
+) -> Option<PathBuf> {
+    let Some(raw) = cwd.map(str::trim).filter(|s| !s.is_empty()) else {
+        return tab_root;
+    };
+    let given = canon(Path::new(raw));
+    // 1. The tab's own root, when the cwd is inside it.
+    if let Some(tr) = &tab_root {
+        if is_ancestor_or_equal(&canon(tr), &given) {
+            return Some(tr.clone());
+        }
+    }
+    // 2. The nearest marker up the chain.
+    if let Some(found) = crate::fsutil::find_project_root(&given, db_subdir) {
+        if let Some(stray) = &found.stray_state {
+            report_stray_state(&found.root, stray);
+        }
+        return Some(PathBuf::from(crate::fsutil::plain_path(
+            &found.root.to_string_lossy(),
+        )));
+    }
+    // 3. No marker: the tab's root, or refuse.
+    tab_root
+}
+
+/// Stray `<db_subdir>` directories already reported this process.
+///
+/// One row per path per run, not one per hook call: resolution runs on every
+/// prompt, read and tool result, and an unbounded repeat would evict the graph
+/// lane it is recorded in — the very failure #51's per-lane retention exists to
+/// prevent. Bounded, because the set is derived from caller-supplied cwds.
+static STRAY_STATE_SEEN: OnceLock<Mutex<std::collections::HashSet<PathBuf>>> = OnceLock::new();
+
+/// The most distinct stray paths one run will remember (and therefore report).
+const MAX_STRAY_STATE_SEEN: usize = 64;
+
+/// Report — never remove — a `<db_subdir>` directory found BELOW a resolved
+/// project root (#104 item 7).
+///
+/// **Reported, not swept.** The directory holds a `graph.db` and a `shadow.git`;
+/// they are the user's data, and an app that silently deletes state it decides
+/// is misplaced is a worse failure than the one being fixed. So this says where
+/// it is and stops there — the operator removes it (cImp holds `graph.db` open
+/// while it runs, so the removal wants the app closed anyway).
+///
+/// The row lands in the **graph** lane with `source = "project_root"`, which is
+/// where the read advisor's and auto-check's own structural rows already live
+/// and where the `<db_subdir>` this is about belongs. It is deliberately not a
+/// new [`crate::activity::ActivityKind`]: a kind is a retention lane plus a UI
+/// filter (#51), and one warning class does not earn either. `ok = false`, so
+/// the Events tab shows it as something to act on.
+fn report_stray_state(root: &Path, stray: &Path) {
+    {
+        let seen = STRAY_STATE_SEEN.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+        let Ok(mut seen) = seen.lock() else {
+            return;
+        };
+        if !seen.insert(stray.to_path_buf()) {
+            return;
+        }
+        if seen.len() > MAX_STRAY_STATE_SEEN {
+            seen.clear();
+        }
+    }
+    let stray_s = crate::fsutil::plain_path(&stray.to_string_lossy());
+    let root_s = crate::fsutil::plain_path(&root.to_string_lossy());
+    warn!(
+        target: "offload",
+        stray = %stray_s,
+        root = %root_s,
+        "project state directory found BELOW this project's root — cImp minted it from a \
+         sub-agent's working directory (#104) and no longer uses it. Nothing here reads or \
+         writes it; remove it by hand with cImp closed if you do not want it."
+    );
+    crate::activity::record_bg(crate::activity::ActivityRecord {
+        request: format!("resolved root {root_s}"),
+        response: String::new(),
+        entry: crate::activity::ActivityEntry::new(
+            crate::activity::ActivityKind::Graph,
+            crate::activity::now_ms(),
+            crate::activity::root_key(root),
+            "project_root".to_string(),
+            "stray_state".to_string(),
+            stray_s,
+            0,
+            0,
+            false,
+            crate::activity::Attribution::Headless,
+            None,
+            None,
+            None,
+        ),
+    });
+}
+
 /// Whether the endpoint an entry names is **answering as the instance that
 /// entry claims**: a blocking `GET /health` presenting that entry's own token,
 /// 2xx only, inside [`DISCOVERY_PROBE_TIMEOUT`].
@@ -4680,10 +4853,6 @@ async fn handle_graph_run(stream: &mut TcpStream, app: &AppHandle, req: &Request
             return write_json(stream, 200, &r).await;
         }
     };
-    let cwd = body
-        .cwd
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
     let consumer = body.consumer.as_deref().unwrap_or("claude");
     // V28: resolve the calling TAB to the session it currently reports, so the
     // `context_*` memory tools scope to this tab's own session instead of "the
@@ -4701,6 +4870,25 @@ async fn handle_graph_run(stream: &mut TcpStream, app: &AppHandle, req: &Request
     // id is now validated against the configured tab list and that check must
     // use the same snapshot as the policy it feeds.
     let settings = live_settings(app);
+    // #104: the tools this route serves take a project root — `run_command`
+    // creates its marker directory under it and `run_check` runs the project's
+    // configured commands from it — so the body's `cwd` is resolved to a real
+    // root rather than used as one. A refusal is a tool-level error the model
+    // can read and act on, not a silently different project.
+    let Some(cwd) = external_project_root(app, &settings, body.tab.as_deref(), body.cwd.as_deref())
+    else {
+        let r = RunResult {
+            ok: false,
+            text: None,
+            error: Some(format!(
+                "no project root for {} — a working directory is not a project by \
+                 itself; open this project as a cImp tab, or run it from inside a \
+                 git repository",
+                bounded_id(body.cwd.as_deref().unwrap_or("(none)"))
+            )),
+        };
+        return write_json(stream, 200, &r).await;
+    };
     let scoping = latch_scope(
         app,
         &settings,
@@ -5439,11 +5627,15 @@ fn merge_files_used(parked: Vec<String>, fresh: Vec<String>) -> Vec<String> {
 /// reads (consumed exactly once), and both are cheap — no embed, no network —
 /// so a slow retrieval can never cost the session its project map.
 async fn context_retrieve_core(app: &AppHandle, body: &ContextRetrieveBody) -> serde_json::Value {
-    let cwd = body
-        .cwd
-        .clone()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
+    // #104: both consumers below create per-project state — the workbench's
+    // `<db_subdir>/shadow.git` and the graph store — so the payload's `cwd` is
+    // resolved to a real root first. `None` refuses BOTH: no checkpoint and no
+    // retrieval for a directory that is no project (`empty` is this route's
+    // established "nothing to say" answer).
+    let Some(cwd) = external_project_root(app, &live_settings(app), body.tab.as_deref(), body.cwd.as_deref())
+    else {
+        return serde_json::json!({ "ok": true, "text": "", "files": [], "tokens_est": 0 });
+    };
 
     // V13 Phase C: fire the prompt-tap checkpoint trigger for EVERY prompt
     // that reaches this route, BEFORE the `context_injection` gate below —
@@ -5801,7 +5993,12 @@ async fn tool_checkpoint_core(
     if !workbench.checkpoints_enabled() {
         return false;
     }
-    let root = cwd.map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    // #104: the checkpointer creates `<root>/<db_subdir>/shadow.git`, so a cwd
+    // that resolves to no project takes no checkpoint rather than minting a
+    // shadow repo inside one.
+    let Some(root) = external_project_root(app, settings, tab, cwd) else {
+        return false;
+    };
     let origin = checkpoint_identity(settings, agent, session_id, tab);
     // `harness:tool_name` — the locked value format. `bounded_id` caps the
     // caller-supplied half before it reaches a commit trailer; `trailer_identity`
@@ -6053,13 +6250,15 @@ fn compaction_block(app: &AppHandle, body: &ContextCompactionBody) -> String {
         return String::new();
     };
     let graph = graph.inner().clone();
-    let cwd = body
-        .cwd
-        .clone()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
+    // #104: `compaction_context` opens the project's store — resolve, never
+    // trust the payload's cwd. No root ⇒ no carry-over block, the route's own
+    // fail-safe.
+    let Some(root) = external_project_root(app, &live_settings(app), body.tab.as_deref(), body.cwd.as_deref())
+    else {
+        return String::new();
+    };
     graph
-        .compaction_context(&cwd, body.session_id.as_deref())
+        .compaction_context(&root, body.session_id.as_deref())
         .unwrap_or_default()
 }
 
@@ -6152,13 +6351,13 @@ async fn handle_should_read(
 fn should_read_verdict(app: &AppHandle, body: &ShouldReadBody) -> Option<String> {
     let graph = app.try_state::<Arc<crate::graph::GraphService>>()?;
     let graph = graph.inner().clone();
-    let cwd = body
-        .cwd
-        .clone()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
+    // #104: the advisor OPENS (and therefore creates) the project's graph store,
+    // so it is the route that minted the stray state dirs. The root is resolved,
+    // never taken from the payload; no root ⇒ pass the read through, which is
+    // this route's fail-safe everywhere else too.
+    let root = external_project_root(app, &live_settings(app), body.tab.as_deref(), body.cwd.as_deref())?;
     graph.should_read(
-        &cwd,
+        &root,
         body.session_id.as_deref(),
         &body.file_path,
         body.offset,
@@ -6837,10 +7036,20 @@ fn claude_hook_tab(settings: &crate::settings::Settings, req: &Request) -> Optio
 /// here would silently point a hook at the wrong project on any tab whose `cwd`
 /// is a worktree (V13 Phase D's "New tab in worktree…").
 ///
-/// The tab's configured directory is resolved through [`crate::tabs::ai_tab_dir`]
-/// — the same call the spawner makes — so this is the directory cImp itself
-/// launched that tab in. `None` when neither is available, which every caller
-/// turns into its own existing "no cwd" default.
+/// The tab's configured directory is resolved through [`hook_tab_root`] (i.e.
+/// [`crate::tabs::ai_tab_dir`] — the same call the spawner makes), so this is
+/// the directory cImp itself launched that tab in. `None` when neither is
+/// available, which every caller turns into its own existing "no cwd" default.
+///
+/// **#104: this deliberately still returns the payload's cwd VERBATIM, and is
+/// not where the project root is decided.** The obvious-looking fix — walk up
+/// to the project root here, once, for every Claude hook — is wrong, because
+/// this value is not only used as a root: `claude_hook::plan_request` joins a
+/// relative Bash path onto it (a walked-up root would resolve the wrong file),
+/// and `permission_signal` matches it against each tab's launch directory to
+/// decide which tab a permission prompt belongs to (a walked-up root collapses
+/// two tabs in one repo into one candidate). The root question is answered where
+/// a root is actually needed, by [`external_project_root`].
 fn claude_hook_cwd(
     app: &AppHandle,
     settings: &crate::settings::Settings,
@@ -6851,12 +7060,7 @@ fn claude_hook_cwd(
     if !raw.is_empty() {
         return Some(raw.to_string());
     }
-    let tab = tab?;
-    let launch = app
-        .try_state::<crate::ipc::AppState>()
-        .map(|s| s.launch.cwd.clone())
-        .or_else(|| std::env::current_dir().ok())?;
-    crate::tabs::ai_tab_dir(settings, tab, &launch).map(|d| d.to_string_lossy().into_owned())
+    hook_tab_root(app, settings, tab).map(|d| d.to_string_lossy().into_owned())
 }
 
 /// Parse a Claude hook-input payload, or `None` when the body is not JSON.
@@ -7492,8 +7696,13 @@ fn tool_result_core(
     let Some(graph) = app.try_state::<Arc<crate::graph::GraphService>>() else {
         return false;
     };
+    // #104: `record_usage` opens the project's store. A sub-agent's cwd is not
+    // a root; with no resolvable one there is nothing to attribute the usage to.
+    let Some(root) = external_project_root(app, &live_settings(app), Some(tab), Some(cwd)) else {
+        return false;
+    };
     graph.record_usage(
-        std::path::Path::new(cwd),
+        &root,
         session_id,
         agent,
         crate::graph::UsageEvent::ToolResult { tool, chars },
@@ -8955,6 +9164,7 @@ async fn post_edit_diagnostics(
 ) -> String {
     // V33 C4: decide WHERE before deciding whether there is anything to run —
     // the roots are app-derived, so this cannot be moved by the body.
+    let exec_roots = hook_exec_roots(app, settings);
     let Some(cwd) = admitted_hook_root(&hook_exec_roots(app, settings), body.cwd.as_deref()) else {
         // Bounded: the rejected string is caller-chosen and unbounded on the
         // wire, and this is the one place it reaches an operator-facing line.
@@ -8970,9 +9180,30 @@ async fn post_edit_diagnostics(
     let Some(graph) = app.try_state::<Arc<crate::graph::GraphService>>() else {
         return String::new();
     };
+    // #104: admitted is not the same as *is a project root* — a sub-agent's cwd
+    // passes C4's allowlist perfectly well and `post_edit` opens the project's
+    // store from whatever it is handed. Resolve it, then **re-apply C4 to the
+    // answer**: the walk goes UP, and a resolved root above every served root
+    // would run the operator's check commands one directory further out than
+    // C4 admits. It never widens; on a miss the route takes its own fail-safe.
+    let root = external_project_root(app, settings, body.tab.as_deref(), Some(&cwd.to_string_lossy()));
+    let Some(root) = root.filter(|r| {
+        let r = canon(r);
+        exec_roots.iter().any(|allowed| is_ancestor_or_equal(&canon(allowed), &r))
+    }) else {
+        warn!(
+            target: "offload",
+            requested = %bounded_id(&cwd.to_string_lossy()),
+            "loopback: /context/post_edit could not resolve a project root at or under \
+             this instance's served roots from the working directory it named — the \
+             project's configured check commands were NOT run (the edit itself is \
+             unaffected)"
+        );
+        return String::new();
+    };
     let graph = graph.inner().clone();
     graph
-        .post_edit(&cwd, body.session_id.as_deref(), &body.file_path)
+        .post_edit(&root, body.session_id.as_deref(), &body.file_path)
         .await
         .unwrap_or_default()
 }
@@ -9162,11 +9393,15 @@ async fn handle_memory_event(
         return write_json(stream, 200, &ok).await;
     };
     let graph = graph.inner().clone();
-    let cwd = body
-        .cwd
-        .as_deref()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
+    // #104: every arm below opens the project's store (memory rows, usage
+    // totals), so the plugin-supplied `cwd` is resolved to a real root first.
+    // This body carries no `tab` — the OpenCode plugin's memory POST never had
+    // one — so an unresolvable cwd has nothing to fall back to and the event is
+    // dropped rather than filed against a directory that is not a project.
+    let Some(cwd) = external_project_root(app, &live_settings(app), None, body.cwd.as_deref())
+    else {
+        return write_json(stream, 200, &ok).await;
+    };
     let agent = body.agent.as_deref().unwrap_or("opencode");
     // C-2 (2026-08-07 review): ONE settings read for the whole request, feeding
     // every `mark_live_session` below through `mark_live_session_from_event` —
@@ -18259,6 +18494,216 @@ mod tests {
             ),
             "the roots must derive from the app and the settings, never from a request body"
         );
+    }
+
+    // ── #104: a cwd is never a project root by itself ──────────────────────
+
+    /// A throwaway directory tree for the root-resolution tests.
+    ///
+    /// Canonicalized (so it matches what `canon` resolves the cwd to on
+    /// Windows) and then put back in the PLAIN spelling, which is the form
+    /// `resolve_external_root` answers in — see `fsutil::plain_path`.
+    fn root_tree(tag: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("cimp-root-{tag}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&p).unwrap();
+        let canon = p.canonicalize().unwrap();
+        PathBuf::from(crate::fsutil::plain_path(&canon.to_string_lossy()))
+    }
+
+    /// Whether any `.cimp` directory exists anywhere under `dir`.
+    fn any_state_dir_under(dir: &Path) -> bool {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            if !p.is_dir() {
+                continue;
+            }
+            if p.file_name().map(|n| n == ".cimp").unwrap_or(false) || any_state_dir_under(&p) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// **The defect.** A sub-agent's Bash keeps its cwd across calls, so after
+    /// one `cd src-tauri/src/harness` every hook it fires reports that
+    /// directory. It is not a project, it is not the tab's directory, and the
+    /// sub-agent is `headless` so there is no tab to ask — resolution must walk
+    /// UP to the repo that contains it rather than treat it as a root.
+    #[test]
+    fn resolve_external_root_walks_up_from_a_sub_agents_cwd() {
+        let root = root_tree("subagent-cwd");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let cwd = root.join("src-tauri").join("src").join("harness");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let got = resolve_external_root(None, Some(&cwd.to_string_lossy()), ".cimp");
+        assert_eq!(
+            got.as_deref().map(crate::fsutil::norm_dir_key_path),
+            Some(crate::fsutil::norm_dir_key_path(&root)),
+            "a sub-directory cwd must resolve to the repo that contains it"
+        );
+        // And nothing was minted on the way — the whole point of the issue.
+        assert!(!any_state_dir_under(&root));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The tab's own configured directory is the one legitimate root source, so
+    /// it beats the walk: a sub-project opened as its own tab inside a larger
+    /// repo must not have its rows (or its state) filed under the outer repo.
+    #[test]
+    fn resolve_external_root_prefers_the_tabs_own_directory() {
+        let root = root_tree("tab-root");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let tab_root = root.join("frontend");
+        let cwd = tab_root.join("src").join("lib");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let got =
+            resolve_external_root(Some(tab_root.clone()), Some(&cwd.to_string_lossy()), ".cimp");
+        assert_eq!(got, Some(tab_root));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A cwd outside the tab's directory still gets the walk — the tab root is
+    /// a preference, not a clamp, and this is the sub-agent that ran in a
+    /// different checkout.
+    #[test]
+    fn resolve_external_root_walks_when_the_cwd_is_outside_the_tab() {
+        let a = root_tree("tab-a");
+        let b = root_tree("tab-b");
+        std::fs::create_dir_all(b.join(".git")).unwrap();
+        let cwd = b.join("deep").join("deeper");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let got = resolve_external_root(Some(a.clone()), Some(&cwd.to_string_lossy()), ".cimp");
+        assert_eq!(
+            got.as_deref().map(crate::fsutil::norm_dir_key_path),
+            Some(crate::fsutil::norm_dir_key_path(&b))
+        );
+        std::fs::remove_dir_all(&a).ok();
+        std::fs::remove_dir_all(&b).ok();
+    }
+
+    /// No marker anywhere and no tab ⇒ REFUSED. The caller records the row with
+    /// an empty root and creates nothing; inventing a root here is what minted
+    /// the ten stray directories.
+    #[test]
+    fn resolve_external_root_refuses_an_unmarked_cwd_with_no_tab() {
+        let root = root_tree("unmarked");
+        let cwd = root.join("scratch");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        assert_eq!(
+            resolve_external_root(None, Some(&cwd.to_string_lossy()), ".cimp"),
+            None
+        );
+        assert!(!any_state_dir_under(&root));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A genuinely new, un-versioned folder OPENED AS A TAB still works: the
+    /// tab's directory answers, so first-time indexing of such a project is
+    /// unchanged.
+    #[test]
+    fn resolve_external_root_falls_back_to_the_tab_for_an_unmarked_cwd() {
+        let root = root_tree("unmarked-tab");
+        let cwd = root.join("scratch");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        assert_eq!(
+            resolve_external_root(Some(root.clone()), Some(&cwd.to_string_lossy()), ".cimp"),
+            Some(root.clone())
+        );
+        // An absent cwd is the same question with less information.
+        assert_eq!(
+            resolve_external_root(Some(root.clone()), None, ".cimp"),
+            Some(root.clone())
+        );
+        assert_eq!(resolve_external_root(None, Some("   "), ".cimp"), None);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **End to end from the payload.** A real `PostToolUse`-shaped hook body
+    /// whose `cwd` is a sub-directory, mapped through the same
+    /// parse → cwd → body → root chain the handlers take. The advisor row this
+    /// produces is attributed to the REAL root, and the sub-directory gains
+    /// nothing.
+    ///
+    /// The handlers themselves need an `AppHandle` (unconstructible in a unit
+    /// test), so the tab lookup is supplied directly — which is also the
+    /// `headless` sub-agent's real situation: no tab at all.
+    #[test]
+    fn a_post_tool_use_payload_from_a_sub_dir_attributes_to_the_real_root() {
+        let root = root_tree("hook-e2e");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let sub = root.join("src-tauri").join("src").join("harness");
+        std::fs::create_dir_all(&sub).unwrap();
+        let dir = root.join("src").join("lib").join("settings");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("types.ts");
+        std::fs::write(&file, "export type A = 1;\n").unwrap();
+
+        // The payload the sub-agent's hook actually posts: the shell's cwd,
+        // which is NOT the project, and an absolute file_path elsewhere in the
+        // tree — exactly the row in the issue.
+        let payload = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "session_id": "s-104",
+            "cwd": sub.to_string_lossy(),
+            "tool_name": "Read",
+            "tool_input": { "file_path": file.to_string_lossy() },
+        });
+        let input: claude_hook::HookInput = serde_json::from_value(payload).unwrap();
+        // `claude_hook_cwd` keeps the payload's cwd verbatim (it also feeds
+        // relative-path joins), so this is what reaches the body.
+        let cwd = Some(input.cwd.clone());
+        let reqst =
+            claude_hook::plan_request(input.tool_name.as_deref(), &input.tool_input, &input.cwd)
+                .expect("a Read is a read request");
+        let body = should_read_body_from_hook(&input, &reqst, None, cwd);
+        assert_eq!(body.tab, None, "a sub-agent hook names no tab");
+
+        let resolved = resolve_external_root(None, body.cwd.as_deref(), ".cimp")
+            .expect("the payload's cwd resolves to the repo above it");
+        assert_eq!(
+            crate::fsutil::norm_dir_key_path(&resolved),
+            crate::fsutil::norm_dir_key_path(&root),
+            "the advisor row must be attributed to the project, not to the shell's cwd"
+        );
+        // The row's own key is the project's, in one spelling.
+        assert!(crate::activity::root_key_eq(
+            &crate::activity::root_key(&resolved),
+            &crate::activity::root_key(&root)
+        ));
+        // Nothing was created under the sub-directory.
+        assert!(!any_state_dir_under(&root));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// State the defect already minted does not get to keep capturing the cwds
+    /// below it: the `.git` root wins and the stray is named so the user can
+    /// remove it — and it is still on disk afterwards, because cImp does not
+    /// delete the user's data.
+    #[test]
+    fn a_stray_state_dir_below_a_root_is_reported_and_left_alone() {
+        let root = root_tree("stray");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let sub = root.join("src-tauri").join("src").join("harness");
+        std::fs::create_dir_all(sub.join(".cimp")).unwrap();
+
+        let got = resolve_external_root(None, Some(&sub.to_string_lossy()), ".cimp");
+        assert_eq!(
+            got.as_deref().map(crate::fsutil::norm_dir_key_path),
+            Some(crate::fsutil::norm_dir_key_path(&root))
+        );
+        assert!(
+            sub.join(".cimp").is_dir(),
+            "the stray is reported, not swept"
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// `agent` is caller-asserted and absent on a pre-#48 shim. Absent ⇒

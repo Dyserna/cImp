@@ -745,7 +745,7 @@ pub async fn handle_call(
     // agree on "the project root" in a mixed setup), else fall back to the
     // working directory itself — never require opening an index for this tool.
     if name == "run_check" {
-        let root = find_graph_root(&cwd, &sub).unwrap_or(cwd);
+        let root = headless_project_root(&cwd, &sub);
         return match run_check_tool(
             &root,
             &settings,
@@ -765,7 +765,7 @@ pub async fn handle_call(
     // reason `run_check` does, and more sharply: this one spawns a binary the
     // model named by tool id, which is the definition of LOCAL-CAPABILITY.
     if name == "run_command" {
-        let root = find_graph_root(&cwd, &sub).unwrap_or(cwd);
+        let root = headless_project_root(&cwd, &sub);
         return match run_command_tool(
             &root,
             &settings,
@@ -1017,7 +1017,7 @@ fn refuse_headless(
     tab: crate::activity::Attribution,
 ) -> Value {
     let started = crate::activity::now_ms();
-    let root = find_graph_root(cwd, sub).unwrap_or_else(|| cwd.to_path_buf());
+    let root = headless_project_root(cwd, sub);
     tracing::warn!(
         target: "graph",
         tool = %name,
@@ -3347,6 +3347,29 @@ fn confine_to_root(root: &Path, rel: &str) -> Result<PathBuf, String> {
             Err(format!("refusing to read {rel} — outside the project root"))
         }
     }
+}
+
+/// The project root for a call arriving on the **headless** path — the stdio
+/// MCP child running with the app unreachable, whose `cwd` is its own process
+/// working directory.
+///
+/// #104: that cwd is the sub-agent's shell cwd, not a project. The app-side
+/// routes resolve theirs through `loopback::external_project_root`, which can
+/// also consult the calling tab's configured directory; here there is no app to
+/// ask, so the answer is the marker walk alone
+/// ([`crate::fsutil::find_project_root`] — `.git` beats an existing `<sub>`,
+/// nearest wins), then an existing `graph.db` above, then the cwd itself.
+///
+/// The last fallback is kept because the tools reached from here (`run_check`,
+/// `run_command`) must still work in a project with no VCS and no index yet,
+/// which is the same "the tab's own directory is a root" allowance the app-side
+/// resolver makes at its step 3. What it no longer does is let a *sub-directory*
+/// of a marked project become one.
+fn headless_project_root(cwd: &Path, sub: &str) -> PathBuf {
+    crate::fsutil::find_project_root(cwd, sub)
+        .map(|p| p.root)
+        .or_else(|| find_graph_root(cwd, sub))
+        .unwrap_or_else(|| cwd.to_path_buf())
 }
 
 /// Walk up from `start` looking for an ancestor containing `<sub>/graph.db`.

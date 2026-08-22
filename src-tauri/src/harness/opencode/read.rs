@@ -246,8 +246,16 @@ async fn consume(
                 // Stream closed; flush the remainder and release Thinking —
                 // the fresh Tracker after reconnect starts with `working:
                 // false` and can't release a stale edge from this connection.
-                state.flush_all(ctx).await;
-                state.set_working(ctx, false);
+                //
+                // V39 review R-7: file the buffered turn too. `flush_all`
+                // SPEAKS what is left but the completion is filed by
+                // `close_turn`, which a closed stream never reaches — and this
+                // Tracker is discarded on reconnect, so the text goes with it
+                // and the delegation waiting on it runs to its deadline for an
+                // answer that was already on screen. Only the tab's own
+                // session is ever buffered (`flush` filters by session), so
+                // filing here cannot hand over a sub-agent's words.
+                state.close_stream(ctx).await;
                 return Ok(StreamEnd::Closed);
             }
             Err(e) => {
@@ -1217,6 +1225,24 @@ impl Tracker {
         }
     }
 
+    /// **The connection ended, not the turn** (V39 review R-7).
+    ///
+    /// Speak what is buffered, file the turn's answer if there is one, and
+    /// release the Thinking edge. Filing here is not the same claim
+    /// `close_turn` makes — nothing said the turn is over — but the alternative
+    /// is worse in exactly one direction: this Tracker is discarded on
+    /// reconnect, so text not filed here is lost, and a delegation waiting on
+    /// it waits out its whole deadline for an answer the user can already read.
+    /// A turn that really was still running will be re-served by the reconnected
+    /// stream, and the completion feed is last-wins.
+    async fn close_stream(&mut self, ctx: &OobContext) {
+        self.flush_all(ctx).await;
+        if let Some((text, at_ms)) = self.turn_last_text.take() {
+            ctx.note_turn_text_at(&text, at_ms);
+        }
+        self.set_working(ctx, false);
+    }
+
     /// Edge-triggered avatar Thinking/Idle, mirroring the old scrape path's
     /// `claude_working` marker.
     fn set_working(&mut self, ctx: &OobContext, working: bool) {
@@ -1594,6 +1620,52 @@ mod tests {
         })
         .collect();
         assert_eq!(spoken.len(), 1, "only the first turn had prose: {spoken:?}");
+    }
+
+    /// **A stream that closes mid-turn still hands over what the worker said**
+    /// (V39 review R-7).
+    ///
+    /// The close branch flushed (spoke) the remainder and released Thinking,
+    /// but the completion is filed by `close_turn`, which a closed stream never
+    /// reaches — and the Tracker is discarded on reconnect, so the answer went
+    /// with it and the driver waited out its deadline for text already on
+    /// screen.
+    #[tokio::test]
+    async fn a_closed_stream_files_the_turn_it_was_holding() {
+        let (ctx, mut tts_rx, _sig) = ctx_with("ai-stream-close");
+        let worker = TabId::from_str("ai-stream-close");
+        let _registry = crate::delegation::testing::lock_registry();
+        crate::delegation::testing::claim_and_submit(&worker);
+        let mut t = Tracker::default();
+
+        t.handle(
+            &ev(r#"{"type":"message.updated","properties":{"sessionID":"ses_main","info":{"id":"m1","role":"assistant","time":{"created":1}}}}"#),
+            &ctx,
+        )
+        .await;
+        t.handle(
+            &ev(r#"{"type":"message.part.updated","properties":{"sessionID":"ses_main","part":{"id":"p1","type":"text","messageID":"m1","text":"It exports three symbols."}}}"#),
+            &ctx,
+        )
+        .await;
+        t.handle(
+            &ev(r#"{"type":"message.updated","properties":{"sessionID":"ses_main","info":{"id":"m1","role":"assistant","time":{"created":1,"completed":2}}}}"#),
+            &ctx,
+        )
+        .await;
+        assert!(
+            crate::delegation::testing::take(&worker).is_none(),
+            "still mid-turn while the stream is alive"
+        );
+
+        // …and then the connection drops before any idle arrives.
+        t.close_stream(&ctx).await;
+        assert_eq!(
+            crate::delegation::testing::take(&worker).as_deref(),
+            Some("It exports three symbols."),
+            "a dropped connection must not swallow the worker's answer"
+        );
+        assert!(tts_rx.try_recv().is_ok(), "and it was spoken, as before");
     }
 
     /// The identity rule itself, including its two fail-open answers.

@@ -196,9 +196,17 @@ pub fn load(default_shell: &ShellSpec, launch_cwd: &Path) -> LoadOutcome {
         // key ban, this one SAYS SO. A hand-edited config that sets a binary
         // path per repo is a reasonable thing to try and a silent no-op is how
         // that becomes "cImp ignores my config" an hour later.
+        let mut dropped = strip_overlay_tool_plugins(&mut v);
+        // V40 review M-2: the same structured strip for the per-harness map,
+        // whose scope is per FIELD (see `OVERLAY_BANNED_HARNESS_FIELDS`). Named
+        // in the SAME Events row for the same reason the tool-plugins strip is
+        // named: a hand-edited config that sets one of these per repo is a
+        // reasonable thing to try, and a silent no-op is how that becomes "cImp
+        // ignores my config" an hour later.
+        dropped.extend(strip_overlay_harness(&mut v));
         crate::plugins::events::record_overlay_strip(
             &overlay_path.display().to_string(),
-            &strip_overlay_tool_plugins(&mut v),
+            &dropped,
         );
         v
     });
@@ -326,6 +334,10 @@ pub fn load_readonly(launch_cwd: &Path) -> Settings {
         // this very file. No Events row — a lightweight subprocess has no lane
         // to speak into, and the app's own `load` already reported it.
         let _ = strip_overlay_tool_plugins(&mut overlay);
+        // V40 review M-2, and NOT optional here either: `expose_commands`
+        // decides whether `run_command` is advertised, and this reader IS the
+        // child that asks.
+        let _ = strip_overlay_harness(&mut overlay);
         // V37 registry, same reason and the SAME asymmetry made explicit: `load`
         // promotes an overlay's servers/categories into the global baseline and
         // then enforces the global arrays over the merged view, so an overlay
@@ -844,18 +856,18 @@ fn read_overlay(path: &Path, quarantine: bool) -> Option<Value> {
 /// is sufficient alone: banning the key still leaves a compromised *global*
 /// file able to name `~/.ssh`, and screening paths still leaves
 /// `sandbox.enabled` flippable.
-// V40 Phase B added `harness`. It is machine scope for two reasons that hold
-// jointly: half its fields are written OUT OF BAND by background threads (the
-// version the tap observed, the auto-verify record) and a Settings save
-// carrying a stale snapshot of those would stomp them; and the other half —
-// each plugin's `ext` — configures the harness INSTALL on this machine (where
-// its local proxy is, whether its status line is on, what provider block cImp
-// derived for it), which is not a property of the project you happen to have
-// open. Every one of those settings was already documented as global before the
-// map existed. The write-through that keeps the Settings window's edits
-// reaching disk is `sync_harness_into`, the `sync_sandbox_into` pattern.
-const OVERLAY_BANNED_KEYS: &[&str] =
-    &["llm_pricing", "harness_versions", "harness", "sandbox"];
+// V40 Phase B added `harness` to this list and the review (finding M-2) took it
+// back out. `harness` **cannot** be banned wholesale, for the same reason
+// `tool_plugins` cannot: its scope is per FIELD, not per container. Five of the
+// settings that moved into it were per-project on develop
+// (`statusline.enabled`, `claude_local.*`, `code_audit.expose_<id>`,
+// `offload.opencode_provider{,_auto}`,
+// `offload.injection.opencode_native_gate_enabled`), and banning the container
+// silently narrowed all five to machine scope — a scope change hiding inside a
+// refactor, with the first post-upgrade save erasing the project's values and
+// no trace anywhere. The machine-scope half gets [`strip_overlay_harness`]
+// instead, which names what it drops.
+const OVERLAY_BANNED_KEYS: &[&str] = &["llm_pricing", "harness_versions", "sandbox"];
 
 fn strip_overlay_banned(v: &mut Value) {
     if let Value::Object(map) = v {
@@ -1266,6 +1278,93 @@ fn strip_overlay_tool_plugins(v: &mut Value) -> Vec<String> {
     dropped
 }
 
+/// The fields of a `harness.<id>` row that a project overlay may **not** carry
+/// (V40 review finding M-2).
+///
+/// Two different reasons, both machine scope:
+///
+/// * `last_seen` / `last_verified` / `auto_verify` are written OUT OF BAND by
+///   the transcript tap and the auto-verify worker (`mutate_global_harness`), so
+///   a Settings save carrying a window-open snapshot of them would stomp a newer
+///   observation — the `prompt_templates` stale-snapshot defect in a different
+///   field. `input_profile_status` is the recorded outcome of a manual spike
+///   against the CLI *installed on this machine*, in the same family.
+/// * `expose_commands` decides whether `run_command` is advertised to a
+///   harness — a capability grant, and it was already machine scope before V40
+///   (as `tool_plugins.expose_commands_<id>`, stripped by
+///   [`strip_overlay_tool_plugins`]). A project config file lives inside the
+///   sandbox boundary a confined tool can write to; a boundary a confined
+///   process can widen is not a boundary.
+///
+/// Everything else in the row — `expose_code_audit` and the plugin `ext`
+/// block — is per-project, exactly as its pre-V40 spelling was
+/// (`code_audit.expose_<id>`, `statusline.enabled`, `claude_local.*`,
+/// `offload.opencode_provider{,_auto}`,
+/// `offload.injection.opencode_native_gate_enabled`).
+const OVERLAY_BANNED_HARNESS_FIELDS: &[&str] = &[
+    "last_seen",
+    "last_verified",
+    "auto_verify",
+    "input_profile_status",
+    "expose_commands",
+];
+
+/// Remove the machine-scope fields of every `harness.<id>` row from an overlay
+/// value, returning the dotted names of what was dropped (empty ⇒ the overlay
+/// was already clean).
+///
+/// A deny-list, not an allow-list, and deliberately so — the opposite of
+/// [`strip_overlay_tool_plugins`]. The default answer for a `harness` row is
+/// "the project may set this": each harness plugin declares its own `ext` keys,
+/// so an allow-list here would be a second copy of every plugin's settings
+/// schema, and a newly declared field would silently stop being project-settable
+/// until someone remembered to add it. The five fields that are NOT the
+/// project's are enumerable and stable; see [`OVERLAY_BANNED_HARNESS_FIELDS`].
+///
+/// **Shape is part of it**, the one thing shared with the tool-plugins strip: a
+/// non-object `harness`, or a non-object row inside it, is removed and reported
+/// rather than walked past — `deep_merge` scalar-overwrites, and a scalar
+/// dropped onto a row would delete the whole subtree under it on the way to a
+/// lenient reader that then falls back to defaults.
+fn strip_overlay_harness(v: &mut Value) -> Vec<String> {
+    let mut dropped: Vec<String> = Vec::new();
+    let Some(root) = v.as_object_mut() else {
+        return dropped;
+    };
+    if root.get("harness").is_none() {
+        return dropped;
+    }
+    if remove_if_not_a_map(root, "harness") {
+        dropped.push("harness".to_string());
+        return dropped;
+    }
+    let Some(rows) = root.get_mut("harness").and_then(Value::as_object_mut) else {
+        return dropped;
+    };
+    for key in non_map_keys(rows) {
+        rows.remove(&key);
+        dropped.push(format!("harness.{key}"));
+    }
+    for (id, row) in rows.iter_mut() {
+        // Every survivor of `non_map_keys` is an object.
+        let Some(obj) = row.as_object_mut() else {
+            continue;
+        };
+        for field in OVERLAY_BANNED_HARNESS_FIELDS {
+            if obj.remove(*field).is_some() {
+                dropped.push(format!("harness.{id}.{field}"));
+            }
+        }
+    }
+    // Rows (and a container) reduced to `{}` contribute nothing to a merge and
+    // only noise to a diff; drop the husks.
+    rows.retain(|_, row| !row.as_object().is_some_and(serde_json::Map::is_empty));
+    if rows.is_empty() {
+        root.remove("harness");
+    }
+    dropped
+}
+
 /// The keys of `obj` whose value is not a JSON object — the shape half of the
 /// allow-list, collected up front for the same borrow reason as
 /// [`keys_other_than`].
@@ -1310,21 +1409,23 @@ fn keys_other_than(obj: &serde_json::Map<String, Value>, keep: &[&str]) -> Vec<S
 /// "machine scope" means for a plugin the user has only just configured — but
 /// nothing is ever removed here: a plugin whose file is temporarily missing must
 /// keep its state (see [`crate::settings::ToolPluginsSettings`]).
-/// Write the live per-harness map through to the physical global file.
+/// Write the MACHINE-SCOPE half of the live per-harness map through to the
+/// physical global file — the same fields [`strip_overlay_harness`] keeps out of
+/// a project overlay, and for the same reasons. This is the only place they can
+/// land, so the two lists have to agree; `the_two_halves_of_harness_scope_agree`
+/// asserts they do.
 ///
-/// Deliberately **excludes the out-of-band fields** (`last_seen`,
-/// `last_verified`, `auto_verify`) rather than copying the whole row: the
-/// Settings window holds a snapshot taken when it opened, and the transcript
-/// tap or the auto-verify worker may have written a newer version to disk in
-/// between. Copying the snapshot's copy of those would be a Settings save
-/// silently reverting a version observation — the `prompt_templates`
-/// stale-snapshot defect (V14 review, HIGH/data loss) in a different field.
-/// Those three have their own writer, [`mutate_global_harness`].
+/// Of the five, three are **excluded here too**: `last_seen`, `last_verified`
+/// and `auto_verify` are written out of band, and the Settings window holds a
+/// snapshot taken when it opened. Copying the snapshot's copy of those would be
+/// a Settings save silently reverting a version observation — the
+/// `prompt_templates` stale-snapshot defect (V14 review, HIGH/data loss) in a
+/// different field. They have their own writer, [`mutate_global_harness`].
 ///
-/// Everything the user CAN edit — `expose_commands`, `expose_code_audit`,
-/// `input_profile_status` (a recorded human judgement, entered by hand) and the
-/// plugin `ext` block — is copied. Rows for harnesses this build does not know
-/// are left exactly as the disk has them.
+/// `expose_code_audit` and the plugin `ext` block are NOT copied: they are the
+/// project's (V40 review M-2), so they ride [`save`]'s overlay diff exactly as
+/// their pre-V40 spellings did. Rows for harnesses this build does not know are
+/// left exactly as the disk has them.
 fn sync_harness_into(disk_global: &mut Settings, current: &Settings) -> bool {
     let mut changed = false;
     for (id, live) in &current.harness {
@@ -1340,21 +1441,12 @@ fn sync_harness_into(disk_global: &mut Settings, current: &Settings) -> bool {
                 changed = true;
                 crate::settings::HarnessSettings::defaults_for(harness)
             });
-        for (field, value) in [
-            (&mut disk.expose_commands, live.expose_commands),
-            (&mut disk.expose_code_audit, live.expose_code_audit),
-        ] {
-            if *field != value {
-                *field = value;
-                changed = true;
-            }
+        if disk.expose_commands != live.expose_commands {
+            disk.expose_commands = live.expose_commands;
+            changed = true;
         }
         if disk.input_profile_status != live.input_profile_status {
             disk.input_profile_status = live.input_profile_status.clone();
-            changed = true;
-        }
-        if disk.ext != live.ext {
-            disk.ext = live.ext.clone();
             changed = true;
         }
     }
@@ -1631,9 +1723,9 @@ pub fn save(settings: &Settings, launch_cwd: &Path, global: &Settings) -> AppRes
             // `variables`/`parameters`, so this is the only place the rest can
             // land — see the block comment above `strip_overlay_tool_plugins`.
             let plugins_changed = sync_tool_plugin_state_into(&mut disk, settings);
-            // V40 Phase B: the per-harness map. Banned from overlays (it is
-            // machine scope and half of it is written out of band), so the
-            // global file is the ONLY place a harness settings edit can land.
+            // V40 Phase B: the machine-scope half of the per-harness map.
+            // Stripped from overlays (`strip_overlay_harness`), so the global
+            // file is the ONLY place those fields can land.
             let harness_changed = sync_harness_into(&mut disk, settings);
             if templates_changed
                 || registry_changed
@@ -1663,6 +1755,12 @@ pub fn save(settings: &Settings, launch_cwd: &Path, global: &Settings) -> AppRes
     // about; the load path is where a warning belongs.
     let _ = strip_overlay_tool_plugins(&mut current);
     let _ = strip_overlay_tool_plugins(&mut baseline);
+    // V40 review M-2: both sides, identically — what remains under `harness` on
+    // either side is only the project-settable half, so the diff can express a
+    // project's `ext` overrides and nothing else. `sync_harness_into` above is
+    // the only place the machine-scope half can land.
+    let _ = strip_overlay_harness(&mut current);
+    let _ = strip_overlay_harness(&mut baseline);
     strip_mcp_registry(&mut current);
     strip_mcp_registry(&mut baseline);
 
@@ -3825,6 +3923,182 @@ mod tests {
         assert_eq!(clean, serde_json::json!({ "ui": { "theme": "tui" } }));
     }
 
+    /// V40 review M-2: `harness` splits INSIDE the block too, and V40 Phase B
+    /// banned the whole container.
+    ///
+    /// Five settings that were per-project on develop moved into it —
+    /// `statusline.enabled`, `claude_local.*`, `code_audit.expose_<id>`,
+    /// `offload.opencode_provider{,_auto}` and
+    /// `offload.injection.opencode_native_gate_enabled`. The ban narrowed all
+    /// five to machine scope silently: a project's values became unknown keys at
+    /// the first post-upgrade launch and the first post-upgrade save deleted
+    /// them, with no Events row and no warning. This pins the split as it now
+    /// is: the row's out-of-band fields and the `run_command` capability grant
+    /// are the machine's; `expose_code_audit` and the plugin `ext` block are the
+    /// project's.
+    #[test]
+    fn a_project_overlay_carries_the_harness_ext_and_not_the_machine_half() {
+        let mut hostile: Value = serde_json::json!({
+            "harness": {
+                "claude": {
+                    "expose_commands": true,
+                    "expose_code_audit": false,
+                    "last_seen": "9.9.9",
+                    "last_verified": "9.9.9",
+                    "auto_verify": { "at": "2026-01-01T00:00:00Z" },
+                    "input_profile_status": "pass",
+                    "ext": { "statusline": false, "local.base_url": "http://myproxy:9000" }
+                },
+                "opencode": { "last_seen": "1.2.3" },
+                "scalar": 7
+            },
+            "checks_allow_remote_worker": true
+        });
+        let dropped = strip_overlay_harness(&mut hostile);
+
+        assert_eq!(
+            hostile,
+            serde_json::json!({
+                "harness": { "claude": {
+                    "expose_code_audit": false,
+                    "ext": { "statusline": false, "local.base_url": "http://myproxy:9000" }
+                } },
+                "checks_allow_remote_worker": true
+            }),
+            "only the project-scope half of a harness row may survive"
+        );
+        for expected in [
+            "harness.scalar",
+            "harness.claude.expose_commands",
+            "harness.claude.last_seen",
+            "harness.claude.last_verified",
+            "harness.claude.auto_verify",
+            "harness.claude.input_profile_status",
+            "harness.opencode.last_seen",
+        ] {
+            assert!(
+                dropped.contains(&expected.to_string()),
+                "`{expected}` was dropped but not reported: {dropped:?}"
+            );
+        }
+
+        // A clean overlay says nothing at all — no row, no noise.
+        let mut clean: Value = serde_json::json!({ "ui": { "theme": "tui" } });
+        assert!(strip_overlay_harness(&mut clean).is_empty());
+        assert_eq!(clean, serde_json::json!({ "ui": { "theme": "tui" } }));
+    }
+
+    /// The other half of M-2, end to end: a project's `harness.<id>.ext` value
+    /// reaches the merged settings, WINS over the machine baseline, and is still
+    /// there after a save — which is what "per-project, exactly as on develop"
+    /// has to mean for `statusline.enabled` and `claude_local.*`.
+    #[test]
+    fn a_project_overlay_harness_ext_value_wins_and_survives_a_save() {
+        let _shell = fake_default_shell();
+        let mut global = Settings::default();
+        integrity_check(&mut global);
+        let claude = crate::harness::DEFAULT_HARNESS
+            .id()
+            .expect("DEFAULT_HARNESS is registered");
+
+        let dir = std::env::temp_dir().join(format!("cimp_v40_m2_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+
+        let mut customized = global.clone();
+        {
+            let row = customized
+                .harness
+                .entry(claude.to_string())
+                .or_insert_with(|| {
+                    crate::settings::HarnessSettings::defaults_for(
+                        crate::harness::DEFAULT_HARNESS,
+                    )
+                });
+            row.ext.insert("statusline".to_string(), Value::Bool(false));
+            row.ext.insert(
+                "local.base_url".to_string(),
+                Value::String("http://myproxy:9000".into()),
+            );
+            // Machine scope: must NOT reach the overlay.
+            row.expose_commands = !row.expose_commands;
+            row.input_profile_status = "pass".to_string();
+            row.last_seen = "9.9.9".to_string();
+        }
+        save(&customized, &dir, &global).unwrap();
+
+        let text = fs::read_to_string(custom_path(&dir)).unwrap();
+        let overlay: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            overlay,
+            serde_json::json!({ "harness": { claude: { "ext": {
+                "statusline": false,
+                "local.base_url": "http://myproxy:9000"
+            } } } }),
+            "overlay: {text}"
+        );
+
+        // Merge it back the way `load` does, and the project's values win.
+        let mut merged = serde_json::to_value(&global).unwrap();
+        let mut ov = read_overlay(&custom_path(&dir), false).expect("the overlay parses");
+        strip_overlay_banned(&mut ov);
+        let _ = strip_overlay_harness(&mut ov);
+        deep_merge(&mut merged, ov);
+        let reloaded: Settings = serde_json::from_value(merged).unwrap();
+        let row = &reloaded.harness[claude];
+        assert_eq!(row.ext.get("statusline"), Some(&Value::Bool(false)));
+        assert_eq!(
+            row.ext.get("local.base_url").and_then(Value::as_str),
+            Some("http://myproxy:9000")
+        );
+        // …and the machine half came from the baseline, not the project.
+        assert_eq!(row.expose_commands, global.harness[claude].expose_commands);
+        assert_eq!(row.last_seen, global.harness[claude].last_seen);
+
+        // Saving the reloaded state again is idempotent: the same overlay.
+        save(&reloaded, &dir, &global).unwrap();
+        let again = fs::read_to_string(custom_path(&dir)).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&again).unwrap(),
+            overlay,
+            "a second save must not lose the project's `ext` values"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The strip and the write-through are two halves of ONE scope decision, in
+    /// two functions, and a field that fell out of both would be unsavable —
+    /// edited in the Settings window, kept out of the overlay, never written to
+    /// the global file. Every field `sync_harness_into` copies must therefore be
+    /// one the overlay strip removes, and nothing project-scoped may ride it.
+    #[test]
+    fn the_two_halves_of_harness_scope_agree() {
+        let src = include_str!("persistence.rs");
+        let start = src
+            .find("fn sync_harness_into(")
+            .expect("`sync_harness_into` is gone — re-point this test");
+        let body = &src[start..];
+        let body = &body[..body.find("\n}").unwrap_or(body.len())];
+        for field in OVERLAY_BANNED_HARNESS_FIELDS {
+            let written = body.contains(&format!("disk.{field} ="));
+            // The out-of-band three have their own writer (`mutate_global_harness`).
+            let out_of_band = ["last_seen", "last_verified", "auto_verify"].contains(field);
+            assert!(
+                written || out_of_band,
+                "`{field}` is stripped from overlays and not written through, so a Settings \
+                 edit of it would have nowhere to land. Either give it a write-through or take \
+                 it out of `OVERLAY_BANNED_HARNESS_FIELDS`."
+            );
+        }
+        for field in ["expose_code_audit", "ext"] {
+            assert!(
+                !body.contains(&format!("disk.{field} =")),
+                "`{field}` is the project's (V40 review M-2) and must ride the overlay diff, \
+                 not the machine-scope write-through"
+            );
+        }
+    }
+
     /// **The two settings readers must strip the overlay the same way**
     /// (V38 Phase D).
     ///
@@ -3858,13 +4132,18 @@ mod tests {
                 "pub fn load(",
                 &[
                     "strip_overlay_tool_plugins",
+                    "strip_overlay_harness",
                     "promote_overlay_mcp_registry",
                     "enforce_global_mcp_registry",
                 ],
             ),
             (
                 "pub fn load_readonly(",
-                &["strip_overlay_tool_plugins", "strip_overlay_mcp_registry"],
+                &[
+                    "strip_overlay_tool_plugins",
+                    "strip_overlay_harness",
+                    "strip_overlay_mcp_registry",
+                ],
             ),
         ];
         for (sig, needles) in required {

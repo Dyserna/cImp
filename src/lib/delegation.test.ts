@@ -5,6 +5,7 @@ import {
   backendOf,
   displacedToast,
   drivenReason,
+  FACADE_NAME_TAKEN,
   defaultFacadeName,
   facadeBackends,
   elapsedLabel,
@@ -556,12 +557,46 @@ describe('facadeBackends', () => {
         name: 'lan-worker-2',
         tier: 'fast',
         declaredContext: 128000,
+        inPool: true,
+        droppedReason: null,
       },
     ]);
     // The other two roles are not backends — one enum, not two flags.
     expect(facadeBackends(withRole('manual', 'lan-worker-2'))).toEqual([]);
     expect(facadeBackends(withRole('none', 'lan-worker-2'))).toEqual([]);
     expect(facadeBackends(defaultSettings())).toEqual([]);
+  });
+
+  /// **A collision is SAID, not silently dropped** (V39 review M-9).
+  ///
+  /// `Settings::effective_offload_backends` drops a facade whose name is
+  /// already taken — rather than renaming it, because the router keys on the
+  /// name — and warns once into the log. This list is the only surface a user
+  /// looks at, and it used to render the row as if it were live: a backend the
+  /// router would never pick, with nothing anywhere saying why.
+  it('marks a facade whose name is taken as not in the pool', () => {
+    const s = withRole('remote_offload', 'lan-worker-2');
+    s.offload.backends = [
+      { ...s.offload.backends[0], name: 'lan-worker-2' } as (typeof s.offload.backends)[0],
+    ];
+    const [row] = facadeBackends(s);
+    expect(row.inPool).toBe(false);
+    expect(row.droppedReason).toBe(FACADE_NAME_TAKEN);
+    expect(row.name).toBe('lan-worker-2');
+  });
+
+  it('drops the SECOND of two facades answering to one name', () => {
+    const s = withRole('remote_offload', 'twin');
+    for (const t of s.tabs) {
+      if (t.kind === 'ai_tool' && t.id === 'claude-local') {
+        t.delegation_role = 'remote_offload';
+        t.delegation_backend = { name: 'twin', tier: 'quality', declared_context: null };
+      }
+    }
+    const rows = facadeBackends(s);
+    expect(rows).toHaveLength(2);
+    expect(rows.map((r) => r.inPool)).toEqual([true, false]);
+    expect(rows[1].droppedReason).toBe(FACADE_NAME_TAKEN);
   });
 
   it('falls back to an opaque per-tab name, never the tab name', () => {

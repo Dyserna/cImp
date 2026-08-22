@@ -4738,6 +4738,16 @@
                   <span class="facade-kind">~{Math.max(1, Math.round(facade.declaredContext / 1000))}k ctx</span>
                 {/if}
               </div>
+              <!--
+                V39 review M-9: a name collision DROPS the facade from the pool
+                (the router, the run log and the dashboard all key on the name),
+                and the drop used to be a `warn!` in the log and nothing else —
+                this list showed the row as if it were live. Rendered rather
+                than hidden: the row is where the user can see what to rename.
+              -->
+              {#if facade.droppedReason}
+                <small class="error">{facade.droppedReason}</small>
+              {/if}
               <small class="hint">
                 Configured on the tab “{facade.tabName}” — set its role, backend name,
                 tier and context in that tab's ⇄ popover. It is offered to

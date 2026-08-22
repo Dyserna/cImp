@@ -513,7 +513,23 @@ export interface FacadeBackendRow {
   name: string;
   tier: BackendTier;
   declaredContext: number | null;
+  /// Whether the offload pool actually contains this row.
+  ///
+  /// A facade whose name is already taken is **dropped** by
+  /// `Settings::effective_offload_backends` rather than renamed — the router,
+  /// the run log and the dashboard all key on the name, and two entries
+  /// answering to one name is a bug with no good half. The drop was a `warn!`
+  /// nobody reads, so before V39 review M-9 this list showed the row as if it
+  /// were live and the user had a backend the router would never pick.
+  inPool: boolean;
+  /// Why it is not in the pool, for the row to render. `null` when it is.
+  droppedReason: string | null;
 }
+
+/// The sentence a dropped facade row wears. Spelled once: it is the only place
+/// the user is ever told, and the whole point of M-9 is that it IS said.
+export const FACADE_NAME_TAKEN =
+  'not in the pool \u2014 the name is taken by another backend. Rename it in this tab\u2019s \u21c4 popover.';
 
 /// Every Remote-offload tab, as the backend the offload pool synthesizes from
 /// it.
@@ -525,16 +541,31 @@ export interface FacadeBackendRow {
 /// inferred, and `facade_rows_mirror_the_rust_fallback` is what keeps the two
 /// honest.
 export function facadeBackends(settings: Settings): FacadeBackendRow[] {
+  // The names already spoken for, in the order Rust builds the pool:
+  // `OffloadSettings::effective_backends` first (the configured list, or the
+  // one synthesized `local` entry when there is none), then each facade as it
+  // is appended — so a second facade answering to the first one's name is
+  // dropped too, exactly as it is in `effective_offload_backends`.
+  const taken = new Set<string>(
+    settings.offload.backends.length > 0
+      ? settings.offload.backends.map((b) => b.name)
+      : ['local'],
+  );
   const rows: FacadeBackendRow[] = [];
   for (const t of settings.tabs) {
     if (t.kind !== 'ai_tool' || t.delegation_role !== 'remote_offload') continue;
     const chosen = (t.delegation_backend?.name ?? '').trim();
+    const name = chosen || defaultFacadeName(t.id);
+    const inPool = !taken.has(name);
+    if (inPool) taken.add(name);
     rows.push({
       tabId: t.id,
       tabName: t.name,
-      name: chosen || defaultFacadeName(t.id),
+      name,
       tier: t.delegation_backend?.tier ?? 'quality',
       declaredContext: t.delegation_backend?.declared_context ?? null,
+      inPool,
+      droppedReason: inPool ? null : FACADE_NAME_TAKEN,
     });
   }
   return rows;

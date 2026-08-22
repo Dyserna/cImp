@@ -14,7 +14,7 @@ pub mod registry;
 
 /// NC-2: Claude tabs + their launch directories, for the `/permission/event`
 /// route's cwd fallback when a hook payload can't be matched by session id.
-pub(crate) use config::claude_tab_dirs;
+pub(crate) use config::harness_tab_dirs;
 /// #48 (F-3): one AI tab's launch directory, for the project root V32
 /// containment rows are recorded under — see [`config::ai_tab_dir`].
 pub(crate) use config::ai_tab_dir;

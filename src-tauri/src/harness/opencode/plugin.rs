@@ -294,6 +294,19 @@ pub(crate) struct OpencodePluginFlags {
 /// working security control.
 const OPENCODE_PLUGIN_TEMPLATE: &str = include_str!("templates/plugin.js");
 
+/// **How long the generated plugin waits for cImp's reply** before abandoning
+/// it and letting the tool run — `AbortSignal.timeout(2000)` on the
+/// `/workbench/tool_checkpoint` and `/latch/beacon` POSTs in
+/// [`OPENCODE_PLUGIN_TEMPLATE`].
+///
+/// V40 Phase C, locked decision 22: core derives its own pre-tool budget as
+/// `min(every plugin's declared timeout) - margin`
+/// ([`crate::harness::ingress::hook_reply_budget`]) instead of holding a number
+/// hand-computed from this one. `the_declared_reply_timeout_is_the_templates`
+/// pins the two together, because they live in different files and different
+/// languages and nothing else keeps them equal.
+pub const BEACON_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2000);
+
 /// The FIXED substitution key set of [`OPENCODE_PLUGIN_TEMPLATE`], in emission
 /// order.
 ///

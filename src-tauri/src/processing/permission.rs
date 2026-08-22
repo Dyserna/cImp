@@ -9,35 +9,18 @@
 //! absent (`none_of`), and a `kind` that determines which signal fires on the
 //! absent→present (and present→absent) edges.
 //!
-//! # Why the permission footer is matched loosely
+//! # Where the rows come from
 //!
-//! Claude Code composes the permission prompt's footer at runtime from
-//! *remappable* chord labels (`~/.claude/keybindings.json` can turn `Esc` and
-//! `Tab` into any other chord text), the `… to amend` segment is conditional
-//! (it can be absent entirely), and an extra `… to explain` segment may be
-//! appended. So the old exact marker `Esc to cancel · Tab to amend` only ever
-//! described the default-keybindings, amend-enabled case. What is stable is
-//! the *grammar*: `<chord> to cancel [· <chord> to amend] [· <chord> to
-//! explain]` — the cancel hint is always the FIRST segment.
-//!
-//! The obvious relaxation (match bare `to cancel`) is unsafe twice over:
-//! Claude's select-menu chrome ends with `… · Esc to cancel` (last segment),
-//! and ordinary assistant prose ("press Ctrl+C to cancel the build") contains
-//! the phrase too. The shipped defaults therefore express the permission
-//! prompt as two OR'd patterns, each anchored on structure the menus and prose
-//! don't have, and both refusing to match when menu-only verbs (`to select`,
-//! `to navigate`) are on screen:
-//!
-//! 1. `claude_permission` — `to cancel ·`: the cancel hint is followed by
-//!    another footer segment, which only happens when cancel comes FIRST.
-//!    Chord-rebind proof and amend/explain agnostic.
-//! 2. `claude_permission_bare` — `to cancel` + `1. Yes 2.`: covers the footer
-//!    shape where cancel is the only segment, using the prompt's numbered
-//!    Yes/No option list as the corroborating anchor. The anchor spans the
-//!    first TWO option lines (they are adjacent after whitespace
-//!    normalization), which is structure Claude's own prose does not have — a
-//!    plain `1. Yes` also appears in a numbered list the model writes, and
-//!    such a list can easily mention "to cancel" too.
+//! **The engine is here; the grammar is not** (V40 locked decision 21). What a
+//! pattern matches on is a transcription of somebody else's terminal chrome —
+//! a footer composed at runtime from remappable chord labels, an option list,
+//! a busy marker — and every word of it is a dependency on a product cImp does
+//! not pin. Those rows are declared by the harness that owns them
+//! (`HarnessPlugin::permission_patterns`, `harness/<id>/prompts.rs`), and
+//! [`default_patterns`] is the neutral concatenation over the registry. The
+//! reasoning behind each row — why the permission footer is matched loosely,
+//! why the bare variant needs a second anchor, what re-capturing one costs —
+//! travels with the row, in the plugin.
 //!
 //! Veto (`none_of`) terms are evaluated only from the start of the pattern's
 //! own earliest `all_of` marker onward, not over the whole tail: the tail is a
@@ -107,136 +90,69 @@ pub struct PermissionPattern {
     pub disabled: bool,
 }
 
-/// Built-in fallback patterns. Used when patterns.json is missing/corrupt
-/// at load time so detection still works against the four AI builtins on
-/// fresh installs and after a hand-edit accident. Mirrors the layout the
-/// loader writes to disk on first launch. Pattern matching is pure
-/// substring containment against the ANSI-stripped tail; the same shape
-/// covers Claude Code chrome and OpenCode's `--mini` prompts (the latter
-/// shipped as disabled templates until characterized live — V19 task A4).
+/// One plugin-declared prompt row — the `'static` twin of
+/// [`PermissionPattern`] (V40 locked decision 21).
+///
+/// `PermissionPattern` owns `String`s because it is what the user's
+/// `patterns.json` deserializes into; a plugin's rows are compile-time data, so
+/// they are declared as slices and converted at the one place they enter the
+/// detector. Same fields, same order, same meaning — the conversion is
+/// mechanical on purpose, so "the shipped file is what the plugins declare"
+/// stays a byte-level property.
+#[derive(Debug, Clone, Copy)]
+pub struct PatternSpec {
+    /// See [`PermissionPattern::name`].
+    pub name: &'static str,
+    /// See [`PermissionPattern::kind`].
+    pub kind: PatternKind,
+    /// See [`PermissionPattern::all_of`].
+    pub all_of: &'static [&'static str],
+    /// See [`PermissionPattern::none_of`].
+    pub none_of: &'static [&'static str],
+    /// See [`PermissionPattern::disabled`].
+    pub disabled: bool,
+}
+
+impl PatternSpec {
+    /// The owned row the detector and the on-disk file speak.
+    pub fn to_pattern(&self) -> PermissionPattern {
+        PermissionPattern {
+            name: self.name.to_string(),
+            kind: self.kind,
+            all_of: self.all_of.iter().map(|s| (*s).to_string()).collect(),
+            none_of: self.none_of.iter().map(|s| (*s).to_string()).collect(),
+            disabled: self.disabled,
+        }
+    }
+}
+
+/// Built-in fallback patterns: **every registered harness's declared rows, in
+/// registry order.**
+///
+/// Used when patterns.json is missing/corrupt at load time so detection still
+/// works on fresh installs and after a hand-edit accident, and written verbatim
+/// as the seed on first launch. Pattern matching is pure substring containment
+/// against the ANSI-stripped tail.
+///
+/// **V40 locked decision 21.** This used to be a `vec![]` of six literals, four
+/// transcribed from Claude Code's TUI and two placeholder rows for OpenCode's —
+/// core production code holding one harness's terminal grammar. The rows moved
+/// to `harness/<id>/prompts.rs` behind
+/// [`crate::harness::HarnessPlugin::permission_patterns`] with their reasoning
+/// intact; what is left here is the concatenation, which is the only part that
+/// is true of harnesses in general. A harness added later contributes its rows
+/// by being registered, and the seeded file grows by that fact alone.
+///
+/// Order is the registry's order, and it is load-bearing: the shipped
+/// `scripts/patterns.default.json` is compared byte for byte against what this
+/// composes (`the_shipped_seed_is_byte_identical`), and the detector tests
+/// patterns in declaration order.
 pub fn default_patterns() -> Vec<PermissionPattern> {
-    vec![
-        // Claude Code's tool-approval footer. Matched by grammar, not by the
-        // literal default chrome: the chord labels are remappable via
-        // ~/.claude/keybindings.json, the `… to amend` segment is optional and
-        // a `… to explain` segment may be appended (verified against Claude
-        // Code 2.1.221). What holds is that the cancel hint is the FIRST
-        // segment, so something always follows it — hence `to cancel ·`.
-        // Claude's select menus put their cancel hint LAST (no trailing `·`),
-        // and `none_of` vetoes them outright. See the module docs.
-        PermissionPattern {
-            name: "claude_permission".to_string(),
-            kind: PatternKind::Permission,
-            // `·` is U+00B7 (middle dot). Cell-rendered tail preserves it.
-            all_of: vec!["to cancel ·".to_string()],
-            none_of: vec!["to select".to_string(), "to navigate".to_string()],
-            disabled: false,
-        },
-        // Second permission pattern — patterns of the same `kind` act as
-        // alternatives (OR), so this one covers the shape the first misses:
-        // a footer whose only segment is the cancel hint (no amend, no
-        // explain), where there is no trailing `·` to anchor on. Bare
-        // `to cancel` would also fire on assistant prose ("…press Ctrl+C to
-        // cancel…"), so it is paired with the prompt's numbered option list.
-        //
-        // The option marker is `1. Yes 2.` — the FIRST TWO OPTION LINES, not a
-        // bare `1. Yes` (2026-08-05 review, LOW). The tail is whitespace-
-        // normalized before matching (`normalize_ws`), so consecutive option
-        // rows join with a single space and this reads "option 1 is `Yes` and
-        // option 2 starts immediately after". Claude's approval prompt always
-        // renders ≥2 bare options (`1. Yes` / `2. Yes, and don't ask again` /
-        // `3. No`), and the selector caret sits BEFORE `1.`, so every real
-        // footer variant still matches. Assistant prose cannot: a numbered list
-        // item reading "1. Yes, …" continues with its own text before the next
-        // number, which breaks the adjacency — and prose carrying both
-        // "1. Yes" and "to cancel" was the documented false-positive shape.
-        // If a future release adds per-option description lines to the approval
-        // prompt (as the AskUserQuestion box has), this marker stops matching —
-        // re-capture with RUST_LOG=perm_capture=debug; the primary
-        // `claude_permission` pattern covers every multi-segment footer meanwhile.
-        //
-        // Also the worked example for declaring extra prompt shapes: copy the
-        // entry, change `name`, and edit `all_of`/`none_of`.
-        PermissionPattern {
-            name: "claude_permission_bare".to_string(),
-            kind: PatternKind::Permission,
-            all_of: vec!["to cancel".to_string(), "1. Yes 2.".to_string()],
-            none_of: vec!["to select".to_string(), "to navigate".to_string()],
-            disabled: false,
-        },
-        // Claude Code's AskUserQuestion prompt. Unlike the permission
-        // prompt it renders its own footer ("Enter to select · ↑/↓ to
-        // navigate · Esc to cancel") and always appends a free-text
-        // "Type something" choice. Neither marker appears in permission
-        // prompts or normal output, and the pair is independent of the
-        // specific question text, so it identifies the question UI for any
-        // AskUserQuestion. Both sit at the bottom of the box, so they
-        // survive the rendered-tail window even when a long question
-        // scrolls off the top. Captured 2026-06-09 against Claude Code's
-        // current chrome; re-capture with RUST_LOG=perm_capture=debug if a
-        // future release changes the footer or option wording.
-        //
-        // Cross-pattern invariant: "Enter to select" here and the permission
-        // patterns' `none_of: ["to select", …]` are two views of the same
-        // menu chrome. If this marker is ever re-captured, re-check that the
-        // permission veto still names a substring the new menu footer has —
-        // otherwise the question UI starts firing Permission as well.
-        PermissionPattern {
-            name: "claude_question".to_string(),
-            kind: PatternKind::Question,
-            all_of: vec!["Enter to select".to_string(), "Type something".to_string()],
-            none_of: Vec::new(),
-            disabled: false,
-        },
-        // Claude's "busy" footer, shown only while a request is in flight
-        // (and never during a permission/question prompt, where Claude is
-        // waiting on the user). Drives the avatar's Thinking state: present
-        // = working, absent = done. The verb distinguishes it from the
-        // permission prompt: this footer offers "interrupt", never "cancel",
-        // so it cannot trip the permission patterns (which key off
-        // "to cancel"). If a future Claude Code release reworks this footer
-        // — in particular if it starts saying "to cancel" — re-capture with
-        // RUST_LOG=perm_capture=debug and update the marker here.
-        PermissionPattern {
-            name: "claude_working".to_string(),
-            kind: PatternKind::Working,
-            all_of: vec!["esc to interrupt".to_string()],
-            none_of: Vec::new(),
-            disabled: false,
-        },
-        // OpenCode (`opencode --mini`) permission prompt. OpenCode asks for
-        // tool/edit/bash approval with its own inline footer. The exact marker
-        // substring must be captured live against `opencode --mini` (the
-        // alternate-screen TUI is never launched) — run a permission-triggering
-        // action with `RUST_LOG=perm_capture=debug` and replace the placeholder
-        // below with a distinctive substring from the dumped tail (e.g. the
-        // footer chrome or the "Allow"/"Deny" option line). Shipped `disabled`
-        // until characterized (V19 task A4) so a wrong guess can't mis-fire;
-        // flip to `disabled: false` once the real marker is in place.
-        PermissionPattern {
-            name: "opencode_permission".to_string(),
-            kind: PatternKind::Permission,
-            all_of: vec![
-                "<replace with a substring unique to opencode --mini's permission prompt>"
-                    .to_string(),
-            ],
-            none_of: Vec::new(),
-            disabled: true,
-        },
-        // OpenCode's "busy"/working footer while a request is in flight (drives
-        // the avatar's Thinking↔Idle state, like `claude_working`). Capture the
-        // live `--mini` working chrome the same way and replace the placeholder;
-        // shipped `disabled` until characterized (V19 task A4).
-        PermissionPattern {
-            name: "opencode_working".to_string(),
-            kind: PatternKind::Working,
-            all_of: vec![
-                "<replace with a substring unique to opencode --mini's working footer>".to_string(),
-            ],
-            none_of: Vec::new(),
-            disabled: true,
-        },
-    ]
+    crate::harness::registry::all()
+        .filter_map(|h| h.plugin())
+        .flat_map(|p| p.permission_patterns())
+        .map(PatternSpec::to_pattern)
+        .collect()
 }
 
 /// Empty pattern list for tabs that don't run detection (Shell tabs).

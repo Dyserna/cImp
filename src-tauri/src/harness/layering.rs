@@ -244,12 +244,15 @@ fn harness_literals() -> BTreeSet<String> {
 /// literal it was written for and quietly become a blanket exemption for
 /// whatever that file grows into next.
 const LITERAL_ALLOWLIST: &[(&str, &str)] = &[
-    (
-        "offload/loopback.rs",
-        "L2 by design (§ 4: 'route table; handlers stay in offload/loopback.rs'). \
-         `classify_permission_event` reads Claude's `hook_event_name` values because it is the \
-         receiving end of the wire — the CHP seam itself, not a consumer above it.",
-    ),
+    // `offload/loopback.rs` was the first entry here, and V40 Phase C deleted
+    // it. Its reason was "L2 by design (§ 4: 'route table; handlers stay in
+    // offload/loopback.rs'), and `classify_permission_event` reads Claude's
+    // `hook_event_name` values because it is the receiving end of the wire".
+    // The design sentence it quoted is exactly what locked decisions 15 and 22
+    // overturned: the route table AND the handlers are the plugin's, so the
+    // receiving end of the wire is `harness/claude/hook.rs` and the classifier
+    // went with it. This file holds no harness payload field at all now, which
+    // is strictly better than an exemption — a future one fails the build.
     // TWO MORE entries were deleted here on 2026-08-17, and this time by the
     // follow-up their reasons named. `taint_beacon.rs` and
     // `checkpoint_beacon.rs` were Claude's last two command-hook shims, exempted
@@ -259,14 +262,14 @@ const LITERAL_ALLOWLIST: &[(&str, &str)] = &[
     // into `harness::claude::hook`", and the http migration did both at once: the
     // payload reading is `claude_hook::contract_checks`, the files are gone, and
     // the scan is two files wider with nothing to allow.
-    (
-        "processing/patterns_file.rs",
-        "The Claude TUI permission footer (capability `perm.tui_scrape`, Tier D). The regex \
-         matcher is the FALLBACK detector behind the `Notification` hook, and it lives with the \
-         PTY screen scraper it runs against. Phase J already retired its primacy; Phase L kept \
-         the fallback, on the same principle every other fallback here follows. Its sibling \
-         `processing/permission.rs` used to be listed too — see below.",
-    ),
+    // `processing/patterns_file.rs` was the second entry, for "the Claude TUI
+    // permission footer (capability `perm.tui_scrape`, Tier D)" — the literal
+    // `Esc to cancel · Tab to amend` in its per-release snapshot table, plus the
+    // `aider_*` rows of a harness retired in V19. V40 Phase C moved every row to
+    // the harness that shipped it (`harness/<id>/prompts.rs`, and data-only
+    // `harness/_retired/aider.rs`); what is left is the era list and the
+    // composition, which name no harness at all. The fallback detector is
+    // unchanged and still the fallback — only the transcription moved.
     // TWO entries were deleted here once the allowlist gained its own
     // both-directions check (`every_literal_allowlist_entry_is_still_earning_it`),
     // and in both cases the reason had been describing code that does not exist:
@@ -533,6 +536,13 @@ fn every_registry_entry_is_fully_wired() {
         .flatten()
         .filter(|e| e.path().is_dir())
         .map(|e| e.file_name().to_string_lossy().into_owned())
+        // `_retired/` is data a retired harness left behind, not a harness
+        // (V40 Phase C, locked decision 21). It has no plugin, no descriptor,
+        // no tab and no code path — the underscore is the convention that says
+        // so, and this is the one place it has to be spelled: a directory here
+        // would otherwise have to be declared, and declaring it would make a
+        // harness cImp cannot run look supported.
+        .filter(|name| !name.starts_with('_'))
         .collect();
     let declared: BTreeSet<String> = harness_dirs().iter().map(|(d, _)| d.to_string()).collect();
     assert_eq!(
@@ -946,16 +956,17 @@ const IDENTITY_ALLOWLIST: &[(&str, &str)] = &[
     ),
     // ── the MCP consumer vocabulary ────────────────────────────────────────
     // ── the loopback wire ──────────────────────────────────────────────────
-    (
-        "offload/loopback.rs",
-        "L2 BY DESIGN plus the hook ingress Phase C moves. This file is the receiving end of \
-         the wire: the `/claude/hook/*` route table and the ~900 lines of `handle_claude_*` \
-         bodies move to `harness/claude/hook.rs` behind `HarnessPlugin::routes()` (locked \
-         decisions 15 and 22), `classify_permission_event` reads Claude's `hook_event_name` \
-         values, and the `X-CIMP-*` identity special-case goes with them. Phase A collapsed \
-         what it could here — `AUDIT_CONSUMERS` is a registry view and the consumer defaults \
-         resolve through `DEFAULT_HARNESS`. This file leaves BOTH allowlists in Phase C.",
-    ),
+    //
+    // `offload/loopback.rs` left this list in V40 Phase C, and it is the row the
+    // list was written to retire. Its reason ended "this file leaves BOTH
+    // allowlists in Phase C", and both halves happened in one change: the
+    // `/claude/hook/*` route table and the ~900 lines of `handle_claude_*`
+    // bodies are `harness::claude::hook::ROUTES_TABLE` behind
+    // `HarnessPlugin::routes()` (locked decisions 15 and 22), the `X-CIMP-*`
+    // identity special-case is `identity_of_request()`, the drift vocabulary is
+    // `drift_vocabulary()`, and `classify_permission_event` went with the
+    // payload it classifies. Core's router appends plugin routes after its own
+    // arms and writes back a `HookReply` it does not read.
     // ── the per-harness surfaces later phases own ──────────────────────────
     (
         "graph/service.rs",
@@ -976,18 +987,12 @@ const IDENTITY_ALLOWLIST: &[(&str, &str)] = &[
          proxy start naming the registered ids) and made `delegate_targets` iterate the \
          registry. Phase D (locked decisions 19 and 25).",
     ),
-    (
-        "tabs/config.rs",
-        "ONE residual, named in place. `claude_harness()` is the permission-hook cwd \
-         fallback's harness — a Claude mechanism, because only Claude's hook payload has the \
-         cwd gap it exists for — and it moves behind `identity_of_request()` in Phase C \
-         (locked decision 22). Phase B took the other one: `opencode_native_gate_for`'s \
-         `Scope::Tab { agent: \"opencode\" }` is `harness::opencode::plugin::native_gate_for` \
-         now, resolving `Feature::HarnessNativeGate` — a feature whose SCOPE the declaring \
-         plugin states (locked decision 6). Everything else this file used to know — the ten \
-         branches, the env strip list, the spawn signature, the OOB resolver, the artifact \
-         writes, the two audit-exposure predicates — is behind `HarnessPlugin` as of Phase B.",
-    ),
+    // `tabs/config.rs` left this list in V40 Phase C. Its ONE residual was
+    // `claude_harness()`, the permission-hook cwd fallback's harness — a Claude
+    // mechanism, because only Claude's hook payload has the cwd gap it exists
+    // for. `claude_tab_dirs` is `harness_tab_dirs(.., HarnessId)` now and the
+    // plugin route passes the id it already is, so the question is asked by the
+    // harness rather than answered for it (locked decision 22).
     (
         "ipc/tab_lifecycle.rs",
         "ONE line: the `resolve_command(\"opencode\")` preflight that warns before enabling a \

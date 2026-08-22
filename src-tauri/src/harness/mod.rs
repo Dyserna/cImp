@@ -90,12 +90,14 @@
 //! 4.1 (Phase K: the target tree and the layering tests) and § 5.1 (Phase M:
 //! the emitted artifact as a template file — [`render`]).
 
+pub mod _retired;
 pub mod canary;
 pub mod capture;
 pub mod chp;
 pub mod claude;
 pub mod contract;
 pub mod health;
+pub mod ingress;
 
 #[cfg(test)]
 mod layering;

@@ -269,6 +269,17 @@ impl HarnessPlugin for OpenCodePlugin {
         super::tools::OPENCODE_NATIVE_TABLE
     }
 
+    fn memory_arg_keys(&self, arg: crate::harness::plugin::MemArg) -> &'static [&'static str] {
+        use crate::harness::plugin::MemArg;
+        match arg {
+            // camelCase, and `path` as the fallback the generated plugin itself
+            // falls back to (`inp.args.filePath || inp.args.path`).
+            MemArg::Path => &["filePath", "path"],
+            MemArg::Pattern => &["pattern", "path", "query"],
+            MemArg::Command => &["command"],
+        }
+    }
+
     fn capabilities(&self) -> &'static [crate::harness::contract::Capability] {
         super::input::CAPABILITIES
     }
@@ -289,6 +300,33 @@ impl HarnessPlugin for OpenCodePlugin {
 
     fn declared_unprobed(&self) -> &'static [(&'static str, &'static str)] {
         DECLARED_UNPROBED
+    }
+
+    /// OpenCode's generated plugin posts its pre-mutation checkpoint beacon
+    /// under `AbortSignal.timeout(2000)` (`templates/plugin.js`) and starts the
+    /// tool the instant that timer fires. Declared so core's pre-tool budget is
+    /// derived from it rather than hand-computed against it.
+    fn hook_reply_timeout(&self) -> Option<std::time::Duration> {
+        Some(super::plugin::BEACON_REPLY_TIMEOUT)
+    }
+
+    /// `/memory/event` and `/latch/state` are OpenCode's alone: the generated
+    /// plugin is the only artifact that has ever posted to either
+    /// (`docs/CHP.md` § 4.3), and a `/latch/state` answer attributed to another
+    /// harness would gate the wrong tab's native tools.
+    fn legacy_wire_default_routes(&self) -> &'static [&'static str] {
+        &["/memory/event", "/latch/state"]
+    }
+
+    fn permission_patterns(&self) -> &'static [crate::processing::permission::PatternSpec] {
+        super::prompts::PATTERNS
+    }
+
+    fn legacy_permission_patterns(
+        &self,
+        era: &str,
+    ) -> &'static [crate::processing::permission::PatternSpec] {
+        super::prompts::legacy_patterns(era)
     }
 
     fn sandbox_grants(&self, ctx: &GrantCtx) -> Vec<GrantRow> {

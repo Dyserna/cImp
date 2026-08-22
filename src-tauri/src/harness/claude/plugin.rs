@@ -270,6 +270,17 @@ impl HarnessPlugin for ClaudePlugin {
         super::tools::CLAUDE_NATIVE_TABLE
     }
 
+    fn memory_arg_keys(&self, arg: crate::harness::plugin::MemArg) -> &'static [&'static str] {
+        use crate::harness::plugin::MemArg;
+        match arg {
+            // `notebook_path` is `NotebookEdit`'s; `path` is not a spelling any
+            // documented Claude tool input uses, and it is deliberately absent.
+            MemArg::Path => &["file_path", "notebook_path"],
+            MemArg::Pattern => &["pattern", "path"],
+            MemArg::Command => &["command"],
+        }
+    }
+
     fn capabilities(&self) -> &'static [crate::harness::contract::Capability] {
         super::input::CAPABILITIES
     }
@@ -305,6 +316,45 @@ impl HarnessPlugin for ClaudePlugin {
 
     fn declared_unprobed(&self) -> &'static [(&'static str, &'static str)] {
         DECLARED_UNPROBED
+    }
+
+    fn routes(&self) -> &'static [crate::harness::plugin::Route] {
+        super::hook::ROUTES_TABLE
+    }
+
+    fn identity_of_request(
+        &self,
+        route: &str,
+        req: &crate::offload::loopback::Request,
+    ) -> Option<crate::harness::plugin::RequestIdentity> {
+        super::hook::identity_of_request(route, req)
+    }
+
+    fn chp_event_for_route(&self, route: &str) -> Option<&'static str> {
+        super::hook::chp_event(route)
+    }
+
+    fn drift_token_for_capability(&self, capability: &str) -> Option<&'static str> {
+        super::hook::drift_token_for_event(capability)
+    }
+
+    fn drift_vocabulary(&self) -> &'static [&'static str] {
+        super::hook::DRIFT_TOKENS
+    }
+
+    fn hook_reply_timeout(&self) -> Option<std::time::Duration> {
+        Some(super::hook::REPLY_TIMEOUT)
+    }
+
+    fn permission_patterns(&self) -> &'static [crate::processing::permission::PatternSpec] {
+        super::prompts::PATTERNS
+    }
+
+    fn legacy_permission_patterns(
+        &self,
+        era: &str,
+    ) -> &'static [crate::processing::permission::PatternSpec] {
+        super::prompts::legacy_patterns(era)
     }
 
     fn sandbox_grants(&self, ctx: &GrantCtx) -> Vec<GrantRow> {

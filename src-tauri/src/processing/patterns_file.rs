@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::processing::permission::{default_patterns, PatternKind, PermissionPattern};
+use crate::processing::permission::{default_patterns, PatternSpec, PermissionPattern};
 
 const PATTERNS_FILE_NAME: &str = "patterns.json";
 
@@ -61,41 +61,12 @@ fn default_file() -> PatternsFile {
     }
 }
 
-/// Shorthand for a snapshot entry. Legacy files predate the `none_of` field,
-/// which serde defaults to empty when the key is absent, so every snapshot
-/// pattern is built with an empty veto list — that is exactly what a parsed
-/// legacy file yields.
-fn legacy_pattern(
-    name: &str,
-    kind: PatternKind,
-    all_of: &[&str],
-    disabled: bool,
-) -> PermissionPattern {
-    PermissionPattern {
-        name: name.to_string(),
-        kind,
-        all_of: all_of.iter().map(|s| (*s).to_string()).collect(),
-        none_of: Vec::new(),
-        disabled,
-    }
-}
-
-/// Every distinct pattern list that shipped as `default_patterns()` in a past
-/// release, each labelled with the era it covers. A patterns.json equal to one
-/// of these was written by the seeder and never edited, so it can be replaced
-/// with the current defaults. The list is append-only: whenever
-/// [`default_file`]'s patterns change, the outgoing set is added here.
+/// Every named era of the shipped `patterns.json`, **newest first**.
 ///
-/// **The append rule is enforced** (M13, 2026-08-05 review) by
-/// `current_defaults_match_the_frozen_snapshot`, which holds a literal copy of
-/// the current set: changing `default_patterns()` turns that test red and its
-/// message spells out the two-step fix. Forgetting the append used to be
-/// silent, and its cost is delayed: installs that took the interim release end
-/// up holding a set matching no snapshot, so they are treated as hand-edited
-/// forever and never receive any future default fix (the 199221b bug).
-/// Only sets that actually SHIPPED belong here — a default set changed twice
-/// within one unreleased development range never reached a user's disk, so it
-/// is not a snapshot anyone can hold.
+/// Core owns the labels because they are cImp's own release ranges; the rows
+/// under each label belong to the harnesses that shipped them (V40 locked
+/// decision 21). The v0.22.0 set is the overwhelmingly likely match, so it is
+/// tested first.
 ///
 /// Provenance (see also `scripts/patterns.default.json`, which mirrored these
 /// from the v0.7.0 era onward):
@@ -106,108 +77,60 @@ fn legacy_pattern(
 /// * `v0.22.0` — 8b4728d, 2026-06-29 (reflowed by rustfmt in 5d3a9fc without
 ///   content change). Aider prompts out, OpenCode templates in. Shipped
 ///   through v0.49.1, so this is the set nearly every live install holds.
+const LEGACY_ERAS: [&str; 4] = [
+    "v0.22.0..v0.49.1",
+    "v0.7.0..v0.21.x",
+    "v0.6.3..v0.6.x",
+    "v0.4.0",
+];
+
+/// Every distinct pattern list that shipped as `default_patterns()` in a past
+/// release, each labelled with the era it covers. A patterns.json equal to one
+/// of these was written by the seeder and never edited, so it can be replaced
+/// with the current defaults. The list is append-only: whenever
+/// [`default_file`]'s patterns change, the outgoing set is added here.
+///
+/// **V40 locked decision 21.** This used to be ~100 lines of literal rows —
+/// `claude_*`, `opencode_*` **and `aider_*`, a harness cImp retired in V19** —
+/// composed by hand in core. The rows now come from the plugin that shipped
+/// them (`HarnessPlugin::legacy_permission_patterns`) plus the data-only
+/// [`crate::harness::_retired`] slot, and what is left here is the era list and
+/// the composition order.
+///
+/// **The order is the order every shipped set had**: registered harnesses in
+/// registry order, then retired ones. It is unambiguous in practice because no
+/// era ever carried both OpenCode's rows and aider's — v0.22.0 is exactly the
+/// release that swapped one for the other — and it is asserted by
+/// [`tests::current_defaults_are_not_a_legacy_set`], which requires the four
+/// sets to stay distinct.
+///
+/// **The append rule is enforced** (M13, 2026-08-05 review) by
+/// `current_defaults_match_the_frozen_snapshot`, which holds a literal copy of
+/// the current set: changing what the plugins declare turns that test red and
+/// its message spells out the two-step fix. Forgetting the append used to be
+/// silent, and its cost is delayed: installs that took the interim release end
+/// up holding a set matching no snapshot, so they are treated as hand-edited
+/// forever and never receive any future default fix (the 199221b bug).
+/// Only sets that actually SHIPPED belong here — a default set changed twice
+/// within one unreleased development range never reached a user's disk, so it
+/// is not a snapshot anyone can hold.
 fn legacy_default_sets() -> Vec<(&'static str, Vec<PermissionPattern>)> {
-    const CLAUDE_FOOTER: &str = "Esc to cancel · Tab to amend";
-    const ALT_EXAMPLE: &str = "<replace with a substring unique to this prompt shape>";
-
-    let claude_permission = || {
-        legacy_pattern(
-            "claude_permission",
-            PatternKind::Permission,
-            &[CLAUDE_FOOTER],
-            false,
-        )
-    };
-    let alt_example = || {
-        legacy_pattern(
-            "claude_permission_alt_example",
-            PatternKind::Permission,
-            &[ALT_EXAMPLE],
-            true,
-        )
-    };
-    let question_template = || {
-        legacy_pattern(
-            "claude_question_template",
-            PatternKind::Question,
-            &[
-                CLAUDE_FOOTER,
-                "<replace with a substring unique to question prompts>",
-            ],
-            true,
-        )
-    };
-    let question = || {
-        legacy_pattern(
-            "claude_question",
-            PatternKind::Question,
-            &["Enter to select", "Type something"],
-            false,
-        )
-    };
-    let working = || {
-        legacy_pattern(
-            "claude_working",
-            PatternKind::Working,
-            &["esc to interrupt"],
-            false,
-        )
-    };
-    let aider = || {
-        vec![
-            legacy_pattern(
-                "aider_apply_edits",
-                PatternKind::Permission,
-                &["Apply edits?", "(Y)es"],
-                false,
-            ),
-            legacy_pattern(
-                "aider_add_to_chat",
-                PatternKind::Permission,
-                &["Add ", " to the chat?"],
-                false,
-            ),
-            legacy_pattern(
-                "aider_run_shell",
-                PatternKind::Permission,
-                &["Run shell command?"],
-                false,
-            ),
-        ]
-    };
-    let opencode = || {
-        vec![
-            legacy_pattern(
-                "opencode_permission",
-                PatternKind::Permission,
-                &["<replace with a substring unique to opencode --mini's permission prompt>"],
-                true,
-            ),
-            legacy_pattern(
-                "opencode_working",
-                PatternKind::Working,
-                &["<replace with a substring unique to opencode --mini's working footer>"],
-                true,
-            ),
-        ]
-    };
-
-    let v040 = vec![claude_permission(), alt_example(), question_template()];
-    let mut v063 = v040.clone();
-    v063.extend(aider());
-    let mut v070 = vec![claude_permission(), alt_example(), question(), working()];
-    v070.extend(aider());
-    let mut v022 = vec![claude_permission(), alt_example(), question(), working()];
-    v022.extend(opencode());
-
-    // Newest first: the v0.22.0 set is the overwhelmingly likely match, so it
-    // is tested before the older ones.
-    vec![
-        ("v0.22.0..v0.49.1", v022),
-        ("v0.7.0..v0.21.x", v070),
-        ("v0.6.3..v0.6.x", v063),
-        ("v0.4.0", v040),
-    ]
+    LEGACY_ERAS
+        .into_iter()
+        .map(|era| {
+            let mut rows: Vec<PermissionPattern> = crate::harness::registry::all()
+                .filter_map(|h| h.plugin())
+                .flat_map(|p| p.legacy_permission_patterns(era))
+                .map(PatternSpec::to_pattern)
+                .collect();
+            rows.extend(
+                crate::harness::_retired::legacy_permission_patterns(era)
+                    .into_iter()
+                    .map(PatternSpec::to_pattern),
+            );
+            (era, rows)
+        })
+        .collect()
 }
 
 /// Era label of the shipped default set that `patterns` reproduces verbatim,
@@ -448,6 +371,25 @@ mod tests {
         let parsed = read_file(&path).expect("BOM file should parse");
         assert_eq!(parsed.patterns.len(), default_file().patterns.len());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Shorthand for a hand-written snapshot row, kept as a TEST helper after
+    /// V40 Phase C moved the production snapshots behind the plugins: what the
+    /// reconciliation tests need is an arbitrary row, which is exactly what a
+    /// plugin declaration is not.
+    fn legacy_pattern(
+        name: &str,
+        kind: PatternKind,
+        all_of: &[&str],
+        disabled: bool,
+    ) -> PermissionPattern {
+        PermissionPattern {
+            name: name.to_string(),
+            kind,
+            all_of: all_of.iter().map(|s| (*s).to_string()).collect(),
+            none_of: Vec::new(),
+            disabled,
+        }
     }
 
     /// Scratch dir + patterns.json path for the reconciliation tests.

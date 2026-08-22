@@ -206,7 +206,7 @@ fn ai_env_removals(cfg: &AiToolTabConfig) -> Vec<String> {
 /// The directory an AI tab launches in: its per-tab `cwd` override, else the
 /// app's launch dir. THE one definition — [`build_ai_tool_spec`] (which hands it
 /// to [`resolve_oob_source`], so it also becomes the Claude transcript root
-/// behind the H1 same-root ambiguity predicate) and [`claude_tab_dirs`] (the
+/// behind the H1 same-root ambiguity predicate) and [`harness_tab_dirs`] (the
 /// permission-hook cwd fallback) both call it, so the tab-identity seam and the
 /// hook-attribution seam can never disagree about where a tab runs.
 fn ai_working_dir(cfg: &AiToolTabConfig, launch_cwd: &Path) -> std::path::PathBuf {
@@ -231,7 +231,7 @@ fn ai_working_dir(cfg: &AiToolTabConfig, launch_cwd: &Path) -> std::path::PathBu
 /// function does not invent one, because "the tab does not exist" and "the tab
 /// runs in the launch dir" are different facts.
 ///
-/// Every AI tab kind, not just Claude ([`claude_tab_dirs`]'s narrower set): the
+/// Every AI tab kind, not just one harness's ([`harness_tab_dirs`]'s narrower set): the
 /// taint latch scopes OpenCode tabs identically.
 pub(crate) fn ai_tab_dir(
     settings: &Settings,
@@ -244,13 +244,13 @@ pub(crate) fn ai_tab_dir(
     })
 }
 
-/// NC-2 (issue #5): every configured Claude AI tab and the working directory it
+/// NC-2 (issue #5): every configured AI tab of ONE harness and the working directory it
 /// launches in — `(tab_id, working_dir)`. Resolution is [`ai_working_dir`], the
 /// same call [`build_ai_tool_spec`] makes, so the permission-hook route can
 /// compare a hook payload's `cwd` against the directory the tab was actually
 /// spawned in.
 ///
-/// Note the usual case is that NO tab sets `cwd`, so every Claude tab shares the
+/// Note the usual case is that NO tab sets `cwd`, so every tab of a harness shares the
 /// launch dir — which is why the route's cwd match is only used as a
 /// last-resort tie-break and only when it resolves to exactly one tab.
 ///
@@ -260,24 +260,24 @@ pub(crate) fn ai_tab_dir(
 /// configured-but-closed tab must not degrade a running one — so it is fed by
 /// the running taps themselves (`GraphService::mark_live_tab_root`), not by this
 /// list.
-fn claude_harness() -> Option<crate::harness::HarnessId> {
-    // The permission-hook cwd fallback is a CLAUDE mechanism: the hook payload
-    // it backs carries no cwd, and only Claude's hooks have that gap. Named
-    // here, once, with this note — locked decision 22's rule for a residual
-    // that a later phase moves behind the plugin (`identity_of_request`, Phase
-    // C), rather than a bare literal in a filter.
-    crate::harness::HarnessId::from_id("claude")
-}
-
-pub(crate) fn claude_tab_dirs(
+/// **V40 Phase C, locked decision 22 — the harness is an argument now.**
+/// This was `claude_tab_dirs`, filtered by a local `claude_harness()` that
+/// spelled `"claude"` and carried a note saying Phase C would move it. The gap
+/// it backs is a *harness's* gap (a hook payload that carries no cwd), so the
+/// harness asking the question supplies its own id: the plugin route calls this
+/// with the id it already is, and no core caller names one.
+pub(crate) fn harness_tab_dirs(
     settings: &Settings,
     launch_cwd: &Path,
+    harness: crate::harness::HarnessId,
 ) -> Vec<(String, std::path::PathBuf)> {
     settings
         .tabs
         .iter()
         .filter_map(|t| match t {
-            TabConfig::AiTool(c) if crate::harness::HarnessId::from_command(&c.command) == claude_harness() => {
+            TabConfig::AiTool(c)
+                if crate::harness::HarnessId::from_command(&c.command) == Some(harness) =>
+            {
                 Some((c.id.clone(), ai_working_dir(c, launch_cwd)))
             }
             _ => None,
@@ -1898,7 +1898,7 @@ mod tests {
     /// resolved exactly as `build_ai_tool_spec` does. OpenCode/Shell tabs are
     /// excluded: the hook only fires for Claude.
     #[test]
-    fn claude_tab_dirs_lists_claude_tabs_with_their_launch_dirs() {
+    fn harness_tab_dirs_lists_that_harnesss_tabs_with_their_launch_dirs() {
         let mut settings = Settings {
             tabs: vec![
                 TabConfig::AiTool(claude_cfg()),
@@ -1907,7 +1907,7 @@ mod tests {
             ..Settings::default()
         };
         let launch = Path::new("C:/proj");
-        let dirs = claude_tab_dirs(&settings, launch);
+        let dirs = harness_tab_dirs(&settings, launch, crate::harness::HarnessId::from_id("claude").unwrap());
         assert_eq!(dirs.len(), 1, "only the Claude tab: {dirs:?}");
         assert!(
             dirs.iter().all(|(_, d)| d == launch),
@@ -1923,7 +1923,7 @@ mod tests {
         wt.id = "ai-worktree".to_string();
         wt.cwd = Some(std::path::PathBuf::from("C:/proj/wt"));
         settings.tabs.push(TabConfig::AiTool(wt));
-        let dirs = claude_tab_dirs(&settings, launch);
+        let dirs = harness_tab_dirs(&settings, launch, crate::harness::HarnessId::from_id("claude").unwrap());
         assert_eq!(
             dirs.iter()
                 .find(|(id, _)| id == "ai-worktree")
@@ -1935,7 +1935,7 @@ mod tests {
     /// H1 (2026-08-05 review) cross-module invariant: the directory a Claude
     /// tab's out-of-band tap derives its transcript root from (and therefore the
     /// key the same-root ambiguity predicate groups tabs by) is the SAME
-    /// directory `claude_tab_dirs` reports to the permission-hook cwd fallback.
+    /// directory `harness_tab_dirs` reports to the permission-hook cwd fallback.
     /// If these ever diverge, one seam would call two tabs co-tenants while the
     /// other treats them as distinct — the failure mode H1 exists to remove.
     #[test]
@@ -1951,7 +1951,7 @@ mod tests {
             ],
             ..Settings::default()
         };
-        let dirs = claude_tab_dirs(&settings, launch);
+        let dirs = harness_tab_dirs(&settings, launch, crate::harness::HarnessId::from_id("claude").unwrap());
         for (cfg, id) in [(claude_cfg(), "claude"), (wt, "ai-worktree")] {
             let mut extra: Vec<String> = Vec::new();
             // Exactly what `build_ai_tool_spec` hands the oob resolver. The env

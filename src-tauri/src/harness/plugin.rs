@@ -406,6 +406,102 @@ pub struct Canary {
     pub run: fn(&str) -> Result<(), String>,
 }
 
+// ── hook ingress (locked decisions 15 and 22) ───────────────────────────────
+
+/// What a plugin-owned loopback route answers, **as bytes core does not read**.
+///
+/// Locked decision 22. Claude's hook routes answer hook-output JSON
+/// (`{"continue":true}`, `hookSpecificOutput.additionalContext`,
+/// `permissionDecision: "deny"`); a harness whose ingress is an ordinary plugin
+/// answers `{"ok":true}`. Core must not know either shape — its whole job here
+/// is *status + body*, which is the same job it does for every neutral route.
+///
+/// The status is carried rather than assumed because "fail-open in HTTP terms"
+/// is a per-harness decision: Claude's family answers `200` on every path
+/// including refusals, since a non-2xx is a *non-blocking error* the harness
+/// logs and there is nothing to log about a hook that had nothing to say.
+pub struct HookReply {
+    /// The HTTP status core writes.
+    pub status: u16,
+    /// The body core serializes, verbatim and unread.
+    pub body: serde_json::Value,
+}
+
+impl HookReply {
+    /// A `200` carrying `body`.
+    pub fn ok(body: serde_json::Value) -> Self {
+        Self { status: 200, body }
+    }
+}
+
+/// The future one [`Route`] handler returns.
+///
+/// Boxed because the table is a `const` of `fn` pointers: an `async fn`'s
+/// opaque future type cannot be named in one, and the alternative — a `match`
+/// in core — is the thing decision 15 deletes.
+pub type RouteFuture<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = crate::error::AppResult<HookReply>> + Send + 'a>,
+>;
+
+/// One plugin-owned loopback route.
+///
+/// `method` and `path` are matched by core **after** every CHP-neutral arm, so
+/// a plugin can never shadow `/session/hello`, `/mcp/*` or the audit and push
+/// routes. Core keeps no harness path literal; the strings live beside the
+/// handler that answers them.
+pub struct Route {
+    /// The HTTP method, e.g. `"POST"`.
+    pub method: &'static str,
+    /// The absolute path, query string excluded — core strips it before
+    /// matching, exactly as it does for its own arms.
+    pub path: &'static str,
+    /// The handler. Takes the app and the parsed request; answers a
+    /// [`HookReply`] core writes without inspecting.
+    pub handler: RouteHandler,
+}
+
+/// A [`Route`]'s handler: a plain `fn` pointer over a boxed future.
+pub type RouteHandler =
+    for<'a> fn(&'a tauri::AppHandle, &'a crate::offload::loopback::Request) -> RouteFuture<'a>;
+
+/// The identity a request carries **outside its body**.
+///
+/// Locked decision 22. A Claude hook's body is the harness's own payload with no
+/// room for a CHP envelope, so its `(agent, tab, chp)` triple arrives in
+/// `X-CIMP-*` headers instead. That used to be a `claude_hook::is_hook_route`
+/// special-case inside core's `note_chp`; it is now a question core asks every
+/// registered plugin, and a harness that puts its identity anywhere else answers
+/// for itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestIdentity {
+    /// The CHP version the caller speaks.
+    pub chp: u32,
+    /// The harness discriminator as sent — bounded and validated by the caller,
+    /// exactly like the body field it replaces.
+    pub agent: String,
+    /// The cImp tab the request claims.
+    pub tab: String,
+}
+
+// ── permission edges (locked decision 21) ───────────────────────────────────
+
+/// **Which edge of `awaiting_permission` a harness reported** — the neutral half
+/// of prompt detection.
+///
+/// Locked decision 21. The *classification* is the harness's: which of its
+/// notification types means "a prompt is on screen", which of its footers is the
+/// approval box, what its transcript path is called. What reaches core is this —
+/// two states and the tab they belong to — and it is the same pair the TUI-regex
+/// detector produces, which is why a hook edge and a scrape edge collapse to one
+/// signal at the state manager instead of being two features.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionEdge {
+    /// A permission prompt is now on screen ⇒ `PermissionPromptDetected`.
+    Detected,
+    /// The pending call was resolved ⇒ `PermissionPromptResolved`.
+    Resolved,
+}
+
 // ── the trait ───────────────────────────────────────────────────────────────
 
 /// Everything core asks *this harness* to do.
@@ -569,6 +665,20 @@ pub trait HarnessPlugin: Sync + Send {
         &[]
     }
 
+    /// The argument keys this harness's tool payloads carry a [`MemArg`] under,
+    /// **in precedence order**.
+    ///
+    /// Locked decision 16, closing the ledger's `loopback.rs:9124` row: core
+    /// used to try `file_path` → `filePath` → `notebook_path` → `path` for
+    /// every caller — Claude's snake_case and OpenCode's camelCase merged in one
+    /// `match`, so a third harness's payload was mined with two other products'
+    /// spellings and a collision between them would have been invisible. Each
+    /// harness names its own keys; an empty list records nothing, which is the
+    /// same fail-closed direction [`HarnessPlugin::native_tools`] takes.
+    fn memory_arg_keys(&self, _arg: MemArg) -> &'static [&'static str] {
+        &[]
+    }
+
     // ── the capability registry (locked decision 17) ────────────────────────
 
     /// This harness's own rows in the capability registry.
@@ -632,6 +742,119 @@ pub trait HarnessPlugin: Sync + Send {
     /// can settle this" is a claim that needs writing down, and a probe that
     /// silently stopped emitting a row must not be mistaken for one.
     fn declared_unprobed(&self) -> &'static [(&'static str, &'static str)] {
+        &[]
+    }
+
+    // ── hook ingress (locked decisions 15 and 22) ───────────────────────────
+
+    /// The loopback routes this harness owns.
+    ///
+    /// Core's router appends these after every CHP-neutral arm, so the harness's
+    /// path literals, its payload shapes and its reply envelope all live in
+    /// `harness/<id>/`. Empty is the ordinary answer for a harness that only
+    /// speaks CHP.
+    fn routes(&self) -> &'static [Route] {
+        &[]
+    }
+
+    /// The identity this harness puts **outside** a request body, if it puts one
+    /// there at all.
+    ///
+    /// Answers `None` for a route this harness does not own, and for one whose
+    /// identity rides the CHP envelope — in which case core reads the envelope,
+    /// as it does for every other caller.
+    fn identity_of_request(
+        &self,
+        _route: &str,
+        _req: &crate::offload::loopback::Request,
+    ) -> Option<RequestIdentity> {
+        None
+    }
+
+    /// The CHP event one of **this harness's own** ingress routes feeds.
+    ///
+    /// The join the quiet detector needs in order to speak about capabilities
+    /// rather than about transports: a harness whose hook body cannot carry a
+    /// CHP envelope still reaches the same capability cores, and this is what
+    /// says which. `None` for a route this harness does not own, and for one
+    /// whose event is not one arbitration can turn off.
+    fn chp_event_for_route(&self, _route: &str) -> Option<&'static str> {
+        None
+    }
+
+    /// The drift-ledger token this harness reports a **quiet** capability
+    /// under.
+    ///
+    /// One bucket per capability, shared with that capability's payload-drift
+    /// reports on purpose: a capability that broke either way — a malformed
+    /// payload, or a served push that stopped arriving — lands in one place.
+    /// Must answer with a token this harness also declares in
+    /// [`Self::drift_vocabulary`], which
+    /// `ingress::tests::a_quiet_token_is_a_declared_token` checks.
+    fn drift_token_for_capability(&self, _capability: &str) -> Option<&'static str> {
+        None
+    }
+
+    /// Routes whose **identity-less** bodies came from an older artifact of
+    /// THIS harness.
+    ///
+    /// Locked decision 22's "explicit, commented policy line", declared rather
+    /// than written into core. Core's blanket answer for a body with no
+    /// `agent`/`consumer` is [`crate::harness::DEFAULT_HARNESS`] — a
+    /// compatibility statement about the era before those fields existed, when
+    /// Claude's shims were the only thing that could have posted. Two routes
+    /// invert it because only one harness has ever posted to them at all, and
+    /// that asymmetry is load-bearing: reading them as the default harness
+    /// would attribute an OpenCode tool gate to a Claude tab.
+    ///
+    /// Same expiry as `DEFAULT_HARNESS`: new code requires an identity.
+    fn legacy_wire_default_routes(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// The payload-drift ledger tokens this harness's ingress reports under.
+    ///
+    /// One `&'static str` bucket per capability, so a caller-supplied string can
+    /// never become a ledger key. Core owns the ledger and the bound; the
+    /// vocabulary is the harness's, because the names are its hooks'.
+    fn drift_vocabulary(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// How long this harness's out-of-process caller waits for cImp's reply
+    /// before abandoning it and starting the tool anyway.
+    ///
+    /// Core takes `min(all declared) − `[`HOOK_REPLY_MARGIN`] as its own
+    /// pre-tool budget ([`hook_reply_budget`]), which is the ordering that makes
+    /// cImp's answer the one that decides. `None` means "this harness never
+    /// waits on a reply" and does not participate in the minimum.
+    fn hook_reply_timeout(&self) -> Option<std::time::Duration> {
+        None
+    }
+
+    // ── permission-prompt grammar (locked decision 21) ──────────────────────
+
+    /// This harness's TUI permission/question/working prompt rows.
+    ///
+    /// Data, not code: the detector engine
+    /// ([`crate::processing::permission::PermissionDetector`]) is core and
+    /// harness-neutral; what it matches on is a *transcription of somebody
+    /// else's terminal chrome* and belongs with the harness it was transcribed
+    /// from.
+    fn permission_patterns(&self) -> &'static [crate::processing::permission::PatternSpec] {
+        &[]
+    }
+
+    /// The rows this harness shipped in a **named earlier era** of the on-disk
+    /// `patterns.json`, for pristine-file reconciliation.
+    ///
+    /// A file written by an older cImp is "pristine" when it still equals what
+    /// that version wrote; the reconciler therefore needs every historical row
+    /// set, not just today's. Keyed by the era tag the writer stamped.
+    fn legacy_permission_patterns(
+        &self,
+        _era: &str,
+    ) -> &'static [crate::processing::permission::PatternSpec] {
         &[]
     }
 

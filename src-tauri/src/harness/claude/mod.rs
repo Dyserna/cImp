@@ -19,6 +19,7 @@ pub mod hook;
 pub mod input;
 pub mod overlay;
 pub mod probe;
+pub mod prompts;
 pub mod read;
 pub mod settings;
 pub mod statusline;

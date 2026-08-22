@@ -270,6 +270,32 @@ impl HarnessPlugin for ClaudePlugin {
         super::tools::CLAUDE_NATIVE_TABLE
     }
 
+    /// The fix pointers the drift advisor used to spell in core (V40 Phase C,
+    /// locked decision 23).
+    ///
+    /// Every one of these names a **Claude Code** mechanism — a hook event, a
+    /// transcript field, a directory layout. They were sentences inside
+    /// `advisor.rs`'s rule bodies, which fire for whichever harness produced
+    /// the evidence, so a notice about an OpenCode capability would have told
+    /// the reader to check `PreToolUse`.
+    fn drift_hint(&self, capability: &str) -> Option<&'static str> {
+        match capability {
+            "claude.hook.pretooluse_deny" => Some(
+                "Check the `PreToolUse` hook wiring per MAINTENANCE.md → \"harness contracts\":                  a `type: \"http\"` entry whose matcher still names the read tools, in an                  overlay this tab was launched with.",
+            ),
+            "claude.hook.user_prompt_submit" => Some(
+                "Check the `UserPromptSubmit` contract per MAINTENANCE.md: the hook's                  `hookSpecificOutput.additionalContext` is what carries the injected block into                  the turn, and a harness that stops honouring it drops the block silently.",
+            ),
+            "claude.transcript.usage" => Some(
+                "The shape to re-check is the transcript's `message.usage` object —                  `input_tokens` / `output_tokens` and the two cache counters.",
+            ),
+            "claude.transcript.subagents" => Some(
+                "Verify the transcript layout per MAINTENANCE.md: sub-agent traffic is expected                  either inline in the parent transcript or under                  `<session_id>/subagents/agent-*.jsonl`, and the launcher tool's name is the                  third thing that can have moved.",
+            ),
+            _ => None,
+        }
+    }
+
     fn memory_arg_keys(&self, arg: crate::harness::plugin::MemArg) -> &'static [&'static str] {
         use crate::harness::plugin::MemArg;
         match arg {

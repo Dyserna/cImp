@@ -3074,6 +3074,55 @@ fn count_hideable_tool_calls(
         .count() as u64
 }
 
+/// Every registered harness's [`crate::advisor::DriftSignals`], for one advisor
+/// poll (V40 Phase C, locked decision 23).
+///
+/// The version half — `last_seen`, `last_verified`, `auto_verify` — is genuinely
+/// per harness: it comes out of `Settings::harness[<id>]`, which Phase B made a
+/// map, so a second harness gets a real `drift.version.v1` path for the first
+/// time.
+///
+/// The SESSION half is not, yet, and this is where that is recorded rather than
+/// hidden: `sessions` / `tokenless_sessions` / `subagent_drift` come from
+/// queries that still filter one agent literal in `graph/service.rs` (locked
+/// decision 20, Phase D). They are attributed to the DEFAULT harness — which is
+/// exactly what they measured before — and every other harness gets zeros, so
+/// its `drift.usage_fields_gone.v1` never trips its sample floor. A rule that
+/// cannot see a harness's sessions must not fire ABOUT them; zero counts are the
+/// honest input for that, and the day the query takes a `HarnessId` this
+/// function is where it lands.
+fn harness_drift_signals(
+    default_sessions: u64,
+    default_tokenless: u64,
+    default_subagent_drift: Vec<String>,
+) -> crate::advisor::HarnessDriftSignals {
+    let map = crate::settings::read_global_harness_map();
+    crate::harness::registry::all()
+        .map(|id| {
+            let row = map
+                .get(id.token())
+                .cloned()
+                .unwrap_or_else(|| crate::settings::read_global_harness_settings(id));
+            let is_default = id == crate::harness::DEFAULT_HARNESS;
+            (
+                id,
+                crate::advisor::DriftSignals {
+                    last_seen: row.last_seen,
+                    last_verified: row.last_verified,
+                    auto_verify: row.auto_verify,
+                    sessions: if is_default { default_sessions } else { 0 },
+                    tokenless_sessions: if is_default { default_tokenless } else { 0 },
+                    subagent_drift: if is_default {
+                        default_subagent_drift.clone()
+                    } else {
+                        Vec::new()
+                    },
+                },
+            )
+        })
+        .collect()
+}
+
 /// V14 Phase D2: the budget-tuning advisor's current proposals for `root`.
 /// Assembled fresh on every call from `GraphService`'s D2.1 signal getters —
 /// cheap (bounded Datalog queries + a small in-memory scan), no caching
@@ -3123,7 +3172,6 @@ fn advisor_snapshot_blocking(
     // noting a version mid-run — are visible without a restart (mtime-cached,
     // so the 2s poll doesn't re-parse the file every tick).
     let hv = crate::settings::read_global_harness_versions();
-    let drift_row = crate::settings::read_global_harness_settings(crate::harness::DEFAULT_HARNESS);
     // `remind_count` (drift.read_hook_silent.v1) is the same total-remind-rows
     // count `advisor_reread_rate` just scanned for — reuse its sample count
     // instead of a second identical Datalog scan.
@@ -3234,28 +3282,19 @@ fn advisor_snapshot_blocking(
         graph: settings.graph.clone(),
         dismissed: settings.advisor_dismissed.clone(),
         applied,
-        // V40 Phase B: the three drift signals come out of
-        // `harness[<id>]` now, read from the same fresh physical-global
-        // snapshot (the auto-verify worker writes all three out of band, so a
-        // record a second old must be visible to the very next 2s advisor poll
-        // without a restart).
+        // V40 Phase C, locked decision 23: ONE ROW PER REGISTERED HARNESS,
+        // read from the same fresh physical-global snapshot (the auto-verify
+        // worker writes the version half out of band, so a record a second old
+        // must be visible to the very next 2 s advisor poll without a restart).
         //
-        // Still the DEFAULT harness's row, and still spelled with Claude's
-        // names on `Signals`: every V16 drift rule in `advisor.rs` is written
-        // around Claude's payload shapes (§ H of the residue ledger), and
-        // making them per-harness is Phase C's `HarnessDriftSignals`. Reading
-        // one harness's row here is the honest interim — it is exactly what the
-        // fields held before — and it is one line to widen once the rules are
-        // neutral.
-        claude_last_seen: drift_row.last_seen.clone(),
-        claude_last_verified: drift_row.last_verified.clone(),
-        claude_auto_verify: drift_row.auto_verify.clone(),
+        // Phase B moved the storage into `harness[<id>]` and left a note here
+        // saying the reader still took the DEFAULT harness's row because every
+        // V16 rule was written around Claude's payload shapes. The rules are
+        // per-harness now, so this is the whole map.
+        harness: harness_drift_signals(claude_sessions, claude_tokenless_sessions, subagent_drift),
         remind_count,
         large_reread_pairs,
-        claude_sessions,
-        claude_tokenless_sessions,
         contract_drift,
-        subagent_drift,
         bypass_rate,
         bypass_samples,
         hideable_tool_calls,

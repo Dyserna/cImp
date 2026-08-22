@@ -375,6 +375,63 @@ pub const DRIFT_MIN_TOKENLESS: u64 = 2;
 /// anyone) — a rule whose signal is `None` simply doesn't fire, it never
 /// treats the absence as "0% / healthy". `dismissed` and `graph` are read
 /// straight from the live `Settings` — see `ipc::commands::graph_usage_advice`
+/// **One harness's drift signals** (V40 Phase C, locked decision 23).
+///
+/// `Signals` used to carry six `claude_*` scalars — `claude_last_seen`,
+/// `claude_last_verified`, `claude_auto_verify`, `claude_sessions`,
+/// `claude_tokenless_sessions` and `subagent_drift` — on the core signal
+/// struct. Three of them had no OpenCode twin at all, which is not a gap in the
+/// data but a gap in the RULES: `drift.version.v1` could only ever fire for one
+/// product, so a second harness could auto-update through a contract change and
+/// nothing anywhere would say so.
+///
+/// The fields are the same six, minus the prefix. What changed is that there is
+/// one of these per registered harness and every rule loops.
+#[derive(Clone, Debug, Default)]
+pub struct DriftSignals {
+    /// Latest version of this harness seen in its own telemetry (empty until a
+    /// tab of it has run), and the version its contracts were last verified
+    /// against — `Settings::harness[<id>]`, written by the tap, the tab spawn
+    /// and `harness_mark_verified`.
+    pub last_seen: String,
+    pub last_verified: String,
+    /// The last automatic verification run for this harness, as recorded by
+    /// [`crate::harness::verify`]. Two rules read it, both through that module
+    /// so the interpretation lives once:
+    ///
+    /// * [`RULE_DRIFT_VERSION`] is the **cannot-verify fallback** — it fires
+    ///   only when this record cannot speak for the seen version
+    ///   (`verify::tripwire_superseded`);
+    /// * each recorded failure raises its own [`RULE_DRIFT_CAPABILITY`] notice
+    ///   naming the capability, the layer that saw it and the `wired_in`
+    ///   modules (`verify::notifiable_failures`).
+    ///
+    /// `None` where auto-verify has never completed — a genuinely different
+    /// state from "ran and passed", and exactly when the fallback is wanted.
+    pub auto_verify: Option<crate::settings::AutoVerify>,
+    /// `drift.usage_fields_gone.v1`: this harness's sessions in the window, and
+    /// how many recorded NO token-bearing `usage_stat` rows (a usage-payload
+    /// change ⇒ the parser stops matching ⇒ token totals all zero).
+    ///
+    /// **Populated for the DEFAULT harness only today**, and the reason is a
+    /// seam a later phase owns rather than a decision here: the graph's session
+    /// query still filters one agent literal (`graph/service.rs`, locked
+    /// decision 20, Phase D). A harness with no counts simply never trips the
+    /// floor, which is the correct answer for one whose sessions cannot be
+    /// counted yet — not a silent zero standing in for a real one.
+    pub sessions: u64,
+    pub tokenless_sessions: u64,
+    /// `drift.subagent_transcripts.v1`: summaries of this harness's own
+    /// sub-agent contract-drift reports this run. Empty = healthy.
+    pub subagent_drift: Vec<String>,
+}
+
+/// Every registered harness's [`DriftSignals`], keyed by id.
+///
+/// A `BTreeMap` so iteration order is stable and a notice list does not shuffle
+/// between polls.
+pub type HarnessDriftSignals = std::collections::BTreeMap<crate::harness::HarnessId, DriftSignals>;
+
 /// for how this is assembled.
 #[derive(Clone, Debug, Default)]
 pub struct Signals {
@@ -407,27 +464,10 @@ pub struct Signals {
     pub applied: Vec<AppliedRule>,
 
     // ── V16 drift signals ───────────────────────────────────────────────
-    /// Feature 1: latest Claude Code version seen in a transcript (empty
-    /// until a Claude tab has run) and the version the hook contracts were
-    /// last verified against (`HarnessVersions` in global settings).
-    pub claude_last_seen: String,
-    pub claude_last_verified: String,
-    /// V35 Phase F: the last automatic verification run for Claude
-    /// (`HarnessVersions::claude_auto_verify`), as recorded by
-    /// [`crate::harness::verify`]. Two rules read it, both of them through that
-    /// module so the interpretation lives once:
-    ///
-    /// * [`RULE_DRIFT_VERSION`] is now the **cannot-verify fallback** — it
-    ///   fires only when this record cannot speak for the seen version
-    ///   (`verify::tripwire_superseded`);
-    /// * each recorded failure raises its own [`RULE_DRIFT_CAPABILITY`] notice
-    ///   naming the capability, the layer that saw it and the `wired_in`
-    ///   modules (`verify::notifiable_failures`).
-    ///
-    /// `None` on a machine where auto-verify has never completed — which is a
-    /// genuinely different state from "ran and passed" and is exactly when the
-    /// fallback is wanted.
-    pub claude_auto_verify: Option<crate::settings::AutoVerify>,
+    /// **Per harness** (V40 Phase C, locked decision 23) — see
+    /// [`DriftSignals`] for the six fields this replaced and why they could not
+    /// stay scalars.
+    pub harness: HarnessDriftSignals,
     /// Feature 2 (`drift.read_hook_silent.v1`): total read-advisor remind
     /// events recorded for this root's sessions (mem_event `remind` rows —
     /// written server-side, so a dead hook means exactly zero).
@@ -438,22 +478,10 @@ pub struct Signals {
     /// approximation labeled est.; hash-unchanged isn't reconstructible
     /// retroactively.
     pub large_reread_pairs: u64,
-    /// Feature 2 (`drift.usage_fields_gone.v1`): Claude-agent sessions in
-    /// the window, and how many of them recorded NO token-bearing
-    /// `usage_stat` rows (transcript schema change ⇒ `parse_usage_line`
-    /// stops matching ⇒ token totals all zero).
-    pub claude_sessions: u64,
-    pub claude_tokenless_sessions: u64,
     /// Feature 3 (`drift.payload.v1`): distinct "shim: missing-fields"
     /// summaries from `contract_drift` Activity events this run. Empty =
     /// no payload drift observed.
     pub contract_drift: Vec<String>,
-    /// V17.1 (`drift.subagent_transcripts.v1`): summaries of
-    /// `subagent_drift` Activity events this run — the Claude OOB tap
-    /// reporting that the sub-agent transcript contract moved again
-    /// (transcripts neither inline nor under `subagents/*.jsonl`, or the
-    /// launcher tool renamed). Empty = healthy.
-    pub subagent_drift: Vec<String>,
     /// Feature 4 (`drift.read_bypass.v1`): share of reminders answered with
     /// a shell read of the same file within the bypass window, plus the
     /// remind count backing it. `None` when the advisor never reminded.
@@ -570,6 +598,16 @@ pub struct Proposal {
     /// the signature would be a second implementation of the signature format,
     /// which is the class of mirror this phase removed.
     pub capability: Option<&'static str>,
+    /// V40 Phase C (locked decision 23): the harness this notice is ABOUT, for
+    /// the rules that evaluate per registered harness. `None` for a rule that is
+    /// not about one.
+    ///
+    /// Carried because the card's `mark_verified` action has to name a harness:
+    /// before this, "Mark verified" wrote the DEFAULT harness's row whatever
+    /// notice you clicked it on, so an OpenCode version notice would have
+    /// stamped Claude's — and OpenCode had no version notice to click, which is
+    /// how that went unnoticed.
+    pub harness: Option<&'static str>,
 }
 
 /// Compose the ONE consolidated drift notice (V35 Phase E).
@@ -618,6 +656,9 @@ fn capability_notice(
         warn_only: setting.is_empty(),
         action: None,
         capability: Some(cap.id),
+        // The capability's own harness — so a notice about an OpenCode row
+        // carries OpenCode, whichever rule raised it.
+        harness: cap.harness.id(),
     }
 }
 
@@ -722,15 +763,48 @@ fn in_apply_cooldown(sig: &Signals, rule_id: &str) -> bool {
     })
 }
 
-/// Signature for the version-keyed drift rules: the SEEN Claude version, or
-/// `"unknown"` before any Claude tab has run. A dismissal therefore holds
-/// until the next harness update re-fires the rule.
-fn version_signature(seen: &str) -> String {
-    if seen.is_empty() {
-        "unknown".to_string()
-    } else {
-        seen.to_string()
+/// Signature for the version-keyed drift rules: **the harness and** the version
+/// it was last seen at, or `"unknown"` before any of its tabs has run. A
+/// dismissal therefore holds until that harness's next update re-fires the rule.
+///
+/// **V40 Phase C, locked decision 23 — the harness is part of the key now.** It
+/// used to be the bare version string, which was sound only while exactly one
+/// harness could raise these rules. With every rule evaluating per harness, two
+/// harnesses on the same version string would share one dismissal: silencing
+/// Claude's version notice would silence OpenCode's, which is the precise
+/// failure the signature exists to prevent one rule over. The cost is one-time
+/// and visible: a dismissal recorded before this change no longer matches, so a
+/// dismissed version notice re-fires once.
+/// A rule's neutral rationale, plus the fix pointer the capability's own harness
+/// supplies (V40 Phase C, locked decision 23).
+///
+/// The prose that used to name `PreToolUse`, `UserPromptSubmit`,
+/// `message.usage` and `subagents/*.jsonl` from inside these rules is
+/// `Capability::drift_hint()` now. A capability whose harness declares no hint
+/// renders the neutral sentence and stops — which is the fail-quiet direction,
+/// because a pointer at a mechanism the harness does not have is worse than no
+/// pointer at all.
+fn with_hint(cap: &'static crate::harness::contract::Capability, body: String) -> String {
+    match cap.drift_hint() {
+        Some(hint) => format!("{body} {hint}"),
+        None => body,
     }
+}
+
+/// The version `harness` was last seen at, for a rule whose EVIDENCE is
+/// project-scoped rather than per-harness (the two hook-silence rules): they
+/// fire from one project's counters, and the capability row says whose
+/// mechanism is implicated, so the re-fire boundary is that harness's version.
+fn seen_for(sig: &Signals, harness: crate::harness::HarnessId) -> String {
+    sig.harness
+        .get(&harness)
+        .map(|d| d.last_seen.clone())
+        .unwrap_or_default()
+}
+
+fn version_signature(harness: crate::harness::HarnessId, seen: &str) -> String {
+    let seen = if seen.is_empty() { "unknown" } else { seen };
+    format!("{}:{seen}", harness.token())
 }
 
 /// The V16 drift canary rules (Features 1–4). Each carries its own sample
@@ -739,98 +813,181 @@ fn version_signature(seen: &str) -> String {
 fn drift_rules(sig: &Signals) -> Vec<Proposal> {
     let mut out = Vec::new();
 
-    // V35 Phase F — one notice per capability that auto-verify found BROKEN on
-    // the currently-installed build. Raised before the tripwire because it is
-    // what replaces it: a fact-trigger (no sample floor — a failed canary is a
-    // fact, not a statistic), naming the capability, the layer that saw it and
-    // the modules that break, instead of "the version moved, go check by hand".
-    for failure in crate::harness::verify::notifiable_failures(
-        sig.claude_auto_verify.as_ref(),
-        &sig.claude_last_seen,
-        &sig.claude_last_verified,
-    ) {
-        // A capability the registry no longer carries: skip rather than invent
-        // a card with no `wired_in` pointer. Unreachable while the record is
-        // written by this build (the ids come from the registry), and the
-        // honest answer for a hand-edited or newer-build record.
-        let Some(cap) = crate::harness::contract::get(&failure.capability) else {
-            continue;
-        };
-        let p = capability_notice(
-            cap,
-            crate::harness::verify::evidence_const(&failure.evidence),
-            // Keyed by the version verified against: a dismissal holds for this
-            // build and re-fires when the next update reproduces the failure,
-            // the same re-fire boundary the tripwire it replaces had.
-            &version_signature(&sig.claude_last_seen),
-            "",
-            failure.detail.clone(),
-            "the recorded contract holding again",
-            format!(
-                "Claude Code updated to {} and the automatic contract check FAILED for this \
-                 capability, so the version was NOT auto-verified: {}\n\nThis ran by itself when \
-                 the update was observed — no session had to degrade first. Fix the reader (or \
-                 re-record the shape) and the next check passes silently; if you have verified \
-                 this build by hand, use Mark verified on the harness card.",
-                sig.claude_last_seen, failure.detail
-            ),
-        );
-        if !is_dismissed(&sig.dismissed, p.rule_id, &p.signature) {
-            out.push(p);
-        }
-    }
-
-    // Feature 1 — harness version tripwire. Signature = the SEEN version,
-    // so a dismissal suppresses this exact version but re-fires on the next
-    // update. Fires on a never-verified install too (that's what drives the
-    // initial Phase-0 verification pass).
+    // ── the per-harness half (V40 Phase C, locked decision 23) ─────────────
     //
-    // V35 Phase F demoted it to the **cannot-verify fallback**. The routine
-    // case — an auto-update that broke nothing — no longer reaches here at all:
-    // auto-verify advances `claude_last_verified` on its own, so the versions
-    // match and the condition is false. What remains are the cases nothing else
-    // can speak for: auto-verify has not run yet (a fresh install, a version
-    // observed while the check was in flight), it errored, or it passed and the
-    // advance did not land. When it ran and FOUND failures, the loop above is
-    // already naming them and a second card would be the noise this phase
-    // exists to remove.
-    if !sig.claude_last_seen.is_empty()
-        && sig.claude_last_seen != sig.claude_last_verified
-        && !crate::harness::verify::tripwire_superseded(
-            sig.claude_auto_verify.as_ref(),
-            &sig.claude_last_seen,
-        )
-    {
-        let signature = sig.claude_last_seen.clone();
-        if !is_dismissed(&sig.dismissed, RULE_DRIFT_VERSION, &signature) {
-            let current = if sig.claude_last_verified.is_empty() {
-                "(never verified)".to_string()
-            } else {
-                sig.claude_last_verified.clone()
+    // Everything in this loop used to read `sig.claude_*` and therefore spoke
+    // for exactly one product. `drift.version.v1` is the sharpest case: its
+    // condition was `claude_last_seen != claude_last_verified`, so OpenCode had
+    // no version-drift path at all and could auto-update straight through a
+    // contract change with nothing anywhere saying so.
+    for (harness, d) in &sig.harness {
+        // V35 Phase F — one notice per capability that auto-verify found BROKEN
+        // on the currently-installed build. Raised before the tripwire because
+        // it is what replaces it: a fact-trigger (no sample floor — a failed
+        // canary is a fact, not a statistic), naming the capability, the layer
+        // that saw it and the modules that break, instead of "the version moved,
+        // go check by hand".
+        for failure in crate::harness::verify::notifiable_failures(
+            d.auto_verify.as_ref(),
+            &d.last_seen,
+            &d.last_verified,
+        ) {
+            // A capability the registry no longer carries: skip rather than
+            // invent a card with no `wired_in` pointer. Unreachable while the
+            // record is written by this build (the ids come from the registry),
+            // and the honest answer for a hand-edited or newer-build record.
+            let Some(cap) = crate::harness::contract::get(&failure.capability) else {
+                continue;
             };
-            out.push(Proposal {
-                setting: String::new(),
-                current,
-                proposed: sig.claude_last_seen.clone(),
-                rationale: format!(
-                    "Claude Code is now {} but the hook contracts were last verified against \
-                     {} — a harness auto-update can change hook semantics with no error \
-                     anywhere (hooks fail open). Re-run the checks in MAINTENANCE.md → \
-                     \"harness contracts\", then Mark verified.",
-                    sig.claude_last_seen,
-                    if sig.claude_last_verified.is_empty() {
-                        "nothing"
-                    } else {
-                        sig.claude_last_verified.as_str()
-                    }
+            let p = capability_notice(
+                cap,
+                crate::harness::verify::evidence_const(&failure.evidence),
+                // Keyed by the version verified against: a dismissal holds for
+                // this build and re-fires when the next update reproduces the
+                // failure, the same re-fire boundary the tripwire it replaces
+                // had — and, since Phase C, keyed by the harness too, so two
+                // harnesses on one version string cannot share a dismissal.
+                &version_signature(*harness, &d.last_seen),
+                "",
+                failure.detail.clone(),
+                "the recorded contract holding again",
+                format!(
+                    "{} updated to {} and the automatic contract check FAILED for this                      capability, so the version was NOT auto-verified: {}
+
+This ran by                      itself when the update was observed — no session had to degrade first.                      Fix the reader (or re-record the shape) and the next check passes                      silently; if you have verified this build by hand, use Mark verified on                      the harness card.",
+                    harness.label(),
+                    d.last_seen,
+                    failure.detail
                 ),
-                rule_id: RULE_DRIFT_VERSION,
-                signature,
-                warn_only: true,
-                action: Some("mark_verified"),
-                // Not capability-scoped, and not consolidated: see the const.
-                capability: None,
-            });
+            );
+            if !is_dismissed(&sig.dismissed, p.rule_id, &p.signature) {
+                out.push(p);
+            }
+        }
+
+        // Feature 1 — drift.version.v1: the harness moved and the contracts
+        // have not been re-verified against it.
+        //
+        // V35 Phase F demoted it to the **cannot-verify fallback**. The routine
+        // case — an auto-update that broke nothing — no longer reaches here at
+        // all: auto-verify advances `last_verified` on its own, so the versions
+        // match and the condition is false. What remains are the cases nothing
+        // else can speak for: auto-verify has not run yet (a fresh install, a
+        // version observed while the check was in flight), it errored, or it
+        // passed and the advance did not land. When it ran and FOUND failures,
+        // the loop above is already naming them and a second card would be the
+        // noise this phase exists to remove.
+        if !d.last_seen.is_empty()
+            && d.last_seen != d.last_verified
+            && !crate::harness::verify::tripwire_superseded(d.auto_verify.as_ref(), &d.last_seen)
+        {
+            let signature = version_signature(*harness, &d.last_seen);
+            if !is_dismissed(&sig.dismissed, RULE_DRIFT_VERSION, &signature) {
+                let current = if d.last_verified.is_empty() {
+                    "(never verified)".to_string()
+                } else {
+                    d.last_verified.clone()
+                };
+                out.push(Proposal {
+                    setting: String::new(),
+                    current,
+                    proposed: d.last_seen.clone(),
+                    rationale: format!(
+                        "{} is now {} but the hook contracts were last verified against {} — a \
+                         harness auto-update can change hook semantics with no error anywhere \
+                         (hooks fail open). Re-run the checks in MAINTENANCE.md → \"harness \
+                         contracts\", then Mark verified.",
+                        harness.label(),
+                        d.last_seen,
+                        if d.last_verified.is_empty() {
+                            "nothing"
+                        } else {
+                            d.last_verified.as_str()
+                        }
+                    ),
+                    rule_id: RULE_DRIFT_VERSION,
+                    signature,
+                    warn_only: true,
+                    action: Some("mark_verified"),
+                    // Not capability-scoped, and not consolidated: see the const.
+                    capability: None,
+                    harness: harness.id(),
+                });
+            }
+        }
+
+        // Feature 2 — drift.usage_fields_gone.v1: this harness's sessions are
+        // active but every one of them stopped carrying token fields — the
+        // usage payload changed under the tap. Warn-only. Signature = the seen
+        // version (same re-fire boundary as the tripwire).
+        if d.sessions >= DRIFT_MIN_TOKENLESS && d.tokenless_sessions == d.sessions {
+            if let Some(cap) =
+                crate::harness::contract::capability_for_rule(RULE_DRIFT_USAGE_FIELDS, *harness)
+            {
+                let inner = version_signature(*harness, &d.last_seen);
+                let p = capability_notice(
+                    cap,
+                    RULE_DRIFT_USAGE_FIELDS,
+                    &inner,
+                    "",
+                    format!("{} {} sessions without token fields", d.sessions, harness.label()),
+                    "usage_stat rows with token counts",
+                    with_hint(
+                        cap,
+                        format!(
+                            "All {} recent {} sessions recorded zero token-bearing usage rows — \
+                             the usage payload has likely changed and the Usage section is now \
+                             blind (chars-only estimates). The token-efficiency counters \
+                             underneath it are unaffected but the cost view can't price these \
+                             sessions.",
+                            d.sessions,
+                            harness.label()
+                        ),
+                    ),
+                );
+                if !is_dismissed(&sig.dismissed, p.rule_id, &p.signature) {
+                    out.push(p);
+                }
+            }
+        }
+
+        // V17.1 — drift.subagent_transcripts.v1: this harness's tap reported
+        // that sub-agent traffic is visible in none of the places it knows (or
+        // the launcher tool was renamed). One event is enough — the tap
+        // rate-limits itself to one report per session, and a moved contract is
+        // a fact. Signature = the seen version, so a dismissal holds until the
+        // next harness update (same boundary as the version tripwire — this
+        // drift IS a harness-update symptom).
+        if !d.subagent_drift.is_empty() {
+            let mut what = d.subagent_drift.clone();
+            what.sort();
+            what.dedup();
+            if let Some(cap) =
+                crate::harness::contract::capability_for_rule(RULE_DRIFT_SUBAGENT, *harness)
+            {
+                let inner = version_signature(*harness, &d.last_seen);
+                let p = capability_notice(
+                    cap,
+                    RULE_DRIFT_SUBAGENT,
+                    &inner,
+                    "",
+                    what.join(", "),
+                    "sub-agent transcripts tailed (usage + agents-active tracked)",
+                    with_hint(
+                        cap,
+                        format!(
+                            "The {} tap reported sub-agent contract drift this run: {}. Until \
+                             the tail is re-pointed, sub-agent token spend may be missing from \
+                             the Usage section and/or the agents-active avatar hold may be dead.",
+                            harness.label(),
+                            what.join("; ")
+                        ),
+                    ),
+                );
+                if !is_dismissed(&sig.dismissed, p.rule_id, &p.signature) {
+                    out.push(p);
+                }
+            }
         }
     }
 
@@ -881,7 +1038,7 @@ fn drift_rules(sig: &Signals) -> Vec<Proposal> {
         && sig.remind_count == 0
     {
         if let Some(cap) = sole_capability(RULE_DRIFT_HOOK_SILENT) {
-            let inner = version_signature(&sig.claude_last_seen);
+            let inner = version_signature(cap.harness, &seen_for(sig, cap.harness));
             let p = capability_notice(
                 cap,
                 RULE_DRIFT_HOOK_SILENT,
@@ -889,13 +1046,16 @@ fn drift_rules(sig: &Signals) -> Vec<Proposal> {
                 "",
                 format!("{} large re-reads (est.)", sig.large_reread_pairs),
                 "0 reminders",
-                format!(
-                    "The read advisor is on and this project re-read {} large files across \
-                     {} sessions (est.) — the exact condition it reminds on — yet not one \
-                     remind reached the loopback. The PreToolUse hook is likely not firing \
-                     (settings overlay ignored, matcher renamed, or shim broken). Check the \
-                     hook wiring per MAINTENANCE.md → \"harness contracts\".",
-                    sig.large_reread_pairs, sig.session_count
+                with_hint(
+                    cap,
+                    format!(
+                        "The read advisor is on and this project re-read {} large files across \
+                         {} sessions (est.) — the exact condition it reminds on — yet not one \
+                         remind reached the loopback. The pre-tool hook is likely not firing \
+                         (settings overlay ignored, matcher renamed, or artifact stale). Check \
+                         the hook wiring per MAINTENANCE.md → \"harness contracts\".",
+                        sig.large_reread_pairs, sig.session_count
+                    ),
                 ),
             );
             if !is_dismissed(&sig.dismissed, p.rule_id, &p.signature) {
@@ -923,56 +1083,24 @@ fn drift_rules(sig: &Signals) -> Vec<Proposal> {
                         "",
                         format!("{:.0}% follow rate", follow * 100.0),
                         "injected context reaching the model",
-                        format!(
-                            "Context injection is on and growing, but only {:.1}% of {} \
-                             injected files were ever read or edited afterwards across {} \
-                             sessions — near-zero follow suggests the injected block never \
-                             reaches the model at all (hook output dropped by a harness \
-                             change), not that relevance is mistuned. Check the \
-                             UserPromptSubmit contract per MAINTENANCE.md.",
-                            follow * 100.0,
-                            sig.injection_follow_samples,
-                            sig.session_count
+                        with_hint(
+                            cap,
+                            format!(
+                                "Context injection is on and growing, but only {:.1}% of {} \
+                                 injected files were ever read or edited afterwards across {} \
+                                 sessions — near-zero follow suggests the injected block never \
+                                 reaches the model at all (hook output dropped by a harness \
+                                 change), not that relevance is mistuned.",
+                                follow * 100.0,
+                                sig.injection_follow_samples,
+                                sig.session_count
+                            ),
                         ),
                     );
                     if !is_dismissed(&sig.dismissed, p.rule_id, &p.signature) {
                         out.push(p);
                     }
                 }
-            }
-        }
-    }
-
-    // Feature 2 — drift.usage_fields_gone.v1: Claude sessions are active
-    // but every one of them stopped carrying token fields — the transcript
-    // usage schema changed under the tap. Warn-only. Signature = the seen
-    // Claude version (same re-fire boundary as the tripwire).
-    if sig.claude_sessions >= DRIFT_MIN_TOKENLESS
-        && sig.claude_tokenless_sessions == sig.claude_sessions
-    {
-        if let Some(cap) = sole_capability(RULE_DRIFT_USAGE_FIELDS) {
-            let inner = version_signature(&sig.claude_last_seen);
-            let p = capability_notice(
-                cap,
-                RULE_DRIFT_USAGE_FIELDS,
-                &inner,
-                "",
-                format!(
-                    "{} Claude sessions without token fields",
-                    sig.claude_sessions
-                ),
-                "usage_stat rows with token counts",
-                format!(
-                    "All {} recent Claude sessions recorded zero token-bearing usage rows — \
-                     the transcript's `message.usage` shape has likely changed and the Usage \
-                     section is now blind (chars-only estimates). The token-efficiency \
-                     counters underneath it are unaffected but the cost view can't price \
-                     these sessions.",
-                    sig.claude_sessions
-                ),
-            );
-            if !is_dismissed(&sig.dismissed, p.rule_id, &p.signature) {
-                out.push(p);
             }
         }
     }
@@ -1069,41 +1197,8 @@ fn drift_rules(sig: &Signals) -> Vec<Proposal> {
                     warn_only: true,
                     action: None,
                     capability: None,
+                    harness: None,
                 });
-            }
-        }
-    }
-
-    // V17.1 — drift.subagent_transcripts.v1: the Claude OOB tap reported
-    // that sub-agent traffic is visible in neither of the two known
-    // transcript locations (or the launcher tool was renamed). One event is
-    // enough — the tap rate-limits itself to one report per session, and a
-    // moved contract is a fact. Signature = the seen Claude version, so a
-    // dismissal holds until the next harness update (same boundary as the
-    // version tripwire — this drift IS a harness-update symptom).
-    if !sig.subagent_drift.is_empty() {
-        let mut what = sig.subagent_drift.clone();
-        what.sort();
-        what.dedup();
-        if let Some(cap) = sole_capability(RULE_DRIFT_SUBAGENT) {
-            let inner = version_signature(&sig.claude_last_seen);
-            let p = capability_notice(
-                cap,
-                RULE_DRIFT_SUBAGENT,
-                &inner,
-                "",
-                what.join(", "),
-                "sub-agent transcripts tailed (usage + agents-active tracked)",
-                format!(
-                    "The Claude transcript tap reported sub-agent contract drift this run: \
-                     {}. Until the tail is re-pointed, sub-agent token spend may be missing \
-                     from the Usage section and/or the agents-active avatar hold may be \
-                     dead — verify the transcript layout per MAINTENANCE.md.",
-                    what.join("; ")
-                ),
-            );
-            if !is_dismissed(&sig.dismissed, p.rule_id, &p.signature) {
-                out.push(p);
             }
         }
     }
@@ -1148,6 +1243,7 @@ fn drift_rules(sig: &Signals) -> Vec<Proposal> {
             warn_only: true,
             action: None,
             capability: None,
+            harness: None,
         });
     }
 
@@ -1185,6 +1281,7 @@ fn drift_rules(sig: &Signals) -> Vec<Proposal> {
             warn_only: true,
             action: None,
             capability: None,
+            harness: None,
         });
     }
 
@@ -1232,6 +1329,7 @@ fn drift_rules(sig: &Signals) -> Vec<Proposal> {
             warn_only: true,
             action: None,
             capability: None,
+            harness: None,
         });
     }
 
@@ -1278,6 +1376,7 @@ fn drift_rules(sig: &Signals) -> Vec<Proposal> {
                 warn_only: true,
                 action: None,
                 capability: None,
+                harness: None,
             });
         }
     }
@@ -1368,6 +1467,7 @@ fn drift_rules(sig: &Signals) -> Vec<Proposal> {
                 warn_only: true,
                 action: None,
                 capability: None,
+                harness: None,
             });
         }
     }
@@ -1406,6 +1506,7 @@ fn drift_rules(sig: &Signals) -> Vec<Proposal> {
             warn_only: true,
             action: None,
             capability: None,
+            harness: None,
         });
     }
 
@@ -1478,6 +1579,7 @@ fn surface_rules(sig: &Signals) -> Vec<Proposal> {
                 warn_only: false,
                 action: None,
                 capability: None,
+                harness: None,
             });
         }
     }
@@ -1521,6 +1623,7 @@ fn adopt_rules(sig: &Signals, advisor_disable_proposed: bool) -> Vec<Proposal> {
                         warn_only: false,
                         action: None,
                         capability: None,
+                        harness: None,
                     });
                 }
             }
@@ -1562,6 +1665,7 @@ fn adopt_rules(sig: &Signals, advisor_disable_proposed: bool) -> Vec<Proposal> {
                         warn_only: false,
                         action: None,
                         capability: None,
+                        harness: None,
                     });
                 }
             }
@@ -1602,6 +1706,7 @@ fn tuning_rules(sig: &Signals, advisor_disable_proposed: bool) -> Vec<Proposal> 
                         warn_only: false,
                         action: None,
                         capability: None,
+                        harness: None,
                     });
                 }
             }
@@ -1639,6 +1744,7 @@ fn tuning_rules(sig: &Signals, advisor_disable_proposed: bool) -> Vec<Proposal> 
                     warn_only: false,
                     action: None,
                     capability: None,
+                    harness: None,
                 });
             }
         }
@@ -1682,6 +1788,7 @@ fn tuning_rules(sig: &Signals, advisor_disable_proposed: bool) -> Vec<Proposal> 
                         warn_only: false,
                         action: None,
                         capability: None,
+                        harness: None,
                     });
                 }
             }
@@ -1693,6 +1800,25 @@ fn tuning_rules(sig: &Signals, advisor_disable_proposed: bool) -> Vec<Proposal> 
 
 #[cfg(test)]
 mod tests {
+    /// A [`HarnessDriftSignals`] with one entry: the DEFAULT harness's.
+    ///
+    /// V40 Phase C. Every drift test below was written when `Signals` carried
+    /// six `claude_*` scalars, and each one is still about ONE harness's drift —
+    /// what changed is that the rules now loop, so the fixture has to say which
+    /// harness it is describing. `evaluate_for_two` covers the loop itself.
+    fn one_harness(d: DriftSignals) -> HarnessDriftSignals {
+        [(crate::harness::DEFAULT_HARNESS, d)].into_iter().collect()
+    }
+
+    /// The DEFAULT harness's drift row, created empty if absent — the mutable
+    /// twin of [`one_harness`] for the tests that build a `Signals` and then
+    /// adjust one field.
+    fn drift_mut(sig: &mut Signals) -> &mut DriftSignals {
+        sig.harness
+            .entry(crate::harness::DEFAULT_HARNESS)
+            .or_default()
+    }
+
     use super::*;
 
     /// A signals blob with every sample floor cleared and every rate at the
@@ -2007,6 +2133,16 @@ mod tests {
         format!("{capability}:{evidence}:{inner}")
     }
 
+    /// The version half of a drift signature, for the DEFAULT harness.
+    ///
+    /// V40 Phase C: the version-keyed rules key on `(harness, version)` now, so
+    /// a test that spells the bare version string is asserting the OLD format.
+    /// One helper rather than a literal per site, so the two harnesses' notices
+    /// cannot come to share a dismissal without this turning red.
+    fn version_key(seen: &str) -> String {
+        version_signature(crate::harness::DEFAULT_HARNESS, seen)
+    }
+
     /// Every consolidated detector resolves to a capability the notice can be
     /// about. A rule the matrix stopped naming would keep computing and raise
     /// nothing — the exact "signal with no consumer" failure V35 exists to
@@ -2079,10 +2215,13 @@ mod tests {
     #[test]
     fn a_capability_dismissal_does_not_silence_a_sibling_capability() {
         let sig = Signals {
-            claude_sessions: 3,
-            claude_tokenless_sessions: 3,
-            subagent_drift: vec!["subagents/*.jsonl vanished".to_string()],
-            claude_last_seen: "2.2.0".to_string(),
+            harness: one_harness(DriftSignals {
+                sessions: 3,
+                tokenless_sessions: 3,
+                subagent_drift: vec!["subagents/*.jsonl vanished".to_string()],
+                last_seen: "2.2.0".to_string(),
+                ..DriftSignals::default()
+            }),
             ..Signals::default()
         };
         assert!(evaluate(&sig).iter().any(|p| is_drift(p, RULE_DRIFT_USAGE_FIELDS)));
@@ -2094,7 +2233,7 @@ mod tests {
             signature: drift_signature(
                 "claude.transcript.usage",
                 RULE_DRIFT_USAGE_FIELDS,
-                "2.2.0",
+                &version_key("2.2.0"),
             ),
         }];
         let props = evaluate(&dismissed);
@@ -2110,7 +2249,7 @@ mod tests {
         // Same capability, next harness version ⇒ re-fires (the third
         // signature field is the detector's own re-fire boundary).
         let mut next = dismissed;
-        next.claude_last_seen = "2.3.0".to_string();
+        drift_mut(&mut next).last_seen = "2.3.0".to_string();
         assert!(evaluate(&next).iter().any(|p| is_drift(p, RULE_DRIFT_USAGE_FIELDS)));
     }
 
@@ -2125,9 +2264,9 @@ mod tests {
     #[test]
     fn applying_one_capability_notice_does_not_mute_the_others() {
         let mut sig = read_reason_signals();
-        sig.claude_sessions = 3;
-        sig.claude_tokenless_sessions = 3;
-        sig.claude_last_seen = "2.2.0".to_string();
+        drift_mut(&mut sig).sessions = 3;
+        drift_mut(&mut sig).tokenless_sessions = 3;
+        drift_mut(&mut sig).last_seen = "2.2.0".to_string();
         sig.applied = vec![AppliedRule {
             rule_id: RULE_DRIFT_CAPABILITY.to_string(),
             root: String::new(),
@@ -2144,13 +2283,96 @@ mod tests {
         );
     }
 
+    /// **Every registered harness gets the version tripwire** (V40 Phase C,
+    /// locked decision 23).
+    ///
+    /// Before this phase the condition was `claude_last_seen !=
+    /// claude_last_verified` and OpenCode had no version-drift path at all: it
+    /// could auto-update straight through a contract change and nothing
+    /// anywhere would say so. This is the test that would have caught that, and
+    /// it fails the moment a rule goes back to reading one harness's row.
+    #[test]
+    fn the_version_tripwire_fires_for_every_registered_harness() {
+        for h in crate::harness::registry::all() {
+            let sig = Signals {
+                harness: [(
+                    h,
+                    DriftSignals {
+                        last_seen: "9.9.9".to_string(),
+                        last_verified: "9.9.8".to_string(),
+                        ..DriftSignals::default()
+                    },
+                )]
+                .into_iter()
+                .collect(),
+                ..Signals::default()
+            };
+            let props = evaluate(&sig);
+            let p = props
+                .iter()
+                .find(|p| p.rule_id == RULE_DRIFT_VERSION)
+                .unwrap_or_else(|| panic!("{h}: no version tripwire"));
+            assert_eq!(p.harness, h.id(), "{h}: the notice must name its harness");
+            assert!(
+                p.rationale.contains(h.label()),
+                "{h}: the card must name the harness a reader is being asked to verify"
+            );
+            assert_eq!(p.action, Some("mark_verified"));
+        }
+    }
+
+    /// Two harnesses drifting at once produce **two** notices, and dismissing
+    /// one leaves the other standing.
+    ///
+    /// The signature is `(harness, version)` for exactly this: two harnesses on
+    /// the same version string would otherwise share a dismissal, and silencing
+    /// one would silence the other.
+    #[test]
+    fn two_harnesses_drifting_at_one_version_do_not_share_a_dismissal() {
+        let ids: Vec<_> = crate::harness::registry::all().collect();
+        assert!(ids.len() >= 2, "this test needs two registered harnesses");
+        let row = || DriftSignals {
+            last_seen: "7.0.0".to_string(),
+            last_verified: "6.9.0".to_string(),
+            ..DriftSignals::default()
+        };
+        let mut sig = Signals {
+            harness: ids.iter().map(|h| (*h, row())).collect(),
+            ..Signals::default()
+        };
+        let all = evaluate(&sig);
+        let versions: Vec<&Proposal> = all
+            .iter()
+            .filter(|p| p.rule_id == RULE_DRIFT_VERSION)
+            .collect();
+        assert_eq!(versions.len(), ids.len(), "one notice per drifting harness");
+
+        sig.dismissed = vec![DismissedRule {
+            rule_id: RULE_DRIFT_VERSION.to_string(),
+            signature: version_signature(ids[0], "7.0.0"),
+        }];
+        let after: Vec<String> = evaluate(&sig)
+            .into_iter()
+            .filter(|p| p.rule_id == RULE_DRIFT_VERSION)
+            .filter_map(|p| p.harness.map(str::to_string))
+            .collect();
+        assert_eq!(
+            after,
+            ids[1..].iter().filter_map(|h| h.id()).map(str::to_string).collect::<Vec<_>>(),
+            "dismissing one harness's version notice silenced another's"
+        );
+    }
+
     #[test]
     fn version_tripwire_fires_below_the_global_session_floor() {
         // A version bump is a fact, not a statistic — zero sessions must
         // not gate it.
         let sig = Signals {
-            claude_last_seen: "2.2.0".to_string(),
-            claude_last_verified: "2.1.14".to_string(),
+            harness: one_harness(DriftSignals {
+                last_seen: "2.2.0".to_string(),
+                last_verified: "2.1.14".to_string(),
+                ..DriftSignals::default()
+            }),
             session_count: 0,
             ..Signals::default()
         };
@@ -2160,13 +2382,16 @@ mod tests {
         assert_eq!(p.rule_id, RULE_DRIFT_VERSION);
         assert!(p.warn_only);
         assert_eq!(p.action, Some("mark_verified"));
-        assert_eq!(p.signature, "2.2.0");
+        assert_eq!(p.signature, version_key("2.2.0"));
     }
 
     #[test]
     fn version_tripwire_fires_on_a_never_verified_install_and_not_when_matched() {
         let sig = Signals {
-            claude_last_seen: "2.2.0".to_string(),
+            harness: one_harness(DriftSignals {
+                last_seen: "2.2.0".to_string(),
+                ..DriftSignals::default()
+            }),
             ..Signals::default()
         };
         assert!(evaluate(&sig)
@@ -2174,8 +2399,11 @@ mod tests {
             .any(|p| p.rule_id == RULE_DRIFT_VERSION));
 
         let sig_ok = Signals {
-            claude_last_seen: "2.2.0".to_string(),
-            claude_last_verified: "2.2.0".to_string(),
+            harness: one_harness(DriftSignals {
+                last_seen: "2.2.0".to_string(),
+                last_verified: "2.2.0".to_string(),
+                ..DriftSignals::default()
+            }),
             ..Signals::default()
         };
         assert!(!evaluate(&sig_ok)
@@ -2191,11 +2419,14 @@ mod tests {
     #[test]
     fn version_tripwire_dismissal_is_keyed_to_the_seen_version() {
         let mut sig = Signals {
-            claude_last_seen: "2.2.0".to_string(),
-            claude_last_verified: "2.1.14".to_string(),
+            harness: one_harness(DriftSignals {
+                last_seen: "2.2.0".to_string(),
+                last_verified: "2.1.14".to_string(),
+                ..DriftSignals::default()
+            }),
             dismissed: vec![DismissedRule {
                 rule_id: RULE_DRIFT_VERSION.to_string(),
-                signature: "2.2.0".to_string(),
+                signature: version_key("2.2.0"),
             }],
             ..Signals::default()
         };
@@ -2204,7 +2435,7 @@ mod tests {
             .any(|p| p.rule_id == RULE_DRIFT_VERSION));
 
         // The NEXT version change re-fires despite the old dismissal.
-        sig.claude_last_seen = "2.3.0".to_string();
+        drift_mut(&mut sig).last_seen = "2.3.0".to_string();
         assert!(evaluate(&sig)
             .iter()
             .any(|p| p.rule_id == RULE_DRIFT_VERSION));
@@ -2243,9 +2474,12 @@ mod tests {
     #[test]
     fn a_failed_auto_verify_replaces_the_tripwire_with_a_named_capability() {
         let sig = Signals {
-            claude_last_seen: "2.2.0".to_string(),
-            claude_last_verified: "2.1.14".to_string(),
-            claude_auto_verify: Some(auto_verify_failed("2.2.0", "claude.statusline.stdin")),
+            harness: one_harness(DriftSignals {
+                last_seen: "2.2.0".to_string(),
+                last_verified: "2.1.14".to_string(),
+                auto_verify: Some(auto_verify_failed("2.2.0", "claude.statusline.stdin")),
+                ..DriftSignals::default()
+            }),
             ..Signals::default()
         };
         let props = evaluate(&sig);
@@ -2264,8 +2498,9 @@ mod tests {
         assert_eq!(
             p.signature,
             format!(
-                "claude.statusline.stdin:{}:2.2.0",
-                crate::harness::verify::EVIDENCE_CANARY
+                "claude.statusline.stdin:{}:{}",
+                crate::harness::verify::EVIDENCE_CANARY,
+                version_key("2.2.0")
             ),
             "signature = <capability>:<evidence>:<version>, so a dismissal holds for this build \
              and re-fires on the next one"
@@ -2285,13 +2520,16 @@ mod tests {
     #[test]
     fn a_passing_record_that_did_not_advance_keeps_the_fallback() {
         let sig = Signals {
-            claude_last_seen: "2.2.0".to_string(),
-            claude_last_verified: "2.1.14".to_string(),
-            claude_auto_verify: Some(crate::settings::AutoVerify {
+            harness: one_harness(DriftSignals {
+                last_seen: "2.2.0".to_string(),
+                last_verified: "2.1.14".to_string(),
+                auto_verify: Some(crate::settings::AutoVerify {
                 version: "2.2.0".to_string(),
                 at_ms: 42,
                 status: crate::settings::AutoVerify::PASS.to_string(),
                 failures: Vec::new(),
+                }),
+                ..DriftSignals::default()
             }),
             ..Signals::default()
         };
@@ -2306,9 +2544,12 @@ mod tests {
     #[test]
     fn a_stale_record_neither_suppresses_nor_speaks() {
         let sig = Signals {
-            claude_last_seen: "2.3.0".to_string(),
-            claude_last_verified: "2.1.14".to_string(),
-            claude_auto_verify: Some(auto_verify_failed("2.2.0", "claude.statusline.stdin")),
+            harness: one_harness(DriftSignals {
+                last_seen: "2.3.0".to_string(),
+                last_verified: "2.1.14".to_string(),
+                auto_verify: Some(auto_verify_failed("2.2.0", "claude.statusline.stdin")),
+                ..DriftSignals::default()
+            }),
             ..Signals::default()
         };
         let props = evaluate(&sig);
@@ -2323,13 +2564,16 @@ mod tests {
     #[test]
     fn a_verified_update_produces_no_advisor_card() {
         let sig = Signals {
-            claude_last_seen: "2.2.0".to_string(),
-            claude_last_verified: "2.2.0".to_string(),
-            claude_auto_verify: Some(crate::settings::AutoVerify {
+            harness: one_harness(DriftSignals {
+                last_seen: "2.2.0".to_string(),
+                last_verified: "2.2.0".to_string(),
+                auto_verify: Some(crate::settings::AutoVerify {
                 version: "2.2.0".to_string(),
                 at_ms: 42,
                 status: crate::settings::AutoVerify::PASS.to_string(),
                 failures: Vec::new(),
+                }),
+                ..DriftSignals::default()
             }),
             ..Signals::default()
         };
@@ -2415,10 +2659,13 @@ mod tests {
             ..GraphSettings::default()
         };
         let base = Signals {
+            harness: one_harness(DriftSignals {
+                last_seen: "2.2.0".to_string(),
+                ..DriftSignals::default()
+            }),
             session_count: DRIFT_SILENT_MIN_SESSIONS,
             large_reread_pairs: DRIFT_SILENT_MIN_REREADS,
             remind_count: 0,
-            claude_last_seen: "2.2.0".to_string(),
             graph,
             ..Signals::default()
         };
@@ -2433,7 +2680,11 @@ mod tests {
         // third signature field, unchanged by V35 Phase E's consolidation.
         assert_eq!(
             p.signature,
-            drift_signature("claude.hook.pretooluse_deny", RULE_DRIFT_HOOK_SILENT, "2.2.0")
+            drift_signature(
+                "claude.hook.pretooluse_deny",
+                RULE_DRIFT_HOOK_SILENT,
+                &version_key("2.2.0")
+            )
         );
 
         let mut sig = base.clone();
@@ -2499,9 +2750,12 @@ mod tests {
     #[test]
     fn usage_fields_gone_fires_only_when_every_claude_session_is_tokenless() {
         let base = Signals {
-            claude_sessions: 3,
-            claude_tokenless_sessions: 3,
-            claude_last_seen: "2.2.0".to_string(),
+            harness: one_harness(DriftSignals {
+                sessions: 3,
+                tokenless_sessions: 3,
+                last_seen: "2.2.0".to_string(),
+                ..DriftSignals::default()
+            }),
             ..Signals::default()
         };
         assert!(evaluate(&base)
@@ -2511,15 +2765,15 @@ mod tests {
         // One healthy session ⇒ the schema didn't change, that session is
         // just odd.
         let mut sig = base.clone();
-        sig.claude_tokenless_sessions = 2;
+        drift_mut(&mut sig).tokenless_sessions = 2;
         assert!(!evaluate(&sig)
             .iter()
             .any(|p| is_drift(p, RULE_DRIFT_USAGE_FIELDS)));
 
         // Below the floor a single tokenless session could be a fluke.
         let mut sig = base;
-        sig.claude_sessions = DRIFT_MIN_TOKENLESS - 1;
-        sig.claude_tokenless_sessions = DRIFT_MIN_TOKENLESS - 1;
+        drift_mut(&mut sig).sessions = DRIFT_MIN_TOKENLESS - 1;
+        drift_mut(&mut sig).tokenless_sessions = DRIFT_MIN_TOKENLESS - 1;
         assert!(!evaluate(&sig)
             .iter()
             .any(|p| is_drift(p, RULE_DRIFT_USAGE_FIELDS)));
@@ -2676,8 +2930,11 @@ mod tests {
     fn subagent_drift_fires_on_any_subagent_drift_event() {
         let summary = "subagents/*.jsonl present but no Task/Agent launch tool_use recognized";
         let sig = Signals {
-            subagent_drift: vec![summary.to_string()],
-            claude_last_seen: "2.2.0".to_string(),
+            harness: one_harness(DriftSignals {
+                subagent_drift: vec![summary.to_string()],
+                last_seen: "2.2.0".to_string(),
+                ..DriftSignals::default()
+            }),
             ..Signals::default()
         };
         let props = evaluate(&sig);
@@ -2692,7 +2949,11 @@ mod tests {
         // now carried as the third field of the consolidated signature.
         assert_eq!(
             p.signature,
-            drift_signature("claude.transcript.subagents", RULE_DRIFT_SUBAGENT, "2.2.0")
+            drift_signature(
+                "claude.transcript.subagents",
+                RULE_DRIFT_SUBAGENT,
+                &version_key("2.2.0")
+            )
         );
 
         // Dismissed for this version ⇒ quiet.

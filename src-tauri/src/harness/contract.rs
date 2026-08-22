@@ -1840,6 +1840,38 @@ pub fn gates(settings: &Settings) -> Vec<Gate> {
 /// affected capability. One notice per capability (rather than one naming them
 /// all) is deliberate — the capability id is the dismissal key, so a shared
 /// notice would let dismissing a symptom on one capability silence a sibling.
+/// The row `harness` owns for `rule`, if it owns exactly one.
+///
+/// V40 Phase C, locked decision 23: every V16 drift rule evaluates **per
+/// registered harness**, so "which capability is this notice about" stops being
+/// a question with one global answer. `None` when this harness names no row for
+/// the rule (the rule simply does not apply to it) and when it names several —
+/// the same refusal-to-pick [`capabilities_for_rule`]'s single-row callers
+/// already made, one harness in.
+impl Capability {
+    /// **What to check when this capability drifts**, in the vocabulary of the
+    /// harness that serves it (V40 Phase C, locked decision 23).
+    ///
+    /// The advisor's fix-pointer prose used to name Claude's mechanisms
+    /// directly — `PreToolUse`, `UserPromptSubmit`, `message.usage`,
+    /// `subagents/*.jsonl` — from inside a core rule that fires for whatever
+    /// harness produced the evidence. Those are the harness's words, so the
+    /// harness supplies them; a rule with no hint renders its neutral sentence
+    /// and nothing else, which is the fail-quiet direction (an invented pointer
+    /// is worse than none).
+    pub fn drift_hint(&self) -> Option<&'static str> {
+        self.harness.plugin()?.drift_hint(self.id)
+    }
+}
+
+pub fn capability_for_rule(rule: &str, harness: Harness) -> Option<&'static Capability> {
+    let rows: Vec<&'static Capability> = capabilities_for_rule(rule)
+        .into_iter()
+        .filter(|c| c.harness == harness)
+        .collect();
+    (rows.len() == 1).then(|| rows[0])
+}
+
 pub fn capabilities_for_rule(rule: &str) -> Vec<&'static Capability> {
     capabilities()
         .filter(|c| c.drift_rule.contains(&rule))

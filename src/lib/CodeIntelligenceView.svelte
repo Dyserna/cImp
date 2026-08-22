@@ -1493,7 +1493,7 @@
   async function markVerified(p: AdvisorProposal): Promise<void> {
     advisorBusy = proposalKey(p);
     try {
-      await harnessMarkVerified();
+      await harnessMarkVerified(p.harness);
       dropProposal(p);
     } catch (e) {
       console.error('harness_mark_verified failed', e);

@@ -812,6 +812,16 @@ pub trait HarnessPlugin: Sync + Send {
         &[]
     }
 
+    /// One sentence naming **this harness's** mechanism behind `capability`,
+    /// for the advisor's fix pointer (locked decision 23).
+    ///
+    /// Rendered verbatim after a rule's neutral rationale. `None` is an ordinary
+    /// answer — a rule with no hint says what it measured and stops, which is
+    /// better than a pointer at a mechanism this harness does not have.
+    fn drift_hint(&self, _capability: &str) -> Option<&'static str> {
+        None
+    }
+
     /// The payload-drift ledger tokens this harness's ingress reports under.
     ///
     /// One `&'static str` bucket per capability, so a caller-supplied string can

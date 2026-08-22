@@ -791,6 +791,15 @@ export interface AdvisorProposal {
   /// it is about (`harness::contract::Capability::id`) — the same join key the
   /// Settings window's gate lookup uses. `null` for every other rule.
   capability: string | null;
+  /// V40 Phase C: the harness this notice is ABOUT, for the drift rules that
+  /// evaluate per registered harness. `null` for every rule that is not about
+  /// one.
+  ///
+  /// Passed straight back to `harnessMarkVerified` — before this, the card's
+  /// "Mark verified" wrote the default harness's row whatever notice it sat
+  /// under, and the only reason that was never wrong is that only one harness
+  /// could raise the notice at all.
+  harness: string | null;
 }
 
 /// Mirror of Rust `ipc::commands::AdvisorSnapshot`. `collecting` distinguishes
@@ -823,9 +832,13 @@ export function advisorMarkApplied(ruleId: string, root?: string): Promise<void>
   return invoke<void>('advisor_mark_applied', { ruleId, root: root ?? null });
 }
 
-/// V16 Feature 1: stamp the currently-seen Claude Code version as verified
+/// V16 Feature 1: stamp the currently-seen version of `harness` as verified
 /// (the Advisor card's "Mark verified" — the user just re-ran the
 /// MAINTENANCE.md contract checks).
-export function harnessMarkVerified(): Promise<void> {
-  return invoke<void>('harness_mark_verified');
+///
+/// V40 Phase C: pass the notice's own `harness`. Omitting it means the DEFAULT
+/// harness, which is the documented wire-compat default and what every caller
+/// before this phase meant.
+export function harnessMarkVerified(harness?: string | null): Promise<void> {
+  return invoke<void>('harness_mark_verified', { harness: harness ?? null });
 }

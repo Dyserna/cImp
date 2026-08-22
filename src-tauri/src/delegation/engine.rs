@@ -719,7 +719,14 @@ pub async fn drive(app: &AppHandle, req: DriveRequest) -> Result<Reply, Delegati
                     false,
                     duration_ms,
                     typed,
-                    String::new(),
+                    // V39 review M-6: the RAW text, not an empty string. This
+                    // row is the only record that the turn happened at all, and
+                    // "the worker produced nothing substantive" is a verdict
+                    // about text — a verdict whose evidence was discarded is
+                    // one nobody can check. Unscreened by construction:
+                    // screening is for text entering a MODEL's context, and
+                    // this text reaches no model.
+                    raw,
                 );
                 return Err(e);
             }
@@ -892,30 +899,82 @@ async fn run_flight(
 
 /// Whether a completed turn's text is substantive (locked decision 13).
 ///
-/// Whitespace-only is the obvious half. The other half is "tool scaffolding
-/// only": a final message that is nothing but a fenced block of tool chatter
-/// carries no answer, and returning it as a success would report a task done
-/// that produced nothing. Kept deliberately narrow — the test is *is there any
-/// prose at all*, not a quality judgement.
+/// Whitespace-only is the obvious half. The other half used to be "any reply
+/// that is nothing but fenced blocks", and V39 review M-6 is what that costs:
+/// **a fenced block is very often the whole answer.** "Write the regex" /
+/// "produce the JSON" / "show me the diff" are answered by one code block and
+/// nothing else, and such a reply was reported to the driver as
+/// `worker produced no text` — a delegation that did the work, said so, and
+/// was told it had failed.
+///
+/// So a fence is substantive unless it is recognisable SCAFFOLDING, and the
+/// list of shapes checked is deliberately short (see [`is_scaffold_block`]):
+/// an empty block, or an empty JSON payload. Anything else — code, data, prose
+/// — is an answer.
+///
+/// An UNTERMINATED fence is substantive whenever it holds non-whitespace: a
+/// truncated block is a partial answer, and the driver can see that it is.
 fn substantive(text: &str) -> bool {
     let t = text.trim();
     if t.is_empty() {
         return false;
     }
-    // Strip fenced blocks; if nothing but fences and whitespace remains, the
-    // message is scaffolding.
     let mut outside = String::new();
-    let mut in_fence = false;
+    // `Some((info string, body))` while a fence is open.
+    let mut open: Option<(String, String)> = None;
     for line in t.lines() {
-        if line.trim_start().starts_with("```") {
-            in_fence = !in_fence;
+        let is_fence = line.trim_start().starts_with("```");
+        if let Some((_, body)) = open.as_mut() {
+            if !is_fence {
+                body.push_str(line);
+                body.push('\n');
+                continue;
+            }
+            let (info, body) = open.take().expect("open");
+            if !is_scaffold_block(&info, &body) {
+                return true;
+            }
             continue;
         }
-        if !in_fence {
-            outside.push_str(line);
+        if is_fence {
+            let info = line.trim_start().trim_start_matches('`').trim().to_string();
+            open = Some((info, String::new()));
+            continue;
+        }
+        outside.push_str(line);
+    }
+    // An unterminated block: what is in it still counts.
+    if let Some((info, body)) = open {
+        if !is_scaffold_block(&info, &body) {
+            return true;
         }
     }
     !outside.trim().is_empty()
+}
+
+/// The scaffold shapes [`substantive`] recognises. **Short on purpose**: every
+/// shape here is a reply cImp will call empty, so a wrong entry silently turns
+/// a real answer into `worker produced no text`.
+///
+/// 1. an empty block (nothing but whitespace);
+/// 2. an empty JSON payload — `{}`, `[]`, `null` — which is what a worker that
+///    was asked for JSON and then produced nothing emits.
+///
+/// **Both are shapes, not vocabulary, and that is a layering constraint as
+/// well as a preference.** A list of info strings naming tool-protocol
+/// sections (`tool_use`, `tool_result`, …) would be harness-owned vocabulary
+/// in an L4 module — which `no_harness_literals_outside_harness` forbids, and
+/// rightly: a fenced block a harness happens to label is still a block this
+/// module cannot read. A worker whose whole final message is one such block
+/// therefore returns it, which is the safe direction: the driver gets text it
+/// can judge, instead of a task that did real work being reported as empty.
+///
+/// `info` is unused today and kept in the signature because it is what a
+/// future shape would key on, and because it documents that the info string
+/// was considered rather than forgotten.
+fn is_scaffold_block(_info: &str, body: &str) -> bool {
+    let body = body.trim();
+    body.is_empty() || matches!(body, "{}" | "[]" | "null")
 }
 
 /// Run the worker's reply through the V32 EXTERNAL boundary (locked decision
@@ -1264,17 +1323,37 @@ mod tests {
         );
     }
 
-    /// **Empty is not absent** (locked decision 13). Whitespace and pure tool
-    /// scaffolding are not answers; anything with prose in it is.
+    /// **Empty is not absent** (locked decision 13) — and **a code block is an
+    /// answer** (V39 review M-6).
+    ///
+    /// The second half is the fix: "write the regex" / "produce the JSON" /
+    /// "show me the diff" are answered by one fenced block and nothing else,
+    /// and every one of those was reported to the driver as `worker produced no
+    /// text`. What stays non-substantive is the short scaffold list, and
+    /// nothing else.
     #[test]
     fn a_non_substantive_turn_is_not_a_success() {
-        for empty in ["", "   ", "\n\n\t", "```\n\n```", "```json\n{}\n```"] {
+        for empty in [
+            "",
+            "   ",
+            "\n\n\t",
+            "```\n\n```",
+            "```json\n{}\n```",
+            "```json\n[]\n```",
+            "```json\nnull\n```",
+        ] {
             assert!(!substantive(empty), "{empty:?} must not read as an answer");
         }
         for real in [
             "Done.",
             "The file exports three symbols.",
             "Here:\n```ts\nconst a = 1;\n```\nThat is the export.",
+            // The M-6 shapes: a fenced block, alone, IS the answer.
+            "```ts\nconst a = 1;\n```",
+            "```json\n{\"count\": 3}\n```",
+            "```\n^\\d{4}-\\d{2}$\n```",
+            // …and a truncated block still carries what it carries.
+            "```ts\nconst a = 1;",
         ] {
             assert!(substantive(real), "{real:?} must read as an answer");
         }

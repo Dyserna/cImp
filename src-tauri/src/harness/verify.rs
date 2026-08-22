@@ -295,9 +295,10 @@ pub struct RunSummary {
     pub answers: Vec<Answer>,
 }
 
-/// At most one entry per harness — a short list rather than a map because
-/// [`Harness`] is a two-value enum in practice and a linear scan of two is not
-/// worth a hash. Poisoning is swallowed on both sides: a panicking writer must
+/// At most one entry per harness — a short list rather than a map because the
+/// registry is a handful of entries and a linear scan of a handful is not worth
+/// a hash. (It said "a two-value enum" until V40 review L-10; [`Harness`] is
+/// `HarnessId` now and its arity is the registry's.) Poisoning is swallowed on both sides: a panicking writer must
 /// degrade the panel to "no run recorded", never take the Settings window down
 /// with it.
 static LAST_RUNS: Mutex<Vec<RunSummary>> = Mutex::new(Vec::new());

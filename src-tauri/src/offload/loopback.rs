@@ -1382,24 +1382,47 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 /// way a hand-kept enumeration would.
 #[cfg(test)]
 pub(crate) fn core_route_paths() -> std::collections::BTreeSet<&'static str> {
+    // V40 review L-2: scoped to the dispatch `match` itself, not the whole
+    // file. Scanning the file meant a line beginning `("` anywhere (a tuple in
+    // a test, say) had to be tolerated, which forced the scan to SKIP anything
+    // it could not parse — and a wrapped dispatch arm is exactly that: the path
+    // would drop out of the set, `no_plugin_route_shadows_a_core_route` would
+    // still pass on the smaller set, and a plugin could then declare a
+    // shadowing route with the test green and its handler never running.
+    // Inside the block there is nothing to tolerate, so an unreadable arm is a
+    // panic.
+    //
+    // Both delimiters are built with `concat!` so this function's own source
+    // does not contain them: a self-matching needle would cut the block at the
+    // scanner instead of at the dispatch and answer the empty set.
     let src = include_str!("loopback.rs");
+    let block = src
+        .split_once(concat!("match (req.method.as_str(), ", "route) {"))
+        .expect("the loopback dispatch `match` is gone — re-point this scan")
+        .1;
+    let block = block
+        .split_once(concat!("_ => match crate::harness::", "ingress::route("))
+        .expect("the plugin-route fallthrough arm is gone — re-point this scan")
+        .0;
     let mut out = std::collections::BTreeSet::new();
-    for line in src.lines() {
+    for line in block.lines() {
         let line = line.trim();
         let Some(rest) = line.strip_prefix("(\"") else {
             continue;
         };
         // A dispatch arm reads `(<method>, <path>) => handler(..)`.
-        let Some((_method, tail)) = rest.split_once("\", \"") else {
-            continue;
-        };
-        let Some((path, _)) = tail.split_once('"') else {
-            continue;
-        };
-        if path.starts_with('/') {
-            // `&'static str` from the embedded source, which is `'static`.
-            out.insert(path);
-        }
+        let path = rest
+            .split_once("\", \"")
+            .and_then(|(_method, tail)| tail.split_once('"'))
+            .map(|(path, _)| path)
+            .filter(|path| path.starts_with('/'))
+            .unwrap_or_else(|| {
+                panic!(
+                    "loopback dispatch: `{line}` opens a route arm this scan cannot read (a                      wrapped arm, or a rustfmt pass). Left unread it would drop the path from                      `core_route_paths()` and let a plugin shadow it with every test green."
+                )
+            });
+        // `&'static str` from the embedded source, which is `'static`.
+        out.insert(path);
     }
     out
 }

@@ -207,7 +207,7 @@ fn attach_parent_console() {}
 /// changed is that the value is now *resolved*: a token nobody declared fails
 /// the proxy start with the registered list in the message, instead of silently
 /// serving Claude's tool set to a child that asked for something else.
-fn resolve_consumer(args: &[String]) -> Result<&'static str, String> {
+fn resolve_consumer(args: &[String], in_app_ok: bool) -> Result<&'static str, String> {
     let named = args
         .iter()
         .position(|a| a == "--consumer")
@@ -218,22 +218,36 @@ fn resolve_consumer(args: &[String]) -> Result<&'static str, String> {
             .id()
             .expect("DEFAULT_HARNESS names a registered harness"));
     };
-    // `offload` is cImp's OWN in-app consumer, not a harness: the offload worker
-    // calls the proxy with it. It is a registered token in the MCP host's
-    // vocabulary and has no `harness/<id>/` directory, so it is accepted here
-    // beside the registry's ids rather than smuggled into the registry.
+    let known = crate::harness::registry::harness_ids().join(", ");
+    // `offload` is cImp's OWN in-app consumer, not a harness: it is a registered
+    // token in the MCP host's vocabulary and has no `harness/<id>/` directory,
+    // so it is accepted here beside the registry's ids rather than smuggled into
+    // the registry.
+    //
+    // `in_app_ok` is FALSE for `--code-audit-mcp` (V40 review L-4): that child
+    // posts `/audit/run`, whose `audit_consumer` is narrowed to the registry's
+    // ids and refuses `offload` on every scan. Accepting it here started the
+    // child cleanly and 400'd every scan afterwards — a refusal is better said
+    // once, at the boundary that can name what IS accepted.
     if named.eq_ignore_ascii_case("offload") {
-        return Ok("offload");
+        return if in_app_ok {
+            Ok("offload")
+        } else {
+            Err(format!(
+                "cimp: --consumer \"offload\" is cImp's own in-app consumer and this subcommand                  serves only harnesses. Registered: {known}. Every scan would be refused at                  `/audit/run`, so the child refuses to start instead."
+            ))
+        };
     }
     match crate::harness::HarnessId::from_consumer(named) {
         Some(h) => Ok(h.id().expect("from_consumer never answers ANY")),
-        None => {
-            let known: Vec<&str> = crate::harness::registry::harness_ids();
-            Err(format!(
-                "cimp: --consumer {named:?} names no registered harness. Registered: {} (plus                  `offload`, cImp's own in-app consumer). A consumer token decides which MCP                  servers this child may reach, so an unrecognised one is refused rather than                  defaulted.",
-                known.join(", ")
-            ))
-        }
+        None => Err(format!(
+            "cimp: --consumer {named:?} names no registered harness. Registered: {known}{}. A              consumer token decides which MCP servers this child may reach, so an unrecognised              one is refused rather than defaulted.",
+            if in_app_ok {
+                " (plus `offload`, cImp's own in-app consumer)"
+            } else {
+                ""
+            }
+        )),
     }
 }
 
@@ -381,7 +395,7 @@ fn main() {
     // launch path's `extra_args`.
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--offload-mcp") {
-        let consumer = match resolve_consumer(&args) {
+        let consumer = match resolve_consumer(&args, true) {
             Ok(c) => c,
             Err(msg) => {
                 eprintln!("{msg}");
@@ -419,7 +433,7 @@ fn main() {
     // the same optional `--consumer <name>` (default `claude`); the app's
     // loopback re-checks that consumer's expose toggle on every run.
     if args.iter().any(|a| a == "--code-audit-mcp") {
-        let consumer = match resolve_consumer(&args) {
+        let consumer = match resolve_consumer(&args, false) {
             Ok(c) => c,
             Err(msg) => {
                 eprintln!("{msg}");
@@ -1591,6 +1605,67 @@ fn spawn_settings_broadcast(app: AppHandle, settings: SettingsHandle, read_only:
             }
         }
     });
+}
+
+#[cfg(test)]
+mod consumer_flag_tests {
+    use super::*;
+
+    fn argv(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// **`--consumer` resolves against the registry, and `offload` only where
+    /// it can actually be served** (locked decision 2; V40 review L-4).
+    ///
+    /// The L-4 half: `--code-audit-mcp` posts `/audit/run`, whose
+    /// `audit_consumer` is narrowed to the registry's ids and refuses
+    /// `offload`. Accepting it here started the child cleanly and 400'd every
+    /// scan afterwards — a refusal said once, at the boundary that can name
+    /// what IS accepted, instead of on every scan with no way to see why.
+    #[test]
+    fn resolve_consumer_accepts_the_registry_and_gates_the_in_app_token() {
+        // Absent ⇒ the wire-compatibility default, on both subcommands.
+        for in_app_ok in [true, false] {
+            assert_eq!(
+                resolve_consumer(&argv(&["--offload-mcp"]), in_app_ok).unwrap(),
+                crate::harness::DEFAULT_HARNESS.id().unwrap()
+            );
+        }
+        // Every registered consumer resolves to its own id.
+        for d in crate::harness::registry::HARNESSES {
+            for in_app_ok in [true, false] {
+                assert_eq!(
+                    resolve_consumer(&argv(&["--consumer", d.consumer]), in_app_ok).unwrap(),
+                    d.id,
+                    "{}", d.consumer
+                );
+            }
+        }
+        // `offload` is served by the MCP child and refused by the audit child.
+        assert_eq!(
+            resolve_consumer(&argv(&["--consumer", "offload"]), true).unwrap(),
+            "offload"
+        );
+        let err = resolve_consumer(&argv(&["--consumer", "offload"]), false).unwrap_err();
+        assert!(err.contains("only harnesses"), "{err}");
+        for d in crate::harness::registry::HARNESSES {
+            assert!(err.contains(d.id), "the refusal must name what IS accepted: {err}");
+        }
+        // A token nobody declared fails the start either way, with the list.
+        for in_app_ok in [true, false] {
+            let err = resolve_consumer(&argv(&["--consumer", "codex"]), in_app_ok).unwrap_err();
+            assert!(err.contains("codex"), "{err}");
+            for d in crate::harness::registry::HARNESSES {
+                assert!(err.contains(d.id), "{err}");
+            }
+            assert_eq!(
+                err.contains("in-app consumer"),
+                in_app_ok,
+                "the audit child must not advertise a token it would refuse: {err}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

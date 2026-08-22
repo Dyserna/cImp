@@ -572,6 +572,93 @@ mod tests {
         );
     }
 
+    /// **Two plugins may not claim one subcommand flag, and none may claim a
+    /// flag core answers itself** (V40 review finding L-3).
+    ///
+    /// `subcommand_for` scans the whole of `argv`, takes the FIRST registry
+    /// match, and is dispatched in `main.rs` *before* `--offload-mcp`,
+    /// `--code-audit-mcp` and the retired-shim tombstones. Plugin ROUTES have
+    /// both guards (`no_two_plugins_claim_one_route`,
+    /// `no_plugin_route_shadows_a_core_route`); subcommands had neither, so a
+    /// second declaration of `--statusline` would be answered by whichever
+    /// harness the registry lists first, and a plugin declaring
+    /// `--offload-mcp` would take over cImp's own MCP child with nothing
+    /// anywhere to say so.
+    ///
+    /// Core's flags are read out of `main.rs` rather than hand-listed, the way
+    /// the route guard reads core's dispatch: a flag added there is covered the
+    /// day it is added. Newline-agnostic: CI checks this tree out with CRLF.
+    #[test]
+    fn no_two_plugins_claim_one_subcommand_and_none_shadows_a_core_flag() {
+        let mut seen: std::collections::BTreeMap<&str, &str> = std::collections::BTreeMap::new();
+        for d in HARNESSES {
+            for sub in d.plugin.subcommands() {
+                assert!(
+                    sub.flag.starts_with("--"),
+                    "{}: subcommand flag {:?} is not a `--flag`",
+                    d.id,
+                    sub.flag
+                );
+                if let Some(prior) = seen.insert(sub.flag, d.id) {
+                    panic!(
+                        "`{}` is declared by both `{prior}` and `{}` — `subcommand_for` takes                          the first registry match, so one of them would silently never run",
+                        sub.flag, d.id
+                    );
+                }
+            }
+        }
+
+        // Core's own flags, scraped from its entry point: the `a == "--x"`
+        // comparisons plus the retired-shim tombstone array.
+        /// Collect every `"--flag"` literal in `hay` that follows `opener`.
+        fn flags_after<'a>(
+            hay: &'a str,
+            opener: &str,
+            out: &mut std::collections::BTreeSet<&'a str>,
+        ) {
+            let mut rest = hay;
+            while let Some(i) = rest.find(opener) {
+                rest = &rest[i + opener.len()..];
+                // `rest` now starts just after the opening quote.
+                if let Some((flag, tail)) = rest.split_once('"') {
+                    out.insert(flag);
+                    rest = tail;
+                }
+            }
+        }
+        let main_src = include_str!("../main.rs");
+        let mut core_flags: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        // `if args.iter().any(|a| a == "--offload-mcp")` and friends.
+        flags_after(main_src, "a == \"", &mut core_flags);
+        // …and the retired-shim tombstones, which are an array of literals.
+        let tombstones = main_src
+            .split_once("RETIRED_HOOK_FLAGS")
+            .expect("the tombstone array is gone — re-point this scan")
+            .1;
+        let tombstones = &tombstones[..tombstones.find("];").expect("the array closes")];
+        flags_after(tombstones, "\"", &mut core_flags);
+        core_flags.retain(|f| f.starts_with("--"));
+        // Non-vacuity: the two flags a plugin taking over would matter most for
+        // are cImp's own MCP children, and both are dispatched AFTER the
+        // subcommand loop.
+        for must in ["--offload-mcp", "--code-audit-mcp"] {
+            assert!(
+                core_flags.contains(must),
+                "the core flag scan missed `{must}` — it would pass by finding nothing:                  {core_flags:?}"
+            );
+        }
+        assert!(
+            !seen.is_empty(),
+            "no harness declares a subcommand any more — this guard would pass by iterating              nothing (`--statusline` is the one that exists)"
+        );
+        for (flag, owner) in &seen {
+            assert!(
+                !core_flags.contains(flag),
+                "`{owner}` declares `{flag}`, which cImp's own entry point answers — the                  subcommand dispatch runs FIRST, so the plugin would take the flag over"
+            );
+        }
+    }
+
     #[test]
     fn ids_are_unique_and_non_empty() {
         let mut seen = std::collections::BTreeSet::new();

@@ -1437,7 +1437,16 @@ impl UnscopedAudit {
     ///
     /// Matches the registry's vocabulary, which is what every caller of this
     /// type has already normalised through. An agent that names no registered
-    /// harness lands on the LAST slot — its own lane, not another harness's.
+    /// harness lands on the LAST slot.
+    ///
+    /// **That slot is SHARED** (V40 review L-8): `offload`, `audit`, `unknown`
+    /// and every forged token collide on it, so it is a lane of its own only
+    /// against the registered HARNESSES — one unattributable caller can exhaust
+    /// the row-claim budget of the others on the same screen. Still strictly
+    /// better than the pre-V40 arrangement, where all of them collided on
+    /// Claude's slot 0 and spent a real harness's budget; splitting it further
+    /// would mean minting a slot per caller-asserted string, which is the "no
+    /// string can become a key" bound this function exists to hold.
     fn slot(agent: &str) -> usize {
         crate::harness::HarnessId::from_id(&agent.to_ascii_lowercase())
             .and_then(|h| h.ordinal())

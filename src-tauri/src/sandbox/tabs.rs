@@ -67,6 +67,15 @@ use super::{GrantAccess, GrantHints, GrantRow, SandboxCfg};
 /// whose command matches no registered harness still gets `None` on the spec and
 /// is not sandboxed at all, because a grant table nobody wrote is not a
 /// boundary; it is a tool that fails to start for reasons the user cannot see.
+///
+/// **[`crate::harness::HarnessId::ANY`] is NOT a sandbox harness** (V40 review
+/// L-5). The old local enum made it unrepresentable; `HarnessId` does not, and
+/// `ANY` has no descriptor, so it would sandbox a tab with the neutral rows and
+/// **no harness state grants at all** — precisely the "fails to start for
+/// reasons the user cannot see" outcome the paragraph above exists to avoid.
+/// Unreachable today (`from_command` never answers `ANY`), and
+/// [`grant_rows_with`] debug-asserts it rather than leaving the next caller to
+/// rediscover it.
 pub use crate::harness::HarnessId as Harness;
 
 /// The runtime sandbox config for a TAB spawn.
@@ -230,6 +239,14 @@ fn grant_rows_with(
     env: &dyn Fn(&str) -> Option<OsString>,
     exe: Option<&Path>,
 ) -> Vec<GrantRow> {
+    // See the `Harness` alias: `ANY` is a type-valid value with no descriptor,
+    // so it would confine a tab with cImp's neutral rows and none of the harness
+    // state its program needs (V40 review L-5). A `PtyLaunchSpec` carrying it is
+    // a bug in the caller, not a configuration.
+    debug_assert!(
+        harness.id().is_some(),
+        "`HarnessId::ANY` reached the tab sandbox: it has no grant table, so the tab would be          confined with no harness state and fail to start for reasons the user cannot see"
+    );
     // cImp's own three first: they are anchored on the executable, not on the
     // home directory, so a machine that reports no home still gets a working
     // proxy child.

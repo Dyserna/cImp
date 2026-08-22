@@ -1,0 +1,35 @@
+# V40 Phase E — Claude Code's MODEL-VISIBLE TEXT goldens.
+#
+# ── What this is ────────────────────────────────────────────────────────────
+#
+# `system-prompt-addendum.txt` is the exact string cImp passes to
+# `claude --append-system-prompt` for a default Claude tab with the graph,
+# semantic search, offload guidance and consumer hygiene all ON — captured from
+# the tree **before** locked decision 24 moved the text into
+# `harness::instructions`, and asserted byte for byte by
+# `tabs::config::tests::the_system_prompt_addendum_matches_its_harness_golden`.
+#
+# ── Why it exists ───────────────────────────────────────────────────────────
+#
+# Phase E templated `GRAPH_GUIDANCE` with each harness's own tool names, which
+# is a change to text a model reads on every single session. Claude's rendering
+# must be IDENTICAL to the pre-V40 blob (it named Claude's tools already), and
+# "identical" is a claim worth proving rather than eyeballing: the substitution
+# is a `str::replace` over a 3 KB paragraph, and a stray placeholder or a lost
+# separator would be invisible in review and expensive in the field.
+#
+# The sibling `../opencode/system-prompt-addendum.txt` is the same capture with
+# the two tool names it always should have carried (`Read` → `read`, `Bash` →
+# `bash`) and nothing else changed — so the diff between the two files IS the
+# behaviour change Phase E made, in full, readable in two lines.
+#
+# ── Maintaining them ────────────────────────────────────────────────────────
+#
+# These are goldens, not fixtures: a deliberate edit to any addendum text (the
+# hygiene paragraph, the offload nudge, the graph nudge, the tool-steering
+# sentence) lands as a diff here in the same commit. That is the point — the
+# text is what a model is told, and it should never move without a reviewer
+# seeing exactly how.
+#
+# Regenerate by running the test and copying the `actual` half of the failure.
+# Never regenerate blind: re-read the diff first.

@@ -2,7 +2,7 @@
 //!
 //! The V33 spec opened by asserting cImp owns "two spawn seams". It owns
 //! seventeen source sites across five different spawn mechanisms (the count is
-//! [`LEDGER`]'s length and moves with it — the tripwire below is what keeps the
+//! [`ledger`]'s length and moves with it — the tripwire below is what keeps the
 //! table honest, not this sentence), and the distinction that matters for
 //! sandboxing is not *how many* but *whose work the child is doing*:
 //!
@@ -21,7 +21,7 @@
 //! its row — and its reason — is written down.
 //!
 //! **Why this file allows dead code.** Nothing in the shipped binary reads
-//! [`LEDGER`] yet; its consumers are the tripwire below and V33 stages 2–3,
+//! [`ledger`] yet; its consumers are the tripwire below and V33 stages 2–3,
 //! which will confine the `AgentSpawn` rows. Same posture (and same reason) as
 //! `offload::toolclass`'s `mutates_fs` accessor, which shipped in V32 behind an
 //! `allow(dead_code)` naming V33 as its consumer — and whose `allow` V33 Phase F
@@ -65,12 +65,15 @@ pub struct SpawnSite {
 
 use SpawnClass::{AgentSpawn, HostSpawn};
 
-/// Every external-process spawn in `src-tauri/src/`, classified.
+/// **cImp's OWN external-process spawns**, classified. The whole ledger is
+/// [`ledger`] — this plus every harness plugin's [`HarnessPlugin::spawn_sites`]
+/// (V40 Phase E, locked decision 26).
 ///
 /// Kept in file order. The tripwire
-/// [`tests::the_spawn_ledger_is_exhaustive`] asserts this table matches the
-/// tree exactly, so a new spawn cannot land unclassified.
-pub const LEDGER: &[SpawnSite] = &[
+/// [`tests::the_spawn_ledger_is_exhaustive`] asserts the JOINED table matches
+/// the tree exactly, so a new spawn cannot land unclassified — wherever it
+/// lives.
+pub const CORE_LEDGER: &[SpawnSite] = &[
     SpawnSite {
         file: "audit/mod.rs",
         symbol: "detect_tool",
@@ -144,34 +147,6 @@ pub const LEDGER: &[SpawnSite] = &[
         count: 1,
         reason: "The code-graph indexer's own git reads. Fixed argv, driven by the rebuild \
                  and watcher threads, never by a tool call.",
-    },
-    SpawnSite {
-        file: "harness/claude/probe.rs",
-        symbol: "claude_help",
-        spawns: "claude --help",
-        class: HostSpawn,
-        count: 1,
-        reason: "V35 Phase D's L2 live probe, reached only from `cimp --harness-canary` — a \
-                 maintenance command a human (or a scheduled script) runs, never a tool call, \
-                 and it exits before any Tauri/app init. The program is a FIXED name resolved \
-                 through `pty::resolve_command`, the argv is a literal in code, and no model \
-                 input reaches it. Sandboxing it would be self-defeating: the entire point is to \
-                 observe what the user's REAL installed harness does. V40 Phase A moved this \
-                 half of the old `harness/probe.rs` row into the plugin that owns it (locked \
-                 decision 17); the runner spawns nothing.",
-    },
-    SpawnSite {
-        file: "harness/opencode/probe.rs",
-        symbol: "start_opencode_serve",
-        spawns: "opencode serve --port <free> --hostname 127.0.0.1",
-        class: HostSpawn,
-        count: 1,
-        reason: "The other half of the same V35 Phase D probe, same trigger and same posture as \
-                 `harness/claude/probe.rs`: a fixed name through `pty::resolve_command`, a \
-                 literal argv, no model input, and deliberately unsandboxed because the point is \
-                 to observe the REAL installed harness. This child also gets a free loopback \
-                 port and is reaped through `kill_tree_blocking` on drop, because it forks its \
-                 own children.",
     },
     SpawnSite {
         file: "ipc/commands.rs",
@@ -356,6 +331,25 @@ pub const LEDGER: &[SpawnSite] = &[
     },
 ];
 
+/// Every external-process spawn in `src-tauri/src/`, classified — core's rows
+/// and each registered harness's.
+///
+/// A harness's rows carry ITS CLI's argv (`opencode serve --port <free>
+/// --hostname 127.0.0.1`, `claude --help`), which is a sentence about one
+/// product; keeping them beside that product's probe is what stops core from
+/// holding a table of other people's command lines. Returned in one order —
+/// core first, then the registry's — so the tripwire's diff is stable.
+pub fn ledger() -> Vec<&'static SpawnSite> {
+    CORE_LEDGER
+        .iter()
+        .chain(
+            crate::harness::registry::HARNESSES
+                .iter()
+                .flat_map(|d| d.plugin.spawn_sites().iter()),
+        )
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -446,7 +440,7 @@ mod tests {
     /// The ledger's expected production-spawn count per file.
     fn ledger_counts() -> BTreeMap<&'static str, usize> {
         let mut m: BTreeMap<&'static str, usize> = BTreeMap::new();
-        for site in LEDGER {
+        for site in ledger() {
             *m.entry(site.file).or_default() += site.count;
         }
         m
@@ -486,7 +480,7 @@ mod tests {
                 )),
                 None => problems.push(format!(
                     "{rel}: spawns an external process at line(s) {:?} ({}) but has NO row in \
-                     `spawn_ledger::LEDGER` — classify it AgentSpawn or HostSpawn and record \
+                     `spawn_ledger::ledger` — classify it AgentSpawn or HostSpawn and record \
                      the reason (V33 contract C1)",
                     hits.iter().map(|h| h.line).collect::<Vec<_>>(),
                     hits.iter().map(|h| h.needle).collect::<Vec<_>>().join(", ")
@@ -496,7 +490,7 @@ mod tests {
         for file in expected.keys() {
             if !found.contains_key(*file) {
                 problems.push(format!(
-                    "{file}: has a `spawn_ledger::LEDGER` row but the tree shows no spawn there \
+                    "{file}: has a `spawn_ledger::ledger` row but the tree shows no spawn there \
                      — the seam moved or was removed; update the ledger"
                 ));
             }
@@ -601,8 +595,8 @@ mod tests {
 
     // ── the tripwire ───────────────────────────────────────────────────────
 
-    /// V33 C1 — every external-process spawn in the crate is in [`LEDGER`],
-    /// and [`LEDGER`] names nothing that is not one.
+    /// V33 C1 — every external-process spawn in the crate is in [`ledger`],
+    /// and [`ledger`] names nothing that is not one.
     ///
     /// Run twice over two independent views of the tree: the compile-time
     /// `include_str!` copies of the ledger'd files (which proves the counts on
@@ -655,7 +649,8 @@ mod tests {
             "pty/sandboxed_conpty.rs",
             "sandbox/windows.rs",
         ] {
-            let site = LEDGER
+            let rows = ledger();
+            let site = rows
                 .iter()
                 .find(|s| s.file == file)
                 .unwrap_or_else(|| panic!("{file} lost its ledger row"));
@@ -681,13 +676,14 @@ mod tests {
             "offload/mcp_host.rs",
             "preview/mod.rs",
         ] {
-            let site = LEDGER
+            let rows = ledger();
+            let site = rows
                 .iter()
                 .find(|s| s.file == file)
                 .unwrap_or_else(|| panic!("{file} lost its ledger row"));
             assert_eq!(site.class, HostSpawn, "{file} must stay a host spawn");
         }
-        for site in LEDGER {
+        for site in ledger() {
             assert!(
                 site.reason.len() > 60,
                 "{}: a ledger row without a real reason is a list, not a ledger",

@@ -52,13 +52,20 @@ pub enum TabLifecycleError {
     /// last-checked-is-locked rule prevents this from the user side; the
     /// IPC enforces it as defense-in-depth.
     EmptyAiTabsList,
-    /// An attempt to enable an OpenCode tab (cloud or local) while the
-    /// `opencode` command can't be resolved (not in `ebin`, not on PATH). The
-    /// tab is left disabled and the UI surfaces this so the user can install
-    /// OpenCode first — unlike Claude (the app's own front end), a missing
-    /// OpenCode would only ever show a dead "command not found" tab. cimp does
-    /// not bundle the ~158 MB binary (V19 require-install decision).
-    OpencodeNotFound,
+    /// An attempt to enable a harness tab whose CLI cannot be resolved (not in
+    /// `ebin`, not on PATH). The tab is left disabled and the UI surfaces
+    /// `label` + `hint` so the user can install it first.
+    ///
+    /// **V40 Phase E (locked decision 26).** This was `OpencodeNotFound`, with
+    /// the probe and the exemption for the other harness both spelled in this
+    /// file. Which harnesses are gated, and what a refusal advises, are
+    /// `HarnessPlugin::preflight`'s answer now; core carries the refusal without
+    /// knowing whose it is.
+    HarnessNotFound {
+        harness: String,
+        label: String,
+        hint: String,
+    },
     /// Internal error (lock poisoning, channel send failure, etc.). Not
     /// expected in practice — surfaces as a toast on the frontend.
     Internal { message: String },
@@ -1083,23 +1090,38 @@ pub async fn set_enabled_ai_tabs(
         return Ok(());
     }
 
-    // Gate: don't enable an OpenCode tab (cloud or local) unless the `opencode`
-    // command actually resolves (ebin → PATH, the same resolution the spawn
-    // path uses). Without this an enabled-but-unresolvable OpenCode tab would
-    // just materialize as a dead "command not found" tab. We only probe when a
-    // NEW opencode tab is being turned on, and reject before any state changes
-    // so the toggle is atomic (the UI then reverts the checkbox and shows the
-    // reason). Claude is intentionally not gated — it's the app's own front end.
-    let enabling_opencode = [AiTabId::OpenCode]
-        .iter()
-        .any(|id| want.contains(id) && !have.contains(id));
-    if enabling_opencode {
-        let resolvable =
-            tokio::task::spawn_blocking(|| crate::pty::resolve_command("opencode").is_ok())
-                .await
-                .map_err(|e| TabLifecycleError::internal(format!("opencode probe join: {e}")))?;
-        if !resolvable {
-            return Err(TabLifecycleError::OpencodeNotFound);
+    // Gate: don't enable a harness's tab unless that harness says it can be.
+    // Probed only for tabs being turned ON in this call, and refused before any
+    // state changes, so the toggle stays atomic (the UI reverts the checkbox and
+    // shows the reason).
+    //
+    // **V40 Phase E, locked decision 26.** This used to be one hard-coded
+    // `resolve_command("opencode")` with the other harness's exemption stated in
+    // a comment — an exemption a third harness would have inherited by accident.
+    // Each plugin answers `preflight()` for itself; Claude's "not gated, it's the
+    // app's own front end" is a declared `Ok`.
+    for &id in want.iter() {
+        if have.contains(&id) {
+            continue;
+        }
+        let Some(harness) = crate::harness::HarnessId::from_tab_id(id.as_str()) else {
+            continue;
+        };
+        let Some(plugin) = harness.plugin() else {
+            continue;
+        };
+        // `preflight` resolves a binary, so it runs off the async runtime.
+        let verdict = tokio::task::spawn_blocking(move || plugin.preflight())
+            .await
+            .map_err(|e| {
+                TabLifecycleError::internal(format!("{} preflight join: {e}", harness.token()))
+            })?;
+        if let Err(hint) = verdict {
+            return Err(TabLifecycleError::HarnessNotFound {
+                harness: harness.token().to_string(),
+                label: harness.label().to_string(),
+                hint: hint.to_string(),
+            });
         }
     }
 

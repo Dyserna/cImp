@@ -1689,13 +1689,18 @@
       const restored = structuredClone($state.snapshot(snapshot));
       restored.enabled_ai_tabs = prev;
       snapshot = restored;
-      // The backend rejects enabling an OpenCode tab when `opencode` can't be
-      // resolved (not in ebin, not on PATH) — surface that specifically so the
-      // user knows to install it; everything else is a generic failure.
-      const kind = (e as { kind?: string } | null)?.kind;
+      // The backend rejects enabling a harness tab whose CLI can't be resolved
+      // (not in ebin, not on PATH) — surface that specifically so the user knows
+      // to install it; everything else is a generic failure. V40 Phase E: the
+      // harness label and the install hint come from the refusal (locked
+      // decision 26), so this sentence names no product.
+      const err = e as { kind?: string; label?: string; hint?: string } | null;
       aiTabsError =
-        kind === 'opencode-not-found'
-          ? 'OpenCode was not found in ebin or on your PATH. Install it from https://opencode.ai/docs (or drop opencode.exe in ebin/), then try again.'
+        err?.kind === 'harness-not-found'
+          ? `${err.label ?? 'That harness'} was not found in ebin or on your PATH. ${err.hint ?? ''} — then try again.`.replace(
+              ' —  — ',
+              ' — ',
+            )
           : 'Failed to update AI tabs — see logs for details.';
     }
   }

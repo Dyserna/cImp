@@ -2254,13 +2254,16 @@ fn ai_builtin_ids() -> Vec<&'static str> {
 pub fn integrity_check(settings: &mut Settings) -> bool {
     let mut changed = false;
 
-    // 0. Empty enabled_ai_tabs is invalid — repair to the registry's default
-    //    harness's default tab. V40 Phase B: it used to be a literal
+    // 0. Empty enabled_ai_tabs is invalid — repair to the FIRST REGISTERED
+    //    harness's first built-in tab. V40 Phase B replaced a literal
     //    `[AiTabId::Claude]`, which made ONE harness load-bearing for the app
-    //    booting at all.
+    //    booting at all; Phase E replaced `DEFAULT_HARNESS` with the registry's
+    //    own order, because that constant is a wire-compatibility promise about
+    //    identity-less loopback bodies (locked decision 22) and not an answer to
+    //    "which tab should this install boot with".
     if settings.enabled_ai_tabs.is_empty() {
-        let fallback = crate::harness::DEFAULT_HARNESS
-            .descriptor()
+        let fallback = crate::harness::registry::HARNESSES
+            .first()
             .and_then(|d| d.tab_ids.first())
             .and_then(|id| AiTabId::from_id(id))
             .unwrap_or(AiTabId::Claude);

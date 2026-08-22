@@ -128,7 +128,7 @@ impl Drop for Serve {
         // observed per server), so a bare kill would leave an HTTP server bound
         // to our port after the probe exits. Same tree-kill idiom the audit and
         // checks runners use, in its blocking form.
-        crate::procutil::kill_tree_blocking(&mut self.child);
+        crate::procutil::reap_probe_child(super::harness_plugin::me(), &mut self.child);
     }
 }
 
@@ -544,6 +544,24 @@ fn noauth_outcome(credentialed: bool, pairs: &[AuthPair]) -> Outcome {
         ),
     }
 }
+
+/// This probe's row in the external-process spawn ledger (V40 Phase E, locked
+/// decision 26) — see the sibling in `harness/claude/probe.rs`.
+pub(crate) const SPAWN_SITES: &[crate::spawn_ledger::SpawnSite] = &[
+    crate::spawn_ledger::SpawnSite {
+        file: "harness/opencode/probe.rs",
+        symbol: "start_opencode_serve",
+        spawns: "opencode serve --port <free> --hostname 127.0.0.1",
+        class: crate::spawn_ledger::SpawnClass::HostSpawn,
+        count: 1,
+        reason: "The other half of the same V35 Phase D probe, same trigger and same posture as \
+                 `harness/claude/probe.rs`: a fixed name through `pty::resolve_command`, a \
+                 literal argv, no model input, and deliberately unsandboxed because the point is \
+                 to observe the REAL installed harness. This child also gets a free loopback \
+                 port and is reaped through `kill_tree_blocking` on drop, because it forks its \
+                 own children.",
+    },
+];
 
 #[cfg(test)]
 mod tests {

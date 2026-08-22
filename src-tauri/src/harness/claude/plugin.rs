@@ -89,7 +89,10 @@ impl HarnessPlugin for ClaudePlugin {
     }
 
     /// cimp is documented as a drop-in replacement for `claude`, so invocation
-    /// args (`cimp --resume <id>`, etc.) flow into every Claude tab.
+    /// args (`cimp --resume <id>`, etc.) flow into every Claude tab — and
+    /// `main.rs` composes the sentence in `cimp --help` from whichever harness
+    /// answers `true` here (locked decision 26), so the promise and the tab the
+    /// args reach cannot disagree.
     fn accepts_passthrough_argv(&self) -> bool {
         true
     }
@@ -300,6 +303,28 @@ impl HarnessPlugin for ClaudePlugin {
         super::settings::FIELDS
     }
 
+    /// The two names cImp's own guidance has to spell (locked decision 24).
+    /// Claude Code capitalises both; the pre-V40 `GRAPH_GUIDANCE` said `Read`
+    /// and `Bash` in core, which is exactly these two values inlined.
+    fn tool_for_role(&self, role: crate::harness::plugin::ToolRole) -> Option<&'static str> {
+        use crate::harness::plugin::ToolRole;
+        Some(match role {
+            ToolRole::Read => "Read",
+            ToolRole::Shell => "Bash",
+        })
+    }
+
+    /// The model-visible inventory, rendered once in Claude's vocabulary.
+    ///
+    /// `OnceLock` per implementation, not per trait: a `static` in a default
+    /// trait body would be shared by every harness, which is the one shape this
+    /// method must not have.
+    fn instructions(&self) -> &[crate::harness::instructions::Instruction] {
+        static CELL: std::sync::OnceLock<Vec<crate::harness::instructions::Instruction>> =
+            std::sync::OnceLock::new();
+        CELL.get_or_init(|| crate::harness::instructions::render_for(me()))
+    }
+
     fn native_tools(&self) -> &'static [NativeTool] {
         super::tools::CLAUDE_NATIVE_TABLE
     }
@@ -417,6 +442,27 @@ impl HarnessPlugin for ClaudePlugin {
     /// Claude Code has an inbound MCP path (development channels), which is
     /// what the session-push registration and the `--channel-push` subscription
     /// both gate on.
+    /// Claude Code's channel capability lives in its own vendor namespace, so
+    /// the key is declared here rather than written by core for whichever
+    /// consumer happened to have push armed (locked decision 25).
+    fn decorate_initialize(&self, result: &mut serde_json::Value) {
+        result["capabilities"]["experimental"] = serde_json::json!({ "claude/channel": {} });
+    }
+
+    /// The twin of the capability key above — a push sent under any other
+    /// method name is dropped client-side, silently.
+    fn push_notification_method(&self) -> Option<&'static str> {
+        Some("notifications/claude/channel")
+    }
+
+    /// **Pinned to the era where the client honours channels** (V30 milestone
+    /// invariant 1). Claude Code stopped honouring `notifications/claude/
+    /// channel` outside `2025-06-18`, so this is a compatibility pin and not a
+    /// preference — moving it forward silently disables session push.
+    fn mcp_protocol_version(&self) -> Option<&'static str> {
+        Some("2025-06-18")
+    }
+
     fn supports_session_push(&self) -> bool {
         true
     }
@@ -432,6 +478,35 @@ impl HarnessPlugin for ClaudePlugin {
     /// Claude's, and so is the drift report `read.rs` files when it moves.
     fn drift_report_tools(&self) -> &'static [&'static str] {
         &["subagent_drift"]
+    }
+
+    /// Claude Code's session-selector CLI vocabulary (locked decision 26),
+    /// which `args_select_session` matches a tab's stored arguments against
+    /// before cImp offers a `--session-id` of its own.
+    fn session_selector_flags(&self) -> &'static [&'static str] {
+        SESSION_SELECTORS
+    }
+
+    /// **Declared `Ok`, not absent** (locked decision 26). Claude Code is the
+    /// app's own front end: a cImp with no Claude installed still opens the tab,
+    /// where the "command not found" is visible and actionable. Saying so here
+    /// is what keeps the exemption from being something a third harness inherits
+    /// by accident.
+    fn preflight(&self) -> Result<(), &'static str> {
+        Ok(())
+    }
+
+    /// Claude Code's welcome banner cycles a fresh tab `Idle → Thinking → Idle`
+    /// as it prints — the transition the notification manager's
+    /// "not until this tab has been interacted with" guard exists for.
+    fn emits_startup_chrome(&self) -> bool {
+        true
+    }
+
+    /// The `claude --help` probe's row in the spawn ledger (locked decision 26):
+    /// the argv is this product's, so the row lives with the code that runs it.
+    fn spawn_sites(&self) -> &'static [crate::spawn_ledger::SpawnSite] {
+        super::probe::SPAWN_SITES
     }
 
     /// `cimp --statusline` — see [`super::statusline`].
@@ -533,20 +608,30 @@ impl HarnessPlugin for ClaudePlugin {
 /// V40 Phase A moved it here from `tabs/config.rs`: it is Claude's CLI
 /// vocabulary (locked decision 26), and core cannot own another CLI's flag list.
 pub(crate) fn args_select_session(args: &[String]) -> bool {
-    const SELECTORS: [&str; 7] = [
-        "--session-id",
-        "--resume",
-        "-r",
-        "--continue",
-        "-c",
-        "--fork-session",
-        "--from-pr",
-    ];
+    // Through the trait, not the `const` directly: the list core can ask for and
+    // the list this matcher runs on are then the same object by construction.
+    let selectors = PLUGIN.session_selector_flags();
     args.iter().any(|a| {
         let head = a.split_once('=').map_or(a.as_str(), |(k, _)| k);
-        SELECTORS.contains(&head)
+        selectors.contains(&head)
     })
 }
+
+/// The flags themselves, as [`HarnessPlugin::session_selector_flags`] declares
+/// them (locked decision 26).
+///
+/// A `const` beside the matcher rather than inside it: the list is data core may
+/// ask for — the trait method is what core reads — while the *matching rule*
+/// (`=` spellings, short forms) is this harness's and stays above.
+const SESSION_SELECTORS: &[&str] = &[
+    "--session-id",
+    "--resume",
+    "-r",
+    "--continue",
+    "-c",
+    "--fork-session",
+    "--from-pr",
+];
 
 /// Claude Code's rows that **no probe can settle**, each with the reason
 /// (locked decision 17).

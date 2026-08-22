@@ -8,6 +8,7 @@ import { ptyWrite } from './ipc';
 import { activeTab } from './tabs/state';
 import { focusTerminal } from './terminalFocus';
 import { appendAttachments } from './compose/attachments';
+import { harnessInstruction } from './harnessText';
 
 export const composeOpen = writable<boolean>(false);
 export const composeContent = writable<string>('');
@@ -79,17 +80,23 @@ export function closeCompose(): void {
 export async function submitCompose(): Promise<void> {
   const content = get(composeContent);
   const attachments = get(composeAttachments);
+  // V40 Phase E: the trailing instruction is the TARGET TAB's, fetched from the
+  // backend inventory (locked decision 24). Asked only when there is something
+  // to attach, so a plain-text submit still costs no IPC round trip.
+  const tab = get(activeTab);
+  const instruction =
+    attachments.length > 0 ? await harnessInstruction(tab, 'attachment') : '';
   // `appendAttachments` returns `content` unchanged when there are no
   // attachments, so an image-only draft (empty textarea, one pasted image)
   // still submits — only a truly empty draft (no text AND no attachments)
   // is a no-op.
-  const message = appendAttachments(content, attachments);
+  const message = appendAttachments(content, attachments, instruction);
   if (!message) {
     closeCompose();
     return;
   }
   try {
-    await ptyWrite(get(activeTab), message + '\r');
+    await ptyWrite(tab, message + '\r');
   } catch (e) {
     console.error('compose submit pty_write failed:', e);
   }

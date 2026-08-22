@@ -329,6 +329,28 @@ pub fn subcommand_for(argv: &[String]) -> Option<&'static super::plugin::Subcomm
         .find(|sub| argv.iter().any(|a| a == sub.flag))
 }
 
+/// The harness cImp is a **drop-in replacement for** — the one whose plugin
+/// says [`super::plugin::HarnessPlugin::accepts_passthrough_argv`] — or `None`.
+///
+/// Locked decision 26. `main.rs` stated the contract in its help text and
+/// `tabs::config` enforced it per tab, from two different places; this is the
+/// one lookup both use, so the sentence a user reads names the tab the args
+/// actually reach.
+///
+/// **At most one** is a real constraint, not a convention: forwarding one CLI's
+/// flags into another harness is how a tab fails to launch, and
+/// `at_most_one_harness_takes_the_passthrough_argv` fails the build if two
+/// declare it. With two declared this answers `None` rather than picking — the
+/// fail-closed direction, where the sentence names no harness instead of the
+/// wrong one.
+pub fn passthrough_harness() -> Option<HarnessId> {
+    let mut takers = HARNESSES
+        .iter()
+        .filter(|d| d.plugin.accepts_passthrough_argv());
+    let first = takers.next()?;
+    takers.next().is_none().then(|| HarnessId(first.id))
+}
+
 /// Every reserved built-in tab id, in canonical order across harnesses.
 ///
 /// The order `[claude, claude-local, opencode]` used to be a literal array in
@@ -473,6 +495,56 @@ impl<T: Default + Copy> Default for PerHarness<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A role name must be a tool the harness actually serves** (locked
+    /// decision 24).
+    ///
+    /// `tool_for_role` feeds text a model reads ("prefer … over a full Read"),
+    /// and its answer is a second spelling of a name that already exists in
+    /// `native_tools()`. Two spellings drift: a harness that renamed its read
+    /// tool would keep steering the model at the old name, in prose, silently.
+    #[test]
+    fn every_declared_tool_role_names_a_native_tool() {
+        use super::super::plugin::ToolRole;
+        for id in all() {
+            let Some(plugin) = id.plugin() else { continue };
+            for role in [ToolRole::Read, ToolRole::Shell] {
+                let Some(name) = plugin.tool_for_role(role) else {
+                    continue;
+                };
+                assert!(
+                    plugin.native_tools().iter().any(|t| t.name == name),
+                    "{id}: declares {name:?} for {role:?}, which is not one of its native tools \
+                     — the guidance would steer the model at a name it does not serve"
+                );
+            }
+        }
+    }
+
+    /// **At most one harness takes cImp's unrecognised argv** (locked decision
+    /// 26).
+    ///
+    /// cImp is documented as a drop-in for ONE binary. Two harnesses answering
+    /// `true` would forward one CLI's flags into the other's tabs — a launch
+    /// failure with no visible cause — and would make `passthrough_harness`
+    /// answer `None`, which would silently drop the contract from `--help`.
+    #[test]
+    fn at_most_one_harness_takes_the_passthrough_argv() {
+        let takers: Vec<&str> = HARNESSES
+            .iter()
+            .filter(|d| d.plugin.accepts_passthrough_argv())
+            .map(|d| d.id)
+            .collect();
+        assert!(
+            takers.len() <= 1,
+            "cImp can only be a drop-in replacement for one binary; these claim it: {takers:?}"
+        );
+        assert_eq!(
+            passthrough_harness().map(|h| h.token()),
+            takers.first().copied(),
+            "`passthrough_harness` and the descriptors disagree"
+        );
+    }
 
     #[test]
     fn ids_are_unique_and_non_empty() {

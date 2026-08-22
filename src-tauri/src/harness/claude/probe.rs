@@ -100,7 +100,7 @@ fn claude_help() -> Result<String, String> {
             Ok(Some(_)) => break,
             Ok(None) if Instant::now() < deadline => std::thread::sleep(SERVE_POLL_INTERVAL),
             Ok(None) => {
-                crate::procutil::kill_tree_blocking(&mut child);
+                crate::procutil::reap_probe_child(super::plugin::me(), &mut child);
                 return Err(format!(
                     "`claude --help` did not exit within {}s",
                     HELP_TIMEOUT.as_secs()
@@ -795,6 +795,31 @@ fn identity_outcome(tail: &Tail) -> Outcome {
         ),
     }
 }
+
+/// This probe's row in the external-process spawn ledger (V40 Phase E, locked
+/// decision 26).
+///
+/// The ledger's tripwire scans every `.rs` file for spawn constructors and
+/// demands a matching row, so the row has to exist — but `claude --help` is one
+/// product's command line, and core is not where a table of those belongs. The
+/// plugin hands it over through `HarnessPlugin::spawn_sites`.
+pub(crate) const SPAWN_SITES: &[crate::spawn_ledger::SpawnSite] = &[
+    crate::spawn_ledger::SpawnSite {
+        file: "harness/claude/probe.rs",
+        symbol: "claude_help",
+        spawns: "claude --help",
+        class: crate::spawn_ledger::SpawnClass::HostSpawn,
+        count: 1,
+        reason: "V35 Phase D's L2 live probe, reached only from `cimp --harness-canary` — a \
+                 maintenance command a human (or a scheduled script) runs, never a tool call, \
+                 and it exits before any Tauri/app init. The program is a FIXED name resolved \
+                 through `pty::resolve_command`, the argv is a literal in code, and no model \
+                 input reaches it. Sandboxing it would be self-defeating: the entire point is to \
+                 observe what the user's REAL installed harness does. V40 Phase A moved this \
+                 half of the old `harness/probe.rs` row into the plugin that owns it (locked \
+                 decision 17); the runner spawns nothing.",
+    },
+];
 
 #[cfg(test)]
 mod tests {

@@ -46,16 +46,28 @@ export function clipboardHasImage(types: readonly string[]): boolean {
   return types.some((t) => t.startsWith('image/'));
 }
 
-/// Appends one `[image] <path>` line per attachment, followed by a single
-/// trailing instruction line, to `content`. Both Claude Code and OpenCode
+/// Appends one `[image] <path>` line per attachment, followed by the harness's
+/// `attachment` instruction line, to `content`. Both Claude Code and OpenCode
 /// accept local image paths dropped straight into the prompt text as plain
 /// path text — no special markup needed (verified against both; milestone
 /// Decision 3). Returns `content` unchanged when there are no attachments,
 /// so a plain-text submit is byte-identical to before Phase B.
-export function appendAttachments(content: string, attachments: string[]): string {
+///
+/// V40 Phase E (locked decision 24): `instruction` is model-visible text and
+/// therefore comes from the backend's instruction inventory
+/// (`harness_instructions`), not from a literal here — a string the model reads
+/// that only the frontend knows is one nothing can enumerate. An EMPTY
+/// instruction appends nothing rather than an empty line: the paths still
+/// submit, which is the honest degradation when the backend could not be asked.
+export function appendAttachments(
+  content: string,
+  attachments: string[],
+  instruction: string,
+): string {
   if (attachments.length === 0) return content;
   const lines = attachments.map((p) => `\n[image] ${p}`).join('');
-  return `${content}${lines}\nRead the attached image file(s).`;
+  const tail = instruction.trim() ? `\n${instruction.trim()}` : '';
+  return `${content}${lines}${tail}`;
 }
 
 /// Reads the system clipboard's image (via the Tauri plugin — never

@@ -460,6 +460,28 @@ pub enum TabId {
 }
 
 impl TabId {
+    /// **The fallback identity for a reader that must answer with SOME tab** —
+    /// the first registered harness's first built-in tab (V40 Phase E, locked
+    /// decision 26).
+    ///
+    /// Three hot paths need one: the boot active-tab resolution when settings
+    /// name no surviving tab, and the two poisoned-lock reads of the shared
+    /// active-tab cell (`audio::playback`, `notifications::manager`), where a
+    /// `panic!` would permanently kill the audio or notification task. All three
+    /// used to say `TabId::Claude` — "when in doubt, Claude", six times over,
+    /// which is what locked decision 2 removed everywhere else.
+    ///
+    /// It is still a guess; what changed is that it is the REGISTRY's guess and
+    /// moves with the registry, so a build that ships a different first harness
+    /// does not silently fall back to one it does not ship.
+    pub fn first_harness_default() -> TabId {
+        crate::harness::registry::HARNESSES
+            .first()
+            .and_then(|d| d.tab_ids.first())
+            .map(|id| TabId::from_str(id))
+            .unwrap_or(TabId::Claude)
+    }
+
     pub fn as_str(&self) -> &str {
         match self {
             TabId::Claude => "claude",

@@ -997,14 +997,13 @@ const IDENTITY_ALLOWLIST: &[(&str, &str)] = &[
     // for. `claude_tab_dirs` is `harness_tab_dirs(.., HarnessId)` now and the
     // plugin route passes the id it already is, so the question is asked by the
     // harness rather than answered for it (locked decision 22).
-    (
-        "ipc/tab_lifecycle.rs",
-        "ONE line: the `resolve_command(\"opencode\")` preflight that warns before enabling a \
-         tab whose CLI is not installed. Locked decision 26 makes it \
-         `HarnessPlugin::preflight()`, with Claude's \"not gated\" becoming a declared `Ok` \
-         rather than an absence. Phase A already replaced this file's canonical-order array \
-         with the registry view. Phase F.",
-    ),
+    // `ipc/tab_lifecycle.rs` left this list in V40 Phase E, and its reason named
+    // exactly what happened: the `resolve_command("opencode")` preflight is
+    // `HarnessPlugin::preflight()` (locked decision 26), asked of every harness
+    // whose tab is being turned on, and Claude's "intentionally not gated — it's
+    // the app's own front end" is a declared `Ok` instead of a comment beside an
+    // `if`. The refusal it raises carries the harness token, label and install
+    // hint the plugin supplied, so `TabLifecycleError` names no product either.
 ];
 
 /// The identity needles: every registry id, tab id, binary and consumer token.

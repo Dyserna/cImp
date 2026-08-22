@@ -66,7 +66,7 @@ use crate::ipc::commands::{
     graph_note_review, graph_note_set_pinned, graph_path, graph_rebuild, graph_rebuild_embeddings,
     graph_session_usage, graph_set_language_enabled, graph_set_watch_paused, graph_status,
     graph_tab_session, graph_test_embedder, graph_usage, graph_usage_advice, graph_viz_ego, graph_viz_file_status,
-    graph_viz_snapshot, harness_mark_verified, harness_usage, harness_run_checks, harness_settings_schema,
+    graph_viz_snapshot, harness_instructions, harness_mark_verified, harness_usage, harness_run_checks, harness_settings_schema,
     harness_versions_get, injection_status,
     latch_override, latch_status,
     list_tabs, list_voices,
@@ -115,18 +115,32 @@ use crate::stt::SttHandle;
 use crate::tabs::{TabRegistry, TabRegistryHandle};
 use crate::tts::{spawn_tts_worker, ActiveTab, AiTtsSuppressed, SpeakSession, TtsRequest};
 
-/// Usage text for `cimp --help`. Lists the drop-in `claude` forwarding
-/// contract and the service flags so an agent probing the CLI learns the
-/// surface instead of launching a GUI window per probe.
+/// Usage text for `cimp --help`. Lists the drop-in forwarding contract and the
+/// service flags so an agent probing the CLI learns the surface instead of
+/// launching a GUI window per probe.
+///
+/// **V40 Phase E (locked decision 26): the forwarding sentence is composed from
+/// the registry**, not written here. Exactly one harness declares
+/// `accepts_passthrough_argv`, and that is the harness the args actually reach —
+/// so the promise a user reads and the tab they land in cannot disagree, and a
+/// build whose passthrough harness changed does not ship a help text about the
+/// old one.
 fn help_text() -> String {
+    let (label, binary) = crate::harness::registry::passthrough_harness()
+        .and_then(|h| h.descriptor())
+        .map(|d| (d.label, d.binaries.first().copied().unwrap_or(d.id)))
+        .unwrap_or(("the AI", "the harness"));
+    let usage = format!(
+        "  cimp [ARGS...]          launch the GUI in the current directory; unrecognized\n\
+                          args are forwarded verbatim to the {label} tab\n\
+                          (drop-in `{binary}` replacement, e.g. `cimp --resume <id>`)"
+    );
     format!(
         "\
 cimp {} — code Imp: a TTS/avatar terminal for AI coding agents
 
 USAGE:
-  cimp [CLAUDE_ARGS...]   launch the GUI in the current directory; unrecognized
-                          args are forwarded verbatim to the Claude tab
-                          (drop-in `claude` replacement, e.g. `cimp --resume <id>`)
+{usage}
 
 INFO:
   -h, --help              print this help and exit
@@ -134,8 +148,8 @@ INFO:
 
 MAINTENANCE:
   --harness-canary [--json]
-                          probe the INSTALLED Claude Code / OpenCode CLIs against
-                          cImp's harness capability registry and print one line per
+                          probe the INSTALLED harness CLIs against cImp's harness
+                          capability registry and print one line per
                           capability. Needs no running cImp. Exits non-zero ONLY on
                           real drift — an absent CLI or an upstream improvement
                           reports `unknown` / `transition` and exits 0.
@@ -149,7 +163,7 @@ MAINTENANCE:
                           exits non-zero only if it could write nothing at all.
 
 SERVICE FLAGS (spawned by agent harnesses over stdio; not for interactive use):
-  --statusline                           Claude Code status-line renderer
+  --statusline                           a harness status-line renderer
   --offload-mcp [--consumer <name>] [--tab <id>] [--channel-push]
                                          stdio MCP server (offload + graph + proxied servers)
   --code-audit-mcp [--consumer <name>] [--tab <id>]
@@ -230,8 +244,9 @@ fn main() {
     // Claude Code running `cimp --help`, `cimp help`, `cimp code-audit --help`
     // in a project where the audit MCP server wasn't advertised). Handled
     // first and GUI-free like the service shims below. Everything else still
-    // falls through: `cimp` is a drop-in `claude` replacement and forwards
-    // unrecognized args to the Claude tab.
+    // falls through: `cimp` is a drop-in replacement for whichever harness
+    // declares `accepts_passthrough_argv`, and forwards unrecognized args to
+    // that harness's tabs (V40 locked decision 26).
     {
         let early: Vec<String> = std::env::args().skip(1).collect();
         let wants_help = early.iter().any(|a| a == "--help" || a == "-h")
@@ -593,7 +608,9 @@ fn main() {
             tab_metas
                 .first()
                 .map(|m| m.id.clone())
-                .unwrap_or(TabId::Claude)
+                // V40 Phase E (locked decision 26): the registry's own default,
+                // not a named harness — see `TabId::first_harness_default`.
+                .unwrap_or_else(TabId::first_harness_default)
         });
     drop(snap);
     let tts_active: ActiveTab = Arc::new(RwLock::new(initial_active.clone()));
@@ -1214,6 +1231,7 @@ fn main() {
             advisor_mark_applied,
             harness_versions_get,
             harness_settings_schema,
+            harness_instructions,
             harness_mark_verified,
             harness_run_checks,
             workbench_status,

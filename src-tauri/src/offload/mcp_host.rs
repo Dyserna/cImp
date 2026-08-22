@@ -1028,6 +1028,28 @@ pub enum Consumer {
 }
 
 impl Consumer {
+    /// **The grant a request from one of cImp's OWN in-app consumers is judged
+    /// under, on a surface that only serves harness children** (V40 locked
+    /// decision 25).
+    ///
+    /// `Consumer::Offload` and `Consumer::Audit` cannot legitimately reach the
+    /// per-session MCP proxy — the offload worker and the audit fan-out call the
+    /// host in-process — so a query naming one is either a stray value or a
+    /// caller mistake. Both are folded onto a HARNESS's grants rather than onto
+    /// the `offload_access` flag, because that flag means "cImp's own in-app
+    /// consumers may reach this server" and honouring it here would let a stray
+    /// value WIDEN what a proxied child is served.
+    ///
+    /// **This is a security default and it stays in core**, named, with this
+    /// paragraph, and pinned by
+    /// `tests::the_conservative_grant_never_answers_an_in_app_consumer`. It is
+    /// not a harness fact: nothing about Claude Code decides it, and the harness
+    /// it happens to resolve to is `DEFAULT_HARNESS` only because that is the
+    /// documented stand-in for a consumer cImp cannot name (locked decision 22).
+    pub fn conservative_grant() -> Consumer {
+        Consumer::Harness(crate::harness::DEFAULT_HARNESS)
+    }
+
     /// Parse the `--consumer` discriminator the per-session child is launched
     /// with.
     ///
@@ -3970,6 +3992,37 @@ fn confine_filesystem(cfg: &McpServerConfig, args: &mut Vec<String>, allowed_roo
 
 #[cfg(test)]
 mod tests {
+
+    /// **The conservative grant never answers one of cImp's OWN consumers**
+    /// (V40 locked decision 25).
+    ///
+    /// The rule folds `Offload` and `Audit` onto a harness's grants on the
+    /// proxy surface, and the whole point is the DIRECTION: answering
+    /// `Consumer::Offload` there would judge a stray query value against the
+    /// `offload_access` flag — "cImp's own in-app consumers may reach this
+    /// server" — and hand a proxied harness child a server the user never
+    /// exposed to it.
+    #[test]
+    fn the_conservative_grant_never_answers_an_in_app_consumer() {
+        let grant = Consumer::conservative_grant();
+        assert!(
+            matches!(grant, Consumer::Harness(_)),
+            "the fold must land on a harness's grants, not on `offload_access`: {grant:?}"
+        );
+        // …and it names a REGISTERED harness, so `granted` reads a real slot
+        // rather than falling through to `unwrap_or(false)` — which would be
+        // fail-closed, but silently, and for the wrong reason.
+        if let Consumer::Harness(h) = grant {
+            assert!(
+                h.ordinal().is_some(),
+                "{h} has no registry slot; every access lookup for it would answer false"
+            );
+        }
+        // The fold is not a widening: with every harness denied, the folded
+        // consumer is denied too.
+        let denied = crate::harness::PerHarness::filled(false);
+        assert!(!grant.granted(&denied, true), "the fold must not read `offload_access`");
+    }
     use super::*;
 
     #[tokio::test]

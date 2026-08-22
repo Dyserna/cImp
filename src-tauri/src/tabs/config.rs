@@ -557,9 +557,22 @@ pub(crate) fn compose_capability_guidance(cfg: &AiToolTabConfig, settings: &Sett
         if !addendum.is_empty() {
             addendum.push_str("\n\n");
         }
-        addendum.push_str(GRAPH_GUIDANCE);
+        // V40 Phase E, locked decision 24: the graph nudge is model-visible text
+        // and it NAMES a harness tool ("over a full Read", "the test command in
+        // Bash"). It comes from the instruction inventory now, rendered in this
+        // tab's own vocabulary — a tab that runs no registered harness gets the
+        // neutral rendering rather than Claude's tool ids, which is what it used
+        // to be handed.
+        let harness = tab_harness(cfg);
+        addendum.push_str(crate::harness::instructions::text(
+            harness,
+            crate::harness::instructions::Slot::GraphGuidance,
+        ));
         if settings.graph.semantic_search {
-            addendum.push_str(GRAPH_SEMANTIC_GUIDANCE);
+            addendum.push_str(crate::harness::instructions::text(
+                harness,
+                crate::harness::instructions::Slot::GraphSemantic,
+            ));
         }
     }
     if settings.graph.enabled && settings.graph.promote_pinned_facts {
@@ -753,37 +766,6 @@ instead of doing the work yourself: it returns only a synthesized result, conser
 window. Keep work that needs your full reasoning or the conversation's context here. Set the \
 `thinking` arg to 'off' for simple lookups/extraction, 'on' for analysis, or leave it 'auto'.";
 
-/// V9-01: the system-prompt addendum telling Opus the code-knowledge-graph
-/// tools exist. Gated on `graph.enabled` (the tools are only injected then).
-const GRAPH_GUIDANCE: &str = "This project has a code knowledge graph (from the cimp-offload MCP \
-server). Prefer the `graph_*` tools over grep for code-structure questions: `graph_find_symbol` \
-(where a symbol is defined), `graph_callers`/`graph_callees` (call relationships), \
-`graph_references`, `graph_imports`, `graph_outline` (a file's definitions), `graph_snippet` \
-(fetch just one definition's body instead of reading the whole file — for files over ~300 lines \
-prefer `graph_outline` → `graph_snippet` over a full Read), `graph_transitive` \
-(transitive call chains), `graph_search_docs` (documentation/doc-comments), and \
-`graph_struct_search` (find code by AST shape via a tree-sitter query — e.g. every `.unwrap()` or \
-every function with a given parameter pattern — when text search can't express the structure). They \
-return precise, token-bounded results from an index, so they're cheaper and more exact than text \
-search for 'where is X defined', 'who calls X', and impact analysis. `graph_dead_exports` lists \
-candidate unused public symbols and `graph_cycles` lists import cycles. For the edit→check→fix \
-loop: before changing shared code run `graph_impact` (what your working-tree diff could break) and \
-`graph_tests_for` (which tests cover a symbol); after edits run `run_check` for deduplicated \
-diagnostics instead of a raw build dump — pass `name` (the check to run; its schema lists this \
-project's configured names, and it is required when there is more than one) plus \
-`changed_only:true`, e.g. `run_check {name: <one of the schema's names>, changed_only: true}` — \
-including test runs: prefer a configured test check over running the test command in Bash; it \
-returns failures only; `graph_recent_changes` shows what's been churning lately. This project also has \
-session memory: call `context_recall` at the start of a follow-up task to reload what this session \
-has been working on, and `context_note` to record a non-obvious decision (pin=true to keep it \
-across sessions) so it survives into later sessions.";
-
-/// V9-01: appended after [`GRAPH_GUIDANCE`] only when semantic search is on
-/// (the `graph_semantic_docs` tool is advertised to Opus only then).
-const GRAPH_SEMANTIC_GUIDANCE: &str = " Also available: `graph_semantic_docs`, a meaning-based \
-(embedding) search over the project's docs and doc-comments — use it when you want relevant \
-material that may not share keywords with your query.";
-
 /// V32 Phase D — the **data-not-instructions contract**, stated once per
 /// session for both consumers.
 ///
@@ -931,22 +913,18 @@ fn build_extra_args(
 /// precedence over synthesized values. The merge order is:
 /// synthesized → tab.env (per-tab keys never get overwritten).
 ///
-/// Synthesis is gated on `use_local_provider` and the resolved binary,
-/// not the `TabId` variant — so a `+`-spawned duplicate is treated
-/// exactly like the reserved tab it was cloned from:
+/// Synthesis is the PLUGIN's, resolved from the tab's command and not from the
+/// `TabId` variant — so a `+`-spawned duplicate is treated exactly like the
+/// reserved tab it was cloned from, and a tab whose command matches no
+/// registered harness gets no synthesized provider env at all (the user's own
+/// configuration is in charge).
 ///
-/// - Claude binary + `use_local_provider`: synthesize
-///   `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_MODEL`
-///   from `claude_local`.
-/// - OpenCode binary: always set `OPENCODE_CONFIG_CONTENT` (the synthesized
-///   session config), the 2026-08-17 server-auth pair (a fresh per-spawn
-///   password, so the TUI's own HTTP server stops serving unauthenticated
-///   loopback calls — `harness::opencode::config::server_auth_env`), plus the
-///   noise-suppression env vars. When
-///   `use_local_provider`, the local endpoint is carried inside that config
-///   as a `provider` block (see `build_opencode_config`), not as env.
-/// - Anything else (cloud Claude, `use_local_provider` off): no synthesized
-///   provider env — the user's existing configuration is in charge.
+/// **What each harness synthesizes is documented with that harness**
+/// (`HarnessPlugin::compose_env`, and the config-file half behind
+/// `HarnessPlugin::config_writer` — locked decision 26). This list used to be
+/// here, naming one harness's `ANTHROPIC_*` variables and another's config
+/// document, which made a core function the place an upstream env rename would
+/// have to be noticed.
 ///
 /// V28: `tab` is passed straight through to [`build_opencode_config`], which
 /// bakes it into the `cimp-offload` child's argv.
@@ -2892,6 +2870,70 @@ mod tests {
         assert!(text.len() < 1200, "too long to ride every session: {}", text.len());
     }
 
+    /// **The system-prompt addendum, byte for byte, per harness** (V40 Phase E,
+    /// locked decision 24).
+    ///
+    /// Claude's golden was captured from the tree BEFORE `GRAPH_GUIDANCE` was
+    /// templated, so this asserts the one thing the templating had to preserve:
+    /// that a Claude session is told exactly what it was told before. OpenCode's
+    /// is the same capture with the two tool names it always should have carried
+    /// — so the diff between the two files is the whole behaviour change.
+    ///
+    /// A golden rather than a `contains`: the substitution runs over a 3 KB
+    /// paragraph a model reads every session, and a stray placeholder or a lost
+    /// separator is exactly the kind of thing a `contains` assertion misses.
+    #[test]
+    fn the_system_prompt_addendum_matches_its_harness_golden() {
+        let mut settings = Settings::default();
+        settings.graph.enabled = true;
+        settings.graph.semantic_search = true;
+        settings.offload.enabled = true;
+        settings.offload.inject_guidance = true;
+        for (dir, cfg) in [("claude", claude_cfg()), ("opencode", opencode_cfg())] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("fixtures")
+                .join("plugin-goldens")
+                .join(dir)
+                .join("system-prompt-addendum.txt");
+            let golden = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+                .replace("\r\n", "\n");
+            let actual = compose_capability_guidance(&cfg, &settings).replace("\r\n", "\n");
+            assert_eq!(
+                actual,
+                golden,
+                "{dir}: the model-visible addendum changed. If that was deliberate, update \
+                 {} — after reading the diff.",
+                path.display()
+            );
+        }
+    }
+
+    /// The one INTENDED difference between the two goldens: each harness's own
+    /// tool names, and nothing else.
+    ///
+    /// Asserted as a property rather than trusted to the files, because two
+    /// goldens that silently drifted apart in some other sentence would still
+    /// both pass the test above.
+    #[test]
+    fn the_two_addenda_differ_only_in_the_harnesss_own_tool_names() {
+        let mut settings = Settings::default();
+        settings.graph.enabled = true;
+        settings.graph.semantic_search = true;
+        settings.offload.enabled = true;
+        settings.offload.inject_guidance = true;
+        let claude = compose_capability_guidance(&claude_cfg(), &settings);
+        let opencode = compose_capability_guidance(&opencode_cfg(), &settings);
+        assert_ne!(claude, opencode, "the templating did nothing");
+        let normalised = opencode
+            .replace("over a full read)", "over a full Read)")
+            .replace("command in bash;", "command in Bash;");
+        assert_eq!(
+            claude, normalised,
+            "the two addenda differ somewhere other than the two templated tool names"
+        );
+    }
+
     /// It rides both consumers' launch injections whenever the consumer-hygiene
     /// control is on for that tab — which, since V37 Phase F, is the whole gate
     /// (the `cimp-offload` proxy is in every AI tab and its surface changes
@@ -2910,7 +2952,17 @@ mod tests {
                 "{}: contract must lead the addendum, got: {text}",
                 cfg.command
             );
-            assert!(text.contains(GRAPH_GUIDANCE), "{}: {text}", cfg.command);
+            // The graph nudge each tab actually gets is its OWN rendering
+            // (locked decision 24) — asserting the Claude one for both is the
+            // defect Phase E fixed.
+            assert!(
+                text.contains(crate::harness::instructions::text(
+                    tab_harness(&cfg),
+                    crate::harness::instructions::Slot::GraphGuidance
+                )),
+                "{}: {text}",
+                cfg.command
+            );
         }
         // Claude's flag actually carries it.
         let args = build_pre_args(&claude_cfg(), &settings, "claude", Some(&hook_endpoint()));

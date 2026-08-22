@@ -1080,18 +1080,20 @@ impl OffloadService {
             // This loopback proxy only serves the interactive HARNESS children;
             // the offload worker reaches the host in-process, never via this
             // route. An unexpected `offload` query value therefore can't arrive
-            // in practice — fall back to the default harness's set (the
-            // conservative, grant-guarded default) rather than leaking the
-            // offload set.
+            // in practice — it is answered under `Consumer::conservative_grant`
+            // (V40 locked decision 25, where the rule is written down) rather
+            // than leaking the offload set.
             //
             // V38 Phase F: `Audit` lands here for the same reason and never in
             // practice — the audit fan-out advertises nothing and calls a name
             // its manifest already fixed, so it has no `tools/list` at all.
-            Consumer::Offload | Consumer::Audit => {
-                self.host
-                    .tool_defs_for(crate::harness::DEFAULT_HARNESS)
-                    .await
-            }
+            Consumer::Offload | Consumer::Audit => match Consumer::conservative_grant() {
+                Consumer::Harness(h) => self.host.tool_defs_for(h).await,
+                // Unreachable by construction (the rule answers a harness) and
+                // fail-closed if it ever stopped being: advertise nothing rather
+                // than guess.
+                _ => Vec::new(),
+            },
         };
         defs.into_iter()
             .map(|d| {
@@ -1172,16 +1174,15 @@ impl OffloadService {
         audit: &dyn outbound::ScopeAudit,
     ) -> Result<String, super::mcp_host::HostError> {
         // See `mcp_tool_descriptors`: `offload` never legitimately reaches
-        // this proxy; fall back to the Claude-guarded set.
+        // this proxy.
         let consumer = match consumer {
             Consumer::Harness(h) => Consumer::Harness(h),
             // V38 Phase F: `Audit` cannot reach this route either — the fan-out
-            // calls the host directly, in-process. Folded onto the DEFAULT
-            // harness's grants with the worker, so a stray query value can never
-            // widen a grant by naming a consumer this proxy does not serve.
-            Consumer::Offload | Consumer::Audit => {
-                Consumer::Harness(crate::harness::DEFAULT_HARNESS)
-            }
+            // calls the host directly, in-process. Both fold onto
+            // `Consumer::conservative_grant` (V40 locked decision 25), so a stray
+            // query value can never widen a grant by naming a consumer this proxy
+            // does not serve.
+            Consumer::Offload | Consumer::Audit => Consumer::conservative_grant(),
         };
         let snap = self.settings.current();
         let agent = crate::graph::source_for_consumer(consumer.source());

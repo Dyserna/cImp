@@ -67,6 +67,9 @@ use crate::settings::{
     BackendTier, OffloadBackend, OffloadBackendKind, OffloadSettings, ToolScope,
 };
 
+/// The MCP protocol version cImp itself speaks. A CONSUMER may pin another —
+/// `HarnessPlugin::mcp_protocol_version` — because "which era does this client
+/// honour" is a fact about the client (V40 Phase E, locked decision 25).
 const PROTOCOL_VERSION: &str = "2025-06-18";
 const SERVER_NAME: &str = "cimp-offload";
 
@@ -74,6 +77,19 @@ const SERVER_NAME: &str = "cimp-offload";
 /// `"claude"`). Threaded onto the loopback `/mcp/*` queries so the app returns
 /// the right per-consumer MCP-server tool set. Set once at startup.
 static CONSUMER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// The harness behind [`consumer`], or `None` when this child serves one of
+/// cImp's own in-app consumers (`offload`, `audit`) or a token nobody
+/// registered.
+///
+/// V40 Phase E: the ONE lookup the MCP-client specifics go through. Everything
+/// Claude-shaped about this handshake — the `claude/channel` capability key, the
+/// `notifications/claude/channel` method, the protocol-era pin — is now asked of
+/// this harness's plugin instead of written by core for whoever happened to have
+/// push armed.
+fn consumer_harness() -> Option<crate::harness::HarnessId> {
+    crate::harness::HarnessId::from_consumer(consumer())
+}
 
 /// V28 (issue #13): the cImp TAB this child was spawned for (from
 /// `--tab <tab-id>`). One `--offload-mcp` child runs per tab and its argv is
@@ -359,8 +375,16 @@ async fn handle(method: &str, params: Value) -> Result<Value, (i64, String)> {
             // discarded) so the handshake is reported exactly once on stderr —
             // the line one looks for when a push goes missing.
             record_client_init(&params);
+            let harness = consumer_harness();
+            // The consumer's own protocol pin, if it has one (locked decision
+            // 25). Claude Code honours channel notifications only in the
+            // `2025-06-18` era; a harness that pins nothing gets cImp's version.
+            let protocol = harness
+                .and_then(|h| h.plugin())
+                .and_then(|p| p.mcp_protocol_version())
+                .unwrap_or(PROTOCOL_VERSION);
             let mut result = json!({
-                "protocolVersion": PROTOCOL_VERSION,
+                "protocolVersion": protocol,
                 "capabilities": { "tools": { "listChanged": true } },
                 "serverInfo": { "name": SERVER_NAME, "version": env!("CARGO_PKG_VERSION") }
             });
@@ -368,7 +392,7 @@ async fn handle(method: &str, params: Value) -> Result<Value, (i64, String)> {
             // `instructions` when session push is armed for THIS child (a pure
             // argv read — see `session_push_enabled`).
             let declared = if session_push_enabled() {
-                decorate_initialize_channel(&mut result, CHANNEL_INSTRUCTIONS);
+                decorate_initialize_channel(&mut result, harness);
                 true
             } else {
                 false
@@ -378,8 +402,8 @@ async fn handle(method: &str, params: Value) -> Result<Value, (i64, String)> {
                 // the one line that tells a user debugging a missing push
                 // whether the SERVER half of the handshake happened at all.
                 eprintln!(
-                    "cimp-offload: declared the claude/channel capability \
-                     (session push armed for consumer {})",
+                    "cimp-offload: declared the session-push channel capability \
+                     (armed for consumer {})",
                     consumer()
                 );
             }
@@ -1997,15 +2021,27 @@ async fn dispatch_sse_frame(stdout: &Arc<TokioMutex<tokio::io::Stdout>>, frame: 
                 // so say so where a user debugging a missing push will see it.
                 eprintln!(
                     "cimp-offload: dropped a session push — this connection never declared \
-                     the claude/channel capability (enable offload.session_push and restart \
+                     the channel capability (enable offload.session_push and restart \
                      the tab)"
                 );
                 return;
             }
+            // The method name is the consumer's (locked decision 25) — the twin
+            // of the capability key it declared at `initialize`. A push sent
+            // under any other name is dropped client-side, silently.
+            let Some(method) = consumer_harness()
+                .and_then(|h| h.plugin())
+                .and_then(|p| p.push_notification_method())
+            else {
+                eprintln!(
+                    "cimp-offload: dropped a session push — consumer {} declares no channel \
+                     notification method",
+                    consumer()
+                );
+                return;
+            };
             match channel_params(&frame.data) {
-                Some(params) => {
-                    emit_notification(stdout, "notifications/claude/channel", Some(params)).await
-                }
+                Some(params) => emit_notification(stdout, method, Some(params)).await,
                 None => eprintln!(
                     "cimp-offload: dropped an unusable session push payload ({} bytes)",
                     frame.data.len()
@@ -2054,24 +2090,32 @@ async fn emit_list_changed(stdout: &Arc<TokioMutex<tokio::io::Stdout>>) {
 
 // ── V30 Phase A: session-push capability declaration ───────────────────────
 
-/// The system-prompt `instructions` block injected alongside the channel
-/// capability when `offload.session_push` is on.
-///
-/// It tells the model what a `<channel source="cimp-offload">` message is and
-/// how to treat one. The "do not invent" clause is deliberate: a channel
-/// message is a plain user-role message from the model's point of view, so
-/// without it the pattern is trivially imitable in the model's own output.
-const CHANNEL_INSTRUCTIONS: &str = "cimp-offload may push out-of-band notices into this session as <channel source=\"cimp-offload\"> messages — completion notices from the local toolchain (offloaded tasks, code audits, graph indexing). When one arrives, take it into account: act on it if it is relevant to the current task, otherwise acknowledge it briefly. Do not invent channel messages; only react to ones actually delivered.";
+/// The system-prompt `instructions` block, from the model-visible text
+/// inventory (V40 Phase E, locked decision 24 — the text itself lives in
+/// `harness::instructions`, which is what makes it enumerable).
+fn channel_instructions(harness: Option<crate::harness::HarnessId>) -> &'static str {
+    crate::harness::instructions::text(harness, crate::harness::instructions::Slot::Channel)
+}
 
-/// Add `capabilities.experimental["claude/channel"]` + the top-level
-/// `instructions` string to an otherwise-unchanged `initialize` result.
+/// Add the consumer's own channel capability + the top-level `instructions`
+/// string to an otherwise-unchanged `initialize` result.
+///
+/// **Two halves with two owners** (V40 Phase E, locked decision 25). The
+/// `instructions` block is cImp's text about cImp's channel, so it comes from
+/// the model-visible inventory; the capability KEY lives in one vendor's
+/// namespace (`experimental["claude/channel"]`) and is written by that harness's
+/// plugin. Core used to write both, for whichever consumer had push armed — so
+/// the second harness to grow an inbound MCP path would have been handed
+/// Claude's key.
 ///
 /// Pure, so a test can pin both the addition and the untouched base — notably
 /// `protocolVersion`, which MUST stay on the legacy `2025-06-18` era where the
 /// client honours channels (milestone invariant 1), and `tools.listChanged`.
-fn decorate_initialize_channel(result: &mut Value, instructions: &str) {
-    result["capabilities"]["experimental"] = json!({ "claude/channel": {} });
-    result["instructions"] = Value::String(instructions.to_string());
+fn decorate_initialize_channel(result: &mut Value, harness: Option<crate::harness::HarnessId>) {
+    if let Some(plugin) = harness.and_then(|h| h.plugin()) {
+        plugin.decorate_initialize(result);
+    }
+    result["instructions"] = Value::String(channel_instructions(harness).to_string());
 }
 
 /// Whether this child should declare the channel capability.
@@ -2738,6 +2782,12 @@ mod tests {
 
     // ── V30 Phase A: session push ────────────────────────────────────────
 
+    /// The harness this child's tests speak for. `consumer()` answers the
+    /// default harness when `run` never set it, which is the case in tests.
+    fn test_harness() -> Option<crate::harness::HarnessId> {
+        consumer_harness()
+    }
+
     /// A base `initialize` result, exactly as the handler builds it.
     fn base_initialize() -> Value {
         json!({
@@ -2754,13 +2804,28 @@ mod tests {
     /// bump here would silently kill session push.
     #[test]
     fn channel_decoration_preserves_the_legacy_handshake() {
+        let harness = test_harness();
         let mut result = base_initialize();
-        decorate_initialize_channel(&mut result, CHANNEL_INSTRUCTIONS);
+        decorate_initialize_channel(&mut result, harness);
         assert_eq!(result["protocolVersion"], "2025-06-18");
         assert_eq!(result["capabilities"]["tools"]["listChanged"], json!(true));
         assert_eq!(result["serverInfo"]["name"], SERVER_NAME);
-        assert!(result["capabilities"]["experimental"]["claude/channel"].is_object());
-        assert_eq!(result["instructions"], json!(CHANNEL_INSTRUCTIONS));
+        // The capability key is the CONSUMER's, written by its plugin (locked
+        // decision 25) — core no longer knows the namespace.
+        let experimental = result["capabilities"]["experimental"]
+            .as_object()
+            .expect("the consumer declared its channel capability");
+        assert_eq!(experimental.len(), 1);
+        assert!(experimental.values().all(|v| v.is_object()));
+        assert_eq!(result["instructions"], json!(channel_instructions(harness)));
+        // …and the pin the consumer declares is the era it is answered in.
+        assert_eq!(
+            harness
+                .and_then(|h| h.plugin())
+                .and_then(|p| p.mcp_protocol_version()),
+            Some("2025-06-18"),
+            "the channel-honouring era is a pin, not a preference"
+        );
     }
 
     /// An undecorated handshake carries neither key — the default-off setting
@@ -2778,8 +2843,9 @@ mod tests {
     /// is trivially imitable).
     #[test]
     fn channel_instructions_cover_the_delivery_contract() {
-        assert!(CHANNEL_INSTRUCTIONS.contains("<channel source=\"cimp-offload\">"));
-        assert!(CHANNEL_INSTRUCTIONS.contains("Do not invent channel messages"));
+        let text = channel_instructions(test_harness());
+        assert!(text.contains("<channel source=\"cimp-offload\">"));
+        assert!(text.contains("Do not invent channel messages"));
     }
 
     /// V30 Phase A: the client's `clientInfo` is no longer discarded — it is
@@ -2980,8 +3046,12 @@ mod tests {
         let params = channel_params(r#"{"content":"audit done","meta":{"kind":"audit"}}"#).unwrap();
         assert_eq!(params["content"], "audit done");
         assert_eq!(params["meta"]["kind"], "audit");
-        let frame = notification_frame("notifications/claude/channel", Some(params));
-        assert_eq!(frame["method"], "notifications/claude/channel");
+        let method = test_harness()
+            .and_then(|h| h.plugin())
+            .and_then(|p| p.push_notification_method())
+            .expect("this consumer declares a push method");
+        let frame = notification_frame(method, Some(params));
+        assert_eq!(frame["method"], method);
         assert_eq!(frame["params"]["content"], "audit done");
 
         // A push with no meta still carries an (empty) meta object.
@@ -3030,8 +3100,12 @@ mod tests {
         // contract: keys `^[a-zA-Z_][a-zA-Z0-9_]*$` (others silently dropped)
         // with STRING values. Pinned end to end from a real producer notice —
         // this is what the Phase 0 spike rig used to verify by hand.
-        let frame = notification_frame("notifications/claude/channel", Some(params));
-        assert_eq!(frame["method"], "notifications/claude/channel");
+        let method = test_harness()
+            .and_then(|h| h.plugin())
+            .and_then(|p| p.push_notification_method())
+            .expect("this consumer declares a push method");
+        let frame = notification_frame(method, Some(params));
+        assert_eq!(frame["method"], method);
         let meta = frame["params"]["meta"].as_object().unwrap();
         assert!(!meta.is_empty());
         for (k, v) in meta {
@@ -3153,22 +3227,16 @@ mod tests {
 /// leave a tool that lists but does not dispatch.
 const DELEGATE_TOOL_PREFIX: &str = "delegate_task_";
 
-/// **The pinned contract sentence** (locked decision 3), templated with the
-/// harness display name.
+/// **The pinned contract sentence** (locked decision 3), from the model-visible
+/// inventory, already templated with this harness's descriptor label.
 ///
-/// Every generated description opens with this, and
-/// `every_generated_delegate_tool_opens_with_the_pinned_sentence` asserts it.
-/// It is the whole distinction between this tool and `offload_task`: not *what
-/// the work is*, but **who decided to hand it off**. A model that read only the
-/// tool name would call this whenever it wanted help; the sentence is what
-/// makes it a user-directed instrument.
-fn delegate_tool_contract(display: &str) -> String {
-    format!(
-        "Hand a task to an open {display} tab and return its answer. Call this ONLY when the user \
-         explicitly asked for a task to be delegated to {display} (e.g. \"send this to \
-         {display}\"). Never call it on your own initiative — for work you decide to offload \
-         yourself, use `offload_task`, which you may call automatically whenever you judge it \
-         useful."
+/// V40 Phase E, locked decision 24: the sentence is text cImp puts in front of a
+/// model, so it lives in `harness::instructions` with every other such string
+/// rather than in a `format!` nothing can enumerate.
+fn delegate_tool_contract(harness: crate::harness::HarnessId) -> &'static str {
+    crate::harness::instructions::text(
+        Some(harness),
+        crate::harness::instructions::Slot::DelegateContract,
     )
 }
 
@@ -3204,7 +3272,7 @@ fn current_settings_full() -> crate::settings::Settings {
 fn delegate_targets(
     settings: &crate::settings::Settings,
     own_tab: Option<&str>,
-) -> Vec<(&'static str, String, String)> {
+) -> Vec<(crate::harness::HarnessId, String)> {
     use crate::settings::{DelegationRole, TabConfig};
     let mut out = Vec::new();
     for harness in crate::harness::registry::all() {
@@ -3241,7 +3309,7 @@ fn delegate_targets(
         if own_tab.is_some_and(|own| own == cfg.id) {
             continue;
         }
-        out.push((id, harness.label().to_string(), cfg.name.clone()));
+        out.push((harness, cfg.name.clone()));
     }
     out
 }
@@ -3250,21 +3318,26 @@ fn delegate_targets(
 fn delegate_task_tools(own_tab: Option<&str>) -> Vec<Value> {
     delegate_targets(&current_settings_full(), own_tab)
         .into_iter()
-        .map(|(id, display, tab_name)| delegate_task_tool(id, &display, &tab_name))
+        .map(|(harness, tab_name)| delegate_task_tool(harness, &tab_name))
         .collect()
 }
 
 /// One `delegate_task_<id>` descriptor.
-fn delegate_task_tool(id: &str, display: &str, tab_name: &str) -> Value {
+///
+/// Both halves of the description are inventory rows (locked decision 24): the
+/// pinned contract sentence, templated with this harness's label, and the detail
+/// paragraph, whose one runtime value is the Manual tab's CURRENT name — which
+/// changes when the user renames the tab and therefore cannot be baked in.
+fn delegate_task_tool(harness: crate::harness::HarnessId, tab_name: &str) -> Value {
+    let id = harness.id().expect("a delegation target is a real harness");
+    let detail = crate::harness::instructions::text(
+        Some(harness),
+        crate::harness::instructions::Slot::DelegateToolDetail,
+    )
+    .replace("{tab}", tab_name);
     json!({
         "name": format!("{DELEGATE_TOOL_PREFIX}{id}"),
-        "description": format!(
-            "{} The tab it drives right now is \"{tab_name}\". The request is typed into that \
-             tab exactly as you write it and its answer is read back off the same session, so \
-             everything you send is visible on screen and in that harness's own transcript. The \
-             worker keeps its own tools, permissions and sandbox; it is a peer, not a subprocess.",
-            delegate_tool_contract(display)
-        ),
+        "description": format!("{} {detail}", delegate_tool_contract(harness)),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -3427,14 +3500,16 @@ mod delegate_tool_tests {
         let ids = crate::harness::registry::harness_ids();
         assert!(!ids.is_empty());
         for id in ids {
-            let display = crate::harness::HarnessId::from_id(id)
-                .expect("registry harness")
-                .label();
-            let tool = delegate_task_tool(id, display, "api-work");
+            let harness = crate::harness::HarnessId::from_id(id).expect("registry harness");
+            let tool = delegate_task_tool(harness, "api-work");
             let desc = tool["description"].as_str().expect("a description");
             assert!(
-                desc.starts_with(&delegate_tool_contract(display)),
+                desc.starts_with(delegate_tool_contract(harness)),
                 "`delegate_task_{id}` does not open with the pinned contract sentence:\n{desc}"
+            );
+            assert!(
+                desc.contains(harness.label()),
+                "the contract must name the harness it drives: {desc}"
             );
             assert!(
                 desc.contains("Never call it on your own initiative"),
@@ -3463,6 +3538,48 @@ mod delegate_tool_tests {
         }
     }
 
+    /// **V39 regression 8, re-asserted after Phase E moved the descriptions**
+    /// (locked decision 24): the advertised tool SET is exactly one
+    /// `delegate_task_<id>` per registered harness with a Manual tab, and
+    /// nothing else moved with the text.
+    ///
+    /// The descriptions are rendered from the instruction inventory now. A
+    /// refactor of *text* must not change which tools exist, and this is the
+    /// assertion that says so — the set diff, both directions, against the
+    /// registry rather than against a hard-coded pair.
+    #[test]
+    fn the_generated_delegate_tool_set_is_exactly_the_registrys() {
+        use std::collections::BTreeSet;
+        for own in [None, Some("claude"), Some("opencode")] {
+            let mut s = Settings::default();
+            s.tabs.push(crate::settings::default_claude_tab());
+            s.tabs.push(crate::settings::default_opencode_tab());
+            for t in s.tabs.iter_mut() {
+                if let TabConfig::AiTool(c) = t {
+                    c.delegation_role = DelegationRole::Manual;
+                }
+            }
+            let expected: BTreeSet<String> = crate::harness::registry::all()
+                .filter(|h| h.plugin().and_then(|p| p.input_profile()).is_some())
+                .filter_map(|h| h.id())
+                .filter(|id| own != Some(id))
+                .map(|id| format!("{DELEGATE_TOOL_PREFIX}{id}"))
+                .collect();
+            let got: BTreeSet<String> = delegate_targets(&s, own)
+                .into_iter()
+                .map(|(h, tab)| {
+                    let tool = delegate_task_tool(h, &tab);
+                    tool["name"].as_str().expect("a name").to_string()
+                })
+                .collect();
+            assert_eq!(
+                got, expected,
+                "the delegate tool set changed for own_tab={own:?} — text moved, tools must not"
+            );
+            assert!(!expected.is_empty(), "the fixture advertises nothing");
+        }
+    }
+
     /// A harness with no Manual tab gets no tool - **no dead tools**.
     #[test]
     fn only_harnesses_with_a_manual_tab_are_advertised() {
@@ -3472,7 +3589,7 @@ mod delegate_tool_tests {
         let s = settings_with_manual(crate::settings::CLAUDE_TAB_ID);
         let ids: Vec<&str> = delegate_targets(&s, None)
             .iter()
-            .map(|(id, _, _)| *id)
+            .map(|(h, _)| h.token())
             .collect();
         assert_eq!(ids.len(), 1, "exactly the harness that has a Manual tab");
     }
@@ -3534,7 +3651,7 @@ mod delegate_tool_tests {
         s.harness_row("claude").input_profile_status = "fail".to_string();
         let left = delegate_targets(&s, None);
         assert_eq!(left.len(), 1, "only the failing harness drops out: {left:?}");
-        assert_eq!(left[0].0, "opencode");
+        assert_eq!(left[0].0.token(), "opencode");
 
         // …and the reverse: Claude passing does not vouch for OpenCode.
         let mut s2 = s.clone();
@@ -3542,7 +3659,7 @@ mod delegate_tool_tests {
         s2.harness_row("opencode").input_profile_status = "fail".to_string();
         let left = delegate_targets(&s2, None);
         assert_eq!(left.len(), 1, "{left:?}");
-        assert_eq!(left[0].0, "claude");
+        assert_eq!(left[0].0.token(), "claude");
     }
 
     // ── V39 Phase C — the facade in the tool prose ──────────────────────────

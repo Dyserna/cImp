@@ -178,6 +178,26 @@ pub enum MemArg {
     Command,
 }
 
+/// A role core has to NAME in text it sends the model — the one thing about a
+/// harness's tool vocabulary that a *neutral* sentence cannot avoid mentioning.
+///
+/// Locked decision 24. `GRAPH_GUIDANCE` says "prefer `graph_outline` →
+/// `graph_snippet` over a full **Read**" and "prefer a configured test check
+/// over running the test command in **Bash**": both sentences are about cImp's
+/// own tools, and both have to name the harness tool they are steering away
+/// from. Naming it from a `match` in core is how that blob came to tell every
+/// OpenCode session to prefer two tools it does not have.
+///
+/// Deliberately a tiny closed set: a role exists here because a *neutral*
+/// string needs the name, not because the tool is important.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolRole {
+    /// Read one file's contents (Claude's `Read`, OpenCode's `read`).
+    Read,
+    /// Run a shell command (Claude's `Bash`, OpenCode's `bash`).
+    Shell,
+}
+
 /// One tool a HARNESS serves itself — a name cImp never routes and therefore
 /// can never block (locked decision 3's honest limit).
 ///
@@ -809,6 +829,26 @@ pub struct Subcommand {
     pub run: fn(),
 }
 
+/// A harness that is pointed at a local model through a **config file or block
+/// cImp writes**, rather than through env or flags.
+///
+/// A separate trait object rather than more [`HarnessPlugin`] methods because it
+/// is a whole sub-surface with one implementor and one caller: keeping it behind
+/// [`HarnessPlugin::config_writer`] makes "does this harness have one at all" a
+/// question with an answer, instead of a method every plugin has to explain
+/// returning `None`.
+pub trait ConfigWriter: Sync + Send {
+    /// Derive this harness's local-provider block from an offload Local
+    /// backend's `server_command`.
+    ///
+    /// `Err` is a self-contained message naming exactly what the command is
+    /// missing, so the Settings button can surface it verbatim.
+    fn derive_local_provider(
+        &self,
+        server_command: &str,
+    ) -> crate::error::AppResult<crate::settings::OpencodeLocalProvider>;
+}
+
 // ── the trait ───────────────────────────────────────────────────────────────
 
 /// Everything core asks *this harness* to do.
@@ -972,6 +1012,39 @@ pub trait HarnessPlugin: Sync + Send {
         &[]
     }
 
+    /// This harness's own name for a [`ToolRole`], or `None` when it serves no
+    /// such tool.
+    ///
+    /// Locked decision 24. The name must be one of this harness's
+    /// [`Self::native_tools`] rows — asserted by
+    /// `registry::tests::every_declared_tool_role_names_a_native_tool`, so a
+    /// renamed tool cannot leave the prompt pointing at a name the harness
+    /// stopped serving. `None` renders as a *description* rather than as
+    /// another product's id ([`crate::harness::instructions`]), which is the
+    /// same fail-closed direction [`Self::native_tools`] takes.
+    fn tool_for_role(&self, _role: ToolRole) -> Option<&'static str> {
+        None
+    }
+
+    /// **Every string cImp puts in front of this harness's model**, rendered in
+    /// its vocabulary (locked decision 24).
+    ///
+    /// The prose is cImp's — it describes cImp's graph tools, cImp's channel,
+    /// cImp's delegation contract — so it lives in
+    /// [`crate::harness::instructions`] and every shipped plugin returns
+    /// `instructions::render_for(<its id>)` out of a `OnceLock`. What the plugin
+    /// contributes is the vocabulary: its [`Self::tool_for_role`] names and its
+    /// descriptor label.
+    ///
+    /// **The default is empty, and it is not a silent default**:
+    /// `instructions::all_for` falls back to the neutral rendering, and
+    /// `instructions::tests::every_harness_declares_every_slot` refuses to let a
+    /// registered harness ship with a partial inventory. Overriding this is how
+    /// a harness would say something *else* — not how it opts out.
+    fn instructions(&self) -> &[crate::harness::instructions::Instruction] {
+        &[]
+    }
+
     /// The argument keys this harness's tool payloads carry a [`MemArg`] under,
     /// **in precedence order**.
     ///
@@ -982,8 +1055,55 @@ pub trait HarnessPlugin: Sync + Send {
     /// spellings and a collision between them would have been invisible. Each
     /// harness names its own keys; an empty list records nothing, which is the
     /// same fail-closed direction [`HarnessPlugin::native_tools`] takes.
+    ///
+    /// **This IS locked decision 24's tool-arg aliasing**, which the milestone
+    /// doc spells `native_tools().arg_names()`. Phase C had already landed the
+    /// same narrowing keyed by [`MemArg`] rather than by tool name, and Phase E
+    /// kept it: the consumer asks "which key carries the target of THIS event",
+    /// the event's kind is what decides that, and a second per-tool spelling of
+    /// the same answer would be a third vocabulary for one question — the exact
+    /// shape both this method and [`crate::harness::native`] exist to remove.
     fn memory_arg_keys(&self, _arg: MemArg) -> &'static [&'static str] {
         &[]
+    }
+
+    // ── MCP client specifics (locked decision 25) ───────────────────────────
+
+    /// Add this harness's own capability declarations to the per-session MCP
+    /// child's `initialize` result.
+    ///
+    /// Locked decision 25. `capabilities.experimental["claude/channel"]` is a
+    /// key in ONE vendor's namespace, and core wrote it unconditionally for
+    /// whichever consumer had session push armed — so a second harness with an
+    /// inbound MCP path would have been handed Claude's key. The neutral half
+    /// (`protocolVersion`, `tools.listChanged`, `serverInfo`, and the
+    /// `instructions` block from [`Self::instructions`]) stays core's; this adds
+    /// only what is the harness's own.
+    ///
+    /// Called only when the child is actually declaring the channel — i.e. when
+    /// [`Self::supports_session_push`] is true and the spawn baked the flag in.
+    fn decorate_initialize(&self, _result: &mut serde_json::Value) {}
+
+    /// The JSON-RPC notification method a session push is delivered as, or
+    /// `None` for a harness with no inbound path.
+    ///
+    /// `notifications/claude/channel` is Claude Code's spelling, and it is the
+    /// twin of [`Self::decorate_initialize`]'s capability key: a client that
+    /// declared one and was sent the other would drop every push silently.
+    fn push_notification_method(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// The MCP protocol version the per-session child must answer this
+    /// harness's `initialize` with, or `None` to speak cImp's own.
+    ///
+    /// A PIN, not a preference (milestone invariant 1): Claude Code honours
+    /// channel notifications only in the `2025-06-18` era, so the child must
+    /// report that version to it whatever cImp itself would otherwise
+    /// negotiate. Declared per harness because "which era does the client
+    /// honour" is a fact about the client.
+    fn mcp_protocol_version(&self) -> Option<&'static str> {
+        None
     }
 
     // ── the capability registry (locked decision 17) ────────────────────────
@@ -1266,6 +1386,94 @@ pub trait HarnessPlugin: Sync + Send {
     /// itself or return.
     fn subcommands(&self) -> &'static [Subcommand] {
         &[]
+    }
+
+    // ── CLI vocabulary and config writers (locked decision 26) ──────────────
+
+    /// The flags with which this harness's CLI selects a session, so cImp can
+    /// tell "the user pinned a session" from "cImp may pin one".
+    ///
+    /// Locked decision 26. `["--session-id", "--resume", "-r", "--continue",
+    /// "-c", "--fork-session", "--from-pr"]` is Claude Code's vocabulary and
+    /// nobody else's; the `--flag=value` form is matched as well as the
+    /// two-token one by the plugin that declares it. Empty means "this harness
+    /// selects its session some other way", which is OpenCode's answer.
+    fn session_selector_flags(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// Whether a tab of this harness may be enabled right now — `Err` carries
+    /// the **install hint** the UI appends to its refusal.
+    ///
+    /// Locked decision 26. This was an `if enabling_opencode { resolve_command
+    /// ("opencode") }` in the tab-lifecycle command, with Claude's exemption
+    /// stated as a comment ("intentionally not gated — it's the app's own front
+    /// end"). An exemption in a comment is not one a third harness inherits
+    /// correctly: it would have been ungated by accident. Claude declares its
+    /// `Ok` here instead, so *not gated* is a decision on the record.
+    ///
+    /// **Blocking** — an implementation resolves a binary. Callers run it off
+    /// the async runtime.
+    fn preflight(&self) -> Result<(), &'static str> {
+        Ok(())
+    }
+
+    /// Whether killing this harness's child must reap the whole process TREE.
+    ///
+    /// `opencode serve` is a Bun binary that forks children (observed: two
+    /// grandchildren per server), so a bare kill leaves a live HTTP server bound
+    /// to the probe's loopback port. The primitive stays in `procutil`
+    /// (`reap_probe_child`); what is declared here is the REQUIREMENT, so a
+    /// harness that needs it says so rather than the reaping code naming a
+    /// product.
+    ///
+    /// **Defaults to `true`** — the direction where being wrong is cheap. A
+    /// leaked child holding a port outlives the run that made it and is
+    /// invisible until the next bind fails; a redundant tree kill costs one
+    /// process spawn on a path that is already tearing a child down. A harness
+    /// whose child provably has no descendants may declare `false`.
+    fn needs_tree_reap(&self) -> bool {
+        true
+    }
+
+    /// Whether a freshly spawned tab of this harness paints startup chrome that
+    /// looks like a completed turn.
+    ///
+    /// Claude Code's welcome banner cycles a new tab `Idle → Thinking → Idle` as
+    /// it prints, which the notification manager would otherwise announce as
+    /// "your task finished" before the user has typed anything. The guard (a tab
+    /// stays silent until it has been driven to `Listening` once) is core's; the
+    /// FACT that a harness needs it is the harness's.
+    ///
+    /// Defaults to `true` — the fail-safe direction: the cost of the guard is a
+    /// suppressed announcement nobody asked for, and the cost of missing it is a
+    /// spurious one on every tab spawn.
+    fn emits_startup_chrome(&self) -> bool {
+        true
+    }
+
+    /// This harness's rows in the external-process spawn ledger
+    /// ([`crate::spawn_ledger`]), or none.
+    ///
+    /// The ledger is a reviewed table whose tripwire scans the whole tree, so
+    /// the rows must exist — but a row for `opencode serve --port <free>
+    /// --hostname 127.0.0.1` is a sentence about one product's CLI, and it
+    /// belongs beside that product's probe. The tripwire consumes core's rows
+    /// and every plugin's together.
+    fn spawn_sites(&self) -> &'static [crate::spawn_ledger::SpawnSite] {
+        &[]
+    }
+
+    /// How this harness is pointed at a local provider, or `None` when it has no
+    /// such config to write.
+    ///
+    /// Locked decision 26. Claude's half is env synthesis and already rides
+    /// [`Self::compose_env`]; OpenCode's is a `local-llama` provider block
+    /// derived from the offload server's command line, which core used to own in
+    /// `offload/server.rs` and which core still needs to CALL (the Settings
+    /// "Add to OpenCode" button). It asks here instead of naming the harness.
+    fn config_writer(&self) -> Option<&'static dyn ConfigWriter> {
+        None
     }
 
     // ── sandbox ─────────────────────────────────────────────────────────────

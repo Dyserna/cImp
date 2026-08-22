@@ -1792,16 +1792,52 @@ pub async fn offload_test(
         .await
 }
 
-/// V21: derive the OpenCode `local-llama` provider from a Local backend's
-/// server command (the Settings "Add to OpenCode" button). Pure — parses and
-/// validates only; the frontend persists the returned snapshot via
-/// `settings_update`. On a missing `--port` or model flag it errors with a
-/// message naming exactly what's absent, which the button surfaces verbatim.
+/// V21: derive a harness's local-provider block from a Local backend's server
+/// command (the Settings "Add to OpenCode" button). Pure — parses and validates
+/// only; the frontend persists the returned snapshot via `settings_update`. On a
+/// missing `--port` or model flag it errors with a message naming exactly what's
+/// absent, which the button surfaces verbatim.
+///
+/// **V40 Phase E (locked decision 26).** The body used to call
+/// `offload::server::derive_opencode_provider` — core holding one harness's
+/// config writer. It asks the registry now, through
+/// [`crate::harness::plugin::ConfigWriter`].
+///
+/// `harness` is optional for wire compatibility with the pre-V40 frontend: when
+/// it is absent the registry answers, and it **refuses if more than one harness
+/// declares a writer** rather than picking the first. A silently-chosen harness
+/// here would write one product's provider block into another's settings, which
+/// is precisely the class of defect this milestone removes. The Settings section
+/// passes the id explicitly once decision 27 lands.
 #[tauri::command]
 pub async fn offload_derive_opencode_provider(
+    harness: Option<String>,
     server_command: String,
 ) -> AppResult<crate::settings::OpencodeLocalProvider> {
-    crate::offload::server::derive_opencode_provider(&server_command)
+    let writers: Vec<crate::harness::HarnessId> = match harness.as_deref().map(str::trim) {
+        Some(h) if !h.is_empty() => vec![crate::harness::HarnessId::from_id(h).ok_or_else(|| {
+            crate::error::AppError::Offload(format!("{h:?} names no registered harness"))
+        })?],
+        _ => crate::harness::registry::all()
+            .filter(|h| h.plugin().is_some_and(|p| p.config_writer().is_some()))
+            .collect(),
+    };
+    let [only] = writers[..] else {
+        return Err(crate::error::AppError::Offload(format!(
+            "which harness should this provider be written for? {} of them accept one — name it",
+            writers.len()
+        )));
+    };
+    let writer = only
+        .plugin()
+        .and_then(|p| p.config_writer())
+        .ok_or_else(|| {
+            crate::error::AppError::Offload(format!(
+                "{} is not configured through a provider block cImp writes",
+                only.label()
+            ))
+        })?;
+    writer.derive_local_provider(&server_command)
 }
 
 /// V8-03: aggregate offload-service status — the honest global in-flight
@@ -3629,6 +3665,35 @@ pub async fn harness_mark_verified(
         cur.harness.insert(key.clone(), after.clone());
     });
     Ok(())
+}
+
+/// **The model-visible text one tab's harness receives**, keyed by slot (V40
+/// Phase E, locked decision 24).
+///
+/// The compose overlay is the first consumer: it appends one instruction line
+/// after the `[image] <path>` lines it types into the tab, and that line used to
+/// be a literal in `compose/attachments.ts` — a string the model reads that
+/// nothing in the backend inventory could see, and that no harness could
+/// influence. It comes over this command now.
+///
+/// `tab` is a tab id; a tab that runs no registered harness (or an unknown id)
+/// gets the NEUTRAL rendering, which is a real answer rather than a failure —
+/// the same posture `instructions::all_for` takes.
+#[tauri::command]
+pub async fn harness_instructions(
+    state: State<'_, AppState>,
+    tab: Option<String>,
+) -> AppResult<std::collections::BTreeMap<String, String>> {
+    let settings = state.settings.current();
+    let harness = tab
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .and_then(|t| crate::tabs::tab_harness_by_id(&settings, t));
+    Ok(crate::harness::instructions::all_for(harness)
+        .iter()
+        .map(|i| (i.slot.id().to_string(), i.text.to_string()))
+        .collect())
 }
 
 /// V14 Phase D2: dismiss one advisor proposal (`rule_id` + its coarse rate

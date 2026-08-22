@@ -98,7 +98,7 @@ fn auto_sync_active(s: &Settings) -> bool {
 pub fn resolve_provider(s: &Settings) -> Option<OpencodeLocalProvider> {
     if auto_sync_active(s) {
         if let Some(cmd) = s.offload.primary_local_command() {
-            if let Ok(p) = crate::offload::server::derive_opencode_provider(&cmd) {
+            if let Ok(p) = super::config::derive_provider(&cmd) {
                 return Some(p);
             }
         }
@@ -125,7 +125,7 @@ pub fn sync_provider_on_save(s: &mut Settings) {
     if unchanged {
         return;
     }
-    if let Ok(p) = crate::offload::server::derive_opencode_provider(&cmd) {
+    if let Ok(p) = super::config::derive_provider(&cmd) {
         if let Ok(v) = serde_json::to_value(&p) {
             s.set_harness_ext(super::harness_plugin::me(), PROVIDER, v);
         }

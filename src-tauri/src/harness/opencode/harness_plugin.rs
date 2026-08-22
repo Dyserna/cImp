@@ -289,6 +289,27 @@ impl HarnessPlugin for OpenCodePlugin {
         }]
     }
 
+    /// OpenCode's tool ids are lower-case, and this is the pair cImp's graph
+    /// guidance names (locked decision 24). Until Phase E that blob told an
+    /// OpenCode session to prefer `Read` and `Bash` — two tools it does not
+    /// serve.
+    fn tool_for_role(&self, role: crate::harness::plugin::ToolRole) -> Option<&'static str> {
+        use crate::harness::plugin::ToolRole;
+        Some(match role {
+            ToolRole::Read => "read",
+            ToolRole::Shell => "bash",
+        })
+    }
+
+    /// The model-visible inventory, rendered once in OpenCode's vocabulary.
+    /// See the sibling implementation in `claude/plugin.rs` for why the
+    /// `OnceLock` is per implementation.
+    fn instructions(&self) -> &[crate::harness::instructions::Instruction] {
+        static CELL: std::sync::OnceLock<Vec<crate::harness::instructions::Instruction>> =
+            std::sync::OnceLock::new();
+        CELL.get_or_init(|| crate::harness::instructions::render_for(me()))
+    }
+
     fn native_tools(&self) -> &'static [NativeTool] {
         super::tools::OPENCODE_NATIVE_TABLE
     }
@@ -351,6 +372,49 @@ impl HarnessPlugin for OpenCodePlugin {
         era: &str,
     ) -> &'static [crate::processing::permission::PatternSpec] {
         super::prompts::legacy_patterns(era)
+    }
+
+    /// **The one gated harness** (locked decision 26). cImp does not bundle
+    /// OpenCode's ~158 MB binary (V19 require-install decision), so enabling the
+    /// tab without it installed would materialise a dead "command not found"
+    /// terminal with nothing saying why. The same resolution the spawn path uses
+    /// (`ebin` → `PATH`), so a refusal here means the launch would have failed.
+    fn preflight(&self) -> Result<(), &'static str> {
+        if crate::pty::resolve_command("opencode").is_ok() {
+            Ok(())
+        } else {
+            Err("Install it from https://opencode.ai/docs (or drop opencode.exe in ebin/)")
+        }
+    }
+
+    /// `opencode serve` is a Bun binary that forks children (observed: two
+    /// grandchildren per server), so a bare `Child::kill` leaves a live HTTP
+    /// server bound to the port cImp handed it. Declared explicitly even though
+    /// it is the default: this one is an OBSERVATION, and the default is only a
+    /// posture.
+    fn needs_tree_reap(&self) -> bool {
+        true
+    }
+
+    /// The `opencode serve` probe's row in the spawn ledger — the argv is this
+    /// product's CLI, so it lives with the code that runs it.
+    fn spawn_sites(&self) -> &'static [crate::spawn_ledger::SpawnSite] {
+        super::probe::SPAWN_SITES
+    }
+
+    /// OpenCode's TUI paints its own banner on a fresh tab, so the notification
+    /// manager's "not until this tab has been interacted with" guard applies
+    /// here too. Declared rather than inherited from the default, because the
+    /// default is a *posture* and this is an observation.
+    fn emits_startup_chrome(&self) -> bool {
+        true
+    }
+
+    /// The `local-llama` provider block, derived from the offload server's own
+    /// command line (locked decision 26) — the Settings "Add to OpenCode"
+    /// button's backend.
+    fn config_writer(&self) -> Option<&'static dyn crate::harness::plugin::ConfigWriter> {
+        Some(&super::config::WRITER)
     }
 
     fn sandbox_grants(&self, ctx: &GrantCtx) -> Vec<GrantRow> {

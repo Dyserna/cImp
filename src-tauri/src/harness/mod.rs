@@ -98,6 +98,7 @@ pub mod claude;
 pub mod contract;
 pub mod health;
 pub mod ingress;
+pub mod instructions;
 
 #[cfg(test)]
 mod layering;

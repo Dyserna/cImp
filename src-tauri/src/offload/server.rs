@@ -20,11 +20,11 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, warn};
 
 use crate::error::{AppError, AppResult};
-use crate::settings::{BackendTier, OpencodeLocalProvider, ToolScope};
+use crate::settings::{BackendTier, ToolScope};
 
 use super::Backend;
 
-const DEFAULT_HOST: &str = "127.0.0.1";
+pub(crate) const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 8080;
 
 /// Connection facts cImp needs from the user's `server_command`.
@@ -80,7 +80,7 @@ pub fn per_slot_n_ctx(reported: u32, parallel: u32, kv_unified: bool) -> u32 {
 
 /// Split `--flag=value` into `("--flag", Some("value"))`; a bare
 /// `--flag` yields `("--flag", None)`.
-fn split_flag(arg: &str) -> (&str, Option<&str>) {
+pub(crate) fn split_flag(arg: &str) -> (&str, Option<&str>) {
     match arg.split_once('=') {
         Some((k, v)) => (k, Some(v)),
         None => (arg, None),
@@ -89,7 +89,7 @@ fn split_flag(arg: &str) -> (&str, Option<&str>) {
 
 /// Resolve a flag's value: the inline `--flag=value` form, else the next
 /// token (advancing `i`).
-fn flag_value(inline: Option<&str>, args: &[String], i: &mut usize) -> Option<String> {
+pub(crate) fn flag_value(inline: Option<&str>, args: &[String], i: &mut usize) -> Option<String> {
     if let Some(v) = inline {
         return Some(v.to_string());
     }
@@ -105,7 +105,7 @@ fn flag_value(inline: Option<&str>, args: &[String], i: &mut usize) -> Option<St
 /// callers need it and they must not disagree: [`derive_opencode_provider`]
 /// (OpenCode's `local-llama` provider) and [`resolve_local_auth`] (cImp's own
 /// bearer for the same server). A second parser is how the two would drift.
-fn api_key_from_args(args: &[String]) -> String {
+pub(crate) fn api_key_from_args(args: &[String]) -> String {
     let mut key = String::new();
     let mut i = 0;
     while i < args.len() {
@@ -186,7 +186,7 @@ pub fn resolve_local_auth(configured: &str, server_command: &str) -> ResolvedAut
 }
 
 /// Map a bind-all address to a loopback connect address.
-fn normalize_host(host: &str) -> String {
+pub(crate) fn normalize_host(host: &str) -> String {
     match host {
         "0.0.0.0" | "::" | "[::]" => DEFAULT_HOST.to_string(),
         other => other.to_string(),
@@ -266,104 +266,6 @@ impl ServerCommand {
     pub fn per_slot_n_ctx(&self, reported: u32) -> u32 {
         per_slot_n_ctx(reported, self.parallel, self.kv_unified)
     }
-}
-
-/// Derive the OpenCode `local-llama` provider from a Local backend's
-/// `server_command`. Requires an explicit `--port` and a model identifier
-/// (`--alias`/`-a`, else the `--model`/`-m` file basename); the host defaults
-/// to `127.0.0.1`. On a missing required flag, returns a self-contained error
-/// naming exactly what's absent so the Settings button can surface it verbatim.
-pub fn derive_opencode_provider(command: &str) -> AppResult<OpencodeLocalProvider> {
-    let tokens = shlex::split(command)
-        .ok_or_else(|| AppError::Offload("server command has unbalanced quotes".into()))?;
-    let mut it = tokens.into_iter();
-    let _program = it
-        .next()
-        .ok_or_else(|| AppError::Offload("server command is empty".into()))?;
-    let args: Vec<String> = it.collect();
-
-    let mut host = DEFAULT_HOST.to_string();
-    let mut port: Option<u16> = None;
-    let mut alias: Option<String> = None;
-    let mut model_path: Option<String> = None;
-    // One definition of "where the key is", shared with `resolve_local_auth`.
-    let api_key = api_key_from_args(&args);
-
-    let mut i = 0;
-    while i < args.len() {
-        let (key, inline) = split_flag(&args[i]);
-        match key {
-            "--host" => {
-                if let Some(v) = flag_value(inline, &args, &mut i) {
-                    host = normalize_host(&v);
-                }
-            }
-            "--port" => {
-                if let Some(v) = flag_value(inline, &args, &mut i) {
-                    if let Ok(p) = v.parse::<u16>() {
-                        port = Some(p);
-                    }
-                }
-            }
-            "-a" | "--alias" => {
-                if let Some(v) = flag_value(inline, &args, &mut i) {
-                    if !v.trim().is_empty() {
-                        alias = Some(v.trim().to_string());
-                    }
-                }
-            }
-            "-m" | "--model" => {
-                if let Some(v) = flag_value(inline, &args, &mut i) {
-                    if !v.trim().is_empty() {
-                        model_path = Some(v);
-                    }
-                }
-            }
-            // `--api-key` is read by `api_key_from_args` above, not here — one
-            // parser, two callers. It must still be *skipped* correctly so its
-            // value cannot be mistaken for a positional model path.
-            "--api-key" | "--api_key" => {
-                let _ = flag_value(inline, &args, &mut i);
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-
-    let model = alias.or_else(|| model_path.as_deref().map(model_id_from_path));
-
-    // Collect every missing required param so the error names them all at once.
-    let mut missing: Vec<&str> = Vec::new();
-    if port.is_none() {
-        missing.push("--port");
-    }
-    if model.is_none() {
-        missing.push("a model (--model/-m or --alias/-a)");
-    }
-    if !missing.is_empty() {
-        return Err(AppError::Offload(format!(
-            "can't register the OpenCode local-llama provider: the server command is missing {}.",
-            missing.join(" and ")
-        )));
-    }
-
-    Ok(OpencodeLocalProvider {
-        base_url: format!("http://{host}:{}/v1", port.expect("port present")),
-        model: model.expect("model present"),
-        api_key,
-        source_command: command.to_string(),
-    })
-}
-
-/// The OpenCode model id for a `--model` path: the file name with any leading
-/// directory and a trailing `.gguf` removed
-/// (`…/Qwen3.6-35B-A3B-Q4.gguf` → `Qwen3.6-35B-A3B-Q4`).
-fn model_id_from_path(path: &str) -> String {
-    let base = path.rsplit(['/', '\\']).next().unwrap_or(path);
-    base.strip_suffix(".gguf")
-        .or_else(|| base.strip_suffix(".GGUF"))
-        .unwrap_or(base)
-        .to_string()
 }
 
 /// The single Local backend: a supervised `llama-server`.
@@ -997,7 +899,7 @@ mod tests {
             "llama-server -a m --port 12344 --api_key=sk-shared",
             "llama-server -a m --port 12344",
         ] {
-            let provider = derive_opencode_provider(cmd).expect("derives");
+            let provider = crate::harness::opencode::config::derive_provider(cmd).expect("derives");
             assert_eq!(
                 provider.api_key,
                 api_key_from_command(cmd),
@@ -1017,7 +919,7 @@ mod tests {
     /// the token as `-m`'s value), so it is the one pinned.
     #[test]
     fn the_api_key_value_is_not_read_as_another_flags_value() {
-        let p = derive_opencode_provider(
+        let p = crate::harness::opencode::config::derive_provider(
             "llama-server --api-key /models/not-a-model.gguf --port 12344 -m /models/real.gguf",
         )
         .expect("derives");
@@ -1098,7 +1000,7 @@ mod tests {
 
     #[test]
     fn derive_provider_model_from_path_basename() {
-        let p = derive_opencode_provider(
+        let p = crate::harness::opencode::config::derive_provider(
             "llama-server --model C:/models/Qwen3.6-35B-A3B-Q4.gguf --port 8080 --jinja",
         )
         .unwrap();
@@ -1109,7 +1011,7 @@ mod tests {
 
     #[test]
     fn derive_provider_alias_wins_over_model_and_reads_host_apikey() {
-        let p = derive_opencode_provider(
+        let p = crate::harness::opencode::config::derive_provider(
             "llama-server -m /m/q4.gguf -a my-alias --host 0.0.0.0 --port 9001 --api-key sk-x",
         )
         .unwrap();
@@ -1121,7 +1023,7 @@ mod tests {
 
     #[test]
     fn derive_provider_missing_port_errors_naming_it() {
-        let err = derive_opencode_provider("llama-server -a m")
+        let err = crate::harness::opencode::config::derive_provider("llama-server -a m")
             .unwrap_err()
             .to_string();
         assert!(err.contains("--port"), "got: {err}");
@@ -1133,7 +1035,7 @@ mod tests {
 
     #[test]
     fn derive_provider_missing_both_names_both() {
-        let err = derive_opencode_provider("llama-server --jinja")
+        let err = crate::harness::opencode::config::derive_provider("llama-server --jinja")
             .unwrap_err()
             .to_string();
         assert!(err.contains("--port"), "got: {err}");

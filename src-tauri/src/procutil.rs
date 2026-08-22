@@ -138,6 +138,24 @@ pub async fn kill_tree(child: &mut tokio::process::Child) {
 /// blocking spawn site must set its own process group the way
 /// [`own_process_group`] does for `tokio::process` — [`own_process_group_std`]
 /// is that, for `std::process::Command`.
+/// Reap a **probe child of `harness`** — the whole tree when that harness
+/// declares [`crate::harness::HarnessPlugin::needs_tree_reap`], otherwise the
+/// child alone (V40 Phase E, locked decision 26).
+///
+/// The two callers are the L2 live probes, one per harness. Before this, both
+/// called [`kill_tree_blocking`] and the REASON for it — "`opencode serve` is a
+/// Bun binary that forks children" — lived in this file, which is a sentence
+/// about one product in cImp's process plumbing. The primitive stays here; which
+/// harness needs it is the harness's answer.
+pub fn reap_probe_child(harness: crate::harness::HarnessId, child: &mut std::process::Child) {
+    if harness.plugin().is_none_or(|p| p.needs_tree_reap()) {
+        kill_tree_blocking(child);
+        return;
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 pub fn kill_tree_blocking(child: &mut std::process::Child) {
     let pid = child.id();
     #[cfg(windows)]

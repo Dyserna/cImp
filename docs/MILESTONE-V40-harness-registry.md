@@ -795,7 +795,7 @@ interface, and tests 10(a)/10(b)/11 fail if a harness literal reappears.
 ## What changed vs the design
 
 Every ruling taken inside a phase's discretion, or against the letter of a
-locked decision, in one place — so the design above reads as what was approved
+locked decision, in one place, followed by the residuals V40 does NOT close — so the design above reads as what was approved
 and this section reads as what was built.
 
 1. **`SurfaceDigest` never existed.** Decision 25's `PerHarness<T>` list named
@@ -873,6 +873,51 @@ and this section reads as what was built.
     at 2, so a tab open across the upgrade reports `old_plugin` until restarted;
     a harness with no `spawn_sig` slot used to get no restart hint at all and
     now gets one.
+
+14. **Decision 19 needed a seam it did not name: `HarnessPlugin::turn_usage_shape()`.**
+    Phase D put `token_kinds()` and `origins()` on `UsageSource`, and OpenCode's
+    `usage_source()` is `None` — so the harness that writes per-turn token rows
+    through `/memory/event` declared nothing about the rows it writes, and the
+    read boundary had nothing to ask. The declarations move onto the plugin,
+    independent of the quota source: `harness_usage("opencode")` still answers
+    *no usage source* (live-verify 14 stands), and now also answers what its
+    recorded turns look like. The `harness_usage` payload changed shape with it
+    (`token_kinds` / `origins` sit beside `source`, not inside it).
+15. **`TurnOrigin` carries `subagent: bool`.** "Which lane is the fan-out lane"
+    was a comparison against the string `"agent"` in three places, including
+    one in the frontend. A harness with no fan-out declares one lane with the
+    flag false. The `/memory/event` roll-up resolves the lane from the
+    declaration, and a harness that declares no shape records **nothing**
+    rather than being attributed a lane it never claimed — a dropped row is
+    recoverable, a mis-attributed one is not.
+16. **`cacheHitRatio` returns absence, and one cell changed.** A session with no
+    denominator now renders `—` where it rendered `0%`. The backend's
+    `SessionUsageRow.cache_hit_ratio` stays an `f64` (a float cannot carry
+    absence and it has no other consumer), so this is a frontend reading of the
+    same number, for token-less sessions only.
+
+**Recorded residuals — real, bounded, and NOT closed by this milestone:**
+
+* **Lane colour is still a fixed pair.** `usage_color_session` /
+  `usage_color_agent` are settings fields, so a third declared lane gets the
+  second lane's swatch and no donut CSS rule of its own. The donut, its legend,
+  the lane strip and the share line are otherwise fully lane-general. Closing
+  it is a settings change (a colour per declared lane), and it belongs to
+  whoever adds the third lane.
+* **The Cost card's four columns and the Sessions row's four stats are keyed
+  off the price table**, which has exactly four rates. A category a harness
+  does not declare renders `0` there rather than shifting the table out from
+  under the `$/MTok` row beside it. Same for the stacked bar's five segments.
+* **`agentBarClass` fails quiet for one paint.** The declared lanes arrive over
+  IPC, so sub-agent bars are un-outlined until `harness_usage` answers rather
+  than outlined by guessing `"agent"`. The lane strip is unaffected — it keys
+  CSS off the stored lane id, as it always did.
+* **`MemoryEventBody` still lives in `offload/loopback.rs`.** It is one
+  harness's wire payload verbatim, and the ledger's destination for it was
+  `usage_source()`. It names no harness id, so both allowlists stay clean and
+  the layering tests are satisfied — but the row shape is that plugin's, and
+  moving it behind `routes()` is the honest finish. Not a V40 defect; a
+  recorded next step.
 
 ## Live-verify — Phase H (#100), the milestone's remaining gate
 

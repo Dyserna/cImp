@@ -1387,6 +1387,23 @@ fn apply_incoming_settings(cur: &mut Settings, mut incoming: Settings) {
     // this list here covers the in-memory round trip, that one the on-disk
     // diff/merge. Keep both in mind when adding an out-of-band field.)
     incoming.harness_versions = cur.harness_versions.clone();
+    // V40 Phase B: the same rule, one level down. `Settings::harness` is NOT
+    // preserved wholesale — `expose_commands`, `expose_code_audit`, the
+    // recorded spike outcome and every plugin `ext` value are what the Settings
+    // window is FOR — but the three OUT-OF-BAND fields on each row are
+    // (`sync_harness_into` excludes them from the disk write for the same
+    // reason). The window's snapshot is taken when it opens; the transcript tap
+    // or the auto-verify worker may have written a newer version since, and a
+    // save must not revert a version observation or a Mark-verified.
+    for (id, live) in &cur.harness {
+        let row = incoming
+            .harness
+            .entry(id.clone())
+            .or_insert_with(|| live.clone());
+        row.last_seen = live.last_seen.clone();
+        row.last_verified = live.last_verified.clone();
+        row.auto_verify = live.auto_verify.clone();
+    }
     *cur = incoming;
     // Keep the reserved feature tabs (Code Graph monitor / Workbench / ...)
     // present-iff-enabled in the persisted list.

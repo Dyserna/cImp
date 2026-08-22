@@ -625,6 +625,61 @@ fn every_registry_entry_is_fully_wired() {
              restart hint, silently"
         );
 
+        // 4b. Every DECLARED setting is well formed, and every harness-SCOPED
+        //     injection feature names an `ext` key this harness actually
+        //     declares as a `Bool` (V40 locked decision 6).
+        //
+        //     Both halves are load-bearing. A duplicate key would make one
+        //     declaration silently unreachable — the form would render two
+        //     controls writing the same slot. And a `scoped_features()` row
+        //     pointing at a key nobody declared would resolve that feature's
+        //     app-wide L2 to a default nothing stores: the Settings matrix
+        //     would show a switch the user can flip and the launch path would
+        //     never read it, which is the "declared but not enforced" shape
+        //     this milestone keeps removing.
+        let mut keys: BTreeSet<&str> = BTreeSet::new();
+        for field in d.plugin.settings_schema() {
+            assert!(
+                keys.insert(field.key),
+                "{dir}: `settings_schema()` declares `{}` twice — one of the two would be \
+                 unreachable and the form would render both onto the same slot",
+                field.key
+            );
+            assert!(
+                !field.label.trim().is_empty(),
+                "{dir}: setting `{}` has no label, so the generic form would render a \
+                 nameless control",
+                field.key
+            );
+            assert!(
+                field.kind.accepts(&field.default.to_json()),
+                "{dir}: setting `{}`'s declared default is not a value its declared kind \
+                 accepts — the parse boundary would reset it to itself, forever",
+                field.key
+            );
+        }
+        for scoped in d.plugin.scoped_features() {
+            let row = d
+                .plugin
+                .settings_schema()
+                .iter()
+                .find(|f| f.key == scoped.ext_key);
+            let row = row.unwrap_or_else(|| {
+                panic!(
+                    "{dir}: `scoped_features()` names ext key `{}` for {:?}, which \
+                     `settings_schema()` does not declare — its app-wide L2 would resolve to a \
+                     default nothing stores",
+                    scoped.ext_key, scoped.feature
+                )
+            });
+            assert!(
+                matches!(row.kind, crate::harness::plugin::SettingKind::Bool),
+                "{dir}: `{}` backs the {:?} feature's L2 and must be a Bool row",
+                scoped.ext_key,
+                scoped.feature
+            );
+        }
+
         // 5. A non-empty sandbox grant table. A grant table nobody wrote is not a
         //    boundary; it is a tool that fails to start for reasons the user
         //    cannot see.

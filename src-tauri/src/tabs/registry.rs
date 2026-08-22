@@ -281,6 +281,9 @@ impl TabRegistry {
         tts_segments: mpsc::Sender<TtsRequest>,
         user_typed_tts: Arc<StdMutex<HashSet<String>>>,
         settings: SettingsHandle,
+        // V39 review R-5: this start's generation, from
+        // `TabActivity::begin_start`.
+        start_gen: u64,
     ) -> AppResult<()> {
         let manager = self
             .managers
@@ -303,7 +306,7 @@ impl TabRegistry {
         let spec = match build_launch_spec(tab.clone(), &snap, launch_cwd, invocation_args) {
             Ok(s) => s,
             Err(e) => {
-                emit_launch_failure(&self.state_signals, &tab, &e);
+                emit_launch_failure(&self.state_signals, &tab, &e, start_gen);
                 return Err(e);
             }
         };
@@ -318,6 +321,7 @@ impl TabRegistry {
                 user_typed_tts,
                 self.state_signals.clone(),
                 self.patterns.clone(),
+                start_gen,
             )
             .await;
         // On a successful Shell spawn, broadcast `ShellRestarted` so the
@@ -354,6 +358,9 @@ impl TabRegistry {
         tts_segments: mpsc::Sender<TtsRequest>,
         user_typed_tts: Arc<StdMutex<HashSet<String>>>,
         settings: SettingsHandle,
+        // V39 review R-5: this start's generation, from
+        // `TabActivity::begin_start`.
+        start_gen: u64,
     ) -> AppResult<()> {
         let manager = self
             .managers
@@ -367,7 +374,7 @@ impl TabRegistry {
         let spec = match build_launch_spec(tab.clone(), &snap, launch_cwd, invocation_args) {
             Ok(s) => s,
             Err(e) => {
-                emit_launch_failure(&self.state_signals, &tab, &e);
+                emit_launch_failure(&self.state_signals, &tab, &e, start_gen);
                 return Err(e);
             }
         };
@@ -382,6 +389,7 @@ impl TabRegistry {
                 user_typed_tts,
                 self.state_signals.clone(),
                 self.patterns.clone(),
+                start_gen,
             )
             .await;
         if result.is_ok() && matches!(tab.kind(), TabKind::Shell) {
@@ -425,6 +433,17 @@ impl TabRegistry {
     pub async fn clear_permission_latch(&self, tab: &TabId) {
         if let Some(manager) = self.managers.get(tab) {
             manager.clear_permission_latch().await;
+        }
+    }
+
+    /// V39 Phase B: whether `tab` exists AND has a live PTY. `false` for an
+    /// unknown tab and for a known tab whose subprocess is not running — the
+    /// two are one answer here because the caller (delegation preflight) acts
+    /// identically on both: refuse, naming the tab.
+    pub async fn is_started(&self, tab: &TabId) -> bool {
+        match self.managers.get(tab) {
+            Some(m) => m.is_started().await,
+            None => false,
         }
     }
 
@@ -563,7 +582,14 @@ impl TabRegistry {
 /// route Enter to Configure instead of restart. Everything else (AI tabs,
 /// other Shell failure modes) goes through the generic SubprocessExited
 /// path that turns into Error / a regular closed overlay.
-fn emit_launch_failure(state_signals: &mpsc::Sender<StateSignal>, tab: &TabId, err: &AppError) {
+fn emit_launch_failure(
+    state_signals: &mpsc::Sender<StateSignal>,
+    tab: &TabId,
+    err: &AppError,
+    // V39 review R-5: the start that failed, so the mirror can tell this exit
+    // from a later start's.
+    start_gen: u64,
+) {
     if matches!(tab.kind(), TabKind::Shell) {
         if let AppError::CommandNotFound(name) = err {
             let message =
@@ -578,6 +604,7 @@ fn emit_launch_failure(state_signals: &mpsc::Sender<StateSignal>, tab: &TabId, e
     let _ = state_signals.try_send(StateSignal::SubprocessExited {
         tab: tab.clone(),
         code: None,
+        start_gen,
     });
 }
 

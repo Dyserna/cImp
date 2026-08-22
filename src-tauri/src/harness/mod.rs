@@ -96,6 +96,7 @@ pub mod chp;
 pub mod claude;
 pub mod contract;
 pub mod health;
+pub mod input;
 #[cfg(test)]
 mod layering;
 pub mod opencode;
@@ -104,4 +105,5 @@ pub mod reader;
 pub mod render;
 pub mod verify;
 
+pub use input::{input_profile, InputProfile};
 pub use reader::{spawn, OobContext, OobSpec};

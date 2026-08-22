@@ -114,6 +114,15 @@ pub enum AppError {
     #[error("preview error: {0}")]
     Preview(String),
 
+    /// V39 Phase A: a write into a tab whose keyboard is locked (locked
+    /// decision 4). `tab` is the target tab's id, `reason` the human string
+    /// from `ReadOnlySource::reason` — *read-only (user)* or *driven by
+    /// <tab>*. Kept as its own variant, and always carrying the reason,
+    /// because the frontend shows it verbatim in a toast: a refusal the user
+    /// cannot explain is a bug report waiting to happen.
+    #[error("tab `{tab}` is {reason}")]
+    ReadOnly { tab: String, reason: String },
+
     /// V23 Code Audit: a scan couldn't be started or cancelled (already in
     /// flight, no tools enabled, nothing to cancel). The tool run failures
     /// themselves are per-tool `failed` states, not this variant.

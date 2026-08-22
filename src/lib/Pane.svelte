@@ -22,12 +22,14 @@
   } from './terminals';
   import TabBar from './TabBar.svelte';
   import TabErrorOverlay from './TabErrorOverlay.svelte';
+  import DelegationBanner from './DelegationBanner.svelte';
   import ClosedShellOverlay from './ClosedShellOverlay.svelte';
   import PreviewToolbar from './PreviewToolbar.svelte';
   import { attachAppView, detachAppView, isAppViewTab } from './appViews';
   import { isShellTab, type TabId } from './tabs/types';
   import { tabs } from './tabs/store';
   import { latchByTab, taintColor } from './latch';
+  import { delegationInFlight } from './delegationState';
   import { settings } from './settings/store';
   import type { LayoutNode, PaneNode } from './layout/types';
 
@@ -170,6 +172,18 @@
     if (pane.active_tab_id === null) return;
     void retryTerminal(pane.active_tab_id);
   }
+
+  /// V39 Phase B (locked decision 2a): the delegation driving this pane's
+  /// ACTIVE tab, or null. Derived from the snapshot store, so it clears itself
+  /// on the flight's last edge rather than needing a teardown here.
+  const drivenFlight = $derived(
+    pane.active_tab_id === null ? null : ($delegationInFlight[pane.active_tab_id] ?? null),
+  );
+  const drivenTabName = $derived(
+    (pane.active_tab_id === null
+      ? null
+      : $tabs.find((m) => m.id === pane.active_tab_id)?.name) ?? (pane.active_tab_id ?? ''),
+  );
 </script>
 
 <div
@@ -189,6 +203,16 @@
     <div class="app-slot" bind:this={appSlotEl}></div>
     {#if taintFrameColor}
       <div class="taint-frame" style:border-color={taintFrameColor} aria-hidden="true"></div>
+    {/if}
+    <!-- V39 Phase B: the worker tab's attribution banner, for the whole flight.
+         An overlay for the same reason the taint frame above is one — a real
+         element in the column would refit xterm and resize the PTY mid-turn. -->
+    {#if drivenFlight && pane.active_tab_id !== null}
+      <DelegationBanner
+        tabId={pane.active_tab_id}
+        tabName={drivenTabName}
+        inFlight={drivenFlight}
+      />
     {/if}
     {#if pane.active_tab_id !== null}
       {#if $tabs.find((m) => m.id === pane.active_tab_id)?.kind === 'preview'}

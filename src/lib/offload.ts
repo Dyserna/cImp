@@ -69,7 +69,10 @@ export async function offloadServerRestart(): Promise<void> {
 /// V8-02: per-backend status row (mirror of Rust `BackendStatus`).
 export interface BackendStatus {
   name: string;
-  kind: 'local' | 'lan' | 'cloud';
+  /// V39 Phase C: `harness` is a facade — a Remote-offload tab. It has no
+  /// process and no URL, so its `state` is the delegation engine's own worker
+  /// verdict and its `error` is that verdict's reason.
+  kind: 'local' | 'lan' | 'cloud' | 'harness';
   tier: 'fast' | 'quality';
   enabled: boolean;
   cloud_blocked: boolean;
@@ -561,7 +564,7 @@ export interface ServerMetrics {
 /// decides whether the live dashboard or a status line renders.
 export interface BackendDashboard {
   name: string;
-  kind: 'local' | 'lan' | 'cloud';
+  kind: 'local' | 'lan' | 'cloud' | 'harness';
   state: 'ready' | 'stopped' | 'starting' | 'unreachable' | 'blocked' | 'disabled';
   metrics: ServerMetrics;
 }

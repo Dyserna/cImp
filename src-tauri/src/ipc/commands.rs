@@ -10,7 +10,7 @@ use crate::settings::{
     default_claude_local_tab, default_claude_tab, default_opencode_tab, AiToolTabConfig, Settings,
     TabConfig, CLAUDE_LOCAL_TAB_ID, CLAUDE_TAB_ID, OPENCODE_TAB_ID,
 };
-use crate::state::{StateSignal, TabId};
+use crate::state::{ReadOnlySource, StateSignal, TabId, TabKind};
 
 /// V1.4-04 D: pty_start now returns the persisted-scrollback bytes
 /// from the previous session (if any). The frontend writes them to the
@@ -40,6 +40,10 @@ pub async fn pty_start(
     let settings = state.settings.clone();
     let restore_on_launch = settings.current().terminal.scrollback.restore_on_launch;
 
+    // V39 review R-5: seed the activity mirror for THIS start and carry its
+    // generation into the spawn, so an exit belonging to an earlier start of
+    // the same tab can be recognised as late rather than latched onto this one.
+    let start_gen = state.tab_activity.begin_start(&tab);
     {
         let registry = state.tabs.lock().await;
         registry
@@ -54,6 +58,7 @@ pub async fn pty_start(
                 tts_tx,
                 user_typed,
                 settings,
+                start_gen,
             )
             .await?;
     }
@@ -110,6 +115,22 @@ pub async fn pty_restart(
     let tts_tx = state.tts_segments.clone();
     let user_typed = state.user_typed_tts.clone();
     let settings = state.settings.clone();
+    // V39 review HIGH-3 + R-5: re-seed the activity mirror for the fresh
+    // subprocess, BEFORE it is spawned.
+    //
+    // `TabActivity::exited` is latched, and the two signals that clear it do
+    // not cover this path: `TabAdded` fires for a NEW tab, and `ShellRestarted`
+    // is emitted for Shell-kind tabs only (`TabRegistry::restart_tab`). An AI
+    // tab — the only kind a delegation can drive — therefore restarted into a
+    // row still marked `exited`, and preflight refused it forever with "has no
+    // running process".
+    //
+    // Before the spawn rather than after it (R-5), and with a generation the
+    // spawn carries: clearing afterwards raced the old child's exit through the
+    // state-manager mpsc, which re-latched `exited` on the process that had
+    // just started. A failed restart re-latches it honestly — its own failure
+    // path emits an exit under THIS generation.
+    let start_gen = state.tab_activity.begin_start(&tab);
     let registry = state.tabs.lock().await;
     let result = registry
         .restart_tab(
@@ -123,8 +144,18 @@ pub async fn pty_restart(
             tts_tx,
             user_typed,
             settings,
+            start_gen,
         )
         .await;
+    // V39 review HIGH-3: re-seed the activity mirror for the fresh subprocess.
+    //
+    // `TabActivity::exited` is latched, and the two signals that clear it do
+    // not cover this path: `TabAdded` fires for a NEW tab, and `ShellRestarted`
+    // is emitted for Shell-kind tabs only (`TabRegistry::restart_tab`). An AI
+    // tab — the only kind a delegation can drive — therefore restarted into a
+    // row still marked `exited`, and preflight refused it forever with "has no
+    // running process". Only on success: a failed restart leaves no process,
+    // and clearing the flag would claim one.
     // V1.4-04 D.6: on user-initiated restart, the prior session's
     // scrollback is no longer relevant. Clear the in-memory ring so
     // the next graceful-exit persist doesn't include stale bytes from
@@ -171,6 +202,109 @@ pub async fn pty_write(state: State<'_, AppState>, tab: TabId, input: String) ->
     if tab.is_reserved_dashboard() {
         return Ok(());
     }
+
+    // V39 Phase A (locked decision 4): the read-only refusal. It sits here,
+    // ahead of EVERY side effect below — the TTS-marker registration, the
+    // typed-input accumulator, the keystroke/submit state signals — because a
+    // refused keystroke must leave no trace: an input that never reached the
+    // PTY must not have moved the avatar to Listening or armed a TTS-echo
+    // suppression for text the model never saw. This is the enforcement point;
+    // the xterm widget's own gate is a courtesy that keeps the round trip out
+    // of the common case, and is not what makes the lock hold.
+    //
+    // **Terminal protocol replies are exempt.** xterm answers the *program's*
+    // own queries (cursor-position reports, device attributes, focus in/out)
+    // on this same channel; they are the terminal talking to the TUI, not the
+    // user typing, and refusing them wedges a harness that is waiting for one
+    // — precisely while a delegation is driving it. Same predicate the
+    // keystroke bookkeeping below uses, so the two can't disagree about what
+    // counts as user input.
+    if let Some(source) = state.read_only.read_only(&tab) {
+        // The driver's *name* (not its id) is what the refusal says, and names
+        // live in the tab registry. Looked up only on the `Driven` branch so a
+        // plain user lock costs no registry lock.
+        let driver_name = match &source {
+            ReadOnlySource::User => None,
+            ReadOnlySource::Driven { by } => {
+                let registry = state.tabs.lock().await;
+                registry.name_of(by)
+            }
+        };
+        if let Some(reason) = read_only_refusal(&source, &input, driver_name.as_deref()) {
+            tracing::debug!(?tab, %reason, "pty_write refused: tab is read-only");
+            return Err(AppError::ReadOnly {
+                tab: tab.as_str().to_string(),
+                reason,
+            });
+        }
+    }
+
+    // The user's own keystrokes: whether this write submits is read off the
+    // bytes, exactly as it always was.
+    let submit = Submit::from_input(&input);
+    write_through_pipeline(&state, &tab, input, submit).await
+}
+
+/// **Does this write submit the turn?** (V39 review L-1.)
+///
+/// It used to be inferred from the bytes in every case, and for a keyboard that
+/// is right — a person's Enter IS the submit. For the delegation engine it is
+/// not: the engine's PASTE contains the request's own newlines (a multi-line
+/// request is one bracketed paste), so `contains_enter` fired on the paste, one
+/// write EARLY. The `UserSubmit` that went out then cleared the worker's prompt
+/// mirror and zeroed its input counter for a turn that had not been submitted
+/// yet — while the engine's real submit, a lone CR a moment later, is what
+/// actually starts it.
+///
+/// So the caller says. `pty_write` keeps the old inference; the engine passes
+/// `No` for the paste and `Yes` for the submit.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Submit {
+    Yes,
+    No,
+}
+
+impl Submit {
+    /// The keyboard's rule: any CR or LF in the bytes submits.
+    pub(crate) fn from_input(input: &str) -> Self {
+        if contains_enter(input) {
+            Submit::Yes
+        } else {
+            Submit::No
+        }
+    }
+
+    fn is_yes(self) -> bool {
+        self == Submit::Yes
+    }
+}
+
+/// **The one input pipeline** (V39 cross-module invariant): every byte that
+/// reaches a tab's PTY passes through here — the TTS-marker pre-registration,
+/// the typed-input accumulator, the keystroke/submit state signals, and the
+/// registry write, in that order and under one registry lock.
+///
+/// Split out of [`pty_write`] in V39 Phase B so the delegation engine can reuse
+/// it. What the engine skips is **only** the read-only check above, and only
+/// because that check is about the *user's keyboard*: the engine holds the
+/// `Driven` lock itself, so entering through `pty_write` would have it refuse
+/// its own write. Everything else it must not skip — a delegated turn that
+/// bypassed the TTS-marker registration would have the worker's echo of the
+/// task spoken aloud, and one that bypassed `UserSubmit` would leave the
+/// avatar in the wrong state for a turn that really did start.
+///
+/// Takes `&AppState` rather than `State<'_, AppState>` so both a Tauri command
+/// and a plain async caller reach the same body.
+pub(crate) async fn write_through_pipeline(
+    state: &AppState,
+    tab: &TabId,
+    input: String,
+    // V39 review L-1: whether this write SUBMITS. See [`Submit`] — the engine's
+    // paste carries newlines, and inferring it from the bytes fired
+    // `UserSubmit` one write early.
+    submit: Submit,
+) -> AppResult<()> {
+    let tab = tab.clone();
     // Pre-register any TTS markers in the user's input so they don't fire
     // when echoed back by the TUI. Content-based; no per-tab scoping needed.
     // The set stores whitespace-normalized content so a width-driven echo
@@ -244,7 +378,7 @@ pub async fn pty_write(state: State<'_, AppState>, tab: TabId, input: String) ->
     };
 
     if !is_automatic_terminal_response(&input) {
-        if contains_enter(&input) {
+        if submit.is_yes() {
             len_counter.store(0, Ordering::Relaxed);
             let _ = state
                 .state_signals
@@ -262,6 +396,395 @@ pub async fn pty_write(state: State<'_, AppState>, tab: TabId, input: String) ->
     }
 
     registry.write(tab, input.into_bytes()).await
+}
+
+/// V39 Phase A: the read-only decision for one write, as a value.
+///
+/// `Some(reason)` refuses; `None` lets the write through. Two rules, and the
+/// second is the one worth pinning in a test:
+///
+/// 1. A locked tab refuses the user's input, naming the source.
+/// 2. **Terminal protocol replies always pass.** xterm answers the running
+///    program's own queries — cursor-position reports, device attributes,
+///    focus in/out — over the same channel as keystrokes. Those are the
+///    terminal talking to the TUI, not a person typing; a harness that asked
+///    for the cursor position and never gets an answer can wedge, and it would
+///    wedge exactly while a delegation is driving it. The same predicate the
+///    keystroke bookkeeping uses decides this, so the two cannot disagree
+///    about what counts as user input.
+fn read_only_refusal(
+    source: &ReadOnlySource,
+    input: &str,
+    driver_name: Option<&str>,
+) -> Option<String> {
+    if read_only_exempt(input) {
+        return None;
+    }
+    Some(source.reason(driver_name))
+}
+
+/// Everything the read-only lock lets through. **Only** `read_only_refusal`
+/// asks this — `is_automatic_terminal_response` keeps its own, unchanged
+/// meaning for the keystroke/submit bookkeeping, which must go on treating a
+/// wheel report as the non-typing event it always was.
+///
+/// Two exemptions, for two different reasons:
+///
+/// 1. The terminal answering the running program (see `read_only_refusal`).
+/// 2. **Wheel reports: scrolling is reading.** A read-only tab exists so the
+///    user can watch it, and in an alt-screen TUI the wheel is not local
+///    scrollback — it is forwarded to the program as a mouse report, so a
+///    swallowed wheel means a tab the user is allowed to watch but not scroll.
+///    Mouse *clicks* stay refused: a click activates a control (choosing a
+///    permission option, for one), which is exactly the input the lock is for.
+fn read_only_exempt(input: &str) -> bool {
+    is_automatic_terminal_response(input) || is_mouse_wheel(input)
+}
+
+/// Whether `input` is *nothing but* mouse-wheel reports.
+///
+/// Whole-input, and repeat-until-exhausted rather than "starts with": a chunk
+/// that is a wheel report followed by typed text is refused, so the exemption
+/// cannot be used to smuggle a keystroke past the lock. Repeats are allowed
+/// because a fast scroll can arrive as several reports in one chunk, and
+/// letting only the first through would drop the rest silently.
+fn is_mouse_wheel(input: &str) -> bool {
+    let mut rest = input;
+    let mut seen = false;
+    while !rest.is_empty() {
+        match take_wheel_report(rest) {
+            Some(next) => {
+                seen = true;
+                rest = next;
+            }
+            None => return false,
+        }
+    }
+    seen
+}
+
+/// Consume one leading wheel report, returning what follows it.
+///
+/// Handles both encodings xterm can emit: SGR (`ESC [ < Cb ; Cx ; Cy M`) and
+/// the legacy X10/normal one (`ESC [ M` + three bytes, each offset by 32 —
+/// read as `char`s so xterm's UTF-8 extended coordinates don't split).
+///
+/// SGR wheel reports end in `M` only; xterm emits no release for a wheel, so a
+/// `…m` form is not recognized and is refused like any other click release.
+fn take_wheel_report(s: &str) -> Option<&str> {
+    if let Some(body) = s.strip_prefix("\x1b[<") {
+        let end = body.find('M')?;
+        let (params, after) = body.split_at(end);
+        let rest = &after['M'.len_utf8()..];
+        let mut parts = params.split(';');
+        let cb: u32 = parts.next()?.parse().ok()?;
+        let _x: u32 = parts.next()?.parse().ok()?;
+        let _y: u32 = parts.next()?.parse().ok()?;
+        if parts.next().is_some() {
+            return None;
+        }
+        return is_wheel_button(cb).then_some(rest);
+    }
+    if let Some(body) = s.strip_prefix("\x1b[M") {
+        let mut chars = body.chars();
+        let cb = (chars.next()? as u32).checked_sub(32)?;
+        let _x = chars.next()?;
+        let _y = chars.next()?;
+        return is_wheel_button(cb).then(|| chars.as_str());
+    }
+    None
+}
+
+/// The wheel bit is 64 (buttons 64/65 vertical, 66/67 horizontal). Bit 32 is
+/// motion, which a wheel never sets and a drag always does, so it must be
+/// clear. Modifier bits (shift 4, meta 8, ctrl 16) may be set — ctrl+wheel is
+/// still a wheel. Nothing at or above 128 is a mouse button.
+fn is_wheel_button(cb: u32) -> bool {
+    cb < 128 && (cb & 0b110_0000) == 0b100_0000
+}
+
+/// V39 Phase A: set or clear a tab's **user** read-only lock (locked
+/// decision 4's `ReadOnlySource::User`) — the Access radio in the tab's
+/// communication popover.
+///
+/// Does two things, in this order: takes the runtime lock (so it is in force
+/// before this call returns, with no window in which the UI shows "read-only"
+/// and the PTY still accepts keys), then persists the flag so it survives a
+/// restart. The persisted write broadcasts `settings-changed`, which is how
+/// the frontend learns the new state — there is no separate event.
+///
+/// Only ever sets `User`. The engine's `Driven` lock is not reachable from
+/// here: it belongs to a delegation's lifetime, and "Take over" (Phase B), not
+/// a radio button, is what ends one.
+#[tauri::command]
+pub async fn tab_set_read_only(state: State<'_, AppState>, tab: TabId, on: bool) -> AppResult<()> {
+    if tab.kind() != TabKind::AiTool {
+        return Err(AppError::Ipc(format!(
+            "tab `{}` is not an AI tab; the read-only lock applies to AI tabs only",
+            tab.as_str()
+        )));
+    }
+    if !matches!(
+        state.settings.current().find_tab(tab.as_str()),
+        Some(TabConfig::AiTool(_))
+    ) {
+        return Err(AppError::Ipc(format!(
+            "unknown AI tab `{}`",
+            tab.as_str()
+        )));
+    }
+    state.read_only.set_user(&tab, on);
+    let id = tab.as_str().to_string();
+    state.settings.mutate(move |snap| {
+        if let Some(TabConfig::AiTool(cfg)) = snap.find_tab_mut(&id) {
+            cfg.read_only = on;
+        }
+    });
+    Ok(())
+}
+
+/// V39 Phase B: what `tab_set_delegation_role` did, for the UI's toast.
+///
+/// `displaced` is the id of the tab that LOST the Manual role to this call
+/// (locked decision 8's move rule) — `None` when nothing moved. Returned rather
+/// than only recorded because the losing tab may not be visible, and a role
+/// that moved silently is a `delegate_task_*` tool that started driving a
+/// different tab with nothing on screen saying so.
+#[derive(serde::Serialize)]
+pub struct RoleChange {
+    pub tab: String,
+    pub role: crate::settings::DelegationRole,
+    pub displaced: Option<String>,
+}
+
+/// V39 Phase B (locked decision 8): set a tab's delegation role, enforcing
+/// **at most one Manual tab per harness**.
+///
+/// The move rule, and why it is a move rather than a refusal: the user is
+/// choosing which tab `delegate_task_<harness>` drives, and there is exactly
+/// one answer per harness. A refusal ("tab A already holds it") would make the
+/// user go and clear A first for no reason anyone benefits from — so this is a
+/// radio button whose group spans tabs. The previous holder drops to `None`,
+/// both writes land in ONE settings mutation (so no broadcast can observe two
+/// Manual tabs of one harness), an Events row records the move, and the
+/// displaced id comes back for the toast.
+///
+/// Refusals, each naming its condition: a reserved dashboard (no PTY, no
+/// harness), a tab that is not a configured AI tab, and a harness with no input
+/// profile (it could never be driven, so a role on it would be a control that
+/// does nothing).
+///
+/// **Not spawn-baked** (decision 15). The persisted write broadcasts
+/// `settings-changed`, which is also what asks the offload service for a
+/// `tools/list_changed` pulse — `graph::native_surface_sig` now hashes the
+/// Manual set, so the gate sees the move and every live session re-lists on its
+/// next turn without a restart.
+#[tauri::command]
+pub async fn tab_set_delegation_role(
+    state: State<'_, AppState>,
+    tab: TabId,
+    role: crate::settings::DelegationRole,
+) -> AppResult<RoleChange> {
+    use crate::settings::DelegationRole;
+
+    if tab.is_reserved_dashboard() {
+        return Err(AppError::Ipc(format!(
+            "tab `{}` is an app-rendered dashboard, not a harness tab; it has no delegation role",
+            tab.as_str()
+        )));
+    }
+    if tab.kind() != TabKind::AiTool {
+        return Err(AppError::Ipc(format!(
+            "tab `{}` is not an AI tab; delegation roles apply to AI tabs only",
+            tab.as_str()
+        )));
+    }
+    let settings = state.settings.current();
+    let Some(TabConfig::AiTool(cfg)) = settings.find_tab(tab.as_str()) else {
+        return Err(AppError::Ipc(format!("unknown AI tab `{}`", tab.as_str())));
+    };
+    let agent = crate::tabs::tab_consumer(cfg);
+    if crate::harness::input_profile(agent).is_none() {
+        return Err(AppError::Ipc(format!(
+            "tab `{}` runs a harness with no input profile, so cImp could never type a turn into \
+             it — it cannot hold a delegation role",
+            tab.as_str()
+        )));
+    }
+
+    // Who currently holds Manual for this harness, if anyone. Read before the
+    // mutation so the row and the return value name the same tab the mutation
+    // is about to clear.
+    let displaced: Option<(String, String)> = if role == DelegationRole::Manual {
+        settings.tabs.iter().find_map(|t| match t {
+            TabConfig::AiTool(c)
+                if c.delegation_role == DelegationRole::Manual
+                    && c.id != tab.as_str()
+                    && crate::tabs::tab_consumer(c) == agent =>
+            {
+                Some((c.id.clone(), c.name.clone()))
+            }
+            _ => None,
+        })
+    } else {
+        None
+    };
+
+    let id = tab.as_str().to_string();
+    let losing = displaced.as_ref().map(|(id, _)| id.clone());
+    let agent_for_mutate = agent;
+    state.settings.mutate(move |snap| {
+        // ONE mutation for both writes: a snapshot in which two tabs of one
+        // harness hold Manual must never be observable by a broadcast reader.
+        for t in snap.tabs.iter_mut() {
+            let TabConfig::AiTool(c) = t else { continue };
+            if c.id == id {
+                c.delegation_role = role;
+            } else if role == DelegationRole::Manual
+                && c.delegation_role == DelegationRole::Manual
+                && crate::tabs::tab_consumer(c) == agent_for_mutate
+            {
+                c.delegation_role = DelegationRole::None;
+            }
+        }
+    });
+
+    if let Some((lost_id, lost_name)) = &displaced {
+        let taker = {
+            let registry = state.tabs.lock().await;
+            registry
+                .name_of(&tab)
+                .unwrap_or_else(|| tab.as_str().to_string())
+        };
+        crate::delegation::record_row(
+            crate::delegation::transition::ROLE_MOVED,
+            lost_name,
+            Some(&format!(
+                "the Manual role for this harness moved to `{taker}`"
+            )),
+            agent,
+            Some(tab.as_str()),
+            true,
+            0,
+            String::new(),
+            String::new(),
+        );
+        tracing::info!(from = %lost_id, to = %tab.as_str(), harness = %agent, "delegation: Manual role moved");
+    }
+
+    Ok(RoleChange {
+        tab: tab.as_str().to_string(),
+        role,
+        displaced: losing,
+    })
+}
+
+/// **Write one tab's facade-backend knobs, and nothing else** (V39 review
+/// M-10).
+///
+/// The popover used to save these through the ordinary whole-document
+/// `applySettings`: read the store, patch three fields, send the entire
+/// `Settings`. That is the `40d2b32` lost-update shape — a document written
+/// from a snapshot taken before some other write landed silently reverts it —
+/// and the write most likely to be in flight beside it is the ROLE radio one
+/// line above, which goes through `tab_set_delegation_role` precisely because
+/// only the backend can enforce its cross-tab rule. Typing a backend name
+/// could put the role back.
+///
+/// So: one command, three fields, `settings.mutate` (which composes with a
+/// concurrent mutation instead of overwriting the document).
+///
+/// **The role is deliberately not touched**, and neither is anything else on
+/// the tab: a user who sets a name, switches the role away and switches it
+/// back finds the knobs where they left them.
+#[tauri::command]
+pub async fn tab_set_delegation_backend(
+    state: State<'_, AppState>,
+    tab: TabId,
+    backend: crate::settings::DelegationBackend,
+) -> AppResult<()> {
+    if tab.kind() != TabKind::AiTool {
+        return Err(AppError::Ipc(format!(
+            "tab `{}` is not an AI tab; delegation backends are configured on AI tabs only",
+            tab.as_str()
+        )));
+    }
+    if !matches!(
+        state.settings.current().find_tab(tab.as_str()),
+        Some(TabConfig::AiTool(_))
+    ) {
+        return Err(AppError::Ipc(format!("unknown AI tab `{}`", tab.as_str())));
+    }
+    let backend = normalise_backend(backend);
+    let id = tab.as_str().to_string();
+    state.settings.mutate(move |snap| {
+        if let Some(TabConfig::AiTool(cfg)) = snap.find_tab_mut(&id) {
+            apply_backend_patch(cfg, backend);
+        }
+    });
+    Ok(())
+}
+
+/// The two "blank means unset" rules, at the parse boundary rather than at
+/// every reader: a cleared text field arrives as `""` and a cleared number
+/// field as `0`, and both mean "use the default".
+fn normalise_backend(
+    mut backend: crate::settings::DelegationBackend,
+) -> crate::settings::DelegationBackend {
+    backend.name = backend
+        .name
+        .map(|n| n.trim().to_string())
+        .filter(|n| !n.is_empty());
+    backend.declared_context = backend.declared_context.filter(|n| *n > 0);
+    backend
+}
+
+/// Write the knobs onto one tab's config. **Only** the knobs — separated out
+/// so a test can state that, since the command itself needs a running app.
+fn apply_backend_patch(
+    cfg: &mut crate::settings::AiToolTabConfig,
+    backend: crate::settings::DelegationBackend,
+) {
+    cfg.delegation_backend = backend;
+}
+
+/// V39 Phase B (locked decision 6): **take over** a driven tab.
+///
+/// Stops the driver waiting; the worker keeps running, visibly. Sends the
+/// worker NOTHING — no Escape, no interrupt.
+///
+/// **Sets a flag, and that is all it does.** The engine's own path releases the
+/// read-only lock and mints the single `takeover` Events row on its way out —
+/// two owners of a teardown is how one of them ends up running twice, which is
+/// exactly what happened in this phase's first cut: this command minted a
+/// `takeover` row and the engine minted a `cancelled` one, two rows for one
+/// event. One event, one row, minted where the flight ends and the timings are
+/// known.
+///
+/// Returns whether a delegation was actually in flight, so the UI can tell "I
+/// cancelled it" from "it had already finished".
+#[tauri::command]
+pub async fn delegation_take_over(tab: TabId) -> AppResult<bool> {
+    Ok(crate::delegation::take_over(&tab).is_some())
+}
+
+/// V39 Phase B: what is driving `tab` right now, if anything — the glyph's
+/// *driven* state and the worker-tab banner.
+///
+/// A pull to pair with the `delegation-changed` push: the event carries every
+/// edge, and this is what a view that mounts mid-flight asks so it paints the
+/// right thing before the next edge arrives.
+#[tauri::command]
+pub async fn delegation_status(tab: TabId) -> AppResult<Option<crate::delegation::InFlightView>> {
+    Ok(crate::delegation::status(&tab))
+}
+
+/// V39 Phase B: every in-flight delegation, keyed by worker tab id — the
+/// status-bar chip's count and the initial paint of every tab's glyph, in one
+/// call rather than one per tab.
+#[tauri::command]
+pub async fn delegation_statuses() -> AppResult<Vec<(String, crate::delegation::InFlightView)>> {
+    Ok(crate::delegation::statuses())
 }
 
 fn contains_enter(input: &str) -> bool {
@@ -3574,7 +4097,253 @@ pub async fn restart_shell_tab(app: AppHandle, tab: TabId) -> AppResult<()> {
 mod tests {
     use super::apply_incoming_settings;
     use super::is_automatic_terminal_response as auto_reply;
+    use super::read_only_refusal;
     use crate::settings::{PromptTemplate, Settings};
+    use crate::state::{ReadOnlySource, TabId};
+
+    /// **The facade knobs are a NARROW write** (V39 review M-10).
+    ///
+    /// The popover's old path sent the whole `Settings` document, which can
+    /// revert a role change that landed after its snapshot was taken (the
+    /// `40d2b32` class). What replaces it must touch the three knobs and
+    /// nothing else — least of all `delegation_role`, whose cross-tab rule
+    /// only `tab_set_delegation_role` enforces.
+    #[test]
+    fn the_backend_patch_touches_the_knobs_and_nothing_else() {
+        use crate::settings::{BackendTier, DelegationBackend, DelegationRole, TabConfig};
+        let mut tab = crate::settings::default_claude_tab();
+        let TabConfig::AiTool(cfg) = &mut tab else {
+            panic!("an AI tab");
+        };
+        cfg.delegation_role = DelegationRole::Manual;
+        cfg.read_only = true;
+        cfg.name = "api-work".to_string();
+        let before = cfg.clone();
+
+        super::apply_backend_patch(
+            cfg,
+            DelegationBackend {
+                name: Some("lan-worker-2".to_string()),
+                tier: BackendTier::Fast,
+                declared_context: Some(128_000),
+            },
+        );
+
+        assert_eq!(cfg.delegation_backend.name.as_deref(), Some("lan-worker-2"));
+        assert_eq!(cfg.delegation_backend.tier, BackendTier::Fast);
+        assert_eq!(cfg.delegation_backend.declared_context, Some(128_000));
+        assert_eq!(
+            cfg.delegation_role, before.delegation_role,
+            "the role is the one field a knob write must never move"
+        );
+        assert_eq!(cfg.read_only, before.read_only);
+        assert_eq!(cfg.name, before.name);
+        assert_eq!(cfg.command, before.command);
+    }
+
+    /// Blank is unset, at the boundary: a cleared text field arrives as `""`
+    /// and a cleared number field as `0`.
+    #[test]
+    fn a_cleared_knob_is_stored_as_absent_not_as_blank() {
+        use crate::settings::DelegationBackend;
+        let out = super::normalise_backend(DelegationBackend {
+            name: Some("   ".to_string()),
+            declared_context: Some(0),
+            ..Default::default()
+        });
+        assert_eq!(out.name, None);
+        assert_eq!(out.declared_context, None);
+        let kept = super::normalise_backend(DelegationBackend {
+            name: Some("  lan-worker-2 ".to_string()),
+            declared_context: Some(64_000),
+            ..Default::default()
+        });
+        assert_eq!(kept.name.as_deref(), Some("lan-worker-2"));
+        assert_eq!(kept.declared_context, Some(64_000));
+    }
+
+    /// **The keyboard's submit rule is unchanged, and it is the wrong rule for
+    /// a paste** (V39 review L-1).
+    ///
+    /// A person's Enter IS the submit, so `pty_write` still reads it off the
+    /// bytes. A delegation's paste carries the request's own newlines, and
+    /// under the same rule it read as a submit one write early — which is why
+    /// the engine STATES it instead of letting it be inferred.
+    #[test]
+    fn a_submit_is_inferred_for_the_keyboard_and_stated_by_the_engine() {
+        use super::Submit;
+        assert_eq!(Submit::from_input("hello"), Submit::No);
+        assert_eq!(Submit::from_input(""), Submit::No);
+        assert_eq!(Submit::from_input("\r"), Submit::Yes);
+        assert_eq!(Submit::from_input("hello\n"), Submit::Yes);
+        // The trap, spelled out: a bracketed paste of a two-line request looks
+        // exactly like a submit to the byte rule.
+        let paste = "\u{1b}[200~line one\nline two\u{1b}[201~";
+        assert_eq!(
+            Submit::from_input(paste),
+            Submit::Yes,
+            "the byte rule cannot tell a pasted newline from a pressed Enter"
+        );
+    }
+
+    /// **V39 Phase A: a refusal always names why.** The frontend shows this
+    /// string verbatim in a toast, so an empty or generic one leaves the user
+    /// staring at a tab that has silently stopped accepting keys.
+    #[test]
+    fn a_read_only_write_is_refused_with_the_reason_named() {
+        assert_eq!(
+            read_only_refusal(&ReadOnlySource::User, "hello", None).as_deref(),
+            Some("read-only (user)")
+        );
+        assert_eq!(
+            read_only_refusal(
+                &ReadOnlySource::Driven {
+                    by: TabId::OpenCode
+                },
+                "hello",
+                Some("api-work"),
+            )
+            .as_deref(),
+            Some("driven by api-work")
+        );
+    }
+
+    /// **The lock is on the user's keyboard, not on the terminal protocol.**
+    /// A TUI that queried the cursor position must still get its answer while
+    /// the tab is locked — otherwise the very tab a delegation is driving is
+    /// the one that wedges.
+    #[test]
+    fn terminal_protocol_replies_are_not_refused_by_the_lock() {
+        for reply in ["\x1b[24;80R", "\x1b[?1;2c", "\x1b[0n", "\x1b[I", "\x1b[O"] {
+            assert!(
+                auto_reply(reply),
+                "fixture must be an automatic reply: {reply:?}"
+            );
+            assert_eq!(
+                read_only_refusal(&ReadOnlySource::User, reply, None),
+                None,
+                "the terminal's own answer was refused: {reply:?}"
+            );
+        }
+    }
+
+    /// **Scrolling is reading.** A read-only tab exists so the user can WATCH
+    /// it, and in an alt-screen TUI the wheel is forwarded to the program as a
+    /// mouse report rather than scrolling xterm's own buffer — so a swallowed
+    /// wheel means a tab one may watch but not scroll.
+    ///
+    /// The fixture table is duplicated verbatim in
+    /// `src/lib/delegation.test.ts`: the courtesy gate and this enforcement
+    /// point must agree about every one of these, or one of them refuses a
+    /// scroll the other allowed.
+    #[test]
+    fn mouse_wheel_passes_the_lock_under_either_source() {
+        let driven = ReadOnlySource::Driven {
+            by: TabId::OpenCode,
+        };
+        for wheel in [
+            "\x1b[<64;10;5M",              // wheel up (SGR)
+            "\x1b[<65;10;5M",              // wheel down
+            "\x1b[<66;1;1M",               // wheel left
+            "\x1b[<67;1;1M",               // wheel right
+            "\x1b[<80;3;4M",               // ctrl+wheel up (64 + modifier 16)
+            "\x1b[<68;3;4M",               // shift+wheel up (64 + modifier 4)
+            "\x1b[M`!!",                   // wheel up, legacy X10 encoding
+            "\x1b[Ma!!",                   // wheel down, legacy X10 encoding
+            "\x1b[<64;1;1M\x1b[<64;1;1M",  // a fast scroll, coalesced
+        ] {
+            assert!(
+                super::is_mouse_wheel(wheel),
+                "fixture must be a wheel report: {wheel:?}"
+            );
+            for source in [&ReadOnlySource::User, &driven] {
+                assert_eq!(
+                    read_only_refusal(source, wheel, Some("api-work")),
+                    None,
+                    "a locked tab refused a scroll ({source:?}): {wheel:?}"
+                );
+            }
+        }
+    }
+
+    /// **A click is input.** It activates whatever control is under it — a
+    /// permission option, for one — which is the whole reason the lock exists.
+    /// Drag and motion go with it: a drag is a held button.
+    #[test]
+    fn mouse_clicks_drags_and_pastes_are_still_refused() {
+        for click in [
+            "\x1b[<0;10;5M",   // left press
+            "\x1b[<0;10;5m",   // left release
+            "\x1b[<1;1;1M",    // middle press
+            "\x1b[<2;1;1M",    // right press
+            "\x1b[<32;5;5M",   // drag with button 0 held (motion bit)
+            "\x1b[<35;5;5M",   // bare motion
+            "\x1b[M !!",       // left press, legacy X10 encoding
+            "\x1b[M#!!",       // release, legacy X10 encoding
+            "\x1b[200~x\x1b[201~", // a bracketed paste
+        ] {
+            assert!(
+                !super::is_mouse_wheel(click),
+                "fixture must not be a wheel report: {click:?}"
+            );
+            assert!(
+                read_only_refusal(&ReadOnlySource::User, click, None).is_some(),
+                "mouse/paste input slipped through the lock: {click:?}"
+            );
+        }
+    }
+
+    /// **The exemption cannot carry a passenger.** A chunk that is a wheel
+    /// report *plus* typed text is not a wheel report — otherwise the lock
+    /// would be one concatenation away from open.
+    #[test]
+    fn a_wheel_report_with_anything_else_attached_is_refused() {
+        for smuggled in [
+            "\x1b[<64;1;1My",              // wheel then a keystroke
+            "y\x1b[<64;1;1M",              // keystroke then wheel
+            "\x1b[<64;1;1M\r",             // wheel then Enter
+            "\x1b[<64;1;1M\x1b[<0;1;1M",   // wheel then a click
+            "\x1b[<64;1;1",                // truncated: no terminator
+            "\x1b[M`!",                    // truncated X10: two coord bytes
+            "",
+        ] {
+            assert!(
+                !super::is_mouse_wheel(smuggled),
+                "fixture must not be a wheel report: {smuggled:?}"
+            );
+            assert!(
+                read_only_refusal(&ReadOnlySource::User, smuggled, None).is_some(),
+                "input smuggled past the lock behind a wheel report: {smuggled:?}"
+            );
+        }
+    }
+
+    /// The wheel exemption is `read_only_refusal`'s alone: the keystroke and
+    /// submit bookkeeping still sees a wheel report exactly as it always did
+    /// (not an automatic terminal response), so nothing about avatar state or
+    /// echo suppression moved with this.
+    #[test]
+    fn the_wheel_exemption_did_not_change_the_automatic_reply_predicate() {
+        for wheel in ["\x1b[<64;10;5M", "\x1b[M`!!"] {
+            assert!(!auto_reply(wheel), "{wheel:?}");
+        }
+    }
+
+    /// …and the exemption is narrow: an escape sequence a *person* produced
+    /// (arrow keys, Esc, a bracketed paste) is still input, and still refused.
+    #[test]
+    fn keyboard_escape_sequences_are_still_refused() {
+        for keys in ["\x1b[A", "\x1b", "\r", "y", "\x1b[200~pasted\x1b[201~"] {
+            assert!(
+                !auto_reply(keys),
+                "fixture must not be an automatic reply: {keys:?}"
+            );
+            assert!(
+                read_only_refusal(&ReadOnlySource::User, keys, None).is_some(),
+                "user input slipped through the lock: {keys:?}"
+            );
+        }
+    }
 
     /// **#48 (M-21): the manual buttons' refusal names the layer that is off.**
     ///

@@ -641,6 +641,77 @@ about the task's intent — this licence covers interpretation, never facts. You
 must be a single JSON value matching the requested schema and nothing else: no prose, no \
 narration, no citation markers, and cite nothing — the JSON is the whole answer.";
 
+/// The sentence that makes a schema run a schema run, spelled once.
+///
+/// It is a *substring* of [`SCHEMA_SYSTEM_PROMPT`] rather than a piece it is
+/// built from, because that prompt is one `const` literal and splicing it would
+/// cost more than the tripwire that pins the relation
+/// (`the_facade_schema_note_is_the_worker_prompts_own_sentence`). The V39
+/// facade needs exactly this sentence, and needs it to be the SAME sentence:
+/// the facade's promise is that `offload_task`'s options mean the same thing
+/// wherever the task lands.
+const SCHEMA_FINAL_INSTRUCTION: &str = concat!(
+    "Your final message must be a single JSON value matching the requested schema and nothing ",
+    "else: no prose, no narration, no citation markers"
+);
+
+/// **V39 Phase C — what `offload_task`'s `schema` / `profile` become when the
+/// backend is a harness tab.**
+///
+/// A real backend honours both through machinery cImp owns: `schema` becomes a
+/// grammar on the final turn ([`schema_response_format`]) and `profile`
+/// pre-applies the taint latch, which REMOVES tool defs
+/// ([`toolclass::filter_defs`]). A worker tab gives cImp neither — it is a peer
+/// process with its own sampler and its own tools. The only channel to it is
+/// the text a user could have typed, so the options arrive as the instructions
+/// the worker loop's own model would have been given, appended once, after the
+/// caller's context ([`crate::delegation::DriveRequest::format_note`]).
+///
+/// **What that costs, stated plainly, because it is not nothing.** For `schema`
+/// this is a downgrade from a guarantee to a request: a grammar cannot emit
+/// invalid JSON, an instruction can be ignored, and the facade path therefore
+/// does not re-validate (there is no partial output to salvage and no second
+/// turn to spend). For `profile` it is a downgrade from *enforcement* to
+/// *instruction*: cImp cannot take a tool away from another harness. What still
+/// holds on the worker's side is the worker's own configuration — its sandbox,
+/// its permission prompts, its MCP surface (locked decision 1) — which is the
+/// containment the user chose for that tab. A caller that needs V32's
+/// containment as a boundary rather than as a request should not have a facade
+/// in its pool.
+///
+/// `None` when neither option was passed — the overwhelmingly common case, and
+/// the one where the worker reads the caller's bytes and nothing else.
+pub fn facade_format_note(
+    schema: Option<&serde_json::Value>,
+    profile: Option<Profile>,
+) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    // Profile first: it is about how to do the work. Schema last: it is about
+    // the shape of the answer, and last is where a reader looks for that.
+    if let Some(p) = profile {
+        parts.push(
+            match p {
+                Profile::Research => concat!(
+                    "This is a research task: use web and document sources for it, and do not ",
+                    "read local files, search the code or run commands."
+                ),
+                Profile::Code => concat!(
+                    "This is a local code task: use local file, search and command tools for it, ",
+                    "and do not fetch anything from the web."
+                ),
+            }
+            .to_string(),
+        );
+    }
+    if let Some(sc) = schema {
+        let rendered = serde_json::to_string_pretty(sc).unwrap_or_else(|_| sc.to_string());
+        parts.push(format!(
+            "{SCHEMA_FINAL_INSTRUCTION}. The requested schema is:\n\n{rendered}"
+        ));
+    }
+    (!parts.is_empty()).then(|| parts.join("\n\n"))
+}
+
 /// Cap a tool result to `cap_tokens`, appending a truncation marker so
 /// the model knows it was cut and narrows/paginates.
 ///
@@ -3479,6 +3550,66 @@ mod tests {
     }
 
     // ── V21 F9 — grammar-enforced structured output ────────────────────────
+
+    /// **V39 Phase C: `schema` and `profile` reach a facade worker as the
+    /// worker loop's own instructions**, and as nothing else.
+    ///
+    /// The tripwire half matters most: the schema sentence must be the SAME
+    /// sentence a real backend's worker is given, because the facade's promise
+    /// is that `offload_task`'s options mean one thing wherever the task lands.
+    #[test]
+    fn the_facade_schema_note_is_the_worker_prompts_own_sentence() {
+        assert!(
+            SCHEMA_SYSTEM_PROMPT.contains(SCHEMA_FINAL_INSTRUCTION),
+            "the facade's schema instruction has drifted from the worker prompt it is quoting"
+        );
+    }
+
+    #[test]
+    fn no_options_means_no_added_text_at_all() {
+        assert_eq!(facade_format_note(None, None), None);
+    }
+
+    #[test]
+    fn the_schema_note_carries_the_schema_itself() {
+        let schema = json!({ "type": "object", "properties": { "count": { "type": "integer" } } });
+        let note = facade_format_note(Some(&schema), None).expect("a note");
+        assert!(note.starts_with(SCHEMA_FINAL_INSTRUCTION));
+        // The worker has no grammar to constrain it, so it must be able to READ
+        // the schema — a note that only said "match the requested schema" would
+        // be asking for something the worker was never shown.
+        assert!(note.contains("\"count\""), "the schema is rendered into the note: {note}");
+        assert!(note.contains("integer"));
+    }
+
+    /// The profile note states the containment the latch would have ENFORCED on
+    /// a real backend. It is an instruction here, not a boundary — see
+    /// `facade_format_note`'s docs — and both shapes must name their own side
+    /// and forbid the other, or the note would be advice with no content.
+    #[test]
+    fn the_profile_note_states_both_halves_of_the_containment() {
+        let research = facade_format_note(None, Some(Profile::Research)).expect("a note");
+        assert!(research.contains("research task"));
+        assert!(research.contains("do not read local files"));
+        let code = facade_format_note(None, Some(Profile::Code)).expect("a note");
+        assert!(code.contains("local code task"));
+        assert!(code.contains("do not fetch anything from the web"));
+        assert_ne!(research, code);
+    }
+
+    /// Both options: the profile (how to work) first, the schema (what the
+    /// answer must look like) last, separated by a blank line — the same
+    /// separator the engine uses between a task and its context, so the whole
+    /// typed request reads as one person's paragraphs.
+    #[test]
+    fn both_options_compose_in_a_fixed_order() {
+        let schema = json!({ "type": "string" });
+        let note = facade_format_note(Some(&schema), Some(Profile::Code)).expect("a note");
+        let profile_at = note.find("local code task").expect("the profile half");
+        let schema_at = note.find(SCHEMA_FINAL_INSTRUCTION).expect("the schema half");
+        assert!(profile_at < schema_at);
+        assert!(note.contains("\n\n"));
+    }
 
     #[test]
     fn schema_response_format_wraps_for_llama_server() {

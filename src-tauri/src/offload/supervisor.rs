@@ -373,14 +373,20 @@ impl OffloadSupervisor {
         self.state.read().await.clone()
     }
 
-    /// Per-backend status for every enabled backend in the pool (Local +
-    /// Remote). Remote backends are health-probed inline (short timeout).
+    /// Per-backend status for every enabled backend in the pool (Local, Remote
+    /// and V39's facade tabs). Remote backends are health-probed inline (short
+    /// timeout); a facade is asked the delegation engine's worker preflight,
+    /// which touches no network.
     pub async fn statuses(&self) -> Vec<BackendStatus> {
         let snap = self.settings.current().offload;
         if !snap.enabled {
             return Vec::new();
         }
-        let backends = snap.effective_backends();
+        // V39 Phase C: the wrapper, so a Remote-offload tab has a status row
+        // like any other backend. The SPAWN paths below stay on the raw list —
+        // `local_backends()` is about processes cImp owns, and a facade is not
+        // one.
+        let backends = self.settings.current().effective_offload_backends();
         // Do NOT hold the `running` lock across this loop: a remote backend's
         // status is a live network health probe (up to the client timeout,
         // ~10s), and holding the mutex across it would stall every concurrent
@@ -481,6 +487,36 @@ impl OffloadSupervisor {
                     in_flight: 0,
                     tool_scope: scope,
                     error: None,
+                }
+            }
+            // V39 Phase C — **nothing to start, nothing to stop.** The
+            // supervisor owns processes; a facade is an open tab the user
+            // started themselves. It appears here so the Settings backend list
+            // can show it, and its state is the delegation engine's own worker
+            // verdict — no probe, no process, no lifecycle.
+            //
+            // `local_backends()` (what autostart and Start/Stop iterate) filters
+            // to `Local`, so this variant can never reach the spawn path; a test
+            // pins that rather than leaving it to the reader.
+            OffloadBackendKind::HarnessTab { tab } => {
+                let tab_id = crate::state::TabId::from_str(tab);
+                let verdict = crate::delegation::worker_ready(&self.app, &tab_id).await;
+                let driven = crate::delegation::is_driven(&tab_id);
+                BackendStatus {
+                    name: b.name.clone(),
+                    kind: "harness".into(),
+                    tier: tier.into(),
+                    enabled: b.enabled,
+                    cloud_blocked: false,
+                    state: if verdict.is_ok() { "ready" } else { "unreachable" }.into(),
+                    n_ctx: b.declared_context,
+                    slots: 1,
+                    in_flight: driven as u32,
+                    tool_scope: scope,
+                    // The reason a facade is not ready is the same sentence the
+                    // engine would refuse a delegation with — one story, two
+                    // surfaces.
+                    error: verdict.err(),
                 }
             }
         }
@@ -1194,6 +1230,50 @@ async fn log_stream<R>(
 mod tests {
     use super::*;
     use crate::activity::ActivityKind;
+
+    /// **V39 Phase C — a facade is nothing to start and nothing to stop.**
+    ///
+    /// The supervisor owns processes. A Remote-offload tab is a tab the user
+    /// started themselves, so it must never reach the spawn path — not at
+    /// autostart, not from the dashboard's Start button, and not through the
+    /// legacy `primary` shortcut. All three iterate [`local_backends`], so this
+    /// asserts on that one funnel: with a facade in the pool it returns only the
+    /// Local entries, and with ONLY a facade configured it returns nothing at
+    /// all (rather than, say, the facade with an empty command, which would be
+    /// spawned as a blank process).
+    #[test]
+    fn a_facade_backend_is_never_a_spawnable_local_backend() {
+        let mut s = crate::settings::Settings::default();
+        s.offload.backends = vec![OffloadBackend {
+            name: "main".to_string(),
+            kind: OffloadBackendKind::Local {
+                server_command: "llama-server --jinja".to_string(),
+                autostart: true,
+                show_command_on_start: false,
+                auth_token: String::new(),
+            },
+            ..Default::default()
+        }];
+        s.tabs.push(crate::settings::facade_tab("t1", "lan-worker-2"));
+        assert!(
+            s.effective_offload_backends()
+                .iter()
+                .any(|b| b.name == "lan-worker-2"),
+            "the fixture must actually have a facade in the pool"
+        );
+        let spawnable: Vec<String> = local_backends(&s.offload)
+            .into_iter()
+            .map(|b| b.name)
+            .collect();
+        assert_eq!(spawnable, vec!["main".to_string()]);
+
+        // …and a pool whose only member is a facade has nothing to spawn.
+        let mut only = crate::settings::Settings::default();
+        only.tabs.push(crate::settings::facade_tab("t1", "lan-worker-2"));
+        assert!(local_backends(&only.offload)
+            .iter()
+            .all(|b| !matches!(b.kind, OffloadBackendKind::HarnessTab { .. })));
+    }
 
     /// The four transitions must not collapse into "ok / not ok". A `stop` is
     /// an intended shutdown and a `fail` is not, and the Events tab picks its

@@ -2,6 +2,11 @@
   import Tab from './Tab.svelte';
   import TabContextMenu from './TabContextMenu.svelte';
   import TaintMenu from './TaintMenu.svelte';
+  import DelegationPopover from './DelegationPopover.svelte';
+  import { accessOf, backendOf, glyphState, hasCommIcon, manualHolderFor, roleOf } from './delegation';
+  import { delegationInFlight } from './delegationState';
+  import { delegationTakeOver } from './ipc';
+  import { showToast } from './toast';
   import {
     fetchLatchStatus,
     injectionStatus,
@@ -88,6 +93,59 @@
     tab: TabId;
   } | null>(null);
 
+  /// V39 Phase A: the communication popover. Anchored at the glyph, one at a
+  /// time, and holding only the anchor + tab id — everything it renders is
+  /// derived from `$settings` below, so a write made inside it is reflected by
+  /// the same broadcast that persists it (the M-22 rule the taint popover
+  /// already follows).
+  let commMenu = $state<{
+    x: number;
+    y: number;
+    tab: TabId;
+  } | null>(null);
+
+  const commMenuAccess = $derived(commMenu ? accessOf($settings, commMenu.tab) : 'rw');
+  const commMenuName = $derived(
+    (commMenu ? $tabs.find((m) => m.id === commMenu?.tab)?.name : null) ?? commMenu?.tab ?? '',
+  );
+  /// V39 Phase B. All four DERIVED, never copied at click time (M-22): a role
+  /// the user just moved, a flight that just ended, and a Manual holder that
+  /// just changed all have to reach an open popover — it is the surface whose
+  /// entire job is to say what is in force right now.
+  const commMenuRole = $derived(commMenu ? roleOf($settings, commMenu.tab) : 'none');
+  const commMenuBackend = $derived(
+    commMenu ? backendOf($settings, commMenu.tab) : { name: null, tier: 'quality' as const, declared_context: null },
+  );
+  const commMenuInFlight = $derived(commMenu ? ($delegationInFlight[commMenu.tab] ?? null) : null);
+  const commMenuManualHolder = $derived(commMenu ? manualHolderFor($settings, commMenu.tab) : null);
+
+  /// Locked decision 6's mirror: "Take over" is also on the tab context menu so
+  /// it is reachable without finding the glyph. Role and access stay in the
+  /// popover — one control surface — but ENDING a delegation someone else
+  /// started must not require a hunt.
+  async function onTakeOver(tab: TabId): Promise<void> {
+    const name = $tabs.find((m) => m.id === tab)?.name ?? tab;
+    try {
+      const wasRunning = await delegationTakeOver(tab);
+      showToast(
+        wasRunning
+          ? `You took “${name}” back. The driver was told the delegation was cancelled; the worker keeps running — cImp sends it no keys.`
+          : `“${name}” was not being driven any more — the delegation had already finished.`,
+        6000,
+      );
+    } catch (e) {
+      showToast(`Take over failed: ${String(e)}`, 6000);
+    }
+  }
+
+  /// Open the communication popover, closing anything else that is open — two
+  /// popovers anchored at neighbouring glyphs would overlap.
+  function onCommGlyph(tab: TabId, e: MouseEvent): void {
+    menu = null;
+    taintMenu = null;
+    commMenu = { x: e.clientX, y: e.clientY, tab };
+  }
+
   /// The popover's LIVE row — re-read from `latchByTab` on every poll tick for
   /// as long as the popover is open (M-22).
   const taintMenuRow = $derived(
@@ -140,6 +198,7 @@
   /// about; it is deliberately not stored.
   function onTaintBadge(tab: TabId, _row: LatchRow | undefined, e: MouseEvent): void {
     menu = null;
+    commMenu = null;
     taintMenu = { x: e.clientX, y: e.clientY, tab };
   }
 
@@ -362,6 +421,17 @@
             reduced={reducedFeaturesFor($injectionStatus, id)}
             protection={tabProtectionRows($injectionStatus, id)}
             ontaint={(e) => onTaintBadge(id, latchRow, e)}
+            comm={hasCommIcon($settings, id)
+              ? glyphState({
+                  role: roleOf($settings, id),
+                  access: accessOf($settings, id),
+                  inFlight: $delegationInFlight[id] !== undefined,
+                  driverName: $delegationInFlight[id]?.driver_name ?? null,
+                  driverAgent: $delegationInFlight[id]?.driver_agent ?? null,
+                  backendName: backendOf($settings, id).name,
+                })
+              : null}
+            oncomm={(e) => onCommGlyph(id, e)}
             bind:renaming={
               () => renamingTab === id,
               (v) => {
@@ -456,6 +526,7 @@
     onClose={t ? () => onCloseTab(t.id) : undefined}
     onNewWorktreeTab={t && !isShell && !isPreview ? () => openNewWorktreeTabDialog(t.id, pane.id) : undefined}
     onNewPreviewTab={onNewPreviewTabAction}
+    onTakeOver={t && $delegationInFlight[t.id] ? () => void onTakeOver(t.id) : undefined}
     onDismiss={dismissMenu}
   />
 {/if}
@@ -464,6 +535,21 @@
      so an open popover follows the tab's real state instead of freezing the
      instant it was opened. `TaintMenu` already renders entirely from its props,
      so it needed no change for this. -->
+{#if commMenu}
+  <DelegationPopover
+    x={commMenu.x}
+    y={commMenu.y}
+    tab={commMenu.tab}
+    tabName={commMenuName}
+    access={commMenuAccess}
+    role={commMenuRole}
+    backend={commMenuBackend}
+    inFlight={commMenuInFlight}
+    manualHolder={commMenuManualHolder}
+    onDismiss={() => (commMenu = null)}
+  />
+{/if}
+
 {#if taintMenu && taintMenuRow}
   <TaintMenu
     x={taintMenu.x}

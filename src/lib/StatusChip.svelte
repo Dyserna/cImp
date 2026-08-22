@@ -184,6 +184,30 @@
     color: var(--text-tertiary, #9aa0aa);
     opacity: 0.8;
   }
+
+  /* ── V39 delegation transitions ────────────────────────────────────────
+     None of the three is an alarm, and none may borrow one. `driving` is the
+     opening row of a flight whose outcome is elsewhere, so it is quiet accent —
+     present, unmistakably "this is the delegation lane", claiming nothing.
+     `takeover` is a USER action and takes the accent at full strength with an
+     outline, the treatment this app already reserves for "a person did this on
+     purpose" — never `failed`'s pink, which is what it wore under the plain
+     `ok`/`failed` rule. `moved` is configuration and reads as quietly as
+     `stopped`. */
+  .schip.driving {
+    color: var(--accent);
+    opacity: 0.7;
+  }
+  .schip.takeover {
+    color: var(--accent);
+    border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+  }
+  .schip.moved {
+    color: var(--text-tertiary, #9aa0aa);
+    opacity: 0.8;
+    border-style: dashed;
+    border-color: var(--border-default, #3f4554);
+  }
   .schip.down,
   .schip.unhealthy {
     color: var(--text-danger-soft, #ffb0c0);

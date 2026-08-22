@@ -364,6 +364,10 @@ describe('rowStatus', () => {
       'recovered',
       // V37 C9: a tool withheld by description screening.
       'withheld',
+      // V39 delegation transitions that are not call outcomes.
+      'driving',
+      'takeover',
+      'moved',
     ];
     for (const s of all) expect(STATUS_TITLE[s].length).toBeGreaterThan(0);
   });
@@ -676,6 +680,82 @@ describe('rowStatus — plugin discovery', () => {
     expect(rowStatus(plug('rescan', false, { source: 'plugins', target: 'loaded 1 · rejected 1' }))).toBe(
       'failed',
     );
+  });
+});
+
+// ── delegation rows (V39, locked decision 14) ─────────────────────────────
+//
+// The lane where `ok` carries the least: a `start` row is `ok:true` before
+// anything has happened, a `takeover` is `ok:false` because the user chose to
+// end it, and a `role_moved` is not a call at all. The plain `ok`/`failed`
+// fallthrough said "Call succeeded" for the first, "Call failed" for the
+// second and "Call succeeded" for the third — three claims, none of them true.
+
+/// One `delegation` row for transition `tool`. Defaults mirror the writer in
+/// `src-tauri/src/delegation/mod.rs::record_row`: `source` is the DRIVER's
+/// harness, the attribution is the driver TAB.
+function dlg(tool: string, ok: boolean, over: Partial<ActivityEntry> = {}): ActivityEntry {
+  return entry(1, {
+    kind: 'delegation',
+    source: 'opencode',
+    tab: { tab: 'opencode' },
+    tool,
+    ok,
+    ...over,
+  });
+}
+
+describe('rowStatus — delegation transitions', () => {
+  it('gives the three non-outcome transitions their own word', () => {
+    expect(rowStatus(dlg('start', true))).toBe('driving');
+    expect(rowStatus(dlg('takeover', false))).toBe('takeover');
+    expect(rowStatus(dlg('role_moved', true))).toBe('moved');
+  });
+
+  it('never renders a user take-over as a failure', () => {
+    // The whole point of the branch: the user reclaiming their own tab is a
+    // deliberate act, and the worker kept running.
+    expect(rowStatus(dlg('takeover', false))).not.toBe('failed');
+  });
+
+  it('does not let a start and a completed reply collapse via ok', () => {
+    // Both are ok:true. A classifier keyed on `ok` would return one word.
+    expect(rowStatus(dlg('start', true))).not.toBe(rowStatus(dlg('done', true)));
+  });
+
+  it('leaves the real outcomes to ok/failed rather than inventing synonyms', () => {
+    expect(rowStatus(dlg('done', true))).toBe('ok');
+    // A completed turn whose text was not substantive is a `done` that FAILED
+    // (locked decision 13) — the worker really did run.
+    expect(rowStatus(dlg('done', false))).toBe('failed');
+    expect(rowStatus(dlg('refused', false))).toBe('failed');
+    expect(rowStatus(dlg('timeout', false))).toBe('failed');
+    expect(rowStatus(dlg('worker_exited', false))).toBe('failed');
+  });
+
+  it('renders a `driver_gone` row as the failure it is', () => {
+    // V39 review L-7: a new transition — the caller's connection died while the
+    // worker was working. It has no word of its own on purpose: like `timeout`
+    // and `worker_exited`, `failed` plus the row's own reason says it, and a
+    // synonym would dilute the three words that DO mean something.
+    expect(rowStatus(dlg('driver_gone', false))).toBe('failed');
+  });
+
+  it('renders a `cancelled` row an older build wrote', () => {
+    // The vocabulary is a contract with rows already on disk: the transition is
+    // reserved and unreachable today, and must still render rather than throw.
+    expect(rowStatus(dlg('cancelled', false))).toBe('failed');
+  });
+
+  it('degrades an unknown transition without inventing a claim', () => {
+    expect(rowStatus(dlg('resumed', true))).toBe('ok');
+    expect(rowStatus(dlg('resumed', false))).toBe('failed');
+  });
+
+  it('does not treat the driver harness as a canary source', () => {
+    // `source` here is a harness id, not a telemetry channel — a `refused` row
+    // must read as a failed delegation, not as a signal that fired.
+    expect(rowStatus(dlg('refused', false, { source: 'claude' }))).toBe('failed');
   });
 });
 

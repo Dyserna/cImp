@@ -21,6 +21,9 @@
 //!   (`cimp --offload-mcp`).
 //! - `mcp_host` (Phase C) — the MCP client aggregating the user's tool
 //!   servers.
+//! - [`harness_tab`] (V39 Phase C) — the facade [`Backend`]: an open AI tab
+//!   driven by the delegation engine, which the router cannot tell from a
+//!   LAN server.
 //! - [`toolclass`] (V32 Phase A) — the tool-class taxonomy + taint latch:
 //!   the single source of truth deciding which tools a contaminated task or
 //!   session may still reach.
@@ -40,6 +43,7 @@
 pub mod agent;
 pub mod backend_gate;
 pub mod detection;
+pub mod harness_tab;
 pub mod loopback;
 pub mod mcp;
 pub mod mcp_host;

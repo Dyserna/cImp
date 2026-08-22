@@ -578,6 +578,17 @@
     // — see the column conventions in src-tauri/src/plugins/events.rs), and only
     // the per-scan summary has a duration worth printing.
     if (e.kind === 'plugin') return e.ms > 0 ? dur : '';
+    // V39 locked decision 14: only a `done` row carries a payload — `chars` is
+    // the screened reply's length there and a structural 0 on every other
+    // transition, so printing "0 chars" for a `start` or a `refused` would dress
+    // an absence up as a measurement (the `offload_server` rule, same reason).
+    // `start` prints nothing at all: its `ms` is 0 by construction (the flight
+    // has not run yet), and a bare "0ms" would read as latency.
+    if (e.kind === 'delegation') {
+      if (e.tool === 'done') return `${dur} · ${fmtTok(e.chars)} chars`;
+      if (e.tool === 'start') return '';
+      return e.ms > 0 ? dur : '';
+    }
     return `${dur} · ${fmtTok(e.chars)} chars`;
   }
 
@@ -1254,6 +1265,13 @@
   }
   .ekind.mcp {
     color: var(--accent-purple, #d2a8ff);
+  }
+  /* V39: cross-harness delegation. The accent, because this lane is the one
+     place where a tab did something the user did not type — the same colour the
+     driven glyph and the worker's banner wear, so the three surfaces reporting
+     one fact read as one fact. */
+  .ekind.delegation {
+    color: var(--accent);
   }
   /* V37: the health lane sits beside `mcp` and reads as its sibling, the way
      `offload_server` sits beside `offload`. */

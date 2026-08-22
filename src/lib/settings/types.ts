@@ -318,6 +318,46 @@ export interface AiToolTabConfig {
   /// different question and deliberately unchanged: the 34 → 35 schema step
   /// writes the word into every pre-V39 tab so an upgrade changes no posture.
   injection_overrides: TabInjectionOverrides;
+  /// V39 Phase A: the user's sticky read-only lock on this tab. `true` means
+  /// `pty_write` refuses the keyboard with *read-only (user)*; the tab keeps
+  /// running, and it is still a valid delegation worker — the lock governs the
+  /// user's hands, not cImp's. The engine's transient `Driven` lock is runtime
+  /// state and never appears here. Mirror of Rust `AiToolTabConfig::read_only`.
+  read_only: boolean;
+  /// V39 Phase B (locked decision 8): what this tab is **for** in the
+  /// delegation surface. Mirror of Rust `AiToolTabConfig::delegation_role`,
+  /// whose serde is `snake_case` — so the wire words are `none` / `manual` /
+  /// `remote_offload`, not the glyph's shorter `remote`.
+  ///
+  /// Exclusive by construction (one enum, not two flags) and cross-tab unique
+  /// for `manual`: **at most one Manual tab per harness**, enforced by the
+  /// `tab_set_delegation_role` IPC, which MOVES the role rather than refusing.
+  /// Never written straight into a settings save — the move rule lives in the
+  /// backend, and a save that set the field directly would let two tabs of one
+  /// harness hold it.
+  delegation_role: DelegationRole;
+  /// V39 (locked decision 8): the per-backend knobs a `remote_offload` tab is
+  /// synthesized into the offload backend list with (Phase C reads them).
+  /// Edited in the tab's communication popover and persisted through the
+  /// ordinary settings save, unlike the role beside it.
+  delegation_backend: DelegationBackend;
+}
+
+/// V39 Phase B: one tab's delegation role. Mirror of Rust `DelegationRole`
+/// (`#[serde(rename_all = "snake_case")]`).
+export type DelegationRole = 'none' | 'manual' | 'remote_offload';
+
+/// V39: the per-tab facade-backend knobs. Mirror of Rust `DelegationBackend`.
+/// Every field is optional-by-default so a tab that has never held the Remote
+/// offload role still round-trips: `name: null` means "fall back to the tab's
+/// display name", `declared_context: null` means "Phase C picks a generous
+/// default". Kept even while the role is something else — a user who sets a
+/// name, switches the role away and switches it back should find it where they
+/// left it.
+export interface DelegationBackend {
+  name: string | null;
+  tier: BackendTier;
+  declared_context: number | null;
 }
 
 /// V32 Phase G: one L3 cell. `'inherit'` takes the app-wide per-feature value;
@@ -831,6 +871,8 @@ export interface Settings {
   /// OS layer ONLY — job objects, the minimal environment and the
   /// injection-layer controls stay on regardless.
   sandbox: SandboxSettings;
+  /// V39: cross-harness delegation (one tab drives another).
+  delegation: DelegationSettings;
   /// V12 Phase A: project checker commands the `run_check` MCP tool can run
   /// (mirror of Rust `Vec<CheckDef>`). Lives at the root, not inside
   /// `GraphSettings` — independent of the code graph. Empty by default. Edited
@@ -959,6 +1001,11 @@ export interface HarnessVersions {
   e1_status: string;
   /// D0 spike outcome (informational — the feature degrades to a no-op).
   d0_status: string;
+  /// V39 Phase B: input-profile spike outcome (`"unverified" | "pass" |
+  /// "fail"`) — does a harness TUI here accept a pasted multi-line request as
+  /// ONE turn? Raw INPUT to a gate, never interpreted here: read
+  /// `CapabilityGate.blocked` for `CAP_DELEGATION_WORKER` instead.
+  input_profile_status: string;
   /// V35 Phase F: the last automatic verification run for Claude Code — the
   /// embedded L1 canaries plus the L2 live probes, run in the background when
   /// `claude_last_seen` changes. Absent until the first run completes, which is
@@ -1167,6 +1214,13 @@ export const OUTCOME_NO_FAILURE = 'no_failure';
 /// `harness::contract::tests::the_gated_capability_ids_reach_the_frontend`,
 /// which fails the Rust build if this string is missing from this file.
 export const CAP_PRETOOLUSE_DENY = 'claude.hook.pretooluse_deny';
+
+/// V39 Phase B: the capability id cross-harness delegation is gated on — the
+/// registry's first harness-NEUTRAL row (`Harness::Any`). Shared verbatim with
+/// Rust's `contract::CAP_DELEGATION_WORKER` and pinned by the same test. A
+/// blocked verdict means no tab can be driven and no `delegate_task_*` tool is
+/// advertised; the reason string says which spike recorded what.
+export const CAP_DELEGATION_WORKER = 'delegation.worker';
 
 /// Whether `status` says a capability is gated off. A lookup, deliberately not
 /// a rule: the verdict was computed by `harness::contract::gate` against the
@@ -1512,6 +1566,24 @@ export interface SandboxSettings {
   /// Extra directories granted read+execute inside the sandbox (decision 3's
   /// user-curated grant rows). The program's own directory is automatic.
   extra_grant_dirs: string[];
+}
+
+/// V39: the global cross-harness delegation knobs. Mirror of Rust
+/// `DelegationSettings`. The per-tab half (the read-only lock, and in later
+/// phases the tab's role) lives on the tab config, not here.
+export interface DelegationSettings {
+  /// Lock a worker tab's keyboard for the duration of a delegation, then
+  /// release it. Default **on** — while cImp is typing into a tab, a stray
+  /// keystroke lands in the middle of someone else's turn. A courtesy lock
+  /// over the user's own hands, not a security boundary.
+  auto_read_only: boolean;
+  /// Seconds the engine waits for a worker's reply when the caller named no
+  /// timeout. On expiry the driver is told `timeout`; no keys are ever sent to
+  /// the worker to cancel it.
+  default_timeout_s: number;
+  /// How deep delegations may nest. `1` = a tab being driven may not itself
+  /// drive.
+  max_depth: number;
 }
 
 /// V13 §0.4: the Workbench feature's settings. Mirror of Rust
@@ -2185,6 +2257,13 @@ export function defaultSettings(): Settings {
         // V39: a new tab ships every tab-scoped injection control OFF —
         // mirror of Rust `schema::default_claude_tab`.
         injection_overrides: allOffInjectionOverrides(),
+        // V39 Phase A: a fresh tab accepts the keyboard; the lock is a
+        // deliberate user action, never a default.
+        read_only: false,
+        // V39 Phase B: a tab becomes reachable by another harness only by an
+        // explicit user action on that tab.
+        delegation_role: 'none',
+        delegation_backend: { name: null, tier: 'quality', declared_context: null },
       },
       {
         kind: 'ai_tool',
@@ -2215,6 +2294,13 @@ export function defaultSettings(): Settings {
         // V39: a new tab ships every tab-scoped injection control OFF —
         // mirror of Rust `schema::default_claude_tab`.
         injection_overrides: allOffInjectionOverrides(),
+        // V39 Phase A: a fresh tab accepts the keyboard; the lock is a
+        // deliberate user action, never a default.
+        read_only: false,
+        // V39 Phase B: a tab becomes reachable by another harness only by an
+        // explicit user action on that tab.
+        delegation_role: 'none',
+        delegation_backend: { name: null, tier: 'quality', declared_context: null },
       },
     ],
     processing: { stability_timeout_ms: 200, max_hold_ms: 500 },
@@ -2449,6 +2535,11 @@ export function defaultSettings(): Settings {
       allow_network: false,
       extra_grant_dirs: [],
     },
+    delegation: {
+      auto_read_only: true,
+      default_timeout_s: 600,
+      max_depth: 1,
+    },
     checks: [],
     checks_auto_configure: false,
     checks_suggestion_dismissed: false,
@@ -2477,6 +2568,7 @@ export function defaultSettings(): Settings {
       opencode_last_seen: '',
       e1_status: 'unverified',
       d0_status: 'unverified',
+      input_profile_status: 'unverified',
     },
     code_audit: {
       enabled: false,

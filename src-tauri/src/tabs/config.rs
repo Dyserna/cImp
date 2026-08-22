@@ -2152,6 +2152,97 @@ mod tests {
         );
     }
 
+    /// V39 Phase A, locked decision 15: **the read-only lock and the
+    /// `delegation` block are NOT spawn-baked.**
+    ///
+    /// The lock is enforced per write in `pty_write`, and the delegation knobs
+    /// are read when a delegation runs — none of them changes how a tab is
+    /// launched. If either moved this signature, flipping "Read-only" from the
+    /// tab's own popover would raise a "restart the AI tab" hint for a switch
+    /// that takes effect on the very next keystroke, and a restart hint that
+    /// fires for nothing is how a restart hint stops being read.
+    #[test]
+    fn read_only_and_delegation_do_not_move_the_spawn_signature() {
+        use crate::settings::DelegationRole;
+        let mut base = Settings::default();
+        base.tabs.push(claude_tab_inheriting());
+        let sig = spawn_inject_sig(&base);
+
+        let mut locked = Settings::default();
+        locked.tabs.push(claude_tab_inheriting());
+        for cfg in locked.tabs.iter_mut() {
+            if let TabConfig::AiTool(c) = cfg {
+                c.read_only = true;
+            }
+        }
+        assert!(
+            locked
+                .tabs
+                .iter()
+                .any(|t| matches!(t, TabConfig::AiTool(c) if c.read_only)),
+            "the fixture must actually have flipped a tab, or this asserts nothing"
+        );
+        assert_eq!(
+            sig,
+            spawn_inject_sig(&locked),
+            "locking a tab read-only must not ask the user to restart it"
+        );
+
+        let mut delegation = Settings::default();
+        delegation.tabs.push(claude_tab_inheriting());
+        delegation.delegation.auto_read_only = !base.delegation.auto_read_only;
+        delegation.delegation.default_timeout_s = base.delegation.default_timeout_s + 30;
+        delegation.delegation.max_depth = base.delegation.max_depth + 1;
+        assert_ne!(
+            base.delegation, delegation.delegation,
+            "the fixture must actually differ"
+        );
+        assert_eq!(
+            sig,
+            spawn_inject_sig(&delegation),
+            "the delegation settings are not baked into any tab's launch"
+        );
+
+        // V39 Phase B extends the same claim to the per-tab ROLE (locked
+        // decision 15, and live-verify 9 checks the same thing in the app):
+        // the `delegate_task_*` set rides the child proxy's live `tools/list`
+        // plus the V37 `list_changed` pulse, and the facade rides
+        // `offload_task`'s live description — so a role change takes effect on
+        // the next turn and must NOT raise a restart hint. This is the half a
+        // reader is most likely to assume is spawn-baked, because it changes
+        // what a running child advertises.
+        for role in [DelegationRole::Manual, DelegationRole::RemoteOffload] {
+            let mut roled = Settings::default();
+            roled.tabs.push(claude_tab_inheriting());
+            for cfg in roled.tabs.iter_mut() {
+                if let TabConfig::AiTool(c) = cfg {
+                    c.delegation_role = role;
+                    c.delegation_backend.name = Some("lan-worker-2".to_string());
+                    c.delegation_backend.declared_context = Some(128_000);
+                }
+            }
+            assert!(
+                roled
+                    .tabs
+                    .iter()
+                    .any(|t| matches!(t, TabConfig::AiTool(c) if c.delegation_role == role)),
+                "the fixture must actually have set the role, or this asserts nothing"
+            );
+            assert_eq!(
+                sig,
+                spawn_inject_sig(&roled),
+                "setting the {role:?} delegation role must not ask the user to restart the tab"
+            );
+        }
+
+        // …and the input-profile spike outcome is not spawn-baked either: it
+        // gates the surface at list time, not at launch.
+        let mut spiked = Settings::default();
+        spiked.tabs.push(claude_tab_inheriting());
+        spiked.harness_versions.input_profile_status = "fail".to_string();
+        assert_eq!(sig, spawn_inject_sig(&spiked));
+    }
+
     /// NC-2: the cwd-fallback input — every Claude tab with the directory it
     /// actually launches in (per-tab `cwd` override, else the app launch dir),
     /// resolved exactly as `build_ai_tool_spec` does. OpenCode/Shell tabs are

@@ -271,6 +271,22 @@ pub const TABLE: &[ClassRow] = &[
     // both tools reach (an `offload_batch` fans out to one `/run` per subtask).
     row("offload_task", ToolClass::LocalCapability, false),
     row("offload_batch", ToolClass::LocalCapability, false),
+    // V39 Phase B: the identity `POST /delegate` gates under, for the
+    // `delegate_task_<harness>` tools. **LOCAL-CAPABILITY for exactly the
+    // reason `offload_task` is** (V32 C-1c): a delegation hands a task to a
+    // PEER HARNESS whose own latch is fresh and permissive, so a contaminated
+    // conversation that could reach it would have laundered every capability
+    // it had just lost — through a worker with more tools, not fewer. That the
+    // user asked for the hand-off does not change what the hand-off carries:
+    // the task text is model-authored.
+    //
+    // `unrouted`, and that is the honest flag: no dispatcher serves the bare
+    // name `delegate_task`. It is the ROUTE's own identity, composed by cImp
+    // from a harness id (the model names `delegate_task_claude`, which the
+    // child resolves and never forwards as a tool name) — the same shape as
+    // the three `hook_*` rows, and gated the same way: on a route that states
+    // its own name rather than taking one from a request.
+    unrouted("delegate_task", ToolClass::LocalCapability, false),
     // Demoted from TRUSTED by the 2026-08-08 re-review (finding H-1 — C-1
     // reopened; see the milestone's THIRD Phase A amendment). Both were carried
     // into TRUSTED by the word "structural", which describes the relation they
@@ -1980,12 +1996,12 @@ mod tests {
 
     /// **The documented exceptions, named rather than counted.**
     ///
-    /// Six rows are classified for a reason other than being callable. The
-    /// membership is pinned like `TRUSTED`'s count is: adding a seventh is a
-    /// reviewed act, and swapping one for another keeps the count but changes
+    /// These rows are classified for a reason other than being callable by
+    /// name. The membership is pinned like `TRUSTED`'s count is: adding one is
+    /// a reviewed act, and swapping one for another keeps the count but changes
     /// the meaning.
     #[test]
-    fn classified_but_unrouted_rows_are_the_documented_seven() {
+    fn classified_but_unrouted_rows_are_the_documented_eight() {
         let unrouted: Vec<&str> = TABLE
             .iter()
             .filter(|r| !r.dispatchable)
@@ -1994,6 +2010,14 @@ mod tests {
         assert_eq!(
             unrouted,
             [
+                // V39 Phase B. The identity `POST /delegate` gates under: the
+                // model names `delegate_task_<harness>`, the child resolves the
+                // harness and forwards THAT, and the route states its own
+                // class-table name. Nothing serves the bare name, which is all
+                // `unrouted` says here — it is emphatically NOT ungated: it is
+                // gated on `LatchRoute::Delegation`, which (unlike `Hook`) both
+                // refuses AND latches.
+                "delegate_task",
                 // The three `/context/*` hook identities (#48, M-7). They are
                 // gated on `LatchRoute::Hook`, whose name is composed by cImp
                 // and is the route itself — never a name a model supplied.
@@ -2035,6 +2059,11 @@ mod tests {
         assert_eq!(classify("hook_post_edit"), ToolClass::LocalCapability);
         assert_eq!(classify("hook_should_read"), ToolClass::LocalCapability);
         assert_eq!(classify("hook_compaction"), ToolClass::Trusted);
+        // V39 Phase B: and delegation is classified exactly as `offload_task`
+        // is, which is the whole point of the row — the same class means the
+        // same refusal under the same latch, computed rather than restated.
+        assert_eq!(classify("delegate_task"), ToolClass::LocalCapability);
+        assert_eq!(classify("delegate_task"), classify("offload_task"));
     }
 
     /// **Nothing may be ADVERTISED that the table does not classify and a

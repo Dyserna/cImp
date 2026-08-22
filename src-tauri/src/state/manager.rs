@@ -16,6 +16,384 @@ use tracing::{debug, info, warn};
 /// keystroke per tab); a plain RwLock is simpler than a third dependency.
 pub type InputLengths = Arc<RwLock<HashMap<TabId, Arc<AtomicI32>>>>;
 
+/// V39 Phase A (locked decision 4): why a tab's keyboard is locked.
+///
+/// Two sources, deliberately not collapsed into one flag — they have
+/// different lifetimes and different owners:
+///
+/// * [`ReadOnlySource::User`] — the sticky lock the user sets from the tab's
+///   communication popover. Persisted in `AiToolTabConfig::read_only` and
+///   restored into [`ReadOnlyTabs`] at app start.
+/// * [`ReadOnlySource::Driven`] — the transient lock the delegation engine
+///   holds while it drives the tab (Phase B). **Never persisted** — after a
+///   restart no tab is `Driven`.
+///
+/// Named `User`, not `Manual`: `Manual` is a tab *role* in Phase B and the two
+/// must not read as the same concept.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "source", rename_all = "kebab-case")]
+pub enum ReadOnlySource {
+    User,
+    Driven { by: TabId },
+}
+
+impl ReadOnlySource {
+    /// The human reason every refusal carries. A block with a blank reason is
+    /// not a block the user can act on, so this is the ONE place the two
+    /// strings are spelled — the IPC error, the toast and the popover all
+    /// render what this returns.
+    ///
+    /// `driver_name` is the *display name* of the driving tab (Phase B passes
+    /// it; names live in the tab registry, not here). Falls back to the
+    /// driver's tab id, never to an empty string.
+    pub fn reason(&self, driver_name: Option<&str>) -> String {
+        match self {
+            ReadOnlySource::User => "read-only (user)".to_string(),
+            ReadOnlySource::Driven { by } => {
+                let who = driver_name
+                    .map(str::trim)
+                    .filter(|n| !n.is_empty())
+                    .unwrap_or_else(|| by.as_str());
+                format!("driven by {who}")
+            }
+        }
+    }
+}
+
+/// One tab's row in [`ReadOnlyTabs`]. Both sources are held side by side so
+/// that clearing the engine's lock at the end of a delegation cannot silently
+/// clear the user's sticky lock — they are set by different actors, and a
+/// single last-writer-wins slot would lose one of them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ReadOnlyEntry {
+    user: bool,
+    driven_by: Option<TabId>,
+    /// **A prompt is standing on this tab, so the keyboard is open for it**
+    /// (locked decision 5, V39 review M-5).
+    ///
+    /// A separate flag rather than "clear `driven_by` for the duration", which
+    /// is what the engine used to do: a tab whose USER lock was also set then
+    /// fell back to `ReadOnlySource::User` and the keyboard stayed refused —
+    /// so the one prompt only the user can answer could not be answered, and
+    /// the delegation ran to its deadline reporting "worker awaiting
+    /// permission". Clearing it also lost the row's `driven_by` for the
+    /// duration, which the banner and the take-over path read.
+    ///
+    /// Lives and dies with the flight: [`ReadOnlyTabs::set_driven`] clears it
+    /// whenever the engine's lock is released, so it can never outlive the
+    /// prompt that justified it.
+    prompt_relaxed: bool,
+}
+
+impl ReadOnlyEntry {
+    /// `Driven` wins over `User` while both hold: it is the more specific
+    /// answer to "why did my keystroke bounce", and it names who to take over
+    /// from.
+    fn source(&self) -> Option<ReadOnlySource> {
+        // Decision 5 outranks both locks while a prompt stands: answering the
+        // prompt the worker addressed to the USER is the only way this turn
+        // completes, and neither lock is worth more than the turn.
+        if self.prompt_relaxed {
+            return None;
+        }
+        match (&self.driven_by, self.user) {
+            (Some(by), _) => Some(ReadOnlySource::Driven { by: by.clone() }),
+            (None, true) => Some(ReadOnlySource::User),
+            (None, false) => None,
+        }
+    }
+
+    fn is_clear(&self) -> bool {
+        // `prompt_relaxed` is deliberately not consulted: it only ever holds
+        // inside a flight, and `set_driven(None)` clears it on the way out. A
+        // row that was nothing but a relaxation would be a leak, and dropping
+        // it here is what makes that impossible.
+        !self.user && self.driven_by.is_none()
+    }
+}
+
+/// Shared, runtime-mutable per-tab read-only state — the map `pty_write` asks
+/// before it does anything else (locked decision 4: enforcement is
+/// server-side, and it runs ahead of every side effect of a write).
+///
+/// **Why this is a shared map and not a field on [`TabState`]:** `TabState`
+/// lives inside the state-manager actor task and is reachable only by sending
+/// a [`StateSignal`], so an IPC command cannot read it at all, let alone
+/// synchronously — an enforcement check that has to round-trip through an
+/// actor has a race window in front of it. This handle has exactly the shape
+/// of [`InputLengths`] directly above (shared, held by `AppState`, mutated on
+/// tab-lifecycle edges, read on the write path under one `RwLock`), which is
+/// the repo's existing answer to "the write path needs per-tab runtime state".
+/// The state manager can take a clone of this handle when Phase B needs the
+/// permission-prompt relaxation (decision 5) — one map, one owner per source,
+/// no mirror to keep in sync.
+#[derive(Clone, Default)]
+pub struct ReadOnlyTabs {
+    inner: Arc<RwLock<HashMap<TabId, ReadOnlyEntry>>>,
+}
+
+impl ReadOnlyTabs {
+    /// Seed the user locks from persisted `AiToolTabConfig::read_only` at app
+    /// start. `Driven` is never seeded — nothing is in flight at startup.
+    pub fn seeded(user_locked: impl IntoIterator<Item = TabId>) -> Self {
+        let this = Self::default();
+        this.sync_users(user_locked);
+        this
+    }
+
+    /// The effective lock on `tab`, or `None` when the keyboard is free.
+    pub fn read_only(&self, tab: &TabId) -> Option<ReadOnlySource> {
+        let map = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        map.get(tab).and_then(ReadOnlyEntry::source)
+    }
+
+    /// Set or clear the sticky user lock (the popover's Access radio).
+    pub fn set_user(&self, tab: &TabId, on: bool) {
+        self.mutate(tab, |e| e.user = on);
+    }
+
+    /// Make the user locks match `user_locked` exactly — the tabs whose
+    /// persisted `read_only` is currently `true`.
+    ///
+    /// Called on every settings broadcast, not just at startup: `read_only`
+    /// is a persisted field, so the Settings window, a project-overlay switch
+    /// and a hand-edited settings file can all move it without going through
+    /// [`Self::set_user`]. Without this the runtime map would be a second
+    /// source of truth that silently drifts from the file. `Driven` rows are
+    /// untouched — settings has no opinion about them.
+    pub fn sync_users(&self, user_locked: impl IntoIterator<Item = TabId>) {
+        let wanted: std::collections::HashSet<TabId> = user_locked.into_iter().collect();
+        let mut map = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        for tab in &wanted {
+            map.entry(tab.clone()).or_default().user = true;
+        }
+        map.retain(|tab, entry| {
+            if !wanted.contains(tab) {
+                entry.user = false;
+            }
+            !entry.is_clear()
+        });
+    }
+
+    /// Set or clear the engine's transient lock. Phase B's engine calls this
+    /// *before* it writes, so the "user types during the paste window" race is
+    /// closed by ordering rather than by timing.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn set_driven(&self, tab: &TabId, by: Option<TabId>) {
+        self.mutate(tab, |e| {
+            // Releasing the engine's lock ends any prompt relaxation with it:
+            // the relaxation is a property of a flight, and a flight that has
+            // ended cannot be relaxing anything.
+            if by.is_none() {
+                e.prompt_relaxed = false;
+            }
+            e.driven_by = by;
+        });
+    }
+
+    /// **Open (or re-close) the keyboard for a standing prompt** (locked
+    /// decision 5). Called by the delegation engine on the prompt's rising and
+    /// falling edges; the engine's own lock stays recorded throughout, so the
+    /// banner keeps naming the driver and Take over keeps working.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn set_prompt_relaxed(&self, tab: &TabId, on: bool) {
+        self.mutate(tab, |e| e.prompt_relaxed = on);
+    }
+
+    /// Drop a closed tab's row. Called from `close_tab` next to the other
+    /// per-tab map cleanups.
+    pub fn forget(&self, tab: &TabId) {
+        let mut map = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        map.remove(tab);
+    }
+
+    fn mutate(&self, tab: &TabId, f: impl FnOnce(&mut ReadOnlyEntry)) {
+        let mut map = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        let entry = map.entry(tab.clone()).or_default();
+        f(entry);
+        if entry.is_clear() {
+            map.remove(tab);
+        }
+    }
+}
+
+/// V39 Phase B — **the readable mirror of the three `TabState` flags the
+/// delegation engine's preflight and wait loop need**, kept beside
+/// [`ReadOnlyTabs`] and for the identical reason.
+///
+/// `TabState` lives inside the state-manager actor task and is reachable only
+/// by *sending* a [`StateSignal`]; nothing can read it. Preflight (locked
+/// decision 12) has to answer "is this worker idle, and is a prompt standing?"
+/// **before** it types, and the wait loop has to notice a prompt appearing
+/// *during* a flight (decision 5: relax the lock, extend the deadline). An
+/// actor round-trip in front of either would be a race with a message queue in
+/// the middle of it.
+///
+/// So the state manager writes the three edges it already computes into this
+/// shared map as it handles them, and readers above the seam get a
+/// synchronous, lock-free-ish answer. **One writer, many readers**: nothing
+/// outside [`note_signal`](Self::note_signal) may set a flag, which is what
+/// keeps this a mirror rather than a second source of truth.
+///
+/// [`StateSignal`]: crate::state::StateSignal
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TabActivityFlags {
+    /// A permission prompt is standing on this tab
+    /// (`PermissionPromptDetected` … `PermissionPromptResolved`).
+    pub awaiting_permission: bool,
+    /// An AskUserQuestion-style prompt is standing (the same pair, for
+    /// questions). Tracked separately because the two can stand at once and
+    /// each clears on its own edge.
+    pub awaiting_question: bool,
+    /// Output is streaming right now (`ClaudeOutputStarted` …
+    /// `ClaudeOutputStopped`) — i.e. a turn is in flight. Preflight refuses to
+    /// type into a tab mid-burst: the request would land in the middle of
+    /// someone else's turn.
+    pub output_running: bool,
+    /// The start this row describes (V39 review R-5) — bumped by
+    /// [`TabActivity::begin_start`] before every spawn, and carried by that
+    /// spawn's exit signal so a late exit from a PREVIOUS start can be ignored
+    /// instead of re-latching `exited` on a live process.
+    pub start_gen: u64,
+    /// The tab's subprocess has exited. Latched: only a restart clears it —
+    /// `TabAdded` (a fresh tab), `ShellRestarted` (a shell respawn) or
+    /// `pty_restart` (an AI tab respawn, which emits no signal of its own).
+    /// V39 review HIGH-3 is what happens when one of those is missing: the row
+    /// stays `exited` and every later preflight refuses the tab with "has no
+    /// running process", for a process that is running.
+    pub exited: bool,
+}
+
+impl TabActivityFlags {
+    /// Whether a prompt of either kind is standing — the predicate decision 5
+    /// is written in terms of.
+    pub fn awaiting_prompt(&self) -> bool {
+        self.awaiting_permission || self.awaiting_question
+    }
+}
+
+/// Shared, runtime-mutable per-tab activity flags — see [`TabActivityFlags`].
+#[derive(Clone, Default)]
+pub struct TabActivity {
+    inner: Arc<RwLock<HashMap<TabId, TabActivityFlags>>>,
+}
+
+impl TabActivity {
+    /// This tab's flags. An unknown tab reads as all-false, which is the
+    /// honest answer: nothing has been observed about it.
+    ///
+    /// Note what that means for `exited` — a tab the mirror has never seen is
+    /// NOT reported as exited. Liveness is the tab registry's answer
+    /// (`TabRegistry::is_started`); this flag only records an exit that was
+    /// observed, and the engine checks both.
+    pub fn flags(&self, tab: &TabId) -> TabActivityFlags {
+        let map = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        map.get(tab).copied().unwrap_or_default()
+    }
+
+    /// Fold one state signal into the mirror. **The only writer.**
+    ///
+    /// Called from the state manager's loop with every signal, before any of
+    /// its `continue`-guarded branches, so a signal handled by an early return
+    /// still updates the mirror. Deliberately total over the signal set with a
+    /// catch-all: a new signal that says nothing about these four facts must
+    /// not need an edit here.
+    pub fn note_signal(&self, signal: &StateSignal) {
+        let (tab, apply): (&TabId, fn(&mut TabActivityFlags)) = match signal {
+            StateSignal::PermissionPromptDetected { tab } => (tab, |f| f.awaiting_permission = true),
+            StateSignal::PermissionPromptResolved { tab } => {
+                (tab, |f| f.awaiting_permission = false)
+            }
+            StateSignal::QuestionPromptDetected { tab } => (tab, |f| f.awaiting_question = true),
+            StateSignal::QuestionPromptResolved { tab } => (tab, |f| f.awaiting_question = false),
+            StateSignal::ClaudeOutputStarted { tab } => (tab, |f| f.output_running = true),
+            StateSignal::ClaudeOutputStopped { tab } => (tab, |f| f.output_running = false),
+            // V39 review R-5: an exit from a start this row has moved past is
+            // NOT this process's exit. Handled here rather than by the generic
+            // arm below because it is the one signal whose meaning depends on
+            // WHICH start it came from.
+            StateSignal::SubprocessExited { tab, start_gen, .. } => {
+                let mut map = self.inner.write().unwrap_or_else(|e| e.into_inner());
+                let entry = map.entry(tab.clone()).or_default();
+                if *start_gen < entry.start_gen {
+                    return;
+                }
+                entry.exited = true;
+                // A dead process is not mid-burst and holds no prompt. Left
+                // set, `output_running` would make every later preflight
+                // refuse a tab the user has since restarted, for a burst that
+                // ended when the process did.
+                entry.output_running = false;
+                entry.awaiting_permission = false;
+                entry.awaiting_question = false;
+                return;
+            }
+            // V39 review HIGH-3: a restarted subprocess is a CLEAN one. The
+            // mirror's `exited` is latched and was cleared only by `TabAdded`,
+            // which a restart into an existing tab never sends — so a worker
+            // that had exited once was refused forever, "has no running
+            // process", however many times it was restarted. Whole-row reset
+            // rather than clearing `exited` alone: every flag here describes
+            // the process that just went away.
+            StateSignal::ShellRestarted { tab } => (tab, |f| *f = TabActivityFlags::default()),
+            // A user keystroke or submit clears a standing prompt in the state
+            // manager's own bookkeeping, so it clears here too — otherwise a
+            // prompt the user answered by typing would hold the deadline open
+            // for the rest of the flight.
+            StateSignal::UserSubmit { tab } => (tab, |f| {
+                f.awaiting_permission = false;
+                f.awaiting_question = false;
+            }),
+            _ => return,
+        };
+        let mut map = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        apply(map.entry(tab.clone()).or_default());
+    }
+
+    /// Seed (or re-seed) a tab with clean flags — a fresh or restarted
+    /// subprocess. Clears a latched `exited`, and keeps the row's generation
+    /// (only [`Self::begin_start`] moves that).
+    pub fn reset(&self, tab: &TabId) {
+        let mut map = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        let start_gen = map.get(tab).map(|f| f.start_gen).unwrap_or(0);
+        map.insert(
+            tab.clone(),
+            TabActivityFlags {
+                start_gen,
+                ..TabActivityFlags::default()
+            },
+        );
+    }
+
+    /// **A new subprocess is about to be spawned for `tab`** (V39 review R-5):
+    /// clean flags, and a NEW generation, which the caller hands to the spawn
+    /// so that start's exit signal carries it.
+    ///
+    /// The generation is what makes a late exit recognisable. `reset` alone
+    /// could not: signals arrive through an mpsc, so an exit emitted while the
+    /// old child was being killed can be handled after the reset, re-latching
+    /// `exited` on the process that just started — and preflight then refuses a
+    /// live worker with "has no running process", permanently.
+    pub fn begin_start(&self, tab: &TabId) -> u64 {
+        let mut map = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        let start_gen = map.get(tab).map(|f| f.start_gen).unwrap_or(0) + 1;
+        map.insert(
+            tab.clone(),
+            TabActivityFlags {
+                start_gen,
+                ..TabActivityFlags::default()
+            },
+        );
+        start_gen
+    }
+
+    /// Drop a closed tab's row, beside the other per-tab map cleanups.
+    pub fn forget(&self, tab: &TabId) {
+        let mut map = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        map.remove(tab);
+    }
+}
+
 /// Identifier for one of the multi-tab subprocesses cimp owns. Four
 /// reserved AI variants cover the V14 builtins (subscription / local
 /// pairs for Claude Code and Aider); `Shell(id)` carries the
@@ -352,6 +730,18 @@ pub enum StateSignal {
     SubprocessExited {
         tab: TabId,
         code: Option<i32>,
+        /// **Which start of this tab exited** (V39 review R-5).
+        ///
+        /// Signals reach the state manager through an mpsc, so an exit emitted
+        /// while a tab was being restarted can be HANDLED after the restart has
+        /// already re-seeded the activity mirror — re-latching `exited` on a
+        /// process that is running, and refusing the tab as a delegation worker
+        /// forever. The generation is taken from
+        /// [`TabActivity::begin_start`](crate::state::TabActivity::begin_start)
+        /// before the spawn and carried by the waiter that observes THAT
+        /// child's exit, so a late one is recognisable rather than merely
+        /// early.
+        start_gen: u64,
     },
     AudioError {
         tab: TabId,
@@ -649,6 +1039,10 @@ pub fn spawn_state_manager(
     rx: mpsc::Receiver<StateSignal>,
     state_events: broadcast::Sender<StateEvent>,
     input_lengths: InputLengths,
+    // V39 Phase B: the readable mirror of the prompt/burst/exit flags. Handed
+    // in rather than owned here for the same reason `input_lengths` is — the
+    // IPC layer and the delegation engine hold the other end.
+    activity: TabActivity,
     tab_metas: Vec<TabMeta>,
     initial_active: TabId,
     ai_tts_suppressed: crate::tts::AiTtsSuppressed,
@@ -659,6 +1053,7 @@ pub fn spawn_state_manager(
             rx,
             state_events,
             input_lengths,
+            activity,
             tab_metas,
             initial_active,
             ai_tts_suppressed,
@@ -672,6 +1067,7 @@ async fn run(
     mut rx: mpsc::Receiver<StateSignal>,
     state_events: broadcast::Sender<StateEvent>,
     input_lengths: InputLengths,
+    activity: TabActivity,
     tab_metas: Vec<TabMeta>,
     initial_active: TabId,
     ai_tts_suppressed: crate::tts::AiTtsSuppressed,
@@ -716,6 +1112,14 @@ async fn run(
             maybe = rx.recv() => {
                 let Some(signal) = maybe else { break };
 
+                // V39 Phase B: mirror the prompt / output-burst / exit edges
+                // FIRST, ahead of every `continue` below, so a signal handled
+                // by an early return still reaches the readers above the seam
+                // (`crate::delegation`'s preflight and wait loop). Read-only
+                // fold, no side effects, cannot reject a signal — the loop
+                // behaves identically whether this line runs or not.
+                activity.note_signal(&signal);
+
                 // Runtime tab lifecycle (TabAdded / TabRemoved /
                 // TabRenameRequested) is handled before the per-tab
                 // transition routing because (a) the target TabState may
@@ -735,6 +1139,10 @@ async fn run(
                             g.entry(meta.id.clone())
                                 .or_insert_with(|| Arc::new(AtomicI32::new(0)));
                         }
+                        // V39 Phase B: a fresh subprocess starts with clean
+                        // flags — this is also what clears a latched `exited`
+                        // when a tab is restarted into the same id.
+                        activity.reset(&meta.id);
                         info!(tab = ?meta.id, position, "tab added");
                         emit_state(&app, &state_events, meta.id.clone(), AvatarState::Idle);
                         emit_tab_created(
@@ -765,6 +1173,7 @@ async fn run(
                                 active = next;
                             }
                         }
+                        activity.forget(&tab);
                         info!(?tab, "tab removed");
                         emit_tab_closed_event(&app, &state_events, tab);
                     }
@@ -902,7 +1311,7 @@ async fn run(
                 // generic transition path below where the existing v1 logic
                 // turns the signal into Error. Spawn-time failures with
                 // `code = None` still hit this same branch.
-                if let StateSignal::SubprocessExited { tab, code } = &signal {
+                if let StateSignal::SubprocessExited { tab, code, .. } = &signal {
                     let tab = tab.clone();
                     let code = *code;
                     let route_to_closed = tabs
@@ -1491,7 +1900,8 @@ mod tests {
                     s,
                     SubprocessExited {
                         tab: tab(),
-                        code: None
+                        code: None,
+                        start_gen: 0
                     }
                 ),
                 Error
@@ -1832,10 +2242,184 @@ mod tests {
         // it via transition() directly.
         assert!(!is_error_edge(&SubprocessExited {
             tab: tab(),
-            code: None
+            code: None,
+            start_gen: 0
         }));
         assert!(!is_error_edge(&UserKeystroke { tab: tab() }));
         assert!(!is_error_edge(&UserSubmit { tab: tab() }));
         assert!(!is_error_edge(&TtsPlaybackStarted { tab: tab() }));
+    }
+
+    // ---- V39 Phase A: per-tab read-only state -------------------------------
+
+    fn other() -> TabId {
+        TabId::OpenCode
+    }
+
+    #[test]
+    fn read_only_is_absent_until_something_sets_it() {
+        let ro = ReadOnlyTabs::default();
+        assert_eq!(ro.read_only(&tab()), None);
+    }
+
+    #[test]
+    fn the_user_lock_is_seeded_from_the_persisted_set() {
+        let ro = ReadOnlyTabs::seeded([tab()]);
+        assert_eq!(ro.read_only(&tab()), Some(ReadOnlySource::User));
+        assert_eq!(ro.read_only(&other()), None);
+    }
+
+    #[test]
+    fn the_user_lock_toggles_both_ways() {
+        let ro = ReadOnlyTabs::default();
+        ro.set_user(&tab(), true);
+        assert_eq!(ro.read_only(&tab()), Some(ReadOnlySource::User));
+        ro.set_user(&tab(), false);
+        assert_eq!(ro.read_only(&tab()), None);
+    }
+
+    /// The two sources are independent: ending a delegation must not lift a
+    /// lock the user set by hand (and vice versa).
+    #[test]
+    fn clearing_the_driven_lock_leaves_the_user_lock_standing() {
+        let ro = ReadOnlyTabs::default();
+        ro.set_user(&tab(), true);
+        ro.set_driven(&tab(), Some(other()));
+        assert_eq!(
+            ro.read_only(&tab()),
+            Some(ReadOnlySource::Driven { by: other() }),
+            "driven wins while both hold"
+        );
+        ro.set_driven(&tab(), None);
+        assert_eq!(
+            ro.read_only(&tab()),
+            Some(ReadOnlySource::User),
+            "the user's own lock survived the delegation"
+        );
+    }
+
+    #[test]
+    fn clearing_the_user_lock_leaves_a_running_delegation_locked() {
+        let ro = ReadOnlyTabs::default();
+        ro.set_driven(&tab(), Some(other()));
+        ro.set_user(&tab(), false);
+        assert_eq!(
+            ro.read_only(&tab()),
+            Some(ReadOnlySource::Driven { by: other() })
+        );
+    }
+
+    /// `read_only` is a persisted field, so it can also move through the
+    /// Settings window / a project overlay / a hand edit. The runtime map
+    /// follows the file rather than becoming a second source of truth.
+    #[test]
+    fn sync_users_follows_settings_in_both_directions() {
+        let ro = ReadOnlyTabs::seeded([tab()]);
+        ro.sync_users([other()]);
+        assert_eq!(ro.read_only(&tab()), None, "unticked in settings, unlocked");
+        assert_eq!(ro.read_only(&other()), Some(ReadOnlySource::User));
+    }
+
+    #[test]
+    fn sync_users_does_not_disturb_a_driven_tab() {
+        let ro = ReadOnlyTabs::default();
+        ro.set_driven(&tab(), Some(other()));
+        ro.sync_users(std::iter::empty());
+        assert_eq!(
+            ro.read_only(&tab()),
+            Some(ReadOnlySource::Driven { by: other() }),
+            "settings has no opinion about the engine's transient lock"
+        );
+    }
+
+    /// **A standing prompt opens the keyboard whichever lock is on the tab**
+    /// (locked decision 5, V39 review M-5).
+    ///
+    /// The relaxation used to be "clear `driven_by`", so a tab that also
+    /// carried the user's own sticky lock fell straight back to
+    /// `ReadOnlySource::User` and stayed refused — the one prompt only the user
+    /// can answer could not be answered, and the flight ran to its deadline
+    /// reporting "worker awaiting permission". Both sources are asserted here
+    /// because the defect was visible in only one of them.
+    #[test]
+    fn a_standing_prompt_opens_the_keyboard_for_both_lock_sources() {
+        for user_lock in [false, true] {
+            let ro = ReadOnlyTabs::default();
+            ro.set_user(&tab(), user_lock);
+            ro.set_driven(&tab(), Some(other()));
+            assert_eq!(
+                ro.read_only(&tab()),
+                Some(ReadOnlySource::Driven { by: other() })
+            );
+
+            ro.set_prompt_relaxed(&tab(), true);
+            assert_eq!(
+                ro.read_only(&tab()),
+                None,
+                "user_lock={user_lock}: the prompt must be answerable"
+            );
+
+            ro.set_prompt_relaxed(&tab(), false);
+            assert_eq!(
+                ro.read_only(&tab()),
+                Some(ReadOnlySource::Driven { by: other() }),
+                "the lock re-engages on the falling edge"
+            );
+        }
+    }
+
+    /// The relaxation cannot outlive the flight that justified it — and the
+    /// engine's lock is still recorded throughout it, so the banner keeps
+    /// naming the driver and Take over keeps working.
+    #[test]
+    fn a_relaxation_dies_with_the_flight_and_never_hides_the_driver() {
+        let ro = ReadOnlyTabs::default();
+        ro.set_user(&tab(), true);
+        ro.set_driven(&tab(), Some(other()));
+        ro.set_prompt_relaxed(&tab(), true);
+        // Released mid-prompt (a take-over, a timeout): the user's own lock is
+        // back, not silently lifted by a relaxation nobody cleared.
+        ro.set_driven(&tab(), None);
+        assert_eq!(ro.read_only(&tab()), Some(ReadOnlySource::User));
+
+        // …and a tab whose only state was a relaxation leaves no row behind.
+        let ro = ReadOnlyTabs::default();
+        ro.set_driven(&tab(), Some(other()));
+        ro.set_prompt_relaxed(&tab(), true);
+        ro.set_driven(&tab(), None);
+        assert_eq!(ro.read_only(&tab()), None);
+    }
+
+    #[test]
+    fn forgetting_a_closed_tab_drops_its_row() {
+        let ro = ReadOnlyTabs::seeded([tab()]);
+        ro.forget(&tab());
+        assert_eq!(ro.read_only(&tab()), None);
+    }
+
+    /// Every refusal names a reason the user can act on — never an empty
+    /// string, and never a bare tab id when a display name is known.
+    #[test]
+    fn every_read_only_source_has_a_reason() {
+        assert_eq!(ReadOnlySource::User.reason(None), "read-only (user)");
+        let driven = ReadOnlySource::Driven { by: other() };
+        assert_eq!(driven.reason(Some("api-work")), "driven by api-work");
+        assert_eq!(
+            driven.reason(None),
+            format!("driven by {}", other().as_str()),
+            "no name available falls back to the id, not to nothing"
+        );
+        assert_eq!(
+            driven.reason(Some("   ")),
+            format!("driven by {}", other().as_str()),
+            "a blank name is not a name"
+        );
+        for reason in [
+            ReadOnlySource::User.reason(None),
+            driven.reason(Some("api-work")),
+            driven.reason(None),
+        ] {
+            assert!(!reason.trim().is_empty());
+        }
     }
 }

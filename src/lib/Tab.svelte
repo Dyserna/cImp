@@ -14,6 +14,7 @@
     type LatchRow,
   } from './latch';
   import { settings } from './settings/store';
+  import type { GlyphState } from './delegation';
 
   let {
     tabId,
@@ -29,6 +30,7 @@
     taint = null,
     reduced = [],
     protection = [],
+    comm = null,
     onclick,
     onclose,
     onnew,
@@ -36,6 +38,7 @@
     onpointerdowndrag,
     onrename,
     ontaint,
+    oncomm,
   }: {
     /// Stable tab id, surfaced as `data-tab-id` so the M2 drop-target
     /// hit-tester can resolve reorder insertion indices by walking
@@ -75,6 +78,12 @@
     /// first line of its tooltip. Empty means "no report for this tab yet",
     /// which renders as its own state rather than as "nothing is on".
     protection?: FeatureState[];
+    /// V39 Phase A: this tab's communication-glyph state, or `null` on a tab
+    /// that has no glyph at all (Shell, Preview, the reserved dashboards — none
+    /// of them is a harness, so none can be delegated to or locked). Derived
+    /// upstream by `delegation.ts::glyphState` so the rule is testable; this
+    /// component only renders it.
+    comm?: GlyphState | null;
     onclick: () => void;
     /// Invoked when the user confirms the close (or skips the confirm).
     /// Optional because builtin tabs render no close button.
@@ -99,6 +108,10 @@
     /// caller can anchor the override popover at the badge, the same way
     /// `oncontextmenu` anchors the tab menu.
     ontaint?: (e: MouseEvent) => void;
+    /// V39 Phase A: the communication glyph was activated. Receives the event
+    /// so the caller can anchor the popover at the glyph, exactly as `ontaint`
+    /// anchors the containment one.
+    oncomm?: (e: MouseEvent) => void;
   } = $props();
 
   type Indicator = 'error' | 'awaiting' | 'done' | 'working' | null;
@@ -255,6 +268,12 @@
     taintColor(taint, $settings.ui.latched_color, $settings.ui.contaminated_color),
   );
 
+  function onCommClick(e: MouseEvent): void {
+    // Don't let the click also activate or drag the tab.
+    e.stopPropagation();
+    oncomm?.(e);
+  }
+
   function onTaintClick(e: MouseEvent): void {
     // Don't let the click also activate or drag the tab.
     e.stopPropagation();
@@ -395,6 +414,38 @@
         }}
       >
         ⛨
+      </span>
+    {/if}
+    {#if comm}
+      <!--
+        V39 Phase A: the communication glyph — the one control surface for
+        delegation (locked decision 7). Standing on every AI tab, like the
+        shield beside it, because the states it reports (this tab refuses your
+        keyboard / cImp is using this tab) are ones the user must be able to
+        notice without going looking. A `<span role="button">`, mirroring the
+        shield: an icon-only `<button>` grows bracket pseudo-elements under the
+        TUI theme.
+      -->
+      <span
+        class="comm"
+        class:comm-off={comm.state === 'off'}
+        class:comm-role={comm.state === 'manual' || comm.state === 'remote'}
+        class:comm-driven={comm.state === 'driven'}
+        class:comm-locked={comm.locked}
+        role="button"
+        tabindex="0"
+        aria-label="Delegation and access for this tab"
+        title={comm.title}
+        onclick={onCommClick}
+        onpointerdown={(e) => e.stopPropagation()}
+        onkeydown={(e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            onCommClick(e as unknown as MouseEvent);
+          }
+        }}
+      >
+        ⇄{#if comm.locked}<span class="comm-lock" aria-hidden="true">🔒</span>{/if}
       </span>
     {/if}
     {#if onnew}
@@ -577,6 +628,52 @@
   }
   .taint:hover {
     background: var(--surface-3);
+  }
+  /* V39 Phase A: the communication glyph. Same 16px slot as the shield so the
+     two read as one cluster; dim when nothing is delegating, so a tab bar full
+     of them is quiet. */
+  .comm {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    position: relative;
+    width: 16px;
+    height: 16px;
+    border-radius: var(--radius-sm);
+    font-size: 13px;
+    line-height: 1;
+    margin-left: var(--space-1);
+    cursor: pointer;
+    user-select: none;
+  }
+  .comm-off {
+    color: var(--text-tertiary);
+  }
+  .comm-role {
+    color: var(--text-secondary);
+  }
+  /* In flight: this is the state the user must not miss. */
+  .comm-driven {
+    color: var(--accent);
+    font-weight: bold;
+  }
+  .comm-locked {
+    color: var(--awaiting);
+  }
+  .comm-lock {
+    position: absolute;
+    right: -3px;
+    bottom: -3px;
+    font-size: 8px;
+    line-height: 1;
+    pointer-events: none;
+  }
+  .comm:hover {
+    background: var(--surface-3);
+  }
+  .comm:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
   }
   .taint:focus-visible {
     outline: 2px solid var(--accent);

@@ -337,6 +337,10 @@ pub async fn run(project_dir: PathBuf, pinned_session: Option<String>, ctx: OobC
     spawn_heartbeat(ctx.clone(), root.clone(), hb.clone());
 
     let mut seen: HashSet<String> = HashSet::new();
+    // V39 review HIGH-1: the delegation completion is per TURN, and a turn
+    // outlives one drain pass — so its buffer lives here, beside `seen`, for
+    // the lifetime of this tap.
+    let mut turn = TurnText::default();
     // Tool-use IDs of `Task` sub-agents launched but not yet resolved. Non-
     // empty ⇒ at least one agent is running, which holds the avatar in Thinking
     // (see `update_agents`). Keyed by the `toolu_…` id so out-of-order results
@@ -514,6 +518,7 @@ pub async fn run(project_dir: PathBuf, pinned_session: Option<String>, ctx: OobC
                 &path,
                 offset,
                 &mut seen,
+                &mut turn,
                 &mut agents,
                 &mut tool_names,
                 &mut commit_calls,
@@ -599,6 +604,126 @@ pub(crate) fn record_names_session(obj: &Value, session_id: &str) -> bool {
     !session_id.is_empty() && obj.get("sessionId").and_then(Value::as_str) == Some(session_id)
 }
 
+/// **V39 review HIGH-1 — the current turn's answer, and whether the turn is
+/// over.**
+///
+/// The delegation completion feed is per TURN, not per message
+/// (`delegation::note_assistant_text`): a mid-turn preamble filed as the reply
+/// releases the worker's slot while it is still working. The pushed side gets
+/// that for free — the `Stop` hook fires once, with `last_assistant_message` —
+/// so this is the fallback reader's half of the same contract.
+///
+/// # The turn boundary, and what it is derived from
+///
+/// A transcript assistant line carries `message.stop_reason`, and it is the
+/// only turn-shaped fact in the file: `"tool_use"` means the model stopped to
+/// call a tool and the turn continues; anything else non-null (`"end_turn"`,
+/// and the rarer `"max_tokens"` / `"stop_sequence"` / a value a future build
+/// adds) means it stopped talking. Unknown values therefore END a turn, which
+/// is the fail-toward-answering direction: the worst case is filing a
+/// completion one message early, never a delegation that hangs to its deadline
+/// with the answer sitting unread on screen.
+///
+/// # Why the fire happens at the END of a drain pass
+///
+/// One API message is written as SEVERAL transcript lines — one per content
+/// block, all carrying the same `stop_reason` — and the order is the content's
+/// (`thinking`, then `text`). Firing on the first `end_turn` line would file
+/// whatever text preceded the thinking block. So the pass buffers, marks the
+/// turn ended, and files once when the pass is done. A turn split across two
+/// poll ticks still files: `ended` is sticky until the next user prompt, so
+/// the text arriving in the following pass fires it.
+#[derive(Debug, Default)]
+struct TurnText {
+    /// The last non-sidechain assistant text seen in this turn.
+    text: Option<String>,
+    /// A terminal `stop_reason` has been seen for this turn.
+    ended: bool,
+    /// This turn's completion has been filed. One turn, one completion.
+    fired: bool,
+    /// Drain passes observed since the turn ended with no text yet (V39 review
+    /// R-9). One pass of grace before an empty completion is filed — see
+    /// [`Self::take_if_over`].
+    passes_since_end: u8,
+}
+
+impl TurnText {
+    /// A genuine user prompt starts a new turn — drop everything the previous
+    /// one buffered, so a stale answer can never be filed as the new turn's.
+    fn restart(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Fold one non-sidechain assistant line in.
+    fn note_line(&mut self, obj: &Value, texts: &[String]) {
+        if let Some(last) = texts.last() {
+            self.text = Some(last.clone());
+        }
+        if is_turn_end(obj) {
+            self.ended = true;
+        }
+    }
+
+    /// The completion to file now, if the turn is over.
+    ///
+    /// **A turn that ended with NO text files an EMPTY completion** (V39 review
+    /// R-9, locked decision 13: empty is not absent). The engine turns an empty
+    /// completion into `NoText` — "the worker finished its turn without a
+    /// substantive final message" — immediately, which is the honest answer;
+    /// filing nothing made the same outcome arrive as a `timeout` ten minutes
+    /// later, saying the worker was still running when it had stopped.
+    ///
+    /// `definitive` is what stops that from firing early. One API message is
+    /// several transcript lines carrying one `stop_reason`, and the `thinking`
+    /// line comes BEFORE the `text` one — so at the end of the pass that first
+    /// saw `end_turn`, "no text yet" and "no text at all" are the same picture.
+    /// A pass of grace tells them apart. At a user prompt (`definitive`) there
+    /// is nothing left to wait for: the next turn has started.
+    fn take_if_over(&mut self, definitive: bool) -> Option<String> {
+        if !self.ended || self.fired {
+            return None;
+        }
+        if let Some(text) = self.text.clone() {
+            self.fired = true;
+            return Some(text);
+        }
+        self.passes_since_end = self.passes_since_end.saturating_add(1);
+        if !definitive && self.passes_since_end < 2 {
+            return None;
+        }
+        self.fired = true;
+        Some(String::new())
+    }
+}
+
+/// Whether this transcript line ends its turn — see [`TurnText`].
+///
+/// `pub(crate)` for the V35 canary suite: this is the one reader behind
+/// `claude.transcript.stop_reason`, and a canary that re-implemented the rule
+/// would prove its own copy rather than the code that runs.
+pub(crate) fn is_turn_end(obj: &Value) -> bool {
+    if obj.get("type").and_then(Value::as_str) != Some("assistant") {
+        return false;
+    }
+    match obj
+        .get("message")
+        .and_then(|m| m.get("stop_reason"))
+        .and_then(Value::as_str)
+    {
+        // The model paused to call a tool: the turn continues.
+        Some("tool_use") => false,
+        Some(other) => !other.trim().is_empty(),
+        // Absent or null — nothing is claimed either way.
+        None => false,
+    }
+}
+
+/// Whether a transcript line is a sub-agent's own message (the 1.x inline
+/// contract). Those are not the tab's turn and must never complete one.
+fn is_sidechain(obj: &Value) -> bool {
+    obj.get("isSidechain").and_then(Value::as_bool) == Some(true)
+}
+
 /// Read complete new lines from `path` starting at `offset`, speaking assistant
 /// text, and return the new offset (advanced only past whole lines) together
 /// with whether any of those lines identified this session ([`Drained`]).
@@ -607,6 +732,9 @@ async fn drain_new_lines(
     path: &Path,
     mut offset: u64,
     seen: &mut HashSet<String>,
+    // V39 review HIGH-1: the delegation completion's turn buffer, owned by
+    // `run` because a turn outlives one drain pass.
+    turn: &mut TurnText,
     agents: &mut HashSet<String>,
     tool_names: &mut ToolNameRing,
     commit_calls: &mut IdRing,
@@ -621,6 +749,14 @@ async fn drain_new_lines(
     let mut own_record = false;
     let Some((complete, new_offset)) = read_complete_lines(path, offset) else {
         // Nothing new/complete, or rotated away mid-loop.
+        //
+        // V39 review R-9: an empty pass is still a pass. A turn that ended with
+        // no text is waiting out one pass of grace (see `TurnText`), and if the
+        // file has gone quiet — which is exactly what a finished turn looks
+        // like — this is the pass that ends the wait.
+        if let Some(text) = turn.take_if_over(false) {
+            ctx.note_turn_text(&text);
+        }
         return Drained { offset, own_record };
     };
     offset = new_offset;
@@ -669,13 +805,50 @@ async fn drain_new_lines(
             // that boundary: the first push after a switchover strips whatever
             // this tap already spoke of the same message.
             let pushed = ctx.pushed("claude", crate::harness::chp::EV_ASSISTANT_TEXT);
+            // V39 review HIGH-1: a genuine user prompt is the start of a turn,
+            // and the previous turn's buffer must not survive it.
+            //
+            // **Review R-2: file the ended turn FIRST.** The fire is deferred
+            // to the end of the pass (an API message is several lines, and the
+            // final text can follow the line that declared the turn over), so a
+            // pass that carried both a turn's end AND the user's next prompt —
+            // routine when the user types quickly, or when a paused tap catches
+            // up — wiped an ended-but-unfiled turn and the delegation waiting on
+            // it ran to its deadline instead of completing. The boundary is
+            // here, not at the end of the pass, precisely because the prompt is
+            // what makes the previous turn unambiguously over.
+            if !pushed && is_user_prompt(&obj) && !is_sidechain(&obj) && obj.get("isMeta").and_then(Value::as_bool) != Some(true) {
+                // Definitive: the next turn has started, so an ended turn
+                // with no text is an empty answer NOW rather than after a pass
+                // of grace.
+                if let Some(text) = turn.take_if_over(true) {
+                    ctx.note_turn_text(&text);
+                }
+                turn.restart();
+            }
+            let mut fresh: Vec<String> = Vec::new();
             for (key, text) in assistant_texts(&obj) {
                 if seen.insert(key) && !pushed {
                     trace!(tab = ?ctx.tab, "Claude OOB: speaking assistant block");
+                    fresh.push(text.clone());
                     ctx.speak(&text).await;
                 }
             }
+            // V39 Phase B + review HIGH-1: the same arbitrated branch feeds
+            // delegation's completion signal — but per TURN, buffered here and
+            // filed below. Sidechain lines are a sub-agent's own messages and
+            // are never the tab's turn. TTS is untouched: it speaks each block
+            // as it lands, which is what makes speech track the tab.
+            if !pushed && !is_sidechain(&obj) {
+                turn.note_line(&obj, &fresh);
+            }
         }
+    }
+    // Once per pass, after every line of it — an API message is several
+    // transcript lines carrying one `stop_reason`, so the turn's final text can
+    // follow the line that declared the turn over.
+    if let Some(text) = turn.take_if_over(false) {
+        ctx.note_turn_text(&text);
     }
     Drained { offset, own_record }
 }
@@ -2899,10 +3072,12 @@ mod tests {
         let mut commit_calls = IdRing::default();
         let mut version_noted = false;
         let mut subs = SubagentState::default();
+        let mut turn = TurnText::default();
         let drained = drain_new_lines(
             &path,
             0,
             &mut seen,
+            &mut turn,
             &mut agents,
             &mut tool_names,
             &mut commit_calls,
@@ -3001,10 +3176,12 @@ mod tests {
                 let mut commit_calls = IdRing::default();
                 let mut version_noted = false;
                 let mut subs = SubagentState::default();
+                let mut turn = TurnText::default();
                 let out = drain_new_lines(
                     &path,
                     0,
                     &mut seen,
+                    &mut turn,
                     &mut agents,
                     &mut tool_names,
                     &mut commit_calls,
@@ -3058,4 +3235,280 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // -- V39 review HIGH-1: the completion is per TURN ----------------------
+
+    /// A `ctx` on a tab of this test's own, so the process-global delegation
+    /// registry is not shared with the canary suite's fixture replays.
+    fn turn_ctx(tab: &str) -> OobContext {
+        let (tts_tx, _tts_rx) = mpsc::channel::<TtsRequest>(64);
+        let (sig_tx, _sig_rx) = mpsc::channel::<StateSignal>(64);
+        let defaults = Settings::default();
+        let settings = SettingsHandle::new(defaults.clone(), defaults, std::env::temp_dir());
+        OobContext {
+            tab: TabId::from_str(tab),
+            tts: tts_tx,
+            state_signals: sig_tx,
+            settings,
+            cancel: CancellationToken::new(),
+            mem: None,
+            pushes: None,
+        }
+    }
+
+    async fn drain_for_turn(
+        path: &Path,
+        dir: &Path,
+        offset: u64,
+        turn: &mut TurnText,
+        ctx: &OobContext,
+    ) -> u64 {
+        let mut seen = HashSet::new();
+        let mut agents = HashSet::new();
+        let mut tool_names = ToolNameRing::default();
+        let mut commit_calls = IdRing::default();
+        let mut version_noted = false;
+        let mut subs = SubagentState::default();
+        drain_new_lines(
+            path,
+            offset,
+            &mut seen,
+            turn,
+            &mut agents,
+            &mut tool_names,
+            &mut commit_calls,
+            &mut version_noted,
+            &mut subs,
+            dir,
+            "session-1",
+            ctx,
+        )
+        .await
+        .offset
+    }
+
+    /// **The turn boundary itself**, at every shape the transcript produces.
+    #[test]
+    fn only_a_non_tool_stop_reason_ends_a_turn() {
+        let line = |sr: &str| {
+            obj(&format!(
+                r#"{{"type":"assistant","message":{{"id":"m1","stop_reason":{sr},"content":[]}}}}"#
+            ))
+        };
+        assert!(
+            !is_turn_end(&line(r#""tool_use""#)),
+            "a tool call continues the turn"
+        );
+        assert!(is_turn_end(&line(r#""end_turn""#)));
+        assert!(is_turn_end(&line(r#""max_tokens""#)));
+        assert!(
+            is_turn_end(&line(r#""some_future_reason""#)),
+            "an unrecognized reason ends the turn: filing one message early beats hanging"
+        );
+        assert!(!is_turn_end(&line("null")), "present-but-null claims nothing");
+        assert!(!is_turn_end(&line(r#""   ""#)));
+        assert!(!is_turn_end(&obj(r#"{"type":"user","message":{"content":"hi"}}"#)));
+    }
+
+    /// **One completion per turn, and it is the turn's LAST assistant text.**
+    ///
+    /// The failing shape: a preamble, a tool call, then the answer. Per-message
+    /// filing handed the driver "I will read that file first." and released the
+    /// worker's slot while it was still working.
+    #[tokio::test]
+    async fn a_claude_turn_files_one_completion_and_it_is_the_final_text() {
+        let dir = std::env::temp_dir().join(format!("oob-turn-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session-1.jsonl");
+        let head = concat!(
+            r#"{"type":"user","message":{"content":"summarise latch.ts"}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"id":"m1","stop_reason":"tool_use","content":[{"type":"text","text":"Reading that file first."}]}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"id":"m1","stop_reason":"tool_use","content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{}}]}}"#,
+            "\n",
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok"}]}}"#,
+            "\n",
+        );
+        // The same API message, written as two lines: thinking first, then the
+        // answer, both carrying `end_turn`.
+        let tail = concat!(
+            r#"{"type":"assistant","message":{"id":"m2","stop_reason":"end_turn","content":[{"type":"thinking","thinking":"..."}]}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"id":"m2","stop_reason":"end_turn","content":[{"type":"text","text":"It exports three symbols."}]}}"#,
+            "\n",
+        );
+        let ctx = turn_ctx("ai-high1-claude");
+        let worker = TabId::from_str("ai-high1-claude");
+        let _registry = crate::delegation::testing::lock_registry();
+        crate::delegation::testing::claim_and_submit(&worker);
+        let mut turn = TurnText::default();
+
+        std::fs::write(&path, head).unwrap();
+        let offset = drain_for_turn(&path, &dir, 0, &mut turn, &ctx).await;
+        assert!(
+            crate::delegation::testing::take(&worker).is_none(),
+            "a mid-turn preamble must NOT file a completion"
+        );
+
+        std::fs::write(&path, format!("{head}{tail}")).unwrap();
+        drain_for_turn(&path, &dir, offset, &mut turn, &ctx).await;
+        assert_eq!(
+            crate::delegation::testing::take(&worker).as_deref(),
+            Some("It exports three symbols."),
+            "the completion is the turn's final text, not the `end_turn` line before it"
+        );
+        assert!(
+            crate::delegation::testing::take(&worker).is_none(),
+            "filed exactly once"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A turn ending and the next prompt in ONE drain pass still files**
+    /// (V39 review R-2).
+    ///
+    /// The fire is deferred to the end of the pass, and the user prompt that
+    /// starts the next turn resets the buffer — so a pass carrying both wiped
+    /// an ended-but-unfiled turn, and the delegation waiting on it ran to its
+    /// deadline. Routine whenever the user types quickly or a paused tap
+    /// catches up in one read.
+    #[tokio::test]
+    async fn a_turn_that_ends_in_the_same_pass_as_the_next_prompt_still_files() {
+        let dir = std::env::temp_dir().join(format!("oob-turn-r2-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session-1.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"user","message":{"content":"summarise latch.ts"}}"#,
+                "\n",
+                r#"{"type":"assistant","message":{"id":"m1","stop_reason":"end_turn","content":[{"type":"text","text":"It exports three symbols."}]}}"#,
+                "\n",
+                // …and the user's next prompt lands in the SAME chunk.
+                r#"{"type":"user","message":{"content":"now the other file"}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let ctx = turn_ctx("ai-r2-worker");
+        let worker = TabId::from_str("ai-r2-worker");
+        let _registry = crate::delegation::testing::lock_registry();
+        crate::delegation::testing::claim_and_submit(&worker);
+        let mut turn = TurnText::default();
+        drain_for_turn(&path, &dir, 0, &mut turn, &ctx).await;
+        assert_eq!(
+            crate::delegation::testing::take(&worker).as_deref(),
+            Some("It exports three symbols."),
+            "the answer must be filed before the next prompt resets the buffer"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A turn that ends with no text files an EMPTY completion** (V39 review
+    /// R-9, locked decision 13).
+    ///
+    /// The engine turns that into `worker produced no text` immediately. Filing
+    /// nothing made the same outcome arrive as a `timeout` ten minutes later,
+    /// claiming the worker was still running when it had stopped.
+    #[tokio::test]
+    async fn a_turn_that_says_nothing_files_an_empty_completion() {
+        let dir = std::env::temp_dir().join(format!("oob-turn-r9-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session-1.jsonl");
+        let body = concat!(
+            r#"{"type":"user","message":{"content":"summarise latch.ts"}}"#,
+            "\n",
+            // The turn ends carrying nothing but reasoning.
+            r#"{"type":"assistant","message":{"id":"m1","stop_reason":"end_turn","content":[{"type":"thinking","thinking":"..."}]}}"#,
+            "\n",
+        );
+        std::fs::write(&path, body).unwrap();
+        let ctx = turn_ctx("ai-r9-worker");
+        let worker = TabId::from_str("ai-r9-worker");
+        let _registry = crate::delegation::testing::lock_registry();
+        crate::delegation::testing::claim_and_submit(&worker);
+        let mut turn = TurnText::default();
+
+        let offset = drain_for_turn(&path, &dir, 0, &mut turn, &ctx).await;
+        assert!(
+            crate::delegation::testing::take(&worker).is_none(),
+            "one pass of grace: the turn's `text` line may still be coming"
+        );
+        // The next poll finds nothing new — which is what a finished turn looks
+        // like — and the grace runs out.
+        drain_for_turn(&path, &dir, offset, &mut turn, &ctx).await;
+        assert_eq!(
+            crate::delegation::testing::take(&worker).as_deref(),
+            Some(""),
+            "an empty completion, so the driver is told `no text` now rather than `timeout` later"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// …and the grace is load-bearing: the text line arriving in the NEXT pass
+    /// still wins over the empty completion.
+    #[tokio::test]
+    async fn a_turns_final_text_arriving_a_pass_late_still_wins() {
+        let dir = std::env::temp_dir().join(format!("oob-turn-r9b-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session-1.jsonl");
+        let head = concat!(
+            r#"{"type":"user","message":{"content":"summarise latch.ts"}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"id":"m1","stop_reason":"end_turn","content":[{"type":"thinking","thinking":"..."}]}}"#,
+            "\n",
+        );
+        let tail = concat!(
+            r#"{"type":"assistant","message":{"id":"m1","stop_reason":"end_turn","content":[{"type":"text","text":"It exports three symbols."}]}}"#,
+            "\n",
+        );
+        std::fs::write(&path, head).unwrap();
+        let ctx = turn_ctx("ai-r9b-worker");
+        let worker = TabId::from_str("ai-r9b-worker");
+        let _registry = crate::delegation::testing::lock_registry();
+        crate::delegation::testing::claim_and_submit(&worker);
+        let mut turn = TurnText::default();
+
+        let offset = drain_for_turn(&path, &dir, 0, &mut turn, &ctx).await;
+        assert!(crate::delegation::testing::take(&worker).is_none());
+        std::fs::write(&path, format!("{head}{tail}")).unwrap();
+        drain_for_turn(&path, &dir, offset, &mut turn, &ctx).await;
+        assert_eq!(
+            crate::delegation::testing::take(&worker).as_deref(),
+            Some("It exports three symbols."),
+            "the real answer, not the empty completion the grace was holding back"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A sub-agent's own `end_turn` is not the tab's turn ending.
+    #[tokio::test]
+    async fn a_sidechain_turn_does_not_complete_a_delegation() {
+        let dir = std::env::temp_dir().join(format!("oob-turn-side-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session-1.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"user","message":{"content":"go"}}"#,
+                "\n",
+                r#"{"type":"assistant","isSidechain":true,"message":{"id":"s1","stop_reason":"end_turn","content":[{"type":"text","text":"sub-agent done"}]}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let ctx = turn_ctx("ai-high1-side");
+        let worker = TabId::from_str("ai-high1-side");
+        let _registry = crate::delegation::testing::lock_registry();
+        crate::delegation::testing::claim_and_submit(&worker);
+        let mut turn = TurnText::default();
+        drain_for_turn(&path, &dir, 0, &mut turn, &ctx).await;
+        assert!(
+            crate::delegation::testing::take(&worker).is_none(),
+            "a sub-agent's message is not the worker tab's answer"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
 }

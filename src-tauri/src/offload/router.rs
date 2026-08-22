@@ -437,6 +437,98 @@ mod tests {
         }
     }
 
+    // ── V39 Phase C — a facade backend routes like any other ────────────────
+    //
+    // There is no facade-shaped branch in `select`, and these tests exist to
+    // keep it that way: a `HarnessTab` reaches the router as a `BackendView`
+    // with `slots: 1` and `in_flight` read off the delegation registry, and the
+    // existing cascade does the rest. The two properties worth pinning are the
+    // two the doc promises ("a busy worker is routed around or yields
+    // `NoBackendReady`"), because both are emergent rather than written down in
+    // this file.
+
+    /// A worker already driving a delegation reports `in_flight: 1` on its one
+    /// slot, so the free-slot term of the ordering sends the task to the
+    /// backend that can start now — the spill rule, applied to a tab.
+    #[test]
+    fn a_busy_facade_is_routed_around_when_something_else_is_free() {
+        let bs = vec![
+            // The facade: right tier, biggest window, and busy.
+            view(
+                "lan-worker-2",
+                true,
+                BackendTier::Quality,
+                Some(200_000),
+                1,
+                1,
+                ToolScope::All,
+            ),
+            view(
+                "main",
+                true,
+                BackendTier::Quality,
+                Some(32_000),
+                1,
+                0,
+                ToolScope::All,
+            ),
+        ];
+        let chosen = select(&bs, &req(&[], 8_000, TierHint::Quality)).expect("a backend");
+        assert_eq!(bs[chosen].name, "main", "a free slot beats a busy better one");
+    }
+
+    /// …and when the busy facade is the ONLY backend, the task is not silently
+    /// queued into a second delegation: `select` still returns it (queueing for
+    /// a slot is the pool's job, not the router's), which is what makes the
+    /// engine's single-slot claim the one place that says `busy`.
+    #[test]
+    fn a_busy_facade_is_still_chosen_when_it_is_the_only_backend() {
+        let bs = vec![view(
+            "lan-worker-2",
+            true,
+            BackendTier::Quality,
+            Some(200_000),
+            1,
+            1,
+            ToolScope::All,
+        )];
+        let chosen = select(&bs, &req(&[], 8_000, TierHint::Auto)).expect("a backend");
+        assert_eq!(bs[chosen].name, "lan-worker-2");
+        assert!(!bs[chosen].has_free_slot());
+    }
+
+    /// A facade whose tab is closed (or not gate-clean, or mid-turn at the
+    /// moment it was probed) is `ready: false`, and a pool of only those is
+    /// `NoBackendReady` — the doc's "a `HarnessTab` that is not ready is simply
+    /// not routed to", with no new error variant to teach the caller.
+    #[test]
+    fn a_pool_of_unready_facades_is_no_backend_ready() {
+        let bs = vec![
+            view(
+                "lan-worker-2",
+                false,
+                BackendTier::Quality,
+                Some(200_000),
+                1,
+                0,
+                ToolScope::All,
+            ),
+            view(
+                "lan-worker-3",
+                false,
+                BackendTier::Fast,
+                Some(200_000),
+                1,
+                0,
+                ToolScope::All,
+            ),
+        ];
+        assert_eq!(
+            select(&bs, &req(&[], 1_000, TierHint::Auto)),
+            Err(RouteError::NoBackendReady)
+        );
+    }
+
     #[test]
     fn single_backend_is_a_noop() {
         let bs = vec![view(

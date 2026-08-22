@@ -48,6 +48,7 @@
     onClose,
     onNewWorktreeTab,
     onNewPreviewTab,
+    onTakeOver,
     onDismiss,
   }: {
     x: number;
@@ -83,6 +84,14 @@
     /// Preview tab isn't tied to any existing tab the way a worktree
     /// duplicate is.
     onNewPreviewTab?: () => void;
+    /// V39 Phase B, locked decision 6: "Take over (cancel delegation)". Set by
+    /// the caller ONLY while this tab is actually being driven, so the entry is
+    /// absent rather than disabled the rest of the time — a permanent
+    /// greyed-out row on every tab would train the user to stop reading the
+    /// menu. Role and access are deliberately NOT mirrored here: the popover is
+    /// the one control surface (decision 7), and this is the one action that
+    /// must be reachable without finding a glyph.
+    onTakeOver?: () => void;
     onDismiss: () => void;
   } = $props();
 
@@ -229,6 +238,17 @@
     {#if tab.kind === 'ai-tool' && onNewWorktreeTab}
       <button type="button" class="entry" role="menuitem" onclick={fire(onNewWorktreeTab)}>
         New tab in worktree…
+      </button>
+    {/if}
+    {#if onTakeOver}
+      <button
+        type="button"
+        class="entry"
+        role="menuitem"
+        title="Stop cImp waiting and unlock your keyboard. The worker is sent nothing — no Escape, no interrupt — so it finishes its turn visibly."
+        onclick={fire(onTakeOver)}
+      >
+        Take over (cancel delegation)
       </button>
     {/if}
     {#if !tab.builtin}

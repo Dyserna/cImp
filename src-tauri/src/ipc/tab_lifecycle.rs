@@ -700,6 +700,18 @@ pub async fn close_tab(
         buf.remove(&tab);
     }
 
+    // V39 Phase A: and its read-only row. The settings entry is dropped just
+    // below, so the next broadcast would clear a `User` lock anyway; this also
+    // drops a `Driven` row (which settings never describes) and keeps the map
+    // from holding one entry per closed tab for the rest of the session.
+    state.read_only.forget(&tab);
+    // V39 Phase B: and tell any delegation in flight on this tab that its
+    // worker is gone. It cannot be inferred from the state mirror — closing a
+    // tab drops that row, so a closed tab reads exactly like an idle one — and
+    // without it the driver would wait out its whole deadline on a tab that no
+    // longer exists.
+    crate::delegation::note_worker_gone(&tab);
+
     // Remove the settings entry. Drop the active_tab_id pointer if it
     // referenced this tab — the frontend will set a new one on its next
     // tab-switch event. Atomic mutate so a concurrent save_layout /
@@ -1474,6 +1486,11 @@ async fn remove_ai_builtin_tab(
     if let Ok(mut buf) = state.user_input_buf.lock() {
         buf.remove(&tab);
     }
+
+    // V39 Phase A: same for its read-only row (mirrors `close_tab`).
+    state.read_only.forget(&tab);
+    // V39 Phase B: …and the same delegation signal, for the same reason.
+    crate::delegation::note_worker_gone(&tab);
 
     state.settings.mutate(|snap| {
         snap.tabs.retain(|t| t.id() != tab.as_str());

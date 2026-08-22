@@ -598,6 +598,9 @@ pub fn spawn_waiter(
     app: AppHandle,
     cancel: CancellationToken,
     state_signals: mpsc::Sender<StateSignal>,
+    // V39 review R-5: which start this waiter watches. It rides the exit signal
+    // so the activity mirror can tell a late exit from THIS one.
+    start_gen: u64,
 ) {
     tokio::task::spawn_blocking(move || {
         use std::time::{Duration, Instant};
@@ -646,6 +649,7 @@ pub fn spawn_waiter(
         let _ = state_signals.blocking_send(StateSignal::SubprocessExited {
             tab: tab.clone(),
             code,
+            start_gen,
         });
         if let Err(e) = app.emit(
             "pty-exit",

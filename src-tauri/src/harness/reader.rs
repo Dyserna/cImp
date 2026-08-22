@@ -112,10 +112,95 @@ pub struct OobContext {
     pub pushes: Option<Arc<crate::offload::service::PushRegistry>>,
 }
 
+/// The tabs that currently have a fallback reader attached.
+///
+/// V39 Phase B, and it exists for exactly one question: **is there a
+/// completion signal for this tab at all?** Locked decision 12 refuses a
+/// delegation into a worker cImp cannot read back from, and for a harness that
+/// declares `cannot` for CHP `assistant_text` — OpenCode does, by design (D6) —
+/// the reader IS the signal. Without this, "the tab has a reader" would be
+/// inferred from its command, which is a guess about a task that may never have
+/// started.
+///
+/// A `BTreeMap` behind a plain `Mutex`: the write path is two tab-lifecycle
+/// edges, the read path is one preflight.
+///
+/// **The value is a per-spawn epoch, and that is the whole of V39 review M-7.**
+/// It was a set, and deregistration removed the tab id: a tab that had been
+/// restarted therefore had TWO deregistration tasks parked on two cancellation
+/// tokens, and the OLD one — firing whenever the old token was finally
+/// cancelled — deleted the NEW reader's entry. Preflight then refused a tab
+/// that had a perfectly good reader attached, permanently, with "no way to
+/// report the end of a turn". Keyed removal (remove only if the epoch is still
+/// mine) makes the late task a no-op instead.
+static LIVE_READERS: std::sync::Mutex<Option<std::collections::BTreeMap<String, u64>>> =
+    std::sync::Mutex::new(None);
+
+/// Monotonic per-spawn id. Never reused within a process, so an epoch can only
+/// ever name the registration that created it.
+static READER_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn live_readers<T>(f: impl FnOnce(&mut std::collections::BTreeMap<String, u64>) -> T) -> T {
+    let mut g = LIVE_READERS.lock().unwrap_or_else(|e| e.into_inner());
+    f(g.get_or_insert_with(Default::default))
+}
+
+/// Register a reader for `tab`, replacing any earlier registration, and answer
+/// the epoch that names THIS one. Pair with [`deregister_reader`].
+fn register_reader(tab: &str) -> u64 {
+    let epoch = READER_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    live_readers(|m| m.insert(tab.to_string(), epoch));
+    epoch
+}
+
+/// Drop `tab`'s registration **only if it is still the one `epoch` named**.
+///
+/// The guard is the point: a reader's removal task is parked on its own
+/// cancellation token and can fire long after a restart has installed a
+/// successor. Without the comparison it would take the successor's entry with
+/// it, and nothing would ever put it back.
+fn deregister_reader(tab: &str, epoch: u64) {
+    live_readers(|m| {
+        if m.get(tab) == Some(&epoch) {
+            m.remove(tab);
+        }
+    });
+}
+
+/// Whether `tab` has a fallback reader attached right now.
+///
+/// **"Attached", not "healthy".** A reader whose source has gone silent (a 401
+/// on the SSE tap, a transcript that never appears) still answers `true` here,
+/// and that is the honest bound of what this can know from outside: the
+/// difference between a slow turn and a dead tap is a timeout, which is what
+/// the engine's deadline is for. What it does rule out is the case worth
+/// ruling out — a tab that never had a reader and never will.
+pub fn has_live_reader(tab: &crate::state::TabId) -> bool {
+    live_readers(|s| s.contains_key(tab.as_str()))
+}
+
 /// Spawn the adapter described by `spec`, tied to `ctx.cancel`. Non-blocking:
 /// returns immediately, the adapter runs until the token is cancelled (tab
 /// exit) or the source ends.
 pub fn spawn(spec: OobSpec, ctx: OobContext) {
+    // V39 Phase B: register this tab's reader for the lifetime of the token
+    // that owns the adapter below. Deregistration rides the SAME token the
+    // adapter does, so the two cannot disagree about whether a reader is
+    // attached — a separate "on tab close" call site could be forgotten by the
+    // next lifecycle path, and this one cannot.
+    {
+        let tab = ctx.tab.as_str().to_string();
+        // V39 review M-7: the epoch names THIS spawn, and the task below
+        // removes only what it registered. A restarted tab has an older task
+        // still parked on an older token; without the epoch that task deletes
+        // the live reader's entry when it finally fires.
+        let epoch = register_reader(&tab);
+        let cancel = ctx.cancel.clone();
+        tauri::async_runtime::spawn(async move {
+            cancel.cancelled().await;
+            deregister_reader(&tab, epoch);
+        });
+    }
     match spec {
         OobSpec::ClaudeTranscript {
             project_dir,
@@ -152,6 +237,37 @@ impl OobContext {
     /// [`crate::harness::chp::served`] for the three properties of the rule.
     pub fn pushed(&self, agent: &str, event: &str) -> bool {
         crate::harness::chp::served(agent, self.tab.as_str(), event)
+    }
+
+    /// V39 Phase B — **hand one completed assistant message to whatever is
+    /// waiting for this tab's turn to end**, beside speaking it.
+    ///
+    /// The read half of delegation (locked decision 16) is CHP
+    /// `assistant_text`, arbitrated: a tab whose hello declares it is served by
+    /// the push core in `offload::loopback`, and a tab that does not is served
+    /// by its reader — this call. Exactly one of the two fires per message,
+    /// because this is invoked from the same arbitrated branch as
+    /// [`Self::speak`].
+    ///
+    /// Deliberately NOT folded into `speak`: `speak` runs through
+    /// `tts::speak_prose`, which is gated by the per-tab TTS toggle, and a
+    /// delegation must complete on a tab with TTS switched off. Two consumers,
+    /// two calls, one arbitration decision above them.
+    ///
+    /// Routed through this context rather than called directly from the L1
+    /// readers so that `crate::delegation` — an L4 capability — is named in one
+    /// file under `harness/` (this one, already `UPWARD_EXEMPT`) instead of in
+    /// each harness's reader.
+    pub fn note_turn_text(&self, text: &str) {
+        crate::delegation::note_assistant_text(&self.tab, text);
+    }
+
+    /// [`Self::note_turn_text`] for a reader that BUFFERED the text: `at_ms` is
+    /// when the worker produced it, not when this call is made (V39 review
+    /// R-3). Correlation is by time, so a buffer filed with the wrong one can
+    /// hand an earlier turn's words to a delegation that started after them.
+    pub fn note_turn_text_at(&self, text: &str, at_ms: u64) {
+        crate::delegation::note_assistant_text_at(&self.tab, text, at_ms);
     }
 
     /// Speak one block of assistant prose from THIS reader.
@@ -353,6 +469,37 @@ mod tests {
             mem: None,
             pushes: None,
         }
+    }
+
+    /// **A restart's late cleanup must not unregister the live reader**
+    /// (V39 review M-7).
+    ///
+    /// Deregistration rides each adapter's own cancellation token, so a tab
+    /// that has been restarted has two of them: the old token can be cancelled
+    /// at any later moment, and an unkeyed `remove` took the NEW reader's entry
+    /// with it. Preflight then refused a tab with a perfectly good reader —
+    /// "no way to report the end of a turn" — for the rest of the session.
+    #[test]
+    fn a_stale_readers_cleanup_cannot_unregister_its_successor() {
+        let tab = TabId::from_str("ai-reader-epoch");
+        let first = register_reader(tab.as_str());
+        let second = register_reader(tab.as_str());
+        assert_ne!(first, second, "each spawn gets its own epoch");
+        assert!(has_live_reader(&tab));
+
+        // The FIRST adapter's token finally fires, after the restart.
+        deregister_reader(tab.as_str(), first);
+        assert!(
+            has_live_reader(&tab),
+            "the running reader must survive its predecessor's cleanup"
+        );
+
+        // The live one's own cleanup still works.
+        deregister_reader(tab.as_str(), second);
+        assert!(!has_live_reader(&tab));
+        // …and is idempotent.
+        deregister_reader(tab.as_str(), second);
+        assert!(!has_live_reader(&tab));
     }
 
     #[tokio::test]

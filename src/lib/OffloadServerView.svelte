@@ -36,6 +36,12 @@
 
   const local = $derived(dashboards.filter((d) => d.kind === 'local'));
   const remote = $derived(dashboards.filter((d) => d.kind === 'lan' || d.kind === 'cloud'));
+  // V39 Phase C: the facades get their own group rather than joining "Remote".
+  // They are neither — no process to start, no endpoint to reach — and the one
+  // thing a reader needs from this dashboard is which rows have a server behind
+  // them. A filter written as "everything that is not local" would also have
+  // swallowed the next kind silently.
+  const facades = $derived(dashboards.filter((d) => d.kind === 'harness'));
 
   // Start/Stop/Reset for the local offload server, mirroring the per-backend
   // controls in Settings → Offload task tools. cImp normally owns a single local
@@ -118,6 +124,15 @@
       <section class="group">
         <h3 class="group-head">Remote</h3>
         {#each remote as d (d.name)}
+          <BackendDashboardCard dash={d} />
+        {/each}
+      </section>
+    {/if}
+
+    {#if facades.length > 0}
+      <section class="group">
+        <h3 class="group-head">Tab workers</h3>
+        {#each facades as d (d.name)}
           <BackendDashboardCard dash={d} />
         {/each}
       </section>

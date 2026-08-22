@@ -90,6 +90,10 @@
     composeTemplatesProjectGet,
   } from './lib/compose/templates';
   import { localDataExcludedScope, toolScopeMode } from './lib/settings/types';
+  // V39 Phase C: the facade backends, derived from the tab roles this window
+  // already holds — never fetched, so the list cannot disagree with the role
+  // radio in the same settings snapshot.
+  import { facadeBackends } from './lib/delegation';
   import type { AiTabId } from './lib/tabs/types';
   import { AI_TABS } from './lib/tabs/types';
   import { version as appVersion } from '../package.json';
@@ -4715,6 +4719,44 @@
             </div>
           {/each}
 
+          <!--
+            V39 Phase C — the facade backends, READ-ONLY.
+
+            They are not in `offload.backends` and never will be: a Remote-offload
+            tab IS the backend (locked decision 8), so there is exactly one place
+            to change one, and it is that tab's own popover. Listing them here
+            anyway is the point — a backend the router can pick but the backend
+            list does not mention is a backend the user cannot account for.
+          -->
+          {#each facadeBackends(snapshot) as facade (facade.tabId)}
+            <div class="backend-card facade">
+              <div class="backend-head">
+                <span class="backend-name-static" title="The name the requesting harness sees">{facade.name}</span>
+                <span class="facade-kind">tab worker</span>
+                <span class="facade-kind">{facade.tier}</span>
+                {#if facade.declaredContext}
+                  <span class="facade-kind">~{Math.max(1, Math.round(facade.declaredContext / 1000))}k ctx</span>
+                {/if}
+              </div>
+              <!--
+                V39 review M-9: a name collision DROPS the facade from the pool
+                (the router, the run log and the dashboard all key on the name),
+                and the drop used to be a `warn!` in the log and nothing else —
+                this list showed the row as if it were live. Rendered rather
+                than hidden: the row is where the user can see what to rename.
+              -->
+              {#if facade.droppedReason}
+                <small class="error">{facade.droppedReason}</small>
+              {/if}
+              <small class="hint">
+                Configured on the tab “{facade.tabName}” — set its role, backend name,
+                tier and context in that tab's ⇄ popover. It is offered to
+                <code>offload_task</code> under the name above and never as a tab;
+                it is ready while the tab is open and idle.
+              </small>
+            </div>
+          {/each}
+
           <div class="button-row">
             <button type="button" onclick={addLocalBackend}>+ Local backend</button>
             <button type="button" onclick={addRemoteBackend}>+ Remote backend</button>
@@ -5104,6 +5146,66 @@
           <div class="button-row">
             <button type="button" onclick={addCommandPolicy}>Add command policy</button>
           </div>
+
+          <h3>Cross-harness delegation</h3>
+          <small class="hint top">
+            V39: one tab drives another — cImp types a request into an open
+            harness tab exactly as you would, waits for the turn to finish, and
+            hands the answer back to the tab that asked. Which tabs may be driven
+            is set per tab, from that tab's <code>⇄</code> icon; these are
+            the two knobs that are not per tab. Every run is a row in the Events
+            tab under <strong>delegation</strong>.
+          </small>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.delegation.auto_read_only}
+              onchange={(e) =>
+                patch(
+                  (s) =>
+                    (s.delegation.auto_read_only = (
+                      e.currentTarget as HTMLInputElement
+                    ).checked),
+                )}
+            />
+            <span>Lock a tab's keyboard while another harness is driving it</span>
+          </label>
+          <small class="hint">
+            On by default. While cImp is typing into a tab, a stray keystroke of
+            yours lands in the middle of someone else's turn. A courtesy lock over
+            your own hands, not a security boundary: a permission or question
+            prompt relaxes it for that prompt, and <strong>Take over</strong> — on
+            the tab's <code>⇄</code> popover and its context menu — clears it
+            outright and ends the delegation. Turning it off leaves the tab
+            writable throughout; the banner and the glyph still say it is being
+            driven.
+          </small>
+          <label>
+            <span>Default timeout (seconds)</span>
+            <input
+              type="number"
+              min="1"
+              max="86400"
+              step="1"
+              value={snapshot.delegation.default_timeout_s}
+              onchange={(e) =>
+                patch(
+                  (s) =>
+                    (s.delegation.default_timeout_s = Math.max(
+                      1,
+                      Math.round(+(e.currentTarget as HTMLInputElement).value || 600),
+                    )),
+                )}
+            />
+            <small class="hint">
+              How long cImp waits for a worker's reply when the caller named no
+              timeout of its own. On expiry the asking tab is told
+              <code>timeout</code> and <strong>no keys are ever sent</strong> to
+              cancel the worker — it finishes its turn visibly, in its own tab.
+              A standing permission prompt buys one bounded extension, so a run
+              waiting on you does not expire while you walk over to it.
+            </small>
+          </label>
           {/if}
 
           <hr class="card-divider lg" />
@@ -8325,6 +8427,20 @@
     padding: 0.6rem 0.75rem;
     margin: 0.6rem 0;
     background: var(--surface-sunken);
+  }
+  /* V39 Phase C: a facade is read-only here, and it should look it. */
+  .backend-card.facade {
+    border-style: dashed;
+  }
+  .backend-name-static {
+    font-weight: 600;
+  }
+  .facade-kind {
+    font-size: 0.8em;
+    opacity: 0.75;
+    border: 1px solid var(--border-subtle);
+    border-radius: 4px;
+    padding: 0 0.35rem;
   }
   .backend-head {
     display: flex;

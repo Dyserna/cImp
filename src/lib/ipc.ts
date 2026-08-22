@@ -1,6 +1,8 @@
 import { invoke, Channel } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type { TabId, TabKind } from './tabs/types';
+import type { DelegationRole, InFlightView, RoleChange } from './delegation';
+import type { DelegationBackend } from './settings/types';
 
 export type BytesChannel = Channel<string>;
 
@@ -52,6 +54,69 @@ export async function ptyRebindChannel(
 
 export async function ptyWrite(tab: TabId, input: string): Promise<void> {
   await invoke('pty_write', { tab, input });
+}
+
+/// V39 Phase A: set or clear a tab's user read-only lock. Takes the runtime
+/// lock in the backend AND persists the flag, so the tab is refusing input by
+/// the time this resolves and is still refusing it after a restart. The new
+/// state reaches this window as a `settings-changed` broadcast — there is no
+/// separate event to listen for.
+export async function tabSetReadOnly(tab: TabId, on: boolean): Promise<void> {
+  await invoke('tab_set_read_only', { tab, on });
+}
+
+/// V39 Phase B (locked decision 8): set a tab's delegation role.
+///
+/// The backend enforces **at most one Manual tab per harness** and MOVES the
+/// role rather than refusing, so the answer carries `displaced` — the id of the
+/// tab that lost it, or `null`. The caller toasts on that tab: the loser may
+/// not be visible, and a role that moved silently is a `delegate_task_*` tool
+/// that started driving somewhere else with nothing on screen saying so.
+///
+/// Persists the ROLE only; the Remote-offload knobs beside it ride the ordinary
+/// settings save. Refuses — naming the condition — on a reserved dashboard, a
+/// non-AI tab, and a harness with no input profile.
+export async function tabSetDelegationRole(
+  tab: TabId,
+  role: DelegationRole,
+): Promise<RoleChange> {
+  return invoke<RoleChange>('tab_set_delegation_role', { tab, role });
+}
+
+/// V39 review M-10: write one tab's facade-backend knobs, and nothing else.
+///
+/// A dedicated command rather than an `applySettings` of the whole document:
+/// a document written from a snapshot taken before some other write landed
+/// silently reverts it (the `40d2b32` class), and the write most likely to be
+/// in flight beside this one is the ROLE radio one line above in the same
+/// popover. Blank name / zero context are normalised to "unset" backend-side.
+export async function tabSetDelegationBackend(
+  tab: TabId,
+  backend: DelegationBackend,
+): Promise<void> {
+  await invoke('tab_set_delegation_backend', { tab, backend });
+}
+
+/// V39 Phase B (locked decision 6): take a driven tab back.
+///
+/// Stops the driver waiting and clears the engine's lock. Sends the worker
+/// NOTHING — no Escape, no interrupt; it finishes its turn visibly. Returns
+/// whether a delegation was actually in flight, so the UI can tell "I cancelled
+/// it" from "it had already finished".
+export async function delegationTakeOver(tab: TabId): Promise<boolean> {
+  return invoke<boolean>('delegation_take_over', { tab });
+}
+
+/// V39 Phase B: what is driving `tab` right now, if anything.
+export async function delegationStatus(tab: TabId): Promise<InFlightView | null> {
+  return invoke<InFlightView | null>('delegation_status', { tab });
+}
+
+/// V39 Phase B: every in-flight delegation, keyed by worker tab id — the pull
+/// that pairs with the `delegation-changed` push, for a window that mounts
+/// mid-flight.
+export async function delegationStatuses(): Promise<[string, InFlightView][]> {
+  return invoke<[string, InFlightView][]>('delegation_statuses');
 }
 
 export async function ptyResize(tab: TabId, rows: number, cols: number): Promise<void> {

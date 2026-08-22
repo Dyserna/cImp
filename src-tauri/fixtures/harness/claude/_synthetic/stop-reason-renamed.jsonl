@@ -1,0 +1,2 @@
+{"type":"assistant","message":{"id":"msg_canary_stop_0001","model":"claude-sonnet-4-5-20250929","stopReason":"tool_use","content":[{"type":"text","text":"The canary will read a file first."},{"type":"tool_use","id":"toolu_canary_stop_0002","name":"Read","input":{"file_path":"canary.rs"}}]}}
+{"type":"assistant","message":{"id":"msg_canary_stop_0003","model":"claude-sonnet-4-5-20250929","stopReason":"end_turn","content":[{"type":"text","text":"The canary finished its turn."}]}}

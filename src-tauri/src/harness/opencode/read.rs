@@ -246,8 +246,16 @@ async fn consume(
                 // Stream closed; flush the remainder and release Thinking —
                 // the fresh Tracker after reconnect starts with `working:
                 // false` and can't release a stale edge from this connection.
-                state.flush_all(ctx).await;
-                state.set_working(ctx, false);
+                //
+                // V39 review R-7: file the buffered turn too. `flush_all`
+                // SPEAKS what is left but the completion is filed by
+                // `close_turn`, which a closed stream never reaches — and this
+                // Tracker is discarded on reconnect, so the text goes with it
+                // and the delegation waiting on it runs to its deadline for an
+                // answer that was already on screen. Only the tab's own
+                // session is ever buffered (`flush` filters by session), so
+                // filing here cannot hand over a sub-agent's words.
+                state.close_stream(ctx).await;
                 return Ok(StreamEnd::Closed);
             }
             Err(e) => {
@@ -800,8 +808,47 @@ pub(crate) struct Tracker {
     msg_parts: HashMap<String, Vec<String>>,
     /// messageIDs known to be assistant messages.
     assistant: HashSet<String>,
+    /// The same ids in first-seen order, so [`Tracker::flush_all`] speaks a
+    /// turn's messages in the order the stream produced them rather than in a
+    /// `HashSet`'s. V39 review HIGH-1 made that order load-bearing: the
+    /// delegation completion is the LAST message of the turn, and "last" has to
+    /// mean something.
+    assistant_order: Vec<String>,
+    /// **The turn's last flushed assistant text, held until the turn is over**
+    /// (V39 review HIGH-1).
+    ///
+    /// [`Tracker::flush`] runs per MESSAGE — a turn with a preamble, a tool
+    /// call and an answer flushes twice — and it used to hand each one straight
+    /// to `note_turn_text`. The delegation engine takes the first completion it
+    /// sees, so "I'll read that file first." was returned as the reply and the
+    /// worker's slot was released while it was still working. The text is
+    /// buffered here instead and filed once, from [`Tracker::close_turn`].
+    ///
+    /// Carries the moment the text was PRODUCED (V39 review R-3). The
+    /// completion feed correlates by time — a completion older than the
+    /// delegation's submit belongs to an earlier turn — and filing a buffer
+    /// stamped at FILE time defeats that: text this tab produced before a
+    /// delegation existed would look like its reply.
+    turn_last_text: Option<(String, u64)>,
+    /// This turn produced an assistant message of the TAB's own (V39 review
+    /// R-9), whether or not it carried speakable text.
+    ///
+    /// The difference between "the worker answered with nothing" — locked
+    /// decision 13's error, owed to the driver immediately — and "no turn
+    /// happened here at all", which `session.idle` also fires for and which
+    /// must not be reported as anything.
+    turn_saw_assistant: bool,
     /// messageIDs already spoken (don't double-flush on idle).
     flushed: HashSet<String>,
+    /// messageID -> the session that produced it.
+    ///
+    /// **A sub-agent's messages ride the same stream as the tab's own** (the
+    /// V28 finding), and V39's completion feed made that a correctness
+    /// problem rather than a scoping one: a child session's assistant message
+    /// buffered as "the turn's answer" would be handed to the driver as the
+    /// worker's reply. Kept beside `assistant`/`flushed` and bounded the same
+    /// way — one entry per assistant message id.
+    msg_session: HashMap<String, String>,
     /// Whether we've emitted ClaudeOutputStarted without a matching Stopped.
     working: bool,
     /// V28 + V30 (review M7/M8): the tab's session facts — current MAIN session,
@@ -842,7 +889,17 @@ impl Tracker {
                 let info = props.get("info").unwrap_or(&Value::Null);
                 if info.get("role").and_then(Value::as_str) == Some("assistant") {
                     if let Some(id) = info.get("id").and_then(Value::as_str) {
-                        self.assistant.insert(id.to_string());
+                        if self.assistant.insert(id.to_string()) {
+                            self.assistant_order.push(id.to_string());
+                        }
+                        // Which session this message belongs to — read here
+                        // because `message.updated` is the one event that
+                        // announces the message, and `flush` (which decides
+                        // whether it may become a delegation's answer) has no
+                        // event to read.
+                        if let Some(sid) = props.get("sessionID").and_then(Value::as_str) {
+                            self.msg_session.insert(id.to_string(), sid.to_string());
+                        }
                         self.set_working(ctx, true);
                         // Present-but-null must read as "not completed": a
                         // nullable-until-set `completed` field would otherwise
@@ -898,7 +955,10 @@ impl Tracker {
             // would go mute the day upstream drops it — the Tier-C failure mode
             // this whole layer exists to make legible — and honouring only the
             // new one would go mute on every currently-installed build.
-            "session.idle" => self.close_turn(ctx).await,
+            "session.idle" => {
+                let main = self.is_main_session(props.get("sessionID").and_then(Value::as_str));
+                self.close_turn(ctx, main).await
+            }
             "session.status" => {
                 // `properties.status.type` is `"busy"` or `"idle"`. Only idle
                 // closes the turn: a busy status is the OPENING of one, and
@@ -911,7 +971,9 @@ impl Tracker {
                     .and_then(|s| s.get("type"))
                     .and_then(Value::as_str);
                 if status == Some("idle") {
-                    self.close_turn(ctx).await;
+                    let main =
+                        self.is_main_session(props.get("sessionID").and_then(Value::as_str));
+                    self.close_turn(ctx, main).await;
                 }
             }
             _ => {}
@@ -928,8 +990,45 @@ impl Tracker {
     /// message ids, [`Self::set_working`] is edge-triggered, and clearing an
     /// already-cleared map speaks nothing. Pinned by
     /// `both_turn_over_signals_do_not_double_speak`.
-    async fn close_turn(&mut self, ctx: &OobContext) {
+    async fn close_turn(&mut self, ctx: &OobContext, main_session: bool) {
         self.flush_all(ctx).await;
+        // V39 Phase B + review HIGH-1: delegation's completion signal, and the
+        // ONLY place this reader files one. It is filed HERE — after
+        // `flush_all`, on the turn-over edge — carrying the LAST assistant
+        // message of the turn, which is what `last_assistant_message` means on
+        // the pushed side (locked decision 16's read half must mean the same
+        // thing whichever half serves it). Last message rather than a
+        // concatenation of the turn's messages for the same reason: a preamble
+        // is not part of the answer, and gluing it on would hand the driver
+        // text the worker had already superseded.
+        //
+        // A turn that produced no text at all files nothing: `session.idle`
+        // also fires for turns this tab never spoke in, and minting an empty
+        // completion for one would report "the worker said nothing" for a turn
+        // the worker never started.
+        //
+        // …and only the TAB's OWN session may end its turn. Sub-agent sessions
+        // ride the same stream and raise their own `session.idle` /
+        // `session.status:idle` mid-turn (the V28 finding, V39 review): a child
+        // idle used to file whatever the tab had said so far as the delegation's
+        // answer — HIGH-1's failure mode through another door. The buffer is
+        // deliberately LEFT INTACT here: the turn is still running, and the main
+        // session's own idle files it.
+        if main_session {
+            match self.turn_last_text.take() {
+                Some((text, at_ms)) => ctx.note_turn_text_at(&text, at_ms),
+                // V39 review R-9: the tab took a turn and said nothing
+                // speakable. That is locked decision 13's `NoText` — owed to
+                // the driver NOW, not as a timeout ten minutes later — and the
+                // engine mints it from an empty completion. Gated on
+                // `turn_saw_assistant` because `session.idle` also fires for
+                // turns this tab never spoke in, and minting `no text` for one
+                // of those would fail a delegation that had not started.
+                None if self.turn_saw_assistant => ctx.note_turn_text(""),
+                None => {}
+            }
+            self.turn_saw_assistant = false;
+        }
         self.set_working(ctx, false);
         // Turn over: whatever part state is still buffered belongs to
         // messages that will never flush (user echoes, tool parts).
@@ -940,6 +1039,39 @@ impl Tracker {
         self.part_snapshot.clear();
         self.part_type.clear();
         self.msg_parts.clear();
+    }
+
+    /// **Is this the TAB's own session?** — the identity half of the
+    /// delegation completion feed (V39 review).
+    ///
+    /// Answered from the same [`TabSessions`] facts the push path uses, so
+    /// there is one notion of "this tab's session" rather than two: `children`
+    /// is the append-only set of sub-agent sessions (learned from a
+    /// `session.created` carrying `parentID`, or from `verify_main_session`'s
+    /// HTTP probe answering [`SessionVerdict::Child`]), and `main` is the last
+    /// session the tab was bound to.
+    ///
+    /// Two deliberate fail-OPEN answers, both matching what the rest of this
+    /// reader already does with the same uncertainty:
+    ///
+    /// * `None` — the event carries no `sessionID` at all. Every session-scoped
+    ///   event on this stream carries one (the spike-0a capture), so this is a
+    ///   shape nobody has seen; treating it as foreign would silently stop
+    ///   delegations completing on a build that changed the envelope.
+    /// * a session that is neither a known child nor the current `main` — a
+    ///   child whose `session.created` this tap missed. `track_live_session`
+    ///   runs before every match arm and has already re-pointed `main` at it,
+    ///   so this case collapses into "it is main"; it is named here because the
+    ///   fail-open direction is a decision, not an accident.
+    fn is_main_session(&self, sid: Option<&str>) -> bool {
+        let Some(sid) = sid else {
+            return true;
+        };
+        let facts = lock_sessions(&self.sessions);
+        if facts.children.contains(sid) {
+            return false;
+        }
+        facts.main.as_deref().map(|m| m == sid).unwrap_or(true)
     }
 
     /// V28 (issue #13) — OpenCode's half of the per-tab session identity.
@@ -1078,8 +1210,29 @@ impl Tracker {
             self.part_snapshot.remove(pid);
             self.part_type.remove(pid);
         }
+        // V39 review R-9: a turn of this tab's own HAPPENED, whether or not it
+        // said anything speakable. Recorded before the emptiness check, because
+        // "it said nothing" is precisely the case that has to be reportable.
+        let mine = self.is_main_session(self.msg_session.get(mid).map(String::as_str));
+        if mine {
+            self.turn_saw_assistant = true;
+        }
         if !out.trim().is_empty() {
             trace!(tab = ?ctx.tab, "OpenCode OOB: speaking assistant message (reasoning excluded)");
+            // V39 Phase B + review HIGH-1: this reader is OpenCode's DECLARED
+            // path for `assistant_text` (the plugin says `cannot`, by design
+            // D6), so for an OpenCode worker it — not the CHP push core — is
+            // what ends a delegation's wait. But a message is not a turn:
+            // buffer it, and let `close_turn` file the last one. TTS is
+            // unchanged and deliberately so — speaking each message as it
+            // completes is what makes speech track the tab.
+            //
+            // A CHILD session's message is never the tab's answer, so it is
+            // spoken (unchanged) but not buffered: otherwise the tab's own idle
+            // would file a sub-agent's last words as the worker's reply.
+            if mine {
+                self.turn_last_text = Some((out.clone(), crate::activity::now_ms()));
+            }
             ctx.speak(&out).await;
         }
     }
@@ -1087,7 +1240,7 @@ impl Tracker {
     /// Flush every not-yet-spoken assistant message (turn ended).
     async fn flush_all(&mut self, ctx: &OobContext) {
         let ids: Vec<String> = self
-            .assistant
+            .assistant_order
             .iter()
             .filter(|id| !self.flushed.contains(*id))
             .cloned()
@@ -1097,11 +1250,44 @@ impl Tracker {
         }
     }
 
+    /// **The connection ended, not the turn** (V39 review R-7).
+    ///
+    /// Speak what is buffered, file the turn's answer if there is one, and
+    /// release the Thinking edge. Filing here is not the same claim
+    /// `close_turn` makes — nothing said the turn is over — but the alternative
+    /// is worse in exactly one direction: this Tracker is discarded on
+    /// reconnect, so text not filed here is lost, and a delegation waiting on
+    /// it waits out its whole deadline for an answer the user can already read.
+    /// A turn that really was still running will be re-served by the reconnected
+    /// stream, and the completion feed is last-wins.
+    async fn close_stream(&mut self, ctx: &OobContext) {
+        self.flush_all(ctx).await;
+        if let Some((text, at_ms)) = self.turn_last_text.take() {
+            ctx.note_turn_text_at(&text, at_ms);
+        }
+        self.set_working(ctx, false);
+    }
+
     /// Edge-triggered avatar Thinking/Idle, mirroring the old scrape path's
     /// `claude_working` marker.
     fn set_working(&mut self, ctx: &OobContext, working: bool) {
         if working == self.working {
             return;
+        }
+        // **V39 review R-3: a new turn starts with an empty buffer.**
+        //
+        // `close_turn` deliberately LEAVES the buffer when a child session
+        // idles (the tab's turn is still running), and it also releases the
+        // Thinking edge — so the next `message.updated` opens a new turn with
+        // the previous one's text still held. If that turn then produced no
+        // text of its own (a tool-only turn, an interrupt), the tab's own idle
+        // filed the STALE text, and a delegation submitted in between received
+        // words the worker had said before it ever asked. The rising edge is
+        // the one place that means "a turn is beginning", for every path that
+        // reaches it.
+        if working {
+            self.turn_last_text = None;
+            self.turn_saw_assistant = false;
         }
         self.working = working;
         let tab = ctx.tab.clone();
@@ -1135,7 +1321,14 @@ mod tests {
         // true by default for opencode) is satisfied — Settings::default() ships
         // no tabs; the real app seeds them via persistence.
         let mut defaults = Settings::default();
-        defaults.tabs.push(crate::settings::default_opencode_tab());
+        let mut seeded = crate::settings::default_opencode_tab();
+        // The gate is keyed by TAB ID, so a test that uses an id of its own
+        // (to keep the process-global delegation registry to itself) still has
+        // to be able to speak.
+        if let crate::settings::TabConfig::AiTool(c) = &mut seeded {
+            c.id = tab.to_string();
+        }
+        defaults.tabs.push(seeded);
         let settings = SettingsHandle::new(defaults.clone(), defaults, std::env::temp_dir());
         let ctx = OobContext {
             tab: TabId::from_str(tab),
@@ -1183,6 +1376,398 @@ mod tests {
             Ok(TtsRequest::Synthesize { text, .. }) => assert_eq!(text, "Hello world."),
             other => panic!("expected synthesize, got {other:?}"),
         }
+    }
+
+    /// **V39 review HIGH-1: one completion per TURN, and it is the turn's LAST
+    /// assistant message.**
+    ///
+    /// The shape that broke it: a preamble message, a tool call, then the real
+    /// answer — one turn, two assistant messages. `flush` runs per message, so
+    /// the preamble used to be filed as the delegation's completion the moment
+    /// it completed; the engine takes the first completion it sees, so the
+    /// driver got "I'll read that file first." and the worker's slot was
+    /// released while it was still working.
+    ///
+    /// Asserted through the real registry (`delegation::testing`) rather than
+    /// on the tracker's field, because the property is about what the ENGINE
+    /// can observe, and the engine reads the registry.
+    #[tokio::test]
+    async fn a_turn_files_one_completion_and_it_is_the_final_message() {
+        // A tab id of this test's own, seeded into settings so the per-tab TTS
+        // gate still passes. The V35 canary suite runs a `Tracker` over the
+        // OpenCode SSE fixture in this same binary, and it files completions
+        // for the `opencode` tab — a claim on that id would be fed by it.
+        let (ctx, mut tts_rx, _sig) = ctx_with("ai-high1-worker");
+        let worker = TabId::from_str("ai-high1-worker");
+        // Held for the whole body: the registry is one process-global and this
+        // test drives it across `await`s, so the exclusion every other
+        // registry test takes has to be a guard rather than a closure.
+        let _registry = crate::delegation::testing::lock_registry();
+        crate::delegation::testing::claim_and_submit(&worker);
+        let mut t = Tracker::default();
+        let say = |mid: &str, pid: &str, text: &str| {
+            (
+                ev(&format!(
+                    r#"{{"type":"message.updated","properties":{{"info":{{"id":"{mid}","role":"assistant","time":{{"created":1}}}}}}}}"#
+                )),
+                ev(&format!(
+                    r#"{{"type":"message.part.updated","properties":{{"part":{{"id":"{pid}","type":"text","messageID":"{mid}","text":"{text}"}}}}}}"#
+                )),
+                ev(&format!(
+                    r#"{{"type":"message.updated","properties":{{"info":{{"id":"{mid}","role":"assistant","time":{{"created":1,"completed":2}}}}}}}}"#
+                )),
+            )
+        };
+        // Message 1: the preamble. It completes mid-turn — that is the whole
+        // bug — and it is spoken, which is wanted.
+        let (a, b, c) = say("m1", "p1", "I'll read that file first.");
+        t.handle(&a, &ctx).await;
+        t.handle(&b, &ctx).await;
+        t.handle(&c, &ctx).await;
+        assert!(
+            crate::delegation::testing::take(&worker).is_none(),
+            "a mid-turn message must NOT file a completion — the turn is not over"
+        );
+        // A tool call happens here; the tracker sees nothing it speaks.
+        // Message 2: the answer.
+        let (a, b, c) = say("m2", "p2", "The file exports three symbols.");
+        t.handle(&a, &ctx).await;
+        t.handle(&b, &ctx).await;
+        t.handle(&c, &ctx).await;
+        assert!(
+            crate::delegation::testing::take(&worker).is_none(),
+            "still mid-turn: nothing has said the turn is over"
+        );
+        // The turn-over edge.
+        t.handle(&ev(r#"{"type":"session.idle","properties":{}}"#), &ctx)
+            .await;
+        assert_eq!(
+            crate::delegation::testing::take(&worker).as_deref(),
+            Some("The file exports three symbols."),
+            "the completion is the turn's LAST assistant message"
+        );
+        assert!(
+            crate::delegation::testing::take(&worker).is_none(),
+            "filed exactly once"
+        );
+        // TTS is unchanged: both messages were spoken as they completed.
+        let spoken: Vec<String> = std::iter::from_fn(|| match tts_rx.try_recv() {
+            Ok(TtsRequest::Synthesize { text, .. }) => Some(text),
+            _ => None,
+        })
+        .collect();
+        assert_eq!(spoken.len(), 2, "both messages are still spoken: {spoken:?}");
+    }
+
+    /// **Only the TAB's own session ends its turn** (V39 review, HIGH-1's
+    /// failure mode through another door).
+    ///
+    /// Sub-agent sessions ride the same `/event` stream as the tab's own — the
+    /// V28 finding — and they raise their own `session.idle` mid-turn. That
+    /// idle used to reach `close_turn` unfiltered, filing whatever the tab had
+    /// said so far as the delegation's answer: the driver got a preamble, the
+    /// slot was released, and the worker was still working. The child's own
+    /// messages must not be buffered as the answer either.
+    ///
+    /// TTS is asserted unchanged: all three messages are still spoken as they
+    /// complete, sub-agent included.
+    #[tokio::test]
+    async fn a_child_sessions_idle_does_not_end_the_tabs_turn() {
+        let (ctx, mut tts_rx, _sig) = ctx_with("ai-child-idle");
+        let worker = TabId::from_str("ai-child-idle");
+        let _registry = crate::delegation::testing::lock_registry();
+        crate::delegation::testing::claim_and_submit(&worker);
+        let mut t = Tracker::default();
+
+        let say = |sid: &str, mid: &str, pid: &str, text: &str| {
+            (
+                ev(&format!(
+                    r#"{{"type":"message.updated","properties":{{"sessionID":"{sid}","info":{{"id":"{mid}","role":"assistant","time":{{"created":1}}}}}}}}"#
+                )),
+                ev(&format!(
+                    r#"{{"type":"message.part.updated","properties":{{"sessionID":"{sid}","part":{{"id":"{pid}","type":"text","messageID":"{mid}","text":"{text}"}}}}}}"#
+                )),
+                ev(&format!(
+                    r#"{{"type":"message.updated","properties":{{"sessionID":"{sid}","info":{{"id":"{mid}","role":"assistant","time":{{"created":1,"completed":2}}}}}}}}"#
+                )),
+            )
+        };
+
+        // The tab's own turn opens.
+        let (a, b, c) = say("ses_main", "m1", "p1", "Reading that file first.");
+        t.handle(&a, &ctx).await;
+        t.handle(&b, &ctx).await;
+        t.handle(&c, &ctx).await;
+
+        // It launches a sub-agent, which announces itself with a parent.
+        t.handle(
+            &ev(r#"{"type":"session.created","properties":{"sessionID":"ses_child","info":{"id":"ses_child","parentID":"ses_main"}}}"#),
+            &ctx,
+        )
+        .await;
+        let (a, b, c) = say("ses_child", "mc", "pc", "sub-agent chatter");
+        t.handle(&a, &ctx).await;
+        t.handle(&b, &ctx).await;
+        t.handle(&c, &ctx).await;
+
+        // The SUB-AGENT goes idle. The tab's turn is still running.
+        t.handle(
+            &ev(r#"{"type":"session.idle","properties":{"sessionID":"ses_child"}}"#),
+            &ctx,
+        )
+        .await;
+        assert!(
+            crate::delegation::testing::take(&worker).is_none(),
+            "a sub-agent's idle must not end the tab's turn"
+        );
+        // The same through the replacement signal, which a single turn can also
+        // raise — honouring one and not the other would leave the door open.
+        t.handle(
+            &ev(r#"{"type":"session.status","properties":{"sessionID":"ses_child","status":{"type":"idle"}}}"#),
+            &ctx,
+        )
+        .await;
+        assert!(
+            crate::delegation::testing::take(&worker).is_none(),
+            "…and not through `session.status` either"
+        );
+
+        // The tab's own answer, then its own idle.
+        let (a, b, c) = say("ses_main", "m2", "p2", "It exports three symbols.");
+        t.handle(&a, &ctx).await;
+        t.handle(&b, &ctx).await;
+        t.handle(&c, &ctx).await;
+        t.handle(
+            &ev(r#"{"type":"session.idle","properties":{"sessionID":"ses_main"}}"#),
+            &ctx,
+        )
+        .await;
+        assert_eq!(
+            crate::delegation::testing::take(&worker).as_deref(),
+            Some("It exports three symbols."),
+            "the completion is the MAIN session's last message"
+        );
+        assert!(
+            crate::delegation::testing::take(&worker).is_none(),
+            "filed exactly once"
+        );
+
+        // TTS unchanged: every message is still spoken as it completes.
+        let spoken: Vec<String> = std::iter::from_fn(|| match tts_rx.try_recv() {
+            Ok(TtsRequest::Synthesize { text, .. }) => Some(text),
+            _ => None,
+        })
+        .collect();
+        assert_eq!(spoken.len(), 3, "all three messages are spoken: {spoken:?}");
+        assert!(
+            spoken.iter().any(|t| t.contains("sub-agent chatter")),
+            "the sub-agent is still spoken — only the COMPLETION is filtered: {spoken:?}"
+        );
+    }
+
+    /// **A stale buffer never becomes the next turn's reply** (V39 review
+    /// R-3).
+    ///
+    /// `close_turn` leaves the buffer when a CHILD session idles — right, the
+    /// tab's turn is still running — but it also releases the Thinking edge, so
+    /// the next turn opened with the previous one's text still held. A turn
+    /// that then produced no text of its own (a tool-only turn, an interrupt)
+    /// filed the stale text on the tab's own idle, and a delegation submitted
+    /// in between received words the worker had said before it ever asked.
+    #[tokio::test]
+    async fn a_stale_buffer_never_becomes_the_next_turns_reply() {
+        let (ctx, mut tts_rx, _sig) = ctx_with("ai-stale-buffer");
+        let worker = TabId::from_str("ai-stale-buffer");
+        let _registry = crate::delegation::testing::lock_registry();
+        let mut t = Tracker::default();
+
+        // Turn 1, before any delegation exists: the tab says something.
+        t.handle(
+            &ev(r#"{"type":"message.updated","properties":{"sessionID":"ses_main","info":{"id":"m1","role":"assistant","time":{"created":1}}}}"#),
+            &ctx,
+        )
+        .await;
+        t.handle(
+            &ev(r#"{"type":"message.part.updated","properties":{"sessionID":"ses_main","part":{"id":"p1","type":"text","messageID":"m1","text":"An answer to an earlier question."}}}"#),
+            &ctx,
+        )
+        .await;
+        t.handle(
+            &ev(r#"{"type":"message.updated","properties":{"sessionID":"ses_main","info":{"id":"m1","role":"assistant","time":{"created":1,"completed":2}}}}"#),
+            &ctx,
+        )
+        .await;
+        // A sub-agent idles: the buffer is deliberately kept, the Thinking edge
+        // is released.
+        t.handle(
+            &ev(r#"{"type":"session.created","properties":{"sessionID":"ses_child","info":{"id":"ses_child","parentID":"ses_main"}}}"#),
+            &ctx,
+        )
+        .await;
+        t.handle(
+            &ev(r#"{"type":"session.idle","properties":{"sessionID":"ses_child"}}"#),
+            &ctx,
+        )
+        .await;
+
+        // NOW a delegation is submitted, and the next turn produces no text of
+        // its own — it only calls a tool.
+        crate::delegation::testing::claim_and_submit(&worker);
+        t.handle(
+            &ev(r#"{"type":"message.updated","properties":{"sessionID":"ses_main","info":{"id":"m2","role":"assistant","time":{"created":3}}}}"#),
+            &ctx,
+        )
+        .await;
+        t.handle(
+            &ev(r#"{"type":"message.part.updated","properties":{"sessionID":"ses_main","part":{"id":"p2","type":"tool","messageID":"m2","text":""}}}"#),
+            &ctx,
+        )
+        .await;
+        t.handle(
+            &ev(r#"{"type":"message.updated","properties":{"sessionID":"ses_main","info":{"id":"m2","role":"assistant","time":{"created":3,"completed":4}}}}"#),
+            &ctx,
+        )
+        .await;
+        t.handle(
+            &ev(r#"{"type":"session.idle","properties":{"sessionID":"ses_main"}}"#),
+            &ctx,
+        )
+        .await;
+
+        // V39 review R-9 files an EMPTY completion for a turn that said
+        // nothing — which is the honest answer here, and the assertion that
+        // matters is what it is NOT.
+        assert_eq!(
+            crate::delegation::testing::take(&worker).as_deref(),
+            Some(""),
+            "the previous turn's words are not this delegation's reply"
+        );
+        // TTS is untouched: turn 1 was spoken when it happened, turn 2 said
+        // nothing to speak.
+        let spoken: Vec<String> = std::iter::from_fn(|| match tts_rx.try_recv() {
+            Ok(TtsRequest::Synthesize { text, .. }) => Some(text),
+            _ => None,
+        })
+        .collect();
+        assert_eq!(spoken.len(), 1, "only the first turn had prose: {spoken:?}");
+    }
+
+    /// **A stream that closes mid-turn still hands over what the worker said**
+    /// (V39 review R-7).
+    ///
+    /// The close branch flushed (spoke) the remainder and released Thinking,
+    /// but the completion is filed by `close_turn`, which a closed stream never
+    /// reaches — and the Tracker is discarded on reconnect, so the answer went
+    /// with it and the driver waited out its deadline for text already on
+    /// screen.
+    #[tokio::test]
+    async fn a_closed_stream_files_the_turn_it_was_holding() {
+        let (ctx, mut tts_rx, _sig) = ctx_with("ai-stream-close");
+        let worker = TabId::from_str("ai-stream-close");
+        let _registry = crate::delegation::testing::lock_registry();
+        crate::delegation::testing::claim_and_submit(&worker);
+        let mut t = Tracker::default();
+
+        t.handle(
+            &ev(r#"{"type":"message.updated","properties":{"sessionID":"ses_main","info":{"id":"m1","role":"assistant","time":{"created":1}}}}"#),
+            &ctx,
+        )
+        .await;
+        t.handle(
+            &ev(r#"{"type":"message.part.updated","properties":{"sessionID":"ses_main","part":{"id":"p1","type":"text","messageID":"m1","text":"It exports three symbols."}}}"#),
+            &ctx,
+        )
+        .await;
+        t.handle(
+            &ev(r#"{"type":"message.updated","properties":{"sessionID":"ses_main","info":{"id":"m1","role":"assistant","time":{"created":1,"completed":2}}}}"#),
+            &ctx,
+        )
+        .await;
+        assert!(
+            crate::delegation::testing::take(&worker).is_none(),
+            "still mid-turn while the stream is alive"
+        );
+
+        // …and then the connection drops before any idle arrives.
+        t.close_stream(&ctx).await;
+        assert_eq!(
+            crate::delegation::testing::take(&worker).as_deref(),
+            Some("It exports three symbols."),
+            "a dropped connection must not swallow the worker's answer"
+        );
+        assert!(tts_rx.try_recv().is_ok(), "and it was spoken, as before");
+    }
+
+    /// **A turn that says nothing files an EMPTY completion** (V39 review R-9,
+    /// locked decision 13) — and an idle for a turn this tab never took files
+    /// nothing at all.
+    #[tokio::test]
+    async fn a_turn_that_says_nothing_files_an_empty_completion() {
+        let (ctx, _tts_rx, _sig) = ctx_with("ai-r9-oc");
+        let worker = TabId::from_str("ai-r9-oc");
+        let _registry = crate::delegation::testing::lock_registry();
+        crate::delegation::testing::claim_and_submit(&worker);
+        let mut t = Tracker::default();
+
+        // An idle with no turn behind it: nothing happened, nothing is claimed.
+        t.handle(
+            &ev(r#"{"type":"session.idle","properties":{"sessionID":"ses_main"}}"#),
+            &ctx,
+        )
+        .await;
+        assert!(
+            crate::delegation::testing::take(&worker).is_none(),
+            "an idle for a turn this tab never took is not `the worker said nothing`"
+        );
+
+        // A real turn that only calls a tool and then ends.
+        t.handle(
+            &ev(r#"{"type":"message.updated","properties":{"sessionID":"ses_main","info":{"id":"m1","role":"assistant","time":{"created":1}}}}"#),
+            &ctx,
+        )
+        .await;
+        t.handle(
+            &ev(r#"{"type":"message.part.updated","properties":{"sessionID":"ses_main","part":{"id":"p1","type":"tool","messageID":"m1","text":""}}}"#),
+            &ctx,
+        )
+        .await;
+        t.handle(
+            &ev(r#"{"type":"message.updated","properties":{"sessionID":"ses_main","info":{"id":"m1","role":"assistant","time":{"created":1,"completed":2}}}}"#),
+            &ctx,
+        )
+        .await;
+        t.handle(
+            &ev(r#"{"type":"session.idle","properties":{"sessionID":"ses_main"}}"#),
+            &ctx,
+        )
+        .await;
+        assert_eq!(
+            crate::delegation::testing::take(&worker).as_deref(),
+            Some(""),
+            "the driver is told `no text` now rather than `timeout` later"
+        );
+    }
+
+    /// The identity rule itself, including its two fail-open answers.
+    #[test]
+    fn only_a_non_child_session_can_end_the_tabs_turn() {
+        let t = Tracker::default();
+        // Nothing known yet: an unbound tab must not stop completing.
+        assert!(t.is_main_session(Some("ses_main")));
+        assert!(t.is_main_session(None), "no sessionID at all is not foreign");
+
+        {
+            let mut facts = lock_sessions(&t.sessions);
+            facts.main = Some("ses_main".to_string());
+            facts.children.insert("ses_child".to_string());
+        }
+        assert!(t.is_main_session(Some("ses_main")));
+        assert!(!t.is_main_session(Some("ses_child")), "a known child never ends the turn");
+        assert!(
+            !t.is_main_session(Some("ses_other")),
+            "a session the tab is not bound to is not the tab's turn"
+        );
+        assert!(t.is_main_session(None), "still fail-open with facts known");
     }
 
     #[tokio::test]

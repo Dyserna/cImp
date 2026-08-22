@@ -20,6 +20,11 @@
 #       message.content[].text -> body (on both text blocks)
 #       degraded default: `assistant_texts` skips the block; empty Vec, and the
 #       tab simply goes mute on any tab with no `Stop` push (V35 Phase L)
+#   stop-reason-renamed.jsonl               claude.transcript.stop_reason
+#       message.stop_reason -> stopReason (on both lines)
+#       degraded default: `is_turn_end` answers false for EVERY line, so the
+#       fallback reader never files a delegation completion and the driver
+#       waits out its whole deadline for a turn that ended minutes ago
 #   statusline-renamed-context-window.json  claude.statusline.stdin
 #       context_window -> contextWindow (the whole block; live-verify recipe 3)
 #       degraded default: `extract_context` -> None, blank context bar, and a

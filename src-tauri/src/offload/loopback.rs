@@ -1315,6 +1315,15 @@ async fn handle_conn(
         ("POST", "/session/assistant_text") => handle_session_assistant_text(&mut stream, &app, &req).await,
         ("POST", "/session/tool_result") => handle_session_tool_result(&mut stream, &app, &req).await,
         ("POST", "/session/subagent") => handle_session_subagent(&mut stream, &app, &req).await,
+        // V40 Phase D (locked decisions 18 and 30): the neutral activity edges.
+        // Phase C declared them; these are the producers, and what makes them
+        // `live` in `chp::EVENTS`. A harness that reports its own turn
+        // boundaries posts here instead of leaving core to infer them from the
+        // terminal — which is the same fact `ActivitySource::OutOfBand`
+        // declares at L1, arriving over the wire instead.
+        ("POST", "/session/output_started") => handle_harness_output(&mut stream, &app, &req, true).await,
+        ("POST", "/session/output_stopped") => handle_harness_output(&mut stream, &app, &req, false).await,
+        ("POST", "/session/subagents_active") => handle_subagents_active(&mut stream, &app, &req).await,
         // NOTE (#45): there is deliberately no `POST /latch/override`. The
         // manual override is a capability GRANT, and the bearer token gating
         // this listener is readable by every process running as the user, so an
@@ -1780,11 +1789,10 @@ pub(crate) fn is_configured_tab(settings: &crate::settings::Settings, agent: &'s
 
 /// Every configured AI tab's id, in settings order — **every consumer's**.
 ///
-/// Two callers, and neither is the latch: [`names_a_configured_ai_tab`] (a
-/// collision check across the whole id space) and [`is_configured_tab`]'s
-/// availability floor (whose condition is "settings are unreadable", not
-/// "this consumer has no tabs"). Identity checks use
-/// [`ai_tab_ids_for`] instead.
+/// One caller, and it is not the latch: [`is_configured_tab`]'s availability
+/// floor, whose condition is "settings are unreadable", not "this consumer has
+/// no tabs". Identity checks use [`ai_tab_ids_for`] instead. (The second
+/// caller, the C-2 collision check, went with V40 Phase D's key spaces.)
 fn ai_tab_ids(settings: &crate::settings::Settings) -> impl Iterator<Item = &str> {
     settings.tabs.iter().filter_map(|t| match t {
         crate::settings::TabConfig::AiTool(c) => Some(c.id.as_str()),
@@ -1816,24 +1824,12 @@ fn names_a_configured_ai_tab_for(
     ai_tab_ids_for(settings, agent).any(|t| t == id)
 }
 
-/// Whether `id` **exactly** names a configured AI tab of ANY consumer —
-/// [`is_configured_tab`] without its availability floor and without its
-/// consumer scope.
-///
-/// The floor is an availability floor for the *latch* (a gate that rejects
-/// every id before settings load would refuse real tool calls). It is the wrong
-/// polarity for a caller that must be REFUSED for naming a tab, where "no tabs
-/// configured yet" must mean "this string collides with nothing" — so that
-/// caller gets this predicate instead of a negated one. See
-/// [`mark_live_session_from_event`], its only consumer.
-///
-/// V33 C5 left the consumer scope off this one deliberately, for the same
-/// polarity reason: it asks "does this session id collide with a TAB id", and a
-/// collision is a collision whichever consumer owns the tab. Narrowing it to one
-/// consumer would let an OpenCode session id equal to a Claude tab id through.
-fn names_a_configured_ai_tab(settings: &crate::settings::Settings, id: &str) -> bool {
-    ai_tab_ids(settings).any(|t| t == id)
-}
+// `names_a_configured_ai_tab` lived here: "does this session id collide with a
+// configured TAB id", the C-2 guard on `/memory/event`'s registry writes. V40
+// Phase D deleted it with the collision it guarded — the live-session registry
+// has two key spaces now (locked decision 20), a body-supplied id goes into the
+// session space, and no string can be in both. See
+// `mark_live_session_from_body`.
 
 /// Which of three cases a request body's `(agent, tab)` falls into, decided
 /// **without** the `AppHandle` [`latch_scope`]'s session lookup needs.
@@ -6950,6 +6946,149 @@ struct SessionSubagentBody {
     active: bool,
 }
 
+/// A `POST /session/output_started` or `/session/output_stopped` body — one
+/// turn boundary, reported by the harness itself.
+///
+/// Identity only: the edge is the message. Which direction it is comes from the
+/// ROUTE rather than a body field, for the same reason the two `permission.*`
+/// events are two routes — an edge whose direction is a payload value can be
+/// dropped by a lenient parser and read as its opposite.
+#[derive(Deserialize)]
+struct HarnessOutputBody {
+    #[serde(default)]
+    agent: Option<String>,
+    #[serde(default)]
+    tab: Option<String>,
+}
+
+/// A `POST /session/subagents_active` body — the sub-agent COUNT's zero
+/// boundary, as the harness sees it.
+///
+/// Distinct from `session.subagent` (`/session/subagent`), which reports one
+/// sub-agent's lifecycle and lets core derive the edge: a harness that already
+/// knows "none running / some running" posts this and core keeps no set for it.
+#[derive(Deserialize)]
+struct SubagentsActiveBody {
+    #[serde(default)]
+    agent: Option<String>,
+    #[serde(default)]
+    tab: Option<String>,
+    #[serde(default)]
+    active: bool,
+}
+
+/// `POST /session/output_{started,stopped}`: a pushed turn boundary.
+///
+/// **Gated on the tab's own hello** (`chp::served`), exactly as every other
+/// pushed core is, and here that gate is load-bearing for a reason worth
+/// stating: core may ALSO be inferring this tab's activity from its terminal
+/// (`ActivitySource::TuiMarkers`). Two producers for one avatar is the
+/// double-speak V35 Phase L's arbitration exists to prevent, so a harness that
+/// pushes these edges must declare them in its hello — at which point its
+/// plugin declares `ActivitySource::OutOfBand` and the TUI heuristic never runs
+/// for its tabs.
+async fn handle_harness_output(
+    stream: &mut TcpStream,
+    app: &AppHandle,
+    req: &Request,
+    started: bool,
+) -> AppResult<()> {
+    let ok = RunResult {
+        ok: true,
+        text: None,
+        error: None,
+    };
+    let Ok(body) = serde_json::from_slice::<HarnessOutputBody>(&req.body) else {
+        return write_json(stream, 400, &bad_request("bad request body")).await;
+    };
+    if let Some((agent, tab)) =
+        session_push_identity(app, body.agent.as_deref(), body.tab.as_deref())
+    {
+        harness_output_core(app, agent, &tab, started);
+    }
+    write_json(stream, 200, &ok).await
+}
+
+/// Apply one pushed turn boundary — the `harness.output_*` core.
+///
+/// Returns whether it acted, the same shape the other pushed cores answer with
+/// so the arbitration tests can assert an exact complement.
+pub(crate) fn harness_output_core(
+    app: &AppHandle,
+    agent: &'static str,
+    tab: &str,
+    started: bool,
+) -> bool {
+    let event = if started {
+        crate::harness::chp::EV_HARNESS_OUTPUT_STARTED
+    } else {
+        crate::harness::chp::EV_HARNESS_OUTPUT_STOPPED
+    };
+    if !crate::harness::chp::served(agent, tab, event) {
+        return false;
+    }
+    let Some(state) = app.try_state::<crate::ipc::AppState>() else {
+        return false;
+    };
+    let tab = crate::state::TabId::from_str(tab);
+    let signal = if started {
+        crate::state::StateSignal::HarnessOutputStarted { tab }
+    } else {
+        crate::state::StateSignal::HarnessOutputStopped { tab }
+    };
+    let _ = state.state_signals.try_send(signal);
+    true
+}
+
+/// `POST /session/subagents_active`: the pushed zero-boundary of a tab's
+/// sub-agent count.
+async fn handle_subagents_active(
+    stream: &mut TcpStream,
+    app: &AppHandle,
+    req: &Request,
+) -> AppResult<()> {
+    let ok = RunResult {
+        ok: true,
+        text: None,
+        error: None,
+    };
+    let Ok(body) = serde_json::from_slice::<SubagentsActiveBody>(&req.body) else {
+        return write_json(stream, 400, &bad_request("bad request body")).await;
+    };
+    if let Some((agent, tab)) =
+        session_push_identity(app, body.agent.as_deref(), body.tab.as_deref())
+    {
+        subagents_active_core(app, agent, &tab, body.active);
+    }
+    write_json(stream, 200, &ok).await
+}
+
+/// Apply one pushed sub-agent-count edge — the `subagents.active` core.
+///
+/// Emits the same `SubagentsActiveChanged` signal [`subagent_core`] derives
+/// from individual lifecycles, so the state manager sees one signal shape
+/// whichever path produced it.
+pub(crate) fn subagents_active_core(
+    app: &AppHandle,
+    agent: &'static str,
+    tab: &str,
+    active: bool,
+) -> bool {
+    if !crate::harness::chp::served(agent, tab, crate::harness::chp::EV_SUBAGENTS_ACTIVE) {
+        return false;
+    }
+    let Some(state) = app.try_state::<crate::ipc::AppState>() else {
+        return false;
+    };
+    let _ = state
+        .state_signals
+        .try_send(crate::state::StateSignal::SubagentsActiveChanged {
+            tab: crate::state::TabId::from_str(tab),
+            active,
+        });
+    true
+}
+
 /// Speak one pushed assistant message — the `assistant_text` core.
 ///
 /// Returns whether it acted, which is what the arbitration tests assert on:
@@ -7055,7 +7194,7 @@ static PUSHED_SUBAGENTS: OnceLock<Mutex<SubagentSets>> = OnceLock::new();
 
 /// Apply one pushed sub-agent lifecycle edge — the `session.subagent` core.
 ///
-/// Emits `StateSignal::AgentsActiveChanged` on the empty↔non-empty EDGE only,
+/// Emits `StateSignal::SubagentsActiveChanged` on the empty↔non-empty EDGE only,
 /// exactly as `harness::claude::read::update_agents` does, so the state manager
 /// sees the same signal shape whichever path produced it.
 pub(crate) fn subagent_core(
@@ -7094,7 +7233,7 @@ pub(crate) fn subagent_core(
     if let Some(state) = app.try_state::<crate::ipc::AppState>() {
         let _ = state
             .state_signals
-            .try_send(crate::state::StateSignal::AgentsActiveChanged {
+            .try_send(crate::state::StateSignal::SubagentsActiveChanged {
                 tab: crate::state::TabId::from_str(tab),
                 active: now_active,
             });
@@ -7702,7 +7841,7 @@ pub(crate) fn permission_tab_candidates(
     };
     let sessions: Vec<(String, String)> = app
         .try_state::<Arc<crate::graph::GraphService>>()
-        .map(|g| g.live_claude_sessions())
+        .map(|g| g.live_sessions_for(harness))
         .unwrap_or_default();
     crate::tabs::harness_tab_dirs(&state.settings.current(), &state.launch.cwd, harness)
         .into_iter()
@@ -8061,75 +8200,52 @@ fn tool_event_parent(body: &MemoryEventBody) -> Option<String> {
         .filter(|p| !p.is_empty())
         .map(str::to_string)
 }
-
-/// V32 Phase F, C-2 token variant (2026-08-07 review): mark `session` live from
-/// a `/memory/event` body, refusing any id that collides with a configured AI
-/// tab id.
+/// **The live-session write a `/memory/event` body asks for** (V40 Phase D,
+/// locked decision 20).
 ///
-/// # Why the guard exists
+/// The body names a SESSION, so the write lands in the session key space —
+/// where it cannot name a cImp tab. That is the whole of the C-2 fix now: it
+/// used to be `mark_live_session_from_event`, which refused any key that
+/// exactly matched a configured AI tab id, because one map held both key spaces
+/// and a POST could therefore repoint a running tab's session (flapping the
+/// taint latch clear in a loop, with the real tap's re-stamp producing a second
+/// rotation that helped the attacker). A check beside the write has to keep a
+/// list in step; separate spaces make the collision unrepresentable.
 ///
-/// `live_sessions` is ONE map with TWO key spaces: the Claude tap keys it by
-/// **tab id** (`harness/claude/read.rs`), and OpenCode's loopback path keys it by the
-/// **reporting session id**, because OpenCode has no tab binding here (V24
-/// Phase B). Nothing kept them apart. `handle_memory_event` derives all three
-/// of its keys from request-body strings, with `agent` defaulting to
-/// `"opencode"` and no validation of any kind — #45's check is on the *read*
-/// side (`latch_scope`), not here — so an authenticated POST could write
-/// `live_sessions["claude-1"] = <attacker string>` and repoint a real tab's
-/// session identity.
-///
-/// Two things then follow, and the second is the sharp one:
-/// - V28 memory scoping is corrupted: `/graph_run`'s `context_*` calls for that
-///   tab resolve to a session the tab never had.
-/// - [`TabLatch::observe`] reads that session through the same lookup, sees a
-///   *changed* id, and treats it as a new conversation — clearing the latch,
-///   the budget **and `contaminated`**, which locked decision 15 says only a
-///   genuinely new conversation may do. The real tap re-stamps the true id
-///   within its 200 ms poll, producing a SECOND rotation, so the race helps the
-///   attacker: POST in a loop and the tab flaps clean.
-///
-/// # Why rejection, and why exact-match
-///
-/// Namespacing the OpenCode key space would work equally well and is the other
-/// option the review named, but it would rewrite the keys V24's usage/permission
-/// consumers already read (`live_claude_sessions`, `compute_active_session_ids`)
-/// for a hazard that only exists at the collision. Rejecting the collision
-/// leaves every legitimate key untouched: a real OpenCode session id is a UUID,
-/// and a cImp tab id is config-derived (`claude`, `opencode-2`), so the two
-/// never legitimately meet.
-///
-/// Exact-match against the configured list, with **no** empty-list escape (see
-/// [`names_a_configured_ai_tab`]): "settings are not loaded yet" must not be a
-/// window in which every string is refused, and a string that collides with
-/// nothing is not an attack.
-///
-/// This closes the token-gated half of C-2 only. The filesystem half — a
-/// zero-byte `.jsonl` appearing in the transcript dir — is closed in
-/// `harness/claude/read.rs` by requiring observed growth before a rotated file is marked
-/// live. **Neither alone is sufficient**: they are two independent writers into
-/// the same registry.
+/// A harness whose identity is TAB-keyed ([`SessionKey::Tab`] — its session is
+/// bound by cImp's own reader) gets **no registry write from a request body at
+/// all**: its live session is not something a wire value may claim. An
+/// unregistered `agent` likewise writes nothing — fail closed.
 ///
 /// `mark` is the registry write, taken as a parameter rather than reached
-/// through a `GraphService` this crate has no `AppHandle` to build: the point of
-/// #48's `only_configured_ai_tab_ids_can_ever_key_a_latch` rewrite is that a
-/// bound asserted *beside* its enforcement point survives deleting the call, so
-/// the test drives this function and observes whether the write happened.
-fn mark_live_session_from_event(
-    mark: impl FnOnce(&str),
-    settings: &crate::settings::Settings,
+/// through a `GraphService` this crate has no `AppHandle` to build — the same
+/// reasoning #48 gave for the function this replaces: a bound asserted *beside*
+/// its enforcement point survives deleting the call, so the test drives this
+/// function and observes whether (and into which space) the write happened.
+fn mark_live_session_from_body(
+    mark: impl FnOnce(crate::harness::plugin::SessionKey, &str),
     agent: &str,
     session: &str,
 ) {
-    if names_a_configured_ai_tab(settings, session) {
-        warn!(
+    let space = crate::harness::HarnessId::from_id(agent)
+        .and_then(|h| h.plugin())
+        .map(|p| p.session_key_space());
+    match space {
+        Some(crate::harness::plugin::SessionKey::Session) => {
+            mark(crate::harness::plugin::SessionKey::Session, session);
+        }
+        Some(crate::harness::plugin::SessionKey::Tab) => debug!(
             target: "offload",
             agent,
-            key = %session,
-            "loopback: /memory/event refused — the session id collides with a configured tab id"
-        );
-        return;
+            "loopback: /memory/event named a session for a tab-keyed harness; its reader owns \
+             that binding, so nothing is written"
+        ),
+        None => warn!(
+            target: "offload",
+            agent,
+            "loopback: /memory/event from an unregistered harness; no live-session write"
+        ),
     }
-    mark(session);
 }
 
 /// `POST /memory/event`: classify an agent tool call and record it as a memory
@@ -8167,10 +8283,11 @@ async fn handle_memory_event(
         .agent
         .as_deref()
         .unwrap_or_else(|| crate::harness::ingress::wire_default(MEMORY_EVENT_ROUTE).token());
-    // C-2 (2026-08-07 review): ONE settings read for the whole request, feeding
-    // every `mark_live_session` below through `mark_live_session_from_event` —
-    // see its docs for why a body-supplied key must not be able to name a tab.
-    let settings = live_settings(app);
+    // C-2 (2026-08-07 review) used to read settings here, once for the whole
+    // request, so the three live-session writes below could refuse a key that
+    // named a configured tab. V40 Phase D removed the read with the check: the
+    // registry has two key spaces now and `mark_live_session_from_body` decides
+    // which one a body-supplied id lands in, which needs no settings at all.
 
     // V24 Phase F: the usage arm — a completed assistant turn's real token
     // totals (OpenCode's only exact-token ingress; see the spike note atop
@@ -8186,12 +8303,7 @@ async fn handle_memory_event(
             // Mark the SAME id live: the target is the session row that exists
             // / gets the spend attributed (the parent when a child reports),
             // so that's the row the Sessions list should flag active.
-            mark_live_session_from_event(
-                |k| graph.mark_live_session(k, agent, k),
-                &settings,
-                agent,
-                &target,
-            );
+            mark_live_session_from_body(|space, k| graph.mark_live_session(space, k, agent, k), agent, &target);
         }
         return write_json(stream, 200, &ok).await;
     }
@@ -8210,12 +8322,7 @@ async fn handle_memory_event(
     // still reaches the parent via the usage arm above; mark the PARENT live so
     // the sub-agent's activity keeps the parent's row active.
     if let Some(parent) = tool_event_parent(&body) {
-        mark_live_session_from_event(
-            |k| graph.mark_live_session(k, agent, k),
-            &settings,
-            agent,
-            &parent,
-        );
+        mark_live_session_from_body(|space, k| graph.mark_live_session(space, k, agent, k), agent, &parent);
         return write_json(stream, 200, &ok).await;
     }
 
@@ -8291,12 +8398,7 @@ async fn handle_memory_event(
     // TTL (there is no cancel signal to clear it — see the C3 spike note atop
     // `harness/opencode/read.rs`). C-2: which is exactly why the key must not be allowed
     // to name a TAB — the other half of the same map.
-    mark_live_session_from_event(
-        |k| graph.mark_live_session(k, agent, k),
-        &settings,
-        agent,
-        &body.session_id,
-    );
+    mark_live_session_from_body(|space, k| graph.mark_live_session(space, k, agent, k), agent, &body.session_id);
 
     write_json(stream, 200, &ok).await
 }
@@ -10523,6 +10625,9 @@ mod tests {
                     | "/session/assistant_text"
                     | "/session/tool_result"
                     | "/session/subagent"
+                    | "/session/output_started"
+                    | "/session/output_stopped"
+                    | "/session/subagents_active"
             );
             assert_eq!(
                 observed, expected,
@@ -14674,68 +14779,62 @@ mod tests {
         );
     }
 
-    /// **C-2, token variant.** `/memory/event`'s three `mark_live_session`
-    /// calls key the live-session registry on body-supplied strings, with
-    /// `agent` defaulting to `"opencode"` and no validation — the #45 check is
-    /// on the read side only. One map, two key spaces: the Claude tap keys by
-    /// TAB id, OpenCode's loopback path keys by SESSION id. A POST naming a
-    /// configured tab id therefore repointed that tab's session and flapped the
-    /// latch clear in a loop — and the real tap re-stamping the true id within
-    /// 200 ms produced a *second* rotation, so the race helped the attacker.
+    /// **C-2, token variant — closed by construction since V40 Phase D.**
     ///
-    /// Asserted **through** [`mark_live_session_from_event`] — the function the
-    /// handler's three sites call — by observing whether the registry write
-    /// happens, rather than by calling the predicate beside it. Deleting the
-    /// check from that function fails this test.
+    /// `/memory/event`'s three registry writes key on body-supplied strings,
+    /// with `agent` defaulting and no validation. That used to matter because
+    /// the live-session registry was ONE map holding two key spaces: a
+    /// tab-keyed harness's reader wrote the tab id, this route wrote a session
+    /// id. A POST naming a configured tab id therefore repointed that tab's
+    /// session and flapped the latch clear in a loop — and the real tap
+    /// re-stamping the true id within 200 ms produced a *second* rotation, so
+    /// the race helped the attacker. It was closed by refusing any key that
+    /// named a configured tab.
+    ///
+    /// The spaces are separate now (locked decision 20), so the collision
+    /// cannot be expressed and there is no list to keep in step. Asserted
+    /// **through** [`mark_live_session_from_body`] by observing what it would
+    /// write: deleting the key-space decision from that function fails this
+    /// test.
     #[test]
-    fn a_memory_event_cannot_key_the_registry_with_a_tab_id() {
-        let s = settings_with_tabs(&["claude", "opencode-2"]);
-        // Drive the real function; record what it would have written.
-        let written = |settings: &crate::settings::Settings, key: &str| {
-            let mut out: Option<String> = None;
-            mark_live_session_from_event(|k| out = Some(k.to_string()), settings, "opencode", key);
+    fn a_memory_event_can_only_key_the_session_space() {
+        let written = |agent: &str, key: &str| {
+            let mut out: Option<(crate::harness::plugin::SessionKey, String)> = None;
+            mark_live_session_from_body(
+                |space, k| out = Some((space, k.to_string())),
+                agent,
+                key,
+            );
             out
         };
-        for forged in ["claude", "opencode-2"] {
-            assert_eq!(
-                written(&s, forged),
-                None,
-                "{forged:?} names a tab, so /memory/event must not key the registry with it"
-            );
-        }
-        // Every legitimate key still gets through: OpenCode session ids are
-        // UUIDs, and near-misses of a tab id are not tab ids.
-        for real in [
+        // A session-keyed harness writes — including for a string that names a
+        // configured tab, which is now harmless: it lands in the session space,
+        // and every tab-keyed reader looks in the other one.
+        for key in [
             "ses_01JQ8Z2W6R3K4M5N6P7Q8R9S",
             "b3f1c2d4-5e6f-4708-8910-1112131415",
-            "claude-1",
-            "Claude",
-            " claude",
+            "claude",
+            "opencode-2",
             "",
         ] {
-            assert_eq!(written(&s, real), Some(real.to_string()), "{real:?}");
+            assert_eq!(
+                written("opencode", key),
+                Some((crate::harness::plugin::SessionKey::Session, key.to_string())),
+                "{key:?} must key the SESSION space and nothing else"
+            );
         }
-        // The empty-list escape is deliberately NOT inherited: before settings
-        // load, "this string collides with nothing" is the honest answer, and
-        // refusing every key in that window would drop real OpenCode telemetry.
-        let empty = crate::settings::Settings::default();
+        // A tab-keyed harness's live session is bound by cImp's own reader, so
+        // a request body may not claim it at all.
         assert_eq!(
-            written(&empty, "claude"),
-            Some("claude".to_string()),
-            "the availability floor belongs to the latch, not to this route"
+            written("claude", "ses_whatever"),
+            None,
+            "a tab-keyed harness's binding is its reader's, never a POST body's"
         );
-        assert!(
-            is_configured_tab(&empty, "claude", "claude"),
-            "…and the latch's own predicate keeps it"
-        );
+        // An unregistered agent writes nothing — fail closed.
+        assert_eq!(written("not-a-harness", "ses_x"), None);
+        assert_eq!(written("", "ses_x"), None);
     }
 
-    /// **The override's audit row, which had no coverage at all** — every other
-    /// Phase F test calls `apply_override` directly and stops before the row.
-    /// The row is the artifact an incident review reads, so its three
-    /// load-bearing facts are pinned here: the action, the prior latch (because
-    /// "restored full access" from `external` means something very different
-    /// from `local`), and that the override did NOT clear contamination.
     #[test]
     fn an_override_row_records_the_action_the_prior_latch_and_the_surviving_taint() {
         let reg = LatchRegistry::default();
@@ -16425,6 +16524,30 @@ mod tests {
             "POST",
             "handle_session_tool_result",
             Containment::NoRegistry("receives one tool result's SIZE; returns nothing"),
+        ),
+        route(
+            "/session/output_started",
+            "POST",
+            "handle_harness_output",
+            Containment::NoRegistry(
+                "receives a turn boundary; returns nothing and grants no capability — the tab \
+                 must have declared the event in its hello for it to reach the avatar at all",
+            ),
+        ),
+        route(
+            "/session/output_stopped",
+            "POST",
+            "handle_harness_output",
+            Containment::NoRegistry(
+                "receives a turn boundary; returns nothing and grants no capability — the tab \
+                 must have declared the event in its hello for it to reach the avatar at all",
+            ),
+        ),
+        route(
+            "/session/subagents_active",
+            "POST",
+            "handle_subagents_active",
+            Containment::NoRegistry("receives a sub-agent COUNT edge; returns nothing"),
         ),
         route(
             "/session/subagent",

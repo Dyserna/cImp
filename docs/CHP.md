@@ -506,10 +506,18 @@ not broken" means here, and OpenCode is the standing example (§ 4.6).
 reserved *permanently until upstream changes*, for the reason § 4.6 gives: no
 hook payload carries token counts or a context window.
 
-**Optional, reserved (V40 Phase C, `chp = 2`):** `harness.output_started`
+**Optional, live since V40 Phase D (`chp = 2`):** `harness.output_started`
 (`POST /session/output_started`), `harness.output_stopped`
-(`POST /session/output_stopped`), `subagents.active`
-(`POST /session/subagents_active`), `permission.detected`
+(`POST /session/output_stopped`) and `subagents.active`
+(`POST /session/subagents_active`) — the activity edges. A harness that knows
+its own turn boundaries POSTs them instead of leaving cImp to infer them from
+the terminal, and each lands on the same core signal an in-process reader emits.
+All three are gated on the tab's own hello: pushing an edge a tab never declared
+does nothing, which is what keeps a pushing tab and cImp's TUI-marker heuristic
+from driving one avatar at the same time (§ 4.6's arbitration rule, applied to
+activity).
+
+**Optional, reserved (V40 Phase C, `chp = 2`):** `permission.detected`
 (`POST /permission/detected`), `permission.resolved`
 (`POST /permission/resolved`), `turn.usage` (`POST /session/turn_usage`) and
 `drift` (`POST /activity/drift`).
@@ -519,16 +527,17 @@ harness's:
 
 | Event | What it replaces |
 |---|---|
-| `harness.output_started` / `harness.output_stopped` | `StateSignal::ClaudeOutputStarted` / `…Stopped` — the core activity signal vocabulary, named after one product. The TUI-marker heuristic that produces it today stays as a declared `ActivitySource` (V40 locked decision 18). |
-| `subagents.active` | `AgentsActiveChanged`, documented as "the count of in-flight `Task` sub-agents … emitted by the transcript tail" — a Claude mechanism stated as a core signal. |
+| `harness.output_started` / `harness.output_stopped` | `StateSignal::ClaudeOutputStarted` / `…Stopped` — the core activity signal vocabulary, named after one product. The TUI-marker heuristic that produces it today stays as a declared `ActivitySource` (V40 locked decision 18). | **Renamed `HarnessOutput*` and served over the wire since Phase D.**
+| `subagents.active` | `AgentsActiveChanged`, documented as "the count of in-flight `Task` sub-agents … emitted by the transcript tail" — a Claude mechanism stated as a core signal. | **Renamed `SubagentsActiveChanged` and served since Phase D** — distinct from `session.subagent`, which reports one sub-agent's lifecycle and lets cImp derive the edge.
 | `permission.detected` / `permission.resolved` | The neutral half of prompt detection. Which notification type or TUI footer means a prompt is on screen is the harness's own grammar (`harness/<id>/prompts.rs`, `harness/claude/hook.rs`); what reaches core is an edge and a tab. `permission.event` above is unchanged and stays — it is the legacy `--notify-hook` transport, a Claude payload posted verbatim. |
 | `turn.usage` | One turn's reading, carrying the neutral `QuotaWindow` / `TokenKinds` / `TurnOrigin` types. Distinct from `session.usage`, which is the whole-session roll-up. |
 | `drift` | Contract drift a *reader* reports — today an Activity row core writes on the reader's behalf. |
 
-**Nothing serves them yet, and that is the `live` column doing its job.** The
-vocabulary is what L3 gates against, so it is one list rather than a live half
-plus a design document; V40 Phase D wires the producers. `is_push_route` answers
-`false` for every one of these routes, so a POST to one is a 404 today.
+**The `live` column is what tells the two apart.** The vocabulary is what L3
+gates against, so it is one list rather than a live half plus a design document.
+V40 Phase D wired the three activity producers; `is_push_route` answers `true`
+for their routes and `false` for the remaining four, so a POST to one of those is
+still a 404.
 
 ### Why `chp` went to 2
 

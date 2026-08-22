@@ -126,16 +126,18 @@ pub const EV_SESSION_CONTEXT: &str = "session.context";
 /// **Additive only, and reserved to a one.** Every one of these names something
 /// core already knows but only in one harness's vocabulary: the activity edges
 /// are `StateSignal::ClaudeOutput*` (Phase D renames them), the sub-agent count
-/// is `AgentsActiveChanged`, the permission edges are the neutral half of what
+/// is `SubagentsActiveChanged`, the permission edges are the neutral half of what
 /// `harness/claude/hook.rs` classifies today, `turn.usage` is the reading
 /// `usage/` + `statusline/` produce from a Claude-shaped payload, and `drift` is
 /// what a reader reports when a contract moved under it.
 ///
-/// They are declared here **before** their producers exist on purpose, and that
-/// is what the `live` column is for: the vocabulary is the thing L3 gates
-/// against, so it has to be one list rather than a live half plus a design doc.
-/// Phase D wires the producers; nothing in this build posts to these routes and
-/// `is_push_route` answers `false` for all of them.
+/// They were declared **before** their producers existed on purpose, and that is
+/// what the `live` column is for: the vocabulary is the thing L3 gates against,
+/// so it has to be one list rather than a live half plus a design doc. **Phase D
+/// wired the first three** — the activity edges — and they are live: a harness
+/// that reports its own turn boundaries POSTs them, `is_push_route` answers
+/// `true`, and the same `StateSignal` reaches the avatar as from an in-process
+/// reader. The remaining four are still reserved and a POST to one is a 404.
 pub const EV_HARNESS_OUTPUT_STARTED: &str = "harness.output_started";
 pub const EV_HARNESS_OUTPUT_STOPPED: &str = "harness.output_stopped";
 pub const EV_SUBAGENTS_ACTIVE: &str = "subagents.active";
@@ -192,23 +194,24 @@ pub const EVENTS: &[Event] = &[
     ev(EV_SESSION_CONTEXT, false, "/session/context", false),
     // ── V40 Phase C: the neutral vocabulary (locked decision 30) ────────────
     //
-    // Reserved: declared, documented, and not yet served. Each replaces a
-    // harness-named signal core currently speaks (`ClaudeOutputStarted`,
-    // `AgentsActiveChanged`) or a reading it currently derives from one
-    // harness's payload shape.
+    // Phase C declared them; **Phase D wired the producers for the first
+    // three**, so those are LIVE: `offload::loopback` serves the routes, each
+    // gated on the pushing tab's own hello, and each lands on the same
+    // `StateSignal` the in-process readers emit. The rest stay reserved —
+    // declared, documented, and not yet served.
     ev(
         EV_HARNESS_OUTPUT_STARTED,
         false,
         "/session/output_started",
-        false,
+        true,
     ),
     ev(
         EV_HARNESS_OUTPUT_STOPPED,
         false,
         "/session/output_stopped",
-        false,
+        true,
     ),
-    ev(EV_SUBAGENTS_ACTIVE, false, "/session/subagents_active", false),
+    ev(EV_SUBAGENTS_ACTIVE, false, "/session/subagents_active", true),
     // The neutral half of prompt detection: what a harness reports is an EDGE,
     // and which of its notification types or footers means one is its own
     // business (locked decision 21). `permission.event` above stays — it is the

@@ -3684,10 +3684,11 @@ impl GraphIndex {
 
     /// Distinct model ids across `session_id`'s turns, descending by the
     /// total tokens (input + output + cache) attributed to each. Turns with
-    /// no model recorded are skipped, as is `"<synthetic>"` — Claude Code
-    /// stamps that pseudo-model on locally fabricated messages (errors,
-    /// interrupts) and it would pollute a "which model ran this session"
-    /// readout.
+    /// no model recorded are skipped, as are the harnesses' declared
+    /// pseudo-models — a harness stamps one on locally fabricated messages
+    /// (errors, interrupts) and it would pollute a "which model ran this
+    /// session" readout. V40 Phase D: the list comes from
+    /// [`crate::harness::is_model_sentinel`], not from a literal here.
     pub fn usage_session_models(&self, session_id: &str) -> AppResult<Vec<String>> {
         let mut p = BTreeMap::new();
         p.insert("sid".to_string(), DataValue::Str(session_id.into()));
@@ -3705,7 +3706,7 @@ impl GraphIndex {
             let Some(model) = cell_str_opt(r, 1) else {
                 continue;
             };
-            if model == "<synthetic>" {
+            if crate::harness::is_model_sentinel(&model) {
                 continue;
             }
             let toks: u64 = (2..=5).map(|i| cell_i64(r, i).max(0) as u64).sum();
@@ -3722,7 +3723,7 @@ impl GraphIndex {
     /// [`Self::usage_session_models`] but keeps the sums it discards — the Cost
     /// card prices each model in a mixed-model session separately, and the
     /// `SessionUsageRow` cost badge sums per-model auto-matched rates. Same
-    /// `"<synthetic>"` exclusion and no-model skip as `usage_session_models`,
+    /// sentinel exclusion and no-model skip as `usage_session_models`,
     /// and the same `seq`-keeps-rows-distinct reasoning as
     /// [`Self::usage_session_totals`].
     pub fn usage_session_model_totals(&self, session_id: &str) -> AppResult<Vec<ModelUsage>> {
@@ -3744,7 +3745,7 @@ impl GraphIndex {
             let Some(model) = cell_str_opt(r, 1) else {
                 continue;
             };
-            if model == "<synthetic>" {
+            if crate::harness::is_model_sentinel(&model) {
                 continue;
             }
             let in_tok = cell_i64(r, 2).max(0) as u64;
@@ -4194,31 +4195,39 @@ impl GraphIndex {
         Ok(Some((pairs, window.len() as u64)))
     }
 
-    /// V16 Feature 2 (`drift.usage_fields_gone.v1` signals): Claude sessions
-    /// with at least one message-level `usage_stat` row, and how many of
-    /// those carry ZERO tokens across every such row (in/out/cache all 0 —
-    /// the transcript's `message.usage` shape changed under the tap while
-    /// messages kept flowing). Sessions with no usage rows at all appear in
-    /// NEITHER count: a session that never spoke isn't evidence, and
-    /// counting it in the denominator would let one idle session suppress
-    /// the canary (the advisor fires on `tokenless == claude_sessions`).
+    /// V16 Feature 2 (`drift.usage_fields_gone.v1` signals): **`agent`'s**
+    /// sessions with at least one message-level `usage_stat` row, and how many
+    /// of those carry ZERO tokens across every such row (in/out/cache all 0 —
+    /// the payload's usage shape changed under the reader while messages kept
+    /// flowing). Sessions with no usage rows at all appear in NEITHER count: a
+    /// session that never spoke isn't evidence, and counting it in the
+    /// denominator would let one idle session suppress the canary (the advisor
+    /// fires on `tokenless == sessions`).
+    ///
+    /// **V40 Phase D (locked decision 20): the agent is a query parameter.** It
+    /// was `agent == "claude"` inside the Datalog string, so the rule that
+    /// reads these counts could only ever fire for one harness and every other
+    /// harness's row was filled with zeros — a signal that looks answered and
+    /// is not (global principle 3).
     ///
     /// (Deliberately NOT `SessionUsageRow.est_only` — that flag now means "this
-    /// session recorded no real Turn tokens at all", so it's false for a Claude
-    /// session that spoke even once, whereas this counts Claude sessions whose
-    /// turns landed but carried a zeroed/dropped `usage` block.)
+    /// session recorded no real Turn tokens at all", so it's false for a
+    /// session that spoke even once, whereas this counts sessions whose turns
+    /// landed but carried a zeroed/dropped usage block.)
     ///
     /// Datalog's set semantics may collapse identical projected rows, but
     /// that can't change a zero-vs-nonzero verdict or row presence, which is
     /// all this reads.
-    pub fn claude_tokenless_sessions(&self) -> AppResult<(u64, u64)> {
+    pub fn tokenless_sessions(&self, agent: &str) -> AppResult<(u64, u64)> {
+        let mut p = BTreeMap::new();
+        p.insert("agent".to_string(), DataValue::Str(agent.into()));
         let sess = self.run(
-            "?[session_id] := *session{session_id, agent}, agent == \"claude\"",
-            BTreeMap::new(),
+            "?[session_id] := *session{session_id, agent}, agent == $agent",
+            p,
             ScriptMutability::Immutable,
         )?;
-        let claude_ids: HashSet<String> = sess.rows.iter().map(|r| cell_str(r, 0)).collect();
-        if claude_ids.is_empty() {
+        let session_ids: HashSet<String> = sess.rows.iter().map(|r| cell_str(r, 0)).collect();
+        if session_ids.is_empty() {
             return Ok((0, 0));
         }
         let rows = self.run(
@@ -4231,7 +4240,7 @@ impl GraphIndex {
         let mut token_sum: HashMap<String, u64> = HashMap::new();
         for r in &rows.rows {
             let sid = cell_str(r, 0);
-            if !claude_ids.contains(&sid) {
+            if !session_ids.contains(&sid) {
                 continue;
             }
             let toks: u64 = (1..=4).map(|i| cell_i64(r, i).max(0) as u64).sum();

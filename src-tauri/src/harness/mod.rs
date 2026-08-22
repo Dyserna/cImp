@@ -127,10 +127,47 @@ pub fn input_profile(id: &str) -> Option<InputProfile> {
     HarnessId::from_id(id)?.plugin()?.input_profile()
 }
 
+/// **Whether `model` is a harness's fabricated pseudo-model** rather than a
+/// model anybody ran (V40 Phase D, locked decision 20).
+///
+/// A union over every registered harness's declared sentinels, because a usage
+/// row records the model id but not which harness's vocabulary it came from,
+/// and the two shipped harnesses record the SAME provider's model ids — the id
+/// is provider knowledge, and only the sentinel is a harness's. Iterating the
+/// registry is what stops this from being the `"<synthetic>"` literal it was in
+/// two `graph/index.rs` queries.
+///
+/// Empty ⇒ nothing is a sentinel, which is the fail-open direction on purpose:
+/// a harness that declares none must not have its real models filtered out.
+pub fn is_model_sentinel(model: &str) -> bool {
+    registry::all()
+        .filter_map(|h| h.plugin())
+        .filter_map(|p| p.usage_source())
+        .any(|s| s.model_sentinels().contains(&model))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use plugin::PasteMode;
+
+    /// The sentinel filter answers from DECLARATIONS, and answers `false` for
+    /// a real model id — the fail-open direction, since a wrongly filtered
+    /// model silently disappears from every cost readout.
+    #[test]
+    fn model_sentinels_come_from_the_plugins() {
+        assert!(
+            registry::all()
+                .filter_map(|h| h.plugin())
+                .filter_map(|p| p.usage_source())
+                .any(|s| !s.model_sentinels().is_empty()),
+            "at least one shipped harness declares a pseudo-model; if that stops being true, \
+             the two graph queries that filter on it have nothing to filter and should say so"
+        );
+        for real in ["claude-opus-4-8", "anthropic/claude-sonnet-4-5", "", "synthetic"] {
+            assert!(!is_model_sentinel(real), "{real:?} is a model, not a sentinel");
+        }
+    }
 
     /// **Every harness the registry knows has a profile, and an unknown id has
     /// none.** The second half is the fail-closed direction: a tab pointed at

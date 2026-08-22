@@ -356,11 +356,22 @@ impl OobContext {
 
     /// V24 Phase B: mark this tab's session live in the graph's live-session
     /// registry, keyed by the stable tab id (so a session rotation on the same
-    /// tab doesn't leak a stale key). Called on every Claude drain tick. A
+    /// tab doesn't leak a stale key). Called on every reader drain tick. A
     /// no-op when memory isn't wired (mirrors [`Self::record_mem`]).
+    ///
+    /// Always a [`SessionKey::Tab`] write, whatever the harness: this is
+    /// **cImp's own reader**, running in a tab cImp launched, and the tab id is
+    /// cImp's own. The session-space half of the registry is for ids a harness
+    /// reports over the loopback, which is a different claim by a different
+    /// party (V40 Phase D, locked decision 20).
     pub fn mark_live_session(&self, session_id: &str, agent: &str) {
         if let Some(mem) = self.mem.as_ref() {
-            mem.mark_live_session(self.tab.as_str(), agent, session_id);
+            mem.mark_live_session(
+                crate::harness::plugin::SessionKey::Tab,
+                self.tab.as_str(),
+                agent,
+                session_id,
+            );
         }
     }
 

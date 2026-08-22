@@ -593,8 +593,11 @@ Review: docs/reviews/code-review-V39-2026-08-22.md. Fix commits listed there onc
 ## Review-fix record (2026-08-22)
 
 All findings in `docs/reviews/code-review-V39-2026-08-22.md` closed in
-`4fc007e..e32cade` (cargo 2708/0/6, vitest 788) + two follow-ups (OpenCode
-main-session-only idle; Claude `stop_reason` canary + row). Facts that refine
+`4fc007e..6c160e6` (19 commits; cargo 2712/0/6, vitest 788), incl. `737da02`
+(OpenCode MAIN-session-only idle ends a turn; child idles leave the buffer; TTS
+unchanged, test-pinned) and `6c160e6` (row `claude.transcript.stop_reason`,
+Seam C, `Fallback { to: "claude.hook.stop" }`, fixture pair + negative twin +
+L2 probe that reports rather than asserts). Facts that refine
 the design:
 - **Turn boundary, as built.** OpenCode: `close_turn` after `flush_all`, last
   assistant message of the turn (not a concatenation), MAIN session only.

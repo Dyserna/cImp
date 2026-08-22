@@ -930,10 +930,9 @@ async fn run_flight(
 /// `worker produced no text` — a delegation that did the work, said so, and
 /// was told it had failed.
 ///
-/// So a fence is substantive unless it is recognisable SCAFFOLDING, and the
-/// list of shapes checked is deliberately short (see [`is_scaffold_block`]):
-/// an empty block, or an empty JSON payload. Anything else — code, data, prose
-/// — is an answer.
+/// So a fence is substantive unless it is recognisable SCAFFOLDING, and after
+/// V39 review R-1 the list is exactly ONE shape (see [`is_scaffold_block`]): an
+/// EMPTY block. Anything else — code, data, prose — is an answer.
 ///
 /// An UNTERMINATED fence is substantive whenever it holds non-whitespace: a
 /// truncated block is a partial answer, and the driver can see that it is.
@@ -975,29 +974,33 @@ fn substantive(text: &str) -> bool {
     !outside.trim().is_empty()
 }
 
-/// The scaffold shapes [`substantive`] recognises. **Short on purpose**: every
-/// shape here is a reply cImp will call empty, so a wrong entry silently turns
-/// a real answer into `worker produced no text`.
+/// The scaffold shapes [`substantive`] recognises. **One shape**: a block with
+/// nothing but whitespace in it.
 ///
-/// 1. an empty block (nothing but whitespace);
-/// 2. an empty JSON payload — `{}`, `[]`, `null` — which is what a worker that
-///    was asked for JSON and then produced nothing emits.
+/// It was three (V39 review R-1 removed two): `{}`, `[]` and `null` were also
+/// read as scaffolding, on the theory that they are what a worker asked for
+/// JSON emits when it found nothing. They are also what a worker emits when the
+/// correct answer IS "none found" — the single most common result of "list the
+/// call sites of X", and a `schema` request asking for exactly that gets an
+/// empty array back. Calling it `worker produced no text` told the driver the
+/// task had failed when it had succeeded. The inconsistency made it plainer
+/// still: an UNFENCED `[]` was substantive, and the same answer in a fence was
+/// not.
 ///
-/// **Both are shapes, not vocabulary, and that is a layering constraint as
-/// well as a preference.** A list of info strings naming tool-protocol
-/// sections (`tool_use`, `tool_result`, …) would be harness-owned vocabulary
-/// in an L4 module — which `no_harness_literals_outside_harness` forbids, and
-/// rightly: a fenced block a harness happens to label is still a block this
-/// module cannot read. A worker whose whole final message is one such block
-/// therefore returns it, which is the safe direction: the driver gets text it
-/// can judge, instead of a task that did real work being reported as empty.
+/// A shape, not vocabulary, and that is a layering constraint as well as a
+/// preference. A list of info strings naming tool-protocol sections
+/// (`tool_use`, `tool_result`, …) would be harness-owned vocabulary in an L4
+/// module — which `no_harness_literals_outside_harness` forbids, and rightly: a
+/// fenced block a harness happens to label is still a block this module cannot
+/// read. A worker whose whole final message is one such block therefore returns
+/// it, which is the safe direction: the driver gets text it can judge, instead
+/// of a task that did real work being reported as empty.
 ///
-/// `info` is unused today and kept in the signature because it is what a
-/// future shape would key on, and because it documents that the info string
-/// was considered rather than forgotten.
+/// `info` is unused and kept in the signature because it is what a future shape
+/// would key on, and because it documents that the info string was considered
+/// rather than forgotten.
 fn is_scaffold_block(_info: &str, body: &str) -> bool {
-    let body = body.trim();
-    body.is_empty() || matches!(body, "{}" | "[]" | "null")
+    body.trim().is_empty()
 }
 
 /// Run the worker's reply through the V32 EXTERNAL boundary (locked decision
@@ -1399,16 +1402,28 @@ mod tests {
     /// nothing else.
     #[test]
     fn a_non_substantive_turn_is_not_a_success() {
-        for empty in [
-            "",
-            "   ",
-            "\n\n\t",
-            "```\n\n```",
-            "```json\n{}\n```",
-            "```json\n[]\n```",
-            "```json\nnull\n```",
-        ] {
+        for empty in ["", "   ", "\n\n\t", "```\n\n```", "```json\n\n```"] {
             assert!(!substantive(empty), "{empty:?} must not read as an answer");
+        }
+        // **V39 review R-1: an empty JSON payload is an ANSWER.** "No call
+        // sites", "no matches", "nothing to change" — a `schema` request for a
+        // list gets `[]` back, and reporting that as `worker produced no text`
+        // tells the driver a task that succeeded had failed. The old rule was
+        // inconsistent with itself, too: the same value unfenced was already
+        // substantive.
+        for json in ["```json\n[]\n```", "```json\n{}\n```", "```json\nnull\n```"] {
+            assert!(
+                substantive(json),
+                "{json:?} is a worker answering `none found`, not a worker saying nothing"
+            );
+            let unfenced = json
+                .trim_start_matches("```json")
+                .trim_end_matches("```")
+                .trim();
+            assert!(
+                substantive(unfenced),
+                "…and the fence must not change the verdict: {unfenced:?}"
+            );
         }
         for real in [
             "Done.",

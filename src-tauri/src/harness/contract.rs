@@ -2085,7 +2085,7 @@ mod tests {
         // so a harness whose README lost its table fails rather than passing by
         // having nothing to compare.
         let mut owners: BTreeSet<Harness> = capabilities().map(|c| c.harness).collect();
-        owners.extend(crate::harness::registry::HARNESSES.iter().map(|d| d.id));
+        owners.extend(crate::harness::registry::all());
 
         for owner in owners {
             let expected: BTreeSet<&str> = capabilities()

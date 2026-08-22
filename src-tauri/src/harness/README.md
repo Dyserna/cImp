@@ -42,7 +42,11 @@ rows in the registry and no CHP hello.
 
 ## Adding a harness
 
-A new harness is one directory, one registry row and no changes above L2.
+A new harness is one directory, one registry row and no changes above L2 --
+plus the two things that are generated FROM the row (a frontend mirror and
+a doc section) and the one thing that cannot be: the README beside your code.
+The list below is what a plugin actually costs, with the test that enforces
+each claim.
 
 1. **`harness/<id>/mod.rs`** — and add `pub mod <id>;` here.
 1a. **A `HarnessDescriptor` row in `registry.rs`** (V40 Phase A) — id, label,
@@ -147,14 +151,80 @@ A new harness is one directory, one registry row and no changes above L2.
    write one — or a canary or probe that speaks its types — it will need L4
    types; add the file to `layering.rs`'s `UPWARD_EXEMPT` with the reason.
 
+12. **`input_profile()`** — only if a tab of yours may be driven as a
+   **delegation worker** (`harness/<id>/input.rs`). Four values: how a task is
+   pasted (`PasteMode`), the bytes that submit it, how long to settle before
+   submitting, and the largest paste to attempt. The type is neutral
+   (`plugin.rs`); the values are yours, and none of them is a measurement — each
+   is a floor chosen from the failure it prevents. Declaring it is not free: it
+   also needs an `<id>.input.profile` capability row, a `declared_unprobed()`
+   entry saying why no probe can settle it (nothing but a real turn in a real
+   TUI can), and the recorded spike outcome in
+   `Settings::harness[<id>].input_profile_status` that the neutral worker gate
+   reads. Declare nothing and your tabs are simply not workers — a visible
+   refusal at preflight, never a task typed into a TUI cImp cannot read back.
+13. **`instructions()` and `tool_for_role()`** — the text a model reads.
+   `harness/instructions.rs` owns the *prose* (its subject is cImp: cImp's graph
+   tools, cImp's channel, cImp's delegation contract), and you own the
+   **vocabulary it is rendered in**: `tool_for_role(Read)` and
+   `tool_for_role(Shell)` name your own tools, and the descriptor names your
+   label. Declare neither and every slot renders with descriptions ("a full file
+   read", "the shell") instead of another product's tool ids — which is the
+   honest answer, and strictly better than what core did before V40.
+   `every_harness_declares_every_slot` refuses a plugin that overrode
+   `instructions()` and dropped a row.
+14. **`preflight()`, `needs_tree_reap()`, `emits_startup_chrome()`,
+   `session_selector_flags()`, `accepts_passthrough_argv()`** — the CLI facts
+   core used to branch on. Whether your binary must be resolvable before a tab
+   of yours can be enabled (and the install hint the refusal carries), whether
+   your process forks children a plain kill would orphan, whether a fresh tab
+   prints a banner the notification layer must not ring for, which of your flags
+   select a session (so cImp does not double-pin one), and whether unrecognised
+   `cimp` argv is forwarded to you at all. Each is a declaration with a default;
+   none of them is a branch anywhere else.
+15. **`spawn_sites()` and `config_writer()`** — anything that spawns or writes.
+   `spawn_ledger`'s tripwire scans every `.rs` under `src/`, so a spawn inside
+   your directory must be described by a row; the row stays in core and the
+   *strings* come from `spawn_sites()`. `config_writer()` is for a file or
+   env-var block cImp writes on your behalf into the user's own configuration —
+   OpenCode's local-provider block is the worked example.
+16. **`affordances` on the descriptor** — what the *frontend* needs to say about
+   you without knowing what you are: your new-session command (the "run
+   `/clear`" strings), how your tool list refreshes, your web tools, your state
+   directories, an install hint and a docs URL, your attachment format, your
+   local-provider env preview, how many rows your status line occupies, and the
+   attribution template a delegated turn is banner-stamped with. Every one of
+   these was prose in a Svelte file before V40.
+17. **`harness/<id>/README.md`** — your drift rows, version pins, ingress
+   routing, open spikes and their recipes. This is the human twin of your
+   capability rows and `matrix_matches_maintenance_doc` pairs the two: every row
+   the registry declares for you appears in exactly one row of YOUR README, and
+   a row there naming another harness's capability fails. A section in
+   `docs/HARNESS-NATIVE-TOOLS.md` reproducing your `native_tools()` is checked
+   the same way. Neutral rows — a contract stated about a *tab* rather than
+   about a product — stay in `docs/MAINTENANCE.md`.
+
 What you must **not** need: a new enum variant outside `harness/`, a new match
-arm in `tabs/config.rs`, a bespoke gate constant, a frontend mirror. Since V40
-Phase A two tests hold that claim up rather than leaving it to good intentions —
-`every_registry_entry_is_fully_wired` (your row reaches every place it must) and
-`no_harness_identity_outside_registry` (nothing outside `harness/` spells a
-harness id, except the files on `IDENTITY_ALLOWLIST`, each with the V40 phase
-that retires it). If you find yourself writing a branch, the seam is in the
-wrong place — say so rather than adding it.
+arm in `tabs/config.rs`, a bespoke gate constant. What you **do** need and the
+pre-V40 version of this list wrongly denied: a **frontend mirror** — but a
+generated one. `harness_list` publishes your descriptor, features and
+affordances over IPC, `src/lib/harness.ts` is the only file that mirrors it, and
+the committed `fixtures/harness/registry.json` (emitted by `cargo test`) is what
+a vitest parity suite checks the TypeScript unions against. A descriptor field
+added in Rust with no TS mirror fails `npx vitest`.
+
+Four tests hold the rest of the claim up rather than leaving it to good
+intentions:
+
+| Claim | Test |
+|---|---|
+| Your row reaches every place it must — directory, capability rows, hello, `spawn_sig` slot, sandbox grants, health panel, plugin README, goldens | `harness::layering::tests::every_registry_entry_is_fully_wired` |
+| Nothing outside `harness/` spells a harness id, or branches on a `HarnessId` | `harness::layering::tests::no_harness_identity_outside_registry` (allowlisted files carry a reason; the survivors are persisted wire forms and one word collision) |
+| The same rule on the frontend | `src/lib/harnessIdentity.test.ts` |
+| Prose cannot drift from the registry | `harness::contract::tests::matrix_matches_maintenance_doc`, `harness::native::tests::the_native_tools_doc_matches_the_declared_tables` |
+
+If you find yourself writing a branch, the seam is in the wrong place — say so
+rather than adding it.
 
 There is **no third-party plugin loading** (design D7). Adding a harness means
 adding a directory here and opening a PR. The reason is in

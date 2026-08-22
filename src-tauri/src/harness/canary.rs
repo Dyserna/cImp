@@ -490,6 +490,17 @@ mod tests {
     /// must declare [`MODELS_VERSION_KEY`].
     const SYNTHETIC_DIR: &str = "_synthetic";
 
+    /// The one sibling of a version directory that is NOT one.
+    ///
+    /// V40 Phase G moved `fixtures/plugin-goldens/<id>/` in beside the
+    /// version dirs, so a harness directory now holds captured fixtures AND
+    /// the goldens of the artifact cImp WRITES for that harness. The two
+    /// answer different provenance questions -- a fixture records what
+    /// upstream sent and when, a golden records what cImp emits and why --
+    /// so the goldens carry their own prose manifest and are exempt from the
+    /// four capture keys rather than made to fake them.
+    const GOLDENS_DIR: &str = "goldens";
+
     /// The fifth key a `_synthetic/` manifest carries: the sibling version
     /// directory whose fixtures it mutates. Checked to be a real directory, so a
     /// drift model cannot outlive the fixture it was derived from — the two must
@@ -530,7 +541,10 @@ mod tests {
 
         let mut checked = 0usize;
         for harness in harnesses {
-            let versions = read_dirs(&harness);
+            let versions: Vec<_> = read_dirs(&harness)
+                .into_iter()
+                .filter(|d| d.file_name().is_some_and(|n| n != GOLDENS_DIR))
+                .collect();
             assert!(
                 !versions.is_empty(),
                 "{}: a harness directory with no version directory — fixtures are versioned by the \

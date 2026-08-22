@@ -154,6 +154,125 @@ mod tests {
         assert_eq!(class(h("claude"), "not_a_tool"), None);
     }
 
+    /// **`docs/HARNESS-NATIVE-TOOLS.md` is the machine-checked twin of
+    /// `native_tools()`** (V40 Phase G, carried item).
+    ///
+    /// That document has always described what each harness serves; §§ 2 and 3
+    /// are the VENDOR's surface, transcribed from their docs, and are
+    /// deliberately wider than these tables. What was missing was the other
+    /// half: what cImp *classifies*, which is the half that decides whether a
+    /// checkpoint is taken before a call, whether the call is recorded as a
+    /// memory event, and what class would gate it. That half was prose, so it
+    /// drifted — the document said "the eight ids in `OPENCODE_NATIVE_TABLE`"
+    /// while the table had ten. It is checked now, in both directions: a row
+    /// that outlives its declaration fails as loudly as a declaration with no
+    /// row.
+    ///
+    /// **Which section belongs to which harness is derived, not hard-coded.**
+    /// The test finds every *"What cImp's plugin declares"* subsection, matches
+    /// each to the harness whose vocabulary its first row is in, and asserts
+    /// every registered harness has exactly one — so a harness added later
+    /// needs a section here by being registered, and a section for a harness
+    /// nobody registered is a failure rather than dead prose.
+    #[test]
+    fn the_native_tools_doc_matches_the_declared_tables() {
+        const MARKER: &str = "What cImp's plugin declares";
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../docs/HARNESS-NATIVE-TOOLS.md");
+        let doc = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+            .replace("\r\n", "\n");
+
+        // (heading, rows) for every declaring subsection in the document.
+        let mut sections: Vec<(String, Vec<String>)> = Vec::new();
+        let mut current: Option<(String, Vec<String>)> = None;
+        for line in doc.lines().map(str::trim_end) {
+            if line.starts_with("## ") || line.starts_with("### ") {
+                if let Some(done) = current.take() {
+                    sections.push(done);
+                }
+                if line.contains(MARKER) {
+                    current = Some((line.to_string(), Vec::new()));
+                }
+            } else if let Some((_, rows)) = current.as_mut() {
+                if line.starts_with("| `") {
+                    rows.push(line.to_string());
+                }
+            }
+        }
+        if let Some(done) = current.take() {
+            sections.push(done);
+        }
+        assert!(
+            !sections.is_empty(),
+            "docs/HARNESS-NATIVE-TOOLS.md has no \"{MARKER}\" subsection at all — the \
+             machine-checked half of the document is gone, and this test would otherwise \
+             pass by finding nothing"
+        );
+
+        let mut claimed = vec![false; sections.len()];
+        for id in super::super::registry::all() {
+            let Some(p) = id.plugin() else { continue };
+            let expected: Vec<String> = p
+                .native_tools()
+                .iter()
+                .map(|t| {
+                    let class = match t.class {
+                        Some(c) => format!("`{c:?}`"),
+                        None => "\u{2014}".to_string(),
+                    };
+                    let mem = match t.memory_kind {
+                        Some((kind, arg)) => {
+                            format!("`{kind}` ({} arg)", format!("{arg:?}").to_lowercase())
+                        }
+                        None => "\u{2014}".to_string(),
+                    };
+                    format!(
+                        "| `{}` | {class} | `{}` | {mem} |",
+                        t.name, t.mutates_fs
+                    )
+                })
+                .collect();
+            let first = p.native_tools()[0].name;
+            let hits: Vec<usize> = sections
+                .iter()
+                .enumerate()
+                .filter(|(_, (_, rows))| {
+                    rows.first()
+                        .is_some_and(|r| r.starts_with(&format!("| `{first}` |")))
+                })
+                .map(|(i, _)| i)
+                .collect();
+            assert_eq!(
+                hits.len(),
+                1,
+                "{id}: {} \"{MARKER}\" subsections open with `{first}` — each registered \
+                 harness needs exactly one, headed so a reader can tell them apart",
+                hits.len()
+            );
+            claimed[hits[0]] = true;
+            let (heading, rows) = &sections[hits[0]];
+            assert_eq!(
+                rows,
+                &expected,
+                "{heading} has drifted from `{id}`'s `native_tools()`. Replace that table's \
+                 body with:\n{}",
+                expected.join("\n")
+            );
+        }
+        let orphans: Vec<&String> = sections
+            .iter()
+            .zip(&claimed)
+            .filter(|(_, taken)| !**taken)
+            .map(|((heading, _), _)| heading)
+            .collect();
+        assert!(
+            orphans.is_empty(),
+            "these \"{MARKER}\" subsections belong to no registered harness — a retired \
+             harness's table is prose that reads like a contract: {orphans:?}"
+        );
+    }
+
     /// Every registered harness declares SOME native vocabulary. A harness that
     /// declared none would have every one of its tool calls fail closed — every
     /// call a checkpoint, no call a memory event — which is a working system

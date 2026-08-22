@@ -57,7 +57,7 @@
 //! Phases A–C had none on purpose — the tests below and in
 //! [`crate::harness::canary`] were the consumers. V35 Phase D added the first
 //! real one: [`crate::harness::probe`], reached from `cimp --harness-canary`,
-//! reads [`CAPABILITIES`] to decide what to drive and what to enumerate as
+//! reads [`capabilities`] to decide what to drive and what to enumerate as
 //! `unknown`.
 //!
 //! **Phase E added the other two** (matrix draft § 3, consumers 1 and 2):
@@ -299,7 +299,7 @@ pub const CAP_PRETOOLUSE_DENY: &str = "claude.hook.pretooluse_deny";
 /// [`InputProfile`]: crate::harness::InputProfile
 pub const CAP_DELEGATION_WORKER: &str = "delegation.worker";
 
-/// Every control id that is declared somewhere in [`CAPABILITIES`]. Each must
+/// Every control id that is declared somewhere in the registry. Each must
 /// appear exactly once — see [`tests::tcb_controls_are_declared_exactly_once`].
 ///
 /// **A control id names one PLACE enforcement executes, not one concept.** That
@@ -328,8 +328,16 @@ pub const CONTROLS: &[&str] = &[
     CONTROL_CHECKPOINT_PRE_MUTATION_CLAUDE,
 ];
 
-/// The registry. Extracted from the code on `develop`, not invented.
-pub const CAPABILITIES: &[Capability] = &[
+/// The **harness-neutral** half of the registry: every row whose contract is
+/// stated about cImp's own seam or about a tab rather than about one vendor.
+/// Extracted from the code on `develop`, not invented.
+///
+/// Each harness's own rows live with it, behind
+/// [`HarnessPlugin::capabilities`](crate::harness::plugin::HarnessPlugin::capabilities)
+/// (V40 Phase A, locked decision 17). Read the whole registry through
+/// [`capabilities`] — a consumer that iterated this const alone would silently
+/// stop seeing a harness's rows.
+const CORE_CAPABILITIES: &[Capability] = &[
     // ── Claude Code: documented hooks (Tier B) ──────────────────────────────
     Capability {
         id: "claude.hook.user_prompt_submit",
@@ -1569,61 +1577,31 @@ pub const CAPABILITIES: &[Capability] = &[
         controls: &[],
         drift_token: None,
     },
-    Capability {
-        id: "claude.input.profile",
-        harness: CLAUDE,
-        tier: Seam::D,
-        contract: "Claude Code's TUI accepts a bracketed paste (`ESC [ 200 ~` … `ESC [ 201 ~`) as                    ONE literal insertion — embedded newlines land in the composer as newlines,                    not as submits — and a CR written after it submits that buffer as exactly one                    turn.",
-        depends_on: &[Dep::Behavior(
-            "multi-line bracketed paste + submit yields exactly one turn",
-        )],
-        wired_in: &[
-            "src-tauri/src/harness/claude/input.rs",
-            "src-tauri/src/harness/plugin.rs",
-        ],
-        degradation: Degradation::FailClosed,
-        drift_rule: &[],
-        canary: None,
-        probe: None,
-        waiver: Some(
-            "A `Dep::Behavior` no payload reveals: a TUI that split a paste into two turns would              corrupt the task SILENTLY, which is why the row fails closed instead of degrading.              Verification is the input-profile spike recorded in              `harness_versions.input_profile_status` (recipe in MAINTENANCE.md); a recorded              `\"fail\"` blocks `delegation.worker` for every harness. Owner: V39 Phase D.",
-        ),
-        controls: &[],
-        drift_token: None,
-    },
-    Capability {
-        id: "opencode.input.profile",
-        harness: OPENCODE,
-        tier: Seam::D,
-        contract: "OpenCode's TUI accepts a bracketed paste (`ESC [ 200 ~` … `ESC [ 201 ~`) as                    ONE literal insertion, and a CR written after it submits that buffer as                    exactly one turn.",
-        depends_on: &[Dep::Behavior(
-            "multi-line bracketed paste + submit yields exactly one turn",
-        )],
-        wired_in: &[
-            "src-tauri/src/harness/opencode/input.rs",
-            "src-tauri/src/harness/plugin.rs",
-        ],
-        degradation: Degradation::FailClosed,
-        drift_rule: &[],
-        canary: None,
-        probe: None,
-        waiver: Some(
-            "Same class as `claude.input.profile`, same spike, same recorded outcome. Owner: V39              Phase D.",
-        ),
-        controls: &[],
-        drift_token: None,
-    },
 ];
+
+/// **The registry**: the neutral rows, then every registered harness's own, in
+/// registry order.
+///
+/// The one accessor. `CORE_CAPABILITIES` is deliberately private, so "iterate
+/// the capability registry" cannot accidentally mean "iterate the half core
+/// happens to hold" — which is the shape locked decision 17 removes.
+pub fn capabilities() -> impl Iterator<Item = &'static Capability> {
+    CORE_CAPABILITIES.iter().chain(
+        crate::harness::registry::all()
+            .filter_map(|h| h.plugin())
+            .flat_map(|p| p.capabilities().iter()),
+    )
+}
 
 // `all()` lived here from Phase A as the accessor the seeded consumers would
 // use. Phase E deleted it rather than carrying it under an allow: every real
 // consumer — the probe, the gate, the Advisor's two reverse lookups — either
-// iterates `CAPABILITIES` directly or asks by id, so it was an alias for a
+// iterates the registry directly or asks by id, so it was an alias for a
 // public const that nothing called.
 
 /// One capability by id, or `None`. [`gate`] builds on this.
 pub fn get(id: &str) -> Option<&'static Capability> {
-    CAPABILITIES.iter().find(|c| c.id == id)
+    capabilities().find(|c| c.id == id)
 }
 
 // ── Consumer 1: feature gating (V35 Phase E) ────────────────────────────────
@@ -1799,8 +1777,7 @@ pub fn gates(settings: &Settings) -> Vec<Gate> {
 /// all) is deliberate — the capability id is the dismissal key, so a shared
 /// notice would let dismissing a symptom on one capability silence a sibling.
 pub fn capabilities_for_rule(rule: &str) -> Vec<&'static Capability> {
-    CAPABILITIES
-        .iter()
+    capabilities()
         .filter(|c| c.drift_rule.contains(&rule))
         .collect()
 }
@@ -1836,8 +1813,7 @@ pub fn capability_for_payload_shim(shim: &str) -> Option<&'static Capability> {
     if shim.is_empty() {
         return None;
     }
-    let mut hits = CAPABILITIES
-        .iter()
+    let mut hits = capabilities()
         .filter(|c| c.drift_token == Some(shim) && c.drift_rule.contains(&RULE_DRIFT_PAYLOAD));
     let first = hits.next()?;
     // Two rows naming one token is a registry defect, not a runtime condition —
@@ -1930,10 +1906,10 @@ mod tests {
     /// naming a retired id fails here too.
     #[test]
     fn matrix_matches_maintenance_doc() {
-        let registry: BTreeSet<&str> = CAPABILITIES.iter().map(|c| c.id).collect();
+        let registry: BTreeSet<&str> = capabilities().map(|c| c.id).collect();
         assert_eq!(
             registry.len(),
-            CAPABILITIES.len(),
+            capabilities().count(),
             "duplicate capability id in the registry — ids are the join key and must be unique"
         );
 
@@ -1982,8 +1958,7 @@ mod tests {
     /// `claude.transcript.identity` have no single reader to drive one through.
     #[test]
     fn every_silent_degradation_has_a_canary_or_a_probe_or_a_waiver() {
-        let naked: Vec<&str> = CAPABILITIES
-            .iter()
+        let naked: Vec<&str> = capabilities()
             .filter(|c| c.degradation == Degradation::Silent)
             .filter(|c| c.canary.is_none() && c.probe.is_none() && c.waiver.is_none())
             .map(|c| c.id)
@@ -1997,7 +1972,7 @@ mod tests {
 
         // Non-empty prose, not merely `Some("")` — global principle 5: a blank
         // waiver would pass the check above while recording nothing.
-        for c in CAPABILITIES {
+        for c in capabilities() {
             if let Some(w) = c.waiver {
                 assert!(
                     w.trim().len() > 20,
@@ -2018,7 +1993,7 @@ mod tests {
         // repo-relative, so climb one level first.
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
         let mut missing: Vec<String> = Vec::new();
-        for c in CAPABILITIES {
+        for c in capabilities() {
             assert!(
                 !c.wired_in.is_empty(),
                 "{}: a capability with no consumer is a dependency nothing needs — delete the \
@@ -2058,8 +2033,7 @@ mod tests {
     /// built to avoid, so it is a build failure here.
     #[test]
     fn probes_and_the_matrix_agree() {
-        let declared: BTreeSet<&str> = CAPABILITIES
-            .iter()
+        let declared: BTreeSet<&str> = capabilities()
             .filter_map(|c| {
                 c.probe.inspect(|p| {
                     assert_eq!(
@@ -2110,8 +2084,7 @@ mod tests {
             .iter()
             .copied()
             .collect();
-        let orphans: Vec<&str> = CAPABILITIES
-            .iter()
+        let orphans: Vec<&str> = capabilities()
             .map(|c| c.id)
             .filter(|id| !declared.contains(id) && !unprobed.contains(id))
             .collect();
@@ -2183,7 +2156,7 @@ mod tests {
             settings_with_input_profile("fail"),
             settings_with_input_profile("nonsense"),
         ];
-        for c in CAPABILITIES {
+        for c in capabilities() {
             for s in &inputs {
                 if gate(c.id, s).blocked {
                     assert!(
@@ -2269,8 +2242,7 @@ mod tests {
     /// depends on when it looks a harness up by id.
     #[test]
     fn the_neutral_row_is_the_delegation_worker_and_names_no_vendor() {
-        let neutral: Vec<&str> = CAPABILITIES
-            .iter()
+        let neutral: Vec<&str> = capabilities()
             .filter(|c| c.harness == ANY)
             .map(|c| c.id)
             .collect();
@@ -2368,7 +2340,7 @@ mod tests {
     #[test]
     fn every_declared_drift_rule_resolves_back_to_its_rows() {
         let mut seen = BTreeSet::new();
-        for c in CAPABILITIES {
+        for c in capabilities() {
             for rule in c.drift_rule {
                 seen.insert(*rule);
                 let rows: Vec<&str> = capabilities_for_rule(rule).iter().map(|r| r.id).collect();
@@ -2433,7 +2405,7 @@ mod tests {
         // claims a lagging indicator that can never attribute to it), and a row
         // that carries a token must name the rule (or the token is decoration).
         let mut tokens: Vec<&str> = Vec::new();
-        for c in CAPABILITIES {
+        for c in capabilities() {
             match (c.drift_token, c.drift_rule.contains(&RULE_DRIFT_PAYLOAD)) {
                 (Some(tok), true) => {
                     tokens.push(tok);
@@ -2474,8 +2446,7 @@ mod tests {
     #[test]
     fn tcb_controls_are_declared_exactly_once() {
         for control in CONTROLS {
-            let owners: Vec<&str> = CAPABILITIES
-                .iter()
+            let owners: Vec<&str> = capabilities()
                 .filter(|c| c.controls.contains(control))
                 .map(|c| c.id)
                 .collect();
@@ -2485,7 +2456,7 @@ mod tests {
                 "control `{control}` must be declared by exactly one capability, found: {owners:?}"
             );
         }
-        for c in CAPABILITIES {
+        for c in capabilities() {
             for declared in c.controls {
                 assert!(
                     CONTROLS.contains(declared),

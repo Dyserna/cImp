@@ -42,6 +42,7 @@
 //! Nothing here is spawn-baked: the profile is read when a delegation runs, so
 //! changing it needs no tab restart (locked decision 15).
 
+use crate::harness::contract::{Capability, Degradation, Dep, Harness, Seam};
 use crate::harness::plugin::{InputProfile, PasteMode};
 
 /// Milliseconds between the paste and the submit. See the module docs — a
@@ -64,6 +65,44 @@ pub fn input_profile() -> InputProfile {
         max_paste_bytes: MAX_PASTE_BYTES,
     }
 }
+
+
+/// This harness, as the registry's own opaque id — the same value
+/// `contract.rs` spells for its neutral rows, declared here because a row that
+/// names its harness by hand is a row that can name the wrong one.
+const HARNESS: Harness = Harness::declared("claude");
+
+/// The registry row this profile depends on, contributed to
+/// [`crate::harness::contract::capabilities`] by
+/// [`HarnessPlugin::capabilities`](crate::harness::plugin::HarnessPlugin::capabilities).
+///
+/// It lives here rather than in the neutral table because its CONTRACT is a
+/// sentence about Claude Code's TUI, and it is the same sentence the module
+/// docs above state: the row and the values it is about are one edit.
+pub const CAPABILITIES: &[Capability] = &[
+    Capability {
+        id: "claude.input.profile",
+        harness: HARNESS,
+        tier: Seam::D,
+        contract: "Claude Code's TUI accepts a bracketed paste (`ESC [ 200 ~` … `ESC [ 201 ~`) as                    ONE literal insertion — embedded newlines land in the composer as newlines,                    not as submits — and a CR written after it submits that buffer as exactly one                    turn.",
+        depends_on: &[Dep::Behavior(
+            "multi-line bracketed paste + submit yields exactly one turn",
+        )],
+        wired_in: &[
+            "src-tauri/src/harness/claude/input.rs",
+            "src-tauri/src/harness/plugin.rs",
+        ],
+        degradation: Degradation::FailClosed,
+        drift_rule: &[],
+        canary: None,
+        probe: None,
+        waiver: Some(
+            "A `Dep::Behavior` no payload reveals: a TUI that split a paste into two turns would              corrupt the task SILENTLY, which is why the row fails closed instead of degrading.              Verification is the input-profile spike recorded in              `harness_versions.input_profile_status` (recipe in MAINTENANCE.md); a recorded              `\"fail\"` blocks `delegation.worker` for every harness. Owner: V39 Phase D.",
+        ),
+        controls: &[],
+        drift_token: None,
+    },
+];
 
 #[cfg(test)]
 mod tests {

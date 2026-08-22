@@ -277,6 +277,10 @@ impl HarnessPlugin for ClaudePlugin {
         Some(hv.claude_last_verified.clone())
     }
 
+    fn capabilities(&self) -> &'static [crate::harness::contract::Capability] {
+        super::input::CAPABILITIES
+    }
+
     fn canaries(&self) -> &'static [Canary] {
         super::canary::CANARIES
     }

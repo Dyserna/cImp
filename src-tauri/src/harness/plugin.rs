@@ -354,6 +354,26 @@ pub trait HarnessPlugin: Sync + Send {
         None
     }
 
+    // ── the capability registry (locked decision 17) ────────────────────────
+
+    /// This harness's own rows in the capability registry.
+    ///
+    /// Rows whose CONTRACT is a sentence about this product — "Claude Code's TUI
+    /// accepts a bracketed paste as one literal insertion" — rather than about a
+    /// tab. `contract::capabilities()` chains them after the neutral ones, so
+    /// every consumer (the gate, the probe, the health panel, the drift advisor,
+    /// the literal scan) sees one registry and none of them holds a per-harness
+    /// list.
+    ///
+    /// A harness that declares an [`InputProfile`] must declare the row that
+    /// states what that profile depends on — asserted by
+    /// `layering::every_registry_entry_is_fully_wired`, because a profile with
+    /// no row is a Tier-D behaviour nothing records, nothing degrades on and
+    /// nobody can mark verified.
+    fn capabilities(&self) -> &'static [crate::harness::contract::Capability] {
+        &[]
+    }
+
     // ── canaries (locked decision 17) ───────────────────────────────────────
 
     /// This harness's L1 canaries — the fixture-backed substantiveness checks

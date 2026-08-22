@@ -244,6 +244,10 @@ impl HarnessPlugin for OpenCodePlugin {
         hv.opencode_last_seen.trim().to_string()
     }
 
+    fn capabilities(&self) -> &'static [crate::harness::contract::Capability] {
+        super::input::CAPABILITIES
+    }
+
     fn canaries(&self) -> &'static [Canary] {
         super::canary::CANARIES
     }

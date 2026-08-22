@@ -246,7 +246,7 @@ pub(in crate::harness) mod support {
     }
 
     /// The registry row a canary proves, with the join key checked in both
-    /// directions: the id must exist in [`contract::CAPABILITIES`], and that
+    /// directions: the id must exist in [`contract::capabilities`], and that
     /// row's `canary` must name this same id. A canary drifting away from its
     /// row is the one failure mode that would make the whole suite decorative.
     pub(in crate::harness) fn row(id: &'static str) -> &'static Capability {
@@ -291,10 +291,8 @@ mod tests {
             ids.len(),
             "two harnesses declare the same canary id: {ids:?}"
         );
-        let declared: BTreeSet<&str> = contract::CAPABILITIES
-            .iter()
-            .filter_map(|c| c.canary)
-            .collect();
+        let declared: BTreeSet<&str> =
+            contract::capabilities().filter_map(|c| c.canary).collect();
         assert_eq!(
             unique, declared,
             "the runtime canary list and the registry's `canary` column have diverged — \
@@ -450,7 +448,7 @@ mod tests {
         );
 
         let mut declared: BTreeSet<&str> = BTreeSet::new();
-        for c in contract::CAPABILITIES {
+        for c in contract::capabilities() {
             if let Some(canary) = c.canary {
                 // The join key, asserted for EVERY row rather than only for the
                 // ones with a test: `row` cannot catch a row whose canary names
@@ -469,7 +467,7 @@ mod tests {
         assert!(
             untested.is_empty(),
             "declared canary has no test: {untested:?} carry `canary: Some(..)` in \
-             `harness::contract::CAPABILITIES` but nothing in harness/canary.rs drives them. Write \
+             `harness::contract`'s registry but no canary module drives them. Write \
              the canary, or put the waiver back."
         );
 

@@ -40,7 +40,7 @@
 //! milestone's own deploy trap.
 
 use crate::harness::chp::{self, StalePlugin};
-use crate::harness::contract::{self, Capability, Degradation, Gate, Harness, Seam, CAPABILITIES};
+use crate::harness::contract::{self, Capability, Degradation, Gate, Harness, Seam};
 use crate::harness::probe::{harness_name, tier_name};
 use crate::harness::verify::{self, RunSummary};
 use crate::settings::{AutoVerify, Settings};
@@ -381,7 +381,7 @@ pub fn health(settings: &Settings) -> Vec<HarnessHealth> {
             // phase is not allowed — and does not need).
             let record = harness.plugin().and_then(|p| p.auto_verify_record(hv));
             let mut rows: Vec<&'static Capability> =
-                CAPABILITIES.iter().filter(|c| c.harness == harness).collect();
+                contract::capabilities().filter(|c| c.harness == harness).collect();
             rows.sort_by_key(|c| risk_rank(c.tier));
             let capabilities = rows
                 .into_iter()
@@ -463,7 +463,7 @@ mod tests {
             .collect();
         let unique: BTreeSet<&str> = shown.iter().copied().collect();
         assert_eq!(shown.len(), unique.len(), "a capability is rendered twice");
-        let registry: BTreeSet<&str> = CAPABILITIES.iter().map(|c| c.id).collect();
+        let registry: BTreeSet<&str> = contract::capabilities().map(|c| c.id).collect();
         assert_eq!(
             unique, registry,
             "the Harness health panel and the registry disagree about which capabilities exist"

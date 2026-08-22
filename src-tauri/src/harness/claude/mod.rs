@@ -11,7 +11,7 @@
 //! | [`statusline`] | harness ▸ cImp | the Claude-shaped stdin payload `cimp --statusline` is handed (Tier C, same) |
 //!
 //! What this harness serves is declared in [`overlay::claude_hello`] and, per
-//! capability, in [`crate::harness::contract::CAPABILITIES`]. Adding a harness
+//! capability, in [`crate::harness::contract::capabilities`]. Adding a harness
 //! is adding a sibling of this directory — see `harness/README.md`.
 
 pub mod canary;

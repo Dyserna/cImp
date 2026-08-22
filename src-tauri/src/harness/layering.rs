@@ -36,7 +36,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use super::contract::{Dep, Harness, CAPABILITIES};
+use super::contract::{self, Dep, Harness};
 
 /// `<repo>/src-tauri/src`.
 fn src_root() -> PathBuf {
@@ -208,7 +208,7 @@ fn tokens_of(dep_str: &str) -> Vec<String> {
 /// test said nothing.
 fn harness_literals() -> BTreeSet<String> {
     let mut needles: BTreeSet<String> = BTreeSet::new();
-    for c in CAPABILITIES {
+    for c in contract::capabilities() {
         for d in c.depends_on {
             let raw = match d {
                 Dep::JsonPath(p) | Dep::ConfigKey(p) => *p,
@@ -546,8 +546,7 @@ fn every_registry_entry_is_fully_wired() {
         let harness = d.harness();
 
         // 1. Capability rows: what cImp depends on this harness for.
-        let rows: Vec<&str> = CAPABILITIES
-            .iter()
+        let rows: Vec<&str> = contract::capabilities()
             .filter(|c| c.harness == harness)
             .map(|c| c.id)
             .collect();
@@ -581,6 +580,31 @@ fn every_registry_entry_is_fully_wired() {
         assert!(!d.tab_ids.is_empty(), "{dir}: no reserved tab id");
         assert!(!d.consumer.is_empty(), "{dir}: no MCP consumer token");
         assert!(!d.label.is_empty(), "{dir}: no human label");
+
+        // 3b. Exactly ONE `<id>.input.profile` row, contributed by the plugin
+        //     (V40 locked decision 17). The row states a Tier-D behaviour no
+        //     payload reveals — "a bracketed paste plus a CR yields exactly one
+        //     turn" — and the `delegation.worker` gate is built on it. A harness
+        //     that declares an `InputProfile` with no row would be typed into on
+        //     the strength of a contract nobody wrote down, with nothing to mark
+        //     verified and nothing to degrade; two rows would mean two contracts
+        //     claiming the same name, and the health panel would show whichever
+        //     it iterated first.
+        let profile_rows: Vec<&str> = contract::capabilities()
+            .filter(|c| c.id == format!("{dir}.input.profile"))
+            .map(|c| c.id)
+            .collect();
+        assert_eq!(
+            profile_rows.len(),
+            1,
+            "{dir}: expected exactly one `{dir}.input.profile` capability row from its plugin's \
+             `capabilities()`, got {profile_rows:?}"
+        );
+        assert!(
+            d.plugin.input_profile().is_some(),
+            "{dir}: declares an `{dir}.input.profile` contract row but no `input_profile()` — the \
+             row would describe a paste encoding nothing uses"
+        );
 
         // 4. A spawn signature. A harness with none gets NO restart hint when a
         //    spawn-baked setting changes — the exact failure the mechanism exists

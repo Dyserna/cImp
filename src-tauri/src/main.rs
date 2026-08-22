@@ -19,6 +19,7 @@ mod notifications;
 mod offload;
 mod plugins;
 mod preview;
+mod pricing;
 mod process_guard;
 mod processing;
 mod procutil;

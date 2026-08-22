@@ -43,14 +43,15 @@ use crate::error::{AppError, AppResult};
 use crate::settings::migration;
 use crate::settings::schema::{
     default_ai_tab, default_events_tab, default_graph_monitor_tab,
-    default_shell_1_tab, default_tool_activity_tab, default_workbench_tab, pricing_rows_since,
+    default_shell_1_tab, default_tool_activity_tab, default_workbench_tab,
     starter_prompt_templates, AiTabId, HarnessVersions, LayoutNodePersisted, LlmPricingModel,
     McpCategory, McpServerConfig, PromptTemplate, RemoteBackendTemplate, ServerCommandTemplate,
     Settings, TabConfig,
     CLAUDE_LOCAL_TAB_ID, CLAUDE_TAB_ID, CODE_AUDIT_TAB_ID, CODE_QUALITY_TAB_ID, EVENTS_TAB_ID,
     GRAPH_MONITOR_TAB_ID, GRAPH_VIEW_TAB_ID, OFFLOAD_SERVER_TAB_ID, OPENCODE_TAB_ID,
-    PRICING_GENERATION, SHELL_DEFAULT_TAB_ID, TOOL_ACTIVITY_TAB_ID, WORKBENCH_TAB_ID,
+    SHELL_DEFAULT_TAB_ID, TOOL_ACTIVITY_TAB_ID, WORKBENCH_TAB_ID,
 };
+use crate::pricing::{pricing_rows_since, PRICING_GENERATION};
 use crate::settings::write_atomic;
 use crate::shell::ShellSpec;
 
@@ -411,20 +412,20 @@ fn write_prompt_templates_to(path: &Path, templates: Vec<PromptTemplate>) -> App
 /// that carries the key — even as `[]` — keeps exactly what it has.
 pub fn read_global_llm_pricing() -> Vec<LlmPricingModel> {
     let Ok(path) = global_path() else {
-        return crate::settings::default_llm_pricing();
+        return crate::pricing::default_llm_pricing();
     };
     read_llm_pricing_from(&path)
 }
 
 fn read_llm_pricing_from(path: &Path) -> Vec<LlmPricingModel> {
     if !path.exists() {
-        return crate::settings::default_llm_pricing();
+        return crate::pricing::default_llm_pricing();
     }
     fs::read_to_string(path)
         .ok()
         .and_then(|t| serde_json::from_str::<Settings>(&t).ok())
         .map(|s| s.llm_pricing)
-        .unwrap_or_else(crate::settings::default_llm_pricing)
+        .unwrap_or_else(crate::pricing::default_llm_pricing)
 }
 
 /// Write the LLM price table straight to the physical global file, bypassing
@@ -4370,7 +4371,7 @@ mod tests {
 
         // A missing file reads as the seeded defaults, never empty.
         let seeded = read_llm_pricing_from(&path);
-        assert_eq!(seeded, crate::settings::default_llm_pricing());
+        assert_eq!(seeded, crate::pricing::default_llm_pricing());
         assert!(!seeded.is_empty());
 
         let pricing = vec![LlmPricingModel {

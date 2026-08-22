@@ -22,3 +22,10 @@ detection/** text eol=lf
 # bundle above, one layer up.
 src-tauri/src/harness/opencode/templates/plugin.js text eol=lf
 src-tauri/fixtures/plugin-goldens/** text eol=lf
+
+# V40 Phase C: the Claude TUI rendered-tail scrapes. `processing::permission`
+# `include_str!`s them and feeds them to the detector unchanged, so a CRLF
+# checkout would change the very bytes the pattern rows are matched against —
+# and `permission_body()` slices one of them by its exact footer suffix. Same
+# reasoning as the plugin goldens above.
+src-tauri/fixtures/harness/*/*/tui/** text eol=lf

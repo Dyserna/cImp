@@ -569,13 +569,13 @@ mod tests {
                         manifest_path.display()
                     );
                 }
-                let fixtures: Vec<PathBuf> = std::fs::read_dir(&version)
-                    .into_iter()
-                    .flatten()
-                    .flatten()
-                    .map(|e| e.path())
-                    .filter(|p| p.is_file() && p.file_name().is_some_and(|n| n != "MANIFEST.toml"))
-                    .collect();
+                // V40 Phase C: recursive, because a version directory may now
+                // group its fixtures by seam (`2.1.221/tui/` holds the rendered
+                // TUI tails the permission detector matches on, which are a
+                // different kind of recording from a transcript line). The
+                // manifest stays at the version root and covers all of them —
+                // one provenance statement per CLI build, not per seam.
+                let fixtures = fixture_files(&version);
                 assert!(
                     !fixtures.is_empty(),
                     "{}: a manifest with no fixtures beside it",
@@ -623,6 +623,21 @@ mod tests {
             "only {seen} embedded fixtures were checked — the registry stopped producing canaries \
              and this test is now vacuous"
         );
+    }
+
+    /// Every fixture file at or below `dir`, ignoring `MANIFEST.toml`.
+    fn fixture_files(dir: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                out.extend(fixture_files(&p));
+            } else if p.file_name().is_some_and(|n| n != "MANIFEST.toml") {
+                out.push(p);
+            }
+        }
+        out.sort();
+        out
     }
 
     /// Immediate sub-directories of `dir`, sorted, ignoring files.

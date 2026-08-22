@@ -1,0 +1,36 @@
+# V40 Phase C, locked decision 28 — provenance for the Claude Code TUI scrapes
+# in this directory.
+#
+# Required keys (all four): `captured_from`, `date`, `method`, `redaction`.
+# A version directory missing this file, or any of those keys, fails
+# `harness::canary::every_fixture_version_dir_has_a_manifest` — an anonymous
+# fixture is indistinguishable from a guess (V35 locked decision 4).
+#
+# These are RENDERED TAILS: the ANSI-stripped text `processing::screen`'s
+# `recent_rendered` hands the permission detector, trimmed to the bottom of each
+# prompt (what the tail window actually sees). They lived as `const &str`
+# literals in `processing/permission.rs`'s test module until V40 Phase C moved
+# them here — a recorded input belongs in the corpus, beside the version it was
+# recorded from, not inside the engine that consumes it.
+#
+# Files here, and the pattern rows each one exercises
+# (`harness::claude::prompts::PATTERNS`):
+#   tui/permission-prompt.txt   claude_permission, claude_permission_bare
+#                               (and, with its footer line replaced, every
+#                               footer variant 2.1.221 can compose — the body is
+#                               taken as this file minus its last line)
+#   tui/question-menu.txt       claude_question; also the NEGATIVE for the two
+#                               permission rows, whose `none_of` vetoes the menu
+#                               verbs this footer carries
+#   tui/question-yes-no.txt     the hard negative: an AskUserQuestion whose
+#                               option list is `1. Yes` / `2. No`, i.e. exactly
+#                               a permission prompt's shape. Only the menu verbs
+#                               tell them apart, which is what a relaxation to
+#                               bare `Esc to cancel` would break on.
+#   tui/working-footer.txt      claude_working. Note the lowercase `esc`,
+#                               distinct from the permission prompt's `Esc`.
+
+captured_from = "Claude Code 2.1.221"
+date = "2026-06-09"
+method = "captured live from Claude Code's TUI via RUST_LOG=perm_capture=debug, which dumps the rendered tail the detector matches against. Trimmed to the bottom of each prompt and with the ANSI already stripped, as the detector receives it. The footer-variant coverage in `processing::permission`'s tests composes the captured body with synthesized footers; the bodies here are the capture."
+redaction = "the captured prompts are from a scratch project and were reviewed line by line: the only path is the literal `delete.me` the prompt was provoked with, the questions are invented, and there is no user prompt text, file content, tool output, home directory or credential-shaped string in any of them."

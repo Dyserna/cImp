@@ -359,6 +359,95 @@ mod tests {
         );
     }
 
+    /// **The shipped seed is BYTE-identical to what the plugins compose.**
+    ///
+    /// V40 Phase C's exit criterion for locked decision 21. Its sibling
+    /// [`shipped_default_file_matches_code_defaults`] compares SEMANTICALLY —
+    /// it re-serializes both sides, so on-disk whitespace is not load-bearing —
+    /// and that is the right check for "did the content drift". It is the wrong
+    /// check for this phase: the rows moved out of core into two plugin tables
+    /// and a retired-harness file, and what had to be proven is that the file a
+    /// fresh install receives did not move a single byte with them.
+    ///
+    /// A carriage return is stripped on both sides because the working tree's line endings
+    /// depend on how Git checked the file out (`core.autocrlf`), which is a fact
+    /// about the checkout and not about the seed — the same reason
+    /// `harness::layering::executable_text` normalizes them.
+    #[test]
+    fn the_shipped_seed_is_byte_identical_to_what_the_plugins_compose() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("scripts")
+            .join("patterns.default.json");
+        let on_disk = fs::read_to_string(&path)
+            .expect("read scripts/patterns.default.json")
+            .replace('\r', "");
+        let composed = serde_json::to_string_pretty(&default_file()).expect("serialize");
+        assert_eq!(
+            on_disk.trim_end(),
+            composed.trim_end(),
+            "scripts/patterns.default.json is not byte-identical to what the registered plugins              compose. This file is copied verbatim into the release zip as `bin/patterns.json`,              and an install that receives a different byte sequence is an install whose              patterns.json no longer compares equal to any shipped set — i.e. one that is              treated as hand-edited forever and never receives another default fix."
+        );
+    }
+
+    /// Every era of the legacy table still composes the exact row set that era
+    /// shipped — including the aider rows of a harness retired in V19.
+    ///
+    /// The composition order is registered plugins in registry order, then
+    /// retired ones, and no era ever carried both OpenCode's rows and aider's
+    /// (v0.22.0 is exactly the release that swapped one for the other). This
+    /// pins the row NAMES per era, which is what makes that claim checkable
+    /// rather than a comment.
+    #[test]
+    fn every_legacy_era_composes_the_rows_that_era_shipped() {
+        let by_era: std::collections::BTreeMap<&str, Vec<String>> = legacy_default_sets()
+            .into_iter()
+            .map(|(era, rows)| (era, rows.into_iter().map(|r| r.name).collect()))
+            .collect();
+        assert_eq!(
+            by_era["v0.4.0"],
+            vec![
+                "claude_permission",
+                "claude_permission_alt_example",
+                "claude_question_template"
+            ]
+        );
+        assert_eq!(
+            by_era["v0.6.3..v0.6.x"],
+            vec![
+                "claude_permission",
+                "claude_permission_alt_example",
+                "claude_question_template",
+                "aider_apply_edits",
+                "aider_add_to_chat",
+                "aider_run_shell"
+            ]
+        );
+        assert_eq!(
+            by_era["v0.7.0..v0.21.x"],
+            vec![
+                "claude_permission",
+                "claude_permission_alt_example",
+                "claude_question",
+                "claude_working",
+                "aider_apply_edits",
+                "aider_add_to_chat",
+                "aider_run_shell"
+            ]
+        );
+        assert_eq!(
+            by_era["v0.22.0..v0.49.1"],
+            vec![
+                "claude_permission",
+                "claude_permission_alt_example",
+                "claude_question",
+                "claude_working",
+                "opencode_permission",
+                "opencode_working"
+            ]
+        );
+    }
+
     #[test]
     fn bom_prefixed_file_still_parses() {
         // Windows editors may save the hand-edited file as UTF-8 with BOM;

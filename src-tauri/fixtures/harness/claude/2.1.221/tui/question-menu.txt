@@ -1,0 +1,10 @@
+Which primary color do you prefer?
+
+> 1. Red
+     A warm, high-energy primary color.
+  2. Green
+  3. Blue
+  4. Type something.
+  5. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel

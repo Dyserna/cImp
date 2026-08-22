@@ -666,27 +666,51 @@ mod tests {
         assert!(d.check("real").is_empty());
     }
 
-    // Rendered-tail fixtures captured from Claude Code via
-    // RUST_LOG=perm_capture=debug on 2026-06-09. Trimmed to the bottom of
-    // each prompt (what the detector's tail window actually sees) and with
-    // the ANSI already stripped, as the detector receives it.
-    const PERMISSION_TAIL: &str = "   New-Item -ItemType File -Path \"delete.me\"\n\n \
-        Do you want to proceed?\n > 1. Yes\n  2. Yes, and don't ask again\n   3. No\n\n \
-        Esc to cancel · Tab to amend · ctrl+e to explain\n";
-    /// Everything above the footer in [`PERMISSION_TAIL`]. Combined with
+    // ── the rendered-tail corpus (V40 Phase C, locked decision 28) ─────────
+    //
+    // These were four `const &str` literals here, captured from Claude Code
+    // 2.1.221 via `RUST_LOG=perm_capture=debug` on 2026-06-09. They are
+    // RECORDED INPUTS — the same class as the transcript lines the canaries
+    // run on — so they live in the corpus beside the CLI version they came
+    // from, under `fixtures/harness/claude/2.1.221/tui/`, with a MANIFEST
+    // stating how they were captured and what was redacted. `include_str!`
+    // embeds them so the test reads the committed bytes; `.gitattributes`
+    // pins them LF, for the same reason the plugin goldens are pinned.
+    const PERMISSION_TAIL: &str =
+        include_str!("../../fixtures/harness/claude/2.1.221/tui/permission-prompt.txt");
+    const QUESTION_TAIL: &str =
+        include_str!("../../fixtures/harness/claude/2.1.221/tui/question-menu.txt");
+    /// A Yes/No AskUserQuestion: the option list looks exactly like a
+    /// permission prompt's (`1. Yes` / `2. No`) and the footer carries the same
+    /// cancel hint. Only the menu verbs tell them apart — this is the shape a
+    /// naive relaxation to bare `Esc to cancel` would break on.
+    const YES_NO_QUESTION_TAIL: &str =
+        include_str!("../../fixtures/harness/claude/2.1.221/tui/question-yes-no.txt");
+    /// The working-state footer while Claude is generating. Note lowercase
+    /// `esc`, distinct from the permission prompt's `Esc to cancel`.
+    const WORKING_TAIL: &str =
+        include_str!("../../fixtures/harness/claude/2.1.221/tui/working-footer.txt");
+
+    /// The footer line of [`PERMISSION_TAIL`] as 2.1.221 composed it, with
+    /// default keybindings, amend enabled and explain appended.
+    const CAPTURED_FOOTER: &str = "Esc to cancel · Tab to amend · ctrl+e to explain\n";
+
+    /// Everything above the footer in [`PERMISSION_TAIL`].
+    ///
+    /// Derived rather than stored: a fixture whose last byte is a significant
+    /// trailing space is one an editor silently breaks. Combined with
     /// [`permission_tail`] to exercise the footer variants Claude Code 2.1.221
-    /// can compose: remapped chord labels, the optional `… to amend` segment,
-    /// and the optional appended `… to explain` segment.
-    const PERMISSION_BODY: &str = "   New-Item -ItemType File -Path \"delete.me\"\n\n \
-        Do you want to proceed?\n > 1. Yes\n  2. Yes, and don't ask again\n   3. No\n\n ";
+    /// can compose: remapped chord labels, the optional amend segment, and the
+    /// optional appended explain segment.
+    fn permission_body() -> &'static str {
+        PERMISSION_TAIL
+            .strip_suffix(CAPTURED_FOOTER)
+            .expect("the captured permission tail ends with the footer it was captured with")
+    }
 
     fn permission_tail(footer: &str) -> String {
-        format!("{PERMISSION_BODY}{footer}\n")
+        format!("{}{footer}\n", permission_body())
     }
-    const QUESTION_TAIL: &str = "Which primary color do you prefer?\n\n> 1. Red\n     \
-        A warm, high-energy primary color.\n  2. Green\n  3. Blue\n  4. Type something.\n  \
-        5. Chat about this\n\nEnter to select · ↑/↓ to navigate · Esc to cancel\n";
-
     #[test]
     fn shipped_defaults_detect_question_not_permission() {
         // The AskUserQuestion box must fire the Question kind only — its
@@ -762,13 +786,6 @@ mod tests {
             assert!(detected_permission(&out), "tail {tail:?} → {out:?}");
         }
     }
-
-    // A Yes/No AskUserQuestion: the option list looks exactly like a
-    // permission prompt's ("1. Yes" / "2. No") and the footer carries the
-    // same cancel hint. Only the menu verbs tell them apart — this is the
-    // shape a naive relaxation to bare "Esc to cancel" would break on.
-    const YES_NO_QUESTION_TAIL: &str = "Should I delete the temp files?\n\n> 1. Yes\n  2. No\n  \
-        3. Type something.\n\nEnter to select · ↑/↓ to navigate · Esc to cancel\n";
 
     #[test]
     fn yes_no_question_menu_does_not_fire_permission() {
@@ -896,11 +913,6 @@ mod tests {
             .check("  ❯ 1. Yes\n    2. No\n\n  Esc to cancel · Enter to select\n")
             .is_empty());
     }
-
-    // Working-state footer while Claude is generating. Note lowercase "esc",
-    // distinct from the permission prompt's "Esc to cancel".
-    const WORKING_TAIL: &str = "✢ Pouncing… (4s · ↓ 176 tokens · thinking)\n\n\
-        ────────────────────\n> \n────────────────────\n  esc to interrupt\n";
 
     #[test]
     fn shipped_defaults_detect_working_marker() {

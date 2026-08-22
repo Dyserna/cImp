@@ -511,11 +511,17 @@ fn delegation_sig(settings: &crate::settings::Settings) -> u64 {
                 crate::settings::DelegationRole::RemoteOffload => {
                     c.id.hash(&mut h);
                     c.delegation_backend.name.hash(&mut h);
-                    matches!(
-                        c.delegation_backend.tier,
-                        crate::settings::BackendTier::Fast
-                    )
-                    .hash(&mut h);
+                    // V39 review L-6: the tier's own wire word, not
+                    // `is_fast`. A bool is lossless for exactly two variants
+                    // and silently collapses the moment a third is added —
+                    // and the symptom of a collapsed fingerprint component is
+                    // the one this whole type exists to prevent: a surface
+                    // that moved while the pulse gate saw no move, so every
+                    // live session keeps the old `offload_task` prose until
+                    // its next restart.
+                    serde_json::to_string(&c.delegation_backend.tier)
+                        .unwrap_or_default()
+                        .hash(&mut h);
                     c.delegation_backend.declared_context.hash(&mut h);
                 }
                 crate::settings::DelegationRole::None => {}
@@ -3475,6 +3481,47 @@ mod run_check_tests {
             spec.parameters["properties"]["args"]["items"]["type"],
             json!("string")
         );
+    }
+
+    /// **Every backend tier is its own fingerprint** (V39 review L-6).
+    ///
+    /// The tier used to be hashed as `is_fast` — lossless for exactly two
+    /// variants, and silently collapsing the day a third is added. The symptom
+    /// of a collapsed component is the one this type exists to prevent: the
+    /// advertised `offload_task` prose moves (the tier is rendered into it) but
+    /// the pulse gate sees no move, so every live session keeps the old list
+    /// until its next restart.
+    ///
+    /// A tripwire as much as an assertion. The `match` below is exhaustive on
+    /// purpose: a new variant stops this test COMPILING, which is the
+    /// notification the bool never gave — and the distinctness assert is then
+    /// what fails if the new variant hashes to an existing value.
+    #[test]
+    fn every_backend_tier_is_its_own_delegation_fingerprint() {
+        use crate::settings::BackendTier;
+        let tiers = [BackendTier::Fast, BackendTier::Quality];
+        for tier in tiers {
+            match tier {
+                BackendTier::Fast | BackendTier::Quality => {}
+            }
+        }
+        let sig_for = |tier: BackendTier| {
+            let mut s = Settings::default();
+            let mut tab = crate::settings::facade_tab("t1", "lan-worker-2");
+            if let crate::settings::TabConfig::AiTool(c) = &mut tab {
+                c.delegation_backend.tier = tier;
+            }
+            s.tabs.push(tab);
+            super::delegation_sig(&s)
+        };
+        let sigs: std::collections::HashSet<u64> = tiers.iter().copied().map(sig_for).collect();
+        assert_eq!(
+            sigs.len(),
+            tiers.len(),
+            "two tiers that advertise different prose must not hash alike"
+        );
+        // …and the fingerprint the pulse actually reads moves with it.
+        assert_ne!(sig_for(BackendTier::Fast), sig_for(BackendTier::Quality));
     }
 
     /// The pulse gate must move when this surface moves: flipping either switch

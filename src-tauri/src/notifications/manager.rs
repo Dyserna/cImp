@@ -16,7 +16,7 @@ use tracing::{debug, info, warn};
 
 /// Drain debounce: when a notification is enqueued and audio is currently
 /// idle, wait this long before draining. Lets closely-spaced related events
-/// (e.g. ClaudeOutputStopped → Idle followed shortly by a permission
+/// (e.g. HarnessOutputStopped → Idle followed shortly by a permission
 /// detection on the same tab) land in the queue together so dedup can
 /// collapse them to the most informative one.
 const DRAIN_DEBOUNCE: Duration = Duration::from_millis(200);

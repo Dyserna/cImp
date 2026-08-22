@@ -194,7 +194,7 @@ pub const ROUTE_POST_TOOL_USE_FAILURE: &str = "/claude/hook/post_tool_use_failur
 /// One route for two events, dispatching on `hook_event_name`, exactly as
 /// [`ROUTE_NOTIFICATION`] serves `Notification` and `PermissionDenied`. The
 /// pair is a lifecycle: an id that started and has not stopped is an agent
-/// running, which is the only fact the avatar's `AgentsActiveChanged` edge
+/// running, which is the only fact the avatar's `SubagentsActiveChanged` edge
 /// needs.
 ///
 /// **Sub-agent TOKEN usage does not come this way**, and cannot: no hook

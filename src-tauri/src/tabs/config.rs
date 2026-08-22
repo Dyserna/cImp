@@ -308,6 +308,23 @@ pub(crate) fn tab_harness(cfg: &AiToolTabConfig) -> Option<crate::harness::Harne
     crate::harness::HarnessId::from_command(&cfg.command)
 }
 
+/// Which harness the CONFIGURED tab with this id runs, or `None`.
+///
+/// The id-keyed twin of [`tab_harness`], for a caller that holds a `TabId` and
+/// no config — the state manager's sub-agent stall backstop, which needs the
+/// tab's declared activity tuning (V40 Phase D, locked decision 18). `None`
+/// covers all three honest answers: no such tab, not an AI tab, or a command no
+/// registered harness claims.
+pub(crate) fn tab_harness_by_id(
+    settings: &Settings,
+    tab_id: &str,
+) -> Option<crate::harness::HarnessId> {
+    settings.tabs.iter().find_map(|t| match t {
+        TabConfig::AiTool(c) if c.id == tab_id => tab_harness(c),
+        _ => None,
+    })
+}
+
 /// [`tab_harness`] as the CHP `agent` token, for the callers that key a map or a
 /// wire field by it. `None` means the same thing it does there: not a harness.
 pub(crate) fn tab_consumer(cfg: &AiToolTabConfig) -> Option<&'static str> {
@@ -1106,7 +1123,7 @@ mod tests {
         let overlay = settings_overlay(&args).expect("statusLine overlay present");
         assert_eq!(overlay["statusLine"]["type"], "command");
         // Idle-refresh timer that keeps the usage push (and the bottom-bar
-        // widget) alive between turns; must stay under usage::STALE_AFTER.
+        // widget) alive between turns; must stay under `harness::claude::usage::STALE_AFTER`.
         assert_eq!(overlay["statusLine"]["refreshInterval"], 30);
         let cmd = overlay["statusLine"]["command"]
             .as_str()

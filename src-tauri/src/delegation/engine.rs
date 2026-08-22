@@ -1340,7 +1340,7 @@ mod tests {
         use crate::state::{StateSignal, TabActivity, TabId};
         let mirror = TabActivity::default();
         let tab = TabId::from_str("ai-restart-probe");
-        mirror.note_signal(&StateSignal::ClaudeOutputStarted { tab: tab.clone() });
+        mirror.note_signal(&StateSignal::HarnessOutputStarted { tab: tab.clone() });
         mirror.note_signal(&StateSignal::SubprocessExited {
             tab: tab.clone(),
             code: Some(1),

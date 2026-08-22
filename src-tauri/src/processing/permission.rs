@@ -53,8 +53,8 @@ pub enum PatternKind {
     /// Claude is actively generating — its "busy" chrome (the
     /// `esc to interrupt` footer) is on screen. Drives the avatar's
     /// Thinking↔Idle activity instead of the byte-silence timer:
-    /// `Detected` maps to `ClaudeOutputStarted`, `Resolved` to
-    /// `ClaudeOutputStopped`. Content-based so a thinking pause (no output
+    /// `Detected` maps to `HarnessOutputStarted`, `Resolved` to
+    /// `HarnessOutputStopped`. Content-based so a thinking pause (no output
     /// for >0.5s) no longer collapses the avatar to Idle mid-work.
     Working,
 }

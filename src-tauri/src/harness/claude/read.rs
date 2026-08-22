@@ -484,7 +484,7 @@ pub async fn run(project_dir: PathBuf, pinned_session: Option<String>, ctx: OobC
                     // running — releasing the avatar here would contradict a
                     // `SubagentStart` that has not been stopped.
                     if !ctx.pushed("claude", crate::harness::chp::EV_SESSION_SUBAGENT) {
-                        ctx.signal(StateSignal::AgentsActiveChanged {
+                        ctx.signal(StateSignal::SubagentsActiveChanged {
                             tab: ctx.tab.clone(),
                             active: false,
                         });
@@ -985,7 +985,7 @@ struct AgentDelta {
 }
 
 /// Update the in-flight sub-agent set from one transcript line and emit
-/// `AgentsActiveChanged` when the running count crosses the zero boundary.
+/// `SubagentsActiveChanged` when the running count crosses the zero boundary.
 /// Returns the line's [`AgentDelta`] for the sub-agent drift canary.
 ///
 /// An agent launch is a `tool_use` block named per [`AGENT_TOOL_NAMES`] (in
@@ -1059,7 +1059,7 @@ fn update_agents(obj: &Value, agents: &mut HashSet<String>, ctx: &OobContext) ->
     // a serving tab.
     if now_active != was_active && !ctx.pushed("claude", crate::harness::chp::EV_SESSION_SUBAGENT) {
         debug!(tab = ?ctx.tab, count = agents.len(), active = now_active, "Claude OOB: agents active edge");
-        ctx.signal(StateSignal::AgentsActiveChanged {
+        ctx.signal(StateSignal::SubagentsActiveChanged {
             tab: ctx.tab.clone(),
             active: now_active,
         });
@@ -2370,13 +2370,13 @@ mod tests {
         update_agents(&launch("toolu_a"), &mut agents, &ctx);
         assert!(matches!(
             sig.try_recv(),
-            Ok(StateSignal::AgentsActiveChanged { active: true, .. })
+            Ok(StateSignal::SubagentsActiveChanged { active: true, .. })
         ));
 
         update_agents(&result("toolu_a"), &mut agents, &ctx);
         assert!(matches!(
             sig.try_recv(),
-            Ok(StateSignal::AgentsActiveChanged { active: false, .. })
+            Ok(StateSignal::SubagentsActiveChanged { active: false, .. })
         ));
         assert!(sig.try_recv().is_err(), "no further edges");
         assert!(agents.is_empty());
@@ -2395,7 +2395,7 @@ mod tests {
         update_agents(&both, &mut agents, &ctx);
         assert!(matches!(
             sig.try_recv(),
-            Ok(StateSignal::AgentsActiveChanged { active: true, .. })
+            Ok(StateSignal::SubagentsActiveChanged { active: true, .. })
         ));
         assert!(sig.try_recv().is_err(), "only one active edge for a batch");
 
@@ -2407,7 +2407,7 @@ mod tests {
         update_agents(&result("toolu_2"), &mut agents, &ctx);
         assert!(matches!(
             sig.try_recv(),
-            Ok(StateSignal::AgentsActiveChanged { active: false, .. })
+            Ok(StateSignal::SubagentsActiveChanged { active: false, .. })
         ));
     }
 
@@ -2460,13 +2460,13 @@ mod tests {
         update_agents(&launch_named("toolu_a", "Agent"), &mut agents, &ctx);
         assert!(matches!(
             sig.try_recv(),
-            Ok(StateSignal::AgentsActiveChanged { active: true, .. })
+            Ok(StateSignal::SubagentsActiveChanged { active: true, .. })
         ));
 
         update_agents(&result("toolu_a"), &mut agents, &ctx);
         assert!(matches!(
             sig.try_recv(),
-            Ok(StateSignal::AgentsActiveChanged { active: false, .. })
+            Ok(StateSignal::SubagentsActiveChanged { active: false, .. })
         ));
         assert!(agents.is_empty());
     }
@@ -2507,7 +2507,7 @@ mod tests {
         update_agents(&launch("toolu_orphan"), &mut agents, &ctx);
         assert!(matches!(
             sig.try_recv(),
-            Ok(StateSignal::AgentsActiveChanged { active: true, .. })
+            Ok(StateSignal::SubagentsActiveChanged { active: true, .. })
         ));
 
         // Plain-string user prompt.
@@ -2520,7 +2520,7 @@ mod tests {
         );
         assert!(matches!(
             sig.try_recv(),
-            Ok(StateSignal::AgentsActiveChanged { active: false, .. })
+            Ok(StateSignal::SubagentsActiveChanged { active: false, .. })
         ));
     }
 
@@ -2538,7 +2538,7 @@ mod tests {
         assert!(agents.is_empty());
         assert!(matches!(
             sig.try_recv(),
-            Ok(StateSignal::AgentsActiveChanged { active: false, .. })
+            Ok(StateSignal::SubagentsActiveChanged { active: false, .. })
         ));
     }
 
@@ -2556,7 +2556,7 @@ mod tests {
         update_agents(&both, &mut agents, &ctx);
         assert!(matches!(
             sig.try_recv(),
-            Ok(StateSignal::AgentsActiveChanged { active: true, .. })
+            Ok(StateSignal::SubagentsActiveChanged { active: true, .. })
         ));
 
         // tool_result for one — is_user_prompt is false (only tool_result
@@ -3107,11 +3107,11 @@ mod tests {
         );
         assert!(matches!(
             sig.try_recv(),
-            Ok(StateSignal::AgentsActiveChanged { active: true, .. })
+            Ok(StateSignal::SubagentsActiveChanged { active: true, .. })
         ));
         assert!(matches!(
             sig.try_recv(),
-            Ok(StateSignal::AgentsActiveChanged { active: false, .. })
+            Ok(StateSignal::SubagentsActiveChanged { active: false, .. })
         ));
         let _ = std::fs::remove_dir_all(&dir);
     }

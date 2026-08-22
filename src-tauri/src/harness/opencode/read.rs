@@ -849,7 +849,7 @@ pub(crate) struct Tracker {
     /// worker's reply. Kept beside `assistant`/`flushed` and bounded the same
     /// way — one entry per assistant message id.
     msg_session: HashMap<String, String>,
-    /// Whether we've emitted ClaudeOutputStarted without a matching Stopped.
+    /// Whether we've emitted HarnessOutputStarted without a matching Stopped.
     working: bool,
     /// V28 + V30 (review M7/M8): the tab's session facts — current MAIN session,
     /// the CHILD (sub-agent / task-tool) sessions to exclude, and the ones proven
@@ -1292,9 +1292,9 @@ impl Tracker {
         self.working = working;
         let tab = ctx.tab.clone();
         ctx.signal(if working {
-            StateSignal::ClaudeOutputStarted { tab }
+            StateSignal::HarnessOutputStarted { tab }
         } else {
-            StateSignal::ClaudeOutputStopped { tab }
+            StateSignal::HarnessOutputStopped { tab }
         });
     }
 }
@@ -1892,11 +1892,11 @@ mod tests {
         // Working state went up then down.
         assert!(matches!(
             sig.try_recv(),
-            Ok(StateSignal::ClaudeOutputStarted { .. })
+            Ok(StateSignal::HarnessOutputStarted { .. })
         ));
         assert!(matches!(
             sig.try_recv(),
-            Ok(StateSignal::ClaudeOutputStopped { .. })
+            Ok(StateSignal::HarnessOutputStopped { .. })
         ));
     }
 
@@ -1932,10 +1932,10 @@ mod tests {
         }
         assert!(matches!(
             sig.try_recv(),
-            Ok(StateSignal::ClaudeOutputStarted { .. })
+            Ok(StateSignal::HarnessOutputStarted { .. })
         ));
         assert!(
-            matches!(sig.try_recv(), Ok(StateSignal::ClaudeOutputStopped { .. })),
+            matches!(sig.try_recv(), Ok(StateSignal::HarnessOutputStopped { .. })),
             "a status-idle turn-over must release the Thinking edge"
         );
     }
@@ -2039,11 +2039,11 @@ mod tests {
             );
             assert!(matches!(
                 sig.try_recv(),
-                Ok(StateSignal::ClaudeOutputStarted { .. })
+                Ok(StateSignal::HarnessOutputStarted { .. })
             ));
             assert!(matches!(
                 sig.try_recv(),
-                Ok(StateSignal::ClaudeOutputStopped { .. })
+                Ok(StateSignal::HarnessOutputStopped { .. })
             ));
             assert!(
                 sig.try_recv().is_err(),
@@ -2310,11 +2310,11 @@ mod tests {
         // …and Thinking was released (Started then Stopped).
         assert!(matches!(
             sig.try_recv(),
-            Ok(StateSignal::ClaudeOutputStarted { .. })
+            Ok(StateSignal::HarnessOutputStarted { .. })
         ));
         assert!(matches!(
             sig.try_recv(),
-            Ok(StateSignal::ClaudeOutputStopped { .. })
+            Ok(StateSignal::HarnessOutputStopped { .. })
         ));
     }
 }

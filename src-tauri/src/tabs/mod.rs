@@ -22,6 +22,9 @@ pub(crate) use config::ai_tab_dir;
 /// `loopback::is_configured_tab`'s `(consumer, tab)` check — see
 /// [`config::tab_consumer`] for why both ends must classify through one call.
 pub(crate) use config::tab_consumer;
+/// V40 Phase D: which harness a tab id runs, for the state manager's sub-agent
+/// stall backstop — see [`config::tab_harness_by_id`].
+pub(crate) use config::tab_harness_by_id;
 /// The advertised-MCP-server signature, re-exported for the Settings save
 /// path's restart-hint edge detector (`ipc::commands::settings_update`).
 pub(crate) use config::spawn_inject_sig;

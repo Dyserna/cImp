@@ -34,6 +34,30 @@ pub(in crate::harness) fn me() -> crate::harness::HarnessId {
 }
 
 impl HarnessPlugin for OpenCodePlugin {
+    /// OpenCode's SSE event stream reports its own turn boundaries, so core
+    /// runs **no** TUI heuristic for one of its tabs. This declaration replaces
+    /// `pty::manager`'s `oob_drives_activity = matches!(spec.oob,
+    /// Some(OobSpec::OpenCodeEvent { .. }))` — core testing for this harness's
+    /// transport to decide whether to model its terminal.
+    fn activity_source(&self) -> crate::harness::plugin::ActivitySource {
+        crate::harness::plugin::ActivitySource::OutOfBand
+    }
+
+    /// OpenCode has **no usage source**. Its plugin posts per-turn token
+    /// totals to `/memory/event` (which the graph records), but nothing
+    /// reports a subscription quota or a live context window — so
+    /// `harness_usage` answers *no usage source*, and the widget must render
+    /// that as absence rather than as a harness sitting at 0%.
+    fn usage_source(&self) -> Option<&'static dyn crate::harness::plugin::UsageSource> {
+        None
+    }
+
+    /// Identity is the session id OpenCode reports over the loopback; it lives
+    /// in its own key space and therefore can never name a cImp tab.
+    fn session_key_space(&self) -> crate::harness::plugin::SessionKey {
+        crate::harness::plugin::SessionKey::Session
+    }
+
     fn input_profile(&self) -> Option<InputProfile> {
         Some(super::input::input_profile())
     }

@@ -25,6 +25,40 @@ pub struct ClaudePlugin;
 /// The value the registry's descriptor points at.
 pub static PLUGIN: ClaudePlugin = ClaudePlugin;
 
+/// **The five timings core's TUI activity arbitration used to hard-code**
+/// (locked decision 18).
+///
+/// Every number is a measurement of Claude Code's screen, and each was tuned
+/// against an observed avatar defect:
+///
+/// * `burst_min` (1000 ms) — real responses sustain bytes for seconds; a
+///   per-keystroke TUI redraw is tens of ms, so anything shorter is churn.
+/// * `quiet` (500 ms) — closes a burst once the marker is gone. Claude routinely
+///   emits nothing for >0.5 s mid-response, which is why the MARKER and not this
+///   timer decides Idle while it is working.
+/// * `marker_grace` (1200 ms) — while Claude drives parallel sub-agents its
+///   `esc to interrupt` footer blinks in and out roughly once a second. Each gap
+///   used to trip the 500 ms release, so the avatar cycled Thinking → Idle →
+///   Thinking every second and announced "idle" on each cycle.
+/// * `working_stale` (6 s) — the live spinner repaints its elapsed-second
+///   counter ~once/sec, so a marker still matched with the stream fully silent
+///   this long is a ghost left in the cell grid.
+/// * `subagents_stall` (8 s) — longer than `working_stale` on purpose, so the
+///   marker path always concludes first (asserted by
+///   `harness::plugin::tests::every_stall_backstop_outlasts_its_marker_path`).
+///
+/// **Pinned by a golden test** rather than merely moved: these are the
+/// pre-V40 constants to the millisecond, and a refactor that rounds one of them
+/// is a regression nobody sees until an avatar flickers.
+const ACTIVITY_TUNING: crate::harness::plugin::ActivityTuning =
+    crate::harness::plugin::ActivityTuning {
+        burst_min: std::time::Duration::from_millis(1000),
+        quiet: std::time::Duration::from_millis(500),
+        marker_grace: std::time::Duration::from_millis(1200),
+        working_stale: std::time::Duration::from_secs(6),
+        subagents_stall: std::time::Duration::from_secs(8),
+    };
+
 /// This plugin's own id, for the one place it has to recognise its own tabs
 /// (the `claude_local` spawn-signature slot). Inside `harness/claude/` naming
 /// this harness is the point; test 10(a) polices core, not here.
@@ -364,6 +398,47 @@ impl HarnessPlugin for ClaudePlugin {
         super::hook::drift_token_for_event(capability)
     }
 
+    /// TUI markers, with the timings Claude Code's screen was measured at.
+    ///
+    /// Claude Code reports no turn boundaries out of band — no hook payload
+    /// carries "a turn started" — so the only way to know this tab is busy is
+    /// to read the terminal cImp is already painting: the `claude_working`
+    /// footer (`esc to interrupt`) while it is on screen, a sustained byte
+    /// burst when a response never paints it.
+    fn activity_source(&self) -> crate::harness::plugin::ActivitySource {
+        crate::harness::plugin::ActivitySource::TuiMarkers(ACTIVITY_TUNING)
+    }
+
+    /// The status-line push file — see [`super::usage`].
+    fn usage_source(&self) -> Option<&'static dyn crate::harness::plugin::UsageSource> {
+        Some(&super::usage::USAGE)
+    }
+
+    /// Claude Code has an inbound MCP path (development channels), which is
+    /// what the session-push registration and the `--channel-push` subscription
+    /// both gate on.
+    fn supports_session_push(&self) -> bool {
+        true
+    }
+
+    /// Claude's live session is bound by cImp's own transcript tap and keyed by
+    /// the TAB it runs in. Nothing that arrives over the wire keys it — which
+    /// is what closes C-2 structurally instead of by a collision check.
+    fn session_key_space(&self) -> crate::harness::plugin::SessionKey {
+        crate::harness::plugin::SessionKey::Tab
+    }
+
+    /// The sub-agent transcript contract (`<sid>/subagents/*.jsonl`) is
+    /// Claude's, and so is the drift report `read.rs` files when it moves.
+    fn drift_report_tools(&self) -> &'static [&'static str] {
+        &["subagent_drift"]
+    }
+
+    /// `cimp --statusline` — see [`super::statusline`].
+    fn subcommands(&self) -> &'static [crate::harness::plugin::Subcommand] {
+        super::statusline::SUBCOMMANDS
+    }
+
     fn drift_vocabulary(&self) -> &'static [&'static str] {
         super::hook::DRIFT_TOKENS
     }
@@ -571,6 +646,50 @@ const DECLARED_UNPROBED: &[(&str, &str)] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::harness::plugin::ActivitySource;
+    use std::time::Duration;
+
+    /// **The golden for [`ACTIVITY_TUNING`]** (V40 Phase D, locked decision 18).
+    ///
+    /// These five values were `CLAUDE_BURST_MIN`, `CLAUDE_QUIET`,
+    /// `CLAUDE_MARKER_GRACE`, `CLAUDE_WORKING_STALE` (`pty/tasks.rs`) and
+    /// `AGENTS_STALL_TIMEOUT` (`state/manager.rs`) before the move. Each was
+    /// tuned against an observed avatar defect and none of them is a round
+    /// number by accident, so the move is asserted to the millisecond rather
+    /// than trusted: a regression here is invisible until an avatar flickers or
+    /// announces "idle" mid-turn.
+    #[test]
+    fn the_activity_tuning_is_the_pre_v40_constants() {
+        assert_eq!(ACTIVITY_TUNING.burst_min, Duration::from_millis(1000));
+        assert_eq!(ACTIVITY_TUNING.quiet, Duration::from_millis(500));
+        assert_eq!(ACTIVITY_TUNING.marker_grace, Duration::from_millis(1200));
+        assert_eq!(ACTIVITY_TUNING.working_stale, Duration::from_secs(6));
+        assert_eq!(ACTIVITY_TUNING.subagents_stall, Duration::from_secs(8));
+    }
+
+    /// The plugin hands core exactly that table — the declaration and the
+    /// golden cannot drift apart, because the test that pins the values reads
+    /// the same const the trait method returns.
+    #[test]
+    fn the_declared_source_carries_the_golden_tuning() {
+        match PLUGIN.activity_source() {
+            ActivitySource::TuiMarkers(t) => assert_eq!(t, ACTIVITY_TUNING),
+            ActivitySource::OutOfBand => panic!(
+                "Claude Code reports no turn boundaries out of band; declaring OutOfBand                  would leave its avatar permanently Idle"
+            ),
+        }
+    }
+
+    /// The stall backstop must outlast the marker path, or the avatar is
+    /// released while the footer is still on screen — the ordering the pre-V40
+    /// comment stated in prose beside two constants in different files.
+    #[test]
+    fn the_stall_backstop_outlasts_the_marker_path() {
+        assert!(ACTIVITY_TUNING.subagents_stall > ACTIVITY_TUNING.working_stale);
+        assert!(ACTIVITY_TUNING.working_stale > ACTIVITY_TUNING.quiet);
+        assert!(ACTIVITY_TUNING.marker_grace > ACTIVITY_TUNING.quiet);
+    }
+
 
     #[test]
     fn args_select_session_spots_every_documented_selector() {

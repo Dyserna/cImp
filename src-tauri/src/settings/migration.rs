@@ -3123,6 +3123,27 @@ fn migrate_v35_to_v36(value: &mut Value) {
         let mut out = row_obj.clone();
         if let Some(Value::Object(prior)) = existing.get(&id) {
             for (k, v) in prior {
+                // `ext` is a CONTAINER, not a value (V40 review finding M-5).
+                // "Existing keys win" is right at the row level and wrong one
+                // level down: a partial `ext` — a hand-written
+                // `{"statusline": true}`, or one written by a newer build the
+                // user downgraded from — would replace the whole block and
+                // discard every key this step had just carried over, so a
+                // migrated `local.base_url` silently reverted to
+                // `http://localhost:4000` and the tab connected to a proxy the
+                // user never configured. Merged per key instead, with prior
+                // still winning on a collision.
+                match (k.as_str(), out.get_mut(k)) {
+                    ("ext", Some(Value::Object(carried))) => {
+                        if let Value::Object(prior_ext) = v {
+                            for (ek, ev) in prior_ext {
+                                carried.insert(ek.clone(), ev.clone());
+                            }
+                            continue;
+                        }
+                    }
+                    _ => {}
+                }
                 out.insert(k.clone(), v.clone());
             }
         }
@@ -4291,6 +4312,26 @@ mod tests {
         assert_eq!(opencode["ext"]["provider_auto"], json!(true));
         assert_eq!(opencode["ext"]["provider"]["model"], json!("Q"));
 
+        // V40 review L-6: this step's `ext` key literals are FROZEN (locked
+        // decision 14) and the plugins' `pub const`s are not, so nothing tied
+        // the two together — renaming a const would orphan every migrated value
+        // into an undeclared key `normalize_harness_settings` deliberately
+        // leaves alone. Driven off THIS file, which sets every old field, the
+        // two sets have to be equal in both directions.
+        for d in crate::harness::registry::HARNESSES {
+            let declared: std::collections::BTreeSet<&str> =
+                d.plugin.settings_schema().iter().map(|f| f.key).collect();
+            let migrated: std::collections::BTreeSet<&str> = v["harness"][d.id]["ext"]
+                .as_object()
+                .map(|o| o.keys().map(String::as_str).collect())
+                .unwrap_or_default();
+            assert_eq!(
+                migrated, declared,
+                "{}: the frozen 35 -> 36 step and `settings_schema()` must spell the same                  `ext` keys",
+                d.id
+            );
+        }
+
         // The per-server access pair.
         let server = &v["offload"]["mcp_servers"][0];
         assert_eq!(server["access"]["claude"]["enabled"], json!(true));
@@ -4388,6 +4429,58 @@ mod tests {
             back["harness"]["codex"]["ext"]["sandbox_mode"],
             json!("read-only")
         );
+    }
+
+    /// **A partial existing `ext` MERGES with the carried-over one** (V40 review
+    /// finding M-5).
+    ///
+    /// "Existing keys win" is right at the ROW level and wrong one level down:
+    /// `ext` is a container, so inserting the prior row's `"ext"` key replaced
+    /// the whole block and discarded every key this step had just moved into it.
+    /// A v35 file carrying both `harness.claude.ext = {"statusline": true}` (a
+    /// hand edit, or a write by a newer build the user downgraded from) and
+    /// `claude_local.base_url` lost the URL entirely, and the tab then connected
+    /// to `http://localhost:4000` — a proxy the user never configured.
+    #[test]
+    fn v35_to_v36_merges_a_partial_existing_ext_instead_of_replacing_it() {
+        let mut v = json!({
+            "schema_version": 35,
+            "harness": {
+                "claude": { "ext": { "statusline": true, "local.model_alias": "mine" } },
+            },
+            "claude_local": {
+                "base_url": "http://myproxy:9000",
+                "auth_token": "sk-real",
+                "model_alias": "stale-from-the-old-field",
+            },
+            "statusline": { "enabled": false },
+        });
+        migrate_v35_to_v36(&mut v);
+        let ext = &v["harness"]["claude"]["ext"];
+        assert_eq!(
+            ext["local.base_url"], json!("http://myproxy:9000"),
+            "a key carried over by this step must survive a partial existing `ext`"
+        );
+        assert_eq!(ext["local.auth_token"], json!("sk-real"));
+        // …and prior still WINS per key, both for a key the step also carried
+        // over and for one only the prior block had.
+        assert_eq!(
+            ext["local.model_alias"], json!("mine"),
+            "the value already in the NEW shape wins over the old field"
+        );
+        assert_eq!(
+            ext["statusline"], json!(true),
+            "…including against `statusline.enabled: false`"
+        );
+
+        // The typed round trip keeps all four.
+        let typed: crate::settings::Settings = serde_json::from_value(v).expect("loads");
+        let row = typed.harness_settings(crate::harness::DEFAULT_HARNESS);
+        assert_eq!(
+            row.ext.get("local.base_url").and_then(|v| v.as_str()),
+            Some("http://myproxy:9000")
+        );
+        assert_eq!(row.ext.get("statusline"), Some(&json!(true)));
     }
 
     /// V32 → V33 moves nothing: the V38 `tool_plugins` container is additive and

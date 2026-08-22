@@ -774,7 +774,20 @@ async fn drain_new_lines(
             let pushed = ctx.pushed("claude", crate::harness::chp::EV_ASSISTANT_TEXT);
             // V39 review HIGH-1: a genuine user prompt is the start of a turn,
             // and the previous turn's buffer must not survive it.
+            //
+            // **Review R-2: file the ended turn FIRST.** The fire is deferred
+            // to the end of the pass (an API message is several lines, and the
+            // final text can follow the line that declared the turn over), so a
+            // pass that carried both a turn's end AND the user's next prompt —
+            // routine when the user types quickly, or when a paused tap catches
+            // up — wiped an ended-but-unfiled turn and the delegation waiting on
+            // it ran to its deadline instead of completing. The boundary is
+            // here, not at the end of the pass, precisely because the prompt is
+            // what makes the previous turn unambiguously over.
             if !pushed && is_user_prompt(&obj) && !is_sidechain(&obj) && obj.get("isMeta").and_then(Value::as_bool) != Some(true) {
+                if let Some(text) = turn.take_if_over() {
+                    ctx.note_turn_text(&text);
+                }
                 turn.restart();
             }
             let mut fresh: Vec<String> = Vec::new();
@@ -3312,6 +3325,46 @@ mod tests {
         assert!(
             crate::delegation::testing::take(&worker).is_none(),
             "filed exactly once"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A turn ending and the next prompt in ONE drain pass still files**
+    /// (V39 review R-2).
+    ///
+    /// The fire is deferred to the end of the pass, and the user prompt that
+    /// starts the next turn resets the buffer — so a pass carrying both wiped
+    /// an ended-but-unfiled turn, and the delegation waiting on it ran to its
+    /// deadline. Routine whenever the user types quickly or a paused tap
+    /// catches up in one read.
+    #[tokio::test]
+    async fn a_turn_that_ends_in_the_same_pass_as_the_next_prompt_still_files() {
+        let dir = std::env::temp_dir().join(format!("oob-turn-r2-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session-1.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"user","message":{"content":"summarise latch.ts"}}"#,
+                "\n",
+                r#"{"type":"assistant","message":{"id":"m1","stop_reason":"end_turn","content":[{"type":"text","text":"It exports three symbols."}]}}"#,
+                "\n",
+                // …and the user's next prompt lands in the SAME chunk.
+                r#"{"type":"user","message":{"content":"now the other file"}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let ctx = turn_ctx("ai-r2-worker");
+        let worker = TabId::from_str("ai-r2-worker");
+        let _registry = crate::delegation::testing::lock_registry();
+        crate::delegation::testing::claim_and_submit(&worker);
+        let mut turn = TurnText::default();
+        drain_for_turn(&path, &dir, 0, &mut turn, &ctx).await;
+        assert_eq!(
+            crate::delegation::testing::take(&worker).as_deref(),
+            Some("It exports three symbols."),
+            "the answer must be filed before the next prompt resets the buffer"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -4,7 +4,7 @@
 //! harness surface into one directory; the three § 4.1 tests here
 //! ([`no_harness_literals_outside_harness`],
 //! [`harness_modules_do_not_import_capabilities`],
-//! [`every_harness_dir_declares_its_capabilities`]) are what stop the next
+//! [`every_registry_entry_is_fully_wired`]) are what stop the next
 //! feature from putting it back. The fourth test named in § 4.1,
 //! `wired_in_paths_exist`, already lives with the registry it checks
 //! ([`crate::harness::contract`]) and is what forced this phase to update every
@@ -399,15 +399,18 @@ fn the_literal_scan_reads_the_same_code_on_every_platform() {
 
     // …and neither pass may be reading nothing. `tabs/config.rs` is the file the
     // CRLF bug flooded with false hits, so it is also the honest witness that the
-    // CRLF pass still reaches real production code: `resolve_oob_source` is a
+    // CRLF pass still reaches real production code: `build_ai_tool_spec` is a
     // production fn, sits above that file's test module, and is not a needle.
+    // (It replaced `resolve_oob_source`, which V40 Phase A moved behind
+    // `HarnessPlugin::resolve_oob` — a witness has to be a function that is
+    // still there.)
     let (_, config) = crlf
         .iter()
         .find(|(p, _)| p == "tabs/config.rs")
         .expect("tabs/config.rs is in the tree");
     let body = executable_text("tabs/config.rs", config);
     assert!(
-        body.contains("fn resolve_oob_source"),
+        body.contains("fn build_ai_tool_spec"),
         "the CRLF pass lost `tabs/config.rs`'s production code — an equal-and-empty comparison \
          above would then be two blind runs agreeing"
     );
@@ -492,19 +495,30 @@ fn executable_text_ignores_line_endings_and_cuts_at_every_test_item() {
     );
 }
 
-/// Which `harness/<id>/` directory belongs to which [`Harness`].
+/// Which `harness/<id>/` directory belongs to which [`Harness`] — **a view over
+/// the registry**, not a second list (V40 locked decision 1).
 ///
-/// A new sub-directory must be added here, which is what makes
-/// [`every_harness_dir_declares_its_capabilities`] able to say anything at all.
-const HARNESS_DIRS: &[(&str, Harness)] = &[("claude", Harness::Claude), ("opencode", Harness::OpenCode)];
+/// It used to be a hand-kept array, which meant a new harness had to be declared
+/// twice and the test could only ever check the half it was told about.
+fn harness_dirs() -> Vec<(&'static str, Harness)> {
+    crate::harness::registry::HARNESSES
+        .iter()
+        .map(|d| (d.id, d.harness()))
+        .collect()
+}
 
-/// **Every `harness/<id>/` declares itself** (design § 4.1).
+/// **Every registry entry is fully wired** (V40 locked decision 10(b)).
 ///
-/// Two claims, because a harness nobody can reason about fails either one: it
-/// has rows in the capability registry (what cImp depends on it for), and it
-/// opens with a CHP hello (what it says it can serve, per tab, at connect).
+/// One descriptor is a promise about eight places; this is the test that makes
+/// forgetting one of them a red build instead of a silent hole. It absorbed
+/// V35's `every_harness_dir_declares_its_capabilities`, whose two claims are the
+/// first two below.
+///
+/// Checked **in both directions** for the directory set: a `harness/<id>/`
+/// directory the registry does not declare fails just as loudly as a descriptor
+/// with no directory.
 #[test]
-fn every_harness_dir_declares_its_capabilities() {
+fn every_registry_entry_is_fully_wired() {
     let root = src_root().join("harness");
     let on_disk: BTreeSet<String> = std::fs::read_dir(&root)
         .expect("src/harness exists")
@@ -512,17 +526,29 @@ fn every_harness_dir_declares_its_capabilities() {
         .filter(|e| e.path().is_dir())
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .collect();
-    let declared: BTreeSet<String> = HARNESS_DIRS.iter().map(|(d, _)| d.to_string()).collect();
+    let declared: BTreeSet<String> = harness_dirs().iter().map(|(d, _)| d.to_string()).collect();
     assert_eq!(
         on_disk, declared,
-        "a `harness/<id>/` directory exists that this test does not know about (or vice versa) — \
-         declare it in HARNESS_DIRS so its rows and its hello are checked"
+        "a `harness/<id>/` directory exists that the registry does not declare (or vice versa) — \
+         add its `HarnessDescriptor` row so its rows, its hello, its grants, its spawn signature \
+         and its health panel are all checked"
     );
 
-    for (dir, harness) in HARNESS_DIRS {
+    // The `MAINTENANCE.md` drift table — read as a document, so "the doc has
+    // rows for this harness" is checked against the file rather than a copy.
+    let maintenance = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/MAINTENANCE.md"),
+    )
+    .expect("docs/MAINTENANCE.md is readable");
+
+    for d in crate::harness::registry::HARNESSES {
+        let dir = d.id;
+        let harness = d.harness();
+
+        // 1. Capability rows: what cImp depends on this harness for.
         let rows: Vec<&str> = CAPABILITIES
             .iter()
-            .filter(|c| c.harness == *harness)
+            .filter(|c| c.harness == harness)
             .map(|c| c.id)
             .collect();
         assert!(
@@ -530,8 +556,9 @@ fn every_harness_dir_declares_its_capabilities() {
             "harness/{dir}/ has no rows in the capability registry — nothing records what cImp \
              depends on it for, so nothing can degrade visibly when it changes"
         );
-        // The hello is the other half: `serves` / `cannot`, built from the
-        // per-tab flags that decided what was actually wired (design D3).
+
+        // 2. The hello: `serves` / `cannot`, built from the per-tab flags that
+        //    decided what was actually wired (design D3).
         let has_hello = std::fs::read_dir(root.join(dir))
             .expect("harness dir readable")
             .flatten()
@@ -547,7 +574,82 @@ fn every_harness_dir_declares_its_capabilities() {
              stale-artifact detection cannot cover its tabs and a capability's absence is \
              indistinguishable from nobody having written it down"
         );
+
+        // 3. Identity: a binary to recognise it by, at least one reserved tab id,
+        //    a consumer token, and a label a human reads.
+        assert!(!d.binaries.is_empty(), "{dir}: no binary — nothing can classify its tabs");
+        assert!(!d.tab_ids.is_empty(), "{dir}: no reserved tab id");
+        assert!(!d.consumer.is_empty(), "{dir}: no MCP consumer token");
+        assert!(!d.label.is_empty(), "{dir}: no human label");
+
+        // 4. A spawn signature. A harness with none gets NO restart hint when a
+        //    spawn-baked setting changes — the exact failure the mechanism exists
+        //    to prevent, and the one that used to be a missing array element.
+        assert!(
+            !d.plugin
+                .spawn_sig(&crate::settings::Settings::default())
+                .is_null(),
+            "{dir}: `spawn_sig` answers null — a spawn-baked setting could change with no \
+             restart hint, silently"
+        );
+
+        // 5. A non-empty sandbox grant table. A grant table nobody wrote is not a
+        //    boundary; it is a tool that fails to start for reasons the user
+        //    cannot see.
+        let home = std::path::PathBuf::from("/home/tester");
+        let grants = d.plugin.sandbox_grants(&crate::harness::plugin::GrantCtx {
+            home: &home,
+            env: &|_| None,
+        });
+        assert!(
+            !grants.is_empty(),
+            "{dir}: declares no sandbox grant rows — a sandboxed tab of this harness would be \
+             confined away from its own state with no row explaining it"
+        );
+
+        // 6. A health panel row, so a user can see what is broken.
+        assert!(
+            super::health::panel_labels().iter().any(|(h, _)| *h == harness),
+            "{dir}: no Harness health panel — a capability the user can be blocked by and \
+             cannot see is what that panel exists to end"
+        );
+
+        // 7. The `MAINTENANCE.md` drift table names its rows.
+        for id in &rows {
+            assert!(
+                maintenance.contains(id),
+                "{dir}: capability `{id}` has no row in docs/MAINTENANCE.md — the human twin of \
+                 the registry has to be editable in the same commit"
+            );
+        }
+
+        // 8. A harness configured through a file cImp writes gets plugin
+        //    goldens, so a change to that file is a reviewable diff.
+        if d.features
+            .contains(&crate::harness::registry::HarnessFeature::FileArtifact)
+        {
+            let goldens = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("fixtures")
+                .join("plugin-goldens")
+                .join(dir);
+            assert!(
+                goldens.is_dir(),
+                "{dir}: declares FileArtifact but has no fixtures/plugin-goldens/{dir}/ — the \
+                 artifact it writes would change with no diff to review"
+            );
+        }
     }
+
+    // The neutral panel is a SECOND source, not a descriptor (amendment 0-e):
+    // dropping it would hide the `delegation.worker` gate.
+    assert!(
+        super::health::panel_labels()
+            .iter()
+            .any(|(h, _)| *h == Harness::ANY),
+        "the Harness health panels lost their neutral row — the `Harness::ANY` capabilities \
+         (today `delegation.worker`) carry a GATE, and a gate the user can be blocked by and \
+         cannot see is the thing that panel exists to end"
+    );
 }
 
 /// The L4 capabilities. A harness module reaching for one of these has put
@@ -694,5 +796,257 @@ fn harness_modules_do_not_import_capabilities() {
         stale.is_empty(),
         "these UPWARD_EXEMPT entries no longer import anything upward — delete them. An exemption \
          that outlives its reason is how a shrinking list becomes padding: {stale:#?}"
+    );
+}
+
+// ── V40 locked decision 10(a): harness IDENTITY, not harness payloads ───────
+
+/// Production files outside `harness/` that may still name a harness, each with
+/// the reason and the phase that retires it.
+///
+/// This is the worklist for V40 phases B–G, and it is **meant to be long right
+/// now**: Phase A moved the registry, the plugin interface and the ten "which
+/// harness" functions, and every remaining row here is a surface a later phase
+/// owns. What it must never be is *dishonest* — an entry that does not
+/// correspond to a real hit, or a hit that nobody wrote a reason for.
+///
+/// **Checked in both directions** by
+/// [`every_identity_allowlist_entry_is_still_earning_it`], exactly like
+/// [`LITERAL_ALLOWLIST`] and [`UPWARD_EXEMPT`]: a path must exist AND still
+/// contain an identity hit, so an entry cannot outlive the code it was written
+/// for and become a blanket exemption for whatever that file grows into. It
+/// already caught one: `graph/mcp.rs` had a row here until Phase A's fix to
+/// `source_for_consumer` left the file with no identity in it at all.
+const IDENTITY_ALLOWLIST: &[(&str, &str)] = &[
+    // ── settings: persisted wire forms and frozen migrations ───────────────
+    (
+        "settings/schema.rs",
+        "PERSISTED WIRE FORMS. `CLAUDE_TAB_ID` / `CLAUDE_LOCAL_TAB_ID` / `OPENCODE_TAB_ID` and \
+         `AiTabId`'s serde renames are what is on disk in every user's settings file, and \
+         `RETIRED_TAB_IDS` is a migration input. Locked decision 3 keeps their encodings; what \
+         moved in Phase A is the ORDER (`canonical_ai_tab_order` is a registry view) and the \
+         ranking (`AiTabId::canonical_order`). The remaining per-harness FIELDS \
+         (`claude_local`, `statusline`, `expose_commands_claude/opencode`, \
+         `claude_access/opencode_access`, `harness_versions.*`) go behind the plugin's `ext` \
+         with the 35 -> 36 migration. Phase B (locked decisions 5 and 6).",
+    ),
+    (
+        "settings/persistence.rs",
+        "FROZEN HISTORY plus the field pairs Phase B replaces. The historical migrations \
+         describe old on-disk shapes and must keep their literals (locked decision 14); \
+         `note_harness_version`'s two writes are `claude_last_seen` / `opencode_last_seen`, a \
+         field PAIR that becomes `Settings.harness[<id>]` in Phase B — Phase A moved the \
+         DISPATCH (an unregistered id is now dropped with a log line instead of landing on a \
+         `_ => {}`), the fields move with the schema bump. Phase B (locked decision 5).",
+    ),
+    // ── state: a persisted tab id is a persisted tab id ────────────────────
+    (
+        "state/manager.rs",
+        "PERSISTED WIRE FORMS (locked decision 29). `TabId::{as_str, from_str}` and its \
+         `Serialize`/`Deserialize` carry `\"claude\"` / `\"claude-local\"` / `\"opencode\"` \
+         because those strings are in every settings file and every frontend payload; typing \
+         them as `HarnessId` would mis-read a pre-split row. Phase A removed the per-harness \
+         BRANCHES (`kind`, `is_builtin` are registry lookups now); the variants stay for the \
+         encodings. The `StateSignal::ClaudeOutput*` / `claude_output_active` names are a \
+         different residue — they are renamed to `HarnessOutput*` and become CHP events in \
+         Phase D (locked decisions 18 and 30).",
+    ),
+    // ── the MCP consumer vocabulary ────────────────────────────────────────
+    (
+        "offload/mcp_host.rs",
+        "The `Consumer` ENUM has a variant per harness, which locked decision 25 replaces with \
+         `PerHarness` in Phase B. Until the variants go, the join between them and the registry \
+         has to be spelled once — `Consumer::for_harness` / `Consumer::harness` are that one \
+         place, and Phase A pointed `tool_defs_for(HarnessId)` and the grant path through them. \
+         `Consumer::parse`'s unknown-token fallback and the `claude_access`/`opencode_access` \
+         field pair go with the settings map. Phase B (locked decisions 5 and 25).",
+    ),
+    (
+        "settings/injection.rs",
+        "The injection hierarchy's own `Consumer` enum, same shape and same phase as the MCP \
+         host's. Phase A made `Consumer::for_command` FALLIBLE (an unregistered command no \
+         longer resolves as OpenCode) and added `from_agent`; what remains is the two-variant \
+         vocabulary itself and `Scope::Tab { agent: \"opencode\" }` in the OpenCode native-web \
+         gate, which is `Feature::OpencodeNativeGate` — a plugin-scoped feature in Phase B. \
+         Phase B (locked decisions 5, 6 and 25).",
+    ),
+    // ── the loopback wire ──────────────────────────────────────────────────
+    (
+        "offload/loopback.rs",
+        "L2 BY DESIGN plus the hook ingress Phase C moves. This file is the receiving end of \
+         the wire: the `/claude/hook/*` route table and the ~900 lines of `handle_claude_*` \
+         bodies move to `harness/claude/hook.rs` behind `HarnessPlugin::routes()` (locked \
+         decisions 15 and 22), `classify_permission_event` reads Claude's `hook_event_name` \
+         values, and the `X-CIMP-*` identity special-case goes with them. Phase A collapsed \
+         what it could here — `AUDIT_CONSUMERS` is a registry view and the consumer defaults \
+         resolve through `DEFAULT_HARNESS`. This file leaves BOTH allowlists in Phase C.",
+    ),
+    // ── the per-harness surfaces later phases own ──────────────────────────
+    (
+        "graph/service.rs",
+        "SESSION IDENTITY (locked decision 20). `live_claude_sessions` filters `e.agent == \
+         \"claude\"` and the tab-binding ambiguity guard is keyed by it, because Claude keys \
+         live sessions by TAB id and OpenCode by SESSION id — one map with two key spaces. \
+         `live_sessions_for(HarnessId)` and a declared `session_key_space()` are what fix it. \
+         Phase A closed the one silent fallback here (`session_agent(..).unwrap_or(\"claude\")` \
+         now skips the provenance row rather than mis-stamping it). Phase D.",
+    ),
+    (
+        "offload/mcp.rs",
+        "`consumer() == \"claude\"` gates the session-push registration \
+         (`--dangerously-load-development-channels` and the child's `--channel-push`), which \
+         locked decision 25 turns into a declared `supports_session_push()` on the plugin — \
+         OpenCode has no MCP inbound path, and that is a fact about OpenCode, not about \
+         Claude. Phase A registry-resolved this child's `--consumer` (a typo now refuses the \
+         proxy start naming the registered ids) and made `delegate_targets` iterate the \
+         registry. Phase D (locked decisions 19 and 25).",
+    ),
+    (
+        "tabs/config.rs",
+        "TWO residuals, both named in place. `claude_harness()` is the permission-hook cwd \
+         fallback's harness — a Claude mechanism, because only Claude's hook payload has the \
+         cwd gap it exists for — and it moves behind `identity_of_request()` in Phase C \
+         (locked decision 22). `opencode_native_gate_for`'s `Scope::Tab { agent: \
+         \"opencode\" }` is `Feature::OpencodeNativeGate`, a plugin-scoped feature in Phase B \
+         (locked decision 6). Everything else this file used to know — the ten branches, the \
+         env strip list, the spawn signature, the OOB resolver, the artifact writes — is \
+         behind `HarnessPlugin` as of Phase A.",
+    ),
+    (
+        "ipc/tab_lifecycle.rs",
+        "ONE line: the `resolve_command(\"opencode\")` preflight that warns before enabling a \
+         tab whose CLI is not installed. Locked decision 26 makes it \
+         `HarnessPlugin::preflight()`, with Claude's \"not gated\" becoming a declared `Ok` \
+         rather than an absence. Phase A already replaced this file's canonical-order array \
+         with the registry view. Phase F.",
+    ),
+    (
+        "audit/runner.rs",
+        "`consumer_exposed` reads the `code_audit.expose_claude` / `_opencode` / `_offload` \
+         field TRIO, which locked decision 25 turns into a `PerHarness` plus the neutral \
+         offload slot. Phase A closed its silent fallback — an unrecognised consumer is now \
+         NOT exposed, where it used to inherit `expose_claude` (fail-open, on a question about \
+         reaching a scanner). The field names move with the settings map. Phase B.",
+    ),
+];
+
+/// The identity needles: every registry id, tab id, binary and consumer token.
+///
+/// Derived from the registry rather than hand-kept, so a harness added later
+/// widens the scan by that fact alone — the same two-sources-of-truth
+/// discipline [`harness_literals`] follows.
+fn identity_needles() -> BTreeSet<String> {
+    let mut out: BTreeSet<String> = BTreeSet::new();
+    for d in crate::harness::registry::HARNESSES {
+        out.insert(d.id.to_string());
+        out.insert(d.consumer.to_string());
+        out.extend(d.tab_ids.iter().map(|s| s.to_string()));
+        out.extend(d.binaries.iter().map(|s| s.to_string()));
+    }
+    out
+}
+
+/// Files whose harness identity is EXEMPT by class rather than by row.
+///
+/// `settings/migration.rs` and the historical migrations in
+/// `settings/persistence.rs` describe **old on-disk shapes** (locked decision
+/// 14): they are frozen history and must keep their literals, or they stop
+/// describing the files they exist to read. Test files are out of scope for the
+/// same reason [`executable_text`] drops test modules — a fixture that names a
+/// harness is a recorded input, not a dependency on one.
+fn identity_exempt_by_class(path: &str) -> bool {
+    path == "settings/migration.rs" || path.ends_with("tests.rs")
+}
+
+/// Every production file outside `harness/` that still names a harness, with the
+/// needles it names.
+fn identity_offenders(files: &[(String, String)]) -> BTreeMap<String, BTreeSet<String>> {
+    let needles = identity_needles();
+    assert!(
+        needles.len() >= 3,
+        "the identity needle list collapsed to {} entries — the registry-derived scan stopped \
+         producing tokens, which would make this test pass by finding nothing",
+        needles.len()
+    );
+    let mut offenders: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (path, text) in files {
+        if path.starts_with("harness/") || identity_exempt_by_class(path) {
+            continue;
+        }
+        if IDENTITY_ALLOWLIST.iter().any(|(p, _)| p == path) {
+            continue;
+        }
+        let body = executable_text(path, text);
+        for n in &needles {
+            if body.contains(&format!("\"{n}\"")) {
+                offenders.entry(path.clone()).or_default().insert(n.clone());
+            }
+        }
+    }
+    offenders
+}
+
+/// **No harness IDENTITY outside the registry** (V40 locked decision 10(a)).
+///
+/// [`no_harness_literals_outside_harness`] never policed this: its needles come
+/// from registry `Dep` tokens filtered to >= 8 chars / underscore / camelCase,
+/// so `"claude"` and `"opencode"` were never needles at all — `graph/service.rs`
+/// carried 128 of them and the suite was green. That test protects Claude's
+/// *payload field names*, which is what V35 Phase K set out to do; "which
+/// harness is this" was never in scope.
+///
+/// This one is that scope. Core may HOLD a `HarnessId` and pass it to the
+/// registry; it may not spell one, and it may not branch on one. The built-in
+/// ids exist for persisted wire forms, and those are what the allowlist is for.
+#[test]
+fn no_harness_identity_outside_registry() {
+    let offenders = identity_offenders(&source_files());
+    assert!(
+        offenders.is_empty(),
+        "harness identity outside `harness/` — resolve it through \
+         `harness::HarnessId::from_{{command,tab_id,consumer,id}}`, or add an IDENTITY_ALLOWLIST \
+         entry naming the phase that retires it:\n{offenders:#?}"
+    );
+}
+
+/// The identity allowlist, checked the other way round.
+///
+/// Every entry must name a file that exists AND still contains an identity
+/// needle. An exemption that outlives its reason is how a shrinking worklist
+/// becomes padding — the failure mode
+/// [`every_literal_allowlist_entry_is_still_earning_it`] was written for.
+#[test]
+fn every_identity_allowlist_entry_is_still_earning_it() {
+    let files: BTreeMap<String, String> = source_files().into_iter().collect();
+    let needles = identity_needles();
+    let mut stale: Vec<&str> = Vec::new();
+    let mut duplicated: Vec<&str> = Vec::new();
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    for (path, reason) in IDENTITY_ALLOWLIST {
+        assert!(
+            !reason.trim().is_empty(),
+            "{path}: an allowlist entry with no reason is an exemption nobody can review"
+        );
+        if !seen.insert(path) {
+            duplicated.push(path);
+        }
+        let Some(text) = files.get(*path) else {
+            stale.push(path);
+            continue;
+        };
+        let body = executable_text(path, text);
+        if !needles.iter().any(|n| body.contains(&format!("\"{n}\""))) {
+            stale.push(path);
+        }
+    }
+    assert!(
+        duplicated.is_empty(),
+        "IDENTITY_ALLOWLIST names the same file twice: {duplicated:#?}"
+    );
+    assert!(
+        stale.is_empty(),
+        "these IDENTITY_ALLOWLIST entries name a file that is gone or no longer contains any \
+         harness identity — delete them; the list is the B-G worklist, and a done row must \
+         leave it: {stale:#?}"
     );
 }

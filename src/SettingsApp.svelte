@@ -39,7 +39,7 @@
     defaultSettings,
     findTab,
     findTabIndex,
-    CAP_PRETOOLUSE_DENY,
+    CONTROL_READ_ADVISOR,
     OUTCOME_NO_FAILURE,
     capabilityBlocked,
     // V32 / #48 F-27: the ONE list of spawn-baked injection features, read by
@@ -53,13 +53,21 @@
     harnessRow,
     setHarnessExt,
   } from './lib/settings/types';
-  import { harnessSchemas, loadHarnessSchemas } from './lib/settings/harnessSchema';
+  import {
+    findHarnessByTabId,
+    harnesses,
+    harnessLabels,
+    harnessLabelsProse,
+    labelForTabId,
+    loadHarnesses,
+    reservedAiTabIds,
+  } from './lib/harness';
   import HarnessExtForm from './lib/settings/HarnessExtForm.svelte';
   import { contentClear, contentOpenFolder, setEnabledAiTabs } from './lib/ipc';
   import { listSttModels, listInputDevices } from './lib/stt';
   import {
     offloadTest,
-    offloadDeriveOpencodeProvider,
+    offloadDeriveLocalProvider,
     offloadStatuses,
     offloadBackendStart,
     offloadBackendStop,
@@ -96,13 +104,17 @@
     composeTemplatesGlobalSet,
     composeTemplatesProjectGet,
   } from './lib/compose/templates';
-  import { localDataExcludedScope, toolScopeMode } from './lib/settings/types';
+  import {
+    HARNESS_NATIVE_GATE_KEY,
+    localDataExcludedScope,
+    toolScopeMode,
+  } from './lib/settings/types';
   // V39 Phase C: the facade backends, derived from the tab roles this window
   // already holds — never fetched, so the list cannot disagree with the role
   // radio in the same settings snapshot.
   import { facadeBackends } from './lib/delegation';
   import type { AiTabId } from './lib/tabs/types';
-  import { AI_TABS } from './lib/tabs/types';
+  import { SPRITE_SETS } from './lib/avatarConfig';
   import { version as appVersion } from '../package.json';
   import ShortcutCapture from './lib/settings/ShortcutCapture.svelte';
   import TabSettingsSection from './lib/settings/TabSettingsSection.svelte';
@@ -194,7 +206,8 @@
   // column, so every plugin's credentials get it and none of them needs a flag
   // in this file.
   // Inline error under the AI-tabs checkbox group — e.g. when enabling an
-  // OpenCode tab is rejected because `opencode` isn't installed (ebin/PATH).
+  // an AI tab is rejected because its harness binary isn't installed
+  // (ebin/PATH).
   let aiTabsError = $state<string | null>(null);
   // V8-01 offload: test-box input/result and a busy guard for the
   // Start/Stop/Reset/Test buttons.
@@ -386,30 +399,35 @@
     }
   }
 
-  // V21: register the given Local backend as the OpenCode `local-llama`
-  // provider. Derives base URL + model from its server command in Rust (which
-  // errors, naming the missing --port/model flag, when the command is
-  // incomplete), then persists the snapshot and selects it as the default
-  // model so the OpenCode tab is ready to use. Overrides any existing
-  // registration. `opencodeProviderMsg` reports success/failure inline.
-  let opencodeProviderMsg = $state<{ i: number; text: string; ok: boolean } | null>(null);
-  async function registerOpencodeProvider(i: number): Promise<void> {
+  // V21: register the given Local backend as `harness`'s local provider.
+  // Derives base URL + model from its server command in Rust (which errors,
+  // naming the missing --port/model flag, when the command is incomplete), then
+  // persists the snapshot so a freshly opened tab of that harness is ready to
+  // use. Overrides any existing registration; `providerMsg` reports
+  // success/failure inline.
+  //
+  // V40 Phase F (locked decision 26/27): the harness is passed rather than
+  // assumed. The button is mounted by the `local_provider_config` feature, so
+  // the harness whose writer runs is the one whose button was clicked — with
+  // two such harnesses the backend would otherwise have refused, asking which.
+  let providerMsg = $state<{ i: number; text: string; ok: boolean } | null>(null);
+  async function registerLocalProvider(i: number, harness: string): Promise<void> {
     const backend = snapshot?.offload.backends[i];
     if (!backend || backend.kind.type !== 'local') return;
-    opencodeProviderMsg = null;
+    providerMsg = null;
     try {
-      const provider = await offloadDeriveOpencodeProvider(backend.kind.server_command);
-      // V40 Phase B: the derived block is the OpenCode plugin's own `ext` row
+      const provider = await offloadDeriveLocalProvider(harness, backend.kind.server_command);
+      // V40 Phase B: the derived block is that plugin's own `ext` row
       // (`SettingKind::Json` — written by cImp, never typed), not a field in
       // the offload block named after a harness.
-      patch((s) => setHarnessExt(s, 'opencode', 'provider', provider));
-      opencodeProviderMsg = {
+      patch((s) => setHarnessExt(s, harness, 'provider', provider));
+      providerMsg = {
         i,
         ok: true,
-        text: `Registered local-llama → ${provider.model} at ${provider.base_url}. OpenCode tabs will use it by default.`,
+        text: `Registered ${provider.model} at ${provider.base_url}. New tabs of that harness will use it by default.`,
       };
     } catch (e) {
-      opencodeProviderMsg = { i, ok: false, text: `${e}` };
+      providerMsg = { i, ok: false, text: `${e}` };
     }
   }
 
@@ -590,7 +608,7 @@
       hint: 'The on/off above the call/byte caps below. Off: neither cap applies, whatever their numbers say.',
     },
     canary: {
-      hint: 'A per-task marker planted in the worker’s system context; seeing it leave in a tool argument aborts the task. Worker-only — a Claude/OpenCode system prompt is not ours to mark.',
+      hint: 'A per-task marker planted in the worker’s system context; seeing it leave in a tool argument aborts the task. Worker-only — a harness’s own system prompt is not ours to mark.',
     },
     memory_quarantine: {
       hint: 'Notes written by a conversation that has read external content are stored held-for-review instead of entering project memory. Off: they are stored normally. Notes ALREADY held stay held — turning this off never releases them.',
@@ -611,13 +629,13 @@
       hint: 'Set by the Native web tools mode below, which is this feature’s app-wide switch: its "off" IS this control off, and its "sensor" — the shipped default — is this control ON but REPORT-ONLY, raising the taint badge without ever refusing a call. Only "deny" blocks anything. Use the per-tab overrides here to exempt or force one tab.',
     },
     consumer_hygiene: {
-      hint: 'The pinned OpenCode permission block and the data-not-instructions paragraph in the session guidance. Off: OpenCode inherits its upstream defaults and the session is never told how to read cImp’s markers.',
+      hint: 'The pinned harness permission block and the data-not-instructions paragraph in the session guidance. Off: the harness inherits its upstream defaults and the session is never told how to read cImp’s markers.',
     },
     tool_steering: {
       hint: 'One fixed paragraph in the session guidance asking the harness to prefer the `run_check` and `run_command` MCP tools over running the same commands in its own shell. It names no check, binary or path — it points at the tools’ own enums, which update live — so editing the tool registry never changes it. The `run_command` half is written only when that tool is exposed to this consumer (Tool Plugins → advertise commands). Off: nothing is injected and the harness reaches for its shell as it would without cImp.',
     },
-    opencode_native_gate: {
-      hint: 'App-wide ON since V39, like every other control here — but a newly created tab has all of its own switches OFF, so this denies nothing until you enable it for a tab (its shield badge, or the per-tab override below). It shipped app-wide OFF under locked decision 17, for the reason the sentence after this one gives; V39 kept the judgement and moved it a level down. With it on, an OpenCode tab that has read external content is refused its OWN bash/read/edit/write/patch/glob/grep for the rest of the session (and, having gone local first, its own webfetch/websearch instead). Whole-surface by design: a partial gate is routed around. Policy, not containment — it runs inside OpenCode’s process, so a nested ungated `opencode`, OPENCODE_PURE=1, a user-typed !shell and the raw terminal all bypass it. A per-tab override is the usual way in; it does nothing on Claude tabs.',
+    [HARNESS_NATIVE_GATE_KEY]: {
+      hint: 'App-wide ON since V39, like every other control here — but a newly created tab has all of its own switches OFF, so this denies nothing until you enable it for a tab (its shield badge, or the per-tab override below). It shipped app-wide OFF under locked decision 17, for the reason the sentence after this one gives; V39 kept the judgement and moved it a level down. With it on, a tab of the harness that HAS this gate, once it has read external content, is refused its OWN shell/read/edit/write/patch/glob/grep for the rest of the session (and, having gone local first, its own web tools instead). Whole-surface by design: a partial gate is routed around. Policy, not containment — it runs inside the harness’s own process, so a nested ungated copy of it, its pure mode, a user-typed !shell and the raw terminal all bypass it. A per-tab override is the usual way in; it does nothing on a tab whose harness has no native gate.',
     },
     terminal_escape_hygiene: {
       hint: 'Strips ANSI/OSC control sequences (including OSC 52 clipboard writes) out of external text cImp composes into spoken/toast output. Off: a fetched page’s escape sequences travel with the text.',
@@ -1157,7 +1175,12 @@
   // pre-Phase-E behaviour: `snapshot` is null then too, and the old
   // expression read an empty status as "not blocked".
   let harnessFresh = $state<HarnessStatus | null>(null);
-  const e1Gate = $derived(capabilityBlocked(harnessFresh, CAP_PRETOOLUSE_DENY));
+  // V40 Phase F: the capability id comes from the payload, keyed by the neutral
+  // control name (locked decision 27). An id the backend has not sent yet
+  // (first paint) reads as "not blocked", the same as a capability with no gate.
+  const e1Gate = $derived(
+    capabilityBlocked(harnessFresh, harnessFresh?.gated_controls?.[CONTROL_READ_ADVISOR] ?? ''),
+  );
   const e1Blocked = $derived(e1Gate !== null);
 
   // ── V35 Phase G: Harness health ─────────────────────────────────────────
@@ -1362,7 +1385,7 @@
     // own, named exactly as the milestone and the docs name it, so every
     // pointer at it is findable. It is deliberately NOT a sub-tab of Code
     // Intelligence or Tabs — the rows it shows govern the transcript readers,
-    // the statusline, the hooks, the OpenCode tap AND the native-tool gate, so
+    // the status line, the hooks, the out-of-band tap AND the native-tool gate, so
     // burying it under any one consumer would misdescribe its scope. Adjacent
     // to Advanced because it is a status board, not a set of knobs: it is
     // entirely read-only apart from one button.
@@ -1401,11 +1424,58 @@
   // sub-tab; every Shell tab is grouped under 'shells'. Keeps the
   // previously-collapsible <details> wall navigable.
   type TabsSubSection = AiTabId | 'shells';
-  let tabsSubSection = $state<TabsSubSection>('claude');
+  /// The reserved AI tab ids, in canonical order, from the registry (V40 Phase
+  /// F, locked decision 7). Empty until `harness_list` answers — every consumer
+  /// below iterates it, so a window that opened a frame early renders no AI tab
+  /// sections rather than sections for a roster it guessed.
+  const aiTabIds = $derived(reservedAiTabIds($harnesses));
+  /// The harnesses that MOUNT each feature panel (V40 Phase F, locked decision
+  /// 6). The two bottom-bar sections used to exist unconditionally and name one
+  /// product in their headings; they are feature slots now, so a build with no
+  /// harness that reports usage shows no usage panel at all rather than a panel
+  /// about a thing nothing does.
+  const sessionUsageHarnesses = $derived(
+    $harnesses.filter((h) => h.features.includes('session_usage')),
+  );
+  const contextBarHarnesses = $derived(
+    $harnesses.filter((h) => h.features.includes('context_bar')),
+  );
+  /// The shipped roster, as copy. Every sentence that used to enumerate the
+  /// harnesses by hand ("restart the X/Y tab") interpolates one of
+  /// these, so what a user reads is the roster the app actually has (V40 Phase
+  /// F, locked decision 7).
+  const harnessNames = $derived(harnessLabels($harnesses));
+  const harnessNamesProse = $derived(harnessLabelsProse($harnesses));
+  /// Each harness's OWN web tools, spelled the way it spells them — one
+  /// harness capitalises them and another does not, which is why no single
+  /// spelling could serve both (locked decision 27).
+  const nativeWebToolsByHarness = $derived(
+    $harnesses
+      .filter((h) => h.affordances.webTools.length > 0)
+      .map((h) => `${h.label}'s ${h.affordances.webTools.join('/')}`)
+      .join(' and '),
+  );
+  /// Where each harness keeps its own state, for the sandbox copy.
+  const harnessStateDirs = $derived(
+    $harnesses.flatMap((h) => h.affordances.stateDirs).join(', '),
+  );
+  /// How each harness receives an injected prompt.
+  const injectMechanisms = $derived(
+    $harnesses
+      .filter((h) => h.affordances.injectMechanism)
+      .map((h) => `${h.label} via ${h.affordances.injectMechanism}`)
+      .join(', '),
+  );
+  /// The sub-tab the Tabs section opens on: the first reserved tab there is.
+  /// `''` while the roster is loading, which is one paint at most.
+  let tabsSubSection = $state<TabsSubSection>('');
+  $effect(() => {
+    if (tabsSubSection === '' && aiTabIds.length > 0) tabsSubSection = aiTabIds[0];
+  });
   // Sub-tab nav within the Offload section: the backend pool + limits live
   // under 'pool'; native tools, allowlist, and command policies under 'tools'.
   // (MCP servers moved to their own top-level `mcp` section — they're usable by
-  // Claude Code directly now, not just the offload worker.)
+  // the harness tabs directly now, not just the offload worker.)
   type OffloadSubSection = 'pool' | 'tools';
   let offloadSubSection = $state<OffloadSubSection>('pool');
   // Sub-tab nav within the Code Intelligence section: index/build knobs under
@@ -1414,14 +1484,7 @@
   type GraphSubSection = 'graph' | 'semantic' | 'efficiency' | 'viz';
   let graphSubSection = $state<GraphSubSection>('graph');
   function subSectionForTabId(tabId: string): TabsSubSection {
-    if (
-      tabId === 'claude' ||
-      tabId === 'claude-local' ||
-      tabId === 'opencode'
-    ) {
-      return tabId;
-    }
-    return 'shells';
+    return aiTabIds.includes(tabId) ? tabId : 'shells';
   }
 
   // Keep `snapshot` in sync with the global store. Every input mutates
@@ -1508,11 +1571,12 @@
   onMount(async () => {
     await initSettings();
     if (disposed) return;
-    // V40 Phase B: what each harness declares. Fetched once — it is `'static`
-    // backend data — and read by the generic per-harness form, the two
-    // exposure lists and the MCP access boxes, so none of them re-declares the
-    // roster.
-    void loadHarnessSchemas();
+    // V40 Phase F (locked decision 7): the registry — ids, labels, reserved tab
+    // ids, features, affordances and each harness's declared settings. Fetched
+    // once, since it is `'static` backend data, and read by the per-harness
+    // form, the enable checkboxes, the sub-tab nav, the two exposure lists and
+    // the MCP access boxes, so none of them re-declares the roster.
+    void loadHarnesses();
     startBackendStatusPolling();
     void refreshPlugins();
     pluginsProjectKey()
@@ -1522,7 +1586,7 @@
       // writing overrides under an empty key that nothing would ever read.
       .catch((e) => console.warn('plugins_project_key failed', e));
     snapshot = structuredClone(get(settings));
-    for (const t of AI_TABS) captureBaseline(t);
+    for (const t of aiTabIds) captureBaseline(t);
     injectionAppBaseline = injectionAppShape(snapshot);
     unsub = settings.subscribe((s) => {
       draftSync.broadcast(s);
@@ -1555,7 +1619,7 @@
     void refreshHarness().then(() => {
       if (harnessFresh?.verify_in_flight) startHarnessPoll();
     });
-    for (const t of AI_TABS) {
+    for (const t of aiTabIds) {
       aiToolTabDefaults(t)
         .then((d) => {
           tabDefaults = { ...tabDefaults, [t]: d };
@@ -1665,17 +1729,16 @@
     let next_ids: AiTabId[];
     if (enable) {
       // Insert in canonical order so the persisted list mirrors the
-      // tab-bar order users see.
-      const order: AiTabId[] = ['claude', 'claude-local', 'opencode'];
-      next_ids = order.filter((x) => prev.includes(x) || x === id);
+      // tab-bar order users see. The order is the registry's declaration order
+      // flattened through each descriptor's `tab_ids` (V40 Phase F).
+      next_ids = aiTabIds.filter((x) => prev.includes(x) || x === id);
     } else {
       if (prev.length <= 1) return; // last-one lock (also guarded by the disabled attribute)
       next_ids = prev.filter((x) => x !== id);
     }
     if (!enable && tabsSubSection === id) {
       // Jump to the first surviving id in canonical order.
-      const order: AiTabId[] = ['claude', 'claude-local', 'opencode'];
-      const survivor = order.find((x) => next_ids.includes(x));
+      const survivor = aiTabIds.find((x) => next_ids.includes(x));
       if (survivor) tabsSubSection = survivor;
     }
     const updated = structuredClone($state.snapshot(snapshot));
@@ -1793,7 +1856,8 @@
   }
 
   // Restart-affecting subset: command + args + cwd + env + the local-provider
-  // toggle (it synthesizes ANTHROPIC_* env at launch). Notifications,
+  // toggle (it synthesizes the harness's local-provider env at launch).
+  // Notifications,
   // first_launch_notice_dismissed, and (V20) the tts_injection speak gate
   // apply live and are excluded — the out-of-band TTS source reads the toggle
   // per-utterance, so flipping it takes effect without relaunching the tab.
@@ -1859,18 +1923,25 @@
   ///
   /// This is the wider signal of the two: it covers every spawn-baked input,
   /// not just the injection hierarchy — MCP server exposure, the guidance
-  /// addendum, the statusline overlay, the local-provider env, the OpenCode
-  /// provider block. Cleared per tab when that tab is restarted from here.
+  /// addendum, the status-line overlay, whatever local-provider config a
+  /// harness writes. Cleared per tab when that tab is restarted from here.
   let spawnStaleTabs = $state<string[]>([]);
 
+  /// The reserved tabs a consumer token's harness owns — the tabs an exposure
+  /// flag for that consumer actually reaches.
+  ///
+  /// V40 Phase F: a registry lookup. It used to be a two-arm branch whose
+  /// `else` handed every unrecognised consumer one harness's tabs, so a third
+  /// harness's exposure row would have listed somebody else's tabs as its own.
+  /// An unregistered token now owns no tabs, which is the honest answer.
   function consumerTabs(consumer: string): AiTabId[] {
-    return consumer === 'opencode' ? ['opencode'] : ['claude', 'claude-local'];
+    return $harnesses.find((h) => h.consumer === consumer)?.tab_ids ?? [];
   }
 
   const restartRequired = $derived.by(() => {
     const out: Record<string, boolean> = {};
     if (!snapshot) return out;
-    for (const t of AI_TABS) {
+    for (const t of aiTabIds) {
       const baseline = tabBaselines[t];
       const live = aiTabFromSnapshot(t);
       const backendStale = spawnStaleTabs.includes(t);
@@ -2247,9 +2318,9 @@
      nothing, with no work here. -->
 {#snippet harnessSettingsFor(harnessId: string)}
   {#if snapshot}
-    {#each $harnessSchemas.filter((h) => h.id === harnessId) as h (h.id)}
+    {#each $harnesses.filter((h) => h.id === harnessId) as h (h.id)}
       <HarnessExtForm
-        schema={h}
+        harness={h}
         snapshot={snapshot}
         patch={(id, key, value) => patch((s) => setHarnessExt(s, id, key, value))}
       />
@@ -2726,8 +2797,12 @@
                 onchange={(e) =>
                   patch((s) => (s.avatar.sprite.set = (e.currentTarget as HTMLSelectElement).value))}
               >
-                <option value="impSprites">cImp (pixel art)</option>
-                <option value="claudeSprites">Claude (pixel art)</option>
+                <!-- V40 Phase F: the bundled sets are named once, in
+                     `avatarConfig.ts` (locked decision 29 rules them brand
+                     assets, not harness identity). -->
+                {#each SPRITE_SETS as set (set.id)}
+                  <option value={set.id}>{set.label}</option>
+                {/each}
               </select>
             </label>
             <small class="hint">
@@ -3320,15 +3395,16 @@
           </button>
         </section>
       {:else if activeSection === 'bottom-bar'}
+        {#if sessionUsageHarnesses.length > 0}
         <section>
-          <h2>Claude session usage</h2>
+          <h2>{harnessLabels(sessionUsageHarnesses)} session usage</h2>
           <small class="hint top">
-            Shows your Claude Code session (5h) and weekly (7d) quota in the
-            bottom bar, next to Layouts. The numbers are reported by the Claude
-            tab's status line, so they need the context statusline (below) left
-            on and a Claude tab that has sent at least one message; the widget
-            hides until then, and dims when the last report gets old (Claude
-            tab closed or idle too long).
+            Shows the quota windows {harnessLabelsProse(sessionUsageHarnesses)}
+            reports, in the bottom bar next to Layouts. The numbers come from
+            that harness's own status line, so they need the context status bar
+            (below) left on and one of its tabs to have sent at least one
+            message; the widget hides until then, and dims when the last report
+            gets old (tab closed, or idle too long).
           </small>
           <label class="checkbox">
             <input
@@ -3402,12 +3478,13 @@
             second locally between refreshes.
           </small>
         </section>
+        {/if}
 
         <section>
           <h2>Local machine information</h2>
           <small class="hint top">
             Live CPU / memory / GPU / network panel in the bottom bar, right of
-            the Claude session usage meter.
+            the session usage meter.
           </small>
           <label class="checkbox">
             <input
@@ -3518,24 +3595,29 @@
           </small>
         </section>
 
+        {#each contextBarHarnesses as h (h.id)}
         <section>
-          <h2>Claude context bar</h2>
+          <h2>{h.label} context bar</h2>
           <small class="hint top">
-            Adds a context-window usage bar to Claude Code's own status line
-            inside each Claude tab — e.g. <code>Opus ▓▓▓▓▓░░░░░ 50% (100k/200k)</code>,
-            themed to your terminal palette. cImp wires this up only for the
-            Claude tabs it launches; your global Claude Code configuration is
-            left untouched. The status line also feeds the session-usage meter
-            above — turning it off leaves that meter with no data.
+            Adds a context-window usage bar to {h.label}'s own status line inside
+            each of its tabs — e.g.
+            <code>model ▓▓▓▓▓░░░░░ 50% (100k/200k)</code>, themed to your
+            terminal palette. cImp wires this up only for the tabs it launches;
+            your own global {h.label} configuration is left untouched. The status
+            line also feeds the session-usage meter above — turning it off leaves
+            that meter with no data.
           </small>
-          <!-- V40 Phase B: the switch is one of Claude Code's own declared
-               settings now, so it renders with the rest of them rather than
-               being a control this window hard-codes for one harness. -->
+          <!-- V40 Phase B: the switch is one of the harness's own declared
+               settings, so it renders with the rest of them rather than being a
+               control this window hard-codes for one harness. V40 Phase F: the
+               section itself is mounted by the `context_bar` feature, and every
+               name in it is the descriptor's. -->
           <small class="hint">
             The switch lives with the harness that has the status line:
-            <strong>Tabs → Claude Code → Claude Code settings</strong>.
+            <strong>Tabs → {labelForTabId($harnesses, h.tab_ids[0])}</strong>.
           </small>
         </section>
+        {/each}
 
         <section>
           <h2>External tools</h2>
@@ -3611,15 +3693,12 @@
           </label>
         </section>
       {:else if activeSection === 'tabs'}
-        {@const claudeLive = aiTabAt('claude')}
-        {@const claudeLocalLive = aiTabAt('claude-local')}
-        {@const opencodeLive = aiTabAt('opencode')}
         {@const shellEntries = tabEntries.filter((e) => e.kind === 'shell')}
         {@const enabledAiTabs = snapshot.enabled_ai_tabs}
         {@const lastChecked = enabledAiTabs.length === 1 ? enabledAiTabs[0] : null}
         <section>
           <h2>Tabs</h2>
-          <fieldset class="claude-tabs-radio">
+          <fieldset class="ai-tabs-radio">
             <legend>AI tabs enabled</legend>
             <small class="hint">
               Pick which AI-tool tabs to keep. Toggling a checkbox opens
@@ -3628,51 +3707,27 @@
               checked.
             </small>
             <div class="radio-row">
-              <label>
-                <input
-                  type="checkbox"
-                  name="ai-tabs-enabled"
-                  value="claude"
-                  checked={enabledAiTabs.includes('claude')}
-                  disabled={lastChecked === 'claude'}
-                  onchange={(e) =>
-                    void toggleAiTabEnabled(
-                      'claude',
-                      (e.currentTarget as HTMLInputElement).checked,
-                    )}
-                />
-                Claude (cloud)
-              </label>
-              <label>
-                <input
-                  type="checkbox"
-                  name="ai-tabs-enabled"
-                  value="claude-local"
-                  checked={enabledAiTabs.includes('claude-local')}
-                  disabled={lastChecked === 'claude-local'}
-                  onchange={(e) =>
-                    void toggleAiTabEnabled(
-                      'claude-local',
-                      (e.currentTarget as HTMLInputElement).checked,
-                    )}
-                />
-                Claude (local)
-              </label>
-              <label>
-                <input
-                  type="checkbox"
-                  name="ai-tabs-enabled"
-                  value="opencode"
-                  checked={enabledAiTabs.includes('opencode')}
-                  disabled={lastChecked === 'opencode'}
-                  onchange={(e) =>
-                    void toggleAiTabEnabled(
-                      'opencode',
-                      (e.currentTarget as HTMLInputElement).checked,
-                    )}
-                />
-                OpenCode
-              </label>
+              <!-- V40 Phase F (locked decision 7): one checkbox per RESERVED
+                   tab id the registry declares, in its canonical order. It was
+                   three hand-written boxes, so a third harness's tabs could not
+                   be turned on at all without editing this file. -->
+              {#each aiTabIds as aiTabId (aiTabId)}
+                <label>
+                  <input
+                    type="checkbox"
+                    name="ai-tabs-enabled"
+                    value={aiTabId}
+                    checked={enabledAiTabs.includes(aiTabId)}
+                    disabled={lastChecked === aiTabId}
+                    onchange={(e) =>
+                      void toggleAiTabEnabled(
+                        aiTabId,
+                        (e.currentTarget as HTMLInputElement).checked,
+                      )}
+                  />
+                  {labelForTabId($harnesses, aiTabId)}
+                </label>
+              {/each}
             </div>
             {#if aiTabsError}
               <small class="error">{aiTabsError}</small>
@@ -3729,33 +3784,20 @@
             embedded webview.
           </small>
           <div class="sub-tabs" role="tablist" aria-label="Tabs sub-sections">
-            <button
-              type="button"
-              role="tab"
-              class:active={tabsSubSection === 'claude'}
-              aria-selected={tabsSubSection === 'claude'}
-              onclick={() => (tabsSubSection = 'claude')}
-            >
-              Claude
-            </button>
-            <button
-              type="button"
-              role="tab"
-              class:active={tabsSubSection === 'claude-local'}
-              aria-selected={tabsSubSection === 'claude-local'}
-              onclick={() => (tabsSubSection = 'claude-local')}
-            >
-              Claude (local)
-            </button>
-            <button
-              type="button"
-              role="tab"
-              class:active={tabsSubSection === 'opencode'}
-              aria-selected={tabsSubSection === 'opencode'}
-              onclick={() => (tabsSubSection = 'opencode')}
-            >
-              OpenCode
-            </button>
+            <!-- V40 Phase F: one sub-tab per reserved AI tab id, from the
+                 registry (locked decision 7). Three hand-written buttons
+                 before, each naming a tab id and a product. -->
+            {#each aiTabIds as aiTabId (aiTabId)}
+              <button
+                type="button"
+                role="tab"
+                class:active={tabsSubSection === aiTabId}
+                aria-selected={tabsSubSection === aiTabId}
+                onclick={() => (tabsSubSection = aiTabId)}
+              >
+                {labelForTabId($harnesses, aiTabId)}
+              </button>
+            {/each}
             <button
               type="button"
               role="tab"
@@ -3770,67 +3812,50 @@
             </button>
           </div>
 
-          {#if tabsSubSection === 'claude'}
-            <div id="tab-section-claude">
-              {#if claudeLive}
+          {#if aiTabIds.includes(tabsSubSection)}
+            <!--
+              V40 Phase F (locked decision 7): ONE body for every reserved AI
+              tab, instead of a `{:else if}` per tab id. The two facts that used
+              to be spelled per branch are registry lookups now:
+
+              * the harness's declared settings render under its FIRST reserved
+                tab, because they are the harness's and not the tab's — a second
+                reserved tab of the same harness (a local-provider variant) gets
+                a pointer to that section rather than a second copy of the form;
+              * every name comes from the descriptor, so a harness added over
+                IPC arrives with its own heading and no markup here.
+            -->
+            {@const harness = findHarnessByTabId($harnesses, tabsSubSection)}
+            {@const live = aiTabAt(tabsSubSection)}
+            {@const ownsForm = harness?.tab_ids[0] === tabsSubSection}
+            <div id="tab-section-{tabsSubSection}">
+              {#if live}
                 <TabSettingsSection
-                  tabId={'claude'}
-                  displayName={'Claude'}
+                  tabId={tabsSubSection}
+                  displayName={labelForTabId($harnesses, tabsSubSection)}
                   bind:settings={
-                    () => claudeLive,
-                    (v) => patchAiTab('claude', v)
+                    () => live,
+                    (v) => patchAiTab(tabsSubSection, v)
                   }
-                  defaults={tabDefaults['claude'] ?? null}
-                  restartRequired={restartRequired['claude'] ?? false}
+                  defaults={tabDefaults[tabsSubSection] ?? null}
+                  restartRequired={restartRequired[tabsSubSection] ?? false}
                   onchange={() => {}}
-                  onrestart={() => restartTab('claude')}
+                  onrestart={() => restartTab(tabsSubSection)}
                 />
               {:else}
-                <small class="hint top">Claude tab is disabled — tick the checkbox above to enable it.</small>
+                <small class="hint top"
+                  >{labelForTabId($harnesses, tabsSubSection)} tab is disabled — tick the
+                  checkbox above to enable it.</small
+                >
               {/if}
-              {@render harnessSettingsFor('claude')}
-            </div>
-          {:else if tabsSubSection === 'claude-local'}
-            <div id="tab-section-claude-local">
-              {#if claudeLocalLive}
-                <TabSettingsSection
-                  tabId={'claude-local'}
-                  displayName={'Claude (local)'}
-                  bind:settings={
-                    () => claudeLocalLive,
-                    (v) => patchAiTab('claude-local', v)
-                  }
-                  defaults={tabDefaults['claude-local'] ?? null}
-                  restartRequired={restartRequired['claude-local'] ?? false}
-                  onchange={() => {}}
-                  onrestart={() => restartTab('claude-local')}
-                />
-              {:else}
-                <small class="hint top">Claude (local) tab is disabled — tick the checkbox above to enable it.</small>
-              {/if}
-              <small class="hint top">
-                This tab's local-provider values (and the status-line switch)
-                are Claude Code's own settings — see <strong>Tabs → Claude Code</strong>.
-              </small>
-            </div>
-          {:else if tabsSubSection === 'opencode'}
-            <div id="tab-section-opencode">
-              {#if opencodeLive}
-                <TabSettingsSection
-                  tabId={'opencode'}
-                  displayName={'OpenCode'}
-                  bind:settings={
-                    () => opencodeLive,
-                    (v) => patchAiTab('opencode', v)
-                  }
-                  defaults={tabDefaults['opencode'] ?? null}
-                  restartRequired={restartRequired['opencode'] ?? false}
-                  onchange={() => {}}
-                  onrestart={() => restartTab('opencode')}
-                />
-                {@render harnessSettingsFor('opencode')}
-              {:else}
-                <small class="hint top">OpenCode tab is disabled — tick the checkbox above to enable it.</small>
+              {#if harness && ownsForm}
+                {@render harnessSettingsFor(harness.id)}
+              {:else if harness}
+                <small class="hint top">
+                  This tab's local-provider values (and everything else this
+                  harness declares) are {harness.label}'s own settings — see
+                  <strong>Tabs → {labelForTabId($harnesses, harness.tab_ids[0])}</strong>.
+                </small>
               {/if}
             </div>
           {:else}
@@ -4157,7 +4182,7 @@
           <h2>Local task offload</h2>
           <small class="hint top">
             Run a local <code>llama-server</code> and expose an
-            <code>offload_task</code> tool into cImp-launched Claude tabs.
+            <code>offload_task</code> tool into cImp-launched AI tabs.
             The main session can hand token-heavy subtasks (broad codebase
             searches, large-file/log summarization, web research) to the
             local model and get back only the synthesized result —
@@ -4184,7 +4209,7 @@
           </label>
           <small class="hint">
             The <code>offload_task</code> tool and its guidance are injected
-            when an AI tab starts — restart the Claude/OpenCode tab
+            when an AI tab starts — restart the {harnessNames} tab
             (Tabs → Restart) after changing either toggle.
           </small>
           <label class="checkbox">
@@ -4199,19 +4224,20 @@
           <small class="hint">
             Lets cImp push notices — offload results, audit and graph-index
             completions — straight into a live AI tab.
-            <strong>Claude tabs</strong> receive them as
+            A tab whose harness can be PUSHED to receives them as
             <code>&lt;channel source="cimp-offload"&gt;</code> messages at the
             next turn boundary, which <em>starts a turn</em> when the tab is
             idle; that half is baked in at launch, so restart the tab after
             toggling — cImp shows the restart hint automatically. It also needs
             the <code>cimp-offload</code> MCP server to be injected, i.e.
             offload or the code graph enabled.
-            <strong>OpenCode tabs</strong> receive the same envelope as silently
-            injected context (<code>noReply</code>): nothing starts, the model
-            picks it up on its next turn. That half is read live — no tab
-            restart needed.
-            <strong>Experimental:</strong> the Claude half rides a Claude Code
-            research-preview flag that may change or disappear, Claude paints a
+            A tab whose harness takes silently injected context
+            (<code>noReply</code>) instead receives the same envelope with
+            nothing started: the model picks it up on its next turn, and that
+            half is read live — no tab restart needed.
+            <strong>Experimental:</strong> the push half rides a harness
+            research-preview flag that may change or disappear, the harness
+            paints a
             persistent "Channels (experimental)" banner (plus a harmless
             "no MCP server configured with that name" warning) in every tab it
             registers, and a push that can't be delivered is silently dropped.
@@ -4635,41 +4661,40 @@
 
               {#if backend.kind.type === 'local'}
                 <hr class="card-divider" />
-                <div class="button-row">
-                  <button
-                    type="button"
-                    class="secondary"
-                    onclick={() => registerOpencodeProvider(i)}
-                  >Add to OpenCode</button>
-                  <label class="checkbox inline">
-                    <input
-                      type="checkbox"
-                      checked={harnessRow(snapshot, 'opencode').ext?.['provider_auto'] === true}
-                      onchange={(e) =>
-                        patch((s) =>
-                          setHarnessExt(
-                            s,
-                            'opencode',
-                            'provider_auto',
-                            (e.currentTarget as HTMLInputElement).checked,
-                          ),
-                        )}
-                    />
-                    <span>Auto-sync while offload enabled</span>
-                  </label>
-                </div>
-                <small class="hint opencode-desc">
-                  Registers this server as OpenCode's <code>local-llama</code>
-                  provider (base URL + model read from the command above) and
-                  selects it as the default model, so a freshly opened OpenCode
-                  tab is ready to work. Overrides any existing
-                  <code>local-llama</code>. Auto-sync re-derives it from the
-                  primary local backend at launch and on save, but only while the
-                  offload server is enabled. OpenCode reads the provider from its
-                  launch config — restart the OpenCode tab to apply a change.
-                </small>
-                {#if opencodeProviderMsg && opencodeProviderMsg.i === i}
-                  <small class={opencodeProviderMsg.ok ? 'hint' : 'error'}>{opencodeProviderMsg.text}</small>
+                <!-- V40 Phase F: one block per harness that declares
+                     `local_provider_config` — i.e. one cImp can WRITE a provider
+                     block for. It was hard-coded for one harness, so a second
+                     one with a config writer would have had no button at all. -->
+                {#each $harnesses.filter((h) => h.features.includes('local_provider_config')) as h (h.id)}
+                  <div class="button-row">
+                    <button
+                      type="button"
+                      class="secondary"
+                      onclick={() => registerLocalProvider(i, h.id)}
+                    >Add to {h.label}</button>
+                    <label class="checkbox inline">
+                      <input
+                        type="checkbox"
+                        checked={harnessRow(snapshot, h.id).ext?.['provider_auto'] === true}
+                        onchange={(e) =>
+                          patch((s) =>
+                            setHarnessExt(
+                              s,
+                              h.id,
+                              'provider_auto',
+                              (e.currentTarget as HTMLInputElement).checked,
+                            ),
+                          )}
+                      />
+                      <span>Auto-sync while offload enabled</span>
+                    </label>
+                  </div>
+                  {#if h.affordances.localProviderConfigNote}
+                    <small class="hint provider-desc">{h.affordances.localProviderConfigNote}</small>
+                  {/if}
+                {/each}
+                {#if providerMsg && providerMsg.i === i}
+                  <small class={providerMsg.ok ? 'hint' : 'error'}>{providerMsg.text}</small>
                 {/if}
                 <div class="button-row offload-lifecycle-row">
                   <button type="button" disabled={offloadBusy} onclick={() => runOffloadAction(() => offloadBackendStart(backend.name))}>Start</button>
@@ -5273,7 +5298,7 @@
             <small class="hint down">
               ⚠ Spawn-baked changes are pending. The master switch, the
               spotlighting envelope, the native web tools mode, consumer hygiene,
-              managed-tool steering and OpenCode native-tool gating are baked
+              managed-tool steering and harness native-tool gating are baked
               into an AI tab when it launches, so every running tab
               keeps the posture it started with — restart them (Settings → Tabs
               → Restart) for these to apply.
@@ -5369,7 +5394,7 @@
             />
             <small class="hint">
               How many external (web / MCP-server) tool calls one offload task —
-              or one Claude/OpenCode tab session — may make before further ones
+              or one AI tab session — may make before further ones
               are refused. Generous by design: it stops runaway fetch loops and
               bulk data staging, not research.
             </small>
@@ -5399,8 +5424,7 @@
           <h3>Native web tools</h3>
           <small class="hint top">
             cImp's containment latch only sees web access that goes through its
-            own proxy. Claude's <code>WebFetch</code>/<code>WebSearch</code> and
-            OpenCode's <code>webfetch</code>/<code>websearch</code> bypass it
+            own proxy. {nativeWebToolsByHarness} bypass it
             entirely, so without one of the modes below a tab can read a hostile
             page while cImp still believes it is clean. Takes effect when an AI
             tab is <strong>restarted</strong>.
@@ -5825,10 +5849,10 @@
           <small class="hint top">
             Model Context Protocol servers cImp connects to and keeps warm. Each
             server's read-class tools (web search, fetch, docs, …) can be exposed
-            to <strong>Claude Code</strong>, to <strong>OpenCode</strong> and/or
-            to the <strong>offload worker</strong> — per server, below.
-            Write/destructive tools are filtered out. Exposing a server to Claude
-            Code works whether or not offload is enabled.
+            to <strong>{harnessNamesProse}</strong> and/or to the
+            <strong>offload worker</strong> — per server, below.
+            Write/destructive tools are filtered out. Exposing a server to a
+            harness works whether or not offload is enabled.
           </small>
           <!-- V37 Phase D (contract C8): the body of this section is
                `McpManagementEditor` — registry, categories, per-project
@@ -5853,7 +5877,7 @@
             Build a per-project graph of your code and docs (symbols, calls,
             imports, doc-comments), stored at
             <code>&lt;project&gt;/.cimp/graph.db</code> and kept live by a file
-            watcher. The cloud Claude session queries it through
+            watcher. The harness session queries it through
             <code>graph_*</code> tools (re-launch a tab to pick them up) instead
             of grepping. Off by default; everything stays on this machine.
           </small>
@@ -6124,8 +6148,8 @@
               query the graph. A <strong>remote</strong> backend — whether a box
               on your LAN or a public cloud API — would receive your project's
               code structure (symbol names, call relationships, doc snippets).
-              Leave this off unless you trust the remote. The cloud Claude
-              session's <code>graph_*</code> tools are unaffected by this
+              Leave this off unless you trust the remote. A harness tab's own
+              <code>graph_*</code> tools are unaffected by this
               setting.
             </small>
             {:else if graphSubSection === 'semantic'}
@@ -6147,7 +6171,7 @@
               (e.g. a <code>llama-server --embedding</code> on a spare GPU box).
               Degrades to full-text search when the endpoint is unreachable; the
               structural graph never depends on it. Toggling this changes the
-              tools and guidance an AI tab sees — restart Claude/OpenCode tabs
+              tools and guidance an AI tab sees — restart AI tabs
               to pick it up.
             </small>
             <h3>Embedding server</h3>
@@ -6265,8 +6289,7 @@
             </label>
             <small class="hint">
               Prepends a budget-bounded digest of the most relevant files to each
-              prompt (Claude via a <code>UserPromptSubmit</code> hook, OpenCode via
-              a generated <code>.opencode/plugin</code>). Off by default — it
+              prompt ({injectMechanisms}). Off by default — it
               changes what the agent sees. Re-launch a tab to pick it up. Tune and
               preview it on the <strong>Context</strong> section of the Code
               Intelligence tab.
@@ -6378,7 +6401,7 @@
                         ).checked),
                     )}
                 />
-                <span>Feed working set + pinned notes to Claude's compactor</span>
+                <span>Feed working set + pinned notes to the harness's compactor</span>
               </label>
               <small class="hint">
                 On compaction (<code>PreCompact</code> hook) the session's working
@@ -6398,7 +6421,7 @@
                     (s) => (s.graph.read_advisor = (e.currentTarget as HTMLInputElement).checked),
                   )}
               />
-              <span>Redundant-read advisor (Claude tabs)</span>
+              <span>Redundant-read advisor</span>
             </label>
             {#if e1Gate}
               <!--
@@ -6414,7 +6437,9 @@
                 Intercepts a <code>Read</code> of a file already read unchanged this
                 session and answers with a cheap outline reminder instead of
                 re-reading it. Changes the agent's tool behaviour — strictly opt-in.
-                Claude tabs only for now. Re-launch the tab to pick it up.
+                It needs a harness that can deny a tool call before it runs, so it
+                reaches only tabs whose harness declares that. Re-launch the tab to
+                pick it up.
               </small>
             {/if}
             {#if snapshot.graph.read_advisor && !e1Blocked}
@@ -6518,7 +6543,7 @@
                 file is intercepted; anything with a pipe, redirect, glob, second
                 path, or a partial-read verb (<code>sed</code>, <code>head</code>)
                 runs untouched. Installs a second hook matcher — re-launch the
-                Claude tab to pick it up.
+                tab to pick it up.
               </small>
               <label>
                 <span>First-read digest tier (KiB, 0 = off)</span>
@@ -6672,7 +6697,7 @@
           <h2>Checks</h2>
           <small class="hint">
             Project checker commands the <code>run_check</code> tool exposes to
-            Claude, OpenCode, and the offload worker — a build, typecheck, lint, or test run
+            {harnessNamesProse}, and the offload worker — a build, typecheck, lint, or test run
             turned into bounded, deduplicated diagnostics instead of a raw dump.
             Configured per project; changes land in this project's
             <code>.cimp/config.json</code> overlay.
@@ -6723,7 +6748,7 @@
             Ticking it lets that remote choose which of the checks above runs here,
             against your working tree, and hands it their output, which quotes your
             source. Denied by default; leave it off unless you trust the remote.
-            The Claude / OpenCode session's own <code>run_check</code> is
+            An AI tab session's own <code>run_check</code> is
             unaffected — this governs the offload worker only. Applies from the
             worker's next call; no tab restart needed.
           </small>
@@ -6808,13 +6833,13 @@
             worker tools for offload) so AI consumers can trigger audits
             themselves. Each requires Code Audit enabled above. The server set
             is injected when an AI tab starts — after enabling Code Audit or
-            flipping an exposure here, restart the Claude/OpenCode tab
+            flipping an exposure here, restart the {harnessNames} tab
             (Tabs → Restart) for the tools to appear.
           </small>
 <!-- V40 Phase B: one box per REGISTERED harness. It was a hand-written
-               Claude/OpenCode pair, so Code Audit would have been unreachable
-               from a third harness until someone edited this file. -->
-          {#each $harnessSchemas as h (h.id)}
+               two-harness pair, so Code Audit would have been unreachable from
+               a third harness until someone edited this file. -->
+          {#each $harnesses as h (h.id)}
             <label class="checkbox">
               <input
                 type="checkbox"
@@ -6864,13 +6889,13 @@
 
           <h3>Command tools in AI tabs</h3>
           <small class="hint">
-            Let Claude Code / OpenCode tabs run this project's
+            Let AI tabs run this project's
             <strong>command</strong> tools through the
             <code>run_command</code> MCP tool — the enabled ones with a path set,
             and nothing else. It runs the registered binary directly with the
             arguments the model passes (no shell) in the project root. Hidden
-            while no command tool is runnable. OpenCode caches its tool list at
-            connect, so a change here shows up there only after a tab restart
+            while no command tool is runnable. A harness that caches its tool
+            list at connect picks a change here up only after a tab restart
             (Tabs → Restart). A change here also rewrites the managed-tool
             steering paragraph a tab is launched with (Injection protection →
             Managed-tool steering), which is spawn-baked on both harnesses — so
@@ -6878,7 +6903,7 @@
           </small>
 <!-- V40 Phase B: one box per registered harness, same reason as the
                Code Audit set above. -->
-          {#each $harnessSchemas as h (h.id)}
+          {#each $harnesses as h (h.id)}
             <label class="checkbox">
               <input
                 type="checkbox"
@@ -7299,8 +7324,8 @@
             "MTok") used by the Code Intelligence tab's session-cost popup and
             its Usage view's <em>est. cost</em> mode (auto-matched by the
             <em>Id prefix</em> column). Fresh installs are seeded with current
-            Anthropic API and GitHub Copilot rates — Anthropic cache-write at
-            the 1-hour-TTL 2× rate Claude Code sessions actually pay; every
+            vendor API and GitHub Copilot rates — cache-write priced at the
+            1-hour-TTL 2× rate a real session actually pays; every
             value is editable, and prices drift, so corrections are yours to
             make (no auto-update). Saved to the global settings file, not this
             project's overlay.
@@ -7314,7 +7339,7 @@
               <div class="pricing-head-row">
                 <span>Provider</span>
                 <span>Model</span>
-                <span title="Transcript model-id prefix this row auto-matches in the Usage view's cost mode (e.g. claude-opus-4-8). Longest match wins; empty = manual-pick only.">Id prefix</span>
+                <span title="Transcript model-id prefix this row auto-matches in the Usage view's cost mode. Longest match wins; empty = manual-pick only.">Id prefix</span>
                 <span class="num">Input</span>
                 <span class="num">Cache write</span>
                 <span class="num">Cache read</span>
@@ -7342,7 +7367,7 @@
                   />
                   <input
                     type="text"
-                    placeholder="e.g. claude-opus-4-8"
+                    placeholder="model-id prefix"
                     title="Transcript model-id prefix for cost-mode auto-match (longest wins; empty = manual-pick only)"
                     value={row.model_prefix}
                     oninput={(e) =>
@@ -7480,12 +7505,12 @@
                   (s) => (s.sandbox.tabs = (e.currentTarget as HTMLInputElement).checked),
                 )}
             />
-            <span>Also sandbox AI tabs (Claude, OpenCode)</span>
+            <span>Also sandbox AI tabs ({harnessNames})</span>
           </label>
           <small class="hint down">
             The tab <em>is</em> the agent, so this confines everything it later
             runs. A sandboxed tab reads and writes the project and its own
-            harness state (<code>~/.claude</code>, OpenCode's config and data),
+            harness state ({harnessStateDirs}),
             reads <code>~/.gitconfig</code> for your commit identity, and always
             has network access — an AI CLI without egress is a bricked tab.
             Deliberately <strong>not</strong> granted: <code>~/.ssh</code> and the
@@ -7601,8 +7626,8 @@
                   <span class="harness-title">{panel.label}</span>
                   <!--
                     Every button is disabled while ANY run is in flight — the
-                    single flight is process-wide (one set of `claude --help` /
-                    `opencode serve` children at a time), so a second harness's
+                    single flight is process-wide (one set of probe children at
+                    a time), so a second harness's
                     click would be dropped rather than queued. Only the harness
                     actually running says so, and the shared note below covers
                     the case where the run is an automatic one nobody clicked.
@@ -7787,9 +7812,10 @@
             <small class="hint down">
               <em>Run checks now</em> drives this harness's embedded fixture canaries
               (L1) and then the installed CLI itself (L2); it takes up to 90 seconds
-              and only one run happens at a time across the whole app. For Claude
-              Code it records the same result an automatic post-update run would, and
-              advances the verified version when nothing failed. Recording a
+              and only one run happens at a time across the whole app. For a
+              harness with a recorded auto-verify path it records the same result
+              an automatic post-update run would, and advances the verified
+              version when nothing failed. Recording a
               <em>manual</em> contract spike (the D0 / E1 behaviours no payload can
               reveal) is still the Advisor card's <em>Mark verified</em>, not this
               button.
@@ -7837,9 +7863,9 @@
             shadow git repo (your own <code>.git</code> is never touched).
             Enable this to start capturing checkpoints; restore one from the
             Workbench tab's Timeline section. The per-prompt checkpoint trigger
-            rides a Claude prompt hook installed at tab launch (needs the code
-            graph) — if context injection is off, restart the Claude tab after
-            enabling this.
+            rides the harness prompt hook installed at tab launch (needs the code
+            graph) — if context injection is off, restart the tab after enabling
+            this.
           </small>
           <label>
             <span>Max checkpoints kept</span>
@@ -7994,7 +8020,7 @@
 
           <h3>Content capture</h3>
           <small class="hint top">
-            When on, raw PTY output for every Claude / shell tab is also
+            When on, raw PTY output for every AI / shell tab is also
             written to <code>logs/content/&lt;tab-id&gt;.log.&lt;date&gt;</code>,
             rotated daily. Output includes ANSI escape codes — pipe through
             <code>sed</code> or a viewer if you want plain text.
@@ -8177,10 +8203,10 @@
     margin-top: 0.4rem;
     flex-wrap: wrap;
   }
-  /* Offload local-backend card: 1 blank line between the OpenCode buttons
-     (Add to OpenCode / Auto-sync) and their description. Overrides the
+  /* Offload local-backend card: 1 blank line between the provider buttons
+     (Add to <harness> / Auto-sync) and their description. Overrides the
      default `small.hint` negative top margin. */
-  small.hint.opencode-desc {
+  small.hint.provider-desc {
     margin-top: 1.5rem;
   }
   /* …and 2 blank lines between that description and the Start/Stop/Reset
@@ -9125,7 +9151,7 @@
     color: var(--text-tertiary);
     font-size: var(--font-size-xs);
     /* Generous leading so tall inline glyphs — e.g. the ▓░ shade blocks in
-       the Claude context-bar example below — don't bleed up into the line
+       the context-bar example below — don't bleed up into the line
        above when their fallback-font ink overflows the line box. */
     line-height: 1.6;
     margin: -8px 0 var(--space-3) 0;
@@ -9147,7 +9173,7 @@
   /* A hint that follows a bare button or a checkbox row has no tall block
      label above it for the negative top margin to tuck under — that margin
      would otherwise pull the hint up over the button/checkbox (e.g. the
-     Bottom bar → Status bar arrangement and Claude context bar sections).
+     Bottom bar → Status bar arrangement and context bar sections).
      Reset to a normal positive gap. */
   button + small.hint,
   .button-row + small.hint,
@@ -9246,30 +9272,30 @@
     background: transparent;
     cursor: pointer;
   }
-  .claude-tabs-radio {
+  .ai-tabs-radio {
     border: 1px solid var(--border-subtle);
     border-radius: var(--radius-md);
     padding: var(--space-3) var(--space-4);
     margin: 0 0 var(--space-4) 0;
     background: var(--surface-1);
   }
-  .claude-tabs-radio legend {
+  .ai-tabs-radio legend {
     padding: 0 var(--space-2);
     font-size: var(--font-size-sm);
     font-weight: 500;
     color: var(--text-primary);
   }
-  .claude-tabs-radio .hint {
+  .ai-tabs-radio .hint {
     display: block;
     margin: 0 0 var(--space-3) 0;
     color: var(--text-quiet);
   }
-  .claude-tabs-radio .radio-row {
+  .ai-tabs-radio .radio-row {
     display: flex;
     flex-wrap: wrap;
     gap: var(--space-4);
   }
-  .claude-tabs-radio .radio-row label {
+  .ai-tabs-radio .radio-row label {
     display: inline-flex;
     align-items: center;
     gap: 6px;

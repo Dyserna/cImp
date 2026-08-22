@@ -26,7 +26,7 @@
   // call is refused for. The chips here mirror it (see `mcpEditor.ts`) so the
   // user can see the state the backend will act on — they never *are* it.
   import type { McpActivation, McpCategory, McpServerConfig } from './types';
-  import { harnessSchemas } from './harnessSchema';
+  import { harnesses } from '../harness';
   import { describeMcpServerHealth, type McpServerHealth } from '../offload';
   import {
     clearStaleRefs,
@@ -85,6 +85,21 @@
     /// connection to change a number the checker re-reads each tick anyway.
     onhealthinterval: (secs: number) => void;
   } = $props();
+
+  /// When a live session picks up a changed tool list, per harness (V40 Phase
+  /// F, locked decision 27).
+  ///
+  /// This sentence appeared twice, hand-written, naming both shipped harnesses
+  /// and their refresh semantics — a per-harness behaviour stated as user copy
+  /// in a file that could not know it. Each harness declares its own clause
+  /// now; one that declares none is simply not listed, rather than being given
+  /// another harness's timing.
+  const toolListRefresh = $derived(
+    $harnesses
+      .filter((h) => h.affordances.toolListRefresh)
+      .map((h) => `${h.label} ${h.affordances.toolListRefresh}`)
+      .join(', '),
+  );
 
   const registry = $derived<McpRegistry>({ servers, categories, activation });
   const groups = $derived(groupServers(registry));
@@ -160,7 +175,7 @@
     <small class="hint">
       {activeCount} of {servers.length} configured server(s) active in this
       project{health.length === 0
-        ? ' — health appears once the warm MCP host is running (it starts when offload is enabled or any server is exposed to Claude Code).'
+        ? ' — health appears once the warm MCP host is running (it starts when offload is enabled or any server is exposed to a harness).'
         : '.'}
     </small>
   {/if}
@@ -292,10 +307,9 @@
     read-class tools from these servers and keeps the connections warm;
     write/destructive tools are filtered out. <strong>Every switch on this page
     — the category and server toggles, and the per-harness access boxes —
-    applies to tabs you already have open.</strong> <strong>OpenCode</strong>
-    refreshes its tool list in the same session, <strong>Claude Code</strong>
-    picks the new surface up on its next turn, and restarting the tab
-    (Tabs → Restart) is only a fallback if one still shows a stale list. A call
+    applies to tabs you already have open.</strong> {toolListRefresh}, and
+    restarting the tab (Tabs → Restart) is only a fallback if one still shows a
+    stale list. A call
     that reaches a disabled server is refused with a message naming which toggle
     did it, so a stale tool list can never quietly do the thing you turned off.
     Advanced stdio servers (command/args/env) remain editable in
@@ -462,11 +476,11 @@
                  telling the user to open a fresh one. -->
             <!-- V40 Phase B: one checkbox per REGISTERED harness, from
                  `harness_settings_schema`, plus the offload worker's own box.
-                 It used to be a hand-written Claude/OpenCode pair, so a third
+                 It used to be a hand-written two-harness pair, so a third
                  harness would have been ungrantable until someone edited this
                  file. -->
             <div class="mcp-enable-row">
-              {#each $harnessSchemas as h (h.id)}
+              {#each $harnesses as h (h.id)}
                 <label class="mcp-enable" title="Expose this server's tools to {h.label}">
                   <input
                     type="checkbox"
@@ -491,8 +505,7 @@
               </label>
             </div>
             <small class="hint mcp-access-note">
-              Applies to open tabs: OpenCode refreshes in the same session,
-              Claude Code on its next turn.
+              Applies to open tabs: {toolListRefresh}.
             </small>
           </div>
         {/each}

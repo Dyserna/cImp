@@ -40,9 +40,21 @@ rows in the registry and no CHP hello.
 
 ## Adding a harness
 
-A new harness is one directory and no changes above L2.
+A new harness is one directory, one registry row and no changes above L2.
 
 1. **`harness/<id>/mod.rs`** — and add `pub mod <id>;` here.
+1a. **A `HarnessDescriptor` row in `registry.rs`** (V40 Phase A) — id, label,
+   binaries, reserved tab ids in canonical order, consumer token, `expects_chp`,
+   the environment markers to strip, the features core mounts for you, and a
+   `&'static dyn HarnessPlugin`. This is what every "which harness is this?"
+   question in the tree now resolves against, so a harness without a row is not
+   misclassified, it is simply not a harness. `every_registry_entry_is_fully_wired`
+   checks the row against everything below.
+1b. **`impl HarnessPlugin`** in your directory — the code half. Every method has
+   a harness-neutral default, so implement only what is true of your harness;
+   what you do not declare, you do not get (`input_profile() == None` means your
+   tabs are not delegation workers, and that is a visible refusal rather than a
+   task typed into a TUI cImp cannot drive).
 2. **The generated artifact** — whatever this harness's own extension mechanism
    is: `claude/overlay.rs` emits a `--settings` JSON overlay,
    `opencode/plugin.rs` emits an ES module, `opencode/config.rs` emits an env
@@ -77,9 +89,13 @@ A new harness is one directory and no changes above L2.
    with the reason.
 
 What you must **not** need: a new enum variant outside `harness/`, a new match
-arm in `tabs/config.rs`, a bespoke gate constant, a frontend mirror. If you find
-yourself writing one, the seam is in the wrong place — say so rather than
-adding it.
+arm in `tabs/config.rs`, a bespoke gate constant, a frontend mirror. Since V40
+Phase A two tests hold that claim up rather than leaving it to good intentions —
+`every_registry_entry_is_fully_wired` (your row reaches all eight places) and
+`no_harness_identity_outside_registry` (nothing outside `harness/` spells a
+harness id, except the files on `IDENTITY_ALLOWLIST`, each with the V40 phase
+that retires it). If you find yourself writing a branch, the seam is in the
+wrong place — say so rather than adding it.
 
 There is **no third-party plugin loading** (design D7). Adding a harness means
 adding a directory here and opening a PR. The reason is in

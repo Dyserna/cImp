@@ -762,13 +762,29 @@ tests in `harness/layering.rs` keep it that way:
   `usage::` or `workbench::`; the Tier-C fallback readers that still do are a
   declared, **shrinking** list (`UPWARD_EXEMPT`), and the test also fails when an
   exemption stops being needed, so the list cannot rot into padding.
-- `every_harness_dir_declares_its_capabilities` — a `harness/<id>/` with no rows
-  in the registry and no CHP hello is a harness nobody can reason about.
+- `every_registry_entry_is_fully_wired` (V40 Phase A; it absorbed
+  `every_harness_dir_declares_its_capabilities`) — one `HarnessDescriptor` row is
+  a promise about eight places, and this is what makes forgetting one of them a
+  red build: the directory exists and no undeclared one does, the capability
+  registry has rows, a CHP hello is declared, identity is complete, `spawn_sig`
+  is not null, the sandbox grant table is not empty, a health panel row appears
+  (plus the neutral one), `MAINTENANCE.md` names every row, and a harness whose
+  config is a file cImp writes has plugin goldens.
+- `no_harness_identity_outside_registry` (V40 Phase A) — the literals `"claude"`,
+  `"claude-local"`, `"opencode"` and every other descriptor id / tab id / binary
+  / consumer token may not appear in production code outside `harness/`. This is
+  the scan the one above it never was: its needles are derived from `Dep` tokens
+  filtered to >= 8 chars, so harness NAMES were never needles. Exceptions are
+  `IDENTITY_ALLOWLIST`, each naming the V40 phase that retires it and each
+  re-checked by `every_identity_allowlist_entry_is_still_earning_it`.
 
 The steps:
 
-1. **`harness/<id>/mod.rs`**, plus `pub mod <id>;` in `harness/mod.rs` and a row
-   in `layering.rs`'s `HARNESS_DIRS` (the third test fails until you add it).
+1. **`harness/<id>/mod.rs`**, plus `pub mod <id>;` in `harness/mod.rs`, a
+   `HarnessDescriptor` row in `harness/registry.rs` and an `impl HarnessPlugin`
+   (V40 Phase A — `layering.rs`'s `HARNESS_DIRS` is gone; it is a view over the
+   registry now, and `every_registry_entry_is_fully_wired` fails until the row
+   reaches every place it promises).
 2. **Emit the harness's own extension artifact** — whatever mechanism it
    provides. The three that exist are the template:
    `claude/overlay.rs` (a `--settings` JSON overlay + `--mcp-config`),

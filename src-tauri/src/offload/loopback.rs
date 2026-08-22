@@ -5640,14 +5640,18 @@ pub(crate) const TOOL_CHECKPOINT_BUDGET: Duration = Duration::from_millis(1800);
 ///
 /// Split out of [`handle_tool_checkpoint`] so the namespace selection is
 /// exercised by a test rather than re-implemented in one — a test that owned its
-/// own copy of this `match` would stay green after the handler stopped calling
-/// it. `harness` has already been normalised through [`hook_agent`], so it is
-/// one of the two-word vocabulary and the `_` arm is Claude's.
+/// own copy of this lookup would stay green after the handler stopped calling it.
+///
+/// **V40 Phase A, locked decision 16.** This was a `match` with `"opencode"` in
+/// one arm and Claude's table in the `_` arm, which meant a THIRD harness's
+/// `edit` was not rejected but answered out of Claude's vocabulary — `false`,
+/// silently, for its whole mutation surface. It is now one registry lookup that
+/// fails CLOSED: a token naming no registered harness, and a name the registered
+/// plugin does not declare, both answer `true`. A checkpoint nobody needed is a
+/// commit into cImp's own shadow repo; a missed one is a destructive call with
+/// no way back.
 fn tool_checkpoint_is_mutating(harness: &str, tool: &str) -> bool {
-    match harness {
-        "opencode" => crate::harness::opencode::tools::opencode_native_mutates_fs(tool),
-        _ => crate::offload::toolclass::mutates_fs(tool),
-    }
+    crate::harness::native::mutates_fs(crate::harness::HarnessId::from_id(harness), tool)
 }
 
 /// `POST /workbench/tool_checkpoint` (V33 Phase F): take a Workbench checkpoint
@@ -5659,18 +5663,17 @@ fn tool_checkpoint_is_mutating(harness: &str, tool: &str) -> bool {
 /// Both callers pre-filter — Claude's hook is installed with an
 /// `Edit|Write|MultiEdit|Bash` matcher, the plugin consults a baked
 /// `CIMP_MUTATING_TOOLS` set — but neither is the authority. This route resolves
-/// the name against `toolclass`'s reviewed tables, per harness:
-/// [`mutates_fs`](crate::offload::toolclass::mutates_fs) for Claude's
-/// capitalized vocabulary,
-/// [`opencode_native_mutates_fs`](crate::harness::opencode::tools::opencode_native_mutates_fs)
-/// for OpenCode's. A drifted matcher, a shim from a newer build, or a forged
-/// POST from any local process therefore cannot mint a checkpoint for a tool
-/// cImp does not classify as mutating.
+/// the name against the SENDING harness's own reviewed table, through
+/// [`crate::harness::native::mutates_fs`]. A drifted matcher, a shim from a
+/// newer build, or a forged POST from any local process therefore cannot mint a
+/// checkpoint for a tool that harness declares non-mutating — and cannot get a
+/// destructive call waved through by naming a harness cImp does not know.
 ///
-/// **Crossing the two vocabularies would be silent, not loud**: `mutates_fs`
-/// answers `false` for `edit` (an unknown name in cImp's own table), so reading
-/// OpenCode's ids through it would disable the whole OpenCode seam while every
-/// test that only exercised Claude stayed green.
+/// **Crossing the two vocabularies would be silent, not loud**: `edit` and
+/// `Edit` are unknown in each other's tables, so one crossed lookup would
+/// disable a whole harness's seam while every test that only exercised the other
+/// stayed green. The registry lookup is what makes crossing them impossible to
+/// express.
 ///
 /// # Containment posture
 ///
@@ -9229,10 +9232,16 @@ async fn handle_memory_event(
         return write_json(stream, 200, &ok).await;
     }
 
-    if let Some((kind, arg)) = crate::graph::classify_tool(&tool_name) {
+    // V40 Phase A, locked decision 16: the memory classification is the
+    // SENDING harness's, resolved through the registry. A body whose `agent`
+    // names no registered harness records nothing — where the old single
+    // `match` would have answered it out of whichever vocabulary happened to
+    // contain the name.
+    let source = crate::harness::HarnessId::from_id(agent);
+    if let Some((kind, arg)) = crate::harness::native::memory_kind(source, &tool_name) {
         let get = |k: &str| body.args.get(k).and_then(Value::as_str);
         let (path, detail) = match arg {
-            crate::graph::MemArg::Path => (
+            crate::harness::plugin::MemArg::Path => (
                 get("file_path")
                     .or_else(|| get("filePath"))
                     .or_else(|| get("notebook_path"))
@@ -9241,7 +9250,7 @@ async fn handle_memory_event(
                     .to_string(),
                 None,
             ),
-            crate::graph::MemArg::Pattern => (
+            crate::harness::plugin::MemArg::Pattern => (
                 get("pattern")
                     .or_else(|| get("path"))
                     .or_else(|| get("query"))
@@ -9249,7 +9258,7 @@ async fn handle_memory_event(
                     .to_string(),
                 None,
             ),
-            crate::graph::MemArg::Command => (
+            crate::harness::plugin::MemArg::Command => (
                 String::new(),
                 get("command").map(|c| c.chars().take(200).collect::<String>()),
             ),
@@ -9258,7 +9267,7 @@ async fn handle_memory_event(
         // Command whose `command` arg was absent (detail is None) — recording it
         // would just evict useful events from the ring.
         let recordable = match arg {
-            crate::graph::MemArg::Command => detail.is_some(),
+            crate::harness::plugin::MemArg::Command => detail.is_some(),
             _ => !path.is_empty(),
         };
         if recordable {
@@ -9279,7 +9288,7 @@ async fn handle_memory_event(
     // `harness/opencode/read.rs` — its SSE stream carries no usage fields, so this
     // hook, which already fires after every tool call, is the only place
     // that can record OpenCode usage). Unlike the memory recording above,
-    // this runs for EVERY tool call, not just ones `classify_tool` maps to a
+    // this runs for EVERY tool call, not just ones the native table maps to a
     // filesystem/query target — usage wants the full picture. `chars` is
     // estimated from the tool's serialized INPUT args (its actual output
     // isn't visible to this hook). This path records only tool-result chars,
@@ -15461,12 +15470,23 @@ mod tests {
     /// the prompt tap does, and reads the tool name in the CALLER's
     /// vocabulary.**
     ///
-    /// The vocabulary half is the subtle one. `toolclass::TABLE` is cImp's own
-    /// namespace, where `edit` is an unknown name and `mutates_fs` therefore
-    /// answers `false`; `OPENCODE_NATIVE_TABLE` is the harness's, where `Edit`
-    /// is unknown for the mirror reason. Crossing them would not fail loudly —
-    /// it would silently disable one harness's entire seam while every test that
-    /// only exercised the other stayed green. Both directions are asserted.
+    /// The vocabulary half is the subtle one. `CLAUDE_NATIVE_TABLE` and
+    /// `OPENCODE_NATIVE_TABLE` are two closed sets with no member in common:
+    /// `edit` is unknown in the first and `Edit` in the second. Crossing them
+    /// would not fail loudly — it would silently disable one harness's entire
+    /// seam while every test that only exercised the other stayed green. Both
+    /// directions are asserted.
+    ///
+    /// **V40 Phase A changed what "unknown" answers here, and this is the one
+    /// behaviour change locked decision 16 makes.** The lookup used to be a
+    /// `match` with `"opencode"` in one arm and Claude's table in the `_` arm,
+    /// so an id the addressed harness does not declare — and an id from a
+    /// harness cImp has never heard of — answered `false`: *no checkpoint*. It
+    /// now answers `true`. The asymmetry is the argument: a checkpoint nobody
+    /// needed is one commit into cImp's own shadow repo, while a missed one is a
+    /// destructive tool call with no way back, and "not in Claude's table,
+    /// therefore safe" is exactly what made a third harness's whole mutation
+    /// surface invisible. The rows below that flipped are marked.
     #[test]
     fn the_tool_checkpoint_route_narrows_the_tab_and_reads_the_right_vocabulary() {
         let s = settings_with_tabs(&["claude", "claude-2"]);
@@ -15488,20 +15508,37 @@ mod tests {
         for tool in ["Edit", "Write", "MultiEdit", "Bash"] {
             assert!(tool_checkpoint_is_mutating("claude", tool), "{tool}");
         }
-        for tool in ["Read", "Grep", "WebFetch", "edit"] {
+        // Declared by Claude and declared NON-mutating — the answer that keeps a
+        // read or a web fetch from minting a checkpoint. It is a declaration,
+        // not a default: that is the whole difference from the row below.
+        for tool in ["Read", "Grep", "WebFetch"] {
             assert!(!tool_checkpoint_is_mutating("claude", tool), "{tool}");
         }
         // …and OpenCode's lowercase ids, which are a DIFFERENT table.
         for tool in ["edit", "write", "patch", "apply_patch", "bash"] {
             assert!(tool_checkpoint_is_mutating("opencode", tool), "{tool}");
         }
-        for tool in ["read", "grep", "glob", "webfetch", "task", "Edit"] {
+        for tool in ["read", "grep", "glob", "webfetch"] {
             assert!(!tool_checkpoint_is_mutating("opencode", tool), "{tool}");
         }
-        // An unrecognised harness normalises to Claude (`hook_agent`'s own
-        // default), so it reads Claude's table rather than nothing at all.
+        // **The V40 flip.** A name the addressed harness does not declare now
+        // fails CLOSED. `edit` is OpenCode's id and Claude does not serve it;
+        // `Edit` is Claude's and OpenCode does not; `task` is an OpenCode id
+        // cImp reviewed and deliberately left ungated, so it has no row either.
+        // All three used to answer `false` out of whichever table the `match`
+        // happened to reach.
+        assert!(tool_checkpoint_is_mutating("claude", "edit"));
+        assert!(tool_checkpoint_is_mutating("opencode", "Edit"));
+        assert!(tool_checkpoint_is_mutating("opencode", "task"));
+        // A harness with no `agent` on the wire is Claude (`hook_agent`'s
+        // documented pre-CHP default), so it reads Claude's table.
         assert!(tool_checkpoint_is_mutating(hook_agent(None), "Bash"));
+        // An unrecognised token resolves to no harness at all — and reads no
+        // harness's table. Before Phase A it fell through to Claude's; before
+        // this change, falling through to Claude's is what made it answer at
+        // all. Now it fails closed, for `Bash` and for anything else.
         assert!(tool_checkpoint_is_mutating(hook_agent(Some("nonsense")), "Bash"));
+        assert!(tool_checkpoint_is_mutating(hook_agent(Some("nonsense")), "Read"));
     }
 
     /// **The registry's bound, made real.** `latches()`'s doc claimed the map

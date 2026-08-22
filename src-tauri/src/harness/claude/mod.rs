@@ -21,6 +21,7 @@ pub mod overlay;
 pub mod probe;
 pub mod read;
 pub mod statusline;
+pub mod tools;
 
 pub mod plugin;
 

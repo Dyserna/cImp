@@ -363,7 +363,14 @@ fn tool_registry_outcome(ids: Option<&(u16, String)>) -> Outcome {
         };
     }
 
-    let gated: BTreeSet<&str> = OPENCODE_NATIVE_TABLE.iter().map(|(n, _, _)| *n).collect();
+    // The GATED set is the classed rows: a `class: None` row (today `list`,
+    // which exists only for its memory kind) makes no gating claim, so counting
+    // it as classified would let an ungated id pass this subtraction.
+    let gated: BTreeSet<&str> = OPENCODE_NATIVE_TABLE
+        .iter()
+        .filter(|t| t.class.is_some())
+        .map(|t| t.name)
+        .collect();
     let reviewed: BTreeSet<&str> = OPENCODE_NATIVE_REVIEWED_UNGATED
         .iter()
         .map(|(n, _)| *n)
@@ -556,7 +563,8 @@ mod tests {
         // Everything cImp already knows about — gated and reviewed-ungated.
         let known: Vec<&str> = OPENCODE_NATIVE_TABLE
             .iter()
-            .map(|(n, _, _)| *n)
+            .filter(|t| t.class.is_some())
+            .map(|t| t.name)
             .chain(OPENCODE_NATIVE_REVIEWED_UNGATED.iter().map(|(n, _)| *n))
             .collect();
         let all = body(&known);

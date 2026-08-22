@@ -29,6 +29,7 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+use crate::offload::toolclass::ToolClass;
 use crate::sandbox::GrantRow;
 use crate::settings::{AiToolTabConfig, Settings};
 
@@ -157,6 +158,60 @@ pub struct ProbeOutput {
     /// The version this run saw. Empty ⇒ the runner falls back to
     /// [`HarnessPlugin::recorded_version`].
     pub version: String,
+}
+
+// ── harness-native tools (locked decision 16) ───────────────────────────────
+
+/// Which argument of a classified tool carries the recorded target.
+///
+/// Lives here rather than in `graph/memory.rs` because it is part of what the
+/// trait speaks: a harness declares the memory shape of its own tools, and L1
+/// may not import an L4 capability (`layering::harness_modules_do_not_import_capabilities`).
+/// `graph` re-exports it, so every existing consumer keeps its spelling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemArg {
+    /// `file_path` — a concrete file (recorded as `path`).
+    Path,
+    /// `pattern`/`path` of a search (recorded as `path`, best-effort).
+    Pattern,
+    /// `command` of a shell call (recorded into `detail`, no path).
+    Command,
+}
+
+/// One tool a HARNESS serves itself — a name cImp never routes and therefore
+/// can never block (locked decision 3's honest limit).
+///
+/// The three columns are the three questions core asks about such a name, each
+/// of which used to be answered by a different table with a different default:
+/// [`Self::class`] (what would gate it), [`Self::mutates_fs`] (whether a
+/// pre-tool checkpoint fires) and [`Self::memory_kind`] (what memory event it
+/// is recorded as). One row per name, in one reviewed place per harness, is
+/// what stops the three from disagreeing.
+///
+/// Read through [`crate::harness::native`], never directly, so the fail-closed
+/// rule for an unidentified source is applied in exactly one place.
+pub struct NativeTool {
+    /// The id as the harness itself spells it. Vocabularies do not cross:
+    /// `Edit` is Claude's and `edit` is OpenCode's.
+    pub name: &'static str,
+    /// The containment class, or `None` when cImp makes **no gating claim**
+    /// about this name.
+    ///
+    /// `None` is not "unclassified": it is the allowlist-only posture a
+    /// harness registry needs, where an unlisted (or unclassed) name is
+    /// UNGATED because the set is closed and published and most of its members
+    /// are neither external nor local-capability. That is the opposite of
+    /// [`crate::offload::toolclass::classify`]'s unknown-⇒-EXTERNAL, which is
+    /// right for cImp's own routed vocabulary and wrong here.
+    pub class: Option<ToolClass>,
+    /// Whether calling this tool can change files on disk — V33 Phase F's
+    /// pre-mutation checkpoint trigger.
+    pub mutates_fs: bool,
+    /// The V10 memory event this call is recorded as: the `kind` string and
+    /// which argument carries its target. `None` for a tool that is not
+    /// recorded at all (orchestration, bookkeeping, cImp's own proxied tools —
+    /// already captured by the activity ring).
+    pub memory_kind: Option<(&'static str, MemArg)>,
 }
 
 // ── canaries (locked decision 17) ───────────────────────────────────────────
@@ -352,6 +407,19 @@ pub trait HarnessPlugin: Sync + Send {
     /// recorded for it at all.
     fn last_verified(&self, _hv: &crate::settings::HarnessVersions) -> Option<String> {
         None
+    }
+
+    // ── native tool vocabulary (locked decision 16) ─────────────────────────
+
+    /// The tools this harness serves ITSELF — the names cImp never routes.
+    ///
+    /// Empty is the fail-closed answer and it is a loud one: with no rows,
+    /// every one of this harness's tool calls is treated as mutating and none
+    /// is recorded as a memory event, which
+    /// `native::tests::every_registered_harness_declares_its_natives` refuses
+    /// to let a registered harness ship with.
+    fn native_tools(&self) -> &'static [NativeTool] {
+        &[]
     }
 
     // ── the capability registry (locked decision 17) ────────────────────────

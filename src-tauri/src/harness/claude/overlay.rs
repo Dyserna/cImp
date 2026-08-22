@@ -890,7 +890,7 @@ mod tests {
     ///
     /// Moved here from `checkpoint_beacon.rs` when that shim was deleted
     /// (2026-08-17); the matcher it guards lives in this file, so this is where
-    /// it belongs. The matcher and `toolclass::TABLE` are still edited
+    /// it belongs. The matcher and `tools::CLAUDE_NATIVE_TABLE` are still edited
     /// separately, and a matcher naming a tool with no `mutates_fs: true` row now
     /// costs more than it used to: the entry's handler blocks the tool call, so a
     /// mismatch means a call held for a checkpoint the core immediately declines
@@ -903,7 +903,7 @@ mod tests {
     fn every_matched_claude_tool_is_classified_as_mutating() {
         for tool in CLAUDE_MUTATING_TOOL_MATCHER.split('|') {
             assert!(
-                crate::offload::toolclass::mutates_fs(tool),
+                crate::harness::claude::tools::claude_native_mutates_fs(tool),
                 "`{tool}` is in the PreToolUse matcher but has no `mutates_fs: true` row — \
                  every matched call would be held for a checkpoint the core refuses"
             );

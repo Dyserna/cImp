@@ -17,6 +17,7 @@
 //! The [`ToolClass`] vocabulary is shared with `offload::toolclass` and is the
 //! only thing the two tables have in common.
 
+use crate::harness::plugin::{MemArg, NativeTool};
 use crate::offload::toolclass::ToolClass;
 
 // ── V32 Phase H — OpenCode's OWN native tool names ─────────────────────────
@@ -81,19 +82,59 @@ use crate::offload::toolclass::ToolClass;
 /// because the class and the mutation capability of one name must be declared
 /// in one place; `read`/`glob`/`grep` are local capability without being
 /// mutations, and `bash` is both.
-pub const OPENCODE_NATIVE_TABLE: &[(&str, ToolClass, bool)] = &[
+pub const OPENCODE_NATIVE_TABLE: &[NativeTool] = &[
     // Local capability: private data + process execution + mutation.
-    ("bash", ToolClass::LocalCapability, true),
-    ("read", ToolClass::LocalCapability, false),
-    ("glob", ToolClass::LocalCapability, false),
-    ("grep", ToolClass::LocalCapability, false),
-    ("edit", ToolClass::LocalCapability, true),
-    ("write", ToolClass::LocalCapability, true),
+    NativeTool {
+        name: "bash",
+        class: Some(ToolClass::LocalCapability),
+        mutates_fs: true,
+        memory_kind: Some(("query", MemArg::Command)),
+    },
+    NativeTool {
+        name: "read",
+        class: Some(ToolClass::LocalCapability),
+        mutates_fs: false,
+        memory_kind: Some(("read", MemArg::Path)),
+    },
+    NativeTool {
+        name: "glob",
+        class: Some(ToolClass::LocalCapability),
+        mutates_fs: false,
+        memory_kind: Some(("query", MemArg::Pattern)),
+    },
+    NativeTool {
+        name: "grep",
+        class: Some(ToolClass::LocalCapability),
+        mutates_fs: false,
+        memory_kind: Some(("query", MemArg::Pattern)),
+    },
+    NativeTool {
+        name: "edit",
+        class: Some(ToolClass::LocalCapability),
+        mutates_fs: true,
+        memory_kind: Some(("edit", MemArg::Path)),
+    },
+    NativeTool {
+        name: "write",
+        class: Some(ToolClass::LocalCapability),
+        mutates_fs: true,
+        memory_kind: Some(("edit", MemArg::Path)),
+    },
     // Not in the 1.18.13 registry, but the plugin's own `CIMP_EDIT_TOOLS` has
     // carried it since V12 and the milestone's locked list names it. Gating a
     // name the harness does not serve costs nothing and closes it in advance.
-    ("patch", ToolClass::LocalCapability, true),
-    ("apply_patch", ToolClass::LocalCapability, true),
+    NativeTool {
+        name: "patch",
+        class: Some(ToolClass::LocalCapability),
+        mutates_fs: true,
+        memory_kind: Some(("edit", MemArg::Path)),
+    },
+    NativeTool {
+        name: "apply_patch",
+        class: Some(ToolClass::LocalCapability),
+        mutates_fs: true,
+        memory_kind: None,
+    },
     // ── Experiment-gated ids (2026-08-17), absent from a default serve ───────
     //
     // Both exist in the installed binary but are only registered when their
@@ -107,16 +148,52 @@ pub const OPENCODE_NATIVE_TABLE: &[(&str, ToolClass, bool)] = &[
     // `OPENCODE_EXPERIMENTAL_CODE_MODE`: the code-mode tool. It EXECUTES code,
     // so it gets `bash`'s posture exactly — local capability, mutating — because
     // anything that can run code can rewrite the tree and reach the network.
-    ("execute", ToolClass::LocalCapability, true),
+    NativeTool {
+        name: "execute",
+        class: Some(ToolClass::LocalCapability),
+        mutates_fs: true,
+        memory_kind: None,
+    },
     // `OPENCODE_EXPERIMENTAL_LSP_TOOL`: language-server queries over the project
     // (hover/definition/diagnostics). Reads private project data ⇒ local
     // capability; changes nothing on disk ⇒ not mutating, exactly like
     // `read`/`glob`/`grep`.
-    ("lsp", ToolClass::LocalCapability, false),
+    NativeTool {
+        name: "lsp",
+        class: Some(ToolClass::LocalCapability),
+        mutates_fs: false,
+        memory_kind: None,
+    },
     // The harness's own web tools — the EXTERNAL side of the same boundary.
     // Neither writes to the project tree, so neither checkpoints.
-    ("webfetch", ToolClass::External, false),
-    ("websearch", ToolClass::External, false),
+    NativeTool {
+        name: "webfetch",
+        class: Some(ToolClass::External),
+        mutates_fs: false,
+        memory_kind: None,
+    },
+    NativeTool {
+        name: "websearch",
+        class: Some(ToolClass::External),
+        mutates_fs: false,
+        memory_kind: None,
+    },
+    // ── memory-only rows: `class: None`, so NOT part of the gate ────────────
+    //
+    // V40 Phase A brought the memory classification into this table (locked
+    // decision 16), and `list` is the one id it names that the gate does not:
+    // `graph/memory.rs::classify_tool` recorded it as a `query`, while no
+    // shipped OpenCode build serves it (`apply_patch` superseded `patch`, and
+    // `list` went with `todoread`). Carried across verbatim rather than
+    // dropped, and carried with `class: None` — `opencode_native_names` and the
+    // live-registry probe both read the CLASSED rows, so this row adds nothing
+    // to the gate and nothing to what the probe considers classified.
+    NativeTool {
+        name: "list",
+        class: None,
+        mutates_fs: false,
+        memory_kind: Some(("query", MemArg::Pattern)),
+    },
     // Ids deliberately left out of this table are NOT undeclared — they are
     // listed, with their reasons, in [`OPENCODE_NATIVE_REVIEWED_UNGATED`].
 ];
@@ -196,8 +273,8 @@ pub const OPENCODE_NATIVE_REVIEWED_UNGATED: &[(&str, &str)] = &[
 pub fn opencode_native_class(name: &str) -> Option<ToolClass> {
     OPENCODE_NATIVE_TABLE
         .iter()
-        .find(|(n, _, _)| *n == name)
-        .map(|(_, c, _)| *c)
+        .find(|t| t.name == name)
+        .and_then(|t| t.class)
 }
 
 /// Every OpenCode native name in one class, in table order — the input the
@@ -206,8 +283,8 @@ pub fn opencode_native_class(name: &str) -> Option<ToolClass> {
 pub fn opencode_native_names(class: ToolClass) -> Vec<&'static str> {
     OPENCODE_NATIVE_TABLE
         .iter()
-        .filter(|(_, c, _)| *c == class)
-        .map(|(n, _, _)| *n)
+        .filter(|t| t.class == Some(class))
+        .map(|t| t.name)
         .collect()
 }
 
@@ -221,8 +298,8 @@ pub fn opencode_native_names(class: ToolClass) -> Vec<&'static str> {
 pub fn opencode_native_mutating_names() -> Vec<&'static str> {
     OPENCODE_NATIVE_TABLE
         .iter()
-        .filter(|(_, _, m)| *m)
-        .map(|(n, _, _)| *n)
+        .filter(|t| t.mutates_fs)
+        .map(|t| t.name)
         .collect()
 }
 
@@ -233,16 +310,20 @@ pub fn opencode_native_mutating_names() -> Vec<&'static str> {
 /// posture the rest of this table has — a name with no row is a name cImp makes
 /// no claim about, and minting a checkpoint for it would be inventing one.
 ///
-/// The consumer is the loopback's `/workbench/tool_checkpoint` route, which
-/// must not read an OpenCode tool id (`edit`) through [`crate::offload::toolclass::mutates_fs`]: that
-/// function answers for cImp's own vocabulary, where `edit` is an unknown name.
-/// Two vocabularies, two lookups — the drift this second table exists to
-/// prevent.
+/// The consumer is the loopback's `/workbench/tool_checkpoint` route — which
+/// since V40 Phase A reaches this table through
+/// [`crate::harness::native::mutates_fs`], resolving the harness from the
+/// request rather than picking a table by hand. That is the same "two
+/// vocabularies, two lookups" rule this table has always stated, moved to the
+/// one place that can enforce it: reading an OpenCode id (`edit`) through
+/// cImp's own [`crate::offload::toolclass::mutates_fs`] would answer for a
+/// vocabulary `edit` is not in, and is no longer expressible.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn opencode_native_mutates_fs(name: &str) -> bool {
     OPENCODE_NATIVE_TABLE
         .iter()
-        .find(|(n, _, _)| *n == name)
-        .is_some_and(|(_, _, m)| *m)
+        .find(|t| t.name == name)
+        .is_some_and(|t| t.mutates_fs)
 }
 
 #[cfg(test)]
@@ -330,6 +411,49 @@ mod tests {
         }
     }
 
+    /// **V40 Phase A**: the memory column, moved verbatim out of
+    /// `graph/memory.rs::classify_tool`.
+    ///
+    /// That function matched BOTH harnesses' ids in one `match`, so `Edit` and
+    /// `edit` were answered by the same arm — the thing V35 Phase K recorded as
+    /// a FINDING. The answers below are the ones it gave for OpenCode's half,
+    /// unchanged; what changed is that they are no longer reachable by a Claude
+    /// id.
+    #[test]
+    fn the_memory_kinds_are_the_ones_graph_memory_used_to_answer() {
+        let kind = |n: &str| {
+            OPENCODE_NATIVE_TABLE
+                .iter()
+                .find(|t| t.name == n)
+                .and_then(|t| t.memory_kind)
+        };
+        assert_eq!(kind("read"), Some(("read", MemArg::Path)));
+        for n in ["edit", "write", "patch"] {
+            assert_eq!(kind(n), Some(("edit", MemArg::Path)), "{n}");
+        }
+        for n in ["grep", "glob", "list"] {
+            assert_eq!(kind(n), Some(("query", MemArg::Pattern)), "{n}");
+        }
+        assert_eq!(kind("bash"), Some(("query", MemArg::Command)));
+        // Not recorded — `classify_tool` answered `None` for every one of them.
+        for n in ["task", "todowrite", "websearch", "webfetch", "skill"] {
+            assert_eq!(kind(n), None, "{n}");
+        }
+    }
+
+    /// `list` is a MEMORY row, not a gate row. A `class: None` row must not
+    /// widen the set the generated plugin refuses on, nor the set the live
+    /// probe counts as classified — otherwise carrying a memory kind across
+    /// would have quietly changed a security control.
+    #[test]
+    fn a_memory_only_row_is_not_part_of_the_gate() {
+        assert_eq!(opencode_native_class("list"), None);
+        assert!(!opencode_native_mutates_fs("list"));
+        assert!(!opencode_native_names(ToolClass::LocalCapability).contains(&"list"));
+        assert!(!opencode_native_names(ToolClass::External).contains(&"list"));
+        assert!(!opencode_native_mutating_names().contains(&"list"));
+    }
+
     /// V35 Phase D: the gated table and the reviewed-but-ungated list are two
     /// disjoint halves of ONE claim — "every upstream tool id cImp has looked
     /// at". The live probe subtracts their union from
@@ -341,7 +465,9 @@ mod tests {
     fn the_reviewed_ungated_list_is_disjoint_from_the_gated_table() {
         for (name, reason) in OPENCODE_NATIVE_REVIEWED_UNGATED {
             assert!(
-                !OPENCODE_NATIVE_TABLE.iter().any(|(n, _, _)| n == name),
+                !OPENCODE_NATIVE_TABLE
+                    .iter()
+                    .any(|t| t.name == *name && t.class.is_some()),
                 "`{name}` is both gated and recorded as deliberately ungated — pick one"
             );
             // Global principle 5: `Some("")` would satisfy a bare
@@ -372,7 +498,11 @@ mod tests {
     /// in this file green.
     #[test]
     fn the_experiment_gated_ids_are_classified_even_though_no_probe_sees_them() {
-        let gated = |n: &str| OPENCODE_NATIVE_TABLE.iter().any(|(id, _, _)| *id == n);
+        let gated = |n: &str| {
+            OPENCODE_NATIVE_TABLE
+                .iter()
+                .any(|t| t.name == n && t.class.is_some())
+        };
         let reviewed = |n: &str| OPENCODE_NATIVE_REVIEWED_UNGATED.iter().any(|(id, _)| *id == n);
         for n in ["execute", "lsp", "plan_exit"] {
             assert!(

@@ -8,7 +8,9 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::harness::plugin::{Canary, GrantCtx, HarnessPlugin, InputProfile, ProbeOutput};
+use crate::harness::plugin::{
+    Canary, GrantCtx, HarnessPlugin, InputProfile, NativeTool, ProbeOutput,
+};
 use crate::harness::registry::HarnessId;
 use crate::harness::reader::OobSpec;
 use crate::sandbox::{GrantAccess, GrantRow};
@@ -275,6 +277,10 @@ impl HarnessPlugin for ClaudePlugin {
 
     fn last_verified(&self, hv: &crate::settings::HarnessVersions) -> Option<String> {
         Some(hv.claude_last_verified.clone())
+    }
+
+    fn native_tools(&self) -> &'static [NativeTool] {
+        super::tools::CLAUDE_NATIVE_TABLE
     }
 
     fn capabilities(&self) -> &'static [crate::harness::contract::Capability] {

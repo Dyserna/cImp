@@ -1069,7 +1069,7 @@ fn update_agents(obj: &Value, agents: &mut HashSet<String>, ctx: &OobContext) ->
 
 /// V10: record file/query memory events from an assistant line's `tool_use`
 /// blocks. Maps Claude's tool names → a memory `kind` + target
-/// ([`crate::graph::classify_tool`]); tools not in that map (Task, TodoWrite,
+/// ([`super::tools::claude_memory_kind`]); tools not in that map (Task, TodoWrite,
 /// our own `mcp__cimp-offload__*`) are ignored. Sidechain (sub-agent) lines are
 /// skipped so an agent's internal reads don't pollute the parent session. A
 /// no-op when memory isn't wired.
@@ -1106,7 +1106,7 @@ fn record_tool_events(obj: &Value, project_dir: &Path, session_id: &str, ctx: &O
                 ctx.check_bypass(project_dir, session_id, cmd);
             }
         }
-        let Some((kind, arg)) = crate::graph::classify_tool(name) else {
+        let Some((kind, arg)) = super::tools::claude_memory_kind(name) else {
             continue;
         };
         let Some((path, detail)) = mem_target(arg, part.get("input")) else {
@@ -1132,34 +1132,34 @@ fn record_tool_events(obj: &Value, project_dir: &Path, session_id: &str, ctx: &O
 /// ingress guard in `offload::loopback::handle_memory_event` so both taps
 /// classify identically.
 fn mem_target(
-    arg: crate::graph::MemArg,
+    arg: crate::harness::plugin::MemArg,
     input: Option<&Value>,
 ) -> Option<(String, Option<String>)> {
     let get = |k: &str| input.and_then(|i| i.get(k)).and_then(Value::as_str);
     let (path, detail) = match arg {
         // Read/Edit key the target as `file_path`; NotebookRead/NotebookEdit
         // key it as `notebook_path`.
-        crate::graph::MemArg::Path => (
+        crate::harness::plugin::MemArg::Path => (
             get("file_path")
                 .or_else(|| get("notebook_path"))
                 .unwrap_or("")
                 .to_string(),
             None,
         ),
-        crate::graph::MemArg::Pattern => (
+        crate::harness::plugin::MemArg::Pattern => (
             get("pattern")
                 .or_else(|| get("path"))
                 .unwrap_or("")
                 .to_string(),
             None,
         ),
-        crate::graph::MemArg::Command => (
+        crate::harness::plugin::MemArg::Command => (
             String::new(),
             get("command").map(|c| c.chars().take(200).collect::<String>()),
         ),
     };
     let recordable = match arg {
-        crate::graph::MemArg::Command => detail.is_some(),
+        crate::harness::plugin::MemArg::Command => detail.is_some(),
         _ => !path.is_empty(),
     };
     recordable.then_some((path, detail))
@@ -1168,7 +1168,7 @@ fn mem_target(
 // ── V14 Phase C: token/cost usage tap ─────────────────────────────────────
 
 /// Small ring of `tool_use_id -> tool name`, populated from every `tool_use`
-/// block (ALL tools, unlike [`record_tool_events`]'s `classify_tool` filter —
+/// block (ALL tools, unlike [`record_tool_events`]'s memory-kind filter —
 /// usage accounting wants every tool named, not just the memory-worthy ones)
 /// and consulted when the matching `tool_result` arrives so its estimated
 /// chars can be attributed to a tool ("Read of `foo.rs` cost 18k twice" needs
@@ -1616,7 +1616,7 @@ fn record_usage(
     }
 
     // Learn tool_use_id -> name for every tool_use block, regardless of
-    // whether `classify_tool` recognizes it.
+    // whether the native table gives it a memory kind.
     if let Some(parts) = message_parts(obj) {
         for part in parts {
             if part.get("type").and_then(Value::as_str) == Some("tool_use") {
@@ -2786,7 +2786,7 @@ mod tests {
         // `command` used to record a content-free mem_event (empty path, no
         // detail), wasting a ring slot — the OpenCode ingress in
         // offload::loopback already guarded this; both taps now match.
-        use crate::graph::MemArg;
+        use crate::harness::plugin::MemArg;
         let input = obj(r#"{"description":"oops, no command key"}"#);
         assert_eq!(mem_target(MemArg::Command, Some(&input)), None);
         assert_eq!(mem_target(MemArg::Path, Some(&input)), None);

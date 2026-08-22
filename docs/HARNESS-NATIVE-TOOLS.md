@@ -14,7 +14,9 @@ Scope of that re-audit, so the next reader knows what was and was not re-checked
 
 * **Re-checked against code** — every claim about tool classes, what an engaged
   latch removes, which routes enforce it, and whether the natives are gated.
-  The authority is `offload/toolclass.rs::TABLE` plus the five places that read
+  The authority is `offload/toolclass.rs::TABLE` (cImp's ROUTED tools; since
+  V40 Phase A the harness natives live in `harness/<id>/tools.rs` and are read
+  through `harness::native`) plus the five places that read
   it: the worker (`filter_defs` + `Latch::refusal`) and `loopback.rs`'s four
   gated routes `/run`, `/graph_run`, `/mcp/call` and `/audit/run` (all via
   `Latch::proxy_gate`). Corrections are marked **(2026-08-09)** inline. Seven
@@ -385,7 +387,7 @@ still not had its latency spike and is still deferred by locked decision 17.
 Phase F's sensor hook is matched on web tools only, so it levies no per-call tax
 on `Read`/`Grep`/`Bash` and does not need E1.
 
-**OpenCode:** the eight ids in `toolclass.rs::OPENCODE_NATIVE_TABLE` —
+**OpenCode:** the eight ids in `harness/opencode/tools.rs::OPENCODE_NATIVE_TABLE` —
 `bash`, `read`, `glob`, `grep`, `edit`, `write`, `patch`, `apply_patch` — are
 gated as LOCAL-CAPABILITY, and `webfetch`/`websearch` as EXTERNAL, by the
 generated plugin's `tool.execute.before` handler against this tab's latch

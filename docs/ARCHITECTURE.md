@@ -241,7 +241,12 @@ transcript tap (`harness/claude/read.rs::record_tool_events`, beside `update_age
 session id = the `<id>.jsonl` stem), wired through `OobContext.mem` from
 `pty/manager.rs`. OpenCode's OOB SSE stream has no tool events, so its memory
 comes from the injection plugin's `tool.execute.after` hook POSTing to
-`/memory/event`. `graph::classify_tool` maps tool names → `(kind, arg)` for both.
+`/memory/event`. Each harness's plugin declares the mapping (the `memory_kind`
+column of `harness/<id>/tools.rs`), and core reads it through
+`harness::native::memory_kind` with the request's SOURCE — so `Edit` and `edit`
+are answered from their own vocabularies and an unidentifiable source records
+nothing (V40 Phase A, locked decision 16; it used to be one
+`graph::classify_tool` `match` over both).
 
 **Memory-tool session scoping — per-agent, then per-tab (V28).** The
 `context_recall` / `context_note` / `context_notes` MCP tools have no session

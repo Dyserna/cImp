@@ -741,36 +741,26 @@ pub struct UsageSnapshot {
     pub store_error: Option<String>,
 }
 
-/// Map an agent tool name/id to a memory event `kind` + the argument key that
-/// carries the path/target. Shared by the Claude transcript tap and the
-/// OpenCode plugin's `/memory/event` ingress so both classify identically.
-/// Returns `None` for tools that shouldn't be recorded (Task, TodoWrite, our
-/// own graph/offload tools — already captured by the activity ring).
-pub fn classify_tool(tool: &str) -> Option<(&'static str, MemArg)> {
-    match tool {
-        // Reads.
-        "Read" | "NotebookRead" | "read" => Some(("read", MemArg::Path)),
-        // Edits / writes.
-        "Edit" | "Write" | "MultiEdit" | "NotebookEdit" | "edit" | "write" | "patch" => {
-            Some(("edit", MemArg::Path))
-        }
-        // Structural / content queries.
-        "Grep" | "Glob" | "grep" | "glob" | "list" => Some(("query", MemArg::Pattern)),
-        "Bash" | "bash" => Some(("query", MemArg::Command)),
-        _ => None,
-    }
-}
-
-/// Which argument of a classified tool carries the recorded target.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MemArg {
-    /// `file_path` — a concrete file (recorded as `path`).
-    Path,
-    /// `pattern`/`path` of a search (recorded as `path`, best-effort).
-    Pattern,
-    /// `command` of a shell call (recorded into `detail`, no path).
-    Command,
-}
+// V40 Phase A, locked decision 16 — `classify_tool` and `MemArg` used to live
+// here.
+//
+// `classify_tool` was ONE `match` over BOTH harnesses' tool ids: `Edit` next to
+// `edit`, `MultiEdit` next to `patch`. The V35 Phase K layering scan recorded
+// it as a FINDING rather than an exemption ("it should ask `toolclass` /
+// `harness::opencode::tools` instead — but the two vocabularies answer
+// differently for `edit` vs `Edit`, so rerouting it is a behaviour decision").
+// That is the decision decision 16 took: the classification is per harness, it
+// is declared by the plugin beside that harness's `mutates_fs` and `class`
+// columns, and core reads it through
+// [`crate::harness::native::memory_kind`] using the request's source — which
+// answers `None`, rather than another harness's kind, for a source it cannot
+// identify.
+//
+// `MemArg` moved with it, to `harness/plugin.rs`: L1 declares the memory shape
+// of its own tools and may not import an L4 capability, so the type a plugin
+// declares cannot live in `graph`. Nothing in `graph` reads it — the two
+// consumers are the readers on either side of the seam — so it is not
+// re-exported here either.
 
 #[cfg(test)]
 mod tests {
@@ -944,20 +934,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn classify_maps_kinds_and_ignores_meta_tools() {
-        assert_eq!(classify_tool("Read"), Some(("read", MemArg::Path)));
-        assert_eq!(classify_tool("Edit"), Some(("edit", MemArg::Path)));
-        assert_eq!(classify_tool("Write"), Some(("edit", MemArg::Path)));
-        assert_eq!(classify_tool("Grep"), Some(("query", MemArg::Pattern)));
-        assert_eq!(classify_tool("Bash"), Some(("query", MemArg::Command)));
-        // OpenCode lowercase ids.
-        assert_eq!(classify_tool("edit"), Some(("edit", MemArg::Path)));
-        // Not recorded: sub-agents, todos, and our own graph/offload tools.
-        assert_eq!(classify_tool("Task"), None);
-        assert_eq!(classify_tool("TodoWrite"), None);
-        assert_eq!(classify_tool("mcp__cimp-offload__graph_find_symbol"), None);
-    }
 
     // ── V12 Phase E: distiller output validation ──────────────────────────
 

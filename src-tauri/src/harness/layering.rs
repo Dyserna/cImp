@@ -286,14 +286,16 @@ const LITERAL_ALLOWLIST: &[(&str, &str)] = &[
     //
     // Both files are now inside the scan and clean, which is strictly better than
     // an exemption: a future Claude-payload read in either one fails the build.
-    (
-        "offload/toolclass.rs",
-        "`MultiEdit` in cImp's routed tool `TABLE`. Deliberate and documented at the row: those \
-         are Claude's capitalized natives, kept in cImp's vocabulary because V33's `mutates_fs` \
-         consumer resolves a tool name there. The HARNESS-owned table (OpenCode's own ids) moved \
-         to `harness/opencode/tools.rs` in this phase; folding Claude's into it would recreate \
-         the two-vocabularies-one-lookup bug both tables exist to prevent.",
-    ),
+    // `offload/toolclass.rs` was listed here for Claude's capitalized natives
+    // (`Edit`/`Write`/`Bash`/`MultiEdit`) in cImp's routed `TABLE`, kept there
+    // because V33's `mutates_fs` consumer resolved a tool name through it. The
+    // reason ended "folding Claude's into [OpenCode's table] would recreate the
+    // two-vocabularies-one-lookup bug both tables exist to prevent" — which was
+    // true of that move and is not what V40 Phase A did. Claude's rows went to
+    // `harness/claude/tools.rs`, a THIRD table for a third vocabulary, and the one
+    // lookup that must not cross them (`harness::native`) resolves the harness
+    // from the request instead of picking a table by hand. `TABLE` now holds only
+    // names cImp routes, which is what its unknown-⇒-EXTERNAL law is about.
     (
         "graph/index.rs",
         "A COLLISION, not a dependency — and one worth stating rather than silencing. `\"tool_result\"` \
@@ -305,14 +307,20 @@ const LITERAL_ALLOWLIST: &[(&str, &str)] = &[
          to do. The exemption is the honest third option — and it is narrow: `graph/index.rs` \
          reads no harness payload at all.",
     ),
-    (
-        "graph/memory.rs",
-        "FINDING, not a clean exemption: `memory_kind_of` matches both harnesses' edit-tool ids \
-         (`Edit`/`Write`/`MultiEdit`/`NotebookEdit`/`edit`/`write`/`patch`) inline to classify a \
-         memory event. It should ask `toolclass`/`harness::opencode::tools` instead — but the \
-         two vocabularies answer differently for `edit` vs `Edit`, so rerouting it is a \
-         behaviour decision, not a relocation. Phase K recorded it rather than changing it.",
-    ),
+    // `graph/memory.rs` was listed here from Phase K as a FINDING rather than a
+    // clean exemption: `classify_tool` matched BOTH harnesses' edit-tool ids
+    // (`Edit`/`Write`/`MultiEdit`/`NotebookEdit`/`edit`/`write`/`patch`) inline to
+    // classify a memory event, and the reason said it "should ask
+    // `toolclass`/`harness::opencode::tools` instead — but the two vocabularies
+    // answer differently for `edit` vs `Edit`, so rerouting it is a behaviour
+    // decision, not a relocation."
+    //
+    // V40 Phase A took that decision (locked decision 16). The classification is a
+    // `memory_kind` column on each plugin's own native-tool table, core reads it
+    // through `harness::native::memory_kind` with the request's SOURCE, and a
+    // source cImp cannot identify records nothing instead of borrowing a
+    // vocabulary. The file names no harness id at all now, so it is inside the
+    // scan rather than exempt from it.
 ];
 
 /// **No harness-owned string outside `harness/`** (design § 4.1).

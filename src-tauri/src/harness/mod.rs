@@ -99,6 +99,7 @@ pub mod health;
 
 #[cfg(test)]
 mod layering;
+pub mod native;
 pub mod opencode;
 pub mod plugin;
 pub mod probe;

@@ -45,7 +45,7 @@ mod watcher;
 pub use builder::parse_file;
 pub use context::{est_tokens, RetrieveResult};
 pub use index::GraphIndex;
-pub use memory::{classify_tool, MemArg, MemorySnapshot, ProjectFact, UsageEvent, UsageOrigin};
+pub use memory::{MemorySnapshot, ProjectFact, UsageEvent, UsageOrigin};
 // V14 Phase D: only `UsageSnapshot` itself is named by qualified path outside
 // this module (the `graph_usage` IPC handler's return type). Its nested
 // field types (`Effectiveness`/`SessionUsage`/`SessionUsageRow`/`ToolUsage`/

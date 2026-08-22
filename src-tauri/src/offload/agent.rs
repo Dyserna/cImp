@@ -4246,13 +4246,38 @@ mod tests {
     /// **#48 (finding M-2) — A-1's blind spot: a name that IS in `TABLE` and
     /// that no dispatcher serves.**
     ///
-    /// These six classify LOCAL-CAPABILITY or TRUSTED rather than EXTERNAL, so
+    /// These six classified LOCAL-CAPABILITY or TRUSTED rather than EXTERNAL, so
     /// A-1's rule never saw them: they engaged the latch and *then* met
     /// `tools::dispatch`'s "unknown native tool". `Bash` is the live one — a
     /// local code model reaches for it out of habit, and one such hallucination
     /// used to cost an undeclared task its web tools for good.
+    ///
+    /// **V40 Phase A** moved Claude's three natives out of `TABLE` into
+    /// `harness/claude/tools.rs` (locked decision 16), so in cImp's own routed
+    /// vocabulary they are now ordinary unknown names. The property this test
+    /// is about is unchanged and is asserted for all six below: no refusal, no
+    /// latch movement, in either latch state. What changed is WHICH rule
+    /// delivers it for the three — `dispatchable == false` before, A-1's
+    /// unknown-EXTERNAL-is-a-typo rule now — and the two agree, which is the
+    /// reason `table_matches_the_native_dispatch_surface` pins both directions.
     #[test]
     fn a_classified_name_no_dispatcher_serves_does_not_latch_the_task() {
+        // The three hook identities are still CLASSIFIED — `unrouted` is not
+        // `unclassified`, and the hook routes gate on exactly these rows (M-7).
+        for name in ["hook_post_edit", "hook_should_read", "hook_compaction"] {
+            assert_ne!(
+                toolclass::classify(name),
+                ToolClass::External,
+                "{name} must stay classified"
+            );
+        }
+        // Claude's natives are classified by their HARNESS now, and by cImp's
+        // routed table not at all — which is the honest answer for a name no
+        // cImp dispatcher serves.
+        for name in ["Bash", "Edit", "Write"] {
+            assert_eq!(toolclass::classify(name), ToolClass::External, "{name}");
+            assert!(!toolclass::dispatchable(name), "{name}");
+        }
         for name in [
             "Bash",
             "Edit",
@@ -4261,13 +4286,6 @@ mod tests {
             "hook_should_read",
             "hook_compaction",
         ] {
-            // It is still CLASSIFIED — `unrouted` is not `unclassified`, and
-            // the hook routes gate on exactly these rows (M-7).
-            assert_ne!(
-                toolclass::classify(name),
-                ToolClass::External,
-                "{name} must stay classified"
-            );
             let mut latch = Latch::default();
             assert!(gate(&mut latch, name).is_ok(), "{name} must not be refused");
             assert_eq!(latch, Latch::Open, "{name} must not move the latch");

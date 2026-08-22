@@ -1076,7 +1076,7 @@ impl OffloadService {
     /// Claude and OpenCode children from their respective access flags.
     pub async fn mcp_tool_descriptors(&self, consumer: Consumer) -> Vec<serde_json::Value> {
         let defs = match consumer {
-            Consumer::Opencode => self.host.tool_defs_for_opencode().await,
+            Consumer::Opencode => self.host.tool_defs_for(consumer.harness()).await,
             // This loopback proxy only serves the interactive Claude/OpenCode
             // children; the offload worker reaches the host in-process, never via
             // this route. An unexpected `offload` query value therefore can't
@@ -1087,7 +1087,7 @@ impl OffloadService {
             // practice — the audit fan-out advertises nothing and calls a name
             // its manifest already fixed, so it has no `tools/list` at all.
             Consumer::Claude | Consumer::Offload | Consumer::Audit => {
-                self.host.tool_defs_for_claude().await
+                self.host.tool_defs_for(Consumer::Claude.harness()).await
             }
         };
         defs.into_iter()

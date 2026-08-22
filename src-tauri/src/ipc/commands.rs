@@ -603,7 +603,17 @@ pub async fn tab_set_delegation_role(
     let Some(TabConfig::AiTool(cfg)) = settings.find_tab(tab.as_str()) else {
         return Err(AppError::Ipc(format!("unknown AI tab `{}`", tab.as_str())));
     };
-    let agent = crate::tabs::tab_consumer(cfg);
+    let Some(agent) = crate::tabs::tab_consumer(cfg) else {
+        // V40 Phase A (locked decision 2): a tab whose command names no
+        // registered harness is not a worker at all. It used to be classified
+        // as OpenCode here, become eligible for that harness's Manual slot, and
+        // be typed into with OpenCode's paste rules.
+        return Err(AppError::Ipc(format!(
+            "tab `{}` runs no registered harness, so cImp has no way to type a turn into \
+             it - it cannot hold a delegation role",
+            tab.as_str()
+        )));
+    };
     if crate::harness::input_profile(agent).is_none() {
         return Err(AppError::Ipc(format!(
             "tab `{}` runs a harness with no input profile, so cImp could never type a turn into \
@@ -620,7 +630,7 @@ pub async fn tab_set_delegation_role(
             TabConfig::AiTool(c)
                 if c.delegation_role == DelegationRole::Manual
                     && c.id != tab.as_str()
-                    && crate::tabs::tab_consumer(c) == agent =>
+                    && crate::tabs::tab_consumer(c) == Some(agent) =>
             {
                 Some((c.id.clone(), c.name.clone()))
             }
@@ -642,7 +652,7 @@ pub async fn tab_set_delegation_role(
                 c.delegation_role = role;
             } else if role == DelegationRole::Manual
                 && c.delegation_role == DelegationRole::Manual
-                && crate::tabs::tab_consumer(c) == agent_for_mutate
+                && crate::tabs::tab_consumer(c) == Some(agent_for_mutate)
             {
                 c.delegation_role = DelegationRole::None;
             }
@@ -1521,13 +1531,15 @@ pub async fn settings_update(
     // consumer names whose spawn injection changed.
     let now_spawn_sig = crate::tabs::spawn_inject_sig(&now);
     if now_spawn_sig != was_spawn_sig {
-        let mut consumers: Vec<&'static str> = Vec::new();
-        if now_spawn_sig[0] != was_spawn_sig[0] {
-            consumers.push("claude");
-        }
-        if now_spawn_sig[1] != was_spawn_sig[1] {
-            consumers.push("opencode");
-        }
+        // V40 Phase A (locked decision 8): iterate the map instead of reading
+        // slots 0 and 1. A positional pair meant a harness with no slot got NO
+        // restart hint when a spawn-baked setting changed — the exact failure
+        // the mechanism exists to prevent, and one that compiled.
+        let consumers: Vec<&'static str> = now_spawn_sig
+            .iter()
+            .filter(|(h, v)| was_spawn_sig.get(*h) != Some(*v))
+            .filter_map(|(h, _)| h.id())
+            .collect();
         // Best-effort UI hint — never fail the save over it.
         //
         // BOTH windows (#48, F-x). This used to target `main` only, whose

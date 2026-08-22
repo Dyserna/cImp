@@ -1029,6 +1029,36 @@ impl Consumer {
         }
     }
 
+    /// The consumer variant a registered harness proxies through, if this host
+    /// has one. `None` for a harness the host does not serve — which advertises
+    /// nothing rather than borrowing another harness's grants.
+    ///
+    /// The two ids are literals because [`Consumer`] is an ENUM with a variant
+    /// per harness — the shape locked decision 25 replaces with `PerHarness` in
+    /// Phase B. Until the variants go, the join between them and the registry
+    /// has to be spelled somewhere; here, once, is better than at each call.
+    pub(crate) fn for_harness(id: &str) -> Option<Consumer> {
+        match id {
+            "claude" => Some(Consumer::Claude),
+            "opencode" => Some(Consumer::Opencode),
+            _ => None,
+        }
+    }
+
+    /// The registered harness this consumer proxies for.
+    ///
+    /// [`HarnessId::ANY`] for cImp's own in-app consumers (the offload worker,
+    /// the audit fan-out): they are callers, not harnesses, and a grant question
+    /// asked about them must not be answered with a harness's flags.
+    pub(crate) fn harness(self) -> crate::harness::HarnessId {
+        let id = match self {
+            Consumer::Claude => "claude",
+            Consumer::Opencode => "opencode",
+            Consumer::Offload | Consumer::Audit => return crate::harness::HarnessId::ANY,
+        };
+        crate::harness::HarnessId::from_id(id).unwrap_or(crate::harness::HarnessId::ANY)
+    }
+
     fn label(self) -> &'static str {
         match self {
             Consumer::Claude => "Claude Code",
@@ -1843,16 +1873,21 @@ impl McpHost {
         self.tool_defs_filtered(Consumer::Offload).await
     }
 
-    /// Claude-Code tool defs (servers with `claude_access`), proxied to Claude
-    /// through the per-session child's `tools/list`.
-    pub async fn tool_defs_for_claude(&self) -> Vec<ToolDef> {
-        self.tool_defs_filtered(Consumer::Claude).await
-    }
-
-    /// V19: OpenCode tool defs (servers with `opencode_access`), proxied to
-    /// OpenCode through the `--consumer opencode` child's `tools/list`.
-    pub async fn tool_defs_for_opencode(&self) -> Vec<ToolDef> {
-        self.tool_defs_filtered(Consumer::Opencode).await
+    /// One harness's tool defs (the servers granted to it), proxied to that
+    /// harness through its per-session child's `tools/list`.
+    ///
+    /// V40 Phase A (locked decision 25) replaced the
+    /// `tool_defs_for_claude` / `tool_defs_for_opencode` pair. Two methods that
+    /// differ only in a `Consumer` variant is one method per harness, which is
+    /// the shape a third harness would have had to add a third of.
+    pub async fn tool_defs_for(&self, harness: crate::harness::HarnessId) -> Vec<ToolDef> {
+        match harness.id().and_then(Consumer::for_harness) {
+            Some(c) => self.tool_defs_filtered(c).await,
+            // A harness the MCP host has no consumer variant for advertises
+            // NOTHING rather than inheriting another harness's grants — the
+            // fail-closed direction for a grant question.
+            None => Vec::new(),
+        }
     }
 
     /// Route a namespaced `<server>__<tool>` call to its owning server, but
@@ -3923,7 +3958,7 @@ mod tests {
             Arc::new(fake_server("gamma", false, false, true, "gamma__z")), // OpenCode-only
         ]);
 
-        let claude = host.tool_defs_for_claude().await;
+        let claude = host.tool_defs_for(harness_id("claude")).await;
         assert_eq!(claude.len(), 1);
         assert_eq!(claude[0].function.name, "alpha__x");
 
@@ -3931,7 +3966,7 @@ mod tests {
         assert_eq!(offload.len(), 1);
         assert_eq!(offload[0].function.name, "beta__y");
 
-        let opencode = host.tool_defs_for_opencode().await;
+        let opencode = host.tool_defs_for(harness_id("opencode")).await;
         assert_eq!(opencode.len(), 1);
         assert_eq!(opencode[0].function.name, "gamma__z");
 
@@ -4748,9 +4783,9 @@ mod tests {
             vec![disabled("beta", EnableVerdict::CategoriesOff("research".into()))];
 
         for defs in [
-            host.tool_defs_for_claude().await,
+            host.tool_defs_for(harness_id("claude")).await,
             host.tool_defs_for_offload().await,
-            host.tool_defs_for_opencode().await,
+            host.tool_defs_for(harness_id("opencode")).await,
         ] {
             assert_eq!(defs.len(), 1, "got: {defs:?}");
             assert_eq!(defs[0].function.name, "alpha__x");
@@ -5887,7 +5922,7 @@ mod tests {
             ],
         )));
         let before = host.servers.read().await[0].clone();
-        assert_eq!(host.tool_defs_for_claude().await.len(), 2);
+        assert_eq!(host.tool_defs_for(harness_id("claude")).await.len(), 2);
 
         // Screening with detection OFF withholds nothing — a degraded or
         // disabled screener must never empty a surface (the `apply_screen`
@@ -5896,7 +5931,7 @@ mod tests {
             !host.rescreen(NO_SCREEN).await,
             "a screen that cannot run drops nothing"
         );
-        assert_eq!(host.tool_defs_for_claude().await.len(), 2);
+        assert_eq!(host.tool_defs_for(harness_id("claude")).await.len(), 2);
 
         // Now the rules change and the first tool's description starts firing.
         // Driven through `drop_flagged` — the mechanism `rescreen` applies — so
@@ -5919,7 +5954,7 @@ mod tests {
 
         // Gone from every consumer's surface…
         let names: Vec<String> = host
-            .tool_defs_for_claude()
+            .tool_defs_for(harness_id("claude"))
             .await
             .into_iter()
             .map(|d| d.function.name)
@@ -5967,6 +6002,14 @@ mod tests {
         s.origin = McpOrigin::Internal;
         host.servers.write().await.push(Arc::new(s));
         assert!(!host.rescreen(detection::Config::default()).await);
-        assert_eq!(host.tool_defs_for_claude().await.len(), 1);
+        assert_eq!(host.tool_defs_for(harness_id("claude")).await.len(), 1);
     }
+}
+
+/// A registered harness by id — the tests may NAME a harness, they just may not
+/// construct one out of thin air. `expect` because a build whose registry does
+/// not know these two ids is one `every_registry_entry_is_fully_wired` fails.
+#[cfg(test)]
+fn harness_id(id: &str) -> crate::harness::HarnessId {
+    crate::harness::HarnessId::from_id(id).expect("a registered harness id")
 }

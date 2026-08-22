@@ -83,9 +83,14 @@ static CONSUMER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 /// (or by a pre-V28 cImp), which fails open to the old behavior.
 static TAB: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
-/// The configured consumer name, lowercased; `"claude"` when unset.
+/// The configured consumer name, lowercased; [`DEFAULT_HARNESS`] when unset —
+/// a child spawned before the flag existed, see that constant's doc comment.
+///
+/// [`DEFAULT_HARNESS`]: crate::harness::DEFAULT_HARNESS
 fn consumer() -> &'static str {
-    CONSUMER.get().map(String::as_str).unwrap_or("claude")
+    CONSUMER.get().map(String::as_str).unwrap_or_else(|| crate::harness::DEFAULT_HARNESS
+        .id()
+        .expect("DEFAULT_HARNESS names a registered harness"))
 }
 
 /// The tab id this child serves, or `None` when it was spawned without `--tab`.
@@ -3199,17 +3204,15 @@ fn delegate_targets(
         return Vec::new();
     }
     let mut out = Vec::new();
-    for id in crate::harness::contract::harness_ids() {
-        if crate::harness::input_profile(id).is_none() {
+    for harness in crate::harness::registry::all() {
+        let Some(id) = harness.id() else { continue };
+        if harness.plugin().and_then(|p| p.input_profile()).is_none() {
             continue;
         }
-        let Some(harness) = crate::harness::contract::Harness::from_id(id) else {
-            continue;
-        };
         let manual = settings.tabs.iter().find_map(|t| match t {
             TabConfig::AiTool(c)
                 if c.delegation_role == DelegationRole::Manual
-                    && crate::tabs::tab_consumer(c) == id =>
+                    && crate::tabs::tab_consumer(c) == Some(id) =>
             {
                 Some(c)
             }
@@ -3219,7 +3222,7 @@ fn delegate_targets(
         if own_tab.is_some_and(|own| own == cfg.id) {
             continue;
         }
-        out.push((id, harness.display_name().to_string(), cfg.name.clone()));
+        out.push((id, harness.label().to_string(), cfg.name.clone()));
     }
     out
 }
@@ -3402,12 +3405,12 @@ mod delegate_tool_tests {
     /// user-directed instrument into one the model may reach for on its own.
     #[test]
     fn every_generated_delegate_tool_opens_with_the_pinned_sentence() {
-        let ids = crate::harness::contract::harness_ids();
+        let ids = crate::harness::registry::harness_ids();
         assert!(!ids.is_empty());
         for id in ids {
-            let display = crate::harness::contract::Harness::from_id(id)
+            let display = crate::harness::HarnessId::from_id(id)
                 .expect("registry harness")
-                .display_name();
+                .label();
             let tool = delegate_task_tool(id, display, "api-work");
             let desc = tool["description"].as_str().expect("a description");
             assert!(
@@ -3599,11 +3602,11 @@ mod delegate_tool_tests {
     /// claims, and the suffix is the registry's own harness id.
     #[test]
     fn the_tool_name_prefix_round_trips_to_a_registry_harness_id() {
-        for id in crate::harness::contract::harness_ids() {
+        for id in crate::harness::registry::harness_ids() {
             let name = format!("{DELEGATE_TOOL_PREFIX}{id}");
             assert!(name.starts_with(DELEGATE_TOOL_PREFIX));
             assert_eq!(name.strip_prefix(DELEGATE_TOOL_PREFIX), Some(id));
-            assert!(crate::harness::contract::Harness::from_id(id).is_some());
+            assert!(crate::harness::HarnessId::from_id(id).is_some());
         }
         // A bare prefix names no harness and must not dispatch.
         assert_eq!(

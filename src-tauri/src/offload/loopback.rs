@@ -1754,7 +1754,7 @@ fn ai_tab_ids_for<'a>(
     agent: &'static str,
 ) -> impl Iterator<Item = &'a str> {
     settings.tabs.iter().filter_map(move |t| match t {
-        crate::settings::TabConfig::AiTool(c) if crate::tabs::tab_consumer(c) == agent => {
+        crate::settings::TabConfig::AiTool(c) if crate::tabs::tab_consumer(c) == Some(agent) => {
             Some(c.id.as_str())
         }
         _ => None,
@@ -4811,7 +4811,7 @@ struct AuditRunBody {
     /// The agent that triggered the scan, from the child's `--consumer` flag.
     /// It selects which `expose_*` toggle the route re-enforces at run time, so
     /// it is a *capability selector*, not a label — H-8: narrowed to
-    /// [`AUDIT_CONSUMERS`] by [`audit_consumer`] before it reaches
+    /// [`audit_consumers`] by [`audit_consumer`] before it reaches
     /// [`AuditState::consumer_exposed`](crate::audit::AuditState::consumer_exposed).
     #[serde(default)]
     consumer: Option<String>,
@@ -4857,9 +4857,14 @@ struct AuditRunBody {
 /// ("`expose_offload` is deliberately absent: the offload worker runs
 /// in-process"). So `expose_offload` — which defaults **true** — was reachable
 /// over HTTP only by a caller that no legitimate component ever is.
-const AUDIT_CONSUMERS: [&str; 2] = ["claude", "opencode"];
+/// The consumers `/audit/run` serves — **the registry**, not a literal pair
+/// (V40 Phase A). A harness added without a line here used to be refused by a
+/// route it is entitled to, with a message naming two products it isn't one of.
+fn audit_consumers() -> Vec<&'static str> {
+    crate::harness::registry::harness_ids()
+}
 
-/// H-8: narrow `/audit/run`'s caller-asserted `consumer` to [`AUDIT_CONSUMERS`]
+/// H-8: narrow `/audit/run`'s caller-asserted `consumer` to [`audit_consumers`]
 /// at the parse boundary, returning the `&'static str` the rest of the route
 /// uses. Same discipline `ada4bae` gave `/run`'s `tool` label
 /// ([`offload_tool_name`]) and for a stronger reason: `tool` is only a label,
@@ -4873,16 +4878,20 @@ fn audit_consumer(raw: Option<&str>) -> Result<&'static str, String> {
     let raw = raw
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .unwrap_or("claude");
+        .unwrap_or_else(|| {
+            crate::harness::DEFAULT_HARNESS
+                .id()
+                .expect("DEFAULT_HARNESS names a registered harness")
+        });
     let lower = raw.to_ascii_lowercase();
-    AUDIT_CONSUMERS
-        .iter()
-        .copied()
+    audit_consumers()
+        .into_iter()
         .find(|c| *c == lower)
         .ok_or_else(|| {
             format!(
-                "code audit does not serve the consumer {raw:?} — this route serves the \
-                 cimp-code-audit MCP child only (claude, opencode)"
+                "code audit does not serve the consumer {raw:?} - this route serves the \
+                 cimp-code-audit MCP child only ({})",
+                audit_consumers().join(", ")
             )
         })
 }
@@ -4890,7 +4899,7 @@ fn audit_consumer(raw: Option<&str>) -> Result<&'static str, String> {
 /// H-8: `/audit/run` requires a tab identity — a request without one is
 /// **refused**, never treated as clean.
 ///
-/// Both spawn paths have sent `--tab` since V32 C-1b (see [`AUDIT_CONSUMERS`]),
+/// Both spawn paths have sent `--tab` since V32 C-1b (see [`audit_consumers`]),
 /// so the only bodies this rejects are a hand-run child, a forged request, and
 /// a *stale* child left over from a pre-C-1b build — which is why the message
 /// names the remedy (restart the tab) rather than the symptom.
@@ -5076,7 +5085,7 @@ fn audit_admit(
 /// already has this" residual does not cover. Compounding it, `consumer` was
 /// caller-asserted and unbounded while *selecting which `expose_*` toggle is
 /// checked*, including `"offload"` — which defaults **true** and which no
-/// legitimate caller sends (see [`AUDIT_CONSUMERS`]). Both halves are now
+/// legitimate caller sends (see [`audit_consumers`]). Both halves are now
 /// closed at the parse boundary by [`audit_admit`]: a body with no usable tab
 /// identity is refused with an actionable message, an unrecognized `consumer`
 /// is refused, and any surviving path on which the gate does not apply warns.
@@ -13045,7 +13054,7 @@ mod tests {
             assert!(reg.snapshot().is_empty(), "{bad}");
         }
         // The set itself, and the two spellings the spawn paths actually send.
-        assert_eq!(AUDIT_CONSUMERS, ["claude", "opencode"]);
+        assert_eq!(audit_consumers(), crate::harness::registry::harness_ids());
         assert_eq!(audit_consumer(None), Ok("claude"));
         assert_eq!(audit_consumer(Some("")), Ok("claude"));
         assert_eq!(audit_consumer(Some("  ")), Ok("claude"));
@@ -13054,7 +13063,7 @@ mod tests {
         // …and the value that reaches `consumer_exposed` is one of those two
         // literals, never the caller's string, so no `expose_*` toggle outside
         // the pair is reachable over HTTP.
-        for c in AUDIT_CONSUMERS {
+        for c in audit_consumers() {
             assert_eq!(audit_consumer(Some(c)), Ok(c));
         }
     }
@@ -18271,16 +18280,24 @@ mod tests {
         assert_eq!(hook_agent(Some("claude")), "claude");
         assert_eq!(hook_agent(Some("opencode")), "opencode");
         assert_eq!(hook_agent(Some("OpenCode")), "opencode");
-        // Anything invented lands on `claude` rather than inventing an agent —
-        // `source_for_consumer`'s locked behaviour, shared verbatim with
-        // `/graph_run`'s `consumer`. Padding is NOT trimmed (that narrowing
-        // lives in `audit_consumer`, whose route requires identity); no shim
-        // sends any, and trimming would buy nothing here because `agent` is
-        // caller-asserted either way — F-4 still holds, the (agent, tab) pair
-        // is verified on no route, and this fix neither relies on it nor makes
-        // it worse.
-        assert_eq!(hook_agent(Some("offload")), "claude");
-        assert_eq!(hook_agent(Some(" opencode ")), "claude");
+        // cImp's own in-app consumer keeps its own name — it is a real source
+        // in the activity feed, not an invented one.
+        assert_eq!(hook_agent(Some("offload")), "offload");
+        // **V40 Phase A: anything INVENTED is `unknown`, not `claude`.** It used
+        // to fall through to Claude, so a forged or hand-run caller asserting
+        // any token at all got Claude's activity badge and Claude's memory
+        // scope — a misattribution in the view whose whole job is attribution.
+        // `agent` is caller-asserted either way (F-4 still holds; the (agent,
+        // tab) pair is verified on no route), so this is about honesty of the
+        // row, and `unknown` scopes to no sessions rather than to another
+        // agent's.
+        assert_eq!(hook_agent(Some("codex")), crate::graph::UNKNOWN_SOURCE);
+        // Padding is still NOT trimmed — that narrowing lives in
+        // `audit_consumer`, whose route requires identity. No shim sends any.
+        assert_eq!(
+            hook_agent(Some(" opencode ")),
+            crate::graph::UNKNOWN_SOURCE
+        );
     }
 
     /// All three hook bodies still parse without the two new fields — a shim or
@@ -19150,7 +19167,7 @@ fn manual_tab_for(settings: &crate::settings::Settings, harness: &str) -> Option
     settings.tabs.iter().find_map(|t| match t {
         crate::settings::TabConfig::AiTool(c)
             if c.delegation_role == crate::settings::DelegationRole::Manual
-                && crate::tabs::tab_consumer(c) == harness =>
+                && crate::tabs::tab_consumer(c) == Some(harness) =>
         {
             Some(c.id.clone())
         }

@@ -1373,8 +1373,19 @@ impl ScopeAudit for TaskAudit {
 /// boolean test, so the array has exactly as many slots as there are agents and
 /// **no caller-supplied string can create one**. A map keyed on the agent name
 /// would have been the same shape as F-37's defect, in the fix for its sibling.
-static UNSCOPED: std::sync::Mutex<[AuditClaims; 2]> =
-    std::sync::Mutex::new([AuditClaims::EMPTY; 2]);
+static UNSCOPED: std::sync::Mutex<[AuditClaims; UNSCOPED_SLOTS]> =
+    std::sync::Mutex::new([AuditClaims::EMPTY; UNSCOPED_SLOTS]);
+
+/// One slot per registered harness, **plus one** for a caller whose agent names
+/// no registered harness (V40 Phase A, locked decision 25).
+///
+/// The extra slot is the honest half of the same change that made
+/// `HarnessId::from_command` fallible: an unrecognised agent used to fold onto
+/// Claude's ledger, so a forged or third-party caller's denials suppressed a
+/// real Claude tab's rows. It now has its own lane, which is still bounded
+/// (`log2(n)`) and still cannot be multiplied by a caller-supplied string —
+/// the key is an index, never the string.
+const UNSCOPED_SLOTS: usize = crate::harness::registry::COUNT + 1;
 
 /// The ledger for a call that reaches a screen with **no scope of its own** —
 /// the `agent:(no tab identity)` case (#48 finding F-40).
@@ -1424,15 +1435,13 @@ impl UnscopedAudit {
     /// Agent name → slot. The whole of the key derivation, in one place, so the
     /// "no string can become a key" claim is checkable by reading it.
     ///
-    /// Matches `graph::source_for_consumer`'s two-value vocabulary, which is
-    /// what every caller of this type has already normalised through — an
-    /// unrecognised name lands on the same slot that vocabulary would give it.
-    const fn slot(agent: &str) -> usize {
-        // `eq_ignore_ascii_case` is not const; this is the same test.
-        match agent.as_bytes() {
-            b"opencode" | b"OpenCode" | b"OPENCODE" => 1,
-            _ => 0,
-        }
+    /// Matches the registry's vocabulary, which is what every caller of this
+    /// type has already normalised through. An agent that names no registered
+    /// harness lands on the LAST slot — its own lane, not another harness's.
+    fn slot(agent: &str) -> usize {
+        crate::harness::HarnessId::from_id(&agent.to_ascii_lowercase())
+            .and_then(|h| h.ordinal())
+            .unwrap_or(UNSCOPED_SLOTS - 1)
     }
 }
 
@@ -2664,29 +2673,26 @@ mod tests {
             UnscopedAudit::slot("opencode")
         );
         // And nothing else can add a slot. Anything unrecognised folds onto the
-        // same slot `graph::source_for_consumer` would give it, which is the
-        // vocabulary every caller of this type has already normalised through.
-        for forged in [
-            "",
-            "claude",
-            "CLAUDE",
-            "attacker",
-            "opencode-2",
-            "../../etc",
-            "opencodex",
-        ] {
+        // ONE unattributed lane — V40 Phase A: no longer onto Claude's, so a
+        // forged caller cannot suppress a real harness's rows.
+        let unattributed = UnscopedAudit::slot("attacker");
+        for forged in ["", "attacker", "opencode-2", "../../etc", "opencodex"] {
             let slot = UnscopedAudit::slot(forged);
             assert!(
                 slot < UNSCOPED.lock().unwrap().len(),
                 "`{forged}` produced slot {slot}, outside the fixed array"
             );
-            if forged != "opencode" {
-                assert_eq!(
-                    slot,
-                    UnscopedAudit::slot("claude"),
-                    "`{forged}` must fold onto the default agent, not open a slot"
-                );
-            }
+            assert_eq!(
+                slot, unattributed,
+                "`{forged}` must fold onto the unattributed lane, not open a slot"
+            );
+        }
+        for registered in ["claude", "CLAUDE", "opencode", "OpenCode"] {
+            assert_ne!(
+                UnscopedAudit::slot(registered),
+                unattributed,
+                "`{registered}` is a registered harness and owns its own lane"
+            );
         }
     }
 

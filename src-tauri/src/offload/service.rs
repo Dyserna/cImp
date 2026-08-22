@@ -1224,13 +1224,20 @@ impl OffloadService {
         // so an offload from a session in repo A reads repo A — not the app's
         // own launch directory. `None` falls back to the app's cwd.
         session_cwd: Option<PathBuf>,
-        // V33 Phase F: the cImp TAB this offload was requested from, as the
-        // `/run` body asserted it. Used for ONE thing — attributing the
-        // pre-mutation checkpoint the worker takes before `run_command` — and
-        // deliberately not for routing, budgets or gating, all of which resolve
-        // the tab through `latch_scope` at the loopback instead. `None` (an
-        // older MCP child, a tab-less caller) records a checkpoint with no tab,
-        // which is the honest answer and the pre-V33 row.
+        // V33 Phase F: the cImp TAB this offload was requested from — narrowed
+        // at the loopback through `tab_identity`, so it is a configured tab of
+        // the calling consumer or nothing at all.
+        //
+        // It had ONE use (attributing the pre-mutation checkpoint the worker
+        // takes before `run_command`) and V39 Phase C gives it a second: it is
+        // the DRIVER identity of a facade run, which the delegation engine needs
+        // for the acyclic check and the Events row. Both uses want the same
+        // narrow, unforgeable value, which is why this is the field they share.
+        //
+        // Still not routing, budgets or gating: those resolve the tab through
+        // `latch_scope` at the loopback. `None` (an older MCP child, a headless
+        // consumer) records a checkpoint with no tab and makes every facade
+        // unroutable for this call, which are both the honest answers.
         tab: Option<&str>,
         // V21 F9: optional JSON Schema — when set, the worker's final-synthesis
         // turn is grammar-constrained to matching JSON (threaded to `run_on` →
@@ -1312,12 +1319,21 @@ impl OffloadService {
             ));
         }
 
+        // V39 Phase C: a facade needs a DRIVER, and a headless consumer
+        // (`claude -p`, a cron child) has no tab to be one. `drive` refuses that
+        // by name — the acyclic check and the audit row both need to know who
+        // asked — so routing there would be a guaranteed refusal dressed as a
+        // choice. Not ready, for this caller, is the honest view: the cascade
+        // then picks a real backend or says `NoBackendReady`, and nothing about
+        // the pool itself is mutated (`describe` and the health watch, which
+        // have no caller at all, still report the facade for what it is).
+        let has_driver = tab.is_some();
         let views: Vec<BackendView> = pool
             .iter()
             .map(|p| BackendView {
                 name: p.name.clone(),
                 base_url: p.base_url.clone(),
-                ready: p.ready,
+                ready: routable(p.ready, matches!(p.handle, Handle::HarnessTab(_)), has_driver),
                 cloud_blocked: p.cloud_blocked,
                 n_ctx: p.n_ctx,
                 slots: p.slots,
@@ -2888,6 +2904,17 @@ fn effective_roots(snap: &OffloadSettings) -> Vec<PathBuf> {
     }
 }
 
+/// V39 Phase C — whether one resolved backend is routable **for this caller**.
+///
+/// Readiness is a property of the backend; this is the one place a property of
+/// the CALLER narrows it. A facade needs a driver tab (the engine refuses a
+/// headless consumer by name), so for a caller that has none it is not a
+/// candidate — not because it is down, but because this call could never use
+/// it. Written as a function so both halves are assertable without a live pool.
+fn routable(ready: bool, is_facade: bool, has_driver: bool) -> bool {
+    ready && (has_driver || !is_facade)
+}
+
 /// Compute the global concurrency cap: the explicit override, else the
 /// summed per-backend slot counts, clamped to `[1, GLOBAL_CONCURRENCY_MAX]`.
 fn compute_global_cap(cur: &Settings) -> u32 {
@@ -3018,6 +3045,24 @@ mod tests {
     fn global_cap_defaults_to_one_when_empty() {
         let snap = OffloadSettings::default(); // no backends, empty command
         assert_eq!(compute_global_cap(&with_offload(snap)), 1);
+    }
+
+    /// **A facade needs a driver; a real backend does not.**
+    ///
+    /// The asymmetry is the whole rule: a headless consumer (`claude -p`, a
+    /// cron child) can offload to a server all day, and can never drive a tab —
+    /// so routing it at one would be a guaranteed refusal dressed as a choice.
+    #[test]
+    fn a_facade_is_only_routable_for_a_caller_with_a_tab() {
+        // A facade: routable only with a driver.
+        assert!(routable(true, true, true));
+        assert!(!routable(true, true, false));
+        // A real backend: the caller's identity is none of its business.
+        assert!(routable(true, false, false));
+        assert!(routable(true, false, true));
+        // …and nothing here can make an unready backend routable.
+        assert!(!routable(false, false, true));
+        assert!(!routable(false, true, true));
     }
 
     /// **V39 Phase C: a facade tab is one more concurrent slot.**

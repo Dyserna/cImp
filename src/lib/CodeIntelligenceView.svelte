@@ -107,6 +107,8 @@
   } from './viewSection';
   import { harnessMarkVerified } from './graph';
   import { harnesses, harnessLabel } from './harness';
+  import { harnessUsage } from './ipc';
+  import { get } from 'svelte/store';
 
   // The graph_* tool reference list, the recent-calls activity feed, and the
   // graph index dashboard all moved to the Tool Activity tab
@@ -1408,10 +1410,49 @@
       DASH_GAP_INNER,
     ),
   );
-  const DASH_ORIGIN_LABEL: Record<string, string> = {
-    session: 'main session',
-    agent: 'sub-agents',
-  };
+  /// The lane names the donut, its legend and the per-model share line print.
+  ///
+  /// **V40 Phase F (locked decision 19).** These were two literals: the
+  /// `session | agent` split is one harness's sidechain model, and a harness
+  /// that attributes turns some other way had no way to say so. They come from
+  /// `harness_usage`'s declared `origins` now — filled by `loadDeclaredOrigins`
+  /// below — and a lane no harness declares renders as its own id rather than
+  /// as a guess, which is the same posture every other unknown gets.
+  ///
+  /// What did NOT move, and is worth stating: the two-lane SHAPE is still in
+  /// the payload (`OriginSplit { session_tok, agent_tok }`), so this renames
+  /// the lanes rather than generalising them. That shape is `graph/`'s and is
+  /// the ledger's `graph.ts:613-682` row.
+  let declaredOrigins = $state<Record<string, string>>({});
+  const DASH_ORIGIN_LABEL = $derived(declaredOrigins);
+
+  /// Ask each harness that declares `session_usage` what its lanes are called,
+  /// once. Best-effort in both directions: a harness that answers no source
+  /// contributes nothing, and a failed call leaves the map as it is — the
+  /// labels degrade to bare ids, never to another harness's wording.
+  // Driven by the roster rather than by mount: `harness_list` and this
+  // component's mount race, and an empty roster would leave every lane labelled
+  // with its bare id. Re-runs once, when the list arrives.
+  let originsAsked = false;
+  $effect(() => {
+    if (originsAsked || $harnesses.length === 0) return;
+    originsAsked = true;
+    void loadDeclaredOrigins();
+  });
+
+  async function loadDeclaredOrigins(): Promise<void> {
+    const next: Record<string, string> = {};
+    for (const h of get(harnesses)) {
+      if (!h.features.includes('session_usage')) continue;
+      try {
+        const answer = await harnessUsage(h.id);
+        for (const o of answer.source?.origins ?? []) next[o.id] ??= o.label;
+      } catch (e) {
+        console.warn('harness_usage origins failed:', e);
+      }
+    }
+    declaredOrigins = { ...next, ...declaredOrigins };
+  }
   const DASH_KIND_LABEL = Object.fromEntries(DASH_KIND_SEGS.map((s) => [s.key, s.label])) as Record<
     string,
     string
@@ -1788,7 +1829,7 @@
                 {#each dashOuterArcs as a (a.key)}
                   <path class="dseg {a.key}" d={arcPath(66, 66, 62, 46, a.a0, a.a1)}>
                     <title
-                      >{DASH_ORIGIN_LABEL[a.key]}: {a.value.toLocaleString()} tok · {fmtPct(
+                      >{DASH_ORIGIN_LABEL[a.key] ?? a.key}: {a.value.toLocaleString()} tok · {fmtPct(
                         a.share,
                       )}</title
                     >
@@ -1798,7 +1839,7 @@
                   {@const p = dashInnerParts(a.key)}
                   <path class="dseg {p.kind}" d={arcPath(66, 66, 42, 28, a.a0, a.a1)}>
                     <title
-                      >{DASH_ORIGIN_LABEL[p.origin]} {DASH_KIND_LABEL[p.kind]}: {a.value.toLocaleString()} tok
+                      >{DASH_ORIGIN_LABEL[p.origin] ?? p.origin} {DASH_KIND_LABEL[p.kind]}: {a.value.toLocaleString()} tok
                       · {fmtPct(a.share)}</title
                     >
                   </path>
@@ -1817,7 +1858,7 @@
                       oninput={(e) => (chartPreview[r.seg.key] = e.currentTarget.value)}
                       onchange={(e) => commitChartColor(r.seg, e.currentTarget.value)}
                     />
-                    <span class="dl-name">{DASH_ORIGIN_LABEL[r.origin]}</span>
+                    <span class="dl-name">{DASH_ORIGIN_LABEL[r.origin] ?? r.origin}</span>
                     <span class="tnum" title="{r.tok.toLocaleString()} tokens">{fmtTok(r.tok)}</span>
                     <span class="muted">{fmtPct(dashTokenTotal > 0 ? r.tok / dashTokenTotal : 0)}</span>
                   </div>
@@ -2202,7 +2243,10 @@
                 </select>
               </div>
               <!-- Secondary line: the main-session vs sub-agent token share. -->
-              <div class="cm-share muted">{originShareLine(m.origins)}</div>
+              <div class="cm-share muted">{originShareLine(m.origins, {
+                    session: DASH_ORIGIN_LABEL['session'],
+                    agent: DASH_ORIGIN_LABEL['agent'],
+                  })}</div>
               {#if st.selIdx === pricingRows.length && costCustomByModel[m.model]}
                 <div class="cost-custom">
                   <label><span>Input $/MTok</span><input type="number" min="0" step="0.01" bind:value={costCustomByModel[m.model].input} /></label>

@@ -708,8 +708,8 @@ const TOKEN_KINDS: &[TokenKindSpec] = &[
 /// a turn recorded in `<sid>/subagents/*.jsonl`, or an inline `isSidechain:true`
 /// line. Both ids are persisted in `usage_stat.origin`.
 const ORIGINS: &[TurnOrigin] = &[
-    TurnOrigin { id: "session", label: "Session" },
-    TurnOrigin { id: "agent", label: "Sub-agent" },
+    TurnOrigin { id: "session", label: "main session" },
+    TurnOrigin { id: "agent", label: "sub-agents" },
 ];
 
 /// Claude Code's pseudo-model, stamped on messages it fabricates locally

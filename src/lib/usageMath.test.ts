@@ -537,14 +537,29 @@ describe('Cost card pricing (V24 Phase D)', () => {
     });
   });
 
-  describe('originShareLine (S/A share formatting)', () => {
-    test('formats both origins with fmtTok', () => {
+  describe('originShareLine (lane share formatting)', () => {
+    test('formats both origins with fmtTok, under the lane names it is given', () => {
+      expect(
+        originShareLine(
+          { session_tok: 12_300, agent_tok: 4_100 },
+          { session: 'main session', agent: 'sub-agents' },
+        ),
+      ).toBe('main session 12k · sub-agents 4.1k tok');
+    });
+
+    test('lanes with no declared name fall back to their ids, never to a guess', () => {
+      // V40 Phase F: the wording is the harness's declared origins; a build
+      // whose registry has not answered renders the bare lane ids rather than
+      // one harness's phrasing under another's numbers.
       expect(originShareLine({ session_tok: 12_300, agent_tok: 4_100 })).toBe(
-        'session 12k · agents 4.1k tok',
+        'session 12k · agent 4.1k tok',
       );
     });
-    test('a session with no agent fan-out still shows both sides', () => {
-      expect(originShareLine({ session_tok: 500, agent_tok: 0 })).toBe('session 500 · agents 0 tok');
+
+    test('a session with no fan-out still shows both sides', () => {
+      expect(
+        originShareLine({ session_tok: 500, agent_tok: 0 }, { session: 'main', agent: 'subs' }),
+      ).toBe('main 500 · subs 0 tok');
     });
   });
 });

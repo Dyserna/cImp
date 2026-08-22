@@ -392,12 +392,22 @@ export function costGrandTotal(
   return perModel.reduce((sum, m, i) => sum + sessionCost(m.totals, rates(i)).total, 0);
 }
 
-/// A Cost-card row's secondary S/A share line — the origin split formatted
-/// with `fmtTok`, e.g. `"session 12.3k · agents 4.1k tok"`. Both sides are
-/// always shown (a zero reads as `"agents 0"`), so a session with no agent
+/// A Cost-card row's secondary lane-share line — the origin split formatted
+/// with `fmtTok`, e.g. `"main session 12.3k · sub-agents 4.1k tok"`. Both sides
+/// are always shown (a zero reads as `"sub-agents 0"`), so a session with no
 /// fan-out still reads honestly.
-export function originShareLine(origins: { session_tok: number; agent_tok: number }): string {
-  return `session ${fmtTok(origins.session_tok)} · agents ${fmtTok(origins.agent_tok)} tok`;
+///
+/// V40 Phase F (locked decision 19): the LANE NAMES are the harness's declared
+/// origins, passed in by the caller, rather than two words written here — the
+/// `session | agent` split is one harness's sidechain model and its wording is
+/// its own. Absent names fall back to the ids, never to another harness's.
+export function originShareLine(
+  origins: { session_tok: number; agent_tok: number },
+  names: { session?: string; agent?: string } = {},
+): string {
+  const s = names.session ?? 'session';
+  const a = names.agent ?? 'agent';
+  return `${s} ${fmtTok(origins.session_tok)} · ${a} ${fmtTok(origins.agent_tok)} tok`;
 }
 
 // ── V28: Overview dashboard donuts ─────────────────────────────────────

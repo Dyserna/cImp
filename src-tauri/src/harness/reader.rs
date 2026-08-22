@@ -122,14 +122,49 @@ pub struct OobContext {
 /// inferred from its command, which is a guess about a task that may never have
 /// started.
 ///
-/// A `BTreeSet` behind a plain `Mutex`: the write path is two tab-lifecycle
+/// A `BTreeMap` behind a plain `Mutex`: the write path is two tab-lifecycle
 /// edges, the read path is one preflight.
-static LIVE_READERS: std::sync::Mutex<Option<std::collections::BTreeSet<String>>> =
+///
+/// **The value is a per-spawn epoch, and that is the whole of V39 review M-7.**
+/// It was a set, and deregistration removed the tab id: a tab that had been
+/// restarted therefore had TWO deregistration tasks parked on two cancellation
+/// tokens, and the OLD one — firing whenever the old token was finally
+/// cancelled — deleted the NEW reader's entry. Preflight then refused a tab
+/// that had a perfectly good reader attached, permanently, with "no way to
+/// report the end of a turn". Keyed removal (remove only if the epoch is still
+/// mine) makes the late task a no-op instead.
+static LIVE_READERS: std::sync::Mutex<Option<std::collections::BTreeMap<String, u64>>> =
     std::sync::Mutex::new(None);
 
-fn live_readers<T>(f: impl FnOnce(&mut std::collections::BTreeSet<String>) -> T) -> T {
+/// Monotonic per-spawn id. Never reused within a process, so an epoch can only
+/// ever name the registration that created it.
+static READER_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn live_readers<T>(f: impl FnOnce(&mut std::collections::BTreeMap<String, u64>) -> T) -> T {
     let mut g = LIVE_READERS.lock().unwrap_or_else(|e| e.into_inner());
     f(g.get_or_insert_with(Default::default))
+}
+
+/// Register a reader for `tab`, replacing any earlier registration, and answer
+/// the epoch that names THIS one. Pair with [`deregister_reader`].
+fn register_reader(tab: &str) -> u64 {
+    let epoch = READER_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    live_readers(|m| m.insert(tab.to_string(), epoch));
+    epoch
+}
+
+/// Drop `tab`'s registration **only if it is still the one `epoch` named**.
+///
+/// The guard is the point: a reader's removal task is parked on its own
+/// cancellation token and can fire long after a restart has installed a
+/// successor. Without the comparison it would take the successor's entry with
+/// it, and nothing would ever put it back.
+fn deregister_reader(tab: &str, epoch: u64) {
+    live_readers(|m| {
+        if m.get(tab) == Some(&epoch) {
+            m.remove(tab);
+        }
+    });
 }
 
 /// Whether `tab` has a fallback reader attached right now.
@@ -141,7 +176,7 @@ fn live_readers<T>(f: impl FnOnce(&mut std::collections::BTreeSet<String>) -> T)
 /// the engine's deadline is for. What it does rule out is the case worth
 /// ruling out — a tab that never had a reader and never will.
 pub fn has_live_reader(tab: &crate::state::TabId) -> bool {
-    live_readers(|s| s.contains(tab.as_str()))
+    live_readers(|s| s.contains_key(tab.as_str()))
 }
 
 /// Spawn the adapter described by `spec`, tied to `ctx.cancel`. Non-blocking:
@@ -155,11 +190,15 @@ pub fn spawn(spec: OobSpec, ctx: OobContext) {
     // next lifecycle path, and this one cannot.
     {
         let tab = ctx.tab.as_str().to_string();
-        live_readers(|s| s.insert(tab.clone()));
+        // V39 review M-7: the epoch names THIS spawn, and the task below
+        // removes only what it registered. A restarted tab has an older task
+        // still parked on an older token; without the epoch that task deletes
+        // the live reader's entry when it finally fires.
+        let epoch = register_reader(&tab);
         let cancel = ctx.cancel.clone();
         tauri::async_runtime::spawn(async move {
             cancel.cancelled().await;
-            live_readers(|s| s.remove(&tab));
+            deregister_reader(&tab, epoch);
         });
     }
     match spec {
@@ -422,6 +461,37 @@ mod tests {
             mem: None,
             pushes: None,
         }
+    }
+
+    /// **A restart's late cleanup must not unregister the live reader**
+    /// (V39 review M-7).
+    ///
+    /// Deregistration rides each adapter's own cancellation token, so a tab
+    /// that has been restarted has two of them: the old token can be cancelled
+    /// at any later moment, and an unkeyed `remove` took the NEW reader's entry
+    /// with it. Preflight then refused a tab with a perfectly good reader —
+    /// "no way to report the end of a turn" — for the rest of the session.
+    #[test]
+    fn a_stale_readers_cleanup_cannot_unregister_its_successor() {
+        let tab = TabId::from_str("ai-reader-epoch");
+        let first = register_reader(tab.as_str());
+        let second = register_reader(tab.as_str());
+        assert_ne!(first, second, "each spawn gets its own epoch");
+        assert!(has_live_reader(&tab));
+
+        // The FIRST adapter's token finally fires, after the restart.
+        deregister_reader(tab.as_str(), first);
+        assert!(
+            has_live_reader(&tab),
+            "the running reader must survive its predecessor's cleanup"
+        );
+
+        // The live one's own cleanup still works.
+        deregister_reader(tab.as_str(), second);
+        assert!(!has_live_reader(&tab));
+        // …and is idempotent.
+        deregister_reader(tab.as_str(), second);
+        assert!(!has_live_reader(&tab));
     }
 
     #[tokio::test]

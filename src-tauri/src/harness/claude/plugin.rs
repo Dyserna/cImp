@@ -278,11 +278,8 @@ impl HarnessPlugin for ClaudePlugin {
     }
 
     fn probe(&self) -> ProbeOutput {
-        // The bodies stay in `harness/probe.rs` for now — V40 Phase A moves the
-        // DISPATCH (core no longer matches on a harness to pick a prober); the
-        // Claude-payload probe code itself is a later phase's verbatim move.
-        let (mut results, help) = crate::harness::probe::probe_claude_flags();
-        let (transcript, mut observed, version) = crate::harness::probe::probe_claude_transcript();
+        let (mut results, help) = super::probe::probe_claude_flags();
+        let (transcript, mut observed, version) = super::probe::probe_claude_transcript();
         results.extend(transcript);
         // Both flag rows are answered from ONE `claude --help`, and each gets
         // its own copy of it. The duplication is deliberate: the file name IS

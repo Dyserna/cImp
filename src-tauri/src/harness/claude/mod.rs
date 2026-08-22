@@ -17,6 +17,7 @@
 pub mod hook;
 pub mod input;
 pub mod overlay;
+pub mod probe;
 pub mod read;
 pub mod statusline;
 

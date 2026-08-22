@@ -243,7 +243,7 @@ impl HarnessPlugin for OpenCodePlugin {
     }
 
     fn probe(&self) -> ProbeOutput {
-        let (results, observed, version) = crate::harness::probe::probe_opencode();
+        let (results, observed, version) = super::probe::probe_opencode();
         ProbeOutput { results, observed, version }
     }
 

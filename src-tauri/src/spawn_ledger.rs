@@ -146,19 +146,32 @@ pub const LEDGER: &[SpawnSite] = &[
                  and watcher threads, never by a tool call.",
     },
     SpawnSite {
-        file: "harness/probe.rs",
-        symbol: "start_opencode_serve / claude_help",
-        spawns: "opencode serve --port <free> --hostname 127.0.0.1  |  claude --help",
+        file: "harness/claude/probe.rs",
+        symbol: "claude_help",
+        spawns: "claude --help",
         class: HostSpawn,
-        count: 2,
+        count: 1,
         reason: "V35 Phase D's L2 live probe, reached only from `cimp --harness-canary` — a \
                  maintenance command a human (or a scheduled script) runs, never a tool call, \
-                 and it exits before any Tauri/app init. Both programs are FIXED names resolved \
-                 through `pty::resolve_command`, both argv are literals in code, and no model \
-                 input reaches either. Sandboxing them would be self-defeating: the entire point \
-                 is to observe what the user's REAL installed harness does. The `serve` child \
-                 also gets a free loopback port and is reaped through `kill_tree_blocking` on \
-                 drop, because it forks its own children.",
+                 and it exits before any Tauri/app init. The program is a FIXED name resolved \
+                 through `pty::resolve_command`, the argv is a literal in code, and no model \
+                 input reaches it. Sandboxing it would be self-defeating: the entire point is to \
+                 observe what the user's REAL installed harness does. V40 Phase A moved this \
+                 half of the old `harness/probe.rs` row into the plugin that owns it (locked \
+                 decision 17); the runner spawns nothing.",
+    },
+    SpawnSite {
+        file: "harness/opencode/probe.rs",
+        symbol: "start_opencode_serve",
+        spawns: "opencode serve --port <free> --hostname 127.0.0.1",
+        class: HostSpawn,
+        count: 1,
+        reason: "The other half of the same V35 Phase D probe, same trigger and same posture as \
+                 `harness/claude/probe.rs`: a fixed name through `pty::resolve_command`, a \
+                 literal argv, no model input, and deliberately unsandboxed because the point is \
+                 to observe the REAL installed harness. This child also gets a free loopback \
+                 port and is reaped through `kill_tree_blocking` on drop, because it forks its \
+                 own children.",
     },
     SpawnSite {
         file: "ipc/commands.rs",
@@ -507,7 +520,14 @@ mod tests {
             ("checks/gitls.rs", include_str!("checks/gitls.rs")),
             ("checks/mod.rs", include_str!("checks/mod.rs")),
             ("graph/gitcmd.rs", include_str!("graph/gitcmd.rs")),
-            ("harness/probe.rs", include_str!("harness/probe.rs")),
+            (
+                "harness/claude/probe.rs",
+                include_str!("harness/claude/probe.rs"),
+            ),
+            (
+                "harness/opencode/probe.rs",
+                include_str!("harness/opencode/probe.rs"),
+            ),
             ("ipc/commands.rs", include_str!("ipc/commands.rs")),
             ("offload/mcp_host.rs", include_str!("offload/mcp_host.rs")),
             (
@@ -654,6 +674,8 @@ mod tests {
             "checks/gitls.rs",
             "audit/mod.rs",
             "harness/opencode/harness_plugin.rs",
+            "harness/claude/probe.rs",
+            "harness/opencode/probe.rs",
             "procutil.rs",
             "ipc/commands.rs",
             "offload/mcp_host.rs",

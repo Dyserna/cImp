@@ -735,9 +735,13 @@ const UPWARD_EXEMPT: &[(&str, &str)] = &[
          checks is what makes a primary's failure fatal. They follow the readers.",
     ),
     (
-        "harness/probe.rs",
+        "harness/claude/probe.rs",
         "The L2 probe drives the same readers against the installed CLI — same reason as the \
-         canaries.",
+         canaries. V40 Phase A moved the bodies out of `harness/probe.rs` (locked decision 17) \
+         and the exemption moved with them: what reaches `crate::graph` is `parse_usage_line`'s \
+         return type, which is the READER's vocabulary, not the runner's. `harness/probe.rs` \
+         itself keeps the report shape, the outcome model and the CLI, and names nothing above \
+         the seam — which is why its own entry is gone rather than reworded.",
     ),
     (
         "harness/claude/hook.rs",

@@ -589,3 +589,41 @@ Commits `a2db16d 8bfabb7 b803efc 85fbd68 4fc007e` (cargo 2685/0/6, vitest
 - A closed RemoteOffload tab stays in the pool as `ready: false`; the 12 s
   health watch refreshes it and fires the `list_changed` pulse.
 Review: docs/reviews/code-review-V39-2026-08-22.md. Fix commits listed there once landed.
+
+## Review-fix record (2026-08-22)
+
+All findings in `docs/reviews/code-review-V39-2026-08-22.md` closed in
+`4fc007e..e32cade` (cargo 2708/0/6, vitest 788) + two follow-ups (OpenCode
+main-session-only idle; Claude `stop_reason` canary + row). Facts that refine
+the design:
+- **Turn boundary, as built.** OpenCode: `close_turn` after `flush_all`, last
+  assistant message of the turn (not a concatenation), MAIN session only.
+  Claude fallback: `message.stop_reason` present and ≠ `tool_use` (unknown
+  value ends the turn), filed at the end of a drain pass, sidechain excluded,
+  a user prompt restarts. This is a NEW contract dependency
+  (`claude.transcript.stop_reason`, canaried).
+- **Task hygiene.** `compose` normalises `\r\n`→`\n`; any ESC / C0 / C1
+  control other than `\n`,`\t` (incl. bare `\r`) is refused by name and
+  offset before the claim — never sanitised. `write_through_pipeline` takes
+  an explicit `Submit` so only the submit write emits `UserSubmit`.
+- **Restart.** `pty_restart` re-seeds `TabActivity` (AI tabs never emit
+  `ShellRestarted`); `LIVE_READERS` is tab → spawn epoch.
+- **Facade opacity.** Every `DelegationError` maps to a backend-shaped
+  message naming only the facade (`facade_error`, variant-driven; the full
+  reason stays in the log + Events row). Default facade name =
+  `worker-<4 hex FNV-1a of tab id>`, identical in Rust and TS.
+- **Locks.** `ReadOnlyEntry.prompt_relaxed` opens the keyboard for BOTH
+  sources while a prompt stands; cleared on the falling edge and on
+  `set_driven(None)`. Cycle/depth/claim = `claim_checked` under one lock;
+  precedence: busy/mid-turn reasons before the chain.
+- **Substantiveness.** Fenced blocks count unless they are one of two
+  scaffold SHAPES (empty block, empty JSON payload) — tool-protocol words
+  cannot appear in L4; the `NoText` row keeps the raw text.
+- **Facade schema.** Parse-only (one surrounding fence stripped); the repo
+  has no JSON-Schema validator and real backends also only parse.
+- **Driver gone.** `run_facade` selects on the cancellation token; on cancel
+  it marks `driver_gone` and AWAITS the engine's teardown (the future holds
+  the slot and the lock). New transition `driver_gone` (renders failed).
+- Knobs have their own IPC `tab_set_delegation_backend`; `withTabBackend`
+  deleted. Facade collisions are shown as "not in the pool" in Settings.
+- Pre-existing, out of scope: TTS speaks sidechain lines (#103).

@@ -706,6 +706,22 @@ run reviewable.
   `GRAPH_GUIDANCE` templating, `decorate_initialize()` et al.,
   `session_selector_flags()`, `accepts_passthrough_argv()`, `preflight()`,
   `needs_tree_reap()`, `config_writer()`, the boot/poisoned-lock fallbacks.
+  **DONE 2026-08-22.** `harness/instructions.rs` is the inventory (9 slots,
+  4 harness-templated + 5 neutral, complete-by-construction test both ways);
+  `GRAPH_GUIDANCE` templated through `HarnessPlugin::tool_for_role` with
+  byte-identical goldens for Claude and a two-word diff for OpenCode
+  (`fixtures/plugin-goldens/<id>/system-prompt-addendum.txt`); the attachment
+  line left `compose/attachments.ts` for the `harness_instructions` IPC;
+  `decorate_initialize` / `push_notification_method` / `mcp_protocol_version`
+  and `Consumer::conservative_grant` landed; `preflight()` retired
+  `TabLifecycleError::OpencodeNotFound` (now `HarnessNotFound{harness,label,
+  hint}`) and `ipc/tab_lifecycle.rs` left `IDENTITY_ALLOWLIST`;
+  `derive_opencode_provider` moved to `harness/opencode/config.rs` behind
+  `ConfigWriter`; `spawn_ledger::LEDGER` became `CORE_LEDGER` + `ledger()`
+  joining `spawn_sites()`. Decision 24's `native_tools().arg_names()` is
+  Phase C's `memory_arg_keys()` — deliberately not a third vocabulary.
+  Baselines: cargo 2807/0/6, vitest 801 (39 files), svelte-check 356/0/0,
+  `cargo check --all-targets` 0 warnings.
 - **F (#98) — Frontend over IPC** (decisions 7, 11, 27 and the frontend halves of
   19/23). `harness_list` + `HarnessAffordances`, `registry.json` fixture +
   vitest parity test, `src/lib/harness.ts`, every site in decision 7 and 27

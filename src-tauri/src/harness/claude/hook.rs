@@ -89,7 +89,7 @@ use serde::Deserialize;
 use std::path::Path;
 
 use serde_json::Value;
-use tauri::{AppHandle, Manager};
+use tauri::AppHandle;
 use tracing::{debug, info, warn};
 
 use crate::error::AppResult;
@@ -97,7 +97,7 @@ use crate::harness::plugin::{HookReply, RequestIdentity, Route, RouteFuture};
 use crate::offload::loopback::{
     assistant_text_core, bounded_declarations, bounded_id, bounded_tool, claim_contract_drift,
     claim_hello, compaction_block, contract_drift_row, context_retrieve_core, hello_row,
-    hook_gate_admits, is_configured_tab, latch_beacon_for, live_settings,
+    hook_gate_admits, hook_tab_root, is_configured_tab, latch_beacon_for, live_settings,
     permission_tab_candidates, post_edit_diagnostics, send_permission_edge,
     should_read_verdict, subagent_core, tool_checkpoint_core, tool_result_core,
     ContextCompactionBody, ContextPostEditBody, ContextRetrieveBody, ContractDriftBody,
@@ -1308,10 +1308,20 @@ fn claude_hook_tab(settings: &crate::settings::Settings, req: &Request) -> Optio
 /// here would silently point a hook at the wrong project on any tab whose `cwd`
 /// is a worktree (V13 Phase D's "New tab in worktree…").
 ///
-/// The tab's configured directory is resolved through [`crate::tabs::ai_tab_dir`]
-/// — the same call the spawner makes — so this is the directory cImp itself
-/// launched that tab in. `None` when neither is available, which every caller
-/// turns into its own existing "no cwd" default.
+/// The tab's configured directory is resolved through [`hook_tab_root`] (i.e.
+/// [`crate::tabs::ai_tab_dir`] — the same call the spawner makes), so this is
+/// the directory cImp itself launched that tab in. `None` when neither is
+/// available, which every caller turns into its own existing "no cwd" default.
+///
+/// **#104: this deliberately still returns the payload's cwd VERBATIM, and is
+/// not where the project root is decided.** The obvious-looking fix — walk up
+/// to the project root here, once, for every Claude hook — is wrong, because
+/// this value is not only used as a root: [`plan_request`] joins a relative Bash
+/// path onto it (a walked-up root would resolve the wrong file), and
+/// [`permission_signal`] matches it against each tab's launch directory to
+/// decide which tab a permission prompt belongs to (a walked-up root collapses
+/// two tabs in one repo into one candidate). The root question is answered where
+/// a root is actually needed, by `loopback::external_project_root`.
 fn claude_hook_cwd(
     app: &AppHandle,
     settings: &crate::settings::Settings,
@@ -1322,12 +1332,7 @@ fn claude_hook_cwd(
     if !raw.is_empty() {
         return Some(raw.to_string());
     }
-    let tab = tab?;
-    let launch = app
-        .try_state::<crate::ipc::AppState>()
-        .map(|s| s.launch.cwd.clone())
-        .or_else(|| std::env::current_dir().ok())?;
-    crate::tabs::ai_tab_dir(settings, tab, &launch).map(|d| d.to_string_lossy().into_owned())
+    hook_tab_root(app, settings, tab).map(|d| d.to_string_lossy().into_owned())
 }
 
 /// Parse a Claude hook-input payload, or `None` when the body is not JSON.
@@ -1421,7 +1426,7 @@ fn compaction_body_from_hook(
 /// `read_hook.rs`'s body: `{cwd, session_id, file_path, offset, limit, agent,
 /// tab}` — built from the already-planned [`ReadRequest`], because
 /// the shim built it from the same plan.
-fn should_read_body_from_hook(
+pub(crate) fn should_read_body_from_hook(
     input: &HookInput,
     reqst: &ReadRequest,
     tab: Option<String>,

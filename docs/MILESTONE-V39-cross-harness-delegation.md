@@ -1,7 +1,8 @@
 # V39 — Cross-harness delegation (tab drives tab)
 
-**Status:** APPROVED DESIGN (2026-08-21) — implementation not started.
-GitHub: umbrella #90, milestone 13; phases A #91 · B #87 · C #88 · D #89.
+**Status:** CODE-COMPLETE, MERGED TO DEVELOP `2a7f1fe` (2026-08-22) — gated on
+live-verify only (#105, milestone 13). GitHub: umbrella #90 (closed), phases
+A #91 · B #87 · C #88 · D #89 (all closed); follow-ups #92 #103 #104.
 **Sequencing:** builds on V30 (push bus + per-tab addressing), V32 (result
 screening), V35 (hook push / CHP), V37 (live `tools/list` propagation), V38
 (`offload_task` live description). Nothing here needs a schema migration step

@@ -23,9 +23,17 @@ Requirements
     - libvulkan1 + a Vulkan driver : GPU TTS/STT (any vendor: NVIDIA,
       AMD, Intel). Absent/unusable -> automatic CPU fallback.
 
-  * Claude Code: cImp spawns the `claude` binary as a subprocess. Install
-    it separately and make sure `claude` is on your PATH. `claude
-    --version` should print a version from a fresh shell.
+  * A supported harness CLI: cImp does not ship an AI agent — it spawns
+    the harness binary as a subprocess, so install at least one
+    separately and make sure it is on your PATH (or drop it into the
+    `ebin/` folder). The two supported today:
+
+      Claude Code  binary `claude`   https://docs.anthropic.com/en/docs/claude-code/setup
+      OpenCode     binary `opencode` https://opencode.ai/docs
+
+    `claude --version` (or `opencode --version`) should print a version
+    from a fresh shell. A fresh install enables the Claude tab only;
+    turn the others on under Settings -> Tabs -> AI tabs enabled.
 
 
 Quick start
@@ -107,7 +115,8 @@ Troubleshooting
     keep libwebgpu_dawn.so in the same bin/ folder as cimp (the rpath is
     relative to the binary).
   * Won't start on Ubuntu 22.04 -> unsupported; needs 24.04+ (glibc 2.39).
-  * "claude not found" -> install Claude Code and put `claude` on PATH.
+  * "claude not found" / "opencode not found" -> install that harness
+    and put its binary on PATH (or drop it in `ebin/`).
   * TTS silent, log shows "Kokoro model files not found" -> restore
     models/kokoro-v1.0.onnx (re-extract the full tarball).
 

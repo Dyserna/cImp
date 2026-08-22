@@ -1,14 +1,21 @@
 # cImp
 
-Multi-tab AI assistant wrapper with text-to-speech and a state-driven
-animated avatar. A Tauri desktop app that hosts agentic coding tools —
-**Claude Code** and **OpenCode** — each in its native fullscreen TUI, reads
-their assistant prose aloud through a local Kokoro ONNX voice, and drives a
-per-tab avatar overlay (Idle / Listening / Thinking / Speaking / Error)
-plus a real-time waveform.
+A terminal for AI coding agents, with text-to-speech and a state-driven
+animated avatar. A Tauri desktop app that hosts **registered coding
+harnesses** — real command-line agents cImp does not ship — each in its own
+native fullscreen TUI, reads their assistant prose aloud through a local
+Kokoro ONNX voice, and drives a per-tab avatar overlay (Idle / Listening /
+Thinking / Speaking / Error) plus a real-time waveform.
 
-Speech is sourced **out of band** from each tool's own structured output —
-Claude Code's transcript JSONL, OpenCode's event stream — rather than by
+This is not a chat client over a model API: every AI tab is the real CLI
+running in a real PTY, with all of its own tools, slash commands, file
+editing and TUI behaviour intact. Two harnesses ship registered —
+**Claude Code** and **OpenCode** — and which harnesses exist is data, not
+code paths: a third is one registry row plus one `harness/<id>/` plugin
+directory (see `src-tauri/src/harness/README.md`).
+
+Speech is sourced **out of band** from each harness's own structured output
+— Claude Code's transcript JSONL, OpenCode's event stream — rather than by
 scraping the terminal, so the fullscreen UIs render untouched while cImp
 still knows what was said.
 
@@ -16,26 +23,29 @@ Local, offline-after-install, no audio leaves the machine.
 
 ## AI tabs
 
-cImp hosts three kinds of agentic-coding tab, each running its tool's
-native fullscreen TUI:
+Every registered harness declares its own reserved tab ids, so the built-in
+AI tabs are the registry's list — today `claude`, `claude-local`, and
+`opencode`:
 
 - **Claude** — your normal Claude Code, running with whatever auth flow
   you configured (Pro/Max subscription via OAuth, or `ANTHROPIC_API_KEY`).
-- **Claude (local)** — a second `claude` instance with `ANTHROPIC_BASE_URL`
-  / `ANTHROPIC_AUTH_TOKEN` (and optionally `ANTHROPIC_MODEL`) injected at
-  spawn time so it talks to a local Anthropic-compatible proxy instead of
-  `api.anthropic.com`. Configured in *Settings → Tabs → Claude (local) →
-  Local LLM provider*.
+- **Claude (local)** — the *same harness's* second reserved tab: another
+  `claude` instance with `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` (and
+  optionally `ANTHROPIC_MODEL`) injected at spawn time so it talks to a
+  local Anthropic-compatible proxy instead of `api.anthropic.com`.
+  Configured in *Settings → Tabs → Claude (local) → Local LLM provider*. A
+  harness that picks its own provider declares no such variant.
 - **OpenCode** — the [OpenCode](https://opencode.ai) agent, which manages
   its own providers and credentials (configured inside OpenCode, switchable
-  in-session). cImp injects only its MCP tools and TTS / offload / code-graph
-  guidance.
+  in-session), so it has one reserved tab, not two. cImp injects only its
+  MCP tools and TTS / offload / code-graph guidance.
 
-Which of the three exist is controlled by the **AI tabs enabled**
-checkboxes in *Settings → Tabs*. A fresh install enables **Claude** only.
-Ticking or unticking a box at runtime creates the tab from its built-in
-defaults or closes it (kills its PTY, drops its session). Enabling OpenCode
-requires the `opencode` binary on `PATH` (or dropped into `ebin/`).
+Which of them exist is controlled by the **AI tabs enabled** checkboxes in
+*Settings → Tabs*, one per reserved id. A fresh install enables **Claude**
+only. Ticking or unticking a box at runtime creates the tab from its
+registry defaults or closes it (kills its PTY, drops its session). Enabling
+a harness requires its binary on `PATH` (or dropped into `ebin/`) — the
+`claude` binary for the two Claude tabs, `opencode` for the OpenCode tab.
 
 - Switch between tabs with `Ctrl+1`..`Ctrl+9` (within the focused pane), or click the tab.
 - Enabled AI subprocesses spawn at app launch in the directory cImp was
@@ -44,8 +54,8 @@ requires the `opencode` binary on `PATH` (or dropped into `ebin/`).
 
 ### Fullscreen interaction
 
-AI tabs render their tool's fullscreen (alternate-screen) interface, so the
-tool owns the screen — there is no cImp inline scrollback for these tabs
+AI tabs render the harness's fullscreen (alternate-screen) interface, so the
+harness owns the screen — there is no cImp inline scrollback for these tabs
 (shell tabs keep theirs). cImp suppresses the TUI's mouse tracking by
 default so the mouse behaves shell-like: drag to select-and-copy,
 `Shift`+right-click to paste, `Ctrl`+right-click to speak the selection.
@@ -56,12 +66,13 @@ need to click its own UI.
 
 Each builtin AI tab carries a **`+` button** (revealed on hover, or while
 the tab is active). Click it to spawn **another tab of the same type** — a
-second Claude, a second Claude (local), or a second OpenCode. A duplicate:
+second tab of whichever reserved tab you clicked. A duplicate:
 
 - clones the origin tab's live config (CLI flags, environment, per-tab speak
   toggle, *Use local LLM provider*), so a Claude (local) duplicate gets the
   same `ANTHROPIC_*` injection as the tab it came from;
-- is auto-named `Claude 2`, `Claude 3`, … — rename via double-click;
+- is auto-named after its origin (`Claude 2`, `OpenCode 2`, …) — rename via
+  double-click;
 - is **closable** — it shows a `×` and accepts `Ctrl+W`, unlike the builtin
   it was spawned from;
 - persists across restarts, reopening with your saved layout.
@@ -246,6 +257,12 @@ rebind path covers them.
 
 ## Local LLM provider (the Claude (local) tab)
 
+A harness may declare a **local-provider variant**: a second reserved tab of
+the same binary that cImp spawns with provider environment synthesized from
+settings. Claude Code declares one; OpenCode picks its own provider in-app
+and declares none. The variables below are Claude Code's, which is why they
+are named here and nowhere in cImp's own core.
+
 The **Claude (local)** tab runs the same `claude` binary as the
 subscription tab but with environment injected at spawn time:
 
@@ -290,8 +307,8 @@ Environment*.
 
 ## How TTS works
 
-cImp speaks each AI tab's **assistant prose** as the tool produces it,
-sourced out of band from the tool's own structured output:
+cImp speaks each AI tab's **assistant prose** as the harness produces it,
+sourced out of band from that harness's own structured output:
 
 - **Claude** — cImp tails Claude Code's transcript JSONL
   (`~/.claude/projects/<slug>/<session>.jsonl`) and speaks each assistant
@@ -331,11 +348,19 @@ interaction*).
   TTS → Process on* and *Settings → Speech-to-text → Process on* — with no
   restart. See `docs/MAINTENANCE.md` for the GPU support matrix and Blackwell
   caveat.
-- **Claude Code:** the `claude` binary must be on `PATH` for the Claude and
-  Claude (local) tabs. cImp spawns it as a subprocess.
-- **OpenCode (optional):** the `opencode` binary must be on `PATH` (or in
-  `ebin/`) to enable the OpenCode tab. OpenCode manages its own providers
-  and credentials.
+- **At least one harness CLI:** cImp spawns the harness binary as a
+  subprocess, so the binary of every AI tab you enable must be on `PATH` (or
+  dropped into `ebin/`). The two that ship registered:
+  - **Claude Code** — the `claude` binary, for the Claude and Claude (local)
+    tabs. Install per
+    <https://docs.anthropic.com/en/docs/claude-code/setup>.
+  - **OpenCode** — the `opencode` binary, for the OpenCode tab. It manages
+    its own providers and credentials. Install per
+    <https://opencode.ai/docs>.
+
+  A fresh install enables the Claude tab only, so `claude` is what an
+  out-of-the-box run needs; enable the tabs you actually want under
+  *Settings → Tabs → AI tabs enabled*.
 - **Local proxy (optional, for the Claude (local) tab):** if that tab's
   *Use local LLM provider* flag is on, you need a running Anthropic-
   compatible proxy (e.g. LiteLLM bridging to Ollama / LM Studio / vLLM /
@@ -424,15 +449,16 @@ portable and isn't shipped.
 
 ## Local task offload
 
-Offloading lets the main Claude (Opus) session hand a self-contained, token-heavy
-subtask — a broad codebase search, summarizing a large file or log, web research —
-to a **local model**, and get back only the synthesized result. The local model
-does the searching/reading/summarizing; Opus's context grows by a paragraph
-instead of a megabyte. Everything stays local (unless you opt a cloud backend in).
+Offloading lets the frontier session in an AI tab hand a self-contained,
+token-heavy subtask — a broad codebase search, summarizing a large file or log,
+web research — to a **local model**, and get back only the synthesized result.
+The local model does the searching/reading/summarizing; the frontier model's
+context grows by a paragraph instead of a megabyte. Everything stays local
+(unless you opt a cloud backend in).
 
 This is **not** the *Claude (local)* tab — that swaps the whole session's brain to
-a local model. Offload keeps Opus in charge and delegates a bounded subtask to a
-subordinate worker, exposed as an `offload_task` MCP tool.
+a local model. Offload keeps the frontier model in charge and delegates a bounded
+subtask to a subordinate worker, exposed as an `offload_task` MCP tool.
 
 **Setup** (*Settings → Offload*):
 
@@ -454,8 +480,9 @@ subordinate worker, exposed as an `offload_task` MCP tool.
    **Offload server** section of the **Tool Activity** tab shows the live server
    log and a per-backend dashboard (slots busy/total, queue depth, throughput,
    context-fill, request history).
-4. **Re-launch a Claude tab** so it picks up the injected `offload_task` tool. With
-   *Inject offload guidance* on, cImp also nudges Opus on when to offload.
+4. **Re-launch an AI tab** so it picks up the injected `offload_task` tool. With
+   *Inject offload guidance* on, cImp also nudges the frontier model on when to
+   offload.
 
 **Tools the worker can use.** Built-in native tools are read-only: `read_file`
 (bounded reads), `code_search` (literal search), and `run_command` (allowlisted,
@@ -491,11 +518,11 @@ must read local files is never sent to a backend that lacks file tools;
 (2) **required context** — a 100k-token ingest can't go to a small-window box;
 (3) **tier/complexity** — trivial single-pass work → the fast backend, real
 reasoning → the large one; (4) **availability** — spill to another eligible
-backend when the preferred one is busy, fail over when it's down. Claude can bias
-the choice with a `tier: "auto" | "fast" | "quality"` argument on `offload_task`;
-with one enabled backend the router is a no-op. The `offload_task` description
-reports the pool to Opus so it knows a fast tier exists and which backends can
-read local files.
+backend when the preferred one is busy, fail over when it's down. The calling
+agent can bias the choice with a `tier: "auto" | "fast" | "quality"` argument on
+`offload_task`; with one enabled backend the router is a no-op. The
+`offload_task` description reports the pool back to the caller so it knows a
+fast tier exists and which backends can read local files.
 
 **Per-backend tool scoping is the privacy boundary.** Local and trusted-LAN
 backends get all tools by default. A **cloud** backend defaults to **web/docs
@@ -508,8 +535,8 @@ task text itself is sent to a third party) and is badged distinctly from LAN
 backends. The LAN case keeps data on your own network.
 
 > **Cloud = data leaves your machine.** Offloading to a cloud backend sends the
-> task instructions (and any `context` Opus passes, plus any tool results if you
-> widen its scope) to that provider. It still protects Opus's context window, but
+> task instructions (and any `context` the caller passes, plus any tool results if
+> you widen its scope) to that provider. It still protects the caller's window, but
 > breaks the local/offline property. Use a LAN backend to keep everything on your
 > network.
 
@@ -522,8 +549,8 @@ server so an offload reaches real tools without paying an `npx`/`uvx` cold-start
 per call, and it surfaces per-server health in *Settings → Offload → MCP tool
 servers*.
 
-Configure them in `settings.json` under `offload.mcp_servers` (the same shape as
-Claude's own `mcpServers`):
+Configure them in `settings.json` under `offload.mcp_servers` (the standard MCP
+`mcpServers` shape):
 
 ```jsonc
 "offload": {
@@ -553,7 +580,8 @@ a cloud backend never sees a local-data MCP server (`git`, `filesystem`).
 backend pool, the global concurrency gate, and the MCP host; the hidden
 `cimp --offload-mcp` server in each AI tab is a thin proxy to it over a
 **token-authenticated loopback endpoint** (`127.0.0.1`, ephemeral port). If the
-app isn't running (e.g. a headless `claude -p` run), the child falls back to a
+app isn't running (e.g. a headless one-shot harness run from a script), the
+child falls back to a
 self-contained path so offload still works — just without the warm tool pool,
 global concurrency, or live health. Changes to a server's config take effect when
 the app next warms the pool; toggling **Enable offload** itself takes effect on
@@ -562,7 +590,7 @@ the next app launch.
 ## Code Intelligence (code knowledge graph)
 
 cImp builds a per-project **code + docs knowledge graph** (CozoDB + tree-sitter
-over `.cimp/graph.db`) that Opus and offload workers can query through MCP tools —
+over `.cimp/graph.db`) that AI tabs and offload workers can query through MCP tools —
 `graph_find_symbol`, `graph_callers`, `graph_callees`, `graph_references`,
 `graph_imports`, `graph_outline`, `graph_transitive`, `graph_search_docs`,
 `graph_struct_search`, `graph_snippet`, `graph_repo_map`, `graph_impact`,
@@ -592,9 +620,11 @@ Beyond structural search, Code Intelligence adds three capabilities (**Memory**,
   with its caller (claude / opencode / offload).
 - **Automatic context injection** (opt-in, off by default) — ranks the files
   most relevant to each prompt and prepends a budget-bounded digest before the
-  agent runs (Claude via a `UserPromptSubmit` hook, OpenCode via a generated
-  `.opencode/plugin`). Session-hot files rank first; a live preview and per-file
-  / per-turn budgets are in the tab and Settings.
+  agent runs. Both shipped harnesses support it; how the digest is delivered is
+  the harness's own mechanism, declared by its plugin
+  (`src-tauri/src/harness/claude/README.md`,
+  `src-tauri/src/harness/opencode/README.md`). Session-hot files rank first; a
+  live preview and per-file / per-turn budgets are in the tab and Settings.
 - **Packaged analyses** — on-demand **dead exports** (candidate unused public
   symbols) and **import cycles**, also as the `graph_dead_exports` /
   `graph_cycles` tools. Each states which languages it covers (dead exports:
@@ -606,11 +636,14 @@ Beyond structural search, Code Intelligence adds three capabilities (**Memory**,
 `graph_repo_map` gives a budget-bounded, centrality-ranked project map for
 orienting without exploring, agent-pullable any time and (opt-in)
 auto-injected once per session; injection **dedup** demotes an unchanged
-re-candidate to a one-line reminder instead of re-sending its digest; a Claude
-`PreCompact` hook carries the session's working set and pinned notes through a
-compaction; an opt-in Claude `PreToolUse` hook on `Read` can deny a redundant
+re-candidate to a one-line reminder instead of re-sending its digest;
+**compaction survival** carries the session's working set and pinned notes
+through a compaction, and an opt-in **read advisor** can deny a redundant
 re-read of an unchanged file, always with usable content (outline, or outline
-+ body) in its place; files with no useful outline get a cached local-model
++ body) in its place — both need a pre-turn veto/injection point the harness
+must expose, so both are **Claude Code only** today (OpenCode exposes no
+compaction event, and its plugin is not wired to the read advisor); files with
+no useful outline get a cached local-model
 digest (never leaves the machine); and `graph_semantic_code` adds
 symbol-level semantic search alongside the existing doc search.
 
@@ -625,9 +658,11 @@ commit history boosts recently-churned files in injection ranking and adds a
 `last change: "…" (3d ago)` trailer (`graph_recent_changes` surfaces it
 directly); opt-in memory distillation turns a session's working set into
 durable, pinnable **project facts** via the local-only offload path before it
-evicts; and opt-in proactive automation (a Claude `PostToolUse` hook) injects
-only new/worsened diagnostics right after an edit, plus a blast-radius note on
-risky changes — all off by default, same posture as the V11 read advisor.
+evicts; and opt-in proactive automation injects only new/worsened diagnostics
+right after an edit, plus a blast-radius note on risky changes — both shipped
+harnesses report their edits for it (each through its own post-edit mechanism),
+and check runs are single-flight per project root so concurrent tabs share one
+run. All off by default, same posture as the V11 read advisor.
 
 **Token Efficiency II (V17)** pushes the read advisor into the corners V11
 passed on and prices the tool surface itself. Re-reading a file *after it
@@ -702,21 +737,25 @@ localhost/LAN-only dev-server webview with **Snapshot → compose**, turning
 
 ## Configuring Tabs
 
-Per-tab subprocess configuration lives under **Settings → Tabs**, split
-into four sub-sections: **Claude**, **Claude (local)**, **OpenCode**, and
-**Shells**. Each AI tab exposes:
+Per-tab subprocess configuration lives under **Settings → Tabs**, which
+iterates the harness registry: one sub-section per reserved AI tab — today
+**Claude**, **Claude (local)** and **OpenCode** — plus **Shells**. A newly
+registered harness gets its section for free. Each AI tab exposes:
 
-- **Command** (read-only on AI tabs): the binary cImp spawns — `claude`
-  for the Claude tabs, `opencode` for the OpenCode tab.
+- **Command** (read-only on AI tabs): the binary cImp spawns, from that
+  harness's registered default — `claude` for the Claude tabs, `opencode`
+  for the OpenCode tab.
 - **Persistent CLI flags:** flags appended to every spawn of that tab.
-- **Use local LLM provider** (Claude tabs): toggle that gates env synthesis
-  from the global *Local LLM provider* settings (off by default for the
-  subscription Claude tab; on by default for the Claude (local) tab).
+- **Use local LLM provider** (only on tabs whose harness declares a
+  local-provider variable set — the Claude tabs today): toggle that gates
+  env synthesis from the global *Local LLM provider* settings (off by
+  default for the subscription Claude tab; on by default for the Claude
+  (local) tab).
 - **TTS injection** (AI tabs): the toggle that gates whether the tab speaks
   its assistant prose (out of band), plus an editable instructions block
-  injected on each spawn (Claude via `--append-system-prompt`, OpenCode via
-  its instructions file). The Reset button restores cImp's built-in runtime
-  prompt.
+  injected on each spawn through whatever mechanism that harness declares
+  (Claude Code takes `--append-system-prompt`, OpenCode an instructions
+  file). The Reset button restores cImp's built-in runtime prompt.
 - **Notifications:** text spoken when the tab transitions to a notable
   state and the user is focused elsewhere. AI tabs have four slots
   (`idle`, `awaiting_permission`, `question`, `error`); shell tabs have
@@ -742,8 +781,9 @@ on the next launch.
 **End users (Windows):** download the latest portable zip from the
 [Releases page](https://github.com/Dyserna/cImp/releases), unzip it, add
 `bin/` to your PATH, and run `cimp`. The zip ships with the Kokoro
-model and the default voice — no extra setup beyond Claude Code (and,
-optionally, OpenCode) being on PATH.
+model and the default voice — the only extra setup is having a supported
+harness CLI on PATH (`claude` for the Claude tabs, `opencode` for the
+OpenCode tab; a fresh install enables the Claude tab only).
 
 **Developers:**
 
@@ -811,8 +851,9 @@ Open with `Ctrl+,` or the cog button on the avatar.
   open settings, switch-to-tab-N (within focused pane), pane focus and
   splits, new shell tab, close active tab, and close pane. The full
   default set is in *Multi-pane Layout → Keyboard shortcuts* above.
-- **Tabs:** the **AI tabs enabled** checkboxes (Claude / Claude (local) /
-  OpenCode) plus per-tab command, CLI flags, TTS injection, notification
+- **Tabs:** the **AI tabs enabled** checkboxes — one per reserved AI tab in
+  the registry (Claude / Claude (local) / OpenCode today) — plus per-tab
+  command, CLI flags, TTS injection, notification
   text, and appearance overrides — see *Configuring Tabs* above.
 - **Processing:** stability and max-hold timers for the byte-burst
   pipeline.
@@ -855,11 +896,11 @@ are needed, since the per-state behaviour comes from the manifest.
   Place the model + voicepack under `<exe-dir>/../models/` as documented above.
   Also confirm the per-tab **TTS injection** toggle is on for the tab you expect
   to hear.
-- **`claude` not found.** cImp looks up `claude` via `PATH`. Either install
-  Claude Code so it's on `PATH` or add its install dir.
-- **OpenCode tab won't enable.** The `opencode` binary isn't on `PATH` or in
-  `ebin/`. Install it from https://opencode.ai/docs (or drop `opencode.exe`
-  in `ebin/`), then tick the checkbox again.
+- **A harness binary isn't found.** cImp resolves an AI tab's command through
+  `ebin/` first, then `PATH`; the tab fails to spawn if neither has it.
+  Install the harness or drop its executable in `ebin/`, then re-enable the
+  tab. Claude Code: <https://docs.anthropic.com/en/docs/claude-code/setup>.
+  OpenCode: <https://opencode.ai/docs>.
 - **Claude (local) tab errors.** Most often: the local proxy isn't running or
   the URL in *Local LLM provider* is wrong. Confirm the proxy is reachable.
   Until you fix it you can simply use the subscription Claude tab, which is
@@ -872,7 +913,7 @@ are needed, since the per-state behaviour comes from the manifest.
   the bundled defaults). In *Animated sprites* mode, confirm the chosen
   sprite set exists under `sprites/<set>/` with a valid `manifest.json`.
 - **The mouse doesn't work in an AI tab the way I expect.** AI tabs run the
-  tool's fullscreen TUI; cImp keeps the mouse shell-like (select-to-copy,
+  harness's fullscreen TUI; cImp keeps the mouse shell-like (select-to-copy,
   Shift+right-click paste) by default. **Hold `Alt`** to hand the mouse to
   the fullscreen app.
 - **`Ctrl+R` / `Ctrl+Shift+R` / `F5` don't reload the app.** Intentional —
@@ -882,10 +923,10 @@ are needed, since the per-state behaviour comes from the manifest.
 
 ## Known Limitations
 
-- Automatic TTS for an AI tab depends on that tool's out-of-band source —
-  Claude Code's transcript JSONL and OpenCode's event stream. A tool with no
+- Automatic TTS for an AI tab depends on that harness's out-of-band source —
+  Claude Code's transcript JSONL, OpenCode's event stream. A harness with no
   such source (or a future format change in one) would speak nothing until
-  the adapter is updated.
+  its plugin's reader is updated.
 - Tool-use (Edit / Write / Bash / etc.) on the Claude (local) tab depends
   on the local model supporting Anthropic-style tool calling. Test before
   committing to a particular model.

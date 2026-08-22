@@ -66,7 +66,8 @@ Sources:
 Everything else
 ---------------
 
-For PATH setup, prerequisites (Claude Code, WebView2), voicepack
+For PATH setup, prerequisites (a supported harness CLI — Claude Code or
+OpenCode — plus WebView2), voicepack
 discovery, GPU acceleration, uninstall, and troubleshooting — see the
 full README that ships with the standard portable zip, or the project
 docs:

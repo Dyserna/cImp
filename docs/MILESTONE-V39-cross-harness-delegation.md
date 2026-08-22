@@ -550,3 +550,31 @@ Commits `67a9a42 41d55af 831f998 bd62b5f e5159bf` (vitest 780, svelte-check
 - `delegation.max_depth` deliberately NOT exposed (its only legal value is
   the default while nesting is refused). `delegation_status(tab)` has no
   frontend consumer (`delegation_statuses` + the event cover it).
+
+## Implementation record (C — facade, 2026-08-22)
+
+Commits `a2db16d 8bfabb7 b803efc 85fbd68 4fc007e` (cargo 2685/0/6, vitest
+782). New `offload/harness_tab.rs`. Facts:
+- `Settings::effective_offload_backends()` appends facades in both branches;
+  on the raw list by design: `supervisor::local_backends` (process funnel),
+  `primary_local_command`, `outbound::Policy` (no endpoint), the backend
+  editor (a round-trip save never writes `harness_tab` — test-pinned). Name
+  collision: configured wins, facade dropped, one `warn!` per name.
+- Bypass lives in `service::run_on` (right after the slot is taken, before
+  any tool surface), not `agent.rs` — `agent::run` has no `AppHandle`.
+  `agent::facade_format_note` owns the appended text.
+- **`schema`/`profile` on a facade are REQUESTS, not boundaries** (refines
+  decision 3): cImp does not own another harness's tool surface, so the
+  profile is stated as an instruction and the schema is rendered into the
+  task (worker has no grammar); the facade path does not re-validate. What
+  holds is the worker tab's own sandbox / permissions / MCP surface.
+- `n_ctx` default 200 000 (a routing number); `slots = 1`; `in_flight` also
+  counts the worker's OWN user mid-turn (`busy_reason`) so a busy worker
+  spills instead of failing; a headless consumer is never routed at a facade
+  (`routable`); `PoolEntry.is_remote = false`; opaque `harness-tab://<id>`
+  base_url for the escalation guard; `Refused → OffloadNotReady`
+  (re-routable), other errors → `Offload`.
+- Driver-side `offload` row stays `Attribution::Headless` (F-29; also keeps
+  the facade indistinguishable); the driver is on the worker-side rows.
+- A closed RemoteOffload tab stays in the pool as `ready: false`; the 12 s
+  health watch refreshes it and fires the `list_changed` pulse.

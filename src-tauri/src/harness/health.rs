@@ -50,18 +50,37 @@ use crate::settings::{AutoVerify, Settings};
 /// `Capability::harness` values: a harness with zero rows must still get a
 /// header saying so.
 ///
-/// **V39 Phase B added the third, and it is not a product.** [`Harness::Any`]
+/// **V39 Phase B added the third, and it is not a product.** [`Harness::ANY`]
 /// marks a row whose contract is stated about a *tab* rather than about a
 /// vendor — `delegation.worker` is the first — so it has no version, no
 /// installed CLI and no auto-verify record, and every one of those fields
 /// renders empty for it by construction. It gets a panel anyway because it
 /// carries a **gate**: a capability the user can be blocked by and cannot see
 /// is exactly the thing this panel exists to end.
-const PANELS: &[(Harness, &str)] = &[
-    (Harness::Claude, "Claude Code"),
-    (Harness::OpenCode, "OpenCode"),
-    (Harness::Any, "Cross-harness"),
-];
+/// The neutral panel, and the reason it is a SECOND SOURCE rather than a
+/// pseudo-descriptor with empty binaries (amendment 0-e).
+///
+/// A descriptor with no binary, no plugin and no directory would satisfy every
+/// registry lookup by lying; the neutral rows are not a harness, they are the
+/// absence of one. Two explicit sources, joined here, is the honest shape — and
+/// `every_registry_entry_is_fully_wired` asserts both halves so neither can be
+/// dropped.
+const NEUTRAL_PANEL: (Harness, &str) = (Harness::ANY, "Cross-harness");
+
+/// The panels the view shows, in display order.
+///
+/// The registry's descriptors — so a harness with zero capability rows still
+/// gets a header saying so — **plus** [`NEUTRAL_PANEL`]. Plain iteration over
+/// the registry would silently drop the `Harness::ANY` rows and hide a gate the
+/// user can be blocked by, which is exactly what this panel exists to end.
+pub(in crate::harness) fn panel_labels() -> Vec<(Harness, &'static str)> {
+    let mut out: Vec<(Harness, &'static str)> = crate::harness::registry::HARNESSES
+        .iter()
+        .map(|d| (d.harness(), d.label))
+        .collect();
+    out.push(NEUTRAL_PANEL);
+    out
+}
 
 // ── outcome vocabulary ──────────────────────────────────────────────────────
 
@@ -352,18 +371,15 @@ fn run_view(run: &RunSummary) -> RunView {
 pub fn health(settings: &Settings) -> Vec<HarnessHealth> {
     let gates = contract::gates(settings);
     let hv = &settings.harness_versions;
-    PANELS
-        .iter()
-        .map(|&(harness, label)| {
+    panel_labels()
+        .into_iter()
+        .map(|(harness, label)| {
             let run = verify::last_run(harness);
             // Claude is the only harness with a persisted record: Phase F runs
             // on `claude_last_seen` changing, and there is deliberately no
             // second stored field (that would be the Settings schema bump this
             // phase is not allowed — and does not need).
-            let record = match harness {
-                Harness::Claude => hv.claude_auto_verify.as_ref(),
-                _ => None,
-            };
+            let record = harness.plugin().and_then(|p| p.auto_verify_record(hv));
             let mut rows: Vec<&'static Capability> =
                 CAPABILITIES.iter().filter(|c| c.harness == harness).collect();
             rows.sort_by_key(|c| risk_rank(c.tier));
@@ -389,11 +405,10 @@ pub fn health(settings: &Settings) -> Vec<HarnessHealth> {
                     last_verify: last_verify(c, run.as_ref(), record),
                 })
                 .collect();
-            let last_seen = match harness {
-                Harness::Claude => hv.claude_last_seen.clone(),
-                Harness::OpenCode => hv.opencode_last_seen.clone(),
-                Harness::Any => String::new(),
-            };
+            let last_seen = harness
+                .plugin()
+                .map(|p| p.recorded_version(hv))
+                .unwrap_or_default();
             HarnessHealth {
                 harness: harness_name(harness),
                 label,
@@ -404,10 +419,7 @@ pub fn health(settings: &Settings) -> Vec<HarnessHealth> {
                 // line and its stale-plugin list are one reading of one value.
                 stale_plugins: chp::stale_for(harness_name(harness), &last_seen),
                 last_seen,
-                last_verified: match harness {
-                    Harness::Claude => Some(hv.claude_last_verified.clone()),
-                    _ => None,
-                },
+                last_verified: harness.plugin().and_then(|p| p.last_verified(hv)),
                 auto_verify: record.cloned(),
                 last_run: run.as_ref().map(run_view),
                 capabilities,

@@ -108,7 +108,7 @@ pub enum Outcome {
     /// breaks. Never a failure.
     ///
     /// **Declared and, since 2026-08-17, unconstructed in production** — the same
-    /// posture `Seam::A` and `Harness::Any` have in the registry, and for the same
+    /// posture `Seam::A` and `Harness::ANY` have in the registry, and for the same
     /// reason: a vocabulary needs the rung named even when nothing is standing on
     /// it. Its one constructor was `noauth_outcome`, watching for OpenCode to grow
     /// server auth. It did, cImp now sets a password at every spawn
@@ -187,24 +187,16 @@ impl ProbeResult {
 /// report are looking at one vocabulary — and the panel's *Run checks now*
 /// passes the token straight back over IPC.
 pub(crate) fn harness_name(h: Harness) -> &'static str {
-    match h {
-        Harness::Claude => "claude",
-        Harness::OpenCode => "opencode",
-        Harness::Any => "any",
-    }
+    h.token()
 }
 
 /// The inverse of [`harness_name`], for a token arriving from the frontend.
 /// Lives beside it so the two spellings can never part company, and returns
 /// `None` rather than defaulting — a mistyped token must fail the IPC call, not
-/// silently drive the wrong CLI. [`Harness::Any`] is deliberately not
+/// silently drive the wrong CLI. [`Harness::ANY`] is deliberately not
 /// accepted: it names no installed product, so there is nothing to run.
 pub(crate) fn harness_from_name(s: &str) -> Option<Harness> {
-    match s {
-        "claude" => Some(Harness::Claude),
-        "opencode" => Some(Harness::OpenCode),
-        _ => None,
-    }
+    Harness::from_id(s)
 }
 
 /// The wire token for a seam tier — `pub(crate)` for the same reason.
@@ -255,120 +247,32 @@ const IMPLEMENTED: &[&str] = &[
 ///   inside a harness plugin ran. They stay manual spikes (D0 / E1 /
 ///   OpenCode-veto) by locked decision 7, and *Mark verified* survives for
 ///   exactly these.
-const DECLARED_UNPROBED: &[(&str, &str)] = &[
-    (
-        "claude.hook.user_prompt_submit",
-        "needs a scripted turn (L2 residual): proving the stdout envelope reaches the model \
-         requires installing a temporary hook via --settings and running one real prompt",
-    ),
-    (
-        "claude.hook.precompact",
-        "needs a scripted turn AND spike D0: whether the additionalContext reaches the compaction \
-         prompt is a Behavior dep no payload reveals",
-    ),
-    (
-        "claude.hook.pretooluse_deny",
-        "needs a scripted turn AND spike E1: whether the deny reason reaches the model is a \
-         Behavior dep no payload reveals",
-    ),
-    (
-        "claude.hook.posttooluse",
-        "needs a scripted turn (L2 residual): the payload only exists while a real Edit/Write is \
-         being made",
-    ),
-    (
-        "claude.hook.notification",
-        "needs a scripted turn (L2 residual), and the open question — which of the flat and \
-         nested payload shapes this build sends — only answers itself when a real permission \
-         prompt fires",
-    ),
-    (
-        "perm.tui_scrape",
-        "no probe can settle it: a scrape of rendered TUI chrome. Re-characterized in minutes \
-         with RUST_LOG=perm_capture=debug; the real fix is the D→C→B migration of decision 2",
-    ),
-    // V35 Phase L's three pushed rows. Same answer as their Phase J siblings
-    // above and for the same reason: a hook payload exists only while a real
-    // turn produces one, so nothing here can be driven without scripting a
-    // model. What is NOT deferred with them is their silence — the Phase L
-    // quiet detector reports a served capability that stops pushing, in
-    // production, on the live wire, which is the half a scripted probe would
-    // have been worst at anyway.
-    (
-        "claude.hook.stop",
-        "needs a scripted turn (L2 residual): `last_assistant_message` exists only when a real \
-         turn finishes. The open question is a Behavior dep besides — whether its rendering of a \
-         multi-block message matches the transcript reader's join",
-    ),
-    (
-        "claude.hook.tool_result",
-        "needs a scripted turn (L2 residual): the payload exists only while a real tool call \
-         returns, and the property worth proving is that the all-tools matcher fires for tools \
-         the sibling entry does not name",
-    ),
-    (
-        "claude.hook.subagent",
-        "needs a scripted turn (L2 residual) AND a session that happens to launch a sub-agent — \
-         the same 'an absence proves nothing' problem `claude.transcript.subagents` has, one \
-         layer up",
-    ),
-    (
-        "claude.transcript.subagents",
-        "needs a scripted turn (L2 residual): a transcript tail can only show the subagents/ \
-         layout if the tailed session happened to launch a sub-agent, so an absence proves \
-         nothing and a presence is luck",
-    ),
-    (
-        "claude.statusline.stdin",
-        "needs a scripted turn (L2 residual): the payload exists only when the CLI invokes the \
-         statusLine command, so probing it means running a turn with an overlay installed",
-    ),
-    (
-        "opencode.sse.events",
-        "needs a scripted turn (L2 residual): GET /event on an idle server streams nothing, so \
-         the event kinds only arrive if a real agent turn is driven",
-    ),
-    (
-        "opencode.route.push",
-        "needs a scripted turn (L2 residual): the dangerous half is `noReply` losing its meaning, \
-         which is only observable as an agent turn that should not have started",
-    ),
-    (
-        "claude.hook.taint_beacon",
-        "needs a scripted turn (L2 residual): the hook only fires when a real turn reaches for \
-         WebFetch/WebSearch, and the property worth proving is that the beacon LANDED before the \
-         tool ran — an ordering, not a payload shape. Unchanged by the 2026-08-17 http migration, \
-         which moved the row to Tier B: what it bought is app-observable DELIVERY, which is a \
-         production signal rather than something this probe can drive",
-    ),
-    (
-        "claude.hook.checkpoint_beacon",
-        "needs a scripted turn (L2 residual), and the load-bearing half is an ORDERING no fixture \
-         can express: that the tool call does not begin until the hook's response arrives. Since \
-         2026-08-17 that ordering is upstream's DOCUMENTED deny contract rather than an observed \
-         behaviour, so what a probe would add is confirmation, not coverage",
-    ),
-    (
-        "opencode.plugin.load_all",
-        "no probe can settle it, and it is inside the TCB: nothing outside a harness can verify \
-         that a control inside it ran. A plugin that loads but skips the `throw` looks fully \
-         functional. Manual OpenCode-veto spike; Phase I's `chp` handshake at least makes a STALE \
-         plugin a mismatch instead of a mystery",
-    ),
+/// The rows the RUNNER declares permanently unprobed — the harness-neutral ones
+/// only.
+///
+/// Locked decision 17: each harness's own rows and their reason prose moved into
+/// its plugin ([`crate::harness::plugin::HarnessPlugin::declared_unprobed`]);
+/// what stays here is the row whose contract is stated about a *tab*, which no
+/// plugin owns. [`declared_unprobed`] is the joined view.
+const DECLARED_UNPROBED_NEUTRAL: &[(&str, &str)] = &[
     // ── V39 Phase B: delegation (locked decision 16) ─────────────────────────
     (
         "delegation.worker",
         "no probe can settle it: the property is that a REAL turn typed into a REAL TUI comes          back readable, which needs a live worker tab and a live model call — the scripted-turn          class, doubled. Covered meanwhile by the fail-closed gate itself (preflight refuses a          tab with no completion signal rather than typing into it), by the recorded          input-profile spike the gate reads, and by V39 live-verify recipes 1/2/10",
     ),
-    (
-        "claude.input.profile",
-        "no probe can settle it: whether a bracketed paste plus a submit yields exactly ONE turn          is a `Dep::Behavior` visible only as a real turn in a real TUI. Manual input-profile          spike, outcome in `harness_versions.input_profile_status` — the same class as D0/E1, and          `Mark verified` survives for exactly these",
-    ),
-    (
-        "opencode.input.profile",
-        "no probe can settle it — same behaviour, same spike, same recorded outcome as          `claude.input.profile`",
-    ),
 ];
+
+/// Every declared-unprobed row: the neutral ones plus every registered
+/// harness's.
+fn declared_unprobed_rows() -> Vec<(&'static str, &'static str)> {
+    let mut out: Vec<(&'static str, &'static str)> = DECLARED_UNPROBED_NEUTRAL.to_vec();
+    for h in crate::harness::registry::all() {
+        if let Some(p) = h.plugin() {
+            out.extend(p.declared_unprobed().iter().copied());
+        }
+    }
+    out
+}
 
 /// The ids this module drives — the L2 half of the registry join key, consumed
 /// by `contract.rs`'s `probes_and_the_matrix_agree`.
@@ -385,7 +289,7 @@ pub(crate) fn declared_unprobed() -> &'static [&'static str] {
     // stay attached to their ids in the source (a bare id list would rot into
     // unexplained entries) but the cross-check only needs the keys.
     static IDS: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
-    IDS.get_or_init(|| DECLARED_UNPROBED.iter().map(|(id, _)| *id).collect())
+    IDS.get_or_init(|| declared_unprobed_rows().iter().map(|(id, _)| *id).collect())
 }
 
 // ── timings and bounds, all deliberate ──────────────────────────────────────
@@ -424,8 +328,9 @@ pub fn run(args: &[String]) -> i32 {
     // auto-verify uses, so the CLI and the background run can never drive
     // different sets.
     let mut produced: Vec<ProbeResult> = Vec::new();
-    produced.extend(run_for(Harness::OpenCode));
-    produced.extend(run_for(Harness::Claude));
+    for harness in drive_order() {
+        produced.extend(run_for(harness));
+    }
 
     // The report is assembled in DECLARED order, not in the order the probe
     // functions happened to answer. That is what makes [`IMPLEMENTED`]
@@ -452,7 +357,7 @@ pub fn run(args: &[String]) -> i32 {
     // failure; it is still appended rather than dropped, because silently
     // discarding a result is the one thing worse than reporting an odd one.
     results.append(&mut produced);
-    for (id, why) in DECLARED_UNPROBED {
+    for (id, why) in declared_unprobed_rows() {
         results.push(ProbeResult::new(
             id,
             Outcome::Unknown {
@@ -515,46 +420,40 @@ pub(crate) struct Driven {
 /// command writes whatever the outcome and so cannot go through the
 /// success-only trigger.
 pub(crate) fn drive(harness: Harness) -> Driven {
-    let (results, observed, version) = match harness {
-        Harness::Claude => {
-            let (mut results, help) = probe_claude_flags();
-            let (transcript, mut observed, version) = probe_claude_transcript();
-            results.extend(transcript);
-            // Both flag rows are answered from ONE `claude --help`, and each
-            // gets its own copy of it. The duplication is deliberate: the file
-            // name IS the join key, so a reader who was sent here by a failing
-            // `claude.flag.settings_overlay` finds a file with that name rather
-            // than a shared blob they have to know the provenance of. It is
-            // ~20 KiB twice, bounded by the retention sweep.
-            if let Some(help) = help {
-                observed.push(Observed::new(
-                    "claude.flag.session_id",
-                    "txt",
-                    help.clone(),
-                ));
-                observed.push(Observed::new("claude.flag.settings_overlay", "txt", help));
-            }
-            (results, observed, version)
-        }
-        Harness::OpenCode => probe_opencode(),
-        // No seeded row is harness-neutral yet (CHP, milestone decision 9, is
-        // what will produce the first one), so there is nothing to drive.
-        Harness::Any => (Vec::new(), Vec::new(), String::new()),
-    };
+    // V40 Phase A: the DISPATCH is the registry's, not a `match` here. A harness
+    // with no plugin (the neutral `Harness::ANY`, which names no installed
+    // product) drives nothing — the same answer the old `Any` arm gave, arrived
+    // at without naming a vendor.
+    let out = harness.plugin().map(|p| p.probe()).unwrap_or_default();
     Driven {
         harness,
-        results,
-        observed,
+        results: out.results,
+        observed: out.observed,
         // A CLI that has produced no observable version leaves the stamp to the
         // version cImp last recorded for it — written by the OOB tap and by tab
         // spawn from a real `--version`, so it is an observation too, just an
         // older one. Empty when there has never been either.
-        version: if version.trim().is_empty() {
+        version: if out.version.trim().is_empty() {
             recorded_version(harness)
         } else {
-            version
+            out.version
         },
     }
+}
+
+/// The order harnesses are driven in.
+///
+/// Registry order, except that a harness whose probes share **one expensive
+/// child process** goes first: `opencode serve` answers every OpenCode probe,
+/// and starting it while another harness's probes run would hold it open for no
+/// reason. Declared by the plugin
+/// ([`crate::harness::plugin::HarnessPlugin::probes_share_one_child`]) rather
+/// than hard-coded as a literal order here, so the reason travels with the
+/// harness it is true of.
+pub(crate) fn drive_order() -> Vec<Harness> {
+    let mut out: Vec<Harness> = crate::harness::registry::all().collect();
+    out.sort_by_key(|h| !h.plugin().is_some_and(|p| p.probes_share_one_child()));
+    out
 }
 
 /// The version cImp last recorded for `harness`, from the physical global
@@ -562,11 +461,10 @@ pub(crate) fn drive(harness: Harness) -> Driven {
 /// a stale record would file today's shapes under yesterday's release.
 fn recorded_version(harness: Harness) -> String {
     let hv = crate::settings::read_global_harness_versions();
-    match harness {
-        Harness::Claude => hv.claude_last_seen.trim().to_string(),
-        Harness::OpenCode => hv.opencode_last_seen.trim().to_string(),
-        Harness::Any => String::new(),
-    }
+    harness
+        .plugin()
+        .map(|p| p.recorded_version(&hv))
+        .unwrap_or_default()
 }
 
 /// `--json`: a flat array of the same records the human report prints, one per
@@ -813,7 +711,7 @@ fn start_opencode_serve() -> Result<Serve, String> {
 }
 
 /// The two OpenCode probes that share one server child.
-fn probe_opencode() -> (Vec<ProbeResult>, Vec<Observed>, String) {
+pub(in crate::harness) fn probe_opencode() -> (Vec<ProbeResult>, Vec<Observed>, String) {
     let serve = match start_opencode_serve() {
         Ok(s) => s,
         Err(why) => {
@@ -1244,7 +1142,7 @@ fn declared_flags(id: &str) -> Vec<&'static str> {
 /// makes both rows `unknown`, and filing an unreadable one as a known-good
 /// capture would seed the corpus with the shape a later diff is supposed to
 /// flag.
-fn probe_claude_flags() -> (Vec<ProbeResult>, Option<String>) {
+pub(in crate::harness) fn probe_claude_flags() -> (Vec<ProbeResult>, Option<String>) {
     let (session_id, settings) = ("claude.flag.session_id", "claude.flag.settings_overlay");
     let help = match claude_help() {
         Ok(h) => h,
@@ -1423,7 +1321,7 @@ fn read_tail(path: &PathBuf) -> Option<Tail> {
 /// V35 Phase H, up to [`capture::LINES_PER_CAPABILITY`] of the lines that
 /// actually satisfied each row's substantiveness predicate, and the CLI build
 /// string those lines carry.
-fn probe_claude_transcript() -> (Vec<ProbeResult>, Vec<Observed>, String) {
+pub(in crate::harness) fn probe_claude_transcript() -> (Vec<ProbeResult>, Vec<Observed>, String) {
     let ids = [
         "claude.transcript.usage",
         "claude.transcript.tool_result",
@@ -2222,10 +2120,10 @@ Options:
     fn every_declared_unprobed_row_says_why() {
         assert_eq!(
             declared_unprobed().len(),
-            DECLARED_UNPROBED.len(),
+            declared_unprobed_rows().len(),
             "the id view must not drop entries"
         );
-        for (id, why) in DECLARED_UNPROBED {
+        for (id, why) in declared_unprobed_rows() {
             assert!(
                 why.trim().len() > 30,
                 "{id}: say what would be needed to probe it, not merely that it is unprobed"

@@ -82,75 +82,30 @@ use crate::advisor::{
 };
 use crate::settings::Settings;
 
-/// Which harness serves a capability.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Harness {
-    Claude,
-    OpenCode,
-    /// Harness-neutral — served by whatever adapter is attached.
-    ///
-    /// **Constructed since V39 Phase B**, by exactly one row: `delegation.worker`
-    /// (locked decision 16). Phase A of V35 predicted CHP would produce the
-    /// first neutral row and left this variant under an `#[allow(dead_code)]`;
-    /// what actually produced it is the first capability whose contract is
-    /// *"whatever harness this tab runs, it must serve `assistant_text` and
-    /// accept an input profile"* — a requirement stated about a tab, not about
-    /// a vendor. The `allow` is gone with the prediction.
-    Any,
-}
-
-impl Harness {
-    /// The CHP `agent` discriminator for a concrete harness — the SAME
-    /// two-word vocabulary [`crate::tabs::tab_consumer`] classifies a tab's
-    /// command into, so a tab's id and its rows join without a translation
-    /// table. `None` for [`Harness::Any`], which names no vendor.
-    pub fn id(self) -> Option<&'static str> {
-        match self {
-            Harness::Claude => Some("claude"),
-            Harness::OpenCode => Some("opencode"),
-            Harness::Any => None,
-        }
-    }
-
-    /// What a human (and a generated tool description) calls this harness.
-    ///
-    /// Lives here rather than in a frontend string table because the
-    /// `delegate_task_<id>` descriptions are rendered in Rust, above the seam,
-    /// from the registry — L4 must be able to say "Claude Code" without
-    /// containing the word.
-    pub fn display_name(self) -> &'static str {
-        match self {
-            Harness::Claude => "Claude Code",
-            Harness::OpenCode => "OpenCode",
-            Harness::Any => "any harness",
-        }
-    }
-
-    /// The harness whose CHP agent id is `id`, if any.
-    pub fn from_id(id: &str) -> Option<Harness> {
-        [Harness::Claude, Harness::OpenCode]
-            .into_iter()
-            .find(|h| h.id() == Some(id))
-    }
-}
-
-/// Every concrete harness id the registry has rows for, in declaration order.
+/// Which harness serves a capability — the registry's [`HarnessId`], re-exported
+/// under the name this module has always used for the column.
 ///
-/// **The list `delegate_task_*` is generated from** (locked decision 3): a tool
-/// exists per harness id, so nothing above the seam holds a literal set of
-/// harness names. Derived from [`CAPABILITIES`] rather than from a const array
-/// so a harness that gains rows is delegable by that fact alone.
-pub fn harness_ids() -> Vec<&'static str> {
-    let mut out: Vec<&'static str> = Vec::new();
-    for cap in CAPABILITIES {
-        if let Some(id) = cap.harness.id() {
-            if !out.contains(&id) {
-                out.push(id);
-            }
-        }
-    }
-    out
-}
+/// V40 Phase A folded the enum into the registry (locked decision 3). Its three
+/// variants were three answers to "which harness", and the whole point of the
+/// registry is that there is one; [`Harness::ANY`] survives as the marker for a
+/// row whose contract is stated about a *tab* rather than about a vendor.
+pub use crate::harness::registry::HarnessId as Harness;
+
+/// The declaration-site spellings for the `harness:` column below.
+///
+/// Inside `harness/` naming a harness is the job; what locked decision 10(a)
+/// forbids is core doing it. Checked against the registry by
+/// [`registry::every_declared_id_is_registered`].
+const CLAUDE: Harness = Harness::declared("claude");
+const OPENCODE: Harness = Harness::declared("opencode");
+/// Harness-neutral — served by whatever adapter is attached.
+///
+/// **Constructed since V39 Phase B**, by exactly one row: `delegation.worker`
+/// (locked decision 16). Phase A of V35 predicted CHP would produce the first
+/// neutral row; what actually produced it is the first capability whose contract
+/// is *"whatever harness this tab runs, it must serve `assistant_text` and
+/// accept an input profile"* — a requirement stated about a tab, not a vendor.
+const ANY: Harness = Harness::ANY;
 
 /// The seam a dependency sits in. See the module docs for what each predicts.
 // `A` is unconstructed on purpose: Tier A (MCP) has never broken cImp, so the
@@ -330,7 +285,7 @@ pub const CAP_PRETOOLUSE_DENY: &str = "claude.hook.pretooluse_deny";
 
 /// V39 Phase B, locked decision 16 — **the worker gate**, spelled once.
 ///
-/// The registry's first [`Harness::Any`] row: "this tab's harness serves
+/// The registry's first [`ANY`] row: "this tab's harness serves
 /// `assistant_text` for the session's final message (or has a live fallback
 /// reader) and accepts an [`InputProfile`]". A harness that is not gate-clean
 /// is **not a valid worker** — it gets no `delegate_task_*` tool, its
@@ -378,7 +333,7 @@ pub const CAPABILITIES: &[Capability] = &[
     // ── Claude Code: documented hooks (Tier B) ──────────────────────────────
     Capability {
         id: "claude.hook.user_prompt_submit",
-        harness: Harness::Claude,
+        harness: CLAUDE,
         tier: Seam::B,
         contract: "A `UserPromptSubmit` hook of `type: \"http\"` (Claude Code ≥ 2.1.63, contract \
                    verified unchanged through 2.1.233 on 2026-08-17) POSTs \
@@ -425,7 +380,7 @@ pub const CAPABILITIES: &[Capability] = &[
     },
     Capability {
         id: "claude.hook.precompact",
-        harness: Harness::Claude,
+        harness: CLAUDE,
         tier: Seam::B,
         contract: "A `PreCompact` hook of `type: \"http\"` POSTs `{session_id, trigger, cwd}` and \
                    the `hookSpecificOutput.additionalContext` in its 2xx JSON reply reaches the \
@@ -466,7 +421,7 @@ pub const CAPABILITIES: &[Capability] = &[
     },
     Capability {
         id: CAP_PRETOOLUSE_DENY,
-        harness: Harness::Claude,
+        harness: CLAUDE,
         tier: Seam::B,
         contract: "A `PreToolUse` hook of `type: \"http\"` can deny a tool call by answering 2xx \
                    with `hookSpecificOutput.permissionDecision: \"deny\"`, and the accompanying \
@@ -510,7 +465,7 @@ pub const CAPABILITIES: &[Capability] = &[
     },
     Capability {
         id: "claude.hook.posttooluse",
-        harness: Harness::Claude,
+        harness: CLAUDE,
         tier: Seam::B,
         contract: "A `PostToolUse` hook of `type: \"http\"` fires for `Edit` / `Write` / \
                    `MultiEdit` **on success** with the documented payload (`tool_name`, \
@@ -556,7 +511,7 @@ pub const CAPABILITIES: &[Capability] = &[
     },
     Capability {
         id: "claude.hook.notification",
-        harness: Harness::Claude,
+        harness: CLAUDE,
         tier: Seam::B,
         contract: "`Notification` and `PermissionDenied` hooks of `type: \"http\"` fire (matcher \
                    `\"\"` = all types) with `{hook_event_name, session_id, cwd, transcript_path}` \
@@ -626,7 +581,7 @@ pub const CAPABILITIES: &[Capability] = &[
     // column carries a distinct control id per site (see [`CONTROLS`]).
     Capability {
         id: "claude.hook.taint_beacon",
-        harness: Harness::Claude,
+        harness: CLAUDE,
         tier: Seam::B,
         contract: "A `PreToolUse` hook of `type: \"http\"` with matcher `WebFetch|WebSearch` fires \
                    BEFORE the tool runs, POSTing `{session_id, cwd, tool_name}`, and a 2xx reply \
@@ -678,7 +633,7 @@ pub const CAPABILITIES: &[Capability] = &[
     },
     Capability {
         id: "claude.hook.checkpoint_beacon",
-        harness: Harness::Claude,
+        harness: CLAUDE,
         tier: Seam::B,
         contract: "A `PreToolUse` hook of `type: \"http\"` with matcher \
                    `Edit|Write|MultiEdit|Bash` fires BEFORE the tool runs with the same payload, \
@@ -732,7 +687,7 @@ pub const CAPABILITIES: &[Capability] = &[
     // ── Claude Code: scraped UI (Tier D) ────────────────────────────────────
     Capability {
         id: "perm.tui_scrape",
-        harness: Harness::Claude,
+        harness: CLAUDE,
         tier: Seam::D,
         contract: "Claude Code's approval prompt keeps the footer grammar `<chord> to cancel \
                    [· <chord> to amend] [· <chord> to explain]` with the cancel hint FIRST, and \
@@ -788,7 +743,7 @@ pub const CAPABILITIES: &[Capability] = &[
     // exactly one of the two produces each datum.
     Capability {
         id: "claude.hook.stop",
-        harness: Harness::Claude,
+        harness: CLAUDE,
         tier: Seam::B,
         contract: "A `Stop` hook of `type: \"http\"` fires at the end of every assistant turn \
                    with `last_assistant_message` carrying the complete final assistant text. \
@@ -834,7 +789,7 @@ pub const CAPABILITIES: &[Capability] = &[
     },
     Capability {
         id: "claude.hook.tool_result",
-        harness: Harness::Claude,
+        harness: CLAUDE,
         tier: Seam::B,
         contract: "TWO all-tools (`\"\"`) `type: \"http\"` entries, one per outcome, because \
                    `PostToolUse` fires only when a tool SUCCEEDS. `hooks.PostToolUse` carries \
@@ -897,7 +852,7 @@ pub const CAPABILITIES: &[Capability] = &[
     },
     Capability {
         id: "claude.hook.subagent",
-        harness: Harness::Claude,
+        harness: CLAUDE,
         tier: Seam::B,
         contract: "`SubagentStart` and `SubagentStop` hooks of `type: \"http\"` fire (matcher \
                    `\"\"` = all agent types) carrying `agent_id` and `agent_type`; the pair is a \
@@ -958,7 +913,7 @@ pub const CAPABILITIES: &[Capability] = &[
     // says this may move".
     Capability {
         id: "claude.transcript.assistant_text",
-        harness: Harness::Claude,
+        harness: CLAUDE,
         tier: Seam::C,
         contract: "Assistant transcript lines (`type == \"assistant\"`) carry `message.content[]` \
                    blocks with `type == \"text\"` and a `text` string, written COMPLETE at \
@@ -992,7 +947,7 @@ pub const CAPABILITIES: &[Capability] = &[
     // ten-minute wait rather than an error. One row per way of breaking.
     Capability {
         id: "claude.transcript.stop_reason",
-        harness: Harness::Claude,
+        harness: CLAUDE,
         tier: Seam::C,
         contract: "An assistant transcript line carries `message.stop_reason`, and its value \
                    distinguishes a turn that CONTINUES from one that is OVER: `\"tool_use\"` means \
@@ -1052,7 +1007,7 @@ pub const CAPABILITIES: &[Capability] = &[
     // that text predates this check, and this comment is the correction.
     Capability {
         id: "claude.transcript.usage",
-        harness: Harness::Claude,
+        harness: CLAUDE,
         tier: Seam::C,
         contract: "Assistant transcript lines (`type == \"assistant\"`) carry `message.id`, \
                    `message.model` and a `message.usage` block whose four token counters keep \
@@ -1077,7 +1032,7 @@ pub const CAPABILITIES: &[Capability] = &[
     },
     Capability {
         id: "claude.transcript.tool_result",
-        harness: Harness::Claude,
+        harness: CLAUDE,
         tier: Seam::C,
         contract: "User-role transcript lines carry the preceding turn's tool results as \
                    `message.content[]` blocks with `type == \"tool_result\"`, `tool_use_id` and \
@@ -1113,7 +1068,7 @@ pub const CAPABILITIES: &[Capability] = &[
     },
     Capability {
         id: "claude.transcript.identity",
-        harness: Harness::Claude,
+        harness: CLAUDE,
         tier: Seam::C,
         contract: "Every transcript line carries a top-level `sessionId`; lines also carry \
                    `version` (the CLI build that wrote them, feeding the drift tripwire), \
@@ -1144,7 +1099,7 @@ pub const CAPABILITIES: &[Capability] = &[
     },
     Capability {
         id: "claude.transcript.subagents",
-        harness: Harness::Claude,
+        harness: CLAUDE,
         tier: Seam::C,
         contract: "Sub-agent traffic is visible in one of the two known places: inline in the \
                    parent transcript as `isSidechain: true` lines, or as \
@@ -1197,7 +1152,7 @@ pub const CAPABILITIES: &[Capability] = &[
     // into `depends_on` and the canary grows an assertion.
     Capability {
         id: "claude.statusline.stdin",
-        harness: Harness::Claude,
+        harness: CLAUDE,
         tier: Seam::C,
         contract: "The `statusLine` command's stdin JSON carries `model.display_name` (with \
                    `model.id` as the rendered fallback), a `context_window` block \
@@ -1237,7 +1192,7 @@ pub const CAPABILITIES: &[Capability] = &[
     // ── Claude Code: spawn flags (Tier B) ───────────────────────────────────
     Capability {
         id: "claude.flag.settings_overlay",
-        harness: Harness::Claude,
+        harness: CLAUDE,
         tier: Seam::B,
         contract: "`claude --settings <json>` accepts a session-scoped overlay and honors the \
                    `hooks`, `statusLine` and `permissions` keys inside it, without cImp ever \
@@ -1268,7 +1223,7 @@ pub const CAPABILITIES: &[Capability] = &[
     },
     Capability {
         id: "claude.flag.session_id",
-        harness: Harness::Claude,
+        harness: CLAUDE,
         tier: Seam::B,
         contract: "`claude --session-id <uuid>` still exists and pins the process to one \
                    transcript file (V34), and the selectors cImp stands down for — `--resume`, \
@@ -1319,7 +1274,7 @@ pub const CAPABILITIES: &[Capability] = &[
     // notice for once, so the reader took the notice (see the two new deps).
     Capability {
         id: "opencode.sse.events",
-        harness: Harness::OpenCode,
+        harness: OPENCODE,
         tier: Seam::C,
         contract: "`GET /event` streams SSE envelopes `{type, properties}` carrying \
                    `message.updated`, `message.part.updated`, `message.part.delta`, \
@@ -1374,7 +1329,7 @@ pub const CAPABILITIES: &[Capability] = &[
     // the field in the source is not that proof.
     Capability {
         id: "opencode.route.push",
-        harness: Harness::OpenCode,
+        harness: OPENCODE,
         tier: Seam::B,
         contract: "`POST /session/:id/message` accepts a hand-built message envelope, and \
                    `noReply: true` (≥ 1.18.13) injects the text into the session **without** \
@@ -1434,7 +1389,7 @@ pub const CAPABILITIES: &[Capability] = &[
     // drives both directions of it.
     Capability {
         id: "opencode.route.noauth",
-        harness: Harness::OpenCode,
+        harness: OPENCODE,
         tier: Seam::B,
         contract: "Setting the documented `OPENCODE_SERVER_PASSWORD` (non-empty) and \
                    `OPENCODE_SERVER_USERNAME` on the `opencode` child enforces HTTP Basic auth on \
@@ -1484,7 +1439,7 @@ pub const CAPABILITIES: &[Capability] = &[
     // about an id that is never live.
     Capability {
         id: "opencode.tool_registry",
-        harness: Harness::OpenCode,
+        harness: OPENCODE,
         tier: Seam::C,
         contract: "Every tool id `GET /experimental/tool/ids` returns on the running binary is \
                    present in `offload::toolclass::OPENCODE_NATIVE_TABLE`. The table is \
@@ -1527,7 +1482,7 @@ pub const CAPABILITIES: &[Capability] = &[
     // `harness::opencode::tools`, beside the gate that IS real).
     Capability {
         id: "opencode.plugin.load_all",
-        harness: Harness::OpenCode,
+        harness: OPENCODE,
         tier: Seam::D,
         contract: "Every file in `.opencode/plugin/` is loaded (config delivered via \
                    `OPENCODE_CONFIG_CONTENT`), the `chat.message`, `tool.execute.before` and \
@@ -1591,7 +1546,7 @@ pub const CAPABILITIES: &[Capability] = &[
     // requirement and names no vendor.
     Capability {
         id: CAP_DELEGATION_WORKER,
-        harness: Harness::Any,
+        harness: ANY,
         tier: Seam::D,
         contract: "A tab may be driven as a delegation worker: its harness serves CHP                    `assistant_text` ONCE PER TURN, carrying that turn's final assistant                    message (or has a live fallback reader that derives the same boundary), and it declares an input profile whose paste +                    submit encoding yields exactly one turn. Harness-neutral by construction —                    the requirement is stated about a tab, not about a vendor.",
         depends_on: &[Dep::Behavior(
@@ -1602,7 +1557,7 @@ pub const CAPABILITIES: &[Capability] = &[
         wired_in: &[
             "src-tauri/src/delegation/mod.rs",
             "src-tauri/src/delegation/engine.rs",
-            "src-tauri/src/harness/input.rs",
+            "src-tauri/src/harness/plugin.rs",
         ],
         degradation: Degradation::FailClosed,
         drift_rule: &[],
@@ -1616,7 +1571,7 @@ pub const CAPABILITIES: &[Capability] = &[
     },
     Capability {
         id: "claude.input.profile",
-        harness: Harness::Claude,
+        harness: CLAUDE,
         tier: Seam::D,
         contract: "Claude Code's TUI accepts a bracketed paste (`ESC [ 200 ~` … `ESC [ 201 ~`) as                    ONE literal insertion — embedded newlines land in the composer as newlines,                    not as submits — and a CR written after it submits that buffer as exactly one                    turn.",
         depends_on: &[Dep::Behavior(
@@ -1624,7 +1579,7 @@ pub const CAPABILITIES: &[Capability] = &[
         )],
         wired_in: &[
             "src-tauri/src/harness/claude/input.rs",
-            "src-tauri/src/harness/input.rs",
+            "src-tauri/src/harness/plugin.rs",
         ],
         degradation: Degradation::FailClosed,
         drift_rule: &[],
@@ -1638,7 +1593,7 @@ pub const CAPABILITIES: &[Capability] = &[
     },
     Capability {
         id: "opencode.input.profile",
-        harness: Harness::OpenCode,
+        harness: OPENCODE,
         tier: Seam::D,
         contract: "OpenCode's TUI accepts a bracketed paste (`ESC [ 200 ~` … `ESC [ 201 ~`) as                    ONE literal insertion, and a CR written after it submits that buffer as                    exactly one turn.",
         depends_on: &[Dep::Behavior(
@@ -1646,7 +1601,7 @@ pub const CAPABILITIES: &[Capability] = &[
         )],
         wired_in: &[
             "src-tauri/src/harness/opencode/input.rs",
-            "src-tauri/src/harness/input.rs",
+            "src-tauri/src/harness/plugin.rs",
         ],
         degradation: Degradation::FailClosed,
         drift_rule: &[],
@@ -2306,7 +2261,7 @@ mod tests {
         assert!(!gate(CAP_PRETOOLUSE_DENY, &settings_with_input_profile("fail")).blocked);
     }
 
-    /// **The registry's first `Harness::Any` row exists and is the one meant.**
+    /// **The registry's first `ANY` row exists and is the one meant.**
     ///
     /// `Any` carried an `#[allow(dead_code)]` from V35 Phase A with a comment
     /// predicting CHP would construct it. This pins what actually did — and
@@ -2316,20 +2271,23 @@ mod tests {
     fn the_neutral_row_is_the_delegation_worker_and_names_no_vendor() {
         let neutral: Vec<&str> = CAPABILITIES
             .iter()
-            .filter(|c| c.harness == Harness::Any)
+            .filter(|c| c.harness == ANY)
             .map(|c| c.id)
             .collect();
         assert_eq!(neutral, vec![CAP_DELEGATION_WORKER]);
-        assert_eq!(Harness::Any.id(), None, "a neutral row has no agent id");
-        for id in harness_ids() {
+        assert_eq!(ANY.id(), None, "a neutral row has no agent id");
+        for id in crate::harness::registry::harness_ids() {
             assert_eq!(
                 Harness::from_id(id).and_then(Harness::id),
                 Some(id),
                 "`{id}` must round-trip through the registry's harness vocabulary"
             );
-            assert!(!Harness::from_id(id).unwrap().display_name().is_empty());
+            assert!(!Harness::from_id(id).unwrap().label().is_empty());
         }
-        assert_eq!(harness_ids(), vec!["claude", "opencode"]);
+        assert_eq!(
+            crate::harness::registry::harness_ids(),
+            vec!["claude", "opencode"]
+        );
         assert_eq!(Harness::from_id("aider"), None);
     }
 

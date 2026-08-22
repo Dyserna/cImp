@@ -220,7 +220,13 @@ pub fn is_push_route(route: &str) -> bool {
 /// the fix. It is the V32 "needs a FRESH TAB" trap being named at exactly the
 /// moment it applies.
 pub fn expects_chp(agent: &str) -> bool {
-    agent == "opencode" || agent == "claude"
+    // V40 Phase A: the registry answers it. It was a hard-coded disjunction, so
+    // stale-artifact detection was silently OFF for any harness not named in it
+    // — a new harness would have shipped with the mechanism disabled and no
+    // diff saying so.
+    crate::harness::HarnessId::from_id(agent)
+        .and_then(|h| h.descriptor())
+        .is_some_and(|d| d.expects_chp)
 }
 
 // ── the per-tab peer registry ───────────────────────────────────────────────

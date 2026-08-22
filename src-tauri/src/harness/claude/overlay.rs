@@ -23,7 +23,7 @@ use crate::harness::claude::hook as claude_hook;
 use crate::settings::injection::NativeWebMode as NativeWebVisibility;
 use crate::settings::{AiToolTabConfig, Settings};
 use crate::tabs::config::{
-    advertises_audit_to_claude, command_is, compose_capability_guidance, native_web_for,
+    advertises_audit_to_claude, compose_capability_guidance, native_web_for,
     read_advisor_gate_blocked, CHANNEL_PUSH_FLAG, CHANNEL_REGISTRATION_FLAG,
     CHANNEL_REGISTRATION_TARGET,
 };
@@ -239,7 +239,11 @@ pub(crate) fn build_pre_args(
     tab: &str,
     endpoint: Option<&crate::offload::loopback::Discovery>,
 ) -> Vec<String> {
-    if !command_is(&cfg.command, "claude") {
+    // Belt and braces: `ClaudePlugin::pre_args` is the only production caller
+    // and it is reached only for a Claude tab, but the tests drive this
+    // directly with both harnesses' configs and the guard is what makes those
+    // assertions mean something.
+    if crate::harness::HarnessId::from_command(&cfg.command) != super::plugin::id() {
         return Vec::new();
     }
     let mut args = Vec::new();

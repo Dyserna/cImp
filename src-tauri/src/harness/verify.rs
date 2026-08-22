@@ -436,43 +436,51 @@ pub fn run_now(harness: Harness) -> bool {
 /// disagree about what "verified" means.
 fn manual_run(harness: Harness) {
     let hv = crate::settings::read_global_harness_versions();
-    match harness {
-        Harness::Claude => {
-            let seen = hv.claude_last_seen.trim().to_string();
-            if seen.is_empty() {
-                // Nothing to stamp a record against: cImp has never observed
-                // this CLI write a transcript. Run the checks anyway — the
-                // per-capability answers are what the panel shows — but write
-                // NO record. An `AutoVerify` stamped with an empty version
-                // would compare equal to every other empty version, and the
-                // all-pass advance would overwrite a real `claude_last_verified`
-                // with "".
-                let report = verify(Harness::Claude);
-                tracing::info!(tally = ?report.tally(), "manual harness verify ran with no known version; not recorded");
-                remember(&report, "");
-                return;
-            }
-            run_once(&seen);
+    let plugin = harness.plugin();
+    let version = plugin.map(|p| p.recorded_version(&hv)).unwrap_or_default();
+    // "Does this harness have a PERSISTED verify record?" — asked of the plugin
+    // instead of by naming a harness (V40 Phase A). Only a harness that persists
+    // one can go through [`run_once`], which is the write path Phase F's
+    // automatic run uses; for every other harness the in-memory summary IS the
+    // result (see [`RunSummary`]).
+    let persists = plugin.is_some_and(|p| p.last_verified(&hv).is_some());
+    if persists {
+        if version.is_empty() {
+            // Nothing to stamp a record against: cImp has never observed this
+            // CLI write a transcript. Run the checks anyway — the per-capability
+            // answers are what the panel shows — but write NO record. An
+            // `AutoVerify` stamped with an empty version would compare equal to
+            // every other empty version, and the all-pass advance would
+            // overwrite a real `*_last_verified` with "".
+            let report = verify(harness);
+            tracing::info!(tally = ?report.tally(), "manual harness verify ran with no known version; not recorded");
+            remember(&report, "");
+            return;
         }
-        other => {
-            // No persisted record exists for any other harness (see
-            // [`RunSummary`]), so the in-memory summary IS the result.
-            let version = match other {
-                Harness::OpenCode => hv.opencode_last_seen.trim().to_string(),
-                _ => String::new(),
-            };
-            let report = verify(other);
-            let (pass, fail, unknown, transition) = report.tally();
-            tracing::info!(
-                harness = ?other,
-                version = %version,
-                pass, fail, unknown, transition,
-                capped = report.capped,
-                "manual harness verify finished"
-            );
-            remember(&report, &version);
-        }
+        run_once(&version);
+        return;
     }
+    let report = verify(harness);
+    let (pass, fail, unknown, transition) = report.tally();
+    tracing::info!(
+        harness = %harness,
+        version = %version,
+        pass, fail, unknown, transition,
+        capped = report.capped,
+        "manual harness verify finished"
+    );
+    remember(&report, &version);
+}
+
+/// The harness whose verify record is **persisted** today.
+///
+/// V40 Phase A: [`run_once`] and [`worker`] write `claude_auto_verify` and
+/// advance `claude_last_verified` — a settings FIELD PAIR that locked decision 5
+/// turns into a per-harness map in Phase B. Until then the write path is shaped
+/// by those two fields, so it names the one harness they belong to in exactly
+/// one place, with this note, rather than in four `match` arms.
+fn persisted_record_harness() -> Harness {
+    Harness::from_id("claude").expect("claude is a registered harness")
 }
 
 fn spawn_worker(why: &'static str) {
@@ -522,7 +530,7 @@ fn worker(why: &'static str) {
 /// Verify `version` and write the outcome — the ONE place `claude_last_verified`
 /// advances without a click.
 fn run_once(version: &str) {
-    let report = verify(Harness::Claude);
+    let report = verify(persisted_record_harness());
     let record = report.record(version, crate::activity::now_ms());
     let advance = report.advances();
     let (pass, fail, unknown, transition) = report.tally();
@@ -617,6 +625,16 @@ pub fn notifiable_failures<'a>(
 
 #[cfg(test)]
 mod tests {
+
+    /// The two shipped harnesses, resolved through the registry — test code may
+    /// name a harness, it just may not construct one out of thin air.
+    fn claude() -> Harness {
+        Harness::from_id("claude").expect("claude is registered")
+    }
+    #[allow(dead_code)]
+    fn opencode() -> Harness {
+        Harness::from_id("opencode").expect("opencode is registered")
+    }
     use super::*;
 
     fn answer(id: &'static str, outcome: Outcome) -> Answer {
@@ -629,7 +647,7 @@ mod tests {
 
     fn report(answers: Vec<Answer>) -> Report {
         Report {
-            harness: Harness::Claude,
+            harness: claude(),
             answers,
             capped: false,
         }
@@ -811,7 +829,7 @@ mod tests {
     /// blocks.
     #[test]
     fn an_l1_only_run_drives_this_harnesss_canaries_and_advances() {
-        let report = verify_until(Harness::Claude, Instant::now() - Duration::from_secs(1));
+        let report = verify_until(claude(), Instant::now() - Duration::from_secs(1));
         assert!(report.capped, "the L2 half must have been skipped");
         assert_eq!(
             report.answers.len(),
@@ -824,7 +842,7 @@ mod tests {
         for a in &report.answers {
             assert_eq!(a.evidence, EVIDENCE_CANARY);
             let cap = contract::get(a.id).expect("every answer names a registry row");
-            assert_eq!(cap.harness, Harness::Claude, "wrong harness for {}", a.id);
+            assert_eq!(cap.harness, claude(), "wrong harness for {}", a.id);
             assert_eq!(
                 a.outcome.label(),
                 "pass",
@@ -842,9 +860,9 @@ mod tests {
     /// one CLI must not report the other's readers.
     #[test]
     fn a_run_is_scoped_to_one_harness() {
-        let claude = verify_until(Harness::Claude, Instant::now() - Duration::from_secs(1));
+        let claude = verify_until(claude(), Instant::now() - Duration::from_secs(1));
         assert!(!claude.answers.iter().any(|a| a.id.starts_with("opencode.")));
-        let opencode = verify_until(Harness::OpenCode, Instant::now() - Duration::from_secs(1));
+        let opencode = verify_until(opencode(), Instant::now() - Duration::from_secs(1));
         assert_eq!(
             opencode.answers.iter().map(|a| a.id).collect::<Vec<_>>(),
             vec!["opencode.sse.events"]
@@ -856,19 +874,19 @@ mod tests {
     /// tell "passed" from "could not be checked" for a row the stored record
     /// does not name.
     ///
-    /// Keyed on [`Harness::Any`] deliberately. [`LAST_RUNS`] is process-wide
+    /// Keyed on [`Harness::ANY`] deliberately. [`LAST_RUNS`] is process-wide
     /// and `harness::health` asks it about Claude and OpenCode, so writing a
     /// real harness here would leak into that module's fixtures depending on
     /// test order — the neutral marker is invisible to it.
     #[test]
     fn a_remembered_run_is_readable_and_replaced_per_harness() {
         assert!(
-            last_run(Harness::Any).is_none(),
+            last_run(Harness::ANY).is_none(),
             "nothing is ever recorded for the neutral harness outside this test"
         );
 
         let first = Report {
-            harness: Harness::Any,
+            harness: Harness::ANY,
             answers: vec![answer(
                 "a",
                 Outcome::Pass {
@@ -878,14 +896,14 @@ mod tests {
             capped: true,
         };
         remember(&first, "1.0.0");
-        let got = last_run(Harness::Any).expect("the run was recorded");
+        let got = last_run(Harness::ANY).expect("the run was recorded");
         assert_eq!(got.version, "1.0.0");
         assert!(got.capped, "the budget flag survives");
         assert!(got.at_ms > 0, "a run is stamped so the panel can age it");
         assert_eq!(got.answers.len(), 1);
 
         let second = Report {
-            harness: Harness::Any,
+            harness: Harness::ANY,
             answers: vec![
                 answer(
                     "b",
@@ -903,7 +921,7 @@ mod tests {
             capped: false,
         };
         remember(&second, "2.0.0");
-        let got = last_run(Harness::Any).expect("the run was recorded");
+        let got = last_run(Harness::ANY).expect("the run was recorded");
         assert_eq!(got.version, "2.0.0", "the newer run replaces the older one");
         assert!(!got.capped);
         assert_eq!(

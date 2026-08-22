@@ -1514,16 +1514,42 @@ fn apply_incoming_settings(cur: &mut Settings, mut incoming: Settings) {
     // reason). The window's snapshot is taken when it opens; the transcript tap
     // or the auto-verify worker may have written a newer version since, and a
     // save must not revert a version observation or a Mark-verified.
-    for (id, live) in &cur.harness {
+    //
+    // V40 review L-1: iterate the REGISTRY, not `cur.harness`. A registered
+    // harness with no live row used to take all three straight from the
+    // incoming snapshot — and the frontend fabricates them for an absent key
+    // (`harnessRow` answers `last_seen: ''`, `auto_verify: null`), so the health
+    // panel would read "never auto-verified" until the next restart.
+    // `harness_settings` supplies the declared defaults for an absent row, which
+    // is the same answer every other reader gets.
+    for h in crate::harness::registry::all() {
+        let Some(id) = h.id() else {
+            continue;
+        };
+        let live = cur.harness_settings(h).clone();
         let row = incoming
             .harness
-            .entry(id.clone())
+            .entry(id.to_string())
             .or_insert_with(|| live.clone());
-        row.last_seen = live.last_seen.clone();
-        row.last_verified = live.last_verified.clone();
-        row.auto_verify = live.auto_verify.clone();
+        row.last_seen = live.last_seen;
+        row.last_verified = live.last_verified;
+        row.auto_verify = live.auto_verify;
+    }
+    // A row for a harness this build does not know can only have come from the
+    // file, through `cur`; keep it whole rather than letting a window snapshot
+    // that never showed it decide its shape.
+    for (id, live) in &cur.harness {
+        if crate::harness::HarnessId::from_id(id).is_none() {
+            incoming.harness.entry(id.clone()).or_insert_with(|| live.clone());
+        }
     }
     *cur = incoming;
+    // V40 review M-1: the declared parse boundary, on the IPC write path too.
+    // The Settings window can post an out-of-enum `SettingKind::Enum` value or a
+    // non-object `Json` block (its generic form has an `{:else}` branch), and
+    // without this the wrong-typed value would live in memory — and in the file
+    // it is saved to — until some later out-of-band read repaired it.
+    cur.normalize_harness_settings();
     // Keep the reserved feature tabs (Code Graph monitor / Workbench / ...)
     // present-iff-enabled in the persisted list.
     crate::settings::reconcile_reserved_tabs(cur);

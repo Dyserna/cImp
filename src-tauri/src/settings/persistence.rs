@@ -259,6 +259,13 @@ pub fn load(default_shell: &ShellSpec, launch_cwd: &Path) -> LoadOutcome {
         }
     };
 
+    // The merged view goes through the same parse boundary (V40 review M-1):
+    // `load_global` normalised the baseline, but a project overlay's
+    // `harness.<id>.ext` values are merged in AFTER that and are just as
+    // hand-editable. Not folded into `repaired` — a normalisation of the merged
+    // value is not a repair of the GLOBAL file, and `load_global` has already
+    // healed that one on disk.
+    settings.normalize_harness_settings();
     let repaired = integrity_check(&mut settings);
 
     // Re-point bundled avatar videos at the loaded theme. Existing installs
@@ -348,7 +355,13 @@ pub fn load_readonly(launch_cwd: &Path) -> Settings {
         let _ = strip_overlay_mcp_registry(&mut overlay);
         deep_merge(&mut merged, overlay);
     }
-    serde_json::from_value(merged).unwrap_or_default()
+    let mut settings: Settings = serde_json::from_value(merged).unwrap_or_default();
+    // V40 review M-1: the same parse boundary, and NOT optional here — the
+    // children this serves read declared `ext` values (`harness_ext_bool` and
+    // friends) to decide what they advertise. No write-back: this reader's whole
+    // contract is that it has no side effects.
+    settings.normalize_harness_settings();
+    settings
 }
 
 /// V14 Phase A: global scope of the prompt-template library, read directly
@@ -750,15 +763,25 @@ fn load_global(default_shell: &ShellSpec) -> Settings {
     // price table lives, so the top-up has to run here rather than against the
     // merged per-project `Settings`.
     let priced = top_up_llm_pricing_if_needed(&mut typed);
+    // **THE parse boundary for the harness map, on the LOAD path** (V40 review
+    // finding M-1). `read_settings_or_default`'s doc claimed every typed read in
+    // this module went through it; this one did not, so a hand-edited
+    // `"statusline": "yes"` reached the launch path as a string the accessors
+    // answer with the DECLARED DEFAULT (`true`) while the Settings window's
+    // `value === true` rendered it OFF — the UI saying one thing and the spawn
+    // doing the other, which is precisely the divergence `SettingKind::accepts`
+    // exists to prevent. Folded into the write-back below so the repair is
+    // durable rather than re-derived (and re-warned) on every launch.
+    let normalized = typed.normalize_harness_settings();
 
-    if migrated || seeded || priced {
+    if migrated || seeded || priced || normalized {
         // Persist the migrated/seeded shape back to disk so future launches
         // don't re-migrate or re-seed. Atomic write inside save_to keeps
         // this safe under crash.
         if let Err(e) = save_to(&path, &typed) {
             tracing::warn!(error = %e, path = %path.display(), "settings: post-migration/seed global save failed");
         } else {
-            tracing::info!(path = %path.display(), migrated, seeded, "settings: global migrated/seeded and rewritten");
+            tracing::info!(path = %path.display(), migrated, seeded, normalized, "settings: global migrated/seeded and rewritten");
         }
     } else {
         tracing::info!(path = %path.display(), "settings: global loaded");
@@ -3921,6 +3944,100 @@ mod tests {
         let mut clean: Value = serde_json::json!({ "ui": { "theme": "tui" } });
         assert!(strip_overlay_tool_plugins(&mut clean).is_empty());
         assert_eq!(clean, serde_json::json!({ "ui": { "theme": "tui" } }));
+    }
+
+    /// **Every reader of a settings file runs the harness parse boundary**
+    /// (V40 review finding M-1).
+    ///
+    /// `read_settings_or_default`'s doc comment claimed it already — "the load
+    /// path, the out-of-band readers, the read-modify-write helpers" — and the
+    /// load path was the one that did not. `load_global` parsed straight to
+    /// `Settings`, `load` parsed the merged value, and `load_readonly` (the
+    /// `cimp --offload-mcp` child) did the same. A hand-edited
+    /// `harness.claude.ext.statusline = "yes"` therefore reached the launch path
+    /// as a string the accessors answer with the DECLARED DEFAULT while the
+    /// Settings window rendered the checkbox OFF: the UI saying one thing and
+    /// the spawn doing the other, which is the divergence `SettingKind::accepts`
+    /// exists to prevent.
+    ///
+    /// Structural because there is no way to reach `load_global` from a unit
+    /// test without writing next to the test binary; the normaliser's own
+    /// behaviour is covered in `settings::schema`. Newline-agnostic: CI checks
+    /// this tree out with CRLF.
+    #[test]
+    fn every_settings_reader_runs_the_harness_parse_boundary() {
+        let src = include_str!("persistence.rs");
+        for sig in [
+            "fn load_global(",
+            "pub fn load(",
+            "pub fn load_readonly(",
+            "fn read_settings_or_default(",
+        ] {
+            let start = src
+                .find(sig)
+                .unwrap_or_else(|| panic!("`{sig}` is gone — re-point this test"));
+            let body = &src[start..];
+            let body = &body[..body.find("\n}").unwrap_or(body.len())];
+            assert!(
+                body.contains("normalize_harness_settings"),
+                "`{sig}` must run the harness parse boundary: a declared `ext` key whose stored \
+                 value its kind rejects has to be repaired wherever the file was read from, or \
+                 the Settings window and the spawn path answer differently"
+            );
+        }
+    }
+
+    /// The behavioural half: a PROJECT overlay's `ext` values go through the
+    /// boundary too, because they are merged in after `load_global` healed the
+    /// baseline. Mirrors `load`'s own steps (serialize global -> strip -> merge
+    /// -> typed parse -> normalize).
+    #[test]
+    fn a_project_overlay_ext_value_its_kind_rejects_is_reset_to_the_declared_default() {
+        let claude = crate::harness::DEFAULT_HARNESS
+            .id()
+            .expect("DEFAULT_HARNESS is registered");
+        let mut global = Settings::default();
+        global.normalize_harness_settings();
+        // A declared bool key, to prove the boundary reaches the merged value.
+        let declared = crate::harness::DEFAULT_HARNESS
+            .descriptor()
+            .expect("a registered id has a descriptor")
+            .plugin
+            .settings_schema()
+            .iter()
+            .find(|f| matches!(f.kind, crate::harness::plugin::SettingKind::Bool))
+            .map(|f| f.key)
+            .expect("the default harness declares at least one bool setting");
+
+        let mut merged = serde_json::to_value(&global).unwrap();
+        let mut overlay = serde_json::json!({
+            "harness": { claude: { "ext": {
+                declared: "yes",
+                "a.key.from.a.newer.build": { "keep": true }
+            } } }
+        });
+        strip_overlay_banned(&mut overlay);
+        let _ = strip_overlay_harness(&mut overlay);
+        deep_merge(&mut merged, overlay);
+
+        let mut settings: Settings = serde_json::from_value(merged).unwrap();
+        assert_eq!(
+            settings.harness[claude].ext.get(declared).and_then(Value::as_str),
+            Some("yes"),
+            "precondition: the un-normalised merge really does carry the bad value"
+        );
+        assert!(settings.normalize_harness_settings());
+        assert_eq!(
+            settings.harness[claude].ext.get(declared),
+            global.harness[claude].ext.get(declared),
+            "a value the declared kind rejects is reset to the declared default"
+        );
+        // An UNDECLARED key still rides through untouched — a key a newer cImp
+        // declares must survive a downgrade.
+        assert_eq!(
+            settings.harness[claude].ext.get("a.key.from.a.newer.build"),
+            Some(&serde_json::json!({ "keep": true }))
+        );
     }
 
     /// V40 review M-2: `harness` splits INSIDE the block too, and V40 Phase B

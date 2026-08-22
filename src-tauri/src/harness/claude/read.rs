@@ -641,6 +641,10 @@ struct TurnText {
     ended: bool,
     /// This turn's completion has been filed. One turn, one completion.
     fired: bool,
+    /// Drain passes observed since the turn ended with no text yet (V39 review
+    /// R-9). One pass of grace before an empty completion is filed — see
+    /// [`Self::take_if_over`].
+    passes_since_end: u8,
 }
 
 impl TurnText {
@@ -660,14 +664,35 @@ impl TurnText {
         }
     }
 
-    /// The completion to file now, if the turn is over and produced one.
-    fn take_if_over(&mut self) -> Option<String> {
+    /// The completion to file now, if the turn is over.
+    ///
+    /// **A turn that ended with NO text files an EMPTY completion** (V39 review
+    /// R-9, locked decision 13: empty is not absent). The engine turns an empty
+    /// completion into `NoText` — "the worker finished its turn without a
+    /// substantive final message" — immediately, which is the honest answer;
+    /// filing nothing made the same outcome arrive as a `timeout` ten minutes
+    /// later, saying the worker was still running when it had stopped.
+    ///
+    /// `definitive` is what stops that from firing early. One API message is
+    /// several transcript lines carrying one `stop_reason`, and the `thinking`
+    /// line comes BEFORE the `text` one — so at the end of the pass that first
+    /// saw `end_turn`, "no text yet" and "no text at all" are the same picture.
+    /// A pass of grace tells them apart. At a user prompt (`definitive`) there
+    /// is nothing left to wait for: the next turn has started.
+    fn take_if_over(&mut self, definitive: bool) -> Option<String> {
         if !self.ended || self.fired {
             return None;
         }
-        let text = self.text.clone()?;
+        if let Some(text) = self.text.clone() {
+            self.fired = true;
+            return Some(text);
+        }
+        self.passes_since_end = self.passes_since_end.saturating_add(1);
+        if !definitive && self.passes_since_end < 2 {
+            return None;
+        }
         self.fired = true;
-        Some(text)
+        Some(String::new())
     }
 }
 
@@ -724,6 +749,14 @@ async fn drain_new_lines(
     let mut own_record = false;
     let Some((complete, new_offset)) = read_complete_lines(path, offset) else {
         // Nothing new/complete, or rotated away mid-loop.
+        //
+        // V39 review R-9: an empty pass is still a pass. A turn that ended with
+        // no text is waiting out one pass of grace (see `TurnText`), and if the
+        // file has gone quiet — which is exactly what a finished turn looks
+        // like — this is the pass that ends the wait.
+        if let Some(text) = turn.take_if_over(false) {
+            ctx.note_turn_text(&text);
+        }
         return Drained { offset, own_record };
     };
     offset = new_offset;
@@ -785,7 +818,10 @@ async fn drain_new_lines(
             // here, not at the end of the pass, precisely because the prompt is
             // what makes the previous turn unambiguously over.
             if !pushed && is_user_prompt(&obj) && !is_sidechain(&obj) && obj.get("isMeta").and_then(Value::as_bool) != Some(true) {
-                if let Some(text) = turn.take_if_over() {
+                // Definitive: the next turn has started, so an ended turn
+                // with no text is an empty answer NOW rather than after a pass
+                // of grace.
+                if let Some(text) = turn.take_if_over(true) {
                     ctx.note_turn_text(&text);
                 }
                 turn.restart();
@@ -811,7 +847,7 @@ async fn drain_new_lines(
     // Once per pass, after every line of it — an API message is several
     // transcript lines carrying one `stop_reason`, so the turn's final text can
     // follow the line that declared the turn over.
-    if let Some(text) = turn.take_if_over() {
+    if let Some(text) = turn.take_if_over(false) {
         ctx.note_turn_text(&text);
     }
     Drained { offset, own_record }
@@ -3365,6 +3401,83 @@ mod tests {
             crate::delegation::testing::take(&worker).as_deref(),
             Some("It exports three symbols."),
             "the answer must be filed before the next prompt resets the buffer"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A turn that ends with no text files an EMPTY completion** (V39 review
+    /// R-9, locked decision 13).
+    ///
+    /// The engine turns that into `worker produced no text` immediately. Filing
+    /// nothing made the same outcome arrive as a `timeout` ten minutes later,
+    /// claiming the worker was still running when it had stopped.
+    #[tokio::test]
+    async fn a_turn_that_says_nothing_files_an_empty_completion() {
+        let dir = std::env::temp_dir().join(format!("oob-turn-r9-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session-1.jsonl");
+        let body = concat!(
+            r#"{"type":"user","message":{"content":"summarise latch.ts"}}"#,
+            "\n",
+            // The turn ends carrying nothing but reasoning.
+            r#"{"type":"assistant","message":{"id":"m1","stop_reason":"end_turn","content":[{"type":"thinking","thinking":"..."}]}}"#,
+            "\n",
+        );
+        std::fs::write(&path, body).unwrap();
+        let ctx = turn_ctx("ai-r9-worker");
+        let worker = TabId::from_str("ai-r9-worker");
+        let _registry = crate::delegation::testing::lock_registry();
+        crate::delegation::testing::claim_and_submit(&worker);
+        let mut turn = TurnText::default();
+
+        let offset = drain_for_turn(&path, &dir, 0, &mut turn, &ctx).await;
+        assert!(
+            crate::delegation::testing::take(&worker).is_none(),
+            "one pass of grace: the turn's `text` line may still be coming"
+        );
+        // The next poll finds nothing new — which is what a finished turn looks
+        // like — and the grace runs out.
+        drain_for_turn(&path, &dir, offset, &mut turn, &ctx).await;
+        assert_eq!(
+            crate::delegation::testing::take(&worker).as_deref(),
+            Some(""),
+            "an empty completion, so the driver is told `no text` now rather than `timeout` later"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// …and the grace is load-bearing: the text line arriving in the NEXT pass
+    /// still wins over the empty completion.
+    #[tokio::test]
+    async fn a_turns_final_text_arriving_a_pass_late_still_wins() {
+        let dir = std::env::temp_dir().join(format!("oob-turn-r9b-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session-1.jsonl");
+        let head = concat!(
+            r#"{"type":"user","message":{"content":"summarise latch.ts"}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"id":"m1","stop_reason":"end_turn","content":[{"type":"thinking","thinking":"..."}]}}"#,
+            "\n",
+        );
+        let tail = concat!(
+            r#"{"type":"assistant","message":{"id":"m1","stop_reason":"end_turn","content":[{"type":"text","text":"It exports three symbols."}]}}"#,
+            "\n",
+        );
+        std::fs::write(&path, head).unwrap();
+        let ctx = turn_ctx("ai-r9b-worker");
+        let worker = TabId::from_str("ai-r9b-worker");
+        let _registry = crate::delegation::testing::lock_registry();
+        crate::delegation::testing::claim_and_submit(&worker);
+        let mut turn = TurnText::default();
+
+        let offset = drain_for_turn(&path, &dir, 0, &mut turn, &ctx).await;
+        assert!(crate::delegation::testing::take(&worker).is_none());
+        std::fs::write(&path, format!("{head}{tail}")).unwrap();
+        drain_for_turn(&path, &dir, offset, &mut turn, &ctx).await;
+        assert_eq!(
+            crate::delegation::testing::take(&worker).as_deref(),
+            Some("It exports three symbols."),
+            "the real answer, not the empty completion the grace was holding back"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

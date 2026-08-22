@@ -830,6 +830,14 @@ pub(crate) struct Tracker {
     /// stamped at FILE time defeats that: text this tab produced before a
     /// delegation existed would look like its reply.
     turn_last_text: Option<(String, u64)>,
+    /// This turn produced an assistant message of the TAB's own (V39 review
+    /// R-9), whether or not it carried speakable text.
+    ///
+    /// The difference between "the worker answered with nothing" — locked
+    /// decision 13's error, owed to the driver immediately — and "no turn
+    /// happened here at all", which `session.idle` also fires for and which
+    /// must not be reported as anything.
+    turn_saw_assistant: bool,
     /// messageIDs already spoken (don't double-flush on idle).
     flushed: HashSet<String>,
     /// messageID -> the session that produced it.
@@ -1007,9 +1015,19 @@ impl Tracker {
         // deliberately LEFT INTACT here: the turn is still running, and the main
         // session's own idle files it.
         if main_session {
-            if let Some((text, at_ms)) = self.turn_last_text.take() {
-                ctx.note_turn_text_at(&text, at_ms);
+            match self.turn_last_text.take() {
+                Some((text, at_ms)) => ctx.note_turn_text_at(&text, at_ms),
+                // V39 review R-9: the tab took a turn and said nothing
+                // speakable. That is locked decision 13's `NoText` — owed to
+                // the driver NOW, not as a timeout ten minutes later — and the
+                // engine mints it from an empty completion. Gated on
+                // `turn_saw_assistant` because `session.idle` also fires for
+                // turns this tab never spoke in, and minting `no text` for one
+                // of those would fail a delegation that had not started.
+                None if self.turn_saw_assistant => ctx.note_turn_text(""),
+                None => {}
             }
+            self.turn_saw_assistant = false;
         }
         self.set_working(ctx, false);
         // Turn over: whatever part state is still buffered belongs to
@@ -1192,6 +1210,13 @@ impl Tracker {
             self.part_snapshot.remove(pid);
             self.part_type.remove(pid);
         }
+        // V39 review R-9: a turn of this tab's own HAPPENED, whether or not it
+        // said anything speakable. Recorded before the emptiness check, because
+        // "it said nothing" is precisely the case that has to be reportable.
+        let mine = self.is_main_session(self.msg_session.get(mid).map(String::as_str));
+        if mine {
+            self.turn_saw_assistant = true;
+        }
         if !out.trim().is_empty() {
             trace!(tab = ?ctx.tab, "OpenCode OOB: speaking assistant message (reasoning excluded)");
             // V39 Phase B + review HIGH-1: this reader is OpenCode's DECLARED
@@ -1205,7 +1230,7 @@ impl Tracker {
             // A CHILD session's message is never the tab's answer, so it is
             // spoken (unchanged) but not buffered: otherwise the tab's own idle
             // would file a sub-agent's last words as the worker's reply.
-            if self.is_main_session(self.msg_session.get(mid).map(String::as_str)) {
+            if mine {
                 self.turn_last_text = Some((out.clone(), crate::activity::now_ms()));
             }
             ctx.speak(&out).await;
@@ -1262,6 +1287,7 @@ impl Tracker {
         // reaches it.
         if working {
             self.turn_last_text = None;
+            self.turn_saw_assistant = false;
         }
         self.working = working;
         let tab = ctx.tab.clone();
@@ -1608,8 +1634,12 @@ mod tests {
         )
         .await;
 
-        assert!(
-            crate::delegation::testing::take(&worker).is_none(),
+        // V39 review R-9 files an EMPTY completion for a turn that said
+        // nothing — which is the honest answer here, and the assertion that
+        // matters is what it is NOT.
+        assert_eq!(
+            crate::delegation::testing::take(&worker).as_deref(),
+            Some(""),
             "the previous turn's words are not this delegation's reply"
         );
         // TTS is untouched: turn 1 was spoken when it happened, turn 2 said
@@ -1666,6 +1696,56 @@ mod tests {
             "a dropped connection must not swallow the worker's answer"
         );
         assert!(tts_rx.try_recv().is_ok(), "and it was spoken, as before");
+    }
+
+    /// **A turn that says nothing files an EMPTY completion** (V39 review R-9,
+    /// locked decision 13) — and an idle for a turn this tab never took files
+    /// nothing at all.
+    #[tokio::test]
+    async fn a_turn_that_says_nothing_files_an_empty_completion() {
+        let (ctx, _tts_rx, _sig) = ctx_with("ai-r9-oc");
+        let worker = TabId::from_str("ai-r9-oc");
+        let _registry = crate::delegation::testing::lock_registry();
+        crate::delegation::testing::claim_and_submit(&worker);
+        let mut t = Tracker::default();
+
+        // An idle with no turn behind it: nothing happened, nothing is claimed.
+        t.handle(
+            &ev(r#"{"type":"session.idle","properties":{"sessionID":"ses_main"}}"#),
+            &ctx,
+        )
+        .await;
+        assert!(
+            crate::delegation::testing::take(&worker).is_none(),
+            "an idle for a turn this tab never took is not `the worker said nothing`"
+        );
+
+        // A real turn that only calls a tool and then ends.
+        t.handle(
+            &ev(r#"{"type":"message.updated","properties":{"sessionID":"ses_main","info":{"id":"m1","role":"assistant","time":{"created":1}}}}"#),
+            &ctx,
+        )
+        .await;
+        t.handle(
+            &ev(r#"{"type":"message.part.updated","properties":{"sessionID":"ses_main","part":{"id":"p1","type":"tool","messageID":"m1","text":""}}}"#),
+            &ctx,
+        )
+        .await;
+        t.handle(
+            &ev(r#"{"type":"message.updated","properties":{"sessionID":"ses_main","info":{"id":"m1","role":"assistant","time":{"created":1,"completed":2}}}}"#),
+            &ctx,
+        )
+        .await;
+        t.handle(
+            &ev(r#"{"type":"session.idle","properties":{"sessionID":"ses_main"}}"#),
+            &ctx,
+        )
+        .await;
+        assert_eq!(
+            crate::delegation::testing::take(&worker).as_deref(),
+            Some(""),
+            "the driver is told `no text` now rather than `timeout` later"
+        );
     }
 
     /// The identity rule itself, including its two fail-open answers.

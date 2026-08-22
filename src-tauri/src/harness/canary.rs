@@ -106,6 +106,13 @@ const FIXTURE_CLAUDE_TOOL_RESULT: &str =
 /// capability that does not exist.
 const FIXTURE_CLAUDE_ASSISTANT_TEXT: &str =
     include_str!("../../fixtures/harness/claude/2.1.232/transcript.assistant-text.jsonl");
+/// V39. The turn BOUNDARY the delegation completion feed derives from the
+/// transcript — a different contract from the text blocks above, in a different
+/// field, breaking differently: `assistant_texts` going empty makes a tab go
+/// mute, `stop_reason` going missing makes every delegation into a Claude tab
+/// wait out its deadline. Two lines, because the contract is a DISTINCTION.
+const FIXTURE_CLAUDE_STOP_REASON: &str =
+    include_str!("../../fixtures/harness/claude/2.1.232/transcript.stop-reason.jsonl");
 const FIXTURE_CLAUDE_STATUSLINE: &str =
     include_str!("../../fixtures/harness/claude/2.1.232/statusline-stdin.json");
 const FIXTURE_OPENCODE_SSE: &str =
@@ -123,6 +130,7 @@ pub const EMBEDDED: &[&str] = &[
     "claude.transcript.usage",
     "claude.transcript.tool_result",
     "claude.transcript.assistant_text",
+    "claude.transcript.stop_reason",
     "claude.statusline.stdin",
     "opencode.sse.events",
 ];
@@ -142,6 +150,7 @@ pub fn run_embedded(id: &str) -> Option<Result<(), String>> {
         "claude.transcript.usage" => Some(claude_transcript_usage()),
         "claude.transcript.tool_result" => Some(claude_transcript_tool_result()),
         "claude.transcript.assistant_text" => Some(claude_transcript_assistant_text()),
+        "claude.transcript.stop_reason" => Some(claude_transcript_stop_reason()),
         "claude.statusline.stdin" => Some(claude_statusline_stdin()),
         "opencode.sse.events" => Some(block_on_current_thread(opencode_sse_events())),
         _ => None,
@@ -381,6 +390,63 @@ fn check_claude_transcript_assistant_text(raw: &str) -> Result<(), String> {
         "claude.transcript.assistant_text: a non-text block reached the speech path — thinking or \
          tool_use content is being spoken aloud"
     );
+    Ok(())
+}
+
+// ── claude.transcript.stop_reason ───────────────────────────────────────────
+
+/// `harness/claude/read.rs::is_turn_end` still tells a turn that CONTINUES from
+/// a turn that is OVER, from `message.stop_reason` alone.
+///
+/// This is V39's turn boundary for the fallback reader: the delegation
+/// completion is filed once per turn, carrying that turn's final assistant
+/// message, and on a tab whose `Stop` hook does not push, this field is the
+/// only thing in the transcript that says which message that is.
+///
+/// The failure this catches: `stop_reason` is renamed or dropped, `is_turn_end`
+/// answers `false` for every line, no completion is ever filed, and a
+/// delegation into that tab waits out its entire deadline (ten minutes by
+/// default) before reporting `timeout` for a turn that ended in seconds. The
+/// worker looks fine, the transcript looks fine, and nothing errors.
+pub fn claude_transcript_stop_reason() -> Result<(), String> {
+    check_claude_transcript_stop_reason(FIXTURE_CLAUDE_STOP_REASON)
+}
+
+fn check_claude_transcript_stop_reason(raw: &str) -> Result<(), String> {
+    let lines = parse_lines(raw)?;
+    substantive!(
+        lines.len() == 2,
+        "fixture guard: expected a mid-turn line and a turn-final one, got {}",
+        lines.len()
+    );
+
+    // Both halves of the distinction, because either one alone is satisfied by
+    // a reader that has stopped reading the field at all: a rename makes
+    // EVERYTHING answer `false`, which the second assertion catches, and a
+    // reader that answered `true` unconditionally would file a completion on
+    // the preamble — HIGH-1's defect restored — which the first one catches.
+    substantive!(
+        !crate::harness::claude::read::is_turn_end(&lines[0]),
+        "claude.transcript.stop_reason: a `tool_use` stop reason no longer reads as MID-turn — \
+         the delegation completion would be filed on the preamble, and the worker's slot released \
+         while it was still working"
+    );
+    substantive!(
+        crate::harness::claude::read::is_turn_end(&lines[1]),
+        "claude.transcript.stop_reason: an `end_turn` line no longer reads as the end of a turn — \
+         `message.stop_reason` has moved, and every delegation into a Claude tab with no `Stop` \
+         push now waits out its whole deadline before reporting `timeout`"
+    );
+
+    // …and both lines really are assistant lines with prose in them, so neither
+    // answer above can be an artefact of a line the reader skipped wholesale.
+    for (i, line) in lines.iter().enumerate() {
+        substantive!(
+            !crate::harness::claude::read::assistant_texts(line).is_empty(),
+            "fixture guard: line {i} carries no assistant text, so the boundary answer above \
+             proves nothing about a real turn"
+        );
+    }
     Ok(())
 }
 
@@ -715,6 +781,20 @@ mod tests {
         ));
     }
 
+    /// V39. The delegation turn boundary — the one contract whose loss is
+    /// invisible in the transcript itself: every line still parses, every
+    /// message is still spoken, and only the driver waiting on the other side
+    /// of a delegation ever finds out.
+    #[test]
+    fn canary_claude_transcript_stop_reason() {
+        row("claude.transcript.stop_reason");
+        claude_transcript_stop_reason().unwrap_or_else(|e| panic!("{e}"));
+        assert!(matches!(
+            run_embedded("claude.transcript.stop_reason"),
+            Some(Ok(()))
+        ));
+    }
+
     #[tokio::test]
     async fn canary_opencode_sse_events() {
         row("opencode.sse.events");
@@ -724,6 +804,46 @@ mod tests {
     }
 
     // ── the negative twins ──────────────────────────────────────────────────
+
+    /// Negative twin: `message.stop_reason` renamed to `stopReason`.
+    ///
+    /// `is_turn_end` answers `false` for BOTH lines — the mid-turn one (right,
+    /// by accident) and the turn-final one (wrong, silently). That is the
+    /// production failure verbatim: no completion is ever filed, the driver
+    /// waits out its whole deadline, and the Events row says `timeout` for a
+    /// turn that ended in seconds. The untouched half is asserted too, because
+    /// a fixture that broke the LINE rather than the field would prove nothing:
+    /// both lines still yield their assistant text, so the tab still speaks
+    /// while delegation quietly stops completing.
+    #[test]
+    fn negative_canary_claude_transcript_stop_reason() {
+        row("claude.transcript.stop_reason");
+
+        let raw = fixture("claude/_synthetic/stop-reason-renamed.jsonl");
+        let lines = json_lines(&raw);
+        assert_eq!(lines.len(), 2, "fixture guard: expected both lines");
+
+        for (i, line) in lines.iter().enumerate() {
+            assert!(
+                !crate::harness::claude::read::is_turn_end(line),
+                "guard: this fixture models the drift case — line {i} must read as MID-turn once \
+                 `stop_reason` is renamed, which is exactly why the loss is silent"
+            );
+            assert!(
+                !crate::harness::claude::read::assistant_texts(line).is_empty(),
+                "guard: only ONE field may differ from the positive twin — the text blocks must \
+                 still read, or this fixture proves nothing about the renamed field"
+            );
+        }
+
+        // And the positive fixture's own answer is not an accident of the
+        // checker: the same function, on the untouched twin, still distinguishes.
+        assert!(check_claude_transcript_stop_reason(FIXTURE_CLAUDE_STOP_REASON).is_ok());
+        assert!(
+            check_claude_transcript_stop_reason(&raw).is_err(),
+            "the canary must FAIL on the drift model — otherwise it is decorative"
+        );
+    }
 
     /// Negative twin: `message.usage.input_tokens` renamed to `inputTokens`.
     ///
@@ -1240,6 +1360,10 @@ mod tests {
             (
                 FIXTURE_CLAUDE_TOOL_RESULT,
                 "claude/2.1.232/transcript.tool-result.jsonl",
+            ),
+            (
+                FIXTURE_CLAUDE_STOP_REASON,
+                "claude/2.1.232/transcript.stop-reason.jsonl",
             ),
             (FIXTURE_CLAUDE_STATUSLINE, "claude/2.1.232/statusline-stdin.json"),
             (

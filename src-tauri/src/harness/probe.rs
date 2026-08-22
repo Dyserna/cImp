@@ -235,6 +235,10 @@ const IMPLEMENTED: &[&str] = &[
     // worth driving precisely BECAUSE it is now a fallback: a fallback nobody
     // checks is what turns the primary's failure into a mute tab.
     "claude.transcript.assistant_text",
+    // V39. Same tail again, and the same argument one step further: this row's
+    // loss is invisible even in the tab — only a driver waiting on a delegation
+    // ever notices, ten minutes later.
+    "claude.transcript.stop_reason",
 ];
 
 /// Every other registry row, with the reason this phase does not drive it.
@@ -1425,6 +1429,7 @@ fn probe_claude_transcript() -> (Vec<ProbeResult>, Vec<Observed>, String) {
         "claude.transcript.tool_result",
         "claude.transcript.identity",
         "claude.transcript.assistant_text",
+        "claude.transcript.stop_reason",
     ];
     let unknown = |why: String| {
         (
@@ -1457,6 +1462,7 @@ fn probe_claude_transcript() -> (Vec<ProbeResult>, Vec<Observed>, String) {
         ProbeResult::new(ids[1], tool_result_outcome(&tail)),
         ProbeResult::new(ids[2], identity_outcome(&tail)),
         ProbeResult::new(ids[3], assistant_text_outcome(&tail)),
+        ProbeResult::new(ids[4], stop_reason_outcome(&tail)),
     ];
     // Only rows that PASSED contribute lines. A line that failed the
     // substantiveness predicate is not a known-good shape, and the harness-level
@@ -1471,6 +1477,7 @@ fn probe_claude_transcript() -> (Vec<ProbeResult>, Vec<Observed>, String) {
             substantive_lines(&tail, |l| identity_is_substantive(l, &tail.session_id)),
         ),
         (ids[3], substantive_lines(&tail, assistant_text_is_substantive)),
+        (ids[4], substantive_lines(&tail, stop_reason_is_substantive)),
     ] {
         let passed = results
             .iter()
@@ -1676,6 +1683,83 @@ fn assistant_text_outcome(tail: &Tail) -> Outcome {
         detail: format!(
             "{substantive}/{with_content} assistant line(s) yielded speakable prose \
              ({text_blocks} text block(s) total)"
+        ),
+    }
+}
+
+/// One line declares a stop reason at all — the field the turn boundary is
+/// read from. See [`usage_is_substantive`] for why this is a named function.
+fn stop_reason_is_substantive(line: &Value) -> bool {
+    line.get("type").and_then(Value::as_str) == Some("assistant")
+        && line
+            .get("message")
+            .and_then(|m| m.get("stop_reason"))
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty())
+}
+
+/// `message.stop_reason` still says where a turn ends (V39).
+///
+/// The delegation completion feed's boundary on the FALLBACK path: with no
+/// `Stop` push for a tab, this field is the only thing in the transcript that
+/// says which assistant message is the turn's last one.
+///
+/// Independent witness on the same discipline as its three siblings, and a
+/// different field path from the thing witnessed: the count of assistant lines
+/// carrying a `message` object at all. Such lines with NO readable stop reason
+/// between them is drift — every turn then reads as still running, no
+/// completion is ever filed, and a delegation waits out its whole deadline
+/// before reporting `timeout` for a turn that ended in seconds.
+///
+/// Deliberately NOT a failure when every stop reason in the window is
+/// `tool_use`: a window can legitimately hold nothing but tool-calling turns.
+/// What is asserted is that the FIELD still reads; the split between turn-end
+/// and mid-turn is reported instead, so a build that started answering the same
+/// value for everything is visible in the detail line rather than silently
+/// passing.
+fn stop_reason_outcome(tail: &Tail) -> Outcome {
+    let assistant = tail
+        .lines
+        .iter()
+        .filter(|l| {
+            l.get("type").and_then(Value::as_str) == Some("assistant") && l.get("message").is_some()
+        })
+        .count();
+    if assistant == 0 {
+        return Outcome::Unknown {
+            why: format!(
+                "no assistant line in the last {} transcript lines — nothing to read a stop \
+                 reason out of",
+                tail.lines.len()
+            ),
+        };
+    }
+    let declared = tail
+        .lines
+        .iter()
+        .filter(|l| stop_reason_is_substantive(l))
+        .count();
+    if declared == 0 {
+        return Outcome::Fail {
+            detail: format!(
+                "{assistant} assistant line(s) in the window and NONE carries a readable \
+                 `message.stop_reason` — the fallback reader can no longer tell a turn's end \
+                 from a tool pause, so a delegation into a tab with no `Stop` push files no \
+                 completion at all and waits out its entire deadline"
+            ),
+        };
+    }
+    let ended = tail
+        .lines
+        .iter()
+        .filter(|l| crate::harness::claude::read::is_turn_end(l))
+        .count();
+    Outcome::Pass {
+        detail: format!(
+            "{declared}/{assistant} assistant line(s) declare a stop reason; {ended} read as the \
+             END of a turn and {} as mid-turn (a window of nothing but tool-calling turns is \
+             normal, so only the field itself is asserted)",
+            declared.saturating_sub(ended)
         ),
     }
 }

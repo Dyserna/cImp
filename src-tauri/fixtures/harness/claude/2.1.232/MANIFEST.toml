@@ -17,6 +17,12 @@
 #                                     (V35 Phase L: the row existed in the code
 #                                     and not in the registry until the push
 #                                     migration needed a fallback to name)
+#   transcript.stop-reason.jsonl      claude.transcript.stop_reason
+#                                     harness/claude/read.rs::is_turn_end
+#                                     (V39: the fallback reader's TURN boundary
+#                                     — two lines, because the contract is a
+#                                     DISTINCTION: `tool_use` continues the
+#                                     turn, anything else non-null ends it)
 #   statusline-stdin.json             claude.statusline.stdin
 #                                     statusline/mod.rs::render,
 #                                     ::extract_push / ::extract_rate_limits

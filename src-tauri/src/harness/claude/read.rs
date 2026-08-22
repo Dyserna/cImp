@@ -672,7 +672,11 @@ impl TurnText {
 }
 
 /// Whether this transcript line ends its turn — see [`TurnText`].
-fn is_turn_end(obj: &Value) -> bool {
+///
+/// `pub(crate)` for the V35 canary suite: this is the one reader behind
+/// `claude.transcript.stop_reason`, and a canary that re-implemented the rule
+/// would prove its own copy rather than the code that runs.
+pub(crate) fn is_turn_end(obj: &Value) -> bool {
     if obj.get("type").and_then(Value::as_str) != Some("assistant") {
         return false;
     }

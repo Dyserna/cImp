@@ -983,6 +983,46 @@ pub const CAPABILITIES: &[Capability] = &[
         controls: &[],
         drift_token: None,
     },
+    // V39: the boundary the row above is READ AT. Deliberately its own row
+    // rather than another `Dep::JsonPath` on `claude.transcript.assistant_text`,
+    // because the two break differently and are noticed by different people:
+    // losing `message.content[].text` makes a tab go mute, which a user hears
+    // within one turn; losing `message.stop_reason` changes nothing anybody can
+    // see except a driver waiting on a delegation, and it changes it into a
+    // ten-minute wait rather than an error. One row per way of breaking.
+    Capability {
+        id: "claude.transcript.stop_reason",
+        harness: Harness::Claude,
+        tier: Seam::C,
+        contract: "An assistant transcript line carries `message.stop_reason`, and its value \
+                   distinguishes a turn that CONTINUES from one that is OVER: `\"tool_use\"` means \
+                   the model paused to call a tool, anything else non-null (`\"end_turn\"`, and \
+                   the rarer `\"max_tokens\"` / `\"stop_sequence\"`) means it stopped talking. \
+                   Several transcript lines may carry one message's blocks and they all repeat \
+                   that message's stop reason, so the turn's final TEXT can follow the line that \
+                   declared the turn over.",
+        depends_on: &[
+            Dep::JsonPath("type"),
+            Dep::JsonPath("message.stop_reason"),
+        ],
+        wired_in: &["src-tauri/src/harness/claude/read.rs"],
+        // A tab whose `Stop` hook pushes `assistant_text` never reads this at
+        // all: the push core files the completion per turn, arbitrated by
+        // `chp::served`. The fallback is therefore a real, named, tested path —
+        // and the residual, for a tab with no push, is a `timeout` row with a
+        // reason rather than a hang or a wrong answer (an unrecognized
+        // stop reason ENDS the turn, so a new value files one message early
+        // instead of never).
+        degradation: Degradation::Fallback {
+            to: "claude.hook.stop",
+        },
+        drift_rule: &[],
+        canary: Some("claude.transcript.stop_reason"),
+        probe: Some("claude.transcript.stop_reason"),
+        waiver: None,
+        controls: &[],
+        drift_token: None,
+    },
     // **This row does NOT migrate, and the reason is upstream's, not cImp's.**
     //
     // V35 Phase L moved the read path onto pushed hook payloads wherever a hook
@@ -1541,6 +1581,14 @@ pub const CAPABILITIES: &[Capability] = &[
     // because they break differently and are fixed in different files: the
     // neutral one loses its READ half (a completion signal), the per-harness
     // ones lose their PUSH half (a paste that no longer yields one turn).
+    //
+    // A fourth row is part of the same requirement without being part of this
+    // group: where the completion signal is a FALLBACK READER, that reader has
+    // to derive the turn boundary itself, and the boundary is per harness — for
+    // Claude it is `claude.transcript.stop_reason` (V39 review), for OpenCode
+    // the `session.idle` / `session.status` pair inside `opencode.sse.events`.
+    // Both live with their harness, which is why the neutral row states the
+    // requirement and names no vendor.
     Capability {
         id: CAP_DELEGATION_WORKER,
         harness: Harness::Any,
@@ -1548,6 +1596,8 @@ pub const CAPABILITIES: &[Capability] = &[
         contract: "A tab may be driven as a delegation worker: its harness serves CHP                    `assistant_text` ONCE PER TURN, carrying that turn's final assistant                    message (or has a live fallback reader that derives the same boundary), and it declares an input profile whose paste +                    submit encoding yields exactly one turn. Harness-neutral by construction —                    the requirement is stated about a tab, not about a vendor.",
         depends_on: &[Dep::Behavior(
             "a completion signal exists for this tab (pushed `assistant_text`, or the harness's              declared fallback reader) AND the harness declares an input profile — a worker cImp              can type into but cannot read back from would silently swallow the task",
+        ), Dep::Behavior(
+            "…and that signal fires ONCE PER TURN, carrying the turn's final assistant message.              A push is turn-shaped by construction (the harness's own turn-over hook); a              fallback reader must DERIVE the boundary from the artifact it reads, which is a              per-harness contract with its own row and its own canary (see the reader rows for              each harness). A per-MESSAGE signal hands the driver a mid-turn preamble and              releases the worker while it is still working; no signal at all leaves the driver              waiting out its whole deadline",
         )],
         wired_in: &[
             "src-tauri/src/delegation/mod.rs",

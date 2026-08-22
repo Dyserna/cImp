@@ -630,3 +630,17 @@ the design:
 - Knobs have their own IPC `tab_set_delegation_backend`; `withTabBackend`
   deleted. Facade collisions are shown as "not in the pool" in Settings.
 - Pre-existing, out of scope: TTS speaks sidechain lines (#103).
+- **R-1..R-9 (`d3792a3..7442bb9`, cargo 2723/0/6, vitest 792)**: scaffold =
+  empty block ONLY; Claude drain files an ended turn before `restart()`;
+  OpenCode buffer cleared on `set_working` rising edge and stamped at
+  PRODUCTION time (`note_*_at`); frontend gate honours `prompt_relaxed` via
+  `delegationPrompt.ts` (residual: with `auto_read_only` OFF a user-locked tab
+  still refuses — there is no engine lock to relax); `SubprocessExited`
+  carries a `start_gen` issued by `TabActivity::begin_start` BEFORE the spawn
+  (HIGH-3's post-restart reset removed — it was the race); single cancel path
+  `delegation::drive_watching` for `/delegate` and the facade; OpenCode
+  stream close files the held turn; `Registry::abandoned` makes a pre-claim
+  hang-up refuse at the claim; both readers file `""` on a text-less turn
+  (Claude waits one pass of grace for the `text` line after `thinking`).
+- **Merged to develop `2a7f1fe` (2026-08-22, user call).** Known flake:
+  `sandbox::windows::…mapped_drive…spawn_cwd` (environment `S:\`), unrelated.

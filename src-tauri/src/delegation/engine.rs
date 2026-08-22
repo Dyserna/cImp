@@ -131,6 +131,20 @@ pub struct DriveRequest {
     /// Caller's timeout override in seconds; `None` ⇒
     /// `delegation.default_timeout_s`.
     pub timeout_s: Option<u64>,
+    /// **The one exception to "the task is typed verbatim"** (locked decision
+    /// 2a), and it exists for exactly one caller: the Phase C facade.
+    ///
+    /// `offload_task` carries `schema` and `profile`, which a real backend
+    /// honours through machinery cImp owns — a grammar on the final turn, a
+    /// latch over the advertised tool defs. A worker tab has neither: cImp does
+    /// not own its sampler and it does not own its tool surface. So the facade
+    /// passes the *same instruction a real backend's worker would have been
+    /// given* ([`crate::offload::agent::facade_format_note`]) and the engine
+    /// appends it after the context — in one place, where a test can see it.
+    ///
+    /// `None` for the explicit tool: a user-directed hand-off adds nothing at
+    /// all, and a test pins that.
+    pub format_note: Option<String>,
 }
 
 /// A completed delegation.
@@ -157,11 +171,20 @@ pub struct Reply {
 /// the local echo) plus in the Events row. A blank line is the separator
 /// because it is what a person typing two paragraphs would produce, and it is
 /// the only thing here that is not caller text.
-fn compose(task: &str, context: Option<&str>) -> String {
-    match context.map(str::trim).filter(|c| !c.is_empty()) {
+///
+/// `note` is [`DriveRequest::format_note`] — the ONE caller-independent
+/// sentence cImp is allowed to add, and only the facade passes one. It goes
+/// last, after the caller's context, because it is about the shape of the
+/// answer rather than about the work.
+fn compose(task: &str, context: Option<&str>, note: Option<&str>) -> String {
+    let mut out = match context.map(str::trim).filter(|c| !c.is_empty()) {
         Some(c) => format!("{}\n\n{}", task.trim_end(), c),
         None => task.to_string(),
+    };
+    if let Some(n) = note.map(str::trim).filter(|n| !n.is_empty()) {
+        out = format!("{}\n\n{n}", out.trim_end());
     }
+    out
 }
 
 /// The tool name the reply is screened under (locked decision 11).
@@ -197,6 +220,121 @@ fn ai_tab<'a>(
     }
 }
 
+// ── the preflight checks that are properties of the WORKER ALONE ────────────
+//
+// Locked decision 12 lists ten conditions. Five of them ask nothing about the
+// driver, the request or the moment — they ask whether this tab is a worker at
+// all — and those five are exactly what Phase C's facade `is_ready` needs. They
+// live here as named functions so [`drive`] and [`worker_ready`] cannot come to
+// disagree about what a worker is: there is one rule per condition, written
+// once, and both callers run it.
+//
+// The other five (a driver identity, a non-empty in-bounds task, the acyclic
+// check, idleness, an empty input line) are properties of the REQUEST or the
+// MOMENT and stay inline in `drive`. Idleness in particular is deliberately not
+// here: for the router "the worker is mid-turn" is *no free slot*, not *not
+// ready*, and folding it in would make a busy worker look permanently broken.
+
+/// Preflight 1: the `delegation.worker` gate. A harness that is not gate-clean
+/// is not a worker at all, which is why this is asked before anything about the
+/// specific tabs.
+fn gate_reason(settings: &Settings) -> Option<String> {
+    let gate = contract::gate(CAP_DELEGATION_WORKER, settings);
+    gate.blocked.then_some(gate.reason)
+}
+
+/// Preflight 4: the worker id names a configured AI tab. Answers its harness id.
+fn worker_agent(settings: &Settings, worker: &TabId) -> Result<&'static str, String> {
+    match ai_tab(settings, worker) {
+        Some((agent, _)) => Ok(agent),
+        None => Err(format!(
+            "`{}` is not a configured AI tab, so it cannot be a delegation worker",
+            worker.as_str()
+        )),
+    }
+}
+
+/// Preflight 5: a live process behind the tab. Takes the two facts rather than
+/// reading them, because `drive` already holds both and re-reading them under a
+/// second lock is how two answers to one question start.
+fn worker_process(alive: bool, exited: bool, worker_name: &str) -> Result<(), String> {
+    if !alive || exited {
+        return Err(format!(
+            "worker tab `{worker_name}` has no running process — start it and try again"
+        ));
+    }
+    Ok(())
+}
+
+/// Preflight 6: the worker's harness declares an input profile. `None` is the
+/// fail-closed half of decision 16 — a harness cImp cannot type into is not a
+/// worker.
+fn worker_profile(
+    agent: &str,
+    worker_name: &str,
+) -> Result<crate::harness::InputProfile, String> {
+    crate::harness::input_profile(agent).ok_or_else(|| {
+        format!(
+            "worker tab `{worker_name}` runs a harness with no input profile, so cImp does not              know how to submit a turn to it"
+        )
+    })
+}
+
+/// Preflight 11: a completion signal exists — either the harness pushes CHP
+/// `assistant_text` for THIS tab, or it has a fallback reader attached. Without
+/// one the engine would type into a tab it cannot read back from, which is the
+/// silent-swallow decision 12 exists to prevent.
+fn worker_completion_source(agent: &str, worker: &TabId, worker_name: &str) -> Result<(), String> {
+    let pushed = crate::harness::chp::served(
+        agent,
+        worker.as_str(),
+        crate::harness::chp::EV_ASSISTANT_TEXT,
+    );
+    let reader = crate::harness::reader::has_live_reader(worker);
+    if !pushed && !reader {
+        return Err(format!(
+            "worker tab `{worker_name}` has no way to report the end of a turn (its harness pushes              no assistant text for this tab and no fallback reader is attached), so cImp could not              read the answer back — restart the tab and try again"
+        ));
+    }
+    Ok(())
+}
+
+/// **Is this tab a worker right now?** — the facade backend's readiness
+/// (V39 Phase C, locked decision 3: "`is_ready` = preflight conditions minus
+/// idleness").
+///
+/// The five worker-only checks above, in `drive`'s own order, and nothing else:
+/// no driver (there is none yet — the router is asking about capacity, not
+/// about a call), no idleness (that is the free-slot question, and
+/// `in_flight` answers it), no slot claim (asking must never take one).
+///
+/// `Err` carries the reason, unchanged from the one `drive` would refuse with,
+/// so a backend that is "down" in the pool and a delegation that is refused at
+/// preflight tell the user the same story.
+pub async fn worker_ready(app: &AppHandle, worker: &TabId) -> Result<(), String> {
+    let Some(state) = app.try_state::<crate::ipc::AppState>() else {
+        return Err("cImp's tab layer is not running, so no tab can be driven".to_string());
+    };
+    let settings = state.settings.current();
+    if let Some(reason) = gate_reason(&settings) {
+        return Err(reason);
+    }
+    let agent = worker_agent(&settings, worker)?;
+    let worker_name = {
+        let registry = state.tabs.lock().await;
+        registry
+            .name_of(worker)
+            .unwrap_or_else(|| worker.as_str().to_string())
+    };
+    let alive = {
+        let registry = state.tabs.lock().await;
+        registry.is_started(worker).await
+    };
+    worker_process(alive, state.tab_activity.flags(worker).exited, &worker_name)?;
+    worker_profile(agent, &worker_name)?;
+    worker_completion_source(agent, worker, &worker_name)
+}
+
 /// **Drive one worker tab and return its answer.**
 ///
 /// Every failure is a named [`DelegationError`]; every outcome mints exactly
@@ -218,9 +356,8 @@ pub async fn drive(app: &AppHandle, req: DriveRequest) -> Result<Reply, Delegati
 
     // 1. The gate. A harness that is not gate-clean is not a worker at all, so
     //    this is asked before anything about the specific tabs.
-    let gate = contract::gate(CAP_DELEGATION_WORKER, &settings);
-    if gate.blocked {
-        let e = refuse(gate.reason.clone());
+    if let Some(reason) = gate_reason(&settings) {
+        let e = refuse(reason);
         record_refusal(&req, &settings, "unknown", &e);
         return Err(e);
     }
@@ -266,11 +403,9 @@ pub async fn drive(app: &AppHandle, req: DriveRequest) -> Result<Reply, Delegati
     }
 
     // 4. The worker is a configured AI tab…
-    let Some((worker_agent, _worker_cfg)) = ai_tab(&settings, &req.worker) else {
-        return Err(deny(format!(
-            "`{}` is not a configured AI tab, so it cannot be a delegation worker",
-            req.worker.as_str()
-        )));
+    let worker_agent = match worker_agent(&settings, &req.worker) {
+        Ok(a) => a,
+        Err(reason) => return Err(deny(reason)),
     };
     let worker_name = {
         let registry = state.tabs.lock().await;
@@ -287,25 +422,25 @@ pub async fn drive(app: &AppHandle, req: DriveRequest) -> Result<Reply, Delegati
         registry.is_started(&req.worker).await
     };
     let flags = state.tab_activity.flags(&req.worker);
-    if !alive || flags.exited {
-        return Err(deny(format!(
-            "worker tab `{worker_name}` has no running process — start it and try again"
-        )));
+    if let Err(reason) = worker_process(alive, flags.exited, &worker_name) {
+        return Err(deny(reason));
     }
 
     // 6. Its harness declares an input profile. `None` here is the fail-closed
     //    half of decision 16: a harness cImp cannot type into is not a worker.
-    let Some(profile) = crate::harness::input_profile(worker_agent) else {
-        return Err(deny(format!(
-            "worker tab `{worker_name}` runs a harness with no input profile, so cImp does not \
-             know how to submit a turn to it"
-        )));
+    let profile = match worker_profile(worker_agent, &worker_name) {
+        Ok(p) => p,
+        Err(reason) => return Err(deny(reason)),
     };
 
     // 7. A substantive request that fits the profile's paste bound. Refused,
     //    never truncated — half a request is the one failure a worker cannot
     //    report, because it would answer the truncated question perfectly.
-    let typed = compose(&req.task, req.context.as_deref());
+    let typed = compose(
+        &req.task,
+        req.context.as_deref(),
+        req.format_note.as_deref(),
+    );
     if typed.trim().is_empty() {
         return Err(deny("the task is empty".to_string()));
     }
@@ -381,18 +516,8 @@ pub async fn drive(app: &AppHandle, req: DriveRequest) -> Result<Reply, Delegati
     //     `assistant_text` for THIS tab, or it has a fallback reader attached.
     //     Without one the engine would type into a tab it cannot read back
     //     from, which is the silent-swallow decision 12 exists to prevent.
-    let pushed = crate::harness::chp::served(
-        worker_agent,
-        req.worker.as_str(),
-        crate::harness::chp::EV_ASSISTANT_TEXT,
-    );
-    let reader = crate::harness::reader::has_live_reader(&req.worker);
-    if !pushed && !reader {
-        return Err(deny(format!(
-            "worker tab `{worker_name}` has no way to report the end of a turn (its harness pushes \
-             no assistant text for this tab and no fallback reader is attached), so cImp could not \
-             read the answer back — restart the tab and try again"
-        )));
+    if let Err(reason) = worker_completion_source(worker_agent, &req.worker, &worker_name) {
+        return Err(deny(reason));
     }
 
     // ── the slot, then the lock, then the write ─────────────────────────────
@@ -756,13 +881,21 @@ mod tests {
     /// attribution is client-side and in the Events row, and nowhere else.
     #[test]
     fn the_composed_request_is_the_callers_text_and_nothing_else() {
-        assert_eq!(compose("summarise latch.ts", None), "summarise latch.ts");
         assert_eq!(
-            compose("summarise latch.ts", Some("   ")),
+            compose("summarise latch.ts", None, None),
+            "summarise latch.ts"
+        );
+        assert_eq!(
+            compose("summarise latch.ts", Some("   "), None),
             "summarise latch.ts",
             "a blank context is not a context"
         );
-        let both = compose("do the thing", Some("src/lib/latch.ts"));
+        assert_eq!(
+            compose("summarise latch.ts", None, Some("  ")),
+            "summarise latch.ts",
+            "a blank note is not a note"
+        );
+        let both = compose("do the thing", Some("src/lib/latch.ts"), None);
         assert_eq!(both, "do the thing\n\nsrc/lib/latch.ts");
         for marker in ["delegated", "cImp", "via", "[", "Context:", "Task:"] {
             assert!(
@@ -770,6 +903,25 @@ mod tests {
                 "the typed request must carry no cImp-authored text, found {marker:?}"
             );
         }
+    }
+
+    /// **V39 Phase C: the format note goes LAST, and only when there is one.**
+    ///
+    /// The facade's one licence to add text (`DriveRequest::format_note`) — and
+    /// the order is the contract: the caller's task, then the caller's context,
+    /// then cImp's sentence about the answer. A note that landed between the
+    /// task and its context would split a request in half.
+    #[test]
+    fn the_format_note_is_appended_after_the_context() {
+        assert_eq!(
+            compose("do it", Some("ctx"), Some("answer in JSON")),
+            "do it\n\nctx\n\nanswer in JSON"
+        );
+        assert_eq!(
+            compose("do it", None, Some("answer in JSON")),
+            "do it\n\nanswer in JSON",
+            "no context: the note follows the task directly"
+        );
     }
 
     /// **The only bytes this module can write are one profile's paste and its

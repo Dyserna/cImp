@@ -480,7 +480,7 @@ async fn handle(method: &str, params: Value) -> Result<Value, (i64, String)> {
 async fn offload_task_tool_live() -> Value {
     let description = match proxy_describe().await {
         Some(d) if !d.trim().is_empty() => d,
-        _ => offload_task_description(&current_offload_settings()),
+        _ => offload_task_description(&current_settings_full()),
     };
     let mut tool = offload_task_tool();
     tool["description"] = Value::String(description);
@@ -503,10 +503,9 @@ fn profile_param_schema() -> Value {
 /// The `offload_task` tool descriptor, with its `description` rendered
 /// from the current (config-derived) capability set.
 fn offload_task_tool() -> Value {
-    let settings = current_offload_settings();
     json!({
         "name": "offload_task",
-        "description": offload_task_description(&settings),
+        "description": offload_task_description(&current_settings_full()),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -547,9 +546,17 @@ fn offload_task_tool() -> Value {
 ///
 /// Config-derived (the per-call child can't see live app-side health);
 /// health-accurate re-rendering is the warm-pool followup noted in V8-01.
-fn offload_task_description(settings: &OffloadSettings) -> String {
-    let backends: Vec<OffloadBackend> = settings
-        .effective_backends()
+fn offload_task_description(full: &crate::settings::Settings) -> String {
+    let settings = &full.offload;
+    // V39 Phase C: facades included, exactly as an unreachable LAN box is
+    // included — this renderer describes the CONFIGURED pool, and whether a
+    // member can serve right now is what the app's live `/describe` is for. The
+    // child cannot drive a tab itself (`ResolvedBackend::from_config` drops the
+    // kind), so if this text is the one in play the app is down and every
+    // facade in it is unreachable — which is equally true of the LAN box beside
+    // it, and is why neither is silently omitted.
+    let backends: Vec<OffloadBackend> = full
+        .effective_offload_backends()
         .into_iter()
         .filter(|b| b.enabled)
         .collect();
@@ -603,6 +610,13 @@ fn backend_label(b: &OffloadBackend, settings: &OffloadSettings) -> String {
         OffloadBackendKind::Local { .. } => "local",
         OffloadBackendKind::Remote { is_cloud: true, .. } => "cloud",
         OffloadBackendKind::Remote { .. } => "LAN",
+        // **The facade's whole point** (locked decision 3): off this machine's
+        // model, reachable, not cloud — which is exactly what `LAN` already
+        // means to a reader of this prose. Never "tab", never the harness name,
+        // never the tab name: a driver that could tell would be able to steer
+        // its sibling deliberately, and the user's audit trail (the banner, the
+        // Events rows) is what makes the hand-off visible, not the tool text.
+        OffloadBackendKind::HarnessTab { .. } => "LAN",
     };
     let ctx = match b.declared_context {
         Some(n) => format!("~{}k ctx", (n / 1000).max(1)),
@@ -2170,6 +2184,14 @@ impl ResolvedBackend {
                     kv_unified: false,
                 })
             }
+            // **Not resolvable here, by construction.** This is the DEGRADED
+            // path — the per-call child running its own agent loop because the
+            // app is unreachable — and the worker of a facade is a tab inside
+            // that very app. An unreachable app does not mean "drive the tab
+            // from here", it means there is no worker. `None` drops it from the
+            // child's pool exactly as an unaddressable backend is dropped, so
+            // the child routes to a real endpoint or says it has none.
+            OffloadBackendKind::HarnessTab { .. } => None,
         }
     }
 }
@@ -3461,6 +3483,115 @@ mod delegate_tool_tests {
             delegate_targets(&s, None).is_empty(),
             "a recorded input-profile failure must remove every delegation tool, not just refuse \
              at call time"
+        );
+    }
+
+    // ── V39 Phase C — the facade in the tool prose ──────────────────────────
+
+    /// One Remote-offload Claude tab named `lan-worker-2`, beside nothing else.
+    fn settings_with_facade(backend_name: &str) -> Settings {
+        let mut s = Settings::default();
+        s.tabs.push(crate::settings::facade_tab("worker-tab", backend_name));
+        s
+    }
+
+    /// **The driver must not be able to tell** (locked decision 3). The kind
+    /// label for a facade is `LAN` — the same word a trusted off-box model
+    /// server gets — and the description must carry the user's backend name
+    /// and no trace of the tab, its id or its harness.
+    #[test]
+    fn the_backend_prose_names_the_backend_and_never_the_tab() {
+        let s = settings_with_facade("lan-worker-2");
+        let facade = s
+            .effective_offload_backends()
+            .into_iter()
+            .find(|b| b.name == "lan-worker-2")
+            .expect("the facade is in the pool");
+        let label = backend_label(&facade, &s.offload);
+        assert!(
+            label.starts_with("lan-worker-2 (LAN, "),
+            "a facade reads as a LAN backend: {label}"
+        );
+
+        let desc = offload_task_description(&s);
+        assert!(desc.contains("lan-worker-2"), "the backend name is advertised: {desc}");
+        for leak in ["worker-tab", "tab worker-tab", "claude", "Claude", "tab \""] {
+            assert!(
+                !desc.contains(leak),
+                "the facade leaked {leak:?} into the offload_task description: {desc}"
+            );
+        }
+    }
+
+    /// A tab's declared context reaches the prose the same way a configured
+    /// backend's does — the facade is described in the pool's own vocabulary,
+    /// not in one of its own.
+    #[test]
+    fn a_facade_is_described_in_the_same_vocabulary_as_every_other_backend() {
+        let mut s = settings_with_facade("lan-worker-2");
+        for t in s.tabs.iter_mut() {
+            if let TabConfig::AiTool(c) = t {
+                c.delegation_backend.declared_context = Some(128_000);
+                c.delegation_backend.tier = crate::settings::BackendTier::Fast;
+            }
+        }
+        let facade = s
+            .effective_offload_backends()
+            .into_iter()
+            .find(|b| b.name == "lan-worker-2")
+            .expect("facade");
+        let label = backend_label(&facade, &s.offload);
+        assert_eq!(label, "lan-worker-2 (LAN, fast, ~128k ctx, all tools)");
+    }
+
+    /// **Role exclusivity, observed at the two surfaces** (locked decision 8:
+    /// one enum, not two flags). A Remote-offload tab is a backend and NOT a
+    /// `delegate_task_*` target; a Manual tab is the reverse. Asserted here
+    /// rather than on the enum because "one enum" is only useful if both
+    /// consumers actually read it.
+    #[test]
+    fn a_remote_offload_tab_is_a_backend_and_not_a_delegate_target() {
+        let s = settings_with_facade("lan-worker-2");
+        assert!(
+            delegate_targets(&s, None).is_empty(),
+            "a Remote-offload tab must not be advertised as a delegate_task_* target"
+        );
+        assert!(
+            s.effective_offload_backends()
+                .iter()
+                .any(|b| b.name == "lan-worker-2"),
+            "…and it must be in the offload pool"
+        );
+    }
+
+    #[test]
+    fn a_manual_tab_is_a_delegate_target_and_not_a_backend() {
+        let s = settings_with_manual(crate::settings::CLAUDE_TAB_ID);
+        assert_eq!(delegate_targets(&s, None).len(), 1);
+        assert!(
+            !s.effective_offload_backends()
+                .iter()
+                .any(|b| matches!(b.kind, OffloadBackendKind::HarnessTab { .. })),
+            "a Manual tab must not synthesize an offload backend"
+        );
+    }
+
+    /// **The degraded child cannot drive a tab, and says so by having no such
+    /// backend.** The facade is in the child's *prose* (it is configured, and an
+    /// unreachable LAN box is described too) but never in the pool the child
+    /// would route to itself — an unreachable app does not mean "do it here", it
+    /// means there is no worker.
+    #[test]
+    fn the_headless_child_resolves_no_facade_backend() {
+        let s = settings_with_facade("lan-worker-2");
+        let facade = s
+            .effective_offload_backends()
+            .into_iter()
+            .find(|b| b.name == "lan-worker-2")
+            .expect("facade");
+        assert!(
+            ResolvedBackend::from_config(&facade).is_none(),
+            "the child must not resolve a facade into its own pool"
         );
     }
 

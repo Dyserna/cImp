@@ -34,7 +34,8 @@ use tracing::{debug, info, warn};
 
 use crate::error::{AppError, AppResult};
 use crate::settings::{
-    BackendTier, OffloadBackend, OffloadBackendKind, OffloadSettings, SettingsHandle, ToolScope,
+    BackendTier, OffloadBackend, OffloadBackendKind, OffloadSettings, Settings, SettingsHandle,
+    ToolScope,
 };
 
 use super::agent::{self, AgentConfig, HostRouter, OffloadTask, RunTrace, ThinkingMode};
@@ -43,6 +44,7 @@ use super::mcp_host::{
 };
 use super::metrics::{BackendDashboard, CallRecord, MetricsPoller, RunRecord, ServerMetrics};
 use super::outbound;
+use super::harness_tab::HarnessTabBackend;
 use super::remote::RemoteBackend;
 use super::router::{self, BackendView, RouteError, TierHint};
 use super::server::{LlamaServer, ServerCommand};
@@ -82,6 +84,10 @@ pub struct ServiceStatus {
 enum Handle {
     Local(Arc<LlamaServer>),
     Remote(Arc<RemoteBackend>),
+    /// V39 Phase C: no server at all — an open AI tab the delegation engine
+    /// drives. `run_on` branches on this variant instead of entering the agent
+    /// loop; nothing else in this file may treat it as an endpoint.
+    HarnessTab(Arc<HarnessTabBackend>),
 }
 
 impl Handle {
@@ -89,6 +95,7 @@ impl Handle {
         match self {
             Handle::Local(s) => s.acquire_slot(timeout).await,
             Handle::Remote(r) => r.acquire_slot(timeout).await,
+            Handle::HarnessTab(h) => h.acquire_slot(timeout).await,
         }
     }
 }
@@ -139,6 +146,12 @@ pub struct OffloadService {
     /// router would never see the backend as busy. Rebuilt when the base URL
     /// changes.
     local_pool: TokioMutex<HashMap<String, Arc<LlamaServer>>>,
+    /// V39 Phase C: warm facade handles (one `RemoteOffload` tab each), keyed
+    /// by backend name. Cached for the third time for the same reason as the
+    /// two above — the single slot lives on the handle, so a fresh one per call
+    /// would let two concurrent routes into the same tab and have the engine
+    /// refuse the loser as `busy` instead of queueing it.
+    harness_pool: TokioMutex<HashMap<String, Arc<HarnessTabBackend>>>,
     /// Long-timeout client for the agent loop's chat-completions calls
     /// (health/`/props` probes use each handle's own short-timeout client).
     client: reqwest::Client,
@@ -655,8 +668,9 @@ impl OffloadService {
         settings: SettingsHandle,
         supervisor: Arc<OffloadSupervisor>,
     ) -> Arc<Self> {
-        let snap = settings.current().offload;
-        let global_cap = compute_global_cap(&snap);
+        let cur = settings.current();
+        let snap = cur.offload.clone();
+        let global_cap = compute_global_cap(&cur);
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(snap.offload_timeout_secs.max(30)))
             // Bound connection establishment separately from the overall
@@ -684,6 +698,7 @@ impl OffloadService {
             queue_depth: AtomicU32::new(0),
             remote_pool: TokioMutex::new(HashMap::new()),
             local_pool: TokioMutex::new(HashMap::new()),
+            harness_pool: TokioMutex::new(HashMap::new()),
             client,
             change_tx,
             pulse_tx,
@@ -912,10 +927,10 @@ impl OffloadService {
     /// change `global_concurrency` at runtime; without this the app-wide cap
     /// stays frozen at the startup value until restart. Grows by adding
     /// permits; shrinks by acquiring+forgetting the excess as it frees.
-    fn reconcile_global_cap(self: &Arc<Self>, snap: &OffloadSettings) {
+    fn reconcile_global_cap(self: &Arc<Self>, cur: &Settings) {
         // Cheap no-op guard so the common "nothing changed" call doesn't spawn
         // a task.
-        if compute_global_cap(snap) == self.global_cap.load(Ordering::Relaxed) {
+        if compute_global_cap(cur) == self.global_cap.load(Ordering::Relaxed) {
             return;
         }
         // Flag the work and ensure exactly ONE reconcile task runs. A concurrent
@@ -939,7 +954,7 @@ impl OffloadService {
                 this.reconcile_pending.store(false, Ordering::Relaxed);
                 // Recompute from LIVE settings each pass — a config change during
                 // a long drain is then honored without waiting for the next tick.
-                let target = compute_global_cap(&this.settings.current().offload);
+                let target = compute_global_cap(&this.settings.current());
                 let current = this.global_cap.load(Ordering::Relaxed);
                 if target > current {
                     this.global_gate.add_permits((target - current) as usize);
@@ -1231,7 +1246,11 @@ impl OffloadService {
         // instead of running an orphan to completion.
         cancel: CancellationToken,
     ) -> AppResult<String> {
-        let snap = self.settings.current().offload;
+        // ONE read, and the whole file: `snap` is what the rest of this call
+        // reasons about, and V39's facade backends are synthesized from the tab
+        // list beside it. Two reads could disagree about the pool mid-route.
+        let cur = self.settings.current();
+        let snap = cur.offload.clone();
         if !snap.enabled {
             return Err(AppError::OffloadNotReady(
                 "offload is disabled — enable it in cImp settings".into(),
@@ -1285,7 +1304,7 @@ impl OffloadService {
 
         // Resolve + probe the pool from live state. This is the one path that
         // may lazy-start a cold Local backend (start-on-first-offload).
-        let pool = self.resolve_pool(&snap, true).await;
+        let pool = self.resolve_pool(&cur, true).await;
         if pool.is_empty() {
             return Err(AppError::OffloadNotReady(
                 "no offload backend is configured — add one in cImp Settings → Offload task tools"
@@ -1582,6 +1601,71 @@ impl OffloadService {
         result
     }
 
+    /// V39 Phase C: run one task on a facade backend — one delegation, start to
+    /// finish.
+    ///
+    /// # What the driver gets, and what it does not
+    ///
+    /// It gets the worker's final message, already through V32 screening
+    /// (locked decision 11 — a sibling harness's text is model-generated text
+    /// entering another model's context, and it crosses the same boundary every
+    /// external tool result crosses). It does not get the worker's name, the
+    /// harness, or any hint that a tab was involved: the result is the text, and
+    /// the run is logged under the BACKEND name like any other.
+    ///
+    /// # Three deliberate omissions
+    ///
+    /// * **No driver check here.** `None` is refused by `drive` itself, with the
+    ///   reason spelled once ("the acyclic check and the audit row both need to
+    ///   know who asked"). A second check here would be a second wording.
+    /// * **No `timeout_s`.** A delegation is bounded by
+    ///   `delegation.default_timeout_s`, which is about how long a person's tab
+    ///   may take, not by `offload_timeout_secs`, which is about an HTTP call.
+    ///   The loopback heartbeats keep the caller's connection alive meanwhile.
+    /// * **No cancellation token.** The documented failure mode for "driver went
+    ///   away" is that the worker finishes visibly and mints its `done` row with
+    ///   nobody to receive it — cImp never sends a key to stop a worker
+    ///   (decision 6), so there is nothing a cancel could do except stop
+    ///   recording what the tab is going to do anyway.
+    async fn run_facade(
+        &self,
+        facade: &HarnessTabBackend,
+        instructions: &str,
+        context: Option<String>,
+        tab: Option<&str>,
+        schema: Option<&serde_json::Value>,
+        profile: Option<Profile>,
+    ) -> AppResult<String> {
+        let reply = crate::delegation::drive(
+            &self.app,
+            crate::delegation::DriveRequest {
+                worker: facade.tab().clone(),
+                // The routing request's tab — narrowed at the loopback through
+                // `tab_identity`, so this is a configured tab of the calling
+                // consumer or nothing at all.
+                driver: tab.map(crate::state::TabId::from_str),
+                mode: crate::delegation::DelegationMode::Facade,
+                task: instructions.to_string(),
+                context,
+                timeout_s: None,
+                format_note: agent::facade_format_note(schema, profile),
+            },
+        )
+        .await;
+        match reply {
+            Ok(r) => Ok(r.text),
+            // A refusal means this backend could not take the work — the same
+            // shape as an unready endpoint, so it reads as `OffloadNotReady` and
+            // the caller may re-route. Every other outcome is a task-level
+            // failure: real work happened (or was stopped by the user), and
+            // re-running it elsewhere would be a second turn nobody asked for.
+            Err(e @ crate::delegation::DelegationError::Refused(_)) => {
+                Err(AppError::OffloadNotReady(e.to_string()))
+            }
+            Err(e) => Err(AppError::Offload(e.to_string())),
+        }
+    }
+
     /// Insert a `running` run record at the front of a backend's run log.
     fn run_begin(&self, backend: &str, id: u64, instructions: &str, thinking: ThinkingMode) {
         let rec = RunRecord {
@@ -1691,6 +1775,26 @@ impl OffloadService {
     ) -> AppResult<String> {
         let slot_timeout = deadline.saturating_duration_since(Instant::now());
         let _slot = entry.handle.acquire_slot(slot_timeout).await?;
+
+        // ── V39 Phase C — the facade bypass ─────────────────────────────────
+        //
+        // A `HarnessTab` backend has no endpoint and no model of cImp's to run
+        // a loop against: the work is done by another harness, in its own tab,
+        // with its own tools. So everything below — the tool surface, the
+        // router, the agent config, the canary — is replaced by ONE
+        // `delegation::drive` call, and the ordering matters: the slot above is
+        // already held (so a second route queues rather than racing the
+        // engine's atomic claim), and nothing that follows has run, so no tool
+        // context is built for a worker that will never see one.
+        //
+        // The engine is the ONLY thing that types into a tab (the V39
+        // cross-module invariant). This branch does not grow a second write
+        // path; it hands over and waits.
+        if let Handle::HarnessTab(facade) = &entry.handle {
+            return self
+                .run_facade(facade, instructions, context, tab, schema.as_ref(), profile)
+                .await;
+        }
 
         // Prefer the calling session's cwd (forwarded over the loopback) so
         // tool resolution and the empty-`allowed_roots` fallback target the
@@ -1857,9 +1961,17 @@ impl OffloadService {
     /// "start on first offload" behavior when autostart is off), and `false`
     /// for [`describe`](Self::describe) and the health watcher, which must
     /// never load a multi-GB model just to report capabilities or poll health.
-    async fn resolve_pool(&self, snap: &OffloadSettings, lazy_start: bool) -> Vec<PoolEntry> {
-        let backends: Vec<OffloadBackend> = snap
-            .effective_backends()
+    ///
+    /// **V39 Phase C: the whole settings snapshot, not just its offload block.**
+    /// The facade backends are synthesized from tab roles, which live one level
+    /// up — see [`Settings::effective_offload_backends`]. Taking the parent
+    /// value rather than re-reading the handle here is deliberate: the caller's
+    /// `snap` and the tab list must come from ONE read, or a role change landing
+    /// between them would route a task at a pool the rest of the call does not
+    /// believe in.
+    async fn resolve_pool(&self, cur: &Settings, lazy_start: bool) -> Vec<PoolEntry> {
+        let backends: Vec<OffloadBackend> = cur
+            .effective_offload_backends()
             .into_iter()
             .filter(|b| b.enabled)
             .collect();
@@ -1892,6 +2004,11 @@ impl OffloadService {
                         entries.push(e);
                     }
                 }
+                OffloadBackendKind::HarnessTab { tab } => {
+                    if let Some(e) = self.resolve_harness_tab(b, tab).await {
+                        entries.push(e);
+                    }
+                }
             }
         }
 
@@ -1909,8 +2026,72 @@ impl OffloadService {
             .lock()
             .await
             .retain(|k, _| live.contains(k.as_str()));
+        // A facade vanishes the moment its tab's role changes, so this prune is
+        // the one that actually fires in normal use.
+        self.harness_pool
+            .lock()
+            .await
+            .retain(|k, _| live.contains(k.as_str()));
 
         entries
+    }
+
+    /// V39 Phase C: resolve one facade backend to a warm handle with live
+    /// readiness.
+    ///
+    /// No network, no probe, no lazy start: readiness is the delegation
+    /// engine's own worker preflight, asked of the tab right now
+    /// ([`HarnessTabBackend::refresh_ready`]). A closed or unreadable tab is a
+    /// **not-ready** entry rather than an absent one — locked decision 8's
+    /// "reopening the tab restores it" — so the backend stays in the pool, is
+    /// skipped by the router's readiness filter, and can say why it was skipped.
+    async fn resolve_harness_tab(&self, b: &OffloadBackend, tab: &str) -> Option<PoolEntry> {
+        let tab_id = crate::state::TabId::from_str(tab);
+        // Reuse the cached handle unless the knobs it was built with moved; the
+        // slot lives on the handle, so rebuilding on every resolve would reopen
+        // the tab to a second concurrent route.
+        let handle = {
+            let mut pool = self.harness_pool.lock().await;
+            let reuse = pool.get(&b.name).filter(|h| {
+                h.tab() == &tab_id
+                    && h.tier() == b.tier
+                    && h.declared_context() == b.declared_context
+            });
+            match reuse {
+                Some(h) => h.clone(),
+                None => {
+                    let h = Arc::new(HarnessTabBackend::new(
+                        &b.name,
+                        &tab_id,
+                        b.tier,
+                        b.tool_scope.clone(),
+                        b.declared_context,
+                    ));
+                    pool.insert(b.name.clone(), h.clone());
+                    h
+                }
+            }
+        };
+        let ready = handle.refresh_ready(&self.app).await;
+        Some(PoolEntry {
+            name: b.name.clone(),
+            base_url: handle.base_url(),
+            auth_token: None,
+            cloud_blocked: false,
+            tier: b.tier,
+            tool_scope: b.tool_scope.clone(),
+            ready,
+            n_ctx: handle.n_ctx(),
+            slots: handle.slots(),
+            in_flight: handle.in_flight(),
+            // **Not remote.** The worker is a tab on THIS machine, running the
+            // user's own harness against the user's own files — the same trust
+            // boundary a Local backend sits on. `is_remote: true` would deny it
+            // the graph and audit tools (#48 F-10), which is the wrong answer
+            // for a peer that can already read every one of those files itself.
+            is_remote: false,
+            handle: Handle::HarnessTab(handle),
+        })
     }
 
     /// Resolve one Local backend to a live handle. Prefers the supervisor's
@@ -2129,9 +2310,13 @@ impl OffloadService {
     /// Unlike the child's config-derived renderer, this reflects **live**
     /// backend readiness and **healthy** MCP servers.
     pub async fn describe(&self) -> String {
-        let snap = self.settings.current().offload;
-        let backends: Vec<OffloadBackend> = snap
-            .effective_backends()
+        let cur = self.settings.current();
+        // V39 Phase C: facades included, and this is what makes locked decision
+        // 15's "no restart" true for the facade half — the description is
+        // rendered live per `tools/list`, so a role set on a tab is in the next
+        // turn's backend list.
+        let backends: Vec<OffloadBackend> = cur
+            .effective_offload_backends()
             .into_iter()
             .filter(|b| b.enabled)
             .collect();
@@ -2143,7 +2328,7 @@ impl OffloadService {
         }
 
         // describe() must never load a model — capability reporting only.
-        let pool = self.resolve_pool(&snap, false).await;
+        let pool = self.resolve_pool(&cur, false).await;
         let ready_names: Vec<&str> = pool
             .iter()
             .filter(|p| p.ready)
@@ -2306,6 +2491,33 @@ impl OffloadService {
                     metrics,
                 }
             }
+            // V39 Phase C: a facade has no server to poll — no `/slots`, no
+            // `/metrics`, no tokens/sec, and deliberately no health check
+            // (readiness is the live tab state). It still gets a row, because a
+            // backend the router can pick and the user cannot see would be the
+            // one backend with no way to ask "why did nothing happen?".
+            OffloadBackendKind::HarnessTab { tab } => {
+                let tab_id = crate::state::TabId::from_str(tab);
+                let ready = self
+                    .harness_pool
+                    .lock()
+                    .await
+                    .get(&b.name)
+                    .is_some_and(|h| h.is_ready());
+                let in_flight_here = crate::delegation::is_driven(&tab_id) as u32;
+                BackendDashboard {
+                    name: b.name.clone(),
+                    kind: "harness".into(),
+                    state: if in_flight_here > 0 {
+                        "ready".into()
+                    } else if ready {
+                        "ready".into()
+                    } else {
+                        "unreachable".into()
+                    },
+                    metrics: ServerMetrics::status_only(1, b.declared_context, in_flight, cap),
+                }
+            }
         }
     }
 
@@ -2321,13 +2533,18 @@ impl OffloadService {
             let mut pollers: HashMap<String, MetricsPoller> = HashMap::new();
             loop {
                 tokio::time::sleep(Duration::from_millis(600)).await;
-                let snap = this.settings.current().offload;
+                let cur = this.settings.current();
+                let snap = cur.offload.clone();
                 let in_flight = this.global_in_flight();
                 let cap = this.global_cap.load(Ordering::Relaxed);
 
                 let mut rows: Vec<BackendDashboard> = Vec::new();
                 if snap.enabled {
-                    for b in snap.effective_backends().into_iter().filter(|b| b.enabled) {
+                    for b in cur
+                        .effective_offload_backends()
+                        .into_iter()
+                        .filter(|b| b.enabled)
+                    {
                         let row = this
                             .backend_dashboard(&b, &mut pollers, in_flight, cap)
                             .await;
@@ -2437,10 +2654,11 @@ impl OffloadService {
             let mut last: Vec<String> = Vec::new();
             loop {
                 tokio::time::sleep(Duration::from_secs(12)).await;
-                let snap = this.settings.current().offload;
+                let cur = this.settings.current();
+                let snap = cur.offload.clone();
                 // Keep the app-wide gate sized to current config (backends or
                 // global_concurrency may have changed since startup).
-                this.reconcile_global_cap(&snap);
+                this.reconcile_global_cap(&cur);
                 // Keep the MCP host membership live as a safety net: the live
                 // `offload_reload_mcp` IPC reconciles instantly on edit, but
                 // this also catches changes made another way (e.g. a direct
@@ -2451,7 +2669,11 @@ impl OffloadService {
                     continue;
                 }
                 // Health polling only — must not lazy-start a cold backend.
-                let pool = this.resolve_pool(&snap, false).await;
+                // V39 Phase C: this is also what makes a facade's readiness
+                // propagate — the tab opening or closing moves the ready set,
+                // which fires the same `tools/list_changed` pulse a LAN box
+                // going down does.
+                let pool = this.resolve_pool(&cur, false).await;
                 let mut ready: Vec<String> = pool
                     .iter()
                     .filter(|p| p.ready)
@@ -2665,12 +2887,13 @@ fn effective_roots(snap: &OffloadSettings) -> Vec<PathBuf> {
 
 /// Compute the global concurrency cap: the explicit override, else the
 /// summed per-backend slot counts, clamped to `[1, GLOBAL_CONCURRENCY_MAX]`.
-fn compute_global_cap(snap: &OffloadSettings) -> u32 {
+fn compute_global_cap(cur: &Settings) -> u32 {
+    let snap = &cur.offload;
     if let Some(n) = snap.global_concurrency {
         return n.clamp(1, GLOBAL_CONCURRENCY_MAX);
     }
-    let sum: u32 = snap
-        .effective_backends()
+    let sum: u32 = cur
+        .effective_offload_backends()
         .iter()
         .filter(|b| b.enabled)
         .map(|b| match &b.kind {
@@ -2679,7 +2902,12 @@ fn compute_global_cap(snap: &OffloadSettings) -> u32 {
                     .map(|c| c.parallel.max(1))
                     .unwrap_or(1)
             }
+            // One apiece, and now a match rather than a hardcode: a remote
+            // endpoint does not report `-np` (the user sizes real parallelism on
+            // the box) and a facade is single-slot by decision 9. They agree on
+            // the number and not on the reason, which is why they are two arms.
             OffloadBackendKind::Remote { .. } => 1,
+            OffloadBackendKind::HarnessTab { .. } => 1,
         })
         .sum();
     sum.clamp(1, GLOBAL_CONCURRENCY_MAX)
@@ -2754,6 +2982,15 @@ mod tests {
         }
     }
 
+    /// A `Settings` carrying just this offload block. The cap now reads the
+    /// whole file (V39 Phase C: a facade tab is a slot too), so its tests must
+    /// hand it one.
+    fn with_offload(snap: OffloadSettings) -> Settings {
+        let mut s = Settings::default();
+        s.offload = snap;
+        s
+    }
+
     #[test]
     fn global_cap_sums_slots_and_clamps() {
         // Built by mutation rather than by functional update: `OffloadSettings`
@@ -2762,19 +2999,40 @@ mod tests {
         // field, private ones included (E0451).
         let mut snap = OffloadSettings::default();
         snap.backends = vec![local_backend("a", 4), local_backend("b", 2)];
-        assert_eq!(compute_global_cap(&snap), 6);
+        assert_eq!(compute_global_cap(&with_offload(snap.clone())), 6);
 
         snap.global_concurrency = Some(100);
-        assert_eq!(compute_global_cap(&snap), GLOBAL_CONCURRENCY_MAX);
+        assert_eq!(
+            compute_global_cap(&with_offload(snap.clone())),
+            GLOBAL_CONCURRENCY_MAX
+        );
 
         snap.global_concurrency = Some(0);
-        assert_eq!(compute_global_cap(&snap), 1);
+        assert_eq!(compute_global_cap(&with_offload(snap)), 1);
     }
 
     #[test]
     fn global_cap_defaults_to_one_when_empty() {
         let snap = OffloadSettings::default(); // no backends, empty command
-        assert_eq!(compute_global_cap(&snap), 1);
+        assert_eq!(compute_global_cap(&with_offload(snap)), 1);
+    }
+
+    /// **V39 Phase C: a facade tab is one more concurrent slot.**
+    ///
+    /// The cap is what the global gate is sized to, so a pool whose only member
+    /// is a Remote-offload tab must not be capped as if it had none — the
+    /// clamp's floor of 1 would have hidden that for a single facade, so this
+    /// asserts on two.
+    #[test]
+    fn global_cap_counts_facade_tabs() {
+        let mut snap = OffloadSettings::default();
+        snap.backends = vec![local_backend("a", 2)];
+        let mut s = with_offload(snap);
+        s.tabs = vec![
+            crate::settings::facade_tab("t1", "worker-1"),
+            crate::settings::facade_tab("t2", "worker-2"),
+        ];
+        assert_eq!(compute_global_cap(&s), 4, "2 local slots + 1 per facade");
     }
 
     #[test]

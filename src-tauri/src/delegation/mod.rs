@@ -44,7 +44,7 @@ use std::sync::{Mutex, OnceLock};
 use crate::activity::{ActivityEntry, ActivityKind, ActivityRecord, Attribution};
 use crate::state::TabId;
 
-pub use engine::{drive, DriveRequest};
+pub use engine::{drive, worker_ready, DriveRequest};
 
 // ── vocabulary ──────────────────────────────────────────────────────────────
 

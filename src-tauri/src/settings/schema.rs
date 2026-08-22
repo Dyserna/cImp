@@ -1351,6 +1351,100 @@ impl Settings {
     pub fn loopback_needed(&self) -> bool {
         self.offload.mcp_host_needed() || self.graph.enabled || self.code_audit.mcp_exposed()
     }
+
+    /// **The whole offload pool: configured backends + the V39 facades.**
+    ///
+    /// [`OffloadSettings::effective_backends`] cannot answer this and should not
+    /// try: the facades are synthesized from *tab roles*, which live on
+    /// [`Settings::tabs`], one level above the offload block. So the wrapper
+    /// lives here, and every consumer that must see a facade calls this one
+    /// instead of the inner method:
+    ///
+    /// | caller | why |
+    /// |---|---|
+    /// | `offload::service::resolve_pool` | routing — the facade must be a candidate |
+    /// | `offload::service::describe` | the live `offload_task` prose |
+    /// | `offload::service::compute_global_cap` | a facade is one more concurrent slot |
+    /// | the metrics poller / `supervisor::statuses` | the dashboard rows |
+    /// | `offload::mcp::offload_task_description` | the child's config-derived prose |
+    ///
+    /// The ones deliberately left on the raw list are the ones that are about a
+    /// *process* or a *URL*, neither of which a facade has:
+    /// `supervisor::local_backends` (what to spawn),
+    /// [`OffloadSettings::primary_local_command`] (the OpenCode provider), and
+    /// `outbound::Policy::from_settings` (SSRF carve-outs — a facade has no
+    /// endpoint to carve out). The **backend editor's save path** is a fourth:
+    /// it edits `offload.backends` directly and must never see a synthesized
+    /// entry, which is what
+    /// `a_synthesized_facade_never_reaches_the_persisted_backend_list` pins.
+    ///
+    /// Facades are appended in **both** branches of `effective_backends` — the
+    /// configured-pool branch and the legacy synthesized-local one — because a
+    /// user whose only backend is a harness tab has a pool of exactly one, and a
+    /// facade that only appeared next to a configured HTTP backend would be a
+    /// feature you had to own a llama-server to use.
+    pub fn effective_offload_backends(&self) -> Vec<OffloadBackend> {
+        let mut out = self.offload.effective_backends();
+        for cfg in &self.tabs {
+            let TabConfig::AiTool(c) = cfg else { continue };
+            if c.delegation_role != DelegationRole::RemoteOffload {
+                continue;
+            }
+            let name = c
+                .delegation_backend
+                .name
+                .as_deref()
+                .map(str::trim)
+                .filter(|n| !n.is_empty())
+                .unwrap_or(c.name.as_str())
+                .to_string();
+            // A configured backend wins the name, and the facade is dropped
+            // rather than renamed: the router, the run log and the dashboard all
+            // key on the name, so two entries answering to one name is a bug
+            // with no good half. Warned ONCE per name per process — this runs on
+            // every route, every describe and every 600 ms dashboard tick.
+            if out.iter().any(|b| b.name == name) {
+                warn_backend_name_collision(&name, &c.id);
+                continue;
+            }
+            out.push(OffloadBackend {
+                name,
+                enabled: true,
+                kind: OffloadBackendKind::HarnessTab { tab: c.id.clone() },
+                declared_context: c.delegation_backend.declared_context,
+                declared_model: String::new(),
+                tier: c.delegation_backend.tier,
+                // Locked decision 3: the driver must not be able to tell a
+                // facade from an HTTP backend, and a narrowed scope is visible
+                // in the tool prose. It is also the honest value — the worker
+                // tab runs its own harness with its own tools, and cImp does not
+                // filter them.
+                tool_scope: ToolScope::All,
+            });
+        }
+        out
+    }
+}
+
+/// One warning per colliding backend name per process.
+///
+/// Not a rate limiter and not a counter: the collision is a *configuration*
+/// fact, so it is worth saying once and worth never saying again until the user
+/// changes something. Keyed by name so a second, different collision still
+/// speaks.
+fn warn_backend_name_collision(name: &str, tab: &str) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut g = seen.lock().unwrap_or_else(|e| e.into_inner());
+    if g.insert(name.to_string()) {
+        tracing::warn!(
+            backend = %name,
+            tab = %tab,
+            "offload: a configured backend already answers to this name, so the Remote-offload              tab is NOT in the pool — rename one of them (the tab's backend name is in its              delegation popover)"
+        );
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Default)]
@@ -3810,6 +3904,28 @@ pub enum OffloadBackendKind {
         /// party. A cloud backend is unusable until this is `true`.
         cloud_consent: bool,
     },
+    /// **V39 Phase C — a facade over an open AI tab** (locked decision 3).
+    ///
+    /// cImp owns neither a process nor a URL here: the "backend" is another
+    /// harness tab that the delegation engine drives exactly as a user would.
+    /// The requesting harness cannot tell it from an HTTP server — it sees the
+    /// user-chosen backend name, `LAN` as the kind
+    /// ([`crate::offload::mcp`]'s `backend_label`), and nothing else.
+    ///
+    /// **Never written by the user, never persisted.** Entries of this kind
+    /// exist only in [`Settings::effective_offload_backends`], synthesized from
+    /// every AI tab whose `delegation_role` is
+    /// [`RemoteOffload`](DelegationRole::RemoteOffload). The backend editor
+    /// lists them read-only ("configured on the tab"), and
+    /// `a_synthesized_facade_never_reaches_the_persisted_backend_list` pins
+    /// that a save round-trip cannot write one.
+    HarnessTab {
+        /// The worker tab's id. Internal: it keys the engine's registry and the
+        /// readiness probe, and it is the ONE field that must never reach a
+        /// driver-facing string — see `backend_label` and
+        /// `the_live_description_names_the_backend_not_the_tab`.
+        tab: String,
+    },
 }
 
 impl OffloadBackendKind {
@@ -3837,6 +3953,11 @@ impl OffloadBackendKind {
                 ..
             } => crate::offload::server::resolve_local_auth(auth_token, server_command).token,
             OffloadBackendKind::Remote { auth_token, .. } => auth_token.clone(),
+            // A facade is driven through a PTY, not over HTTP: there is no
+            // request to authenticate and no credential to resolve. Empty is
+            // the honest answer, and every caller already treats it as "send no
+            // `Authorization` header at all".
+            OffloadBackendKind::HarnessTab { .. } => String::new(),
         }
     }
 }
@@ -3888,6 +4009,9 @@ impl std::fmt::Debug for OffloadBackend {
                 "Remote {{ base_url: {base_url:?}, auth_token: {}, is_cloud: {is_cloud}, cloud_consent: {cloud_consent} }}",
                 if auth_token.is_empty() { "<none>" } else { "<redacted>" }
             ),
+            // No secret of any kind on this variant — the whole value is a tab
+            // id, which is already all over the logs.
+            OffloadBackendKind::HarnessTab { tab } => format!("HarnessTab {{ tab: {tab:?} }}"),
         };
         f.debug_struct("OffloadBackend")
             .field("name", &self.name)
@@ -4359,6 +4483,31 @@ pub(crate) fn ai_tab_inheriting_injection(tab: TabConfig) -> TabConfig {
 /// Look up the default `TabConfig` for a reserved AI tab id. Used by
 /// the integrity check and the lifecycle IPC when materializing a tab
 /// the user just enabled.
+/// **Test fixture** — one AI tab holding the V39 Remote-offload role, i.e. one
+/// facade backend.
+///
+/// Lives beside the tab constructors rather than in a `mod tests`, because
+/// three modules' tests need it (the pool, the cap, the child's prose) and a
+/// fixture copied three times is three fixtures that can disagree about what a
+/// facade tab looks like. Built from the default Claude tab so it carries no
+/// harness literal of its own.
+#[cfg(test)]
+pub(crate) fn facade_tab(id: &str, backend_name: &str) -> TabConfig {
+    let mut tab = default_claude_tab();
+    if let TabConfig::AiTool(c) = &mut tab {
+        c.id = id.to_string();
+        c.builtin = false;
+        c.name = format!("tab {id}");
+        c.delegation_role = DelegationRole::RemoteOffload;
+        c.delegation_backend = DelegationBackend {
+            name: (!backend_name.is_empty()).then(|| backend_name.to_string()),
+            tier: BackendTier::Quality,
+            declared_context: None,
+        };
+    }
+    tab
+}
+
 pub fn default_ai_tab(id: AiTabId) -> TabConfig {
     match id {
         AiTabId::Claude => default_claude_tab(),
@@ -5587,6 +5736,175 @@ impl Default for ProcessingSettings {
 mod tests {
     use super::*;
     use serde_json::{json, Value};
+
+    // ── V39 Phase C — the synthesized facade backends ───────────────────────
+
+    /// A pool with one configured Local backend, so the *configured* branch of
+    /// `effective_backends` is the one under test.
+    fn with_configured_local(name: &str) -> Settings {
+        let mut s = Settings::default();
+        s.offload.backends = vec![OffloadBackend {
+            name: name.to_string(),
+            kind: OffloadBackendKind::Local {
+                server_command: "llama-server --jinja -np 2".to_string(),
+                autostart: false,
+                show_command_on_start: false,
+                auth_token: String::new(),
+            },
+            ..Default::default()
+        }];
+        s
+    }
+
+    fn pool_names(pool: &[OffloadBackend]) -> Vec<String> {
+        pool.iter().map(|b| b.name.clone()).collect()
+    }
+
+    /// **A Remote-offload tab is a backend, in both branches** (locked decision
+    /// 8: "synthesized from the tab role — there is no separate add-backend
+    /// step").
+    ///
+    /// Both branches, because the legacy one is the whole pool of a user who
+    /// runs no llama-server: a facade that only appeared beside a configured
+    /// HTTP backend would be a feature you had to own a GPU to use.
+    #[test]
+    fn a_remote_offload_tab_is_synthesized_into_both_branches_of_the_pool() {
+        // Configured branch.
+        let mut s = with_configured_local("main");
+        s.tabs.push(facade_tab("t1", "lan-worker-2"));
+        assert_eq!(
+            pool_names(&s.effective_offload_backends()),
+            vec!["main", "lan-worker-2"]
+        );
+
+        // Legacy branch: no `backends` at all, so `effective_backends`
+        // synthesizes its single `local` entry — and the facade still joins it.
+        let mut legacy = Settings::default();
+        assert!(
+            legacy.offload.backends.is_empty(),
+            "the fixture must be legacy"
+        );
+        legacy.tabs.push(facade_tab("t1", "lan-worker-2"));
+        assert_eq!(
+            pool_names(&legacy.effective_offload_backends()),
+            vec!["local", "lan-worker-2"]
+        );
+    }
+
+    /// The synthesized entry carries the tab's knobs — and `ToolScope::All`,
+    /// which is both the honest value (cImp does not filter another harness's
+    /// tools) and the one that keeps the facade indistinguishable from a
+    /// trusted LAN backend in the tool prose.
+    #[test]
+    fn the_synthesized_facade_carries_the_tabs_knobs() {
+        let mut s = with_configured_local("main");
+        let mut tab = facade_tab("t1", "lan-worker-2");
+        if let TabConfig::AiTool(c) = &mut tab {
+            c.delegation_backend.tier = BackendTier::Fast;
+            c.delegation_backend.declared_context = Some(128_000);
+        }
+        s.tabs.push(tab);
+        let pool = s.effective_offload_backends();
+        let b = pool.iter().find(|b| b.name == "lan-worker-2").expect("facade");
+        assert!(matches!(&b.kind, OffloadBackendKind::HarnessTab { tab } if tab == "t1"));
+        assert_eq!(b.tier, BackendTier::Fast);
+        assert_eq!(b.declared_context, Some(128_000));
+        assert!(
+            b.enabled,
+            "a facade is enabled by its role, not by a second switch"
+        );
+        assert!(matches!(b.tool_scope, ToolScope::All));
+        assert!(
+            !b.cloud_blocked(),
+            "nothing about a facade needs cloud consent"
+        );
+        assert!(
+            b.kind.effective_auth_token().is_empty(),
+            "a PTY carries no credential"
+        );
+    }
+
+    /// **The backend name defaults to the tab name** — the honest default for a
+    /// user who has not chosen one (locked decision 8). A blank name is the
+    /// same as none: a cleared text field writes `""`, not `null`.
+    #[test]
+    fn a_facade_without_a_chosen_name_answers_to_the_tab_name() {
+        let mut s = with_configured_local("main");
+        s.tabs.push(facade_tab("t1", ""));
+        let mut blank = facade_tab("t2", "");
+        if let TabConfig::AiTool(c) = &mut blank {
+            c.delegation_backend.name = Some("   ".to_string());
+        }
+        s.tabs.push(blank);
+        assert_eq!(
+            pool_names(&s.effective_offload_backends()),
+            vec!["main", "tab t1", "tab t2"]
+        );
+    }
+
+    /// **A name collision: the configured backend wins, the facade is dropped.**
+    ///
+    /// Not renamed and not appended: the router, the run log and the dashboard
+    /// all key on the name, so two entries answering to one name has no good
+    /// half. The user is warned once (see `warn_backend_name_collision`).
+    #[test]
+    fn a_configured_backend_wins_a_name_collision_with_a_facade() {
+        let mut s = with_configured_local("main");
+        s.tabs.push(facade_tab("t1", "main"));
+        let pool = s.effective_offload_backends();
+        assert_eq!(pool_names(&pool), vec!["main"]);
+        assert!(
+            matches!(pool[0].kind, OffloadBackendKind::Local { .. }),
+            "the surviving `main` must be the configured one"
+        );
+    }
+
+    /// **Nothing synthesized is ever persisted** (the kind's "never written by
+    /// the user").
+    ///
+    /// The backend editor edits `offload.backends`, so the load-bearing claim is
+    /// that the pool view and the persisted list are different values — asking
+    /// for the pool must not mutate what a save then writes. Serializing the
+    /// whole file and looking for the tag is the round-trip half: a
+    /// `harness_tab` in `settings.json` would be a backend nobody can delete
+    /// from the editor and that resurrects itself on every load.
+    #[test]
+    fn a_synthesized_facade_never_reaches_the_persisted_backend_list() {
+        let mut s = with_configured_local("main");
+        s.tabs.push(facade_tab("t1", "lan-worker-2"));
+        assert_eq!(s.effective_offload_backends().len(), 2, "in the POOL");
+        assert_eq!(
+            pool_names(&s.offload.backends),
+            vec!["main"],
+            "…and not in the persisted list"
+        );
+        let json = serde_json::to_string(&s).expect("settings serialize");
+        assert!(
+            !json.contains("harness_tab"),
+            "a save round-trip must not write a synthesized backend"
+        );
+    }
+
+    /// A tab with any other role contributes no backend — including `Manual`,
+    /// which is the *other* delegation role and must not double as a facade
+    /// (locked decision 8: the roles are one enum, not two flags).
+    #[test]
+    fn only_the_remote_offload_role_synthesizes_a_backend() {
+        for role in [DelegationRole::None, DelegationRole::Manual] {
+            let mut s = with_configured_local("main");
+            let mut tab = facade_tab("t1", "lan-worker-2");
+            if let TabConfig::AiTool(c) = &mut tab {
+                c.delegation_role = role;
+            }
+            s.tabs.push(tab);
+            assert_eq!(
+                pool_names(&s.effective_offload_backends()),
+                vec!["main"],
+                "a {role:?} tab is not an offload backend"
+            );
+        }
+    }
+
 
     /// **V35 Phase F, and the V32 F-19 trap it walks past.** A global
     /// `settings.json` written before Phase F loads with

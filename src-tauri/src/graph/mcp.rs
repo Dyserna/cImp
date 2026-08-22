@@ -471,8 +471,10 @@ impl SurfaceFingerprint {
     }
 }
 
-/// Hash what decides the `delegate_task_*` set: the worker gate's verdict, and
-/// every AI tab holding the Manual role with the harness it belongs to.
+/// Hash what decides the delegation-shaped surface: the worker gate's verdict,
+/// every AI tab holding the Manual role with the harness it belongs to (the
+/// `delegate_task_*` set), and every tab holding the Remote-offload role with
+/// its facade knobs (the `offload_task` backend list, V39 Phase C).
 ///
 /// The gate is in here because a `"fail"` recorded against the input-profile
 /// spike removes the whole group, and that is a surface move like any other.
@@ -488,10 +490,35 @@ fn delegation_sig(settings: &crate::settings::Settings) -> u64 {
     .hash(&mut h);
     for cfg in &settings.tabs {
         if let crate::settings::TabConfig::AiTool(c) = cfg {
-            if c.delegation_role == crate::settings::DelegationRole::Manual {
-                crate::tabs::tab_consumer(c).hash(&mut h);
-                c.id.hash(&mut h);
-                c.name.hash(&mut h);
+            match c.delegation_role {
+                crate::settings::DelegationRole::Manual => {
+                    crate::tabs::tab_consumer(c).hash(&mut h);
+                    c.id.hash(&mut h);
+                    c.name.hash(&mut h);
+                }
+                // **V39 Phase C.** A facade moves `offload_task`'s advertised
+                // BYTES: its name, tier and declared window are rendered into
+                // the backend list, and the role appearing or disappearing adds
+                // or removes an entry outright. Same component as the Manual
+                // set because it is the same group — "what the delegation
+                // configuration advertises" — and one fingerprint field per
+                // advertised group is this type's rule.
+                //
+                // The tab NAME is hashed even when a backend name is set: it is
+                // the fallback that renders when the name is blank, so a rename
+                // moves the prose.
+                crate::settings::DelegationRole::RemoteOffload => {
+                    c.id.hash(&mut h);
+                    c.name.hash(&mut h);
+                    c.delegation_backend.name.hash(&mut h);
+                    matches!(
+                        c.delegation_backend.tier,
+                        crate::settings::BackendTier::Fast
+                    )
+                    .hash(&mut h);
+                    c.delegation_backend.declared_context.hash(&mut h);
+                }
+                crate::settings::DelegationRole::None => {}
             }
         }
     }

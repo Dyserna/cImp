@@ -373,14 +373,20 @@ impl OffloadSupervisor {
         self.state.read().await.clone()
     }
 
-    /// Per-backend status for every enabled backend in the pool (Local +
-    /// Remote). Remote backends are health-probed inline (short timeout).
+    /// Per-backend status for every enabled backend in the pool (Local, Remote
+    /// and V39's facade tabs). Remote backends are health-probed inline (short
+    /// timeout); a facade is asked the delegation engine's worker preflight,
+    /// which touches no network.
     pub async fn statuses(&self) -> Vec<BackendStatus> {
         let snap = self.settings.current().offload;
         if !snap.enabled {
             return Vec::new();
         }
-        let backends = snap.effective_backends();
+        // V39 Phase C: the wrapper, so a Remote-offload tab has a status row
+        // like any other backend. The SPAWN paths below stay on the raw list —
+        // `local_backends()` is about processes cImp owns, and a facade is not
+        // one.
+        let backends = self.settings.current().effective_offload_backends();
         // Do NOT hold the `running` lock across this loop: a remote backend's
         // status is a live network health probe (up to the client timeout,
         // ~10s), and holding the mutex across it would stall every concurrent
@@ -481,6 +487,36 @@ impl OffloadSupervisor {
                     in_flight: 0,
                     tool_scope: scope,
                     error: None,
+                }
+            }
+            // V39 Phase C — **nothing to start, nothing to stop.** The
+            // supervisor owns processes; a facade is an open tab the user
+            // started themselves. It appears here so the Settings backend list
+            // can show it, and its state is the delegation engine's own worker
+            // verdict — no probe, no process, no lifecycle.
+            //
+            // `local_backends()` (what autostart and Start/Stop iterate) filters
+            // to `Local`, so this variant can never reach the spawn path; a test
+            // pins that rather than leaving it to the reader.
+            OffloadBackendKind::HarnessTab { tab } => {
+                let tab_id = crate::state::TabId::from_str(tab);
+                let verdict = crate::delegation::worker_ready(&self.app, &tab_id).await;
+                let driven = crate::delegation::is_driven(&tab_id);
+                BackendStatus {
+                    name: b.name.clone(),
+                    kind: "harness".into(),
+                    tier: tier.into(),
+                    enabled: b.enabled,
+                    cloud_blocked: false,
+                    state: if verdict.is_ok() { "ready" } else { "unreachable" }.into(),
+                    n_ctx: b.declared_context,
+                    slots: 1,
+                    in_flight: driven as u32,
+                    tool_scope: scope,
+                    // The reason a facade is not ready is the same sentence the
+                    // engine would refuse a delegation with — one story, two
+                    // surfaces.
+                    error: verdict.err(),
                 }
             }
         }

@@ -12358,6 +12358,50 @@ mod tests {
         }
     }
 
+    /// **V39 Phase C — a facade run needs no second gate, and this is why.**
+    ///
+    /// A facade is reached through `offload_task`, which `/run` already gates
+    /// under V32 C-1c: a latched (injection-flagged) tab is refused there,
+    /// before `service.run` is called at all — and `delegation::drive` is only
+    /// ever reached from inside `service.run` (→ `run_on` → `run_facade`). So
+    /// the refusal happens before the engine exists for this call: no worker
+    /// resolved, no slot claimed, no lock engaged, no byte typed.
+    ///
+    /// Adding a second gate in `run_facade` would be worse than redundant — it
+    /// would put a `delegate_task`-shaped refusal on a path the model reached
+    /// through `offload_task`, and the two say different things about what the
+    /// caller may do next. The property is about ORDER inside `handle_run`, so
+    /// order is what is asserted, on the source, exactly as the `/delegate`
+    /// ordering test above does it.
+    #[test]
+    fn a_facade_run_is_refused_by_offload_tasks_own_gate_before_the_engine() {
+        let src = include_str!("loopback.rs");
+        let body = handler_body(src, "handle_run");
+        let gate_at = body
+            .find("latches().gate(")
+            .expect("handle_run must gate — V32 C-1c");
+        let run_at = body
+            .find("service.run(")
+            .expect("handle_run must run the task");
+        assert!(
+            gate_at < run_at,
+            "the taint gate must precede `service.run`, or a latched tab's facade run reaches \
+             the delegation engine"
+        );
+        assert!(
+            !body.contains("delegation::"),
+            "the facade path must not reach the engine from this handler: it is entered from \
+             `service.run`, downstream of the gate"
+        );
+        // The gate's tool name is `offload_task` for a facade exactly as for
+        // every other backend — the driver asked for an offload and the kind of
+        // backend it landed on is not the caller's business (decision 3).
+        assert!(
+            body.contains("offload_tool_name("),
+            "the gated tool name must still be resolved by the offload naming funnel"
+        );
+    }
+
     /// **`LatchRoute::Delegation` is the fixed-name/elective corner**, and the
     /// two properties that put it there are asserted rather than assumed.
     ///
@@ -19035,6 +19079,11 @@ async fn handle_delegate(
             task: body.task,
             context: body.context,
             timeout_s: body.timeout_s,
+            // The explicit tool adds NOTHING (locked decision 2a): what the
+            // user asked for is what the worker reads. Only the Phase C facade
+            // passes a note, and only because `offload_task`'s `schema` /
+            // `profile` have no other way through a PTY.
+            format_note: None,
         },
     )
     .await;

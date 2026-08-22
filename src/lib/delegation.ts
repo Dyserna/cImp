@@ -12,6 +12,7 @@
 /// every phase, and a table half-written now is a table re-litigated later.
 import type {
   AiToolTabConfig,
+  BackendTier,
   DelegationBackend,
   DelegationRole,
   Settings,
@@ -475,6 +476,48 @@ export function displacedToast(
   takerName: string,
 ): string {
   return `“${displacedName}” is no longer the Manual ${harnessLabel(harness)} tab — moved to “${takerName}”.`;
+}
+
+/// One synthesized facade backend, as the Settings window lists it (V39 Phase
+/// C). The mirror of what Rust's `Settings::effective_offload_backends`
+/// appends — read-only here, because the entry does not exist in
+/// `offload.backends` and saving one would be saving a view.
+export interface FacadeBackendRow {
+  /// The worker tab's id, for the "configured on the tab" link.
+  tabId: string;
+  /// The tab's display name — shown as the SOURCE of the row, never as the
+  /// backend name a driver sees.
+  tabName: string;
+  /// The name the requesting harness sees: the tab's chosen backend name, or
+  /// the tab name when it has none. The same fallback Rust applies.
+  name: string;
+  tier: BackendTier;
+  declaredContext: number | null;
+}
+
+/// Every Remote-offload tab, as the backend the offload pool synthesizes from
+/// it.
+///
+/// **Deliberately a re-derivation, not a fetch.** The list is a pure function
+/// of settings the window already holds, so it cannot be stale relative to the
+/// role radio in the same window; an IPC round-trip could. The fallback rule
+/// (blank backend name ⇒ the tab name) is mirrored from Rust rather than
+/// inferred, and `facade_rows_mirror_the_rust_fallback` is what keeps the two
+/// honest.
+export function facadeBackends(settings: Settings): FacadeBackendRow[] {
+  const rows: FacadeBackendRow[] = [];
+  for (const t of settings.tabs) {
+    if (t.kind !== 'ai_tool' || t.delegation_role !== 'remote_offload') continue;
+    const chosen = (t.delegation_backend?.name ?? '').trim();
+    rows.push({
+      tabId: t.id,
+      tabName: t.name,
+      name: chosen || t.name,
+      tier: t.delegation_backend?.tier ?? 'quality',
+      declaredContext: t.delegation_backend?.declared_context ?? null,
+    });
+  }
+  return rows;
 }
 
 /// Clone `settings` with one AI tab's facade-backend knobs changed.

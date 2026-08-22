@@ -90,6 +90,10 @@
     composeTemplatesProjectGet,
   } from './lib/compose/templates';
   import { localDataExcludedScope, toolScopeMode } from './lib/settings/types';
+  // V39 Phase C: the facade backends, derived from the tab roles this window
+  // already holds — never fetched, so the list cannot disagree with the role
+  // radio in the same settings snapshot.
+  import { facadeBackends } from './lib/delegation';
   import type { AiTabId } from './lib/tabs/types';
   import { AI_TABS } from './lib/tabs/types';
   import { version as appVersion } from '../package.json';
@@ -4715,6 +4719,34 @@
             </div>
           {/each}
 
+          <!--
+            V39 Phase C — the facade backends, READ-ONLY.
+
+            They are not in `offload.backends` and never will be: a Remote-offload
+            tab IS the backend (locked decision 8), so there is exactly one place
+            to change one, and it is that tab's own popover. Listing them here
+            anyway is the point — a backend the router can pick but the backend
+            list does not mention is a backend the user cannot account for.
+          -->
+          {#each facadeBackends(snapshot) as facade (facade.tabId)}
+            <div class="backend-card facade">
+              <div class="backend-head">
+                <span class="backend-name-static" title="The name the requesting harness sees">{facade.name}</span>
+                <span class="facade-kind">tab worker</span>
+                <span class="facade-kind">{facade.tier}</span>
+                {#if facade.declaredContext}
+                  <span class="facade-kind">~{Math.max(1, Math.round(facade.declaredContext / 1000))}k ctx</span>
+                {/if}
+              </div>
+              <small class="hint">
+                Configured on the tab “{facade.tabName}” — set its role, backend name,
+                tier and context in that tab's ⇄ popover. It is offered to
+                <code>offload_task</code> under the name above and never as a tab;
+                it is ready while the tab is open and idle.
+              </small>
+            </div>
+          {/each}
+
           <div class="button-row">
             <button type="button" onclick={addLocalBackend}>+ Local backend</button>
             <button type="button" onclick={addRemoteBackend}>+ Remote backend</button>
@@ -8385,6 +8417,20 @@
     padding: 0.6rem 0.75rem;
     margin: 0.6rem 0;
     background: var(--surface-sunken);
+  }
+  /* V39 Phase C: a facade is read-only here, and it should look it. */
+  .backend-card.facade {
+    border-style: dashed;
+  }
+  .backend-name-static {
+    font-weight: 600;
+  }
+  .facade-kind {
+    font-size: 0.8em;
+    opacity: 0.75;
+    border: 1px solid var(--border-subtle);
+    border-radius: 4px;
+    padding: 0 0.35rem;
   }
   .backend-head {
     display: flex;

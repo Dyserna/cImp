@@ -5,6 +5,7 @@ import {
   backendOf,
   displacedToast,
   drivenReason,
+  facadeBackends,
   elapsedLabel,
   glyphState,
   harnessLabel,
@@ -488,6 +489,48 @@ describe('roles', () => {
     expect(displacedToast('api-work', 'claude', 'review')).toBe(
       '\u201capi-work\u201d is no longer the Manual Claude Code tab \u2014 moved to \u201creview\u201d.',
     );
+  });
+});
+
+/// V39 Phase C — the facade backends the Settings window lists read-only.
+///
+/// The list is a re-derivation of the Rust synthesis, so what these pin is the
+/// two places the two could disagree: WHICH tabs contribute a backend, and what
+/// a tab with no chosen backend name is called.
+describe('facadeBackends', () => {
+  function withRole(role: DelegationRole, name: string | null): Settings {
+    const s = defaultSettings();
+    for (const t of s.tabs) {
+      if (t.kind === 'ai_tool' && t.id === 'claude') {
+        t.name = 'api-work';
+        t.delegation_role = role;
+        t.delegation_backend = { name, tier: 'fast', declared_context: 128000 };
+      }
+    }
+    return s;
+  }
+
+  it('lists one row per Remote-offload tab, and nothing else', () => {
+    expect(facadeBackends(withRole('remote_offload', 'lan-worker-2'))).toEqual([
+      {
+        tabId: 'claude',
+        tabName: 'api-work',
+        name: 'lan-worker-2',
+        tier: 'fast',
+        declaredContext: 128000,
+      },
+    ]);
+    // The other two roles are not backends — one enum, not two flags.
+    expect(facadeBackends(withRole('manual', 'lan-worker-2'))).toEqual([]);
+    expect(facadeBackends(withRole('none', 'lan-worker-2'))).toEqual([]);
+    expect(facadeBackends(defaultSettings())).toEqual([]);
+  });
+
+  it('falls back to the tab name exactly as Rust does', () => {
+    // Both spellings of "no name chosen": the field never set, and a text input
+    // the user cleared.
+    expect(facadeBackends(withRole('remote_offload', null))[0].name).toBe('api-work');
+    expect(facadeBackends(withRole('remote_offload', '   '))[0].name).toBe('api-work');
   });
 });
 

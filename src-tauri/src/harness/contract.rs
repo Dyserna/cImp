@@ -279,8 +279,9 @@ pub const CONTROL_CHECKPOINT_PRE_MUTATION_CLAUDE: &str = "checkpoint.pre_mutatio
 /// join on it and a typo in any of them would silently un-gate a feature: the
 /// registry row's own [`Capability::id`], the two `tabs/config.rs` gate call
 /// sites via [`gate`], and the Settings toggle in `SettingsApp.svelte` (which
-/// mirrors the string as `CAP_PRETOOLUSE_DENY` in `src/lib/settings/types.ts`,
-/// pinned by [`tests::the_gated_capability_ids_reach_the_frontend`]).
+/// since V40 Phase F reads it out of [`GATED_CONTROLS`] over IPC rather than
+/// mirroring the string, so this harness-namespaced id is no longer spelled in
+/// the frontend at all).
 pub const CAP_PRETOOLUSE_DENY: &str = "claude.hook.pretooluse_deny";
 
 /// V39 Phase B, locked decision 16 — **the worker gate**, spelled once.
@@ -293,8 +294,10 @@ pub const CAP_PRETOOLUSE_DENY: &str = "claude.hook.pretooluse_deny";
 /// gate's reason.
 ///
 /// Mirrored to the frontend as `CAP_DELEGATION_WORKER` in
-/// `src/lib/settings/types.ts`, like [`CAP_PRETOOLUSE_DENY`] and pinned by the
-/// same test.
+/// `src/lib/settings/types.ts` — it may be, because the id names no vendor
+/// (locked decision 16's `ANY` row). [`CAP_PRETOOLUSE_DENY`] may not, and
+/// [`tests::the_gated_capability_ids_reach_the_frontend`] enforces the
+/// difference in both directions.
 ///
 /// [`InputProfile`]: crate::harness::InputProfile
 pub const CAP_DELEGATION_WORKER: &str = "delegation.worker";
@@ -1651,6 +1654,25 @@ pub const UNKNOWN_CAPABILITY: &str = "(unknown capability)";
 /// is a gate no UI can see.
 pub const GATED: &[&str] = &[CAP_PRETOOLUSE_DENY, CAP_DELEGATION_WORKER];
 
+/// **The gated capabilities, keyed by the CONTROL each one gates** (V40 Phase
+/// F, locked decision 27).
+///
+/// The Settings window needs one thing from this list: *is the control I am
+/// drawing gated off, and why?* It used to answer that by holding
+/// [`CAP_PRETOOLUSE_DENY`]'s string — a harness-namespaced capability id — as a
+/// TypeScript constant, so one harness's hook name was spelled in the frontend
+/// and a pin test existed only to keep the two copies equal.
+///
+/// The control names here are cImp's own and neutral; the ids travel in the
+/// `harness_versions_get` payload. A gated capability whose id names a harness
+/// therefore never reaches `types.ts` at all, which is what
+/// [`tests::the_gated_capability_ids_reach_the_frontend`] now asserts — in both
+/// directions, together with the requirement that every gate has a control.
+pub const GATED_CONTROLS: &[(&str, &str)] = &[
+    ("read_advisor", CAP_PRETOOLUSE_DENY),
+    ("delegation_worker", CAP_DELEGATION_WORKER),
+];
+
 /// Whether a recorded spike status BLOCKS its capability.
 ///
 /// Moved here verbatim from `HarnessVersions::status_blocks` in V35 Phase E
@@ -2470,11 +2492,41 @@ mod tests {
             "`harnessStatusBlocks` is back in src/lib/settings/types.ts — the E1 rule must not \
              be re-implemented in TypeScript; read `CapabilityGate.blocked` instead"
         );
+        // V40 Phase F. A gated id that NAMES A HARNESS must not be spelled in
+        // the frontend: it reaches the window inside the payload, keyed by the
+        // neutral control name it gates. A gated id that names none (the
+        // `ANY` rows) still may be, and is still pinned.
         for id in GATED {
+            let names_a_harness = crate::harness::registry::HARNESSES
+                .iter()
+                .any(|d| id.starts_with(&format!("{}.", d.id)));
+            let control = GATED_CONTROLS.iter().find(|(_, cap)| cap == id);
             assert!(
-                TS_TYPES.contains(&format!("'{id}'")),
-                "capability id `{id}` is gated in Rust but is not spelled in \
-                 src/lib/settings/types.ts — the Settings window joins on this exact string"
+                control.is_some(),
+                "capability id `{id}` is gated but has no GATED_CONTROLS row, so no UI can find \
+                 it — a gate nothing can see is a gate that does not exist"
+            );
+            if names_a_harness {
+                assert!(
+                    !TS_TYPES.contains(&format!("'{id}'")),
+                    "capability id `{id}` names a harness and is spelled in \
+                     src/lib/settings/types.ts — the window reads it from the \
+                     `gated_controls` payload instead (locked decision 27)"
+                );
+            } else {
+                assert!(
+                    TS_TYPES.contains(&format!("'{id}'")),
+                    "capability id `{id}` is gated in Rust but is not spelled in \
+                     src/lib/settings/types.ts — the Settings window joins on this exact string"
+                );
+            }
+        }
+        // Both directions: a control row for a capability nothing gates would
+        // hand the window an id whose verdict never changes.
+        for (control, cap) in GATED_CONTROLS {
+            assert!(
+                GATED.contains(cap),
+                "GATED_CONTROLS names `{control}` -> `{cap}`, which is not a gated capability"
             );
         }
     }

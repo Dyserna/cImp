@@ -1810,10 +1810,10 @@ pub async fn offload_test(
 /// is precisely the class of defect this milestone removes. The Settings section
 /// passes the id explicitly once decision 27 lands.
 #[tauri::command]
-pub async fn offload_derive_opencode_provider(
+pub async fn offload_derive_local_provider(
     harness: Option<String>,
     server_command: String,
-) -> AppResult<crate::settings::OpencodeLocalProvider> {
+) -> AppResult<crate::settings::LocalProviderBlock> {
     let writers: Vec<crate::harness::HarnessId> = match harness.as_deref().map(str::trim) {
         Some(h) if !h.is_empty() => vec![crate::harness::HarnessId::from_id(h).ok_or_else(|| {
             crate::error::AppError::Offload(format!("{h:?} names no registered harness"))
@@ -3492,92 +3492,36 @@ pub struct HarnessStatus {
     /// A verify run is happening right now, so *Run checks now* is a no-op and
     /// the panel should keep polling.
     pub verify_in_flight: bool,
+    /// V40 Phase F (locked decision 27): the gated capability ids, keyed by the
+    /// neutral CONTROL each one gates (`harness::contract::GATED_CONTROLS`).
+    ///
+    /// The window used to hold one of these ids — a harness-namespaced hook
+    /// name — as a TypeScript constant so it could join on it. It looks the id
+    /// up here now, so a gate whose capability belongs to a harness reaches the
+    /// frontend as data rather than as a second spelling.
+    pub gated_controls: std::collections::BTreeMap<&'static str, &'static str>,
 }
 
-/// One harness's **declared settings**, as the Settings window renders them
-/// (V40 Phase B, locked decision 6).
+/// **Every registered harness, as the window sees it** (V40 Phase F, locked
+/// decisions 7, 11 and 27).
 ///
-/// The window used to carry a hand-written control per per-harness setting —
-/// a Claude status-line checkbox, three `claude_local` text inputs, an OpenCode
-/// provider block — so a harness's new setting cost markup here as well as a
-/// field in Rust. It renders this instead: one generic form per harness,
-/// driven by what the plugin declares, so a harness that declares nothing gets
-/// an empty section and no UI work at all.
-#[derive(serde::Serialize)]
-pub struct HarnessSchemaView {
-    /// The registry id — the key into `Settings::harness`.
-    pub id: &'static str,
-    /// The display name for the section header.
-    pub label: &'static str,
-    /// This harness's declared `ext` fields, in declaration order.
-    pub fields: Vec<SettingFieldView>,
-}
-
-/// One declared `ext` field. A wire-shaped mirror of
-/// `harness::plugin::SettingField` — the enum becomes a tag plus an optional
-/// option list, because a TypeScript form wants a string to switch on.
-#[derive(serde::Serialize)]
-pub struct SettingFieldView {
-    /// The key inside `Settings::harness[<id>].ext`.
-    pub key: &'static str,
-    /// `"bool" | "int" | "text" | "path" | "enum" | "json"`.
-    pub kind: &'static str,
-    /// The allowed values, for `kind == "enum"`; empty otherwise.
-    pub options: &'static [&'static str],
-    /// The form label.
-    pub label: &'static str,
-    /// One sentence under the control. May be empty.
-    pub hint: &'static str,
-    /// The value an absent key reads as — what the form shows before the user
-    /// has ever touched it, and what *Reset* restores.
-    pub default: serde_json::Value,
-    /// Whether flipping it needs a tab restart (the window shows the hint).
-    pub spawn_baked: bool,
-    /// A credential: the form masks it.
-    pub secret: bool,
-}
-
-/// Every registered harness's declared settings.
+/// The one command the frontend learns the roster from: ids, labels, reserved
+/// tab ids, binaries, features, consumer token, the declared `ext` fields and
+/// the affordance strings. See [`crate::harness::info`] for the shape and for
+/// the committed fixture that keeps the TypeScript mirror honest.
 ///
 /// Deliberately a SEPARATE command from [`harness_versions_get`], unlike the
 /// health panel that shares it: this answer is `'static` data that cannot go
 /// stale between calls, so there is no consistency argument for folding it in,
-/// and the window fetches it once on open rather than on every poll.
+/// and each window fetches it once at startup rather than on every poll.
+///
+/// It subsumes Phase B's `harness_settings_schema`, exactly as that command's
+/// doc comment said it would — the declared fields are one more column of the
+/// same row, and two commands would have meant two round trips the window had
+/// to keep in step.
 #[tauri::command]
-pub async fn harness_settings_schema() -> AppResult<Vec<HarnessSchemaView>> {
-    use crate::harness::plugin::SettingKind;
-    Ok(crate::harness::registry::HARNESSES
-        .iter()
-        .map(|d| HarnessSchemaView {
-            id: d.id,
-            label: d.label,
-            fields: d
-                .plugin
-                .settings_schema()
-                .iter()
-                .map(|f| SettingFieldView {
-                    key: f.key,
-                    kind: match f.kind {
-                        SettingKind::Bool => "bool",
-                        SettingKind::Int => "int",
-                        SettingKind::Text => "text",
-                        SettingKind::Path => "path",
-                        SettingKind::Enum(_) => "enum",
-                        SettingKind::Json => "json",
-                    },
-                    options: match f.kind {
-                        SettingKind::Enum(options) => options,
-                        _ => &[],
-                    },
-                    label: f.label,
-                    hint: f.hint,
-                    default: f.default.to_json(),
-                    spawn_baked: f.spawn_baked,
-                    secret: f.secret,
-                })
-                .collect(),
-        })
-        .collect())
+pub async fn harness_list() -> AppResult<Vec<crate::harness::info::HarnessInfo>> {
+    Ok(crate::harness::info::harness_list())
 }
 
 /// V16 Feature 1: the harness version + contract-verification state, read
@@ -3605,6 +3549,10 @@ pub async fn harness_versions_get(state: State<'_, AppState>) -> AppResult<Harne
         harness_health: crate::harness::health::health(&settings),
         verify_in_flight: crate::harness::verify::in_flight(),
         versions,
+        gated_controls: crate::harness::contract::GATED_CONTROLS
+            .iter()
+            .copied()
+            .collect(),
     })
 }
 
@@ -3694,6 +3642,31 @@ pub async fn harness_instructions(
         .iter()
         .map(|i| (i.slot.id().to_string(), i.text.to_string()))
         .collect())
+}
+
+/// **The advisor's rule reference** (V40 Phase F, locked decision 23).
+///
+/// The Code Intelligence panel used to hold this table as a hard-coded tooltip
+/// — a restatement of thresholds `advisor.rs` owns, with one harness's
+/// mechanisms named in it for rules that fire per registered harness. It
+/// renders this instead.
+///
+/// `'static` data; the window fetches it once when the panel first opens.
+#[tauri::command]
+pub async fn advisor_rules() -> AppResult<AdvisorRules> {
+    Ok(AdvisorRules {
+        rules: crate::advisor::RULE_REFERENCE.to_vec(),
+        footer: crate::advisor::RULE_REFERENCE_FOOTER,
+    })
+}
+
+/// The answer [`advisor_rules`] gives.
+#[derive(serde::Serialize)]
+pub struct AdvisorRules {
+    /// One row per rule, in the order the reference lists them.
+    pub rules: Vec<crate::advisor::RuleReference>,
+    /// The one sentence that is about the panel rather than about a rule.
+    pub footer: &'static str,
 }
 
 /// V14 Phase D2: dismiss one advisor proposal (`rule_id` + its coarse rate

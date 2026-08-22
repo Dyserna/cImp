@@ -335,6 +335,155 @@ pub const RULE_DETECTION_LOCAL_RULES_BROKEN: &str = "detection.local_rules_broke
 /// resolution is "close whatever is holding the file open and restart".
 pub const RULE_DETECTION_RULES_INCOMPLETE: &str = "detection.rules_incomplete.v1";
 
+// ── the rule reference (V40 Phase F, locked decision 23) ────────────────
+//
+// The Code Intelligence panel used to carry this whole table as a hard-coded
+// tooltip string, restating numbers THIS file owns and naming one harness's
+// mechanisms while doing it ("Claude Code version", "≥2 Claude sessions", "the
+// PreToolUse hook"). Two problems: a threshold changed here left the tooltip
+// lying, and rules that fire per registered harness read as being about one.
+//
+// It is published instead. Each row states the CONDITION in the rule's own
+// terms; the fix POINTER — which mechanism of which harness to look at — is
+// `Capability::drift_hint()` and reaches the user on the card that actually
+// fired, where it can name the harness that raised it.
+
+/// One rule's entry in the reference the Advisor panel shows.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct RuleReference {
+    /// The rule id, verbatim — the same string the proposal carries.
+    pub id: &'static str,
+    /// What has to be true for it to fire, and what it proposes.
+    pub thresholds: &'static str,
+}
+
+/// Every rule the advisor can raise, with its firing condition.
+///
+/// Ids come from the constants above rather than being spelled again, so a
+/// rename cannot leave a row pointing at a rule that no longer exists, and
+/// `the_rule_reference_covers_every_rule` fails the build if a rule is added
+/// without one.
+pub const RULE_REFERENCE: &[RuleReference] = &[
+    RuleReference {
+        id: RULE_MIN_SCORE,
+        thresholds: "≥5 sessions, ≥200 injections, ≥70% never re-touched → raise context_min_score.",
+    },
+    RuleReference {
+        id: RULE_ADVISOR_LINES,
+        thresholds: "≥5 sessions, ≥20 reminders, ≥50% re-read anyway → raise read_advisor_min_lines.",
+    },
+    RuleReference {
+        id: RULE_TURN_BUDGET,
+        thresholds: "≥5 sessions, ≥200 injections, ≥50 turns, ≥70% unread AND ≥50% turns maxed → lower context_turn_budget_chars.",
+    },
+    RuleReference {
+        id: RULE_SURFACE_LEAN,
+        thresholds: "≥10 sessions, 0 calls to any cold-tail graph tool (cycles, dead_exports, struct_search, path, architecture) → enable lean_tools (hide them from the advertised surface; they still answer if called).",
+    },
+    RuleReference {
+        id: RULE_ADOPT_ADVISOR,
+        thresholds: "≥5 sessions, E1 verified (pass), ≥3 redundant large re-reads per session across ≥10 sessions (est.; external tools may have changed the file between reads) → enable read_advisor.",
+    },
+    RuleReference {
+        id: RULE_ADOPT_SUBSTITUTE,
+        thresholds: "read_advisor on in advise mode, ≥20 reminders, ≤20% re-read anyway, low shell bypass → switch read_advisor_mode to substitute.",
+    },
+    RuleReference {
+        id: RULE_DRIFT_CAPABILITY,
+        thresholds: "a recorded contract check failed for one declared capability → that capability is degraded; the card names the harness and the mechanism.",
+    },
+    RuleReference {
+        id: RULE_DRIFT_VERSION,
+        thresholds: "a harness's installed version ≠ its last-verified one, and no automatic check could reach a verdict → re-verify its contracts (Mark verified).",
+    },
+    RuleReference {
+        id: RULE_DRIFT_READ_REASON,
+        thresholds: "≥15 reminders, ≥90% immediately re-read → the deny reason isn’t reaching the model; disable read_advisor.",
+    },
+    RuleReference {
+        id: RULE_DRIFT_HOOK_SILENT,
+        thresholds: "≥3 sessions, ≥10 large re-reads (est.), 0 reminders → the harness's pre-tool gate isn’t firing.",
+    },
+    RuleReference {
+        id: RULE_DRIFT_INJECTION_UNSEEN,
+        thresholds: "≥5 sessions, ≥30 injections, ≤2% follow → injected context likely never reaches the model.",
+    },
+    RuleReference {
+        id: RULE_DRIFT_USAGE_FIELDS,
+        thresholds: "≥2 sessions of one harness, all without token fields → its transcript usage schema changed.",
+    },
+    RuleReference {
+        id: RULE_DRIFT_PAYLOAD,
+        thresholds: "any shim-reported payload missing required fields.",
+    },
+    RuleReference {
+        id: RULE_DRIFT_READ_BYPASS,
+        thresholds: "≥10 reminders, ≥40% answered via shell reads (est.) → disable read_advisor.",
+    },
+    RuleReference {
+        id: RULE_DRIFT_SUBAGENT,
+        thresholds: "sub-agent turns observed but no sub-agent transcripts read → the transcript layout moved.",
+    },
+    RuleReference {
+        id: RULE_DETECTION_UPDATE_AVAILABLE,
+        thresholds: "a newer detection bundle exists and was not applied — the component is in check-only mode, or the bundle needs a newer app build.",
+    },
+    RuleReference {
+        id: RULE_DETECTION_UPDATE_FAILED,
+        thresholds: "the last update attempt was REFUSED (bad checksum, a bundle that would not compile, a failed smoke control, an artifact outside the curated directory). The old data is still live.",
+    },
+    RuleReference {
+        id: RULE_DETECTION_UPDATE_STALLED,
+        thresholds: "a component got no fresher for a week of consecutive checks, whatever the reason.",
+    },
+    RuleReference {
+        id: RULE_DETECTION_SIGNATURE_DOWN,
+        thresholds: "the signature layer is ON and has nothing to match with — the rules directory is unreadable, or every file in it was rejected.",
+    },
+    RuleReference {
+        id: RULE_DETECTION_LOCAL_RULES_BROKEN,
+        thresholds: "one of your own rules in rules.d/local/ does not compile and is skipped, or is live under a renamed identifier because a shipped rule took its name.",
+    },
+    RuleReference {
+        id: RULE_DETECTION_RULES_INCOMPLETE,
+        thresholds: "a rollback could not put every file back, so rules.d is missing shipped rule files that still exist in the retained copy.",
+    },
+];
+
+/// The one sentence that is about the panel rather than about a rule.
+pub const RULE_REFERENCE_FOOTER: &str =
+    "After an Apply, that rule stays quiet for 3 further sessions so fresh post-change data can \
+     accumulate before it re-evaluates.";
+
+/// Every rule id this module can raise. The coverage test's other half — a new
+/// `RULE_*` constant that is not added here fails nothing, which is why the
+/// test asserts the two lists against each other by LENGTH as well as by
+/// membership.
+#[cfg_attr(not(test), allow(dead_code))]
+const ALL_RULE_IDS: &[&str] = &[
+    RULE_MIN_SCORE,
+    RULE_ADVISOR_LINES,
+    RULE_TURN_BUDGET,
+    RULE_SURFACE_LEAN,
+    RULE_ADOPT_ADVISOR,
+    RULE_ADOPT_SUBSTITUTE,
+    RULE_DRIFT_CAPABILITY,
+    RULE_DRIFT_VERSION,
+    RULE_DRIFT_READ_REASON,
+    RULE_DRIFT_HOOK_SILENT,
+    RULE_DRIFT_INJECTION_UNSEEN,
+    RULE_DRIFT_USAGE_FIELDS,
+    RULE_DRIFT_PAYLOAD,
+    RULE_DRIFT_READ_BYPASS,
+    RULE_DRIFT_SUBAGENT,
+    RULE_DETECTION_UPDATE_AVAILABLE,
+    RULE_DETECTION_UPDATE_FAILED,
+    RULE_DETECTION_UPDATE_STALLED,
+    RULE_DETECTION_SIGNATURE_DOWN,
+    RULE_DETECTION_LOCAL_RULES_BROKEN,
+    RULE_DETECTION_RULES_INCOMPLETE,
+];
+
 /// `drift.read_reason.v1`: reminders observed before the ~100%-reread check
 /// can speak. Lower than the tuning rule's `MIN_REMINDS` (20) — this is a
 /// breakage detector, and waiting longer just burns more bare refusals.
@@ -1800,6 +1949,33 @@ fn tuning_rules(sig: &Signals, advisor_disable_proposed: bool) -> Vec<Proposal> 
 
 #[cfg(test)]
 mod tests {
+    /// **Every rule the advisor can raise has a reference row** (locked
+    /// decision 23, V40 Phase F).
+    ///
+    /// The panel's rule reference is backend-published now. A rule with no row
+    /// is a card a user can read and then find nothing about — the shape this
+    /// milestone's tests exist to catch — and a row with an id no constant
+    /// spells is a line about a rule that cannot fire.
+    #[test]
+    fn the_rule_reference_covers_every_rule() {
+        use super::{ALL_RULE_IDS, RULE_REFERENCE};
+        let referenced: std::collections::BTreeSet<&str> =
+            RULE_REFERENCE.iter().map(|r| r.id).collect();
+        let declared: std::collections::BTreeSet<&str> = ALL_RULE_IDS.iter().copied().collect();
+        assert_eq!(
+            referenced.len(),
+            RULE_REFERENCE.len(),
+            "the rule reference lists the same rule twice"
+        );
+        let missing: Vec<&&str> = declared.difference(&referenced).collect();
+        assert!(missing.is_empty(), "rules with no reference row: {missing:?}");
+        let extra: Vec<&&str> = referenced.difference(&declared).collect();
+        assert!(extra.is_empty(), "reference rows for rules nothing declares: {extra:?}");
+        for r in RULE_REFERENCE {
+            assert!(!r.thresholds.is_empty(), "{}: an empty reference row", r.id);
+        }
+    }
+
     /// A [`HarnessDriftSignals`] with one entry: the DEFAULT harness's.
     ///
     /// V40 Phase C. Every drift test below was written when `Signals` carried

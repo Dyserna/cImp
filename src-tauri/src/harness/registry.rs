@@ -189,6 +189,25 @@ pub enum HarnessFeature {
     /// The harness is configured through a **file cImp writes at spawn** — so
     /// it has plugin goldens, and a stale artifact is detectable.
     FileArtifact,
+    /// A tab of this harness PUSHES a status-line reading into cImp's usage
+    /// file as it runs, so the bottom-bar widget has something to poll for.
+    ///
+    /// Distinct from [`Self::SessionUsage`], which is about the transcript cImp
+    /// reads *after* a turn: this one is about whether a running tab feeds the
+    /// live widget, and it is the question `contextMeter`'s hand-written
+    /// `commandIsClaude` used to answer (locked decision 19). Declaring it
+    /// without a [`super::plugin::HarnessPlugin::usage_source`] is refused by
+    /// `a_declared_usage_push_has_a_source`.
+    UsagePush,
+    /// cImp can WRITE this harness's local-provider configuration for it — the
+    /// plugin has a [`super::plugin::ConfigWriter`].
+    ///
+    /// What mounts the Offload card's *register this backend with the harness*
+    /// button. Declared rather than inferred, and cross-checked against the
+    /// plugin by `a_declared_config_writer_exists`: a button that derives a
+    /// provider block for a harness with no writer is a click that can only
+    /// fail.
+    LocalProviderConfig,
 }
 
 /// One harness, as data. All `'static`; no I/O.
@@ -276,7 +295,11 @@ const REGISTRY: &[HarnessDescriptor] = &[
             "CLAUDECODE",
             "CLAUDE_CODE_ENTRYPOINT",
         ],
-        features: &[HarnessFeature::SessionUsage, HarnessFeature::ContextBar],
+        features: &[
+            HarnessFeature::SessionUsage,
+            HarnessFeature::ContextBar,
+            HarnessFeature::UsagePush,
+        ],
         plugin: &super::claude::PLUGIN,
     },
     HarnessDescriptor {
@@ -289,7 +312,10 @@ const REGISTRY: &[HarnessDescriptor] = &[
         consumer: "opencode",
         expects_chp: true,
         env_strip: &[],
-        features: &[HarnessFeature::FileArtifact],
+        features: &[
+            HarnessFeature::FileArtifact,
+            HarnessFeature::LocalProviderConfig,
+        ],
         plugin: &super::opencode::PLUGIN,
     },
 ];

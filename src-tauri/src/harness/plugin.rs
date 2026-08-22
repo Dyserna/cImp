@@ -846,7 +846,136 @@ pub trait ConfigWriter: Sync + Send {
     fn derive_local_provider(
         &self,
         server_command: &str,
-    ) -> crate::error::AppResult<crate::settings::OpencodeLocalProvider>;
+    ) -> crate::error::AppResult<crate::settings::LocalProviderBlock>;
+}
+
+/// One env var a harness synthesizes when a tab is pointed at a local provider.
+///
+/// Declared as `(name, ext_key)` pairs rather than as a rendered sentence so the
+/// Settings preview shows the user's OWN values: the frontend reads `ext_key`
+/// out of `Settings::harness[<id>].ext` and prints `NAME=<value>`. A `None`
+/// key is a credential — rendered `NAME=…`, never with the value in it.
+pub struct LocalProviderVar {
+    /// The environment variable's name, verbatim.
+    pub name: &'static str,
+    /// The `ext` key whose value fills it, or `None` for a secret.
+    pub ext_key: Option<&'static str>,
+    /// Render the row only when `ext_key`'s value is non-empty. The optional
+    /// model-alias row is the case: an empty alias means the var is not set at
+    /// all, and a preview that showed `NAME=` would be describing a spawn that
+    /// does not happen.
+    pub only_when_set: bool,
+}
+
+/// **The user-facing strings and per-harness UI facts the frontend used to
+/// hard-code** (locked decision 27).
+///
+/// Every field here answers a question some Svelte file used to answer with an
+/// `if (tabId === 'claude')` or a sentence naming a product. The rule for what
+/// belongs is decision 0's, applied to copy: *would this sentence still be true
+/// if both shipped harnesses were deleted?* If not, the harness says it and the
+/// window renders it — verbatim, so moving a string here is not a rewrite.
+///
+/// It is deliberately **prose-free on the core side**: core neither composes nor
+/// edits these, it interpolates the two named slots (`{label}`, `{tab}` in
+/// [`Self::attribution_template`]; `{path}` in [`Self::attachment_format`]) and
+/// prints the rest.
+pub struct HarnessAffordances {
+    /// The in-session command that starts a fresh conversation (`"/clear"`).
+    /// Rendered by the taint/timeline copy that tells a user how to clear a
+    /// flagged session. `None` = this harness has no such command and the copy
+    /// says "restart the tab" alone.
+    pub new_session_command: Option<&'static str>,
+    /// When a live session picks up a changed MCP tool list — one clause,
+    /// rendered after the harness's label ("refreshes its tool list in the same
+    /// session"). `None` = unknown, and the copy omits this harness.
+    pub tool_list_refresh: Option<&'static str>,
+    /// This harness's OWN web tools, spelled as it spells them (Claude's
+    /// `WebFetch`/`WebSearch` are capitalised; OpenCode's are not). The
+    /// native-web-visibility copy lists them per harness rather than picking
+    /// one spelling and being wrong for the other.
+    pub web_tools: &'static [&'static str],
+    /// Where this harness keeps its own state, as the user would name it —
+    /// what the sandbox copy enumerates when it says which directories a
+    /// confined tab still reaches.
+    pub state_dirs: &'static [&'static str],
+    /// What to tell a user whose tab failed to launch because the binary was
+    /// not found. `None` = no hint (the raw error stands alone).
+    pub install_hint: Option<&'static str>,
+    /// Where that hint points. Rendered as a link after it.
+    pub docs_url: Option<&'static str>,
+    /// How a pasted image path is written into the prompt. `{path}` is the only
+    /// slot. The *instruction* that follows it is model-visible text and comes
+    /// from `harness_instructions` (locked decision 24) — this is the line
+    /// shape, which the user sees in their own compose box.
+    pub attachment_format: &'static str,
+    /// The env vars a tab of this harness synthesizes when pointed at a local
+    /// provider, in render order. `None` = this harness has no local-provider
+    /// control at all, and the Settings form hides the checkbox and shows
+    /// [`Self::local_provider_note`] instead.
+    pub local_provider: Option<&'static [LocalProviderVar]>,
+    /// Why this harness has no local-provider control, for the form to print
+    /// where the control would have been.
+    pub local_provider_note: Option<&'static str>,
+    /// What the Offload card's *register this local backend with the harness*
+    /// button does, for the paragraph under it. Only read for a harness that
+    /// declares `LocalProviderConfig`.
+    pub local_provider_config_note: Option<&'static str>,
+    /// How many stacked rows this harness's status-line widget needs in the
+    /// bottom strip. Locked decision 19: the 44 px `.status-bar` height was two
+    /// rows of Claude Code's 5h + 7d pair, asserted in a stylesheet.
+    pub statusline_rows: u8,
+    /// V39's delegation attribution line, with `{label}` and `{tab}` slots
+    /// (*(0-d)*). One source for the banner, the local echo and the glyph
+    /// title. The default is the neutral rendering; a harness overrides it only
+    /// if its users expect different wording.
+    pub attribution_template: &'static str,
+    /// How cImp gets text in front of this harness's model at prompt time
+    /// (Claude: a `UserPromptSubmit` hook; OpenCode: a generated plugin). One
+    /// clause, rendered after the label.
+    pub inject_mechanism: Option<&'static str>,
+    /// The command a fresh tab of this harness is seeded with — what the
+    /// Settings *Command* field says it defaults to.
+    pub default_command: &'static str,
+    /// An absolute-path example for that field's hint, for a binary PATH does
+    /// not reach.
+    pub command_example: Option<&'static str>,
+    /// The CSS colour this harness's rows and glyphs are accented with, as a
+    /// value the frontend can put straight in a `color:` (a `var(--token,
+    /// #fallback)` is expected). Empty = no accent, and the row renders in the
+    /// default colour — which is what an unknown harness gets.
+    pub accent: &'static str,
+    /// Where this harness's model runs, as the graph pulse buckets it:
+    /// `"cloud"` for an interactive agent session, anything else for a harness
+    /// whose calls should not share that bucket.
+    pub tier: &'static str,
+}
+
+impl Default for HarnessAffordances {
+    /// The neutral answer to every question. A harness that declares nothing
+    /// still renders — with no accent, no hints and cImp's own attribution
+    /// wording — rather than borrowing another harness's copy.
+    fn default() -> Self {
+        HarnessAffordances {
+            new_session_command: None,
+            tool_list_refresh: None,
+            web_tools: &[],
+            state_dirs: &[],
+            install_hint: None,
+            docs_url: None,
+            attachment_format: "[image] {path}",
+            local_provider: None,
+            local_provider_note: None,
+            local_provider_config_note: None,
+            statusline_rows: 0,
+            attribution_template: "[delegated by {label} · tab \"{tab}\" · via cImp]",
+            inject_mechanism: None,
+            default_command: "",
+            command_example: None,
+            accent: "",
+            tier: "cloud",
+        }
+    }
 }
 
 // ── the trait ───────────────────────────────────────────────────────────────
@@ -1474,6 +1603,19 @@ pub trait HarnessPlugin: Sync + Send {
     /// "Add to OpenCode" button). It asks here instead of naming the harness.
     fn config_writer(&self) -> Option<&'static dyn ConfigWriter> {
         None
+    }
+
+    // ── the frontend's affordances (locked decision 27) ────────────────────
+
+    /// The user-facing strings and per-harness UI facts this harness supplies
+    /// to the window — see [`HarnessAffordances`].
+    ///
+    /// Reaches the frontend inside `harness_list`, once at startup. The default
+    /// is the neutral one: a harness that declares nothing renders with cImp's
+    /// own wording and no accent, which is a visible absence rather than
+    /// another product's copy under this one's name.
+    fn affordances(&self) -> HarnessAffordances {
+        HarnessAffordances::default()
     }
 
     // ── sandbox ─────────────────────────────────────────────────────────────

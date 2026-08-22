@@ -396,6 +396,43 @@ impl HarnessPlugin for OpenCodePlugin {
         true
     }
 
+    /// **OpenCode's half of the window's copy** (locked decision 27).
+    ///
+    /// The install hint is the one `preflight` already returns, spelled once
+    /// here and reused there, so the refusal a user reads when enabling the tab
+    /// and the hint the error overlay shows cannot drift apart. The lower-case
+    /// `webfetch`/`websearch` are this harness's own tool names — the reason
+    /// the web-visibility copy lists tools per harness instead of picking a
+    /// spelling.
+    fn affordances(&self) -> crate::harness::plugin::HarnessAffordances {
+        use crate::harness::plugin::HarnessAffordances;
+        HarnessAffordances {
+            new_session_command: Some("/clear"),
+            tool_list_refresh: Some("refreshes its tool list in the same session"),
+            web_tools: &["webfetch", "websearch"],
+            state_dirs: &[
+                "~/.config/opencode",
+                "~/.local/share/opencode",
+                "~/.local/state/opencode",
+            ],
+            install_hint: Some("OpenCode is not installed. Install it from"),
+            docs_url: Some("https://opencode.ai/docs"),
+            local_provider: None,
+            local_provider_note: Some(
+                "OpenCode manages its own providers and credentials (global config, switchable \
+                 in-session). Configure providers in OpenCode itself; cimp injects only its MCP \
+                 tools and the TTS/offload/graph guidance.",
+            ),
+            local_provider_config_note: Some(
+                "Registers this server as OpenCode's local-llama provider (base URL + model read                  from the command above) and selects it as the default model, so a freshly opened                  OpenCode tab is ready to work. Overrides any existing local-llama. Auto-sync                  re-derives it from the primary local backend at launch and on save, but only                  while the offload server is enabled. OpenCode reads the provider from its launch                  config — restart the OpenCode tab to apply a change.",
+            ),
+            inject_mechanism: Some("a generated .opencode/plugin"),
+            default_command: "opencode",
+            accent: "var(--accent-purple, #d2a8ff)",
+            ..HarnessAffordances::default()
+        }
+    }
+
     /// The `opencode serve` probe's row in the spawn ledger — the argv is this
     /// product's CLI, so it lives with the code that runs it.
     fn spawn_sites(&self) -> &'static [crate::spawn_ledger::SpawnSite] {

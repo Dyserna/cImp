@@ -6181,7 +6181,7 @@ console.log("OK: the swap reached neither the gate nor the beacon");
         settings.set_ext(
             "opencode",
             "provider",
-            serde_json::to_value(crate::settings::OpencodeLocalProvider {
+            serde_json::to_value(crate::settings::LocalProviderBlock {
             base_url: "http://127.0.0.1:8080/v1".to_string(),
             model: "Qwen3-Q4".to_string(),
             api_key: String::new(),

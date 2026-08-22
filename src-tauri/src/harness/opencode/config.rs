@@ -23,7 +23,7 @@ use std::path::Path;
 use crate::settings::injection::NativeWebMode as NativeWebVisibility;
 use crate::error::{AppError, AppResult};
 use crate::offload::server;
-use crate::settings::{AiToolTabConfig, OpencodeLocalProvider, Settings};
+use crate::settings::{AiToolTabConfig, LocalProviderBlock, Settings};
 use crate::tabs::config::{
     compose_capability_guidance, consumer_hygiene_for,
     native_web_for,
@@ -670,7 +670,7 @@ pub static WRITER: OpencodeConfigWriter = OpencodeConfigWriter;
 pub struct OpencodeConfigWriter;
 
 impl crate::harness::plugin::ConfigWriter for OpencodeConfigWriter {
-    fn derive_local_provider(&self, server_command: &str) -> AppResult<OpencodeLocalProvider> {
+    fn derive_local_provider(&self, server_command: &str) -> AppResult<LocalProviderBlock> {
         derive_provider(server_command)
     }
 }
@@ -680,7 +680,7 @@ impl crate::harness::plugin::ConfigWriter for OpencodeConfigWriter {
 /// (`--alias`/`-a`, else the `--model`/`-m` file basename); the host defaults
 /// to `127.0.0.1`. On a missing required flag, returns a self-contained error
 /// naming exactly what's absent so the Settings button can surface it verbatim.
-pub fn derive_provider(command: &str) -> AppResult<OpencodeLocalProvider> {
+pub fn derive_provider(command: &str) -> AppResult<LocalProviderBlock> {
     let tokens = shlex::split(command)
         .ok_or_else(|| AppError::Offload("server command has unbalanced quotes".into()))?;
     let mut it = tokens.into_iter();
@@ -754,7 +754,7 @@ pub fn derive_provider(command: &str) -> AppResult<OpencodeLocalProvider> {
         )));
     }
 
-    Ok(OpencodeLocalProvider {
+    Ok(LocalProviderBlock {
         base_url: format!("http://{host}:{}/v1", port.expect("port present")),
         model: model.expect("model present"),
         api_key,

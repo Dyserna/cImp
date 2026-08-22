@@ -23,7 +23,7 @@
 //! only.
 
 use crate::harness::plugin::{SettingDefault, SettingField, SettingKind};
-use crate::settings::{OpencodeLocalProvider, Settings};
+use crate::settings::{LocalProviderBlock, Settings};
 
 /// `ext` key: the native-tool gate's app-wide L2 (was
 /// `offload.injection.opencode_native_gate_enabled`).
@@ -72,7 +72,7 @@ pub const FIELDS: &[SettingField] = &[
 ];
 
 /// The stored provider snapshot, or `None`.
-fn stored_provider(s: &Settings) -> Option<OpencodeLocalProvider> {
+fn stored_provider(s: &Settings) -> Option<LocalProviderBlock> {
     let v = s.harness_ext(super::harness_plugin::me(), PROVIDER);
     if v.is_null() {
         return None;
@@ -95,7 +95,7 @@ fn auto_sync_active(s: &Settings) -> bool {
 /// without re-clicking the button; if that command is missing/incomplete, fall
 /// back to the last persisted snapshot. Otherwise use the stored snapshot
 /// as-is.
-pub fn resolve_provider(s: &Settings) -> Option<OpencodeLocalProvider> {
+pub fn resolve_provider(s: &Settings) -> Option<LocalProviderBlock> {
     if auto_sync_active(s) {
         if let Some(cmd) = s.offload.primary_local_command() {
             if let Ok(p) = super::config::derive_provider(&cmd) {

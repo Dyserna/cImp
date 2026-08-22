@@ -2682,7 +2682,7 @@ impl std::fmt::Debug for OffloadSettings {
             .field("max_queue_depth", &self.max_queue_depth)
             .field("escalate_partial", &self.escalate_partial)
             // No secrets beyond the (already-cleartext) `--api-key` the user
-            // themselves put in the server command; `OpencodeLocalProvider`
+            // themselves put in the server command; `LocalProviderBlock`
             // derives Debug.
             .field("session_push", &self.session_push)
             .field("external_fetch_max_calls", &self.external_fetch_max_calls)
@@ -2724,7 +2724,7 @@ impl std::fmt::Debug for OffloadSettings {
 /// session config OpenCode receives via `OPENCODE_CONFIG_CONTENT`.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(default)]
-pub struct OpencodeLocalProvider {
+pub struct LocalProviderBlock {
     /// OpenAI-compatible base URL, ending in `/v1`
     /// (e.g. `http://127.0.0.1:8080/v1`). Host + port come from `--host`
     /// (default `127.0.0.1`) and `--port` in the command.

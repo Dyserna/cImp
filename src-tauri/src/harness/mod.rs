@@ -97,6 +97,7 @@ pub mod chp;
 pub mod claude;
 pub mod contract;
 pub mod health;
+pub mod info;
 pub mod ingress;
 pub mod instructions;
 

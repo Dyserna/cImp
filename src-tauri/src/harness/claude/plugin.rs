@@ -496,6 +496,55 @@ impl HarnessPlugin for ClaudePlugin {
         Ok(())
     }
 
+    /// **Claude Code's half of the window's copy** (locked decision 27).
+    ///
+    /// Every string is the one the frontend used to hold, moved verbatim: the
+    /// `TabErrorOverlay` install hint and its `docs.anthropic.com` link, the
+    /// `WebFetch`/`WebSearch` spelling the native-web-visibility copy needs (it
+    /// is capitalised here and lower-case in OpenCode, which is why one
+    /// spelling could not serve both), the `ANTHROPIC_*` trio the local-provider
+    /// preview prints, the `claude` default command, and the two status-bar rows
+    /// the 5h/7d pair needs.
+    fn affordances(&self) -> crate::harness::plugin::HarnessAffordances {
+        use crate::harness::plugin::{HarnessAffordances, LocalProviderVar};
+        /// `ANTHROPIC_AUTH_TOKEN` has no `ext_key` on purpose: it is the
+        /// credential, and the preview prints `…` rather than the value.
+        const LOCAL_PROVIDER: &[LocalProviderVar] = &[
+            LocalProviderVar {
+                name: "ANTHROPIC_BASE_URL",
+                ext_key: Some("local.base_url"),
+                only_when_set: false,
+            },
+            LocalProviderVar {
+                name: "ANTHROPIC_AUTH_TOKEN",
+                ext_key: None,
+                only_when_set: false,
+            },
+            LocalProviderVar {
+                name: "ANTHROPIC_MODEL",
+                ext_key: Some("local.model_alias"),
+                only_when_set: true,
+            },
+        ];
+        HarnessAffordances {
+            new_session_command: Some("/clear"),
+            tool_list_refresh: Some("picks it up on its next turn"),
+            web_tools: &["WebFetch", "WebSearch"],
+            state_dirs: &["~/.claude"],
+            install_hint: Some(
+                "Make sure Claude Code is installed and on your PATH. Installation instructions:",
+            ),
+            docs_url: Some("https://docs.anthropic.com/en/docs/claude-code/setup"),
+            local_provider: Some(LOCAL_PROVIDER),
+            statusline_rows: 2,
+            inject_mechanism: Some("a UserPromptSubmit hook"),
+            default_command: "claude",
+            command_example: Some(r"C:\tools\claude.exe"),
+            accent: "var(--text-info, #58a6ff)",
+            ..HarnessAffordances::default()
+        }
+    }
+
     /// Claude Code's welcome banner cycles a fresh tab `Idle → Thinking → Idle`
     /// as it prints — the transition the notification manager's
     /// "not until this tab has been interacted with" guard exists for.

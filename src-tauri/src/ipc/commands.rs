@@ -220,7 +220,44 @@ pub async fn pty_write(state: State<'_, AppState>, tab: TabId, input: String) ->
         }
     }
 
-    write_through_pipeline(&state, &tab, input).await
+    // The user's own keystrokes: whether this write submits is read off the
+    // bytes, exactly as it always was.
+    let submit = Submit::from_input(&input);
+    write_through_pipeline(&state, &tab, input, submit).await
+}
+
+/// **Does this write submit the turn?** (V39 review L-1.)
+///
+/// It used to be inferred from the bytes in every case, and for a keyboard that
+/// is right — a person's Enter IS the submit. For the delegation engine it is
+/// not: the engine's PASTE contains the request's own newlines (a multi-line
+/// request is one bracketed paste), so `contains_enter` fired on the paste, one
+/// write EARLY. The `UserSubmit` that went out then cleared the worker's prompt
+/// mirror and zeroed its input counter for a turn that had not been submitted
+/// yet — while the engine's real submit, a lone CR a moment later, is what
+/// actually starts it.
+///
+/// So the caller says. `pty_write` keeps the old inference; the engine passes
+/// `No` for the paste and `Yes` for the submit.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Submit {
+    Yes,
+    No,
+}
+
+impl Submit {
+    /// The keyboard's rule: any CR or LF in the bytes submits.
+    pub(crate) fn from_input(input: &str) -> Self {
+        if contains_enter(input) {
+            Submit::Yes
+        } else {
+            Submit::No
+        }
+    }
+
+    fn is_yes(self) -> bool {
+        self == Submit::Yes
+    }
 }
 
 /// **The one input pipeline** (V39 cross-module invariant): every byte that
@@ -243,6 +280,10 @@ pub(crate) async fn write_through_pipeline(
     state: &AppState,
     tab: &TabId,
     input: String,
+    // V39 review L-1: whether this write SUBMITS. See [`Submit`] — the engine's
+    // paste carries newlines, and inferring it from the bytes fired
+    // `UserSubmit` one write early.
+    submit: Submit,
 ) -> AppResult<()> {
     let tab = tab.clone();
     // Pre-register any TTS markers in the user's input so they don't fire
@@ -318,7 +359,7 @@ pub(crate) async fn write_through_pipeline(
     };
 
     if !is_automatic_terminal_response(&input) {
-        if contains_enter(&input) {
+        if submit.is_yes() {
             len_counter.store(0, Ordering::Relaxed);
             let _ = state
                 .state_signals
@@ -3971,6 +4012,30 @@ mod tests {
     use super::read_only_refusal;
     use crate::settings::{PromptTemplate, Settings};
     use crate::state::{ReadOnlySource, TabId};
+
+    /// **The keyboard's submit rule is unchanged, and it is the wrong rule for
+    /// a paste** (V39 review L-1).
+    ///
+    /// A person's Enter IS the submit, so `pty_write` still reads it off the
+    /// bytes. A delegation's paste carries the request's own newlines, and
+    /// under the same rule it read as a submit one write early — which is why
+    /// the engine STATES it instead of letting it be inferred.
+    #[test]
+    fn a_submit_is_inferred_for_the_keyboard_and_stated_by_the_engine() {
+        use super::Submit;
+        assert_eq!(Submit::from_input("hello"), Submit::No);
+        assert_eq!(Submit::from_input(""), Submit::No);
+        assert_eq!(Submit::from_input("\r"), Submit::Yes);
+        assert_eq!(Submit::from_input("hello\n"), Submit::Yes);
+        // The trap, spelled out: a bracketed paste of a two-line request looks
+        // exactly like a submit to the byte rule.
+        let paste = "\u{1b}[200~line one\nline two\u{1b}[201~";
+        assert_eq!(
+            Submit::from_input(paste),
+            Submit::Yes,
+            "the byte rule cannot tell a pasted newline from a pressed Enter"
+        );
+    }
 
     /// **V39 Phase A: a refusal always names why.** The frontend shows this
     /// string verbatim in a toast, so an empty or generic one leaves the user

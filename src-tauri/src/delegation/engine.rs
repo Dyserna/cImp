@@ -782,7 +782,19 @@ async fn run_flight(
     // read-only check, which is the only thing the engine bypasses and only
     // because it holds the lock itself.
     let paste = String::from_utf8_lossy(&profile.paste_bytes(typed)).into_owned();
-    if let Err(e) = crate::ipc::commands::write_through_pipeline(state, worker, paste).await {
+    // V39 review L-1: the paste is NOT the submit, whatever its bytes look
+    // like. A multi-line request is one bracketed paste full of newlines, and
+    // letting the pipeline infer the submit from them raised `UserSubmit` one
+    // write early — clearing the worker's prompt mirror and zeroing its input
+    // counter for a turn that had not started.
+    if let Err(e) = crate::ipc::commands::write_through_pipeline(
+        state,
+        worker,
+        paste,
+        crate::ipc::commands::Submit::No,
+    )
+    .await
+    {
         return Err(DelegationError::WorkerExited(format!(
             "could not type into worker tab `{worker_name}`: {e}"
         )));
@@ -792,7 +804,14 @@ async fn run_flight(
     // it has not finished ingesting.
     tokio::time::sleep(Duration::from_millis(profile.settle_ms)).await;
     let submit = String::from_utf8_lossy(profile.submit).into_owned();
-    if let Err(e) = crate::ipc::commands::write_through_pipeline(state, worker, submit).await {
+    if let Err(e) = crate::ipc::commands::write_through_pipeline(
+        state,
+        worker,
+        submit,
+        crate::ipc::commands::Submit::Yes,
+    )
+    .await
+    {
         return Err(DelegationError::WorkerExited(format!(
             "could not submit the turn on worker tab `{worker_name}`: {e}"
         )));
@@ -1127,6 +1146,49 @@ mod tests {
             compose("do it", None, Some("answer in JSON")),
             "do it\n\nanswer in JSON",
             "no context: the note follows the task directly"
+        );
+    }
+
+    /// **The paste is not a submit; the submit is** (V39 review L-1).
+    ///
+    /// `write_through_pipeline` used to infer it from the bytes, and the
+    /// engine's paste is full of newlines — a multi-line request is one
+    /// bracketed paste — so `UserSubmit` fired one write early, clearing the
+    /// worker's prompt mirror and zeroing its input counter for a turn that had
+    /// not started. Asserted on the source because the pipeline needs a running
+    /// `AppState`, and what must hold is a property of the CALL SITES: there
+    /// are exactly two, and they disagree about this argument.
+    #[test]
+    fn the_paste_is_written_as_not_a_submit_and_the_submit_as_one() {
+        let src = include_str!("engine.rs").replace('\r', "");
+        let code = crate::rustsrc::code_of("delegation/engine.rs", &src);
+        let mut body = String::new();
+        let mut at = 0usize;
+        for (start, end) in crate::rustsrc::test_regions(&code) {
+            let (start, end) = (start.min(src.len()), end.min(src.len()));
+            if start > at {
+                body.push_str(&src[at..start]);
+            }
+            at = end.max(at);
+        }
+        if at < src.len() {
+            body.push_str(&src[at..]);
+        }
+        let calls: Vec<&str> = body
+            .split("write_through_pipeline(")
+            .skip(1)
+            .map(|rest| &rest[..rest.len().min(220)])
+            .collect();
+        assert_eq!(calls.len(), 2, "the paste and the submit, and nothing else");
+        assert!(
+            calls[0].contains("Submit::No"),
+            "the paste must not be written as a submit: {}",
+            calls[0]
+        );
+        assert!(
+            calls[1].contains("Submit::Yes"),
+            "the submit must be: {}",
+            calls[1]
         );
     }
 

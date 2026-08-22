@@ -299,6 +299,76 @@ fn worker_completion_source(agent: &str, worker: &TabId, worker_name: &str) -> R
     Ok(())
 }
 
+/// Preflight 9 + 10 as one rule: is the worker FREE right now?
+///
+/// `None` when it is; otherwise the named reason, in the order `drive` asks
+/// them — a turn in flight, then a standing prompt, then text the user has
+/// typed and not sent. One function because these three are one question asked
+/// by two callers ([`drive`], which refuses, and [`worker_busy`], which the
+/// router reads as "no free slot"), and a rule written twice is a rule that
+/// answers differently in two places.
+/// Takes the three FACTS rather than the state mirror: they are what the rule
+/// is about, so both callers can hand it their own reading of the world — and a
+/// test can assert on it without a running state manager.
+fn busy_reason(
+    output_running: bool,
+    awaiting_prompt: bool,
+    pending: i32,
+    worker_name: &str,
+) -> Option<String> {
+    if output_running {
+        return Some(format!(
+            "worker tab `{worker_name}` is mid-turn — a request typed now would land in the middle \
+             of someone else's turn"
+        ));
+    }
+    if awaiting_prompt {
+        return Some(format!(
+            "worker tab `{worker_name}` is waiting for an answer to a prompt — answer it, then \
+             delegate"
+        ));
+    }
+    if pending > 0 {
+        return Some(format!(
+            "worker tab `{worker_name}` has {pending} characters typed and not sent — clear the \
+             input line first"
+        ));
+    }
+    None
+}
+
+/// The user's own activity on a worker tab, as the router's **free slot**
+/// question (V39 Phase C).
+///
+/// Deliberately NOT part of [`worker_ready`]: a tab whose user is mid-turn is
+/// not broken, it is busy, and the two are different answers. Readiness that
+/// dropped on every keystroke would take a facade out of the pool and back in;
+/// busy-ness makes the router prefer a backend that can start now and fall back
+/// to this one only when there is nothing else — which is exactly what it does
+/// with a full llama-server.
+pub async fn worker_busy(app: &AppHandle, worker: &TabId) -> bool {
+    let Some(state) = app.try_state::<crate::ipc::AppState>() else {
+        return true;
+    };
+    let flags = state.tab_activity.flags(worker);
+    let pending = {
+        let map = state
+            .input_lengths
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        map.get(worker)
+            .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(0)
+    };
+    busy_reason(
+        flags.output_running,
+        flags.awaiting_prompt(),
+        pending,
+        worker.as_str(),
+    )
+    .is_some()
+}
+
 /// **Is this tab a worker right now?** — the facade backend's readiness
 /// (V39 Phase C, locked decision 3: "`is_ready` = preflight conditions minus
 /// idleness").
@@ -479,23 +549,11 @@ pub async fn drive(app: &AppHandle, req: DriveRequest) -> Result<Reply, Delegati
         )));
     }
 
-    // 9. Idle: no output burst in progress, no prompt standing.
-    if flags.output_running {
-        return Err(deny(format!(
-            "worker tab `{worker_name}` is mid-turn — a request typed now would land in the middle \
-             of someone else's turn"
-        )));
-    }
-    if flags.awaiting_prompt() {
-        return Err(deny(format!(
-            "worker tab `{worker_name}` is waiting for an answer to a prompt — answer it, then \
-             delegate"
-        )));
-    }
-
-    // 10. An empty input line: nothing the user has half-typed and not sent.
-    //     Pasting into a composer that already holds text would send the two
-    //     concatenated, under the user's name.
+    // 9 + 10. Free: no output burst in progress, no prompt standing, and
+    //     nothing the user has half-typed and not sent. (Pasting into a composer
+    //     that already holds text would send the two concatenated, under the
+    //     user's name.) One rule, shared with the router's free-slot question —
+    //     see `busy_reason`.
     let pending = {
         let map = state
             .input_lengths
@@ -505,11 +563,13 @@ pub async fn drive(app: &AppHandle, req: DriveRequest) -> Result<Reply, Delegati
             .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
             .unwrap_or(0)
     };
-    if pending > 0 {
-        return Err(deny(format!(
-            "worker tab `{worker_name}` has {pending} characters typed and not sent — clear the \
-             input line first"
-        )));
+    if let Some(reason) = busy_reason(
+        flags.output_running,
+        flags.awaiting_prompt(),
+        pending,
+        &worker_name,
+    ) {
+        return Err(deny(reason));
     }
 
     // 11. A completion signal exists. Either the harness pushes CHP
@@ -875,6 +935,34 @@ fn record_refusal(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **Busy is not broken** (V39 Phase C).
+    ///
+    /// The same three facts answer two questions — `drive` refuses with the
+    /// reason, and the facade backend reports "no free slot" — so they are one
+    /// function. What this pins is that each fact speaks, that the order is the
+    /// one `drive` asks in (the most specific thing the user can act on first),
+    /// and that a free tab says nothing at all.
+    #[test]
+    fn a_busy_worker_names_the_one_thing_the_user_can_act_on() {
+        assert_eq!(busy_reason(false, false, 0, "api-work"), None);
+
+        let mid = busy_reason(true, false, 0, "api-work").expect("mid-turn is busy");
+        assert!(mid.contains("api-work") && mid.contains("mid-turn"));
+
+        let prompt = busy_reason(false, true, 0, "api-work").expect("a standing prompt is busy");
+        assert!(prompt.contains("waiting for an answer to a prompt"));
+
+        let typed = busy_reason(false, false, 12, "api-work").expect("typed text is busy");
+        assert!(
+            typed.contains("12 characters typed and not sent"),
+            "the reason must say how much: {typed}"
+        );
+
+        // Order: a tab that is mid-turn AND has text typed reports the turn,
+        // because that is the one the user cannot simply clear.
+        assert_eq!(busy_reason(true, false, 12, "api-work"), Some(mid));
+    }
 
     /// **The task is typed verbatim** (locked decision 2a/10). No header, no
     /// marker, nothing a worker model could read as provenance — the

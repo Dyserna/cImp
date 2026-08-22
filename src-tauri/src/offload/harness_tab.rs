@@ -21,9 +21,10 @@
 //!   checks a delegation would run. A not-ready facade is simply not routed to.
 //! * **One slot, and the truth about it lives elsewhere.** [`Backend::slots`]
 //!   is 1 (locked decision 9) and [`Backend::in_flight`] is read from the
-//!   *delegation registry*, not from this handle's semaphore — a tab busy with
-//!   an EXPLICIT `delegate_task_*` call is just as busy, and a router that
-//!   could not see that would route onto a worker whose next answer is `busy`.
+//!   *delegation registry* plus the tab's own activity, not from this handle's
+//!   semaphore — a tab busy with an EXPLICIT `delegate_task_*` call, or with
+//!   its own user's turn, is busy, and a router that could not see that would
+//!   route onto a worker whose next answer is a refusal.
 //!
 //! The semaphore is still real: it is what makes two concurrent facade routes
 //! to one tab queue for the slot rather than race into the engine's atomic
@@ -71,6 +72,10 @@ pub struct HarnessTabBackend {
     tool_scope: ToolScope,
     declared_context: Option<u32>,
     ready: AtomicBool,
+    /// The worker's user was busy at the last probe — mid-turn, on a prompt, or
+    /// with text typed and not sent. Read by [`Backend::in_flight`], never by
+    /// [`Backend::is_ready`]: a tab whose user is typing is BUSY, not broken.
+    busy: AtomicBool,
     /// One permit. Not the source of truth for `in_flight` (see the module
     /// docs) — the thing that makes a second concurrent route *wait* instead of
     /// being refused.
@@ -92,6 +97,7 @@ impl HarnessTabBackend {
             tool_scope,
             declared_context,
             ready: AtomicBool::new(false),
+            busy: AtomicBool::new(false),
             gate: Arc::new(Semaphore::new(1)),
         }
     }
@@ -119,6 +125,12 @@ impl HarnessTabBackend {
     /// so keeping a second copy here would be a cache of a sentence that is free
     /// to recompute.
     pub async fn refresh_ready(&self, app: &tauri::AppHandle) -> bool {
+        // Asked on the same probe, so the router sees one consistent picture of
+        // the tab rather than a readiness from now and a busy-ness from before.
+        self.busy.store(
+            crate::delegation::worker_busy(app, &self.tab).await,
+            Ordering::Relaxed,
+        );
         match crate::delegation::worker_ready(app, &self.tab).await {
             Ok(()) => {
                 self.ready.store(true, Ordering::Relaxed);
@@ -169,9 +181,16 @@ impl Backend for HarnessTabBackend {
         1
     }
     fn in_flight(&self) -> u32 {
-        // The registry, not the semaphore: an explicit `delegate_task_*` call
-        // holds the tab without ever touching this handle.
-        crate::delegation::is_driven(&self.tab) as u32
+        // Two ways the one slot is taken, and the router needs both:
+        //
+        // * a delegation is running on the tab — read from the REGISTRY, not
+        //   from this handle's semaphore, because an explicit `delegate_task_*`
+        //   call holds the tab without ever touching this handle;
+        // * the tab's own user is mid-turn, on a prompt, or has text typed and
+        //   not sent — which preflight would refuse, so a router that could not
+        //   see it would send the task somewhere it is about to be turned away
+        //   from instead of to the free backend beside it.
+        (crate::delegation::is_driven(&self.tab) || self.busy.load(Ordering::Relaxed)) as u32
     }
     fn tier(&self) -> BackendTier {
         self.tier

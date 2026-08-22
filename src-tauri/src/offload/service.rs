@@ -1670,15 +1670,21 @@ impl OffloadService {
         .await;
         match reply {
             Ok(r) => Ok(r.text),
-            // A refusal means this backend could not take the work — the same
-            // shape as an unready endpoint, so it reads as `OffloadNotReady` and
-            // the caller may re-route. Every other outcome is a task-level
-            // failure: real work happened (or was stopped by the user), and
-            // re-running it elsewhere would be a second turn nobody asked for.
-            Err(e @ crate::delegation::DelegationError::Refused(_)) => {
-                Err(AppError::OffloadNotReady(e.to_string()))
+            Err(e) => {
+                // The reason is kept where the app can read it — the Events row
+                // has it in full, and this line puts it in the log beside the
+                // backend name. What the MODEL is told is the mapped sentence.
+                tracing::info!(
+                    backend = %facade.name(),
+                    reason = %e,
+                    "offload: facade run failed"
+                );
+                Err(facade_error(
+                    facade.name(),
+                    crate::delegation::is_driven(facade.tab()),
+                    &e,
+                ))
             }
-            Err(e) => Err(AppError::Offload(e.to_string())),
         }
     }
 
@@ -2907,6 +2913,47 @@ fn effective_roots(snap: &OffloadSettings) -> Vec<PathBuf> {
 /// V39 Phase C — whether one resolved backend is routable **for this caller**.
 ///
 /// Readiness is a property of the backend; this is the one place a property of
+/// **What the DRIVER is told when a facade run fails** (V39 review HIGH-4).
+///
+/// `DelegationError`'s own strings are written for the person who set the
+/// delegation up: they name the worker tab, the driving tab and, in a refusal,
+/// the harness that has no input profile. Handing them to the router meant
+/// `AppError`'s `Display` carried all of that back through `loopback` and into
+/// the asking model's context — which is locked decision 3 (a driver must not
+/// be able to tell a facade from an HTTP backend) failing on the ERROR path,
+/// the path a hostile driver can provoke at will.
+///
+/// So the mapping is by VARIANT, and the only variable in the output is the
+/// backend name. Nothing here says "tab", "driven" or "delegat"; nothing here
+/// interpolates a reason. `busy` is not read out of a string either — it is
+/// the registry's own answer for that worker at the moment of the refusal.
+///
+/// The explicit `/delegate` path keeps the tab-naming strings: there the user
+/// asked for a named tab and the answer is about that tab.
+fn facade_error(backend: &str, busy: bool, e: &crate::delegation::DelegationError) -> AppError {
+    use crate::delegation::DelegationError as D;
+    match e {
+        // Not ready / no free slot: the same shape as an unready endpoint, so
+        // the caller may re-route to a real backend.
+        D::Refused(_) if busy => {
+            AppError::OffloadNotReady(format!("backend `{backend}` is busy"))
+        }
+        D::Refused(_) => AppError::OffloadNotReady(format!("backend `{backend}` is not ready")),
+        // Everything below is a task-level failure: real work happened, and
+        // re-running it elsewhere would be a second turn nobody asked for.
+        D::Timeout(_) => AppError::Offload(format!("backend `{backend}` did not answer in time")),
+        D::Cancelled(_) => {
+            AppError::Offload(format!("the request to backend `{backend}` was cancelled"))
+        }
+        D::WorkerExited(_) => AppError::Offload(format!(
+            "backend `{backend}` went away while the task was running"
+        )),
+        D::NoText(_) => {
+            AppError::Offload(format!("backend `{backend}` returned an empty answer"))
+        }
+    }
+}
+
 /// the CALLER narrows it. A facade needs a driver tab (the engine refuses a
 /// headless consumer by name), so for a caller that has none it is not a
 /// candidate — not because it is down, but because this call could never use
@@ -3045,6 +3092,60 @@ mod tests {
     fn global_cap_defaults_to_one_when_empty() {
         let snap = OffloadSettings::default(); // no backends, empty command
         assert_eq!(compute_global_cap(&with_offload(snap)), 1);
+    }
+
+    /// **A facade's failure names the BACKEND and nothing else** (V39 review
+    /// HIGH-4, locked decision 3).
+    ///
+    /// Every variant, and every forbidden word, because the input side of this
+    /// is attacker-shaped: the reasons are built from tab names the user chose
+    /// and, through the worker's own state, from things a hostile driver can
+    /// provoke. A single variant left mapping `e.to_string()` puts the worker
+    /// tab into the asking model's context.
+    #[test]
+    fn a_facade_failure_names_the_backend_and_never_the_tab() {
+        use crate::delegation::DelegationError as D;
+        // The reasons carry everything that must not come out the other side.
+        let leaky = "worker tab `api-work` is driven by `main` (claude/opencode), delegation";
+        for e in [
+            D::Refused(leaky.into()),
+            D::Timeout(leaky.into()),
+            D::Cancelled(leaky.into()),
+            D::WorkerExited(leaky.into()),
+            D::NoText(leaky.into()),
+        ] {
+            for busy in [false, true] {
+                let msg = facade_error("lan-worker-2", busy, &e).to_string();
+                assert!(
+                    msg.contains("lan-worker-2"),
+                    "{e:?}: the driver must be told WHICH backend: {msg}"
+                );
+                for leak in [
+                    "api-work", "main", "claude", "opencode", "tab", "driven", "delegat",
+                ] {
+                    assert!(
+                        !msg.contains(leak),
+                        "{e:?}: `{leak}` reached the driver: {msg}"
+                    );
+                }
+            }
+        }
+        // Busy and not-ready are both re-routable; the rest are task failures.
+        assert!(matches!(
+            facade_error("b", true, &D::Refused("x".into())),
+            AppError::OffloadNotReady(_)
+        ));
+        assert!(facade_error("b", true, &D::Refused("x".into()))
+            .to_string()
+            .contains("is busy"));
+        assert!(matches!(
+            facade_error("b", false, &D::Refused("x".into())),
+            AppError::OffloadNotReady(_)
+        ));
+        assert!(matches!(
+            facade_error("b", false, &D::Timeout("x".into())),
+            AppError::Offload(_)
+        ));
     }
 
     /// **A facade needs a driver; a real backend does not.**

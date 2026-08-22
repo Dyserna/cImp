@@ -3156,7 +3156,7 @@ mod tests {
     }
 
     /// H1 (2026-08-05 review): two RUNNING Claude tabs on one project make every
-    /// tab-keyed identity claim unprovable, so `live_claude_sessions` (the sole
+    /// tab-keyed identity claim unprovable, so `live_sessions_for` (the sole
     /// source of `session_id` here) hands both candidates `None` — see
     /// `graph::service::live_claude_tab_sessions`. This pins the resulting
     /// contract on THIS side of the seam: refuse, never guess.

@@ -140,7 +140,7 @@ impl UsageSnapshot {
 /// `context_window` block plus the session metadata beside it (NC-3).
 ///
 /// Everything is `Option` on purpose — the block is walked leniently out of a
-/// raw `serde_json::Value` (see `crate::statusline`), so a reshaped or partial
+/// raw `serde_json::Value` (see [`super::statusline`]), so a reshaped or partial
 /// upstream payload yields fewer fields rather than a failed parse, and the UI
 /// can tell "0 tokens" apart from "not reported".
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]

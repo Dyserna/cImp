@@ -755,7 +755,11 @@ fn every_registry_entry_is_fully_wired() {
 const CAPABILITY_MODULES: &[&str] = &[
     "crate::graph",
     "crate::tts",
-    "crate::usage",
+    // `crate::usage` was here until V40 Phase D. It is not an L4 capability any
+    // more — it was never neutral enough to be one, and its whole data path
+    // (the status-line push, the push file, the quota and context readings)
+    // lives in `harness/claude/usage.rs` behind `usage_source()`. There is no
+    // module above the seam for a harness module to reach for.
     "crate::workbench",
     // V39 Phase B. `crate::delegation` is an L4 capability like the four above,
     // and it needs one thing from L1: the moment a turn ended. That arrives

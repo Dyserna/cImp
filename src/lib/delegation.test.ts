@@ -5,6 +5,7 @@ import {
   backendOf,
   displacedToast,
   drivenReason,
+  defaultFacadeName,
   facadeBackends,
   elapsedLabel,
   glyphState,
@@ -563,11 +564,29 @@ describe('facadeBackends', () => {
     expect(facadeBackends(defaultSettings())).toEqual([]);
   });
 
-  it('falls back to the tab name exactly as Rust does', () => {
+  it('falls back to an opaque per-tab name, never the tab name', () => {
     // Both spellings of "no name chosen": the field never set, and a text input
-    // the user cleared.
-    expect(facadeBackends(withRole('remote_offload', null))[0].name).toBe('api-work');
-    expect(facadeBackends(withRole('remote_offload', '   '))[0].name).toBe('api-work');
+    // the user cleared. V39 review L-2: the old fallback was the tab's DISPLAY
+    // NAME, which `offload::mcp::backend_label` renders into `offload_task`'s
+    // description — the asking model could read off what its "LAN backend"
+    // really was.
+    const rows = facadeBackends(withRole('remote_offload', null));
+    expect(rows[0].name).toBe(defaultFacadeName(rows[0].tabId));
+    expect(rows[0].name).not.toContain('api-work');
+    expect(facadeBackends(withRole('remote_offload', '   '))[0].name).toBe(rows[0].name);
+  });
+
+  /// The Rust side (`settings::facade_default_name`) pins the same three
+  /// strings: the popover's placeholder and the Settings list render this
+  /// before any backend call, so the two implementations have to agree byte for
+  /// byte, not merely in shape.
+  it('answers exactly what the Rust default answers', () => {
+    expect(defaultFacadeName('t1')).toBe('worker-0844');
+    expect(defaultFacadeName('t2')).toBe('worker-0744');
+    expect(defaultFacadeName('ai-9f3c')).toBe('worker-f0cb');
+    expect(defaultFacadeName('t1')).toBe(defaultFacadeName('t1'));
+    expect(defaultFacadeName('t1')).not.toBe(defaultFacadeName('t2'));
+    expect(defaultFacadeName('t1')).toMatch(/^worker-[0-9a-f]{4}$/);
   });
 });
 

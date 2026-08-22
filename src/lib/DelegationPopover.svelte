@@ -25,6 +25,7 @@
   import { delegationTakeOver, tabSetDelegationRole, tabSetReadOnly } from './ipc';
   import {
     attributionLine,
+    defaultFacadeName,
     displacedToast,
     glyphState,
     harnessLabel,
@@ -117,10 +118,12 @@
     return cfg && cfg.kind === 'ai_tool' ? tabHarness(cfg) : '';
   });
 
-  /// The backend name the requesting harness would actually see. `null` falls
-  /// back to the tab's display name (Phase C's rule), so the placeholder states
-  /// the effective value rather than leaving the field looking unset.
-  const effectiveBackendName = $derived((backend.name ?? '').trim() || tabName);
+  /// The backend name the requesting harness would actually see. Blank falls
+  /// back to `defaultFacadeName(tab)` (V39 review L-2 — never the tab name,
+  /// which would tell the asking model what its "LAN backend" really is), so
+  /// the placeholder states the effective value rather than leaving the field
+  /// looking unset.
+  const effectiveBackendName = $derived((backend.name ?? '').trim() || defaultFacadeName(tab));
 
   async function setRole(next: DelegationRole): Promise<void> {
     if (busy || next === role || driven) return;
@@ -307,7 +310,7 @@
         <input
           type="text"
           value={backend.name ?? ''}
-          placeholder={tabName}
+          placeholder={effectiveBackendName}
           disabled={busy}
           onchange={(e) => {
             const v = (e.currentTarget as HTMLInputElement).value.trim();
@@ -316,8 +319,9 @@
         />
       </label>
       <small class="hint">
-        What the requesting harness sees — never the tab. Empty falls back to the
-        tab name (“{effectiveBackendName}”).
+        What the requesting harness sees — never the tab. Empty falls back to
+        “{effectiveBackendName}”, a stable name derived from this tab's id: the
+        asking model must not be able to tell a worker tab from a LAN box.
       </small>
       <label class="field">
         <span>Tier</span>

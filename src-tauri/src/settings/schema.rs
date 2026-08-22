@@ -1396,8 +1396,8 @@ impl Settings {
                 .as_deref()
                 .map(str::trim)
                 .filter(|n| !n.is_empty())
-                .unwrap_or(c.name.as_str())
-                .to_string();
+                .map(str::to_string)
+                .unwrap_or_else(|| facade_default_name(&c.id));
             // A configured backend wins the name, and the facade is dropped
             // rather than renamed: the router, the run log and the dashboard all
             // key on the name, so two entries answering to one name is a bug
@@ -1424,6 +1424,32 @@ impl Settings {
         }
         out
     }
+}
+
+/// **The backend name a Remote-offload tab takes when the user picks none**
+/// (V39 review L-2).
+///
+/// It used to be the TAB's display name, and that name is rendered into
+/// `offload_task`'s description (`offload::mcp::backend_label`) and into every
+/// result the driver reads — so a tab called "Claude — API work" told the
+/// asking model exactly what its "LAN backend" really was. Locked decision 3 is
+/// that a driver must not be able to tell a facade from an HTTP backend; a
+/// default that leaks the tab is that decision failing open on the path most
+/// users will never touch.
+///
+/// So: `worker-<4 hex>` over a hash of the tab ID. Stable (the id does not
+/// change when the tab is renamed), non-identifying (a hash of an opaque id),
+/// and short enough to be a name a person can repeat. FNV-1a over the id's
+/// UTF-8 bytes, because the frontend has to produce the SAME string for the
+/// popover's placeholder and the Settings list — `src/lib/delegation.ts`'s
+/// `defaultFacadeName` is the mirror, and a test on each side pins the pair.
+pub fn facade_default_name(tab_id: &str) -> String {
+    let mut h: u32 = 0x811c_9dc5;
+    for b in tab_id.as_bytes() {
+        h ^= *b as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    format!("worker-{:04x}", (h >> 16) as u16)
 }
 
 /// One warning per colliding backend name per process.
@@ -5824,11 +5850,17 @@ mod tests {
         );
     }
 
-    /// **The backend name defaults to the tab name** — the honest default for a
-    /// user who has not chosen one (locked decision 8). A blank name is the
-    /// same as none: a cleared text field writes `""`, not `null`.
+    /// **The backend name defaults to a name that says nothing** (V39 review
+    /// L-2). A blank name is the same as none: a cleared text field writes
+    /// `""`, not `null`.
+    ///
+    /// It used to default to the TAB's display name, which
+    /// `offload::mcp::backend_label` renders into `offload_task`'s description
+    /// — so a tab called "Claude — API work" told the asking model what its
+    /// "LAN backend" really was, which is locked decision 3 failing open on the
+    /// path most users will never touch.
     #[test]
-    fn a_facade_without_a_chosen_name_answers_to_the_tab_name() {
+    fn a_facade_without_a_chosen_name_answers_to_a_name_that_names_no_tab() {
         let mut s = with_configured_local("main");
         s.tabs.push(facade_tab("t1", ""));
         let mut blank = facade_tab("t2", "");
@@ -5838,8 +5870,37 @@ mod tests {
         s.tabs.push(blank);
         assert_eq!(
             pool_names(&s.effective_offload_backends()),
-            vec!["main", "tab t1", "tab t2"]
+            vec!["main", "worker-0844", "worker-0744"]
         );
+        // The property, not just the value: nothing in a default name comes
+        // from the tab's own words or from a harness id.
+        for name in pool_names(&s.effective_offload_backends()) {
+            for leak in ["tab t1", "tab t2", "claude", "opencode", "Claude"] {
+                assert!(
+                    !name.contains(leak),
+                    "the default backend name leaked `{leak}`: {name}"
+                );
+            }
+        }
+    }
+
+    /// **The default name is stable, opaque, and the frontend can reproduce
+    /// it** (V39 review L-2).
+    ///
+    /// The literal values are pinned because `src/lib/delegation.ts`'s
+    /// `defaultFacadeName` has to answer identically — the popover's
+    /// placeholder and the Settings list render it before any backend call —
+    /// and the vitest suite asserts the same three strings.
+    #[test]
+    fn the_default_facade_name_is_a_stable_hash_of_the_tab_id() {
+        assert_eq!(facade_default_name("t1"), "worker-0844");
+        assert_eq!(facade_default_name("t2"), "worker-0744");
+        assert_eq!(facade_default_name("ai-9f3c"), "worker-f0cb");
+        // Stable across calls, distinct across ids, and shaped like a name.
+        assert_eq!(facade_default_name("t1"), facade_default_name("t1"));
+        assert_ne!(facade_default_name("t1"), facade_default_name("t2"));
+        assert!(facade_default_name("t1").starts_with("worker-"));
+        assert_eq!(facade_default_name("t1").len(), "worker-".len() + 4);
     }
 
     /// **A name collision: the configured backend wins, the facade is dropped.**

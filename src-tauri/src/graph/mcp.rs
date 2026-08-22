@@ -504,12 +504,12 @@ fn delegation_sig(settings: &crate::settings::Settings) -> u64 {
                 // configuration advertises" — and one fingerprint field per
                 // advertised group is this type's rule.
                 //
-                // The tab NAME is hashed even when a backend name is set: it is
-                // the fallback that renders when the name is blank, so a rename
-                // moves the prose.
+                // The tab NAME is NOT hashed here (V39 review L-2): the blank
+                // fallback is `facade_default_name(id)` now, not the tab name,
+                // so a rename moves nothing a driver can see — and hashing it
+                // would pulse `tools/list` for every tab title the user edits.
                 crate::settings::DelegationRole::RemoteOffload => {
                     c.id.hash(&mut h);
-                    c.name.hash(&mut h);
                     c.delegation_backend.name.hash(&mut h);
                     matches!(
                         c.delegation_backend.tier,

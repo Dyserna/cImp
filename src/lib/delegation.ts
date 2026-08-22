@@ -478,6 +478,26 @@ export function displacedToast(
   return `“${displacedName}” is no longer the Manual ${harnessLabel(harness)} tab — moved to “${takerName}”.`;
 }
 
+/// **The backend name a Remote-offload tab takes when the user picks none**
+/// (V39 review L-2) — the mirror of Rust `settings::facade_default_name`.
+///
+/// The default used to be the tab's display name, which is rendered into
+/// `offload_task`'s description and into the driver's own result: the asking
+/// model could read off what its "LAN backend" really was. `worker-<4 hex>` of
+/// a hash of the tab ID is stable across renames and says nothing.
+///
+/// FNV-1a over the id's UTF-8 bytes, byte for byte with the Rust side —
+/// `TextEncoder`, not `charCodeAt`, so a non-ASCII id hashes the same on both.
+export function defaultFacadeName(tabId: string): string {
+  let h = 0x811c9dc5;
+  for (const byte of new TextEncoder().encode(tabId)) {
+    h ^= byte;
+    h = Math.imul(h, 0x01000193);
+  }
+  const top = (h >>> 16) & 0xffff;
+  return `worker-${top.toString(16).padStart(4, '0')}`;
+}
+
 /// One synthesized facade backend, as the Settings window lists it (V39 Phase
 /// C). The mirror of what Rust's `Settings::effective_offload_backends`
 /// appends — read-only here, because the entry does not exist in
@@ -489,7 +509,7 @@ export interface FacadeBackendRow {
   /// backend name a driver sees.
   tabName: string;
   /// The name the requesting harness sees: the tab's chosen backend name, or
-  /// the tab name when it has none. The same fallback Rust applies.
+  /// [`defaultFacadeName`] when it has none. The same fallback Rust applies.
   name: string;
   tier: BackendTier;
   declaredContext: number | null;
@@ -512,7 +532,7 @@ export function facadeBackends(settings: Settings): FacadeBackendRow[] {
     rows.push({
       tabId: t.id,
       tabName: t.name,
-      name: chosen || t.name,
+      name: chosen || defaultFacadeName(t.id),
       tier: t.delegation_backend?.tier ?? 'quality',
       declaredContext: t.delegation_backend?.declared_context ?? null,
     });

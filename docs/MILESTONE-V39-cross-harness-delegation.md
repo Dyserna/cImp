@@ -194,7 +194,10 @@ adds the **read-only tab mode** that makes a driven tab safe to leave open.
     `assistant_texts`. Correlation is by turn, not by marker: the first
     completion whose turn began after the submit timestamp (message ids from
     the reader; a test pins that an earlier in-flight turn is not mistaken
-    for the reply). The attribution (2a) is client-side display only;
+    for the reply). **As built:** correlation is a `submit_ms` timestamp
+    comparison (unix ms both sides); the completion signal fires ONLY on the
+    turn-over edge with the turn's last assistant text (review HIGH-1 — the
+    readers' per-message TTS taps are not a delegation source). The attribution (2a) is client-side display only;
     nothing typed into the worker is used as a correlation marker — the task
     text is typed verbatim.
 11. **Reply goes through V32 screening — and the call rides the V32 taint
@@ -230,7 +233,8 @@ adds the **read-only tab mode** that makes a driven tab safe to leave open.
     `takeover` / `worker_exited` / `role_moved`; `cancelled` reserved), `target` = the worker tab
     name (+ reason on refusals), `source` = the driver harness, attribution
     = the driver tab, `ok` = outcome, `ms` = flight time, `request`/`response`
-    = the verbatim task and the screened reply (`done` rows only). Needs its
+    = the verbatim task and the screened reply (`request` also on `start`,
+    `response` on `done` only). Needs its
     own retention lane (`kind_cap` → `DELEGATION_CAP`) — a kind without a
     lane silently falls into the graph lane — a `rowMeta` branch in
     `EventsView.svelte` (a transition row has no payload; do not print
@@ -345,8 +349,11 @@ adds the **read-only tab mode** that makes a driven tab safe to leave open.
 - `agent.rs` gets a bypass: for a `HarnessTab` backend the worker loop is
   replaced by one `drive()` call (instructions + context become the typed
   request; the worker's own tools do the work). The `schema`/`profile`
-  options are honoured by appending the same format instruction the worker
-  loop would have used.
+  options are REQUESTS on a facade, not boundaries: the profile is stated as
+  an instruction (cImp does not own the worker's tool surface; V32
+  containment for a facade run = the worker tab's own sandbox/permissions),
+  the schema is rendered into the task, and the reply is checked to parse as
+  JSON when a schema was requested (named error otherwise) — no grammar.
 - Readiness: `is_ready` is evaluated live from tab state (open + readable);
   there is no health checker for offload backends — V37's checker and its
   `mcp_health` rows cover MCP servers only, and today a *remote* offload
@@ -375,7 +382,8 @@ adds the **read-only tab mode** that makes a driven tab safe to leave open.
   move rule). IPC: `tab_set_delegation_role`, `tab_set_read_only`,
   `delegation_take_over`. `TabContextMenu.svelte` gains only "Take over".
 - Settings → Tools: `delegation.auto_read_only`, `delegation.default_timeout_s`
-  (default 600), `delegation.max_depth`. No backend creation UI — roles are
+  (default 600). `delegation.max_depth` is deliberately NOT exposed while
+  its only legal value is the default. No backend creation UI — roles are
   set on tabs.
 
 ## Failure modes (adversarial)
@@ -396,8 +404,10 @@ adds the **read-only tab mode** that makes a driven tab safe to leave open.
   to user-directed use, and the tab glyph + Events row make every use
   visible. Accepted residual — same class as any tool the model may
   over-call; the per-tab role opt-in bounds the blast radius.
-- **Two drivers race for one worker**: registry insert is atomic; the loser
-  is refused `busy`. Facade: the router sees in-flight=1 and routes
+- **Two drivers race for one worker** (or A→B ∥ B→A): the cycle/depth check
+  and the slot claim run under ONE registry lock (`claim_checked`, review
+  M-8); the loser is refused `busy` / with the chain named. `claim` is the
+  LAST preflight step, which is what makes "no refusal after the claim" true. Facade: the router sees in-flight=1 and routes
   elsewhere or returns `NoBackendReady`.
 - **User types during the paste window** (before the lock engaged): the lock
   engages *before* the write, so the window is closed by ordering; a test
@@ -578,3 +588,4 @@ Commits `a2db16d 8bfabb7 b803efc 85fbd68 4fc007e` (cargo 2685/0/6, vitest
   the facade indistinguishable); the driver is on the worker-side rows.
 - A closed RemoteOffload tab stays in the pool as `ready: false`; the 12 s
   health watch refreshes it and fires the `list_changed` pulse.
+Review: docs/reviews/code-review-V39-2026-08-22.md. Fix commits listed there once landed.

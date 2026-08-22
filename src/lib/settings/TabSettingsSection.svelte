@@ -16,6 +16,7 @@
   import { resolveBundledTheme, defaultPalette } from '../themes';
   import { paletteRegistry } from '../themes/registry';
   import { settings as settingsStore } from './store';
+  import { harnessRow } from './types';
 
   // Renders the per-AI-tab settings form: command (read-only), CLI args,
   // a TTS speak toggle, notification texts, and a Restart Tab button. The
@@ -248,11 +249,16 @@
       {#if settings.use_local_provider}
         <p class="hint hint-effective-env">
           On launch this tab synthesizes
-          <code>ANTHROPIC_BASE_URL={$settingsStore.claude_local.base_url}</code>,
-          <code>ANTHROPIC_AUTH_TOKEN=…</code>{$settingsStore.claude_local.model_alias
-            ? `, ANTHROPIC_MODEL=${$settingsStore.claude_local.model_alias}`
+          <code
+            >ANTHROPIC_BASE_URL={harnessRow($settingsStore, 'claude').ext?.['local.base_url'] ??
+              ''}</code
+          >,
+          <code>ANTHROPIC_AUTH_TOKEN=…</code>{harnessRow($settingsStore, 'claude').ext?.[
+            'local.model_alias'
+          ]
+            ? `, ANTHROPIC_MODEL=${harnessRow($settingsStore, 'claude').ext['local.model_alias']}`
             : ''}
-          from the global <em>Local LLM provider — Claude</em> settings.
+          from the harness's own settings (Tabs → Claude Code).
           Per-tab env entries below override these.
         </p>
       {/if}

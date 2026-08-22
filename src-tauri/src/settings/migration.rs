@@ -4210,6 +4210,186 @@ mod tests {
         assert!(!s.offload.mcp_servers[1].offload_access);
     }
 
+    /// **v35 → v36: every field pair lands in its harness's row** (V40 locked
+    /// decision 5).
+    ///
+    /// The one thing a settings migration has to get right is that the user's
+    /// EXISTING answers survive it. Live-verify 1 and 10 are the human version
+    /// of this; this is the mechanical one, driven over a file carrying every
+    /// pair the step moves, with values chosen so a swapped Claude/OpenCode
+    /// copy would be visible rather than symmetric.
+    #[test]
+    fn v35_to_v36_copies_every_field_pair_into_the_harness_map() {
+        let mut v = json!({
+            "schema_version": 35,
+            "statusline": { "enabled": false },
+            "claude_local": {
+                "base_url": "http://localhost:9999",
+                "auth_token": "sk-house",
+                "model_alias": "local-opus",
+            },
+            "tool_plugins": {
+                "expose_commands_claude": false,
+                "expose_commands_opencode": true,
+                "plugins": {},
+            },
+            "code_audit": {
+                "expose_claude": true,
+                "expose_opencode": false,
+                "expose_offload": true,
+            },
+            "harness_versions": {
+                "claude_last_seen": "2.1.232",
+                "claude_last_verified": "2.1.14",
+                "opencode_last_seen": "1.18.13",
+                "claude_auto_verify": { "version": "2.1.232", "at_ms": 7, "status": "fail",
+                                        "failures": [] },
+                "input_profile_status": "pass",
+                "e1_status": "pass",
+                "d0_status": "unverified",
+            },
+            "offload": {
+                "opencode_provider_auto": true,
+                "opencode_provider": { "base_url": "http://127.0.0.1:8080/v1", "model": "Q",
+                                       "api_key": "", "source_command": "llama-server" },
+                "injection": { "opencode_native_gate_enabled": false },
+                "mcp_servers": [
+                    { "name": "ddg", "claude_access": true, "opencode_access": false,
+                      "offload_access": true },
+                ],
+            },
+        });
+        migrate_v35_to_v36(&mut v);
+        assert_eq!(v["schema_version"], json!(36));
+
+        let claude = &v["harness"]["claude"];
+        let opencode = &v["harness"]["opencode"];
+
+        // The three core pairs, each half in its own row and NOT swapped.
+        assert_eq!(claude["expose_commands"], json!(false));
+        assert_eq!(opencode["expose_commands"], json!(true));
+        assert_eq!(claude["expose_code_audit"], json!(true));
+        assert_eq!(opencode["expose_code_audit"], json!(false));
+        assert_eq!(claude["last_seen"], json!("2.1.232"));
+        assert_eq!(opencode["last_seen"], json!("1.18.13"));
+        assert_eq!(claude["last_verified"], json!("2.1.14"));
+        assert_eq!(claude["auto_verify"]["status"], json!("fail"));
+
+        // The single spike scalar reaches EVERY row. Copied, not moved: the
+        // recorded outcome was a human's judgement about whichever harnesses
+        // the user had, and moving it to one row would reset the other to
+        // `"unverified"` and switch its delegation off after an upgrade.
+        assert_eq!(claude["input_profile_status"], json!("pass"));
+        assert_eq!(opencode["input_profile_status"], json!("pass"));
+
+        // The plugin `ext` blocks.
+        assert_eq!(claude["ext"]["statusline"], json!(false));
+        assert_eq!(claude["ext"]["local.base_url"], json!("http://localhost:9999"));
+        assert_eq!(claude["ext"]["local.auth_token"], json!("sk-house"));
+        assert_eq!(claude["ext"]["local.model_alias"], json!("local-opus"));
+        assert_eq!(opencode["ext"]["native_gate"], json!(false));
+        assert_eq!(opencode["ext"]["provider_auto"], json!(true));
+        assert_eq!(opencode["ext"]["provider"]["model"], json!("Q"));
+
+        // The per-server access pair.
+        let server = &v["offload"]["mcp_servers"][0];
+        assert_eq!(server["access"]["claude"]["enabled"], json!(true));
+        assert_eq!(server["access"]["opencode"]["enabled"], json!(false));
+        assert_eq!(server["offload_access"], json!(true), "not a harness, stays put");
+
+        // The old keys are GONE, so no file carries two copies of one fact.
+        assert!(v.get("statusline").is_none());
+        assert!(v.get("claude_local").is_none());
+        assert!(v["tool_plugins"].get("expose_commands_claude").is_none());
+        assert!(v["code_audit"].get("expose_claude").is_none());
+        assert!(v["harness_versions"].get("claude_last_seen").is_none());
+        assert!(v["harness_versions"].get("input_profile_status").is_none());
+        assert!(v["offload"].get("opencode_provider").is_none());
+        assert!(v["offload"]["injection"]
+            .get("opencode_native_gate_enabled")
+            .is_none());
+        assert!(server.get("claude_access").is_none());
+        // …but the two spike outcomes that stay ARE still there.
+        assert_eq!(v["harness_versions"]["e1_status"], json!("pass"));
+
+        // And the whole thing loads typed, which is the only claim that
+        // matters: a step that produced JSON `Settings` cannot read would
+        // quarantine the file.
+        let typed: crate::settings::Settings =
+            serde_json::from_value(v).expect("the migrated file loads typed");
+        let claude_id = crate::harness::HarnessId::from_id("claude").expect("registered");
+        assert_eq!(typed.harness_settings(claude_id).last_seen, "2.1.232");
+        assert_eq!(
+            typed.harness_ext(claude_id, "local.auth_token"),
+            json!("sk-house")
+        );
+    }
+
+    /// **A v35 file that carries NONE of the pairs gets no rows at all.**
+    ///
+    /// The absent case is what makes a later harness free: the step writes only
+    /// what it found, and everything else resolves through
+    /// `HarnessSettings::defaults_for` at load. Backfilling defaults here would
+    /// be this step deciding a future harness's default at the moment it
+    /// happened to run.
+    #[test]
+    fn v35_to_v36_writes_no_row_for_a_file_that_carried_nothing() {
+        let mut v = json!({ "schema_version": 35, "tabs": [], "offload": {} });
+        migrate_v35_to_v36(&mut v);
+        assert_eq!(v["schema_version"], json!(36));
+        assert!(
+            v.get("harness").is_none(),
+            "nothing to carry over ⇒ no `harness` block: {v}"
+        );
+
+        // …and the typed load still answers every declared default.
+        let typed: crate::settings::Settings = serde_json::from_value(v).expect("loads");
+        for h in crate::harness::registry::all() {
+            assert!(typed.harness_settings(h).expose_commands, "{h}");
+            assert_eq!(typed.harness_settings(h).input_profile_status, "unverified");
+        }
+    }
+
+    /// **A `harness` block already present WINS, and an unknown id rides
+    /// through.**
+    ///
+    /// Two cases in one, because both are about the same downgrade/upgrade
+    /// hazard. A user who ran a newer build (or hand-wrote the new shape) has
+    /// values in `harness.*` that must not be overwritten by a stale copy of
+    /// the old field; and a `harness.codex` row this build knows nothing about
+    /// must survive, or opening an older cImp once is a data-loss operation.
+    #[test]
+    fn v35_to_v36_keeps_an_existing_harness_block_and_an_unknown_id() {
+        let mut v = json!({
+            "schema_version": 35,
+            "harness": {
+                "claude": { "last_seen": "2.2.0" },
+                "codex": { "last_seen": "0.9.1", "ext": { "sandbox_mode": "read-only" } },
+            },
+            "harness_versions": { "claude_last_seen": "1.0.0-stale" },
+        });
+        migrate_v35_to_v36(&mut v);
+        assert_eq!(
+            v["harness"]["claude"]["last_seen"], json!("2.2.0"),
+            "the value already in the NEW shape wins over the old field"
+        );
+        assert_eq!(v["harness"]["codex"]["last_seen"], json!("0.9.1"));
+        assert_eq!(
+            v["harness"]["codex"]["ext"]["sandbox_mode"], json!("read-only"),
+            "a row for a harness this build does not know must ride through"
+        );
+
+        // …and survives the typed round trip, which is where a `HarnessId` key
+        // would have dropped it.
+        let typed: crate::settings::Settings = serde_json::from_value(v).expect("loads");
+        let back = serde_json::to_value(&typed).expect("re-serialize");
+        assert_eq!(back["harness"]["codex"]["last_seen"], json!("0.9.1"));
+        assert_eq!(
+            back["harness"]["codex"]["ext"]["sandbox_mode"],
+            json!("read-only")
+        );
+    }
+
     /// V32 → V33 moves nothing: the V38 `tool_plugins` container is additive and
     /// `#[serde(default)]`, so an existing file is byte-identical apart from the
     /// marker. Phase E's v33 → v34 step is the one that moves `code_audit.tools`,

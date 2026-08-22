@@ -1663,6 +1663,105 @@ mod tests {
         }
     }
 
+    /// **The Phase B shape change raises no spurious restart hint** (locked
+    /// decision 8).
+    ///
+    /// `spawn_inject_sig` went from a positional `PerHarness<Value>` to a
+    /// `BTreeMap<HarnessId, Value>` and grew an automatic `"ext"` half built
+    /// from every `spawn_baked` field a plugin declares. The hazard in that is
+    /// invisible: if the refactor changed any VALUE for an unchanged settings
+    /// file, the first save after an upgrade would tell the user to restart
+    /// every AI tab for a change nobody made — and a hint that fires for
+    /// nothing is a hint nobody reads, which is the rule this mechanism's own
+    /// docs state.
+    ///
+    /// So: a fixed fixture, and the exact per-harness objects it must produce,
+    /// written out. This is a GOLDEN, deliberately: a diff here is a real
+    /// answer changing, and the reviewer's job is to say whether the user owes
+    /// a restart for it.
+    #[test]
+    fn the_spawn_signature_is_pinned_for_a_fixed_settings_fixture() {
+        let sig = spawn_inject_sig(&Settings::default());
+
+        assert_eq!(
+            sig[&h("claude")],
+            serde_json::json!({
+                "mcp": [false],
+                "guidance": crate::harness::plugin::guidance_gates(&Settings::default()),
+                "sandbox": crate::harness::plugin::sandbox_gates(&Settings::default()),
+                "hooks": [false, false, false, false, false, false],
+                "notify_hooks": false,
+                "local_env": null,
+                "channels": false,
+                "injection": crate::settings::injection::spawn_sig(
+                    &Settings::default(),
+                    h("claude"),
+                ),
+                // The automatic half: this harness's `spawn_baked` declarations,
+                // at their declared defaults. `statusline` used to be a
+                // hand-written `"statusline"` key on the object above; the three
+                // `local.*` rows never had an entry of their own at all — they
+                // rode `local_env`, which is `null` until a tab opts in, so
+                // editing the proxy URL with no such tab moved nothing. Both are
+                // covered by the declaration now.
+                "ext": {
+                    "statusline": true,
+                    "local.base_url": "http://localhost:4000",
+                    "local.auth_token": "sk-dummy",
+                    "local.model_alias": "",
+                },
+            }),
+            "the Claude spawn signature moved for a DEFAULT settings file"
+        );
+
+        assert_eq!(
+            sig[&h("opencode")]["ext"],
+            serde_json::json!({
+                "native_gate": true,
+                "provider_auto": false,
+                "provider": null,
+            }),
+            "the OpenCode ext half"
+        );
+
+        // Every registered harness has a slot, and none of them is `null`: a
+        // harness with no signature gets no restart hint at all, which is the
+        // failure the map replaced the positional pair to prevent.
+        for harness in crate::harness::registry::all() {
+            let slot = sig.get(&harness).expect("every harness has a slot");
+            assert!(!slot.is_null(), "{harness} has an empty spawn signature");
+        }
+    }
+
+    /// **A flip names ONLY the harness it can reach** — the other half of the
+    /// hint's contract, driven through the declared `ext` rows since those are
+    /// the ones a plugin can now add without touching this file.
+    #[test]
+    fn an_ext_flip_moves_only_the_declaring_harnesss_slot() {
+        let base = spawn_inject_sig(&Settings::default());
+
+        for (id, key, flipped) in [
+            ("claude", "statusline", serde_json::json!(false)),
+            ("claude", "local.base_url", serde_json::json!("http://elsewhere:1")),
+            ("opencode", "native_gate", serde_json::json!(false)),
+            ("opencode", "provider_auto", serde_json::json!(true)),
+        ] {
+            let mut s = Settings::default();
+            s.set_ext(id, key, flipped);
+            let sig = spawn_inject_sig(&s);
+            let moved: Vec<&str> = sig
+                .iter()
+                .filter(|(harness, v)| base.get(*harness) != Some(*v))
+                .filter_map(|(harness, _)| harness.id())
+                .collect();
+            assert_eq!(
+                moved,
+                vec![id],
+                "flipping `{id}.ext.{key}` must move exactly that harness's slot"
+            );
+        }
+    }
+
     /// H2: the hooks are Settings-DEPENDENT and baked at spawn, so
     /// `spawn_inject_sig` must carry them — otherwise enabling graph/offload
     /// mid-session leaves every running Claude tab permanently hook-blind with

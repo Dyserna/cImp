@@ -1058,17 +1058,11 @@ impl Consumer {
         id.descriptor().map(|_| Consumer::Harness(id))
     }
 
-    /// The registered harness this consumer proxies for.
-    ///
-    /// [`HarnessId::ANY`] for cImp's own in-app consumers (the offload worker,
-    /// the audit fan-out): they are callers, not harnesses, and a grant question
-    /// asked about them must not be answered with a harness's flags.
-    pub(crate) fn harness(self) -> crate::harness::HarnessId {
-        match self {
-            Consumer::Harness(h) => h,
-            Consumer::Offload | Consumer::Audit => crate::harness::HarnessId::ANY,
-        }
-    }
+    // `Consumer::harness()` is gone: with `Consumer::Harness(HarnessId)` the
+    // unwrap is `match`-free at every call site, and the one caller that had it
+    // (`OffloadService::mcp_tool_descriptors`) now matches the variant
+    // directly. It existed to hide a two-arm literal table, and the table is
+    // what V40 Phase B removed.
 
     fn label(self) -> &'static str {
         match self {

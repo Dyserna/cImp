@@ -3302,6 +3302,92 @@ pub struct HarnessStatus {
     pub verify_in_flight: bool,
 }
 
+/// One harness's **declared settings**, as the Settings window renders them
+/// (V40 Phase B, locked decision 6).
+///
+/// The window used to carry a hand-written control per per-harness setting —
+/// a Claude status-line checkbox, three `claude_local` text inputs, an OpenCode
+/// provider block — so a harness's new setting cost markup here as well as a
+/// field in Rust. It renders this instead: one generic form per harness,
+/// driven by what the plugin declares, so a harness that declares nothing gets
+/// an empty section and no UI work at all.
+#[derive(serde::Serialize)]
+pub struct HarnessSchemaView {
+    /// The registry id — the key into `Settings::harness`.
+    pub id: &'static str,
+    /// The display name for the section header.
+    pub label: &'static str,
+    /// This harness's declared `ext` fields, in declaration order.
+    pub fields: Vec<SettingFieldView>,
+}
+
+/// One declared `ext` field. A wire-shaped mirror of
+/// `harness::plugin::SettingField` — the enum becomes a tag plus an optional
+/// option list, because a TypeScript form wants a string to switch on.
+#[derive(serde::Serialize)]
+pub struct SettingFieldView {
+    /// The key inside `Settings::harness[<id>].ext`.
+    pub key: &'static str,
+    /// `"bool" | "int" | "text" | "path" | "enum" | "json"`.
+    pub kind: &'static str,
+    /// The allowed values, for `kind == "enum"`; empty otherwise.
+    pub options: &'static [&'static str],
+    /// The form label.
+    pub label: &'static str,
+    /// One sentence under the control. May be empty.
+    pub hint: &'static str,
+    /// The value an absent key reads as — what the form shows before the user
+    /// has ever touched it, and what *Reset* restores.
+    pub default: serde_json::Value,
+    /// Whether flipping it needs a tab restart (the window shows the hint).
+    pub spawn_baked: bool,
+    /// A credential: the form masks it.
+    pub secret: bool,
+}
+
+/// Every registered harness's declared settings.
+///
+/// Deliberately a SEPARATE command from [`harness_versions_get`], unlike the
+/// health panel that shares it: this answer is `'static` data that cannot go
+/// stale between calls, so there is no consistency argument for folding it in,
+/// and the window fetches it once on open rather than on every poll.
+#[tauri::command]
+pub async fn harness_settings_schema() -> AppResult<Vec<HarnessSchemaView>> {
+    use crate::harness::plugin::SettingKind;
+    Ok(crate::harness::registry::HARNESSES
+        .iter()
+        .map(|d| HarnessSchemaView {
+            id: d.id,
+            label: d.label,
+            fields: d
+                .plugin
+                .settings_schema()
+                .iter()
+                .map(|f| SettingFieldView {
+                    key: f.key,
+                    kind: match f.kind {
+                        SettingKind::Bool => "bool",
+                        SettingKind::Int => "int",
+                        SettingKind::Text => "text",
+                        SettingKind::Path => "path",
+                        SettingKind::Enum(_) => "enum",
+                        SettingKind::Json => "json",
+                    },
+                    options: match f.kind {
+                        SettingKind::Enum(options) => options,
+                        _ => &[],
+                    },
+                    label: f.label,
+                    hint: f.hint,
+                    default: f.default.to_json(),
+                    spawn_baked: f.spawn_baked,
+                    secret: f.secret,
+                })
+                .collect(),
+        })
+        .collect())
+}
+
 /// V16 Feature 1: the harness version + contract-verification state, read
 /// from the physical global `settings.json` (fresh — background writers
 /// bypass the live settings snapshot).

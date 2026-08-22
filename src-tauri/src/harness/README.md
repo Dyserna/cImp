@@ -104,7 +104,21 @@ A new harness is one directory, one registry row and no changes above L2.
    *installed* CLI (`harness/<id>/probe.rs`), and what cannot, each with the
    reason. The runner in `probe.rs` iterates the registry; it spawns nothing
    itself, so a spawn you add there needs a `spawn_ledger::LEDGER` row.
-8. **A fallback reader** (`<id>/read.rs`) only if the harness cannot push. Tier C
+8. **`settings_schema()`** — the settings only YOUR harness has
+   (`harness/<id>/settings.rs`), one `SettingField` per key: kind, label, hint,
+   default, and whether it is `spawn_baked` or a `secret`. Core stores them
+   opaquely in `Settings::harness[<id>].ext`, type-checks the declared keys at
+   the parse boundary, renders the section from this table with one generic
+   form, and never names a key. Three consequences, all of them the point:
+   an absent key reads its declared default (so **no migration**), a
+   `spawn_baked` row is folded into your spawn signature automatically (so the
+   flag and its restart hint cannot disagree), and a `secret` row is redacted in
+   `Debug` without a hand-rolled impl. Declare nothing and you get an empty
+   section and no work anywhere. If a feature of yours is one of the
+   *injection* hierarchy's — the mechanism lives inside the artifact you emit —
+   name it in `scoped_features()` with the `ext` key holding its app-wide L2,
+   and core will stop offering it to every other harness.
+9. **A fallback reader** (`<id>/read.rs`) only if the harness cannot push. Tier C
    stays possible; it is now contained and declared rather than ambient. If you
    write one — or a canary or probe that speaks its types — it will need L4
    types; add the file to `layering.rs`'s `UPWARD_EXEMPT` with the reason.
@@ -112,7 +126,7 @@ A new harness is one directory, one registry row and no changes above L2.
 What you must **not** need: a new enum variant outside `harness/`, a new match
 arm in `tabs/config.rs`, a bespoke gate constant, a frontend mirror. Since V40
 Phase A two tests hold that claim up rather than leaving it to good intentions —
-`every_registry_entry_is_fully_wired` (your row reaches all eight places) and
+`every_registry_entry_is_fully_wired` (your row reaches every place it must) and
 `no_harness_identity_outside_registry` (nothing outside `harness/` spells a
 harness id, except the files on `IDENTITY_ALLOWLIST`, each with the V40 phase
 that retires it). If you find yourself writing a branch, the seam is in the

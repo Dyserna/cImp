@@ -5,11 +5,12 @@ import {
   SPAWN_BAKED_INJECTION_FEATURES,
   defaultSettings,
   localDataExcludedScope,
+  setHarnessExt,
   spawnBakedInjectionL2,
   spawnBakedTabOverrides,
   toolScopeMode,
 } from './types';
-import type { OffloadSettings, TabInjectionOverrides } from './types';
+import type { Settings, TabInjectionOverrides } from './types';
 
 // #48, findings F-12 / F-27. `LOCAL_DATA_TOOLS` is hand-mirrored from Rust
 // (`src-tauri/src/settings/schema.rs`) with no compile-time link, and the
@@ -116,10 +117,13 @@ describe('SPAWN_BAKED_INJECTION_FEATURES (Rust mirror)', () => {
 });
 
 describe('spawnBakedInjectionL2', () => {
-  const offload = (): OffloadSettings => defaultSettings().offload;
+  // V40 Phase B: the reader takes the whole `Settings`, because a
+  // harness-scoped feature's L2 is a row on `harness[<id>].ext` rather than a
+  // field in the offload block.
+  const base = (): Settings => defaultSettings();
 
   test('every feature contributes a defined cell, one per member', () => {
-    const cells = spawnBakedInjectionL2(offload());
+    const cells = spawnBakedInjectionL2(base());
     expect(cells).toHaveLength(SPAWN_BAKED_INJECTION_FEATURES.length);
     // A cell wired to a field that does not exist reads `undefined` and then
     // JSON.stringify drops it — the shape would silently stop tracking it.
@@ -130,31 +134,34 @@ describe('spawnBakedInjectionL2', () => {
   // app-wide flip has to move the shape. Two accessors pointed at the same field
   // (or at the wrong one) would pass a length check and fail this.
   test('flipping any one feature moves the shape', () => {
-    const flip: Record<string, (o: OffloadSettings) => void> = {
-      spotlighting: (o) => (o.injection.spotlighting_enabled = !o.injection.spotlighting_enabled),
+    const flip: Record<string, (s: Settings) => void> = {
+      spotlighting: (s) =>
+        (s.offload.injection.spotlighting_enabled = !s.offload.injection.spotlighting_enabled),
       // Not a boolean: `sensor` → `deny` keeps the feature ON and still changes
       // how a tab launches.
-      native_web: (o) => (o.native_web_visibility = 'deny'),
-      consumer_hygiene: (o) =>
-        (o.injection.consumer_hygiene_enabled = !o.injection.consumer_hygiene_enabled),
-      opencode_native_gate: (o) =>
-        (o.injection.opencode_native_gate_enabled = !o.injection.opencode_native_gate_enabled),
-      tool_steering: (o) => (o.injection.tool_steering_enabled = !o.injection.tool_steering_enabled),
+      native_web: (s) => (s.offload.native_web_visibility = 'deny'),
+      consumer_hygiene: (s) =>
+        (s.offload.injection.consumer_hygiene_enabled =
+          !s.offload.injection.consumer_hygiene_enabled),
+      // The harness-scoped one: its L2 is the declaring plugin's `ext` row.
+      opencode_native_gate: (s) => setHarnessExt(s, 'opencode', 'native_gate', false),
+      tool_steering: (s) =>
+        (s.offload.injection.tool_steering_enabled = !s.offload.injection.tool_steering_enabled),
     };
-    const base = JSON.stringify(spawnBakedInjectionL2(offload()));
+    const baseline = JSON.stringify(spawnBakedInjectionL2(base()));
     for (const f of SPAWN_BAKED_INJECTION_FEATURES) {
-      const o = offload();
+      const s = base();
       expect(flip[f], `no flip written for ${f}`).toBeTypeOf('function');
-      flip[f](o);
-      expect(JSON.stringify(spawnBakedInjectionL2(o)), f).not.toBe(base);
+      flip[f](s);
+      expect(JSON.stringify(spawnBakedInjectionL2(s)), f).not.toBe(baseline);
     }
   });
 
   test('native-web rides as its tri-mode, not as a boolean', () => {
-    const sensor = offload();
-    sensor.native_web_visibility = 'sensor';
-    const deny = offload();
-    deny.native_web_visibility = 'deny';
+    const sensor = base();
+    sensor.offload.native_web_visibility = 'sensor';
+    const deny = base();
+    deny.offload.native_web_visibility = 'deny';
     expect(spawnBakedInjectionL2(sensor)).not.toEqual(spawnBakedInjectionL2(deny));
   });
 });

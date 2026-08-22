@@ -26,6 +26,7 @@
   // call is refused for. The chips here mirror it (see `mcpEditor.ts`) so the
   // user can see the state the backend will act on — they never *are* it.
   import type { McpActivation, McpCategory, McpServerConfig } from './types';
+  import { harnessSchemas } from './harnessSchema';
   import { describeMcpServerHealth, type McpServerHealth } from '../offload';
   import {
     clearStaleRefs,
@@ -459,16 +460,26 @@
                  anything is granted, so a box ticked here reaches a tab that is
                  already open — which is why the hint below says so instead of
                  telling the user to open a fresh one. -->
+            <!-- V40 Phase B: one checkbox per REGISTERED harness, from
+                 `harness_settings_schema`, plus the offload worker's own box.
+                 It used to be a hand-written Claude/OpenCode pair, so a third
+                 harness would have been ungrantable until someone edited this
+                 file. -->
             <div class="mcp-enable-row">
-              <label class="mcp-enable" title="Expose this server's tools to Claude Code">
-                <input
-                  type="checkbox"
-                  checked={srv.claude_access}
-                  onchange={(e) =>
-                    apply((r) => (r.servers[i].claude_access = (e.currentTarget as HTMLInputElement).checked))}
-                />
-                <span>Claude Code</span>
-              </label>
+              {#each $harnessSchemas as h (h.id)}
+                <label class="mcp-enable" title="Expose this server's tools to {h.label}">
+                  <input
+                    type="checkbox"
+                    checked={srv.access?.[h.id]?.enabled ?? false}
+                    onchange={(e) =>
+                      apply((r) => {
+                        const on = (e.currentTarget as HTMLInputElement).checked;
+                        r.servers[i].access = { ...(r.servers[i].access ?? {}), [h.id]: { enabled: on } };
+                      })}
+                  />
+                  <span>{h.label}</span>
+                </label>
+              {/each}
               <label class="mcp-enable" title="Expose this server's tools to the offload worker">
                 <input
                   type="checkbox"
@@ -477,15 +488,6 @@
                     apply((r) => (r.servers[i].offload_access = (e.currentTarget as HTMLInputElement).checked))}
                 />
                 <span>Offload</span>
-              </label>
-              <label class="mcp-enable" title="Expose this server's tools to OpenCode">
-                <input
-                  type="checkbox"
-                  checked={srv.opencode_access}
-                  onchange={(e) =>
-                    apply((r) => (r.servers[i].opencode_access = (e.currentTarget as HTMLInputElement).checked))}
-                />
-                <span>OpenCode</span>
               </label>
             </div>
             <small class="hint mcp-access-note">

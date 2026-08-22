@@ -47,7 +47,14 @@
     spawnBakedInjectionL2,
     spawnBakedTabOverrides,
     toPresetConfig,
+    // V40 Phase B: the per-harness settings map. `harnessRow` answers the
+    // declared defaults for a key the file has never carried, so no control
+    // here has to know whether a harness has ever been saved.
+    harnessRow,
+    setHarnessExt,
   } from './lib/settings/types';
+  import { harnessSchemas, loadHarnessSchemas } from './lib/settings/harnessSchema';
+  import HarnessExtForm from './lib/settings/HarnessExtForm.svelte';
   import { contentClear, contentOpenFolder, setEnabledAiTabs } from './lib/ipc';
   import { listSttModels, listInputDevices } from './lib/stt';
   import {
@@ -182,10 +189,10 @@
     { code: 'he', label: 'Hebrew' },
     { code: 'hi', label: 'Hindi' },
   ];
-  // V1.4-07: Local LLM provider section. The auth-token input toggles
-  // between password and text via this flag (no keychain integration in
-  // this milestone — the token sits cleartext in settings.json).
-  let showLocalToken = $state<boolean>(false);
+  // V1.4-07's `showLocalToken` moved into `HarnessExtForm` with the input it
+  // toggled: the Show/Hide button is now driven by the declaration's `secret`
+  // column, so every plugin's credentials get it and none of them needs a flag
+  // in this file.
   // Inline error under the AI-tabs checkbox group — e.g. when enabling an
   // OpenCode tab is rejected because `opencode` isn't installed (ebin/PATH).
   let aiTabsError = $state<string | null>(null);
@@ -392,9 +399,10 @@
     opencodeProviderMsg = null;
     try {
       const provider = await offloadDeriveOpencodeProvider(backend.kind.server_command);
-      patch((s) => {
-        s.offload.opencode_provider = provider;
-      });
+      // V40 Phase B: the derived block is the OpenCode plugin's own `ext` row
+      // (`SettingKind::Json` — written by cImp, never typed), not a field in
+      // the offload block named after a harness.
+      patch((s) => setHarnessExt(s, 'opencode', 'provider', provider));
       opencodeProviderMsg = {
         i,
         ok: true,
@@ -1500,6 +1508,11 @@
   onMount(async () => {
     await initSettings();
     if (disposed) return;
+    // V40 Phase B: what each harness declares. Fetched once — it is `'static`
+    // backend data — and read by the generic per-harness form, the two
+    // exposure lists and the MCP access boxes, so none of them re-declares the
+    // roster.
+    void loadHarnessSchemas();
     startBackendStatusPolling();
     void refreshPlugins();
     pluginsProjectKey()
@@ -1821,7 +1834,7 @@
     if (!s) return '';
     return JSON.stringify([
       s.offload.injection.protection,
-      ...spawnBakedInjectionL2(s.offload),
+      ...spawnBakedInjectionL2(s),
     ]);
   }
 
@@ -2221,6 +2234,24 @@
     return p.split(/[/\\]/).pop() ?? p;
   }
 </script>
+
+<!-- V40 Phase B (locked decision 6) — one harness's DECLARED settings.
+     A snippet rather than a copy per section: the sections that host it are
+     per TAB, what it renders is per HARNESS, and this window should not be
+     where those two get confused. A harness that declares no fields renders
+     nothing, with no work here. -->
+{#snippet harnessSettingsFor(harnessId: string)}
+  {#if snapshot}
+    {#each $harnessSchemas.filter((h) => h.id === harnessId) as h (h.id)}
+      <HarnessExtForm
+        schema={h}
+        snapshot={snapshot}
+        patch={(id, key, value) => patch((s) => setHarnessExt(s, id, key, value))}
+      />
+    {/each}
+  {/if}
+{/snippet}
+
 
 {#if useCustomTitleBar}
   <TuiTitleBar title="cImp settings" />
@@ -3492,17 +3523,12 @@
             left untouched. The status line also feeds the session-usage meter
             above — turning it off leaves that meter with no data.
           </small>
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.statusline.enabled}
-              onchange={(e) =>
-                patch((s) => (s.statusline.enabled = (e.currentTarget as HTMLInputElement).checked))}
-            />
-            <span>Show the context bar in Claude's status line</span>
-          </label>
+          <!-- V40 Phase B: the switch is one of Claude Code's own declared
+               settings now, so it renders with the rest of them rather than
+               being a control this window hard-codes for one harness. -->
           <small class="hint">
-            Takes effect on the next Claude tab launch (restart the tab to apply).
+            The switch lives with the harness that has the status line:
+            <strong>Tabs → Claude Code → Claude Code settings</strong>.
           </small>
         </section>
 
@@ -3757,6 +3783,7 @@
               {:else}
                 <small class="hint top">Claude tab is disabled — tick the checkbox above to enable it.</small>
               {/if}
+              {@render harnessSettingsFor('claude')}
             </div>
           {:else if tabsSubSection === 'claude-local'}
             <div id="tab-section-claude-local">
@@ -3776,87 +3803,10 @@
               {:else}
                 <small class="hint top">Claude (local) tab is disabled — tick the checkbox above to enable it.</small>
               {/if}
-              <section>
-                <h2>Local LLM provider</h2>
-                <small class="hint top">
-                  Settings for this tab when <em>Use local LLM provider</em>
-                  is enabled. Run a LiteLLM (or compatible) proxy that translates the
-                  Anthropic Messages API to your local model — cImp does not start
-                  the proxy. These values become <code>ANTHROPIC_*</code> env vars
-                  at tab launch — restart the tab after editing them. See the
-                  <a
-                    href="https://docs.litellm.ai/docs/proxy/quick_start"
-                    target="_blank"
-                    rel="noopener noreferrer">LiteLLM docs</a
-                  >.
-                </small>
-                <label>
-                  <span>Proxy URL</span>
-                  <input
-                    type="text"
-                    value={snapshot?.claude_local.base_url ?? ''}
-                    oninput={(e) =>
-                      patch(
-                        (s) =>
-                          (s.claude_local.base_url = (
-                            e.currentTarget as HTMLInputElement
-                          ).value),
-                      )}
-                    placeholder="http://localhost:4000"
-                  />
-                  <small class="hint">
-                    Becomes <code>ANTHROPIC_BASE_URL</code> on launch.
-                  </small>
-                </label>
-                <label>
-                  <span>Auth token</span>
-                  <div class="input-with-action">
-                    <input
-                      type={showLocalToken ? 'text' : 'password'}
-                      value={snapshot?.claude_local.auth_token ?? ''}
-                      oninput={(e) =>
-                        patch(
-                          (s) =>
-                            (s.claude_local.auth_token = (
-                              e.currentTarget as HTMLInputElement
-                            ).value),
-                        )}
-                      placeholder="sk-dummy"
-                    />
-                    <button
-                      type="button"
-                      class="secondary"
-                      onclick={() => (showLocalToken = !showLocalToken)}
-                    >
-                      {showLocalToken ? 'Hide' : 'Show'}
-                    </button>
-                  </div>
-                  <small class="hint">
-                    Becomes <code>ANTHROPIC_AUTH_TOKEN</code>. Stored cleartext;
-                    local proxies usually accept dummy tokens.
-                  </small>
-                </label>
-                <label>
-                  <span>Model alias (optional)</span>
-                  <input
-                    type="text"
-                    value={snapshot?.claude_local.model_alias ?? ''}
-                    oninput={(e) =>
-                      patch(
-                        (s) =>
-                          (s.claude_local.model_alias = (
-                            e.currentTarget as HTMLInputElement
-                          ).value),
-                      )}
-                    placeholder=""
-                  />
-                  <small class="hint">
-                    When non-empty, becomes <code>ANTHROPIC_MODEL</code>. Most
-                    users leave this blank and configure model mapping inside
-                    their LiteLLM proxy config.
-                  </small>
-                </label>
-              </section>
+              <small class="hint top">
+                This tab's local-provider values (and the status-line switch)
+                are Claude Code's own settings — see <strong>Tabs → Claude Code</strong>.
+              </small>
             </div>
           {:else if tabsSubSection === 'opencode'}
             <div id="tab-section-opencode">
@@ -3873,6 +3823,7 @@
                   onchange={() => {}}
                   onrestart={() => restartTab('opencode')}
                 />
+                {@render harnessSettingsFor('opencode')}
               {:else}
                 <small class="hint top">OpenCode tab is disabled — tick the checkbox above to enable it.</small>
               {/if}
@@ -4688,11 +4639,16 @@
                   <label class="checkbox inline">
                     <input
                       type="checkbox"
-                      checked={snapshot.offload.opencode_provider_auto}
+                      checked={harnessRow(snapshot, 'opencode').ext?.['provider_auto'] === true}
                       onchange={(e) =>
-                        patch((s) => {
-                          s.offload.opencode_provider_auto = (e.currentTarget as HTMLInputElement).checked;
-                        })}
+                        patch((s) =>
+                          setHarnessExt(
+                            s,
+                            'opencode',
+                            'provider_auto',
+                            (e.currentTarget as HTMLInputElement).checked,
+                          ),
+                        )}
                     />
                     <span>Auto-sync while offload enabled</span>
                   </label>
@@ -6850,34 +6806,26 @@
             flipping an exposure here, restart the Claude/OpenCode tab
             (Tabs → Restart) for the tools to appear.
           </small>
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.code_audit.expose_claude}
-              onchange={(e) =>
-                patch(
-                  (s) =>
-                    (s.code_audit.expose_claude = (
-                      e.currentTarget as HTMLInputElement
-                    ).checked),
-                )}
-            />
-            <span>Expose to Claude Code</span>
-          </label>
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.code_audit.expose_opencode}
-              onchange={(e) =>
-                patch(
-                  (s) =>
-                    (s.code_audit.expose_opencode = (
-                      e.currentTarget as HTMLInputElement
-                    ).checked),
-                )}
-            />
-            <span>Expose to OpenCode</span>
-          </label>
+<!-- V40 Phase B: one box per REGISTERED harness. It was a hand-written
+               Claude/OpenCode pair, so Code Audit would have been unreachable
+               from a third harness until someone edited this file. -->
+          {#each $harnessSchemas as h (h.id)}
+            <label class="checkbox">
+              <input
+                type="checkbox"
+                checked={harnessRow(snapshot, h.id).expose_code_audit}
+                onchange={(e) =>
+                  patch((s) => {
+                    const on = (e.currentTarget as HTMLInputElement).checked;
+                    s.harness = {
+                      ...(s.harness ?? {}),
+                      [h.id]: { ...harnessRow(s, h.id), expose_code_audit: on },
+                    };
+                  })}
+              />
+              <span>Expose to {h.label}</span>
+            </label>
+          {/each}
           <label class="checkbox">
             <input
               type="checkbox"
@@ -6923,34 +6871,25 @@
             Managed-tool steering), which is spawn-baked on both harnesses — so
             open tabs are owed a restart either way.
           </small>
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.tool_plugins?.expose_commands_claude ?? true}
-              onchange={(e) =>
-                patch(
-                  (s) =>
-                    (s.tool_plugins.expose_commands_claude = (
-                      e.currentTarget as HTMLInputElement
-                    ).checked),
-                )}
-            />
-            <span>Expose to Claude Code</span>
-          </label>
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.tool_plugins?.expose_commands_opencode ?? true}
-              onchange={(e) =>
-                patch(
-                  (s) =>
-                    (s.tool_plugins.expose_commands_opencode = (
-                      e.currentTarget as HTMLInputElement
-                    ).checked),
-                )}
-            />
-            <span>Expose to OpenCode</span>
-          </label>
+<!-- V40 Phase B: one box per registered harness, same reason as the
+               Code Audit set above. -->
+          {#each $harnessSchemas as h (h.id)}
+            <label class="checkbox">
+              <input
+                type="checkbox"
+                checked={harnessRow(snapshot, h.id).expose_commands}
+                onchange={(e) =>
+                  patch((s) => {
+                    const on = (e.currentTarget as HTMLInputElement).checked;
+                    s.harness = {
+                      ...(s.harness ?? {}),
+                      [h.id]: { ...harnessRow(s, h.id), expose_commands: on },
+                    };
+                  })}
+              />
+              <span>Expose to {h.label}</span>
+            </label>
+          {/each}
 
           {#snippet toolPluginRow(plugin: PluginRow, tool: ToolRow)}
             <div class="audit-tool">

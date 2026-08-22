@@ -223,6 +223,13 @@ pub struct NativeTool {
 /// widget would be a harness-shaped UI in core again, which is the thing this
 /// milestone is removing; [`Self::Json`] is the escape hatch and it renders
 /// nothing (see its docs).
+// `Int`, `Path` and `Enum` are unconstructed today, and deliberately declared
+// anyway — the same reasoning as `PasteMode::Raw`. This is the vocabulary a
+// harness's settings are stated IN, and a form that can only render checkboxes
+// and text boxes is one a harness author works around rather than declares
+// against. A kind that only appears once someone needs it is a kind nobody can
+// find.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingKind {
     /// A checkbox.
@@ -267,6 +274,7 @@ impl SettingKind {
 }
 
 /// A declared default, as data — so [`SettingField`] can be a `const` table.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SettingDefault {
     Bool(bool),

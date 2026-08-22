@@ -40,6 +40,10 @@ pub async fn pty_start(
     let settings = state.settings.clone();
     let restore_on_launch = settings.current().terminal.scrollback.restore_on_launch;
 
+    // V39 review R-5: seed the activity mirror for THIS start and carry its
+    // generation into the spawn, so an exit belonging to an earlier start of
+    // the same tab can be recognised as late rather than latched onto this one.
+    let start_gen = state.tab_activity.begin_start(&tab);
     {
         let registry = state.tabs.lock().await;
         registry
@@ -54,6 +58,7 @@ pub async fn pty_start(
                 tts_tx,
                 user_typed,
                 settings,
+                start_gen,
             )
             .await?;
     }
@@ -110,6 +115,22 @@ pub async fn pty_restart(
     let tts_tx = state.tts_segments.clone();
     let user_typed = state.user_typed_tts.clone();
     let settings = state.settings.clone();
+    // V39 review HIGH-3 + R-5: re-seed the activity mirror for the fresh
+    // subprocess, BEFORE it is spawned.
+    //
+    // `TabActivity::exited` is latched, and the two signals that clear it do
+    // not cover this path: `TabAdded` fires for a NEW tab, and `ShellRestarted`
+    // is emitted for Shell-kind tabs only (`TabRegistry::restart_tab`). An AI
+    // tab — the only kind a delegation can drive — therefore restarted into a
+    // row still marked `exited`, and preflight refused it forever with "has no
+    // running process".
+    //
+    // Before the spawn rather than after it (R-5), and with a generation the
+    // spawn carries: clearing afterwards raced the old child's exit through the
+    // state-manager mpsc, which re-latched `exited` on the process that had
+    // just started. A failed restart re-latches it honestly — its own failure
+    // path emits an exit under THIS generation.
+    let start_gen = state.tab_activity.begin_start(&tab);
     let registry = state.tabs.lock().await;
     let result = registry
         .restart_tab(
@@ -123,6 +144,7 @@ pub async fn pty_restart(
             tts_tx,
             user_typed,
             settings,
+            start_gen,
         )
         .await;
     // V39 review HIGH-3: re-seed the activity mirror for the fresh subprocess.
@@ -134,9 +156,6 @@ pub async fn pty_restart(
     // row still marked `exited`, and preflight refused it forever with "has no
     // running process". Only on success: a failed restart leaves no process,
     // and clearing the flag would claim one.
-    if result.is_ok() {
-        state.tab_activity.reset(&tab);
-    }
     // V1.4-04 D.6: on user-initiated restart, the prior session's
     // scrollback is no longer relevant. Clear the in-memory ring so
     // the next graceful-exit persist doesn't include stale bytes from

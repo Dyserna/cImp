@@ -1278,6 +1278,53 @@ mod tests {
         );
     }
 
+    /// **A late exit from the PREVIOUS start does not kill the new one**
+    /// (V39 review R-5).
+    ///
+    /// State signals reach the mirror through an mpsc, and a restart kills the
+    /// old child while the queue may still be draining — so the exit that
+    /// belongs to the process being replaced could be handled AFTER the new one
+    /// had been seeded, re-latching `exited` on a live tab and refusing it as a
+    /// worker permanently. The signal carries the start it belongs to, and a
+    /// start the row has moved past is ignored.
+    #[test]
+    fn an_exit_from_a_previous_start_is_not_this_process_exiting() {
+        use crate::state::{StateSignal, TabActivity, TabId};
+        let mirror = TabActivity::default();
+        let tab = TabId::from_str("ai-restart-race");
+
+        let first = mirror.begin_start(&tab);
+        // The user restarts: the mirror is seeded for the NEW start before the
+        // spawn, exactly as `pty_restart` does it.
+        let second = mirror.begin_start(&tab);
+        assert!(second > first, "each start gets its own generation");
+
+        // …and only now does the OLD child's exit come out of the queue.
+        mirror.note_signal(&StateSignal::SubprocessExited {
+            tab: tab.clone(),
+            code: Some(1),
+            start_gen: first,
+        });
+        let flags = mirror.flags(&tab);
+        assert!(
+            !flags.exited,
+            "a late exit from the start we replaced must not mark the live process dead"
+        );
+        assert!(
+            worker_process(true, flags.exited, "api-work").is_ok(),
+            "…and the tab is still a worker"
+        );
+
+        // The CURRENT start's own exit is not ignored.
+        mirror.note_signal(&StateSignal::SubprocessExited {
+            tab: tab.clone(),
+            code: Some(1),
+            start_gen: second,
+        });
+        assert!(mirror.flags(&tab).exited);
+        assert!(worker_process(true, mirror.flags(&tab).exited, "api-work").is_err());
+    }
+
     /// **A restarted worker is a worker again** (V39 review HIGH-3).
     ///
     /// `TabActivity::exited` is latched — a dead process is not something the
@@ -1293,6 +1340,7 @@ mod tests {
         mirror.note_signal(&StateSignal::SubprocessExited {
             tab: tab.clone(),
             code: Some(1),
+            start_gen: 0,
         });
         let dead = mirror.flags(&tab);
         assert!(dead.exited);

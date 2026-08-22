@@ -287,6 +287,10 @@ impl PtyManager {
         _user_typed_tts: Arc<StdMutex<HashSet<String>>>,
         state_signals: mpsc::Sender<StateSignal>,
         patterns: Arc<Vec<PermissionPattern>>,
+        // V39 review R-5: the generation this start is filed under, from
+        // `TabActivity::begin_start`. Every exit this start can produce carries
+        // it, so an exit handled after a later restart is ignorable.
+        start_gen: u64,
     ) -> AppResult<()> {
         let mut guard = self.inner.lock().await;
         if guard.is_some() {
@@ -341,7 +345,11 @@ impl PtyManager {
         // exactly the degradation V33 decision 5 forbids, and the user sees the
         // reason as the tab's launch error.
         if let crate::sandbox::tabs::TabPlan::Refused(reason) = &sandbox_plan {
-            let _ = state_signals.try_send(StateSignal::SubprocessExited { tab, code: None });
+            let _ = state_signals.try_send(StateSignal::SubprocessExited {
+                tab,
+                code: None,
+                start_gen,
+            });
             return Err(AppError::Spawn(reason.clone()));
         }
 
@@ -378,7 +386,11 @@ impl PtyManager {
                     Ok(pair) => pair,
                     Err(e) => {
                         let _ = state_signals
-                            .try_send(StateSignal::SubprocessExited { tab, code: None });
+                            .try_send(StateSignal::SubprocessExited {
+                tab,
+                code: None,
+                start_gen,
+            });
                         return Err(AppError::Spawn(e));
                     }
                 }
@@ -395,7 +407,11 @@ impl PtyManager {
                         // path; emit it here so the state machine pins the tab
                         // to Error and the avatar reflects the failure.
                         let _ = state_signals
-                            .try_send(StateSignal::SubprocessExited { tab, code: None });
+                            .try_send(StateSignal::SubprocessExited {
+                tab,
+                code: None,
+                start_gen,
+            });
                         return Err(AppError::Pty(format!("openpty: {e}")));
                     }
                 };
@@ -409,7 +425,11 @@ impl PtyManager {
                     Ok(c) => c,
                     Err(e) => {
                         let _ = state_signals
-                            .try_send(StateSignal::SubprocessExited { tab, code: None });
+                            .try_send(StateSignal::SubprocessExited {
+                tab,
+                code: None,
+                start_gen,
+            });
                         return Err(AppError::Spawn(format!("{e}")));
                     }
                 };
@@ -448,7 +468,11 @@ impl PtyManager {
             Ok(r) => r,
             Err(e) => {
                 let _ = child.clone_killer().kill();
-                let _ = state_signals.try_send(StateSignal::SubprocessExited { tab, code: None });
+                let _ = state_signals.try_send(StateSignal::SubprocessExited {
+                tab,
+                code: None,
+                start_gen,
+            });
                 return Err(AppError::Pty(format!("try_clone_reader: {e}")));
             }
         };
@@ -456,7 +480,11 @@ impl PtyManager {
             Ok(w) => w,
             Err(e) => {
                 let _ = child.clone_killer().kill();
-                let _ = state_signals.try_send(StateSignal::SubprocessExited { tab, code: None });
+                let _ = state_signals.try_send(StateSignal::SubprocessExited {
+                tab,
+                code: None,
+                start_gen,
+            });
                 return Err(AppError::Pty(format!("take_writer: {e}")));
             }
         };
@@ -536,7 +564,14 @@ impl PtyManager {
             patterns,
             oob_drives_activity,
         );
-        tasks::spawn_waiter(tab.clone(), child, app, cancel.clone(), state_signals);
+        tasks::spawn_waiter(
+            tab.clone(),
+            child,
+            app,
+            cancel.clone(),
+            state_signals,
+            start_gen,
+        );
 
         // H1-R3 (2026-08-05 review): KEEP THIS IN THE SAME SYNCHRONOUS STRETCH
         // as the `spawn_command` above — do not insert an `.await` (or any

@@ -250,6 +250,11 @@ pub struct TabActivityFlags {
     /// type into a tab mid-burst: the request would land in the middle of
     /// someone else's turn.
     pub output_running: bool,
+    /// The start this row describes (V39 review R-5) — bumped by
+    /// [`TabActivity::begin_start`] before every spawn, and carried by that
+    /// spawn's exit signal so a late exit from a PREVIOUS start can be ignored
+    /// instead of re-latching `exited` on a live process.
+    pub start_gen: u64,
     /// The tab's subprocess has exited. Latched: only a restart clears it —
     /// `TabAdded` (a fresh tab), `ShellRestarted` (a shell respawn) or
     /// `pty_restart` (an AI tab respawn, which emits no signal of its own).
@@ -303,16 +308,26 @@ impl TabActivity {
             StateSignal::QuestionPromptResolved { tab } => (tab, |f| f.awaiting_question = false),
             StateSignal::ClaudeOutputStarted { tab } => (tab, |f| f.output_running = true),
             StateSignal::ClaudeOutputStopped { tab } => (tab, |f| f.output_running = false),
-            StateSignal::SubprocessExited { tab, .. } => (tab, |f| {
-                f.exited = true;
+            // V39 review R-5: an exit from a start this row has moved past is
+            // NOT this process's exit. Handled here rather than by the generic
+            // arm below because it is the one signal whose meaning depends on
+            // WHICH start it came from.
+            StateSignal::SubprocessExited { tab, start_gen, .. } => {
+                let mut map = self.inner.write().unwrap_or_else(|e| e.into_inner());
+                let entry = map.entry(tab.clone()).or_default();
+                if *start_gen < entry.start_gen {
+                    return;
+                }
+                entry.exited = true;
                 // A dead process is not mid-burst and holds no prompt. Left
                 // set, `output_running` would make every later preflight
                 // refuse a tab the user has since restarted, for a burst that
                 // ended when the process did.
-                f.output_running = false;
-                f.awaiting_permission = false;
-                f.awaiting_question = false;
-            }),
+                entry.output_running = false;
+                entry.awaiting_permission = false;
+                entry.awaiting_question = false;
+                return;
+            }
             // V39 review HIGH-3: a restarted subprocess is a CLEAN one. The
             // mirror's `exited` is latched and was cleared only by `TabAdded`,
             // which a restart into an existing tab never sends — so a worker
@@ -336,10 +351,40 @@ impl TabActivity {
     }
 
     /// Seed (or re-seed) a tab with clean flags — a fresh or restarted
-    /// subprocess. Clears a latched `exited`.
+    /// subprocess. Clears a latched `exited`, and keeps the row's generation
+    /// (only [`Self::begin_start`] moves that).
     pub fn reset(&self, tab: &TabId) {
         let mut map = self.inner.write().unwrap_or_else(|e| e.into_inner());
-        map.insert(tab.clone(), TabActivityFlags::default());
+        let start_gen = map.get(tab).map(|f| f.start_gen).unwrap_or(0);
+        map.insert(
+            tab.clone(),
+            TabActivityFlags {
+                start_gen,
+                ..TabActivityFlags::default()
+            },
+        );
+    }
+
+    /// **A new subprocess is about to be spawned for `tab`** (V39 review R-5):
+    /// clean flags, and a NEW generation, which the caller hands to the spawn
+    /// so that start's exit signal carries it.
+    ///
+    /// The generation is what makes a late exit recognisable. `reset` alone
+    /// could not: signals arrive through an mpsc, so an exit emitted while the
+    /// old child was being killed can be handled after the reset, re-latching
+    /// `exited` on the process that just started — and preflight then refuses a
+    /// live worker with "has no running process", permanently.
+    pub fn begin_start(&self, tab: &TabId) -> u64 {
+        let mut map = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        let start_gen = map.get(tab).map(|f| f.start_gen).unwrap_or(0) + 1;
+        map.insert(
+            tab.clone(),
+            TabActivityFlags {
+                start_gen,
+                ..TabActivityFlags::default()
+            },
+        );
+        start_gen
     }
 
     /// Drop a closed tab's row, beside the other per-tab map cleanups.
@@ -685,6 +730,18 @@ pub enum StateSignal {
     SubprocessExited {
         tab: TabId,
         code: Option<i32>,
+        /// **Which start of this tab exited** (V39 review R-5).
+        ///
+        /// Signals reach the state manager through an mpsc, so an exit emitted
+        /// while a tab was being restarted can be HANDLED after the restart has
+        /// already re-seeded the activity mirror — re-latching `exited` on a
+        /// process that is running, and refusing the tab as a delegation worker
+        /// forever. The generation is taken from
+        /// [`TabActivity::begin_start`](crate::state::TabActivity::begin_start)
+        /// before the spawn and carried by the waiter that observes THAT
+        /// child's exit, so a late one is recognisable rather than merely
+        /// early.
+        start_gen: u64,
     },
     AudioError {
         tab: TabId,
@@ -1254,7 +1311,7 @@ async fn run(
                 // generic transition path below where the existing v1 logic
                 // turns the signal into Error. Spawn-time failures with
                 // `code = None` still hit this same branch.
-                if let StateSignal::SubprocessExited { tab, code } = &signal {
+                if let StateSignal::SubprocessExited { tab, code, .. } = &signal {
                     let tab = tab.clone();
                     let code = *code;
                     let route_to_closed = tabs
@@ -1843,7 +1900,8 @@ mod tests {
                     s,
                     SubprocessExited {
                         tab: tab(),
-                        code: None
+                        code: None,
+                        start_gen: 0
                     }
                 ),
                 Error
@@ -2184,7 +2242,8 @@ mod tests {
         // it via transition() directly.
         assert!(!is_error_edge(&SubprocessExited {
             tab: tab(),
-            code: None
+            code: None,
+            start_gen: 0
         }));
         assert!(!is_error_edge(&UserKeystroke { tab: tab() }));
         assert!(!is_error_edge(&UserSubmit { tab: tab() }));

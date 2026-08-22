@@ -91,9 +91,13 @@
     color: var(--accent);
     background: color-mix(in srgb, var(--accent) 16%, var(--surface-0));
     border-bottom: 1px solid var(--accent);
-    /* The strip itself takes clicks (the button is on it); everything below is
-       untouched because the strip is only as tall as one row. */
-    pointer-events: auto;
+    /* V39 review L-5: the strip is TRANSPARENT to the pointer, and only the
+       Take over button on it is not. It is a full-width overlay pinned to the
+       top of `.pane-content`, so with `pointer-events: auto` it ate every click
+       and every wheel report aimed at the terminal's first row — the row an
+       alt-screen TUI puts its own controls on, on the very tab the user is
+       being asked to watch. The button re-enables itself below. */
+    pointer-events: none;
     user-select: none;
   }
   /* A prompt is standing: this is the state where the delegation is waiting on
@@ -122,6 +126,9 @@
     flex: 1 1 auto;
   }
   .takeover {
+    /* The one thing on the strip that is meant to be clicked — see the
+       `pointer-events: none` on the strip itself. */
+    pointer-events: auto;
     flex: 0 0 auto;
     appearance: none;
     font-family: inherit;

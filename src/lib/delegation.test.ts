@@ -369,6 +369,43 @@ const DELEGATION_SOURCE = import.meta.glob('/src/lib/delegation.ts', {
   eager: true,
 }) as Record<string, string>;
 
+/// The banner's own source, for the same reason: a `.svelte` file has no test
+/// harness here, and the rule under test (V39 review L-5) is a CSS property
+/// whose absence is invisible until a user tries to click the terminal's first
+/// row on a driven tab.
+const BANNER_SOURCE = import.meta.glob('/src/lib/DelegationBanner.svelte', {
+  query: '?raw',
+  import: 'default',
+  eager: true,
+}) as Record<string, string>;
+
+describe('the banner overlay does not eat the terminal it covers', () => {
+  /// It is a full-width `position: absolute` strip at `top: 0` of
+  /// `.pane-content` (an overlay on purpose — a real row would refit xterm and
+  /// resize the PTY mid-turn). With `pointer-events: auto` on the strip, every
+  /// click and wheel report aimed at the first row of an alt-screen TUI landed
+  /// on the banner instead. The strip is transparent; only the button is not.
+  it('makes the strip pointer-transparent and re-enables only the button', () => {
+    const src = Object.values(BANNER_SOURCE)[0] ?? '';
+    expect(src.length).toBeGreaterThan(0);
+    // Comments first: the rules below are EXPLAINED in prose that names the
+    // property they replace, and a scan that could not tell prose from CSS
+    // would either fail on the documentation or force it to be deleted.
+    const css = src.slice(src.indexOf('<style>')).replace(/\/\*[\s\S]*?\*\//g, '');
+    const rule = (selector: string): string => {
+      const at = css.indexOf(selector);
+      expect(at, `${selector} must exist`).toBeGreaterThan(-1);
+      const open = css.indexOf('{', at);
+      return css.slice(open, css.indexOf('}', open));
+    };
+    expect(rule('.delegation-banner {')).toMatch(/pointer-events:\s*none/);
+    expect(rule('.takeover {')).toMatch(/pointer-events:\s*auto/);
+    // …and nothing else on the strip claims the pointer back.
+    const claims = css.match(/pointer-events:\s*auto/g) ?? [];
+    expect(claims).toHaveLength(1);
+  });
+});
+
 describe('the attribution never reaches the backend', () => {
   it('leaves delegation.ts with no transport at all', () => {
     const src = Object.values(DELEGATION_SOURCE)[0] ?? '';

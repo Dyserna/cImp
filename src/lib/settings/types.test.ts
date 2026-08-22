@@ -1,4 +1,13 @@
-import { describe, expect, test } from 'vitest';
+import { beforeEach, describe, expect, test } from 'vitest';
+import {
+  FIXTURE_HARNESSES,
+  installFixtureHarnesses,
+} from '../harness.fixture';
+import { scopedFeatureOwner } from '../harness';
+
+// V40 Phase F: the harness-scoped feature's owner is a registry lookup now, so
+// the store has to be filled for `spawnBakedInjectionL2` to read its cell.
+beforeEach(installFixtureHarnesses);
 
 import {
   LOCAL_DATA_TOOLS,
@@ -9,6 +18,7 @@ import {
   spawnBakedInjectionL2,
   spawnBakedTabOverrides,
   toolScopeMode,
+  HARNESS_NATIVE_GATE_KEY,
 } from './types';
 import type { Settings, TabInjectionOverrides } from './types';
 
@@ -100,7 +110,7 @@ describe('SPAWN_BAKED_INJECTION_FEATURES (Rust mirror)', () => {
       [
         'consumer_hygiene',
         'native_web',
-        'opencode_native_gate',
+        HARNESS_NATIVE_GATE_KEY,
         'spotlighting',
         // The managed-tool steering paragraph, written into the same guidance
         // channel as `consumer_hygiene`'s at launch.
@@ -143,8 +153,14 @@ describe('spawnBakedInjectionL2', () => {
       consumer_hygiene: (s) =>
         (s.offload.injection.consumer_hygiene_enabled =
           !s.offload.injection.consumer_hygiene_enabled),
-      // The harness-scoped one: its L2 is the declaring plugin's `ext` row.
-      opencode_native_gate: (s) => setHarnessExt(s, 'opencode', 'native_gate', false),
+      // The harness-scoped one: its L2 is the DECLARING plugin's `ext` row, and
+      // which plugin that is comes from the registry (V40 Phase F) rather than
+      // from a harness named here.
+      [HARNESS_NATIVE_GATE_KEY]: (s) => {
+        const owner = scopedFeatureOwner(FIXTURE_HARNESSES, HARNESS_NATIVE_GATE_KEY);
+        expect(owner, 'no harness scopes the native gate').not.toBeNull();
+        setHarnessExt(s, owner!.harness.id, owner!.extKey, false);
+      },
       tool_steering: (s) =>
         (s.offload.injection.tool_steering_enabled = !s.offload.injection.tool_steering_enabled),
     };

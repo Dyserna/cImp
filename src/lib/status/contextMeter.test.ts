@@ -1,12 +1,10 @@
 import { describe, expect, test } from 'vitest';
+import { clampPct, hasQuotaData, humanizeTokens, statuslineRowsFor, usagePushHarness } from './contextMeter';
 import {
-  clampPct,
-  claudePushTabActive,
-  commandIsClaude,
-  hasQuotaData,
-  humanizeTokens,
-  usagePushHarness,
-} from './contextMeter';
+  FIXTURE_HARNESSES,
+  fixtureHarnessWith,
+  fixtureHarnessWithout,
+} from '../harness.fixture';
 import type { UsageReading } from '../ipc';
 
 describe('humanizeTokens', () => {
@@ -56,45 +54,91 @@ describe('hasQuotaData', () => {
   });
 });
 
-describe('claudePushTabActive', () => {
-  const claude = { kind: 'ai_tool', id: 'claude', command: 'claude' };
-  const claudeLocal = { kind: 'ai_tool', id: 'claude-local', command: 'claude' };
-  const opencode = { kind: 'ai_tool', id: 'opencode', command: 'opencode' };
-  const shell = { kind: 'shell', id: 'shell-default-1', command: 'claude' };
+// V40 Phase F: every id below comes from the committed registry fixture, so
+// this suite says what it means — "the harness that pushes readings", "one that
+// does not" — instead of naming a product. `pusher` is whichever harness
+// declares `usage_push`; `quiet` is one that does not.
+const pusher = fixtureHarnessWith('usage_push')!;
+const quiet = fixtureHarnessWithout('usage_push')!;
+const all = FIXTURE_HARNESSES;
 
-  test('mirrors the backend command_is check', () => {
-    expect(commandIsClaude('claude')).toBe(true);
-    expect(commandIsClaude('CLAUDE.EXE')).toBe(true);
-    expect(commandIsClaude('C:\\Users\\me\\bin\\claude.exe')).toBe(true);
-    expect(commandIsClaude('/usr/local/bin/claude.cmd')).toBe(true);
-    expect(commandIsClaude('  claude  ')).toBe(true);
-    expect(commandIsClaude('opencode')).toBe(false);
-    expect(commandIsClaude('claude-code')).toBe(false);
-    expect(commandIsClaude('')).toBe(false);
-    expect(commandIsClaude(undefined)).toBe(false);
+describe('usagePushHarness', () => {
+  // The reserved tab of the pushing harness, its VARIANT tab (same binary,
+  // second reserved id) and a tab of the harness that pushes nothing.
+  const primary = { kind: 'ai_tool', id: pusher.tab_ids[0], command: pusher.binaries[0] };
+  const variant = { kind: 'ai_tool', id: pusher.tab_ids[1], command: pusher.binaries[0] };
+  const other = { kind: 'ai_tool', id: quiet.tab_ids[0], command: quiet.binaries[0] };
+  const shell = { kind: 'shell', id: 'shell-default-1', command: pusher.binaries[0] };
+
+  test('resolves the command on its file stem, like the backend does', () => {
+    const bin = pusher.binaries[0];
+    for (const command of [
+      bin,
+      bin.toUpperCase() + '.EXE',
+      'C:/Users/me/bin/' + bin + '.exe',
+      `/usr/local/bin/${bin}.cmd`,
+      `  ${bin}  `,
+    ]) {
+      expect(usagePushHarness(all, [{ kind: 'ai_tool', id: 'ai-1', command }], [])).toBe(pusher.id);
+    }
   });
 
-  test('claude-local counts even with the subscription tab disabled', () => {
-    // M15: statusline injection is per command, so this tab pushes too.
-    expect(claudePushTabActive([claude, claudeLocal, opencode], ['claude-local'])).toBe(true);
+  test('a command no harness declares resolves to no harness', () => {
+    // Locked decision 2's frontend half: not the default harness, `null`.
+    for (const command of [`${pusher.binaries[0]}-code`, '', undefined]) {
+      expect(usagePushHarness(all, [{ kind: 'ai_tool', id: 'ai-1', command }], [])).toBe(null);
+    }
+  });
+
+  test('the variant tab counts even with the primary one disabled', () => {
+    // M15: status-line injection is per command, so this tab pushes too.
+    expect(usagePushHarness(all, [primary, variant, other], [variant.id])).toBe(pusher.id);
   });
 
   test('a reserved tab that is switched off does not count', () => {
-    expect(claudePushTabActive([claude, claudeLocal], ['opencode'])).toBe(false);
-    expect(claudePushTabActive([claude, claudeLocal], ['claude'])).toBe(true);
+    expect(usagePushHarness(all, [primary, variant], [other.id])).toBe(null);
+    expect(usagePushHarness(all, [primary, variant], [primary.id])).toBe(pusher.id);
   });
 
-  test('user-created claude-command tabs count and are never id-gated', () => {
-    const custom = { kind: 'ai_tool', id: 'ai-abc123', command: 'C:\\tools\\claude.exe' };
-    expect(claudePushTabActive([custom], [])).toBe(true);
+  test('user-created tabs count and are never id-gated', () => {
+    const custom = {
+      kind: 'ai_tool',
+      id: 'ai-abc123',
+      command: 'C:/tools/' + pusher.binaries[0] + '.exe',
+    };
+    expect(usagePushHarness(all, [custom], [])).toBe(pusher.id);
   });
 
-  test('non-AI tabs and non-claude commands never count', () => {
-    expect(claudePushTabActive([shell, opencode], ['opencode'])).toBe(false);
-    expect(claudePushTabActive([], ['claude'])).toBe(false);
-    expect(claudePushTabActive(null, ['claude'])).toBe(false);
+  test('non-AI tabs never count', () => {
+    expect(usagePushHarness(all, [shell], [])).toBe(null);
     // A Preview tab has no `command` field at all.
-    expect(claudePushTabActive([{ kind: 'preview', id: 'preview-1' }], ['claude'])).toBe(false);
+    expect(usagePushHarness(all, [{ kind: 'preview', id: 'preview-1' }], [primary.id])).toBe(null);
+  });
+
+  test('a harness with no usage source is never polled', () => {
+    // It must not be rendered as a harness sitting at 0% either — the widget
+    // hides on `null`.
+    expect(usagePushHarness(all, [other], [other.id])).toBe(null);
+    expect(usagePushHarness(all, [], [])).toBe(null);
+    expect(usagePushHarness(all, null, [])).toBe(null);
+  });
+
+  test('before the registry answers, nothing is polled', () => {
+    // The store starts empty; a widget that guessed a harness here would poll
+    // an id the backend may not have.
+    expect(usagePushHarness([], [primary], [primary.id])).toBe(null);
+  });
+});
+
+describe('statuslineRowsFor', () => {
+  test('the pushing harness declares how tall the strip must be', () => {
+    expect(statuslineRowsFor(all, pusher.id)).toBe(pusher.affordances.statuslineRows);
+    expect(statuslineRowsFor(all, pusher.id)).toBeGreaterThan(0);
+  });
+
+  test('an unknown or absent harness leaves the stylesheet default alone', () => {
+    expect(statuslineRowsFor(all, 'nobody')).toBe(0);
+    expect(statuslineRowsFor(all, null)).toBe(0);
   });
 });
 
@@ -104,21 +148,5 @@ describe('clampPct', () => {
     expect(clampPct(42.4)).toBe(42.4);
     expect(clampPct(150)).toBe(100);
     expect(clampPct(NaN)).toBe(0);
-  });
-});
-
-describe('usagePushHarness', () => {
-  const claude = { kind: 'ai_tool', id: 'claude', command: 'claude' };
-  const opencode = { kind: 'ai_tool', id: 'opencode', command: 'opencode' };
-
-  test('names the harness whose usage source the widget should poll', () => {
-    expect(usagePushHarness([claude], ['claude'])).toBe('claude');
-  });
-
-  test('is null when nothing running can push a reading', () => {
-    // OpenCode has NO usage source; the widget must not poll — and must never
-    // render a harness that cannot report quota as a harness at 0%.
-    expect(usagePushHarness([opencode], ['opencode'])).toBe(null);
-    expect(usagePushHarness([], [])).toBe(null);
   });
 });

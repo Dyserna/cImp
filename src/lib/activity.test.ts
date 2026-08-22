@@ -30,13 +30,21 @@ import {
   type RowStatus,
 } from './activity';
 
+import { FIRST_HARNESS, SECOND_HARNESS } from './harness.fixture';
+
+// V40 Phase F: the tab/source ids below come from the committed registry
+// fixture. These tests are about ATTRIBUTION — which tab, recognized or not —
+// so what matters is that the ids are real ones, not which products they name.
+const H1 = FIRST_HARNESS.id;
+const H2 = SECOND_HARNESS.id;
+
 function entry(id: number, over: Partial<ActivityEntry> = {}): ActivityEntry {
   return {
     id,
     ts_ms: 1_000 + id,
     kind: 'graph',
     root: '/p',
-    source: 'claude',
+    source: H1,
     tool: 'graph_outline',
     target: 'src/lib.rs',
     chars: 10,
@@ -118,12 +126,12 @@ describe('attributionState / attributionId', () => {
   it('classifies the four wire shapes', () => {
     expect(attributionState('unattributed')).toBe('unattributed');
     expect(attributionState('headless')).toBe('headless');
-    expect(attributionState({ tab: 'claude' })).toBe('tab');
-    expect(attributionState({ unrecognized: 'claude' })).toBe('unrecognized');
+    expect(attributionState({ tab: H1 })).toBe('tab');
+    expect(attributionState({ unrecognized: H1 })).toBe('unrecognized');
   });
 
   it('returns the id only for the two states that carry one', () => {
-    expect(attributionId({ tab: 'claude' })).toBe('claude');
+    expect(attributionId({ tab: H1 })).toBe(H1);
     expect(attributionId({ unrecognized: 'ghost' })).toBe('ghost');
     expect(attributionId('headless')).toBeNull();
     expect(attributionId('unattributed')).toBeNull();
@@ -148,12 +156,12 @@ describe('attributionState / attributionId', () => {
   });
 
   it('isTabAttribution is true ONLY for a real tab of that id', () => {
-    expect(isTabAttribution({ tab: 'claude' }, 'claude')).toBe(true);
-    expect(isTabAttribution({ tab: 'claude' }, 'opencode')).toBe(false);
+    expect(isTabAttribution({ tab: H1 }, H1)).toBe(true);
+    expect(isTabAttribution({ tab: H1 }, H2)).toBe(false);
     // The load-bearing case: the row merely quoted the id.
-    expect(isTabAttribution({ unrecognized: 'claude' }, 'claude')).toBe(false);
-    expect(isTabAttribution('headless', 'claude')).toBe(false);
-    expect(isTabAttribution('unattributed', 'claude')).toBe(false);
+    expect(isTabAttribution({ unrecognized: H1 }, H1)).toBe(false);
+    expect(isTabAttribution('headless', H1)).toBe(false);
+    expect(isTabAttribution('unattributed', H1)).toBe(false);
   });
 });
 
@@ -161,8 +169,8 @@ describe('matchesTabFilter', () => {
   const all: Attribution[] = [
     'unattributed',
     'headless',
-    { tab: 'claude' },
-    { unrecognized: 'claude' },
+    { tab: H1 },
+    { unrecognized: H1 },
   ];
 
   it('"any" matches every state', () => {
@@ -170,9 +178,9 @@ describe('matchesTabFilter', () => {
   });
 
   it('a tab filter matches {tab:x} and never {unrecognized:x}', () => {
-    const f = tabFilterValue('claude');
-    expect(matchesTabFilter({ tab: 'claude' }, f)).toBe(true);
-    expect(matchesTabFilter({ unrecognized: 'claude' }, f)).toBe(false);
+    const f = tabFilterValue(H1);
+    expect(matchesTabFilter({ tab: H1 }, f)).toBe(true);
+    expect(matchesTabFilter({ unrecognized: H1 }, f)).toBe(false);
     expect(matchesTabFilter('headless', f)).toBe(false);
     expect(matchesTabFilter('unattributed', f)).toBe(false);
   });
@@ -186,7 +194,7 @@ describe('matchesTabFilter', () => {
 
   it('selects unrecognized rows through their own option only', () => {
     expect(matchesTabFilter({ unrecognized: 'ghost' }, TAB_FILTER_UNRECOGNIZED)).toBe(true);
-    expect(matchesTabFilter({ tab: 'claude' }, TAB_FILTER_UNRECOGNIZED)).toBe(false);
+    expect(matchesTabFilter({ tab: H1 }, TAB_FILTER_UNRECOGNIZED)).toBe(false);
   });
 
   it('a tab literally named "headless" does not hijack the state option', () => {
@@ -199,17 +207,17 @@ describe('matchesTabFilter', () => {
   it('narrows to nothing on an option this build does not know', () => {
     // A stale selection must not silently widen the feed — showing MORE than
     // was asked for is the failure mode that misleads in an attribution view.
-    expect(matchesTabFilter({ tab: 'claude' }, 'tab-claude')).toBe(false);
+    expect(matchesTabFilter({ tab: H1 }, `tab-${H1}`)).toBe(false);
   });
 });
 
 describe('filterEntries', () => {
   const feed = [
-    entry(5, { kind: 'mcp', source: 'claude', tab: { tab: 'claude' }, session: 's1' }),
-    entry(4, { kind: 'graph', source: 'claude', tab: { unrecognized: 'claude' } }),
+    entry(5, { kind: 'mcp', source: H1, tab: { tab: H1 }, session: 's1' }),
+    entry(4, { kind: 'graph', source: H1, tab: { unrecognized: H1 } }),
     entry(3, { kind: 'graph', source: 'offload', tab: 'headless' }),
     entry(2, { kind: 'offload', source: 'offload', tab: 'unattributed' }),
-    entry(1, { kind: 'injection_flag', source: 'ssrf', tab: { tab: 'opencode' } }),
+    entry(1, { kind: 'injection_flag', source: 'ssrf', tab: { tab: H2 } }),
   ];
 
   it('returns the SAME array when nothing is constrained', () => {
@@ -225,8 +233,8 @@ describe('filterEntries', () => {
     ]);
   });
 
-  it('filtering by tab "claude" excludes the row that only quoted that id', () => {
-    const got = filterEntries(feed, { ...NO_FILTER, tab: tabFilterValue('claude') });
+  it('filtering by one tab id excludes the row that only quoted that id', () => {
+    const got = filterEntries(feed, { ...NO_FILTER, tab: tabFilterValue(H1) });
     expect(got.map((e) => e.id)).toEqual([5]);
   });
 
@@ -697,8 +705,8 @@ describe('rowStatus — plugin discovery', () => {
 function dlg(tool: string, ok: boolean, over: Partial<ActivityEntry> = {}): ActivityEntry {
   return entry(1, {
     kind: 'delegation',
-    source: 'opencode',
-    tab: { tab: 'opencode' },
+    source: H2,
+    tab: { tab: H2 },
     tool,
     ok,
     ...over,
@@ -755,7 +763,7 @@ describe('rowStatus — delegation transitions', () => {
   it('does not treat the driver harness as a canary source', () => {
     // `source` here is a harness id, not a telemetry channel — a `refused` row
     // must read as a failed delegation, not as a signal that fired.
-    expect(rowStatus(dlg('refused', false, { source: 'claude' }))).toBe('failed');
+    expect(rowStatus(dlg('refused', false, { source: H1 }))).toBe('failed');
   });
 });
 

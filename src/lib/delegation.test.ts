@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { beforeEach, describe, it, expect } from 'vitest';
 import {
   accessOf,
   attributionLine,
@@ -30,6 +30,31 @@ import {
 } from './delegation';
 import { isPromptRelaxed, setPromptRelaxedTabs } from './delegationPrompt';
 import { defaultSettings, type Settings } from './settings/types';
+import { harnesses } from './harness';
+import {
+  FIRST_HARNESS,
+  FIXTURE_HARNESSES,
+  SECOND_HARNESS,
+  fixtureAiTabs,
+  installFixtureHarnesses,
+} from './harness.fixture';
+
+// V40 Phase F: every id below comes from the committed registry fixture, and
+// the store the label/attribution helpers read is filled from the same source.
+// No test in this file names a product.
+beforeEach(installFixtureHarnesses);
+
+/// The first harness's primary reserved tab, its VARIANT tab (same binary,
+/// second reserved id) and the second harness's tab.
+const PRIMARY = FIRST_HARNESS.tab_ids[0];
+const VARIANT = FIRST_HARNESS.tab_ids[1];
+const OTHER = SECOND_HARNESS.tab_ids[0];
+/// Locked decision 2a's line for a delegation driven BY the second harness.
+/// The two backend refusal sentences, with a real tab id in them.
+const REFUSAL_LOCKED = 'tab `' + PRIMARY + '` is read-only (user)';
+const REFUSAL_DRIVEN = 'tab `' + PRIMARY + '` is driven by api-work';
+const ATTRIBUTION =
+  '[delegated by ' + SECOND_HARNESS.label + ' \u00b7 tab "api-work" \u00b7 via cImp]';
 
 /// V39 Phase A — the communication glyph and the read-only lock.
 ///
@@ -38,11 +63,12 @@ import { defaultSettings, type Settings } from './settings/types';
 /// stored access, every tooltip says what a click does, and the refusal
 /// sentence the widget shows is the same one the backend sends.
 
-/// The default settings mirror seeds the two Claude AI tabs and no shell, so
-/// the fixture adds one: half of what these functions promise is that a Shell
-/// tab never grows a communication icon or a lock.
+/// The registry's reserved AI tabs plus one Shell tab: half of what these
+/// functions promise is that a Shell tab never grows a communication icon or a
+/// lock.
 function settingsWith(readOnly: string[] = []): Settings {
   const s = defaultSettings();
+  s.tabs = fixtureAiTabs();
   for (const t of s.tabs) {
     if (t.kind === 'ai_tool' && readOnly.includes(t.id)) t.read_only = true;
   }
@@ -105,10 +131,10 @@ describe('glyphState', () => {
         role: 'none',
         access: 'rw',
         inFlight: true,
-        driverAgent: 'opencode',
+        driverAgent: SECOND_HARNESS.id,
         driverName: 'api-work',
       }).title,
-    ).toContain('[delegated by OpenCode \u00b7 tab "api-work" \u00b7 via cImp]');
+    ).toContain(ATTRIBUTION);
     expect(glyphState({ role: 'none', access: 'rw', inFlight: true }).title).toContain(
       'tab "another tab"',
     );
@@ -149,19 +175,19 @@ describe('glyphState', () => {
 
 describe('access + reason', () => {
   it('reads the persisted flag, and treats an unknown tab as writable', () => {
-    expect(accessOf(settingsWith(), 'claude')).toBe('rw');
-    expect(accessOf(settingsWith(['claude']), 'claude')).toBe('ro');
-    expect(accessOf(settingsWith(['claude']), 'no-such-tab')).toBe('rw');
+    expect(accessOf(settingsWith(), PRIMARY)).toBe('rw');
+    expect(accessOf(settingsWith([PRIMARY]), PRIMARY)).toBe('ro');
+    expect(accessOf(settingsWith([PRIMARY]), 'no-such-tab')).toBe('rw');
   });
 
   it('gives a reason exactly when it refuses', () => {
-    expect(readOnlyReason(settingsWith(), 'claude')).toBeNull();
-    expect(readOnlyReason(settingsWith(['claude']), 'claude')).toBe(READ_ONLY_USER_REASON);
-    expect(readOnlyReason(settingsWith(['claude']), 'shell-default-1')).toBeNull();
+    expect(readOnlyReason(settingsWith(), PRIMARY)).toBeNull();
+    expect(readOnlyReason(settingsWith([PRIMARY]), PRIMARY)).toBe(READ_ONLY_USER_REASON);
+    expect(readOnlyReason(settingsWith([PRIMARY]), 'shell-default-1')).toBeNull();
   });
 
   it('puts the icon on AI tabs only', () => {
-    expect(hasCommIcon(settingsWith(), 'claude')).toBe(true);
+    expect(hasCommIcon(settingsWith(), PRIMARY)).toBe(true);
     expect(hasCommIcon(settingsWith(), 'shell-default-1')).toBe(false);
     expect(hasCommIcon(settingsWith(), 'events')).toBe(false);
   });
@@ -176,10 +202,10 @@ describe('withTabReadOnly', () => {
   it('clones rather than mutating, and moves only the named tab', () => {
     const before = settingsWith();
     const snapshot = JSON.stringify(before);
-    const after = withTabReadOnly(before, 'claude', true);
+    const after = withTabReadOnly(before, PRIMARY, true);
     expect(JSON.stringify(before)).toBe(snapshot);
     expect(after).not.toBe(before);
-    expect(accessOf(after, 'claude')).toBe('ro');
+    expect(accessOf(after, PRIMARY)).toBe('ro');
     expect(after.tabs[1]).toBe(before.tabs[1]);
   });
 
@@ -289,10 +315,10 @@ describe('isMouseWheel', () => {
 
 describe('readOnlyRefusalMessage', () => {
   it('recognizes the backend refusal and hands back the whole sentence', () => {
-    expect(readOnlyRefusalMessage('tab `claude` is read-only (user)')).toBe(
-      'tab `claude` is read-only (user)',
+    expect(readOnlyRefusalMessage(REFUSAL_LOCKED)).toBe(
+      REFUSAL_LOCKED,
     );
-    expect(readOnlyRefusalMessage('tab `claude` is driven by api-work')).toContain(
+    expect(readOnlyRefusalMessage(REFUSAL_DRIVEN)).toContain(
       'driven by api-work',
     );
   });
@@ -308,28 +334,32 @@ describe('readOnlyRefusalMessage', () => {
 // ── V39 Phase B ─────────────────────────────────────────────────────────────
 
 describe('harnessLabel + attributionLine', () => {
-  it('names the two harnesses cImp ships with', () => {
-    expect(harnessLabel('claude')).toBe('Claude Code');
-    expect(harnessLabel('opencode')).toBe('OpenCode');
+  it('names every harness the registry declares', () => {
+    for (const h of FIXTURE_HARNESSES) expect(harnessLabel(h.id)).toBe(h.label);
+  });
+
+  it('has nothing to name before the registry answers', () => {
+    // The store starts empty; an id renders as ITSELF rather than as a label
+    // this build guessed at.
+    harnesses.set([]);
+    expect(harnessLabel(FIRST_HARNESS.id)).toBe(FIRST_HARNESS.id);
   });
 
   it('renders an unknown harness as its own id, never as a guess', () => {
     // A harness added after this build must read as itself, not as "unknown"
     // and not as one of the two above.
-    expect(harnessLabel('aider')).toBe('aider');
+    expect(harnessLabel('a-harness-from-the-future')).toBe('a-harness-from-the-future');
     expect(harnessLabel('')).toBe('another harness');
     expect(harnessLabel(null)).toBe('another harness');
   });
 
   it('is the decision-2a line, exactly', () => {
-    expect(attributionLine('opencode', 'api-work')).toBe(
-      '[delegated by OpenCode \u00b7 tab "api-work" \u00b7 via cImp]',
-    );
+    expect(attributionLine(SECOND_HARNESS.id, 'api-work')).toBe(ATTRIBUTION);
   });
 
   it('never renders an empty tab name', () => {
-    expect(attributionLine('claude', '   ')).toContain('tab "another tab"');
-    expect(attributionLine('claude', null)).toContain('tab "another tab"');
+    expect(attributionLine(FIRST_HARNESS.id, '   ')).toContain('tab "another tab"');
+    expect(attributionLine(FIRST_HARNESS.id, null)).toContain('tab "another tab"');
   });
 });
 
@@ -346,14 +376,14 @@ describe('writeLocalEcho', () => {
         written.push(data);
       },
     };
-    writeLocalEcho(term, 'opencode', 'api-work');
+    writeLocalEcho(term, SECOND_HARNESS.id, 'api-work');
     expect(written).toHaveLength(1);
-    expect(written[0]).toContain('[delegated by OpenCode \u00b7 tab "api-work" \u00b7 via cImp]');
+    expect(written[0]).toContain(ATTRIBUTION);
   });
 
   it('styles the line dim italic and resets, so nothing leaks into PTY output', () => {
     const written: string[] = [];
-    writeLocalEcho({ writeln: (d: string) => written.push(d) }, 'claude', 'main');
+    writeLocalEcho({ writeln: (d: string) => written.push(d) }, FIRST_HARNESS.id, 'main');
     expect(written[0]).toContain('\x1b[2;3m');
     expect(written[0].endsWith('\x1b[0m')).toBe(true);
   });
@@ -433,7 +463,7 @@ describe('the attribution never reaches the backend', () => {
         calls.push(d);
       },
     };
-    writeLocalEcho(target, 'opencode', 'api-work');
+    writeLocalEcho(target, SECOND_HARNESS.id, 'api-work');
     expect(calls).toHaveLength(1);
     expect(Object.keys(target)).toEqual(['writeln']);
   });
@@ -457,23 +487,11 @@ describe('elapsedLabel', () => {
 });
 
 describe('roles', () => {
-  /// The fixture's two builtin AI tabs both run `claude`, so a second harness
+  /// The first harness's two reserved tabs run the SAME binary, so a second harness
   /// has to be added by hand — which is the case that matters: the Manual rule
   /// is per harness, not per app.
   function withRoles(roles: Record<string, DelegationRole>): Settings {
     const s = settingsWith();
-    s.tabs = [
-      ...s.tabs,
-      {
-        ...(s.tabs.find((t) => t.kind === 'ai_tool') as Extract<
-          Settings['tabs'][number],
-          { kind: 'ai_tool' }
-        >),
-        id: 'opencode',
-        name: 'OpenCode',
-        command: 'opencode',
-      },
-    ];
     for (const t of s.tabs) {
       if (t.kind === 'ai_tool' && roles[t.id]) t.delegation_role = roles[t.id];
     }
@@ -481,18 +499,20 @@ describe('roles', () => {
   }
 
   it('reads the persisted role, and gives a non-AI tab none', () => {
-    expect(roleOf(withRoles({ claude: 'manual' }), 'claude')).toBe('manual');
-    expect(roleOf(withRoles({}), 'claude')).toBe('none');
+    expect(roleOf(withRoles({ [PRIMARY]: 'manual' }), PRIMARY)).toBe('manual');
+    expect(roleOf(withRoles({}), PRIMARY)).toBe('none');
     expect(roleOf(withRoles({}), 'shell-default-1')).toBe('none');
     expect(roleOf(withRoles({}), 'no-such-tab')).toBe('none');
   });
 
   it('classifies a tab by harness the way tab_consumer does', () => {
     const s = withRoles({});
-    const claude = s.tabs.find((t) => t.id === 'claude');
-    const opencode = s.tabs.find((t) => t.id === 'opencode');
-    expect(claude && claude.kind === 'ai_tool' && tabHarness(claude)).toBe('claude');
-    expect(opencode && opencode.kind === 'ai_tool' && tabHarness(opencode)).toBe('opencode');
+    for (const h of FIXTURE_HARNESSES) {
+      for (const id of h.tab_ids) {
+        const tab = s.tabs.find((t) => t.id === id);
+        expect(tab && tab.kind === 'ai_tool' && tabHarness(tab)).toBe(h.id);
+      }
+    }
   });
 
   it('matches on the file stem, case-insensitively, like command_is', () => {
@@ -500,34 +520,39 @@ describe('roles', () => {
       Settings['tabs'][number],
       { kind: 'ai_tool' }
     >;
-    expect(tabHarness({ ...base, command: 'C:\\bin\\Claude.EXE' })).toBe('claude');
-    expect(tabHarness({ ...base, command: '/usr/bin/claude' })).toBe('claude');
-    // A wrapper is `opencode` to BOTH ends — deliberately the same answer Rust
-    // gives, not a better one: the popover must not name a tab the backend
-    // would never have displaced.
-    expect(tabHarness({ ...base, command: 'claude-code.cmd' })).toBe('opencode');
-    expect(tabHarness({ ...base, command: '' })).toBe('opencode');
+    const bin = FIRST_HARNESS.binaries[0];
+    expect(tabHarness({ ...base, command: 'C:/bin/' + bin.toUpperCase() + '.EXE' })).toBe(
+      FIRST_HARNESS.id,
+    );
+    expect(tabHarness({ ...base, command: '/usr/bin/' + bin })).toBe(FIRST_HARNESS.id);
+    // V40 Phase F: a command NO harness declares answers `null` — not the last
+    // arm of a two-way branch. The popover must not offer such a tab as some
+    // other harness's delegation target, which is what the old `else` did.
+    expect(tabHarness({ ...base, command: bin + '-wrapper.cmd' })).toBeNull();
+    expect(tabHarness({ ...base, command: '' })).toBeNull();
   });
 
   it('names the tab that currently holds Manual for this tab s harness', () => {
-    const s = withRoles({ claude: 'manual', opencode: 'manual' });
-    // `claude-local` also runs `claude`, so its Manual holder is the Claude tab.
-    expect(manualHolderFor(s, 'claude-local')).toMatchObject({ id: 'claude' });
+    const s = withRoles({ [PRIMARY]: 'manual', [OTHER]: 'manual' });
+    // The variant tab runs the SAME binary, so its Manual holder is the primary.
+    expect(manualHolderFor(s, VARIANT)).toMatchObject({ id: PRIMARY });
     // The holder itself is not its own holder.
-    expect(manualHolderFor(s, 'claude')).toBeNull();
-    // …and the OpenCode tab's holder is never a Claude tab: one Manual PER
-    // HARNESS, so the two roles coexist.
-    expect(manualHolderFor(s, 'opencode')).toBeNull();
+    expect(manualHolderFor(s, PRIMARY)).toBeNull();
+    // …and the other harness's tab holds its own: one Manual PER HARNESS, so
+    // the two roles coexist.
+    expect(manualHolderFor(s, OTHER)).toBeNull();
   });
 
   it('has no holder to name when nobody holds it, or the tab is not an AI tab', () => {
-    expect(manualHolderFor(withRoles({}), 'claude-local')).toBeNull();
-    expect(manualHolderFor(withRoles({ claude: 'manual' }), 'shell-default-1')).toBeNull();
+    expect(manualHolderFor(withRoles({}), VARIANT)).toBeNull();
+    expect(manualHolderFor(withRoles({ [PRIMARY]: 'manual' }), 'shell-default-1')).toBeNull();
   });
 
   it('says what moved, in the displaced tab s own words', () => {
-    expect(displacedToast('api-work', 'claude', 'review')).toBe(
-      '\u201capi-work\u201d is no longer the Manual Claude Code tab \u2014 moved to \u201creview\u201d.',
+    expect(displacedToast('api-work', FIRST_HARNESS.id, 'review')).toBe(
+      '\u201capi-work\u201d is no longer the Manual ' +
+        FIRST_HARNESS.label +
+        ' tab \u2014 moved to \u201creview\u201d.',
     );
   });
 });
@@ -540,8 +565,9 @@ describe('roles', () => {
 describe('facadeBackends', () => {
   function withRole(role: DelegationRole, name: string | null): Settings {
     const s = defaultSettings();
+    s.tabs = fixtureAiTabs();
     for (const t of s.tabs) {
-      if (t.kind === 'ai_tool' && t.id === 'claude') {
+      if (t.kind === 'ai_tool' && t.id === PRIMARY) {
         t.name = 'api-work';
         t.delegation_role = role;
         t.delegation_backend = { name, tier: 'fast', declared_context: 128000 };
@@ -553,7 +579,7 @@ describe('facadeBackends', () => {
   it('lists one row per Remote-offload tab, and nothing else', () => {
     expect(facadeBackends(withRole('remote_offload', 'lan-worker-2'))).toEqual([
       {
-        tabId: 'claude',
+        tabId: PRIMARY,
         tabName: 'api-work',
         name: 'lan-worker-2',
         tier: 'fast',
@@ -589,7 +615,7 @@ describe('facadeBackends', () => {
   it('drops the SECOND of two facades answering to one name', () => {
     const s = withRole('remote_offload', 'twin');
     for (const t of s.tabs) {
-      if (t.kind === 'ai_tool' && t.id === 'claude-local') {
+      if (t.kind === 'ai_tool' && t.id === VARIANT) {
         t.delegation_role = 'remote_offload';
         t.delegation_backend = { name: 'twin', tier: 'quality', declared_context: null };
       }
@@ -634,20 +660,20 @@ describe('courtesyRefusal', () => {
   /// prompt only the user can answer could not be answered, and the delegation
   /// ran to its deadline reporting "worker awaiting permission".
   it('forwards the answer to a standing prompt on a user-locked driven tab', () => {
-    const locked = withTabReadOnly(settingsWith(), 'claude', true);
-    expect(readOnlyReason(locked, 'claude')).toBe(READ_ONLY_USER_REASON);
+    const locked = withTabReadOnly(settingsWith(), PRIMARY, true);
+    expect(readOnlyReason(locked, PRIMARY)).toBe(READ_ONLY_USER_REASON);
     // Driven, and the worker is waiting on the user.
-    expect(courtesyRefusal(locked, 'claude', true)).toBeNull();
+    expect(courtesyRefusal(locked, PRIMARY, true)).toBeNull();
   });
 
   it('still refuses when no prompt is standing', () => {
-    const locked = withTabReadOnly(settingsWith(), 'claude', true);
-    expect(courtesyRefusal(locked, 'claude', false)).toBe(READ_ONLY_USER_REASON);
+    const locked = withTabReadOnly(settingsWith(), PRIMARY, true);
+    expect(courtesyRefusal(locked, PRIMARY, false)).toBe(READ_ONLY_USER_REASON);
   });
 
   it('says nothing about a tab that was never locked', () => {
-    expect(courtesyRefusal(settingsWith(), 'claude', false)).toBeNull();
-    expect(courtesyRefusal(settingsWith(), 'claude', true)).toBeNull();
+    expect(courtesyRefusal(settingsWith(), PRIMARY, false)).toBeNull();
+    expect(courtesyRefusal(settingsWith(), PRIMARY, true)).toBeNull();
   });
 });
 
@@ -656,17 +682,17 @@ describe('the prompt-relaxed mirror', () => {
   /// already), so what is worth pinning is that it is a plain snapshot: replaced
   /// wholesale, exactly like the store the `delegation-changed` payload feeds.
   it('replaces the set wholesale, like the snapshot it comes from', () => {
-    setPromptRelaxedTabs(['claude', 'opencode']);
-    expect(isPromptRelaxed('claude')).toBe(true);
-    expect(isPromptRelaxed('opencode')).toBe(true);
-    expect(isPromptRelaxed('claude-local')).toBe(false);
+    setPromptRelaxedTabs([PRIMARY, OTHER]);
+    expect(isPromptRelaxed(PRIMARY)).toBe(true);
+    expect(isPromptRelaxed(OTHER)).toBe(true);
+    expect(isPromptRelaxed(VARIANT)).toBe(false);
 
-    setPromptRelaxedTabs(['claude-local']);
-    expect(isPromptRelaxed('claude')).toBe(false);
-    expect(isPromptRelaxed('claude-local')).toBe(true);
+    setPromptRelaxedTabs([VARIANT]);
+    expect(isPromptRelaxed(PRIMARY)).toBe(false);
+    expect(isPromptRelaxed(VARIANT)).toBe(true);
 
     setPromptRelaxedTabs([]);
-    expect(isPromptRelaxed('claude-local')).toBe(false);
+    expect(isPromptRelaxed(VARIANT)).toBe(false);
   });
 });
 
@@ -675,13 +701,13 @@ describe('readOnlyAdvice', () => {
   /// Access radio is DISABLED for the whole flight, and Take over is what ends
   /// one.
   it('sends a driven tab to Take over, not to the access radio', () => {
-    const advice = readOnlyAdvice('tab `claude` is driven by api-work');
+    const advice = readOnlyAdvice(REFUSAL_DRIVEN);
     expect(advice).toContain('Take over');
     expect(advice).not.toContain('allow input again');
   });
 
   it('sends a user-locked tab to the glyph', () => {
-    const advice = readOnlyAdvice('tab `claude` is read-only (user)');
+    const advice = readOnlyAdvice(REFUSAL_LOCKED);
     expect(advice).toContain('allow input again');
     expect(advice).not.toContain('Take over');
   });

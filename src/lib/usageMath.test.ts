@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'vitest';
 import {
+
   turnTotal,
   maxTurnTotal,
   barHeightPct,
@@ -34,6 +35,13 @@ import {
   type PriceRates,
   type CostOverride,
 } from './usageMath';
+
+import { FIRST_HARNESS } from './harness.fixture';
+
+// V40 Phase F: every harness id below comes from the committed registry fixture
+// (`harness.fixture.ts`), so this suite names no product and re-points itself
+// when the registry changes.
+const H1 = FIRST_HARNESS.id;
 
 function turn(
   over: Partial<{ in_tok: number; cache_read: number; cache_make: number; out_tok: number; tool_chars: number }>,
@@ -173,17 +181,17 @@ describe('sessionCost', () => {
 describe('matchPricing (V16 Feature 8)', () => {
   const rates = { input: 5, cache_write: 10, cache_read: 0.5, output: 25 };
   const rows = [
-    { model_prefix: 'claude-opus-4', name: 'family', ...rates },
-    { model_prefix: 'claude-opus-4-8', name: 'exact', ...rates },
+    { model_prefix: 'vendor-opus-4', name: 'family', ...rates },
+    { model_prefix: 'vendor-opus-4-8', name: 'exact', ...rates },
     { model_prefix: '', name: 'manual-only', ...rates },
   ];
 
   test('longest matching prefix wins', () => {
-    expect(matchPricing('claude-opus-4-8', rows)?.name).toBe('exact');
+    expect(matchPricing('vendor-opus-4-8', rows)?.name).toBe('exact');
     // A dated snapshot still hits the longest prefix.
-    expect(matchPricing('claude-opus-4-8-20260115', rows)?.name).toBe('exact');
+    expect(matchPricing('vendor-opus-4-8-20260115', rows)?.name).toBe('exact');
     // A sibling model falls back to the shorter family prefix.
-    expect(matchPricing('claude-opus-4-7', rows)?.name).toBe('family');
+    expect(matchPricing('vendor-opus-4-7', rows)?.name).toBe('family');
   });
 
   test('empty prefixes never auto-match; unknown models match nothing', () => {
@@ -306,12 +314,12 @@ describe('isEmptyDetailRow (V24 Phase C — vanished-session guard)', () => {
     expect(isEmptyDetailRow({ agent: '', started_ms: 0 })).toBe(true);
   });
   test('a real row is never treated as empty', () => {
-    expect(isEmptyDetailRow({ agent: 'claude', started_ms: 1_700_000_000_000 })).toBe(false);
+    expect(isEmptyDetailRow({ agent: H1, started_ms: 1_700_000_000_000 })).toBe(false);
   });
   test('only-one-field-set is not the sentinel (needs BOTH blank agent and zero ts)', () => {
     // A live session started exactly at epoch 0 would still carry an agent;
     // an agent-less row with a real timestamp shouldn't be a real session.
-    expect(isEmptyDetailRow({ agent: 'claude', started_ms: 0 })).toBe(false);
+    expect(isEmptyDetailRow({ agent: H1, started_ms: 0 })).toBe(false);
     expect(isEmptyDetailRow({ agent: '', started_ms: 1 })).toBe(false);
   });
 });
@@ -364,15 +372,15 @@ describe('Cost card pricing (V24 Phase D)', () => {
   // Identified rows (provider + model give each a stable key) — the shape the
   // stable-identity resolver keys overrides against.
   const rows = [
-    { provider: 'anthropic', model: 'opus-4-family', model_prefix: 'claude-opus-4', ...rates },
-    { provider: 'anthropic', model: 'opus-4-8', model_prefix: 'claude-opus-4-8', ...rates },
-    { provider: 'anthropic', model: 'manual-only', model_prefix: '', ...rates },
+    { provider: 'vendor', model: 'opus-4-family', model_prefix: 'vendor-opus-4', ...rates },
+    { provider: 'vendor', model: 'opus-4-8', model_prefix: 'vendor-opus-4-8', ...rates },
+    { provider: 'vendor', model: 'manual-only', model_prefix: '', ...rates },
   ];
 
   describe('matchPricingIndex', () => {
     test('returns the index of the longest-prefix match', () => {
-      expect(matchPricingIndex('claude-opus-4-8-20260115', rows)).toBe(1); // exact
-      expect(matchPricingIndex('claude-opus-4-7', rows)).toBe(0); // family
+      expect(matchPricingIndex('vendor-opus-4-8-20260115', rows)).toBe(1); // exact
+      expect(matchPricingIndex('vendor-opus-4-7', rows)).toBe(0); // family
     });
     test('-1 when nothing matches (unknown model, empty/blank prefixes only)', () => {
       expect(matchPricingIndex('gpt-5.5', rows)).toBe(-1);
@@ -383,8 +391,8 @@ describe('Cost card pricing (V24 Phase D)', () => {
 
   describe('matchPricing (row form ≡ index form)', () => {
     test('returns the same row matchPricingIndex points at', () => {
-      expect(matchPricing('claude-opus-4-8-20260115', rows)).toBe(rows[1]);
-      expect(matchPricing('claude-opus-4-7', rows)).toBe(rows[0]);
+      expect(matchPricing('vendor-opus-4-8-20260115', rows)).toBe(rows[1]);
+      expect(matchPricing('vendor-opus-4-7', rows)).toBe(rows[0]);
     });
     test('null when the index form returns -1', () => {
       expect(matchPricing('gpt-5.5', rows)).toBeNull();
@@ -394,7 +402,7 @@ describe('Cost card pricing (V24 Phase D)', () => {
 
   describe('pricingRowKey (stable identity)', () => {
     test('is provider + " " + model', () => {
-      expect(pricingRowKey(rows[1])).toBe('anthropic opus-4-8');
+      expect(pricingRowKey(rows[1])).toBe('vendor opus-4-8');
     });
   });
 
@@ -402,8 +410,8 @@ describe('Cost card pricing (V24 Phase D)', () => {
     const CUSTOM = rows.length;
     const FREE = rows.length + 1;
     test('no override → auto-match by longest prefix', () => {
-      expect(costSelIdx('claude-opus-4-8-x', undefined, rows)).toBe(1);
-      expect(costSelIdx('claude-opus-4-7', undefined, rows)).toBe(0);
+      expect(costSelIdx('vendor-opus-4-8-x', undefined, rows)).toBe(1);
+      expect(costSelIdx('vendor-opus-4-7', undefined, rows)).toBe(0);
     });
     test('no override + no match → Custom sentinel (never a made-up cost)', () => {
       expect(costSelIdx('gpt-5.5', undefined, rows)).toBe(CUSTOM);
@@ -411,30 +419,30 @@ describe('Cost card pricing (V24 Phase D)', () => {
     });
     test('a row override resolves to that row\'s CURRENT index', () => {
       const ov: CostOverride = { kind: 'row', key: pricingRowKey(rows[0]) };
-      expect(costSelIdx('claude-opus-4-8-x', ov, rows)).toBe(0); // wins over auto-match
+      expect(costSelIdx('vendor-opus-4-8-x', ov, rows)).toBe(0); // wins over auto-match
     });
     test('a row override survives table REORDER (keyed, not positional)', () => {
       const ov: CostOverride = { kind: 'row', key: pricingRowKey(rows[1]) };
       const reordered = [rows[2], rows[1], rows[0]];
-      expect(costSelIdx('claude-opus-4-8-x', ov, reordered)).toBe(1); // still the opus-4-8 row
+      expect(costSelIdx('vendor-opus-4-8-x', ov, reordered)).toBe(1); // still the opus-4-8 row
     });
     test('a VANISHED row key falls back to auto-match, not silently Free', () => {
       const ov: CostOverride = { kind: 'row', key: 'anthropic gone' };
       // auto-match still finds opus-4-8 for this model:
-      expect(costSelIdx('claude-opus-4-8-x', ov, rows)).toBe(1);
+      expect(costSelIdx('vendor-opus-4-8-x', ov, rows)).toBe(1);
       // and Custom when the model itself no longer matches anything:
       expect(costSelIdx('gpt-5.5', ov, rows)).toBe(CUSTOM);
     });
     test('custom / free overrides map to their sentinels', () => {
-      expect(costSelIdx('claude-opus-4-8-x', { kind: 'custom' }, rows)).toBe(CUSTOM);
-      expect(costSelIdx('claude-opus-4-8-x', { kind: 'free' }, rows)).toBe(FREE);
+      expect(costSelIdx('vendor-opus-4-8-x', { kind: 'custom' }, rows)).toBe(CUSTOM);
+      expect(costSelIdx('vendor-opus-4-8-x', { kind: 'free' }, rows)).toBe(FREE);
     });
   });
 
   describe('costRowState (selIdx + rates + matchedRow)', () => {
     const custom: PriceRates = { input: 1, cache_write: 2, cache_read: 3, output: 4 };
     test('auto-matched row: rates are that row, matchedRow set', () => {
-      const st = costRowState('claude-opus-4-8-x', undefined, rows, custom);
+      const st = costRowState('vendor-opus-4-8-x', undefined, rows, custom);
       expect(st.selIdx).toBe(1);
       expect(st.rates).toBe(rows[1]);
       expect(st.matchedRow).toBe(rows[1]);
@@ -446,13 +454,13 @@ describe('Cost card pricing (V24 Phase D)', () => {
       expect(st.matchedRow).toBeNull();
     });
     test('free override: all-zero rates regardless of the model', () => {
-      const st = costRowState('claude-opus-4-8-x', { kind: 'free' }, rows, custom);
+      const st = costRowState('vendor-opus-4-8-x', { kind: 'free' }, rows, custom);
       expect(st.rates).toEqual(FREE_RATES);
       // matchedRow still reflects the auto-match (for the provider label):
       expect(st.matchedRow).toBe(rows[1]);
     });
     test('vanished row key: rates fall back to the auto-matched row', () => {
-      const st = costRowState('claude-opus-4-8-x', { kind: 'row', key: 'gone gone' }, rows, custom);
+      const st = costRowState('vendor-opus-4-8-x', { kind: 'row', key: 'gone gone' }, rows, custom);
       expect(st.rates).toBe(rows[1]);
     });
   });
@@ -507,8 +515,8 @@ describe('Cost card pricing (V24 Phase D)', () => {
     const opus: PriceRates = { input: 15, cache_write: 18.75, cache_read: 1.5, output: 75 };
     const fable: PriceRates = { input: 1, cache_write: 1.25, cache_read: 0.1, output: 5 };
     const perModel = [
-      { model: 'claude-opus-4-8', totals: { in_tok: 1_000_000, out_tok: 1_000_000, cache_read: 0, cache_make: 0 } },
-      { model: 'claude-fable-2', totals: { in_tok: 2_000_000, out_tok: 0, cache_read: 0, cache_make: 0 } },
+      { model: 'vendor-opus-4-8', totals: { in_tok: 1_000_000, out_tok: 1_000_000, cache_read: 0, cache_make: 0 } },
+      { model: 'vendor-fable-2', totals: { in_tok: 2_000_000, out_tok: 0, cache_read: 0, cache_make: 0 } },
     ];
 
     test('sums each model row at its own rates', () => {

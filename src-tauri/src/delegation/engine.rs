@@ -177,14 +177,62 @@ pub struct Reply {
 /// last, after the caller's context, because it is about the shape of the
 /// answer rather than about the work.
 fn compose(task: &str, context: Option<&str>, note: Option<&str>) -> String {
-    let mut out = match context.map(str::trim).filter(|c| !c.is_empty()) {
+    let task = normalise_newlines(task);
+    let context = context.map(normalise_newlines);
+    let mut out = match context.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
         Some(c) => format!("{}\n\n{}", task.trim_end(), c),
-        None => task.to_string(),
+        None => task,
     };
     if let Some(n) = note.map(str::trim).filter(|n| !n.is_empty()) {
         out = format!("{}\n\n{n}", out.trim_end());
     }
     out
+}
+
+/// `\r\n` → `\n`, and nothing else (V39 review HIGH-2).
+///
+/// The ONE transform applied to caller text, and it is meaning-preserving: a
+/// Windows caller's paragraph break is a paragraph break. A BARE `\r` is not
+/// normalised — it is refused by [`control_refusal`], because in a PTY a lone
+/// CR is the submit key and guessing which of the two a caller meant is exactly
+/// the guess that turns one request into two turns.
+fn normalise_newlines(s: &str) -> String {
+    s.replace("\r\n", "\n")
+}
+
+/// **The paste cannot be broken out of** (V39 review HIGH-2).
+///
+/// `InputProfile::paste_bytes` wraps the request in `ESC [ 200 ~` … `ESC [ 201
+/// ~` and writes it to the PTY. Those markers are *in-band*: a task that itself
+/// contains `ESC [ 201 ~` ends the paste early, and every byte after it is read
+/// by the TUI as live keystrokes — `\r/exit\r` being the shape that matters.
+/// The task is model-authored text (an `offload_task` instruction, a
+/// `delegate_task_*` argument), so this is a request that reaches a shell, and
+/// the bound has to be structural rather than a marker-shaped blocklist.
+///
+/// So: no `ESC`, and no C0/C1 control character other than `\n` and `\t`.
+/// Everything an actual request needs is text, tabs and newlines.
+///
+/// **Refused, never sanitised.** Stripping the control bytes would send a
+/// request the caller did not write, and truncating at the first one would send
+/// half a question the worker would answer perfectly — the one failure mode a
+/// worker cannot report. And it is refused at PREFLIGHT, before the slot claim,
+/// so a hostile task leaves the worker exactly as it was.
+fn control_refusal(typed: &str) -> Option<String> {
+    let (at, c) = typed
+        .char_indices()
+        .find(|(_, c)| !matches!(c, '\n' | '\t') && c.is_control())?;
+    let name = match c {
+        '\u{1b}' => "ESC, U+001B".to_string(),
+        '\r' => "CR, U+000D".to_string(),
+        '\u{7f}' => "DEL, U+007F".to_string(),
+        c => format!("U+{:04X}", c as u32),
+    };
+    Some(format!(
+        "the task contains a control character ({name}) at byte {at} — a delegated request is \
+         pasted into a TUI verbatim, so it may contain text, tabs and newlines only. Nothing was \
+         typed and no tab was claimed"
+    ))
 }
 
 /// The tool name the reply is screened under (locked decision 11).
@@ -521,6 +569,12 @@ pub async fn drive(app: &AppHandle, req: DriveRequest) -> Result<Reply, Delegati
             typed.len(),
             profile.max_paste_bytes
         )));
+    }
+    // 7b. …and one the paste cannot be broken out of (V39 review HIGH-2). The
+    //     bracketed-paste markers are in-band, so a task carrying `ESC [ 201 ~`
+    //     would end the paste and leave the rest to land as live keystrokes.
+    if let Some(reason) = control_refusal(&typed) {
+        return Err(deny(reason));
     }
 
     // 8. Acyclic, and within `delegation.max_depth` (locked decision 9). Both
@@ -1010,6 +1064,91 @@ mod tests {
             "do it\n\nanswer in JSON",
             "no context: the note follows the task directly"
         );
+    }
+
+    /// **A task cannot break out of the paste** (V39 review HIGH-2).
+    ///
+    /// The markers are in-band, so this is the whole boundary: refuse at
+    /// preflight, name the character, and never sanitise. The fixture that
+    /// matters most is the first one — with it accepted, everything after the
+    /// end marker reaches the TUI as live keystrokes.
+    #[test]
+    fn a_task_that_could_end_the_paste_early_is_refused_by_name() {
+        for (label, hostile) in [
+            ("the end marker itself", "summarise this\u{1b}[201~\r/exit\r"),
+            ("a bare ESC", "look at \u{1b}OA the file"),
+            ("the start marker", "\u{1b}[200~nested"),
+            ("Ctrl-C", "stop \u{3} now"),
+            ("DEL", "oops\u{7f}"),
+            ("a bare CR", "line one\rline two"),
+            ("a C1 control", "text \u{9b}[201~"),
+            ("NUL", "a\u{0}b"),
+        ] {
+            let reason = control_refusal(hostile)
+                .unwrap_or_else(|| panic!("{label} must be refused: {hostile:?}"));
+            assert!(
+                reason.contains("control character") && reason.contains("U+"),
+                "{label}: the refusal must name the character: {reason}"
+            );
+        }
+        // Everything a real request is made of passes.
+        for fine in [
+            "summarise src/lib/latch.ts",
+            "line one\nline two\n\tindented",
+            "unicode is fine: \u{e9}\u{4e2d}\u{1f600}",
+            "brackets [201~ without an escape are just text",
+        ] {
+            assert_eq!(control_refusal(fine), None, "{fine:?} must be accepted");
+        }
+    }
+
+    /// **`\r\n` is normalised; a bare `\r` is not.**
+    ///
+    /// A Windows caller's paragraph break is a paragraph break — refusing it
+    /// would refuse half the requests a person pastes. A lone CR is the submit
+    /// key in a PTY, and guessing which one the caller meant is how one request
+    /// becomes two turns.
+    #[test]
+    fn crlf_is_normalised_and_a_bare_cr_is_refused() {
+        let composed = compose("line one\r\nline two", Some("ctx\r\nmore"), None);
+        assert_eq!(composed, "line one\nline two\n\nctx\nmore");
+        assert_eq!(control_refusal(&composed), None);
+        assert!(control_refusal(&compose("line one\rline two", None, None)).is_some());
+    }
+
+    /// **The bytes that reach the PTY are exactly the paste and the submit.**
+    ///
+    /// Asserted on the DATA, not on this file's source: for a task that clears
+    /// preflight, the write is start-marker + the task verbatim + end-marker,
+    /// the end marker appears exactly once and at the very end, and the submit
+    /// is a separate write. That conjunction is what "one paste, one turn"
+    /// means, and it only holds because `control_refusal` ran first.
+    #[test]
+    fn the_written_bytes_are_the_paste_then_the_submit() {
+        const START: &[u8] = b"\x1b[200~";
+        const END: &[u8] = b"\x1b[201~";
+        for id in crate::harness::contract::harness_ids() {
+            let profile = crate::harness::input_profile(id).expect("a shipped profile");
+            let typed = compose("do the thing", Some("src/lib/latch.ts"), None);
+            assert_eq!(control_refusal(&typed), None);
+            let bytes = profile.paste_bytes(&typed);
+            let mut want = Vec::new();
+            want.extend_from_slice(START);
+            want.extend_from_slice(typed.as_bytes());
+            want.extend_from_slice(END);
+            assert_eq!(bytes, want, "{id}: the write is prefix + task + suffix");
+            assert_eq!(
+                bytes.windows(END.len()).filter(|w| *w == END).count(),
+                1,
+                "{id}: exactly one end marker"
+            );
+            assert!(bytes.ends_with(END), "{id}: and it is the last thing written");
+            assert!(
+                !bytes[..bytes.len() - END.len()].ends_with(b"\r"),
+                "{id}: the submit is a separate write, after the settle"
+            );
+            assert_eq!(profile.submit, b"\r", "{id}");
+        }
     }
 
     /// **The only bytes this module can write are one profile's paste and its

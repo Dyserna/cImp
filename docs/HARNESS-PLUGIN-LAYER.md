@@ -4,7 +4,10 @@
 capability-refresh batch: both harnesses re-audited against current upstream
 (Claude Code 2.1.233, OpenCode 1.18.18), the two Claude beacons and OpenCode
 server auth moved D → B, `PostToolUseFailure` wired, and the
-`claude.hook.posttooluse` drift gap closed. § 3.2 and § 11 reflect it. This
+`claude.hook.posttooluse` drift gap closed. § 3.2 and § 11 reflect it.
+**V40 (phases A–G) then put a registry under all of it** — one descriptor and
+one `HarnessPlugin` impl per harness, with every per-harness fact moved behind
+that interface. § 2.2 is the registry; §§ 8 and 9 are rewritten against it. This
 document describes the layer *as it shipped*, and is the long-form twin of
 [`src-tauri/src/harness/README.md`](../src-tauri/src/harness/README.md).
 
@@ -20,6 +23,8 @@ works and how to extend it.
 |---|---|
 | The wire contract — routes, bodies, headers, compatibility rules | [`docs/CHP.md`](CHP.md). **Authoritative for message shapes; this document never restates them.** |
 | The 60-second in-tree entry point | [`src-tauri/src/harness/README.md`](../src-tauri/src/harness/README.md) |
+| What one harness's plugin actually declares | that harness's own README — [`claude`](../src-tauri/src/harness/claude/README.md), [`opencode`](../src-tauri/src/harness/opencode/README.md) |
+| The roster itself — descriptor fields, `HarnessId`, `PerHarness<T>` | § 2.2 below, and `src-tauri/src/harness/registry.rs` |
 | The same how-to beside its siblings | [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) § *Adding a harness plugin* |
 | Why it is shaped this way — locked decisions, findings, phase-by-phase record | [`docs/MILESTONE-V35-harness-resilience.md`](MILESTONE-V35-harness-resilience.md) |
 | The designs the milestone executed | [`DESIGN-harness-plugin-architecture.md`](DESIGN-harness-plugin-architecture.md) (layers, D1–D7), [`DESIGN-harness-capability-matrix.md`](DESIGN-harness-capability-matrix.md) (tier ladder), [`DESIGN-harness-drift-canaries.md`](DESIGN-harness-drift-canaries.md) (canary layers) |
@@ -39,78 +44,225 @@ the places that matters.
 ## 2. The four layers, as modules
 
 ```
-  L4  Capabilities     graph/ · tts/ · usage/ · workbench/ · offload/
+  L4  Capabilities     graph/ · tts/ · workbench/ · delegation/ · offload/
                        ── speak cImp domain types + contract::gate(id) only
                                       ▲  never imported from below the seam
   L3  Session bus      harness/{contract,health,verify}.rs
-                       the registry and every degradation decision —
+                       the capability registry and every degradation decision —
                        harness-agnostic, no harness literals
+      The roster       harness/{registry,plugin}.rs  ── WHICH harness, and
+                       harness/{info,ingress,native,instructions,probe}.rs
+                       the neutral lookups over WHAT each one declared
   ══  L2  CHP ═════════ harness/chp.rs + docs/CHP.md ═══ THE STABLE SEAM ═════
                        versioned HTTP+JSON on loopback, bearer auth,
-                       `agent` discriminator, capability negotiation
-                       (route handlers live in offload/loopback.rs)
+                       `agent` = a registered harness id, capability negotiation
+                       (core's router appends each plugin's own routes last)
   L1  Harness plugin   harness/claude/* · harness/opencode/*
                        + harness/render.rs · harness/reader.rs
                        THE ONLY PER-HARNESS ARTIFACT
-  L0  Harness          Claude Code (≥ 2.1.63; verified 2.1.233)
+  L0  Harness          Claude Code (verified 2.1.233)
                        OpenCode (1.18.13; byte-identical surface at 1.18.18)
                        uncontrolled, self-updating
 ```
+
+`crate::usage` used to sit at L4. It is not there any more: V40 Phase D moved
+its whole data path — the status-line push, the push file, the quota and context
+readings — **below** the seam, into `harness/claude/usage.rs` behind
+`HarnessPlugin::usage_source()`. There is no module above the seam for a harness
+module to reach for, which is why it left `layering::CAPABILITY_MODULES`.
 
 The real tree at HEAD:
 
 | File | Layer | What it is |
 |---|---|---|
-| `harness/contract.rs` | L3 | **The capability registry** — every dependency cImp has on a harness, with tier, deps, consumers, degradation and coverage. The authority; `MAINTENANCE.md`'s drift table is checked against it. Also holds the `gate` / `gates` feature-gate query and the Advisor's two reverse lookups. |
-| `harness/health.rs` | L3 | Read-model for Settings → *Harness health*. Joins registry rows against gate verdicts, the stored auto-verify record and the last in-process run. |
-| `harness/verify.rs` | L3 | Auto-verify: runs L1 + L2 on a CLI version change and advances `claude_last_verified` by itself. |
+| `harness/registry.rs` | roster | **The harness registry** — `HarnessId`, `HarnessDescriptor`, `HARNESSES`, `DEFAULT_HARNESS`, `PerHarness<T>`, and the one place that answers *which harness is this?*. See § 2.2. |
+| `harness/plugin.rs` | roster | **`HarnessPlugin`** — the L1 interface and the neutral types it speaks (`InputProfile`, `NativeTool`, `SettingField`, `Route`/`HookReply`, `ActivitySource`, `SessionKey`, `HarnessAffordances`, …). Every method's default is the harness-neutral answer. |
+| `harness/info.rs` | roster | The registry **as the frontend receives it** — `harness_list`, plus the committed `fixtures/harness/registry.json` that vitest checks the TypeScript unions against. |
+| `harness/ingress.rs` | roster | The neutral lookups over the plugins' own loopback ingress: `route`, `identity_of_request`, `drift_tokens`, `wire_default`, `hook_reply_budget`. |
+| `harness/native.rs` | roster | The neutral lookup over the plugins' own tool vocabularies: `mutates_fs`, `memory_kind`, `class`, `memory_arg` — each taking the request's **source**, and each failing closed when it is unknown. |
+| `harness/instructions.rs` | roster | Every string cImp puts in front of a model, in one place, rendered per harness from that harness's `tool_for_role()` names and label. |
+| `harness/contract.rs` | L3 | **The capability registry** — every dependency cImp has on a harness, with tier, deps, consumers, degradation and coverage. The authority; `MAINTENANCE.md`'s drift table is checked against it. Chains each plugin's own `capabilities()` rows after the neutral ones. Also holds the `gate_for` feature-gate query and the Advisor's reverse lookups. |
+| `harness/health.rs` | L3 | Read-model for Settings → *Harness health*. Joins registry rows against gate verdicts, the stored auto-verify record and the last in-process run — one panel per harness, plus a neutral `Harness::ANY` panel. |
+| `harness/verify.rs` | L3 | Auto-verify, **per harness**: iterates the registry, and on one harness's CLI version change runs that harness's L1 + L2 and advances its own `last_verified`. |
 | `harness/chp.rs` | L2 | **CHP** — `CHP_VERSION`, the event vocabulary (`EVENTS`), the `/session/hello` peer registry, arbitration (`served`), the quiet detector (`note_event`), stale-artifact classification (`stale_for`). |
-| `harness/claude/overlay.rs` | L1 | cImp ▸ Claude: the generated `--settings` / `--mcp-config` overlays and the hello they declare. |
-| `harness/claude/hook.rs` | L1 | Claude ▸ cImp: the `type: "http"` hook payload type, the contract checks, the emitted hook entry (`http_hook_entry`). |
-| `harness/claude/read.rs` | L1 | Claude's **fallback reader** — the transcript JSONL tail (Tier C). |
-| `harness/claude/statusline.rs` | L1 | The Claude-shaped stdin payload `cimp --statusline` is handed (Tier C). |
-| `harness/opencode/plugin.rs` | L1 | cImp ▸ OpenCode: the generated plugin's key set, its values, when it is written or swept. |
-| `harness/opencode/templates/plugin.js` | L1 | **The emitted artifact itself**, as a real 645-line `.js` file with `{{cimp.*}}` slots. |
-| `harness/opencode/config.rs` | L1 | cImp ▸ OpenCode: `OPENCODE_CONFIG_CONTENT`, the managed instructions file, the pinned permission block, and (2026-08-17) the per-spawn server-auth env pair. |
-| `harness/opencode/tools.rs` | L1 | The reviewed table of OpenCode's **own** tool ids — what the plugin's gate and beacon match on. |
-| `harness/opencode/read.rs` | L1 | OpenCode's fallback reader — the `GET /event` SSE tap (Tier C). |
+| `harness/probe.rs` | — | The L2 probe **runner**: the report shape, the outcome model, `IMPLEMENTED` (the declared report order) and the neutral declared-unprobed row. The probe *bodies* live in each plugin. |
+| `harness/canary.rs` | — | The L1 canary **runner** and corpus rules; the assertions live in each plugin's `canary.rs`. |
+| `harness/capture.rs` | — | The capture-on-success corpus, so a break starts with a diff. |
 | `harness/render.rs` | L1 | `{{key}}` substitution for text artifacts, and the one place a value gets JSON-quoted (`json_lit`). |
 | `harness/reader.rs` | L1 | Which fallback reader a tab attaches (`OobSpec` / `spawn`), the context it runs with (`OobContext`), and the arbitration query at the tap (`OobContext::pushed`). |
-| `harness/canary.rs` | — | L1 canaries: recorded fixtures still produce **substantive** output, plus their negative twins. |
-| `harness/probe.rs` | — | L2 live probes: the recorded shape is still real, driven against the installed CLI. |
-| `harness/capture.rs` | — | The capture-on-success corpus, so a break starts with a diff. |
-| `harness/layering.rs` | — | The three tests that keep all of the above true (`#[cfg(test)]`). |
+| `harness/claude/plugin.rs` | L1 | Claude's `impl HarnessPlugin` — the one file the descriptor points at. |
+| `harness/claude/overlay.rs` | L1 | cImp ▸ Claude: the generated `--settings` / `--mcp-config` overlays and the hello they declare. |
+| `harness/claude/hook.rs` | L1 | Claude ▸ cImp: its `ROUTES_TABLE` (returned from `routes()`), the hook payload type, the contract checks, the emitted hook entry. |
+| `harness/claude/{read,usage,statusline}.rs` | L1 | Claude's **fallback readers** — the transcript JSONL tail, and (since V40 Phase D) the whole status-line/quota/context data path behind `usage_source()`. |
+| `harness/claude/{tools,prompts,input,settings,canary,probe}.rs` | L1 | Its native-tool table, TUI prompt grammar, input profile, declared `ext` fields, L1 canaries and L2 probe bodies. |
+| `harness/opencode/harness_plugin.rs` | L1 | OpenCode's `impl HarnessPlugin`. |
+| `harness/opencode/plugin.rs` | L1 | cImp ▸ OpenCode: the generated plugin's key set, its values, when it is written or swept. |
+| `harness/opencode/templates/plugin.js` | L1 | **The emitted artifact itself**, as a real `.js` file with `{{cimp.*}}` slots. |
+| `harness/opencode/config.rs` | L1 | cImp ▸ OpenCode: `OPENCODE_CONFIG_CONTENT`, the managed instructions file, the pinned permission block, the per-spawn server-auth env pair. |
+| `harness/opencode/tools.rs` | L1 | The reviewed table of OpenCode's **own** tool ids — what the plugin's gate and beacon match on. |
+| `harness/opencode/read.rs` | L1 | OpenCode's fallback reader — the `GET /event` SSE tap (Tier C). |
+| `harness/_retired/` | — | Data a retired harness left behind. No descriptor, no plugin, no tab, no code path; the leading underscore is what says so, and `every_registry_entry_is_fully_wired` skips it by that convention alone. |
+| `harness/layering.rs` | — | The four tests that keep all of the above true (`#[cfg(test)]`). |
 
-`harness/mod.rs` re-exports exactly `reader::{spawn, OobContext, OobSpec}` — the
-only thing above the seam that names a harness module by hand.
+`harness/mod.rs` re-exports exactly `reader::{spawn, OobContext, OobSpec}` plus
+the registry's own vocabulary (`HarnessId`, `DEFAULT_HARNESS`, `PerHarness`) —
+and a `HarnessId` is a value core may *hold and pass back*, never one it may
+spell or branch on.
 
 ### 2.1 The layering is tests, not convention
 
-Three tests in `harness/layering.rs`:
+Four tests in `harness/layering.rs`:
 
 - **`no_harness_literals_outside_harness`** — a string a harness owns may not
   appear in production code outside `harness/`. The needle list is *derived from
-  the registry's* `depends_on` (`JsonPath` / `ConfigKey` / `Route`, plus the TUI
-  footer literal), so declaring a new dependency automatically widens what the
-  scan refuses to see elsewhere. `#[cfg(test)]` blocks and comment lines are
-  excluded on purpose: a fixture quoting a payload is a *recorded input*, and
-  prose explaining the seam is wanted everywhere. `Dep::Flag` needles are
-  deliberately excluded — a declared gap, because Claude's session-selection
-  flags are still read in `tabs::config`. Exceptions are an explicit allowlist,
-  **seven files today** (2026-08-17: the two beacon shims retired theirs), each
-  with a reason.
+  the capability registry's* `depends_on` (`JsonPath` / `ConfigKey` / `Route`,
+  plus the TUI footer literal), so declaring a new dependency automatically
+  widens what the scan refuses to see elsewhere. `#[cfg(test)]` blocks and
+  comment lines are excluded on purpose: a fixture quoting a payload is a
+  *recorded input*, and prose explaining the seam is wanted everywhere.
+  `Dep::Flag` needles are deliberately excluded. Exceptions are
+  `LITERAL_ALLOWLIST` — **one file today** (`graph/index.rs`, where
+  `"tool_result"` is cImp's own column name colliding with a harness payload
+  field, not a dependency on one) — re-checked by
+  `every_literal_allowlist_entry_is_still_earning_it`.
+- **`no_harness_identity_outside_registry`** (V40 Phase A, locked decision
+  10(a)) — the scan the one above it never was. Its needles are every
+  descriptor id, reserved tab id, binary stem and consumer token, derived from
+  `registry::HARNESSES`; none of them may appear in production code outside
+  `harness/`. Core may *hold* a `HarnessId` and pass it back to the registry; it
+  may not spell one and it may not branch on one. Exceptions are
+  `IDENTITY_ALLOWLIST` — **two files today** (`settings/schema.rs`,
+  `state/manager.rs`), both persisted wire forms — re-checked in both directions
+  by `every_identity_allowlist_entry_is_still_earning_it`. `settings/migration.rs`
+  and any `tests.rs` are exempt **by class**: a frozen migration describes an old
+  on-disk shape and must keep its literals or it stops describing the file it
+  exists to read.
 - **`harness_modules_do_not_import_capabilities`** — the direction is L1 → L2
   only. A file under `harness/` may not name `crate::graph`, `crate::tts`,
-  `crate::usage` or `crate::workbench`. `UPWARD_EXEMPT` holds the **seven** that
-  still do, each with a reason, and the test asserts in *both* directions — an
-  exemption that stops being needed fails the build, so the list cannot rot into
-  padding.
-- **`every_harness_dir_declares_its_capabilities`** — a `harness/<id>/`
-  directory must be in `HARNESS_DIRS`, must have rows in the registry, and must
-  contain a file mentioning `chp::EV_HELLO`. A harness with neither is one
-  nobody can reason about.
+  `crate::workbench` or `crate::delegation`. `UPWARD_EXEMPT` holds the **six**
+  that still do, each with a reason, and the test asserts in *both* directions —
+  an exemption that stops being needed fails the build, so the list cannot rot
+  into padding.
+- **`every_registry_entry_is_fully_wired`** (V40 Phase A, locked decision 10(b);
+  it absorbed V35's `every_harness_dir_declares_its_capabilities`) — the one
+  test that turns a descriptor row into a promise about a dozen places. See
+  § 2.2.
 
-A fourth, `wired_in_paths_exist`, lives with the registry it checks.
+Two more guard the *guards*, because a source scanner that reads the wrong slice
+of a file reports on nothing and says `ok` while doing it:
+`the_literal_scan_reads_the_same_code_on_every_platform` (the Windows runner
+checks out CRLF; a local LF tree is not the same input) and
+`executable_text_ignores_line_endings_and_cuts_at_every_test_item`. Both were
+added after the first two tests shipped a defect each.
+
+And two live elsewhere: `wired_in_paths_exist`, with the capability registry it
+checks, and the frontend's own identity scan in `src/lib/harnessIdentity.test.ts`.
+
+### 2.2 The registry — `harness/registry.rs`
+
+Before V40 the question *which harness is this?* had ten answers in ten
+vocabularies, **six of which fell back to Claude for an unrecognised command**.
+So a third harness was not rejected, it was *misattributed*: wrong activity
+badge, wrong injection scope, wrong expose flag, wrong audit latch slot, wrong
+graph source — and nothing said so. The registry is the one answer.
+
+**`HarnessId` is an opaque newtype.** It carries the registry's own id string
+and nothing else; it can only be produced by a lookup in that module, and it has
+**no `Claude` / `OpenCode` constants** for core to compare against. That is what
+makes "core may hold a `HarnessId` and pass it to the registry; it may not
+branch on its value" checkable rather than aspirational. Adding a harness is a
+descriptor row plus a `harness/<id>/` directory — deliberately **not** a new
+enum variant, because a variant is a thing every `match` in the tree can be made
+to care about. The lookups:
+
+| Lookup | Answers | `None` means |
+|---|---|---|
+| `from_id(&str)` | the CHP `agent` discriminator | not a registered id — refused, never defaulted |
+| `from_command(&str)` | compares the **file stem**, case-insensitively, so `claude`, `claude.exe` and `/usr/bin/claude` all resolve | *a first-class answer*: this tab is a shell tab, not a harness tab |
+| `from_tab_id(&str)` | a reserved built-in tab id | a user-created `ai-<uuid>` tab — classified by its command instead |
+| `from_consumer(&str)` | an MCP consumer token. **Padding is not trimmed**, deliberately: narrowing `" opencode "` at a caller-asserted wire value would be a widening dressed as a convenience | a token nobody declared — the proxy start fails naming the registered list |
+
+`HarnessId::ANY` is the one non-harness value: the neutral marker for capability
+rows whose contract is stated about a *tab* rather than a vendor
+(`delegation.worker` is the first). It has no descriptor, no directory, no
+binary and no plugin; it prints as `"any"`, and `from_id("any")` answers `None`
+so the neutral token can never drive a CLI nobody named.
+
+**`HarnessDescriptor` — one harness, as data.** All `'static`, no I/O. The rule
+for what belongs here: *would this still make sense if both shipped harnesses
+were deleted?* If not, it is a descriptor field or a `HarnessPlugin` method —
+never a branch in core.
+
+| Field | What it is |
+|---|---|
+| `id` | the CHP `agent` discriminator **and** the `harness/<id>/` directory name |
+| `label` | what a human calls it |
+| `binaries` | the binary file stems that identify this harness |
+| `tab_ids` | reserved built-in tab ids, **in canonical order** — flattened across the registry, this replaces the `[claude, claude-local, opencode]` array that used to be written out in three places |
+| `consumer` | the MCP consumer token its per-session child is launched with |
+| `expects_chp` | whether cImp generates a CHP-speaking artifact for it — i.e. whether staleness detection covers its tabs. It used to be a hard-coded disjunction, which meant the mechanism was silently OFF for any harness not named in it |
+| `env_strip` | environment markers of a session of *this* harness that cImp was launched from, stripped from every AI tab's child |
+| `features` | what core mounts beyond the neutral path (`SessionUsage`, `ContextBar`, `FileArtifact`, `UsagePush`, `LocalProviderConfig`) — **declared, not inferred from `id == "claude"`**: a feature only one harness has today is still a feature, and the next harness that grows one gets it by saying so |
+| `plugin` | the code half: `&'static dyn HarnessPlugin` |
+
+**`HARNESSES`** is that table, and `registry::all()` / `harness_ids()` /
+`canonical_tab_ids()` are the views over it that replaced the hand-kept arrays.
+
+**`DEFAULT_HARNESS` is the one named Claude default left in the tree**, and it
+does *not* mean "when in doubt, Claude". It means *a body with no identity on
+this wire came from a build old enough that Claude was the only thing that could
+have sent it* — a compatibility statement with an expiry date, which is why it
+is one constant with that rationale attached rather than the thirteen
+`unwrap_or("claude")` literals it replaced. New code does not get to use it: a
+route that can carry an identity must require one, and `HarnessId::from_*`
+answering `None` is the answer.
+
+**`PerHarness<T>` is sized by the registry.** Every fixed-arity-2 structure in
+the tree — the audit consumer list, the unscoped ledger's slots, the per-server
+access pair, the spawn-signature pair — was a place where adding a harness meant
+finding and widening an array literal, and where *forgetting to do so compiled*.
+`PerHarness` is `[T; COUNT]`, so the same mistake is a type error; `get`/`get_mut`
+are keyed by `HarnessId` (never by ordinal, which cannot be off by one), and
+`as_map()` is the wire form, a `BTreeMap` keyed by id — because a positional
+array on the wire is the exact defect this replaced.
+
+**What holds it together, in tests:**
+
+- **`layering::every_registry_entry_is_fully_wired`** — the directory set in
+  **both** directions (a `harness/<id>/` directory the registry does not declare
+  fails as loudly as a descriptor with no directory; `_`-prefixed directories are
+  skipped by convention), then per descriptor: capability rows exist, a
+  `chp::EV_HELLO` is declared somewhere in the directory, identity is complete,
+  exactly **one** `<id>.input.profile` capability row exists **and** the plugin
+  really answers an `input_profile()`, `spawn_sig` is not null, every declared
+  setting is unique / labelled / accepted by its own kind and every
+  `scoped_features()` row names a `Bool` field the schema declares, the sandbox
+  grant table is non-empty, a *Harness health* panel row exists (plus the neutral
+  `Harness::ANY` one), `MAINTENANCE.md` names every capability id, and a harness
+  declaring `FileArtifact` has committed plugin goldens.
+- **`layering::no_harness_identity_outside_registry`** — § 2.1. The registry is
+  the only place a harness's name may be written.
+- **The frontend parity pair.**
+  `info::tests::the_committed_registry_fixture_matches_the_registry` renders
+  `harness_list()` to
+  `src-tauri/fixtures/harness/registry.json`, **writes it** when it differs and
+  then fails — so drift is a red `cargo test` with the fix already in the working
+  tree. vitest reads that file and asserts the TypeScript unions in
+  `src/lib/harness.ts` cover it (*registry parity (locked decision 11)* in
+  `src/lib/harness.test.ts`): the `HarnessFeature` union covers every declared
+  feature **and** declares none Rust does not have, `HarnessInfo` and
+  `HarnessAffordances` carry exactly the payload's keys, and `tabHarness` /
+  `findHarnessByCommand` classify every declared binary the way Rust's
+  `from_command` does. A descriptor field, a feature or a harness added in Rust
+  without its TypeScript mirror is a red `npm test` rather than a runtime
+  `undefined`.
+- Plus the registry's own suite: `every_declared_tool_role_names_a_native_tool`,
+  `at_most_one_harness_takes_the_passthrough_argv`, `ids_are_unique_and_non_empty`,
+  `an_unregistered_command_is_not_a_harness`,
+  `a_command_resolves_by_file_stem_case_insensitively`,
+  `every_reserved_tab_id_resolves_to_exactly_one_harness`,
+  `the_default_harness_is_registered`,
+  `per_harness_covers_the_registry_and_nothing_else`, `any_is_not_a_harness`.
 
 ## 3. The seam-tier model
 
@@ -346,7 +498,7 @@ harness it does not control.
 | `degradation` | `Silent` (the dangerous one), `VisibleOff { user_message }`, `FailClosed`, `Fallback { to }`. |
 | `drift_rule` | The V16 statistical rules that **lag** this row, always via the `advisor::RULE_DRIFT_*` consts — never duplicated literals. |
 | `canary` | The L1 fixture canary. **A canary id IS the capability id** — never a third namespace. |
-| `probe` | The L2 live probe, same join rule. Set **only** where `harness::probe` actually drives the row; a permanent-`Unknown` emitter lives in `probe::DECLARED_UNPROBED` instead, because counting one as coverage is the "quality signal with no consumer" this registry exists to prevent. |
+| `probe` | The L2 live probe, same join rule. Set **only** where `harness::probe` actually drives the row; a permanent-`Unknown` emitter is declared by its own plugin (`HarnessPlugin::declared_unprobed()`, joined with the neutral rows by `probe::declared_unprobed()`) instead, because counting one as coverage is the "quality signal with no consumer" this registry exists to prevent. |
 | `waiver` | An accepted residual: why there is no canary *yet*, what covers it meanwhile, and who owns closing it. |
 | `controls` | **The TCB column.** A control id means the security control *executes inside* this capability, not that the row merely carries data for one. Documentation, not a gate — but a reviewer changing such a row is changing the trusted computing base. |
 | `drift_token` | The `shim` token this row's drift reports arrive under at `POST /activity/contract_drift`. **Explicit since Phase J**: attribution used to be inferred from `wired_in` file names, which stopped discriminating when four reporters collapsed into one module. |
@@ -368,7 +520,7 @@ The other consistency tests, all in `contract.rs`:
 |---|---|
 | `matrix_matches_maintenance_doc` | Registry ↔ `MAINTENANCE.md` drift table id-set equality, both directions, uniqueness on both sides. Prose cannot drift from code. |
 | `wired_in_paths_exist` | A declared consumer path that no longer resolves — i.e. a refactor that moved the code and left the row pointing at nothing. |
-| `probes_and_the_matrix_agree` | Every row is in exactly one of `probe::IMPLEMENTED` / `DECLARED_UNPROBED`; a row cannot fall out of both and stop being counted. |
+| `probes_and_the_matrix_agree` | Every row is in exactly one of `probe::IMPLEMENTED` / `probe::declared_unprobed()`; a row cannot fall out of both and stop being counted. |
 | `tcb_controls_are_declared_exactly_once` | Each control id names exactly one *place* enforcement executes. |
 | `every_gated_capability_can_actually_block` / `no_gate_blocks_outside_the_declared_list` | `GATED` and the `gate` match arms agree — an entry no arm can block is a gate that does not exist; an arm not listed is a gate no UI can see. |
 | `a_blocked_gate_always_says_why` | A block with a blank reason (global principle 5). |
@@ -418,23 +570,35 @@ now declared-unconstructed, kept for the next one). Modelling the last
 two as failures would recreate exactly the alarm fatigue the milestone exists to
 remove — `drift.harness_version.v1` fired on every CLI auto-update until the
 rational response became clicking *Mark verified* without running anything.
-Eight rows are driven (`IMPLEMENTED`); sixteen are enumerated as `unknown` with
-the reason (`DECLARED_UNPROBED`) — printed, not omitted, because a dependency
-that stops being listed is one that stopped being counted. The three
-`claude.transcript.*` probes tail a **real** session JSONL, so every detail
-string carries counts and field names only.
+Nine rows are driven (`probe::IMPLEMENTED`, which is also the **declared report
+order** — so a report cannot silently become "whatever the probe functions
+happened to answer"); nineteen are enumerated as `unknown` with the reason, one
+neutral and eighteen contributed by the two plugins' own `declared_unprobed()`
+— printed, not omitted, because a dependency that stops being listed is one that
+stopped being counted. Note the split: the runner drives the loop, holds the
+report shape and decides the ORDER; the probe **bodies** are the plugins'
+(`HarnessPlugin::probe()`), and a plugin whose probes share one expensive child
+says so (`probes_share_one_child()`) rather than the runner hard-coding an
+order. The five `claude.transcript.*` probes tail a **real** session JSONL, so
+every detail string carries counts and field names only.
 
-**Auto-verify on version change (`harness/verify.rs`).** The OOB tap records a
-changed `claude_last_seen`; `on_claude_version_changed` wakes one background
-thread; L1 runs in-process in milliseconds, then L2 drives the installed CLI.
+**Auto-verify on version change, per harness (`harness/verify.rs`).** Everything
+here is keyed by `HarnessId`: `pending_harness()` iterates the registry
+comparing each harness's own `last_seen` against its own `last_verified` (two
+string comparisons per harness against the mtime-cached settings, V40 Phase B),
+`on_version_changed(harness)` wakes one background thread for **that** harness,
+and `last_run(harness)` keeps at most one in-memory record per harness. L1 runs
+in-process in milliseconds, then L2 drives that harness's installed CLI.
 **Advance iff nothing FAILED** — `Unknown` and `Transition` never block (locked
 decision 8), with the honest consequence recorded rather than hidden: on a
 machine where the CLI cannot be probed, a version advances on L1 evidence alone,
 which is strictly more than the reflexive click it replaces. Zero failures ⇒
-`claude_last_verified` advances by itself and no Advisor card appears at all;
-otherwise the version stays put and each failing capability is recorded so the
-Advisor can name it, its evidence (`harness.canary.l1` / `harness.probe.l2`) and
-its `wired_in` modules. The whole run is capped at `OVERALL_CAP` (90 s),
+that harness's `Settings.harness[<id>].last_verified` advances by itself and no
+Advisor card appears at all; otherwise its version stays put and each failing
+capability is recorded so the Advisor can name it, its evidence
+(`harness.canary.l1` / `harness.probe.l2`) and its `wired_in` modules. The
+Advisor's own `version_signature` is per harness too, so one harness's update
+cannot dismiss another's card. The whole run is capped at `OVERALL_CAP` (90 s),
 enforced *between* layers so no probe is killed mid-flight leaving a child
 behind. `e1_status` / `d0_status` are deliberately untouched — **Mark verified**
 survives for exactly the Tier-D `Behavior` spikes no probe can settle, which is
@@ -527,7 +691,7 @@ is used (`every_known_key_is_used_by_the_template`); the generator supplies
 exactly that set, in order
 (`the_generator_supplies_exactly_the_documented_key_set_in_order`). A rendered
 plugin carries no residual `{{`. And three **byte-identical goldens** live under
-`src-tauri/fixtures/plugin-goldens/opencode/` — `plugin.all-on.js`,
+`src-tauri/fixtures/harness/opencode/goldens/` — `plugin.all-on.js`,
 `plugin.all-off.js`, `plugin.mid.js` — asserted by
 `the_template_renders_the_pre_phase_m_goldens_byte_for_byte`. They were captured
 from the pre-Phase-M `format!()` generator *before the template existed*, which
@@ -668,13 +832,21 @@ A new harness is **one directory and no changes above L2**. The tests are the
 checklist: work through the steps, and at each missed one the build tells you
 what is missing.
 
-### Step 1 — the directory
+### Step 1 — the directory, the descriptor and the impl
 
-`harness/<id>/mod.rs`, plus `pub mod <id>;` in `harness/mod.rs`, plus a row in
-`layering.rs`'s `HARNESS_DIRS`.
+`harness/<id>/mod.rs` with an `impl HarnessPlugin`, plus `pub mod <id>;` in
+`harness/mod.rs`, plus **one `HarnessDescriptor` row** in `harness/registry.rs`
+(§ 2.2). `layering.rs`'s old hand-kept `HARNESS_DIRS` array is gone — it is a
+view over the registry now, so a new harness is declared once, and the test can
+check the half it was *not* told about.
 
-> **Fails until you do:** `every_harness_dir_declares_its_capabilities` — "a
-> `harness/<id>/` directory exists that this test does not know about".
+The full per-method checklist, with the test that fails at each missed step, is
+[`docs/ARCHITECTURE.md` § *Adding a harness plugin*](ARCHITECTURE.md); the steps
+below are the narrative for the ones that need one.
+
+> **Fails until you do:** `every_registry_entry_is_fully_wired` — in both
+> directions: "a `harness/<id>/` directory exists that the registry does not
+> declare (or vice versa)".
 
 ### Step 2 — emit the artifact
 
@@ -712,8 +884,8 @@ Event ids come from `chp::EV_*`. Every `cannot` carries a `why`, and a good `why
 names what serves the capability instead. A capability absent from `serves` must
 read as *unavailable, with a reason* — never as *nobody wrote it down*.
 
-> **Fails until you do:** `every_harness_dir_declares_its_capabilities` looks for
-> `EV_HELLO` in a `.rs` file in your directory.
+> **Fails until you do:** `every_registry_entry_is_fully_wired` looks for
+> `chp::EV_HELLO` in a `.rs` file in your directory.
 
 ### Step 4 — capability rows
 
@@ -722,10 +894,18 @@ with `wired_in` naming your files — and add the ids to `MAINTENANCE.md`'s drif
 table in the **same commit** (a doc row may carry several ids; each id must
 appear in exactly one row).
 
-> **Fails until you do:** `every_harness_dir_declares_its_capabilities` (no rows
-> for your `Harness`), `matrix_matches_maintenance_doc` (registry ↔ doc
-> disagreement, both directions), `wired_in_paths_exist` (a path that does not
-> resolve), `probes_and_the_matrix_agree` (a row in neither probe list).
+> **Fails until you do:** `every_registry_entry_is_fully_wired` (no rows for
+> your harness), `matrix_matches_maintenance_doc` (registry ↔ doc disagreement,
+> both directions), `wired_in_paths_exist` (a path that does not resolve),
+> `probes_and_the_matrix_agree` (a row in neither probe list).
+>
+> Rows whose contract is a sentence about **this product** — "this TUI accepts a
+> bracketed paste as one literal insertion" — go in your plugin's
+> `capabilities()` rather than in `contract.rs`'s neutral table;
+> `contract::capabilities()` chains them after the neutral ones, so every
+> consumer (the gate, the probe, the health panel, the drift advisor, the
+> literal scan) still sees one registry and none of them holds a per-harness
+> list.
 >
 > And once your row exists, `no_harness_literals_outside_harness` gets *stricter*
 > — your `depends_on` strings become needles. If it fires, the code reading them
@@ -736,9 +916,21 @@ appear in exactly one row).
 Either a canary, a probe, or a recorded waiver. Any `Silent` row needs one of
 the three; a canary id and a probe id **are** the capability id. If you write a
 canary, write its negative twin: a positive canary that never ran passes just as
-green as one that did. If you can only write a waiver, say what covers the row
-meanwhile and who owns closing it — and put the row in
-`probe::DECLARED_UNPROBED` with the reason rather than leaving it uncounted.
+green as one that did. Canaries and probe bodies are the **plugin's**
+(`canaries()`, `probe()`); `harness/{canary,probe}.rs` keep the runners, the
+corpus rules and the report shape.
+
+If you can only write a waiver, say what covers the row meanwhile and who owns
+closing it — and declare the row unprobed **from your own plugin**
+(`HarnessPlugin::declared_unprobed()`, an `(id, reason)` pair) rather than
+leaving it uncounted. That list is deliberately separate from what `probe()`
+answers: *"no probe can settle this"* is a claim that needs writing down, and a
+probe that silently stopped emitting a row must not be mistaken for one.
+`probe::DECLARED_UNPROBED_NEUTRAL` keeps only the rows no plugin owns — the ones
+stated about a *tab* — and `probe::declared_unprobed()` is the joined view.
+`probe::IMPLEMENTED` likewise stays in core: it is the **declared report
+order**, so a report cannot silently become "whatever the probe functions
+happened to answer".
 
 > **Fails until you do:**
 > `every_silent_degradation_has_a_canary_or_a_probe_or_a_waiver`,
@@ -764,19 +956,34 @@ rather than ambient. Two disciplines come with it:
 > `each_migrated_capability_is_arbitrated_on_both_sides` if you migrate a
 > capability that has a reader.
 
-### What costs nothing above L2
+### What a new harness costs above L2
 
-| You do **not** touch | Because |
+Read this table as *what is enforced*, not as reassurance. Two of the rows it
+used to carry were false, and V40 replaced each with the test that now holds it.
+
+| You do **not** touch | Because — and what fails if you try |
 |---|---|
-| A new enum variant outside `harness/` | `OobSpec` and the spawn seam live in `harness/reader.rs` |
-| A new `match` arm in `tabs/config.rs` | `tabs::config` owns *when* a tab spawns; `harness/<id>/` owns *how the harness is told* |
-| A bespoke gate constant | `contract::gate(id)` is the one query; a gate is a `GATED` entry plus one arm |
-| A frontend mirror | `health.rs` computes the whole view; the panel paints it |
-| A new Settings field for interpretation | Phase E deleted `harnessStatusBlocks` for exactly this reason |
-| `chp.rs`, `contract.rs`'s types, `graph/`, `tts/`, `usage/`, `workbench/` | they type against CHP, not against harness-shaped Rust |
+| A new enum variant outside `harness/` | `HarnessId` is an opaque newtype with **no per-product constants**, and `OobSpec` plus the spawn seam live in `harness/reader.rs`. `no_harness_identity_outside_registry` fails the build if core spells a harness name at all. |
+| A new `match` arm in `tabs/config.rs` | `tabs::config` owns *when* a tab spawns; `harness/<id>/` owns *how the harness is told*. That file left `IDENTITY_ALLOWLIST` in V40 Phase C, so it is now **inside** the identity scan: a new per-harness arm there is a red build, not a discouraged habit. |
+| A bespoke gate constant | `contract::gate_for(id, settings, harness)` is the one query. `every_gated_capability_can_actually_block` and `no_gate_blocks_outside_the_declared_list` hold it in both directions. |
+| A new Settings field for interpretation | Your own fields are `settings_schema()` rows under `Settings.harness[<id>].ext`, rendered by a generic form. The `harness` block is **machine scope** — it describes this installation's harnesses, not this project's preferences — and `every_registry_entry_is_fully_wired` rejects a duplicate key, a nameless control or a default the declared kind would not accept. |
+| `chp.rs`, `contract.rs`'s types, `graph/`, `tts/`, `workbench/`, `delegation/` | they type against CHP and against `HarnessId`, not against harness-shaped Rust. `harness_modules_do_not_import_capabilities` holds the direction. |
 
-If a step forces one of these, **the seam is in the wrong place — say so rather
-than adding it.**
+**One thing you *do* touch, and the old version of this table denied it: the
+frontend mirror.** There is one, and it is pinned rather than hand-kept.
+`harness_list` serves the roster over IPC (identity + features + affordances +
+declared `ext` fields + scoped features);
+`info::tests::the_committed_registry_fixture_matches_the_registry` writes
+`src-tauri/fixtures/harness/registry.json` from the registry and fails when the
+committed copy differs; vitest reads that file and asserts the TypeScript unions
+in `src/lib/harness.ts` cover it. So a new harness costs **no per-harness
+frontend code** — no `{:else if}` body, no CSS class, no label map — but it does
+cost a re-blessed fixture, and if you add a *field* or a *feature* it costs the
+TypeScript union too. Skipping that is a red `npm test`, not a runtime
+`undefined`.
+
+If a step forces anything else outside `harness/<id>/`, **the seam is in the
+wrong place — say so rather than adding it.**
 
 ### The hard rules
 
@@ -839,13 +1046,19 @@ an unsupplied key is echoed as a literal `{{…}}` into a file the harness loads
 
 ### When `CHP_VERSION` bumps
 
-**Bump for a semantic change to something already on the wire. Never for an
-additive route.** New meaning ⇒ new route (compatibility rule 4); a new route
-with a new body is additive and leaves `chp` alone — which is why Phase J and
-Phase L both shipped at `chp = 1`. Bumping means, in one commit: the constant in
-`harness/chp.rs`, the header of `docs/CHP.md`, and a row in § 6.1's table if the
-bump changes what a mismatch *means*. The first two are enforced by
-`the_doc_states_this_version`.
+**Bump for a semantic change to something already on the wire, or for a
+vocabulary addition L3 can gate against. Never for an additive route alone.**
+New meaning ⇒ new route (compatibility rule 4); a new route with a new body is
+additive and leaves `chp` alone — which is why V35 phases J and L both shipped
+at `chp = 1`. **V40 Phase C took it to 2** for the seven neutral events it added
+to `chp::EVENTS` (locked decision 30): every existing event, route and body kept
+its shape, but the *vocabulary* is what a peer's hello is read against, so an
+artifact that had never heard of those ids is genuinely a different peer.
+Bumping means, in one commit: the constant in `harness/chp.rs`, the header of
+`docs/CHP.md`, a row for each new event in § 5 (its id **and** its route, both
+in backticks), and a row in § 6.1's table if the bump changes what a mismatch
+*means*. `the_doc_states_this_version` and `the_doc_documents_every_event`
+enforce all of that except the last.
 
 What a bump does to live tabs: every tab whose artifact was written by the
 previous build starts reporting **`old_plugin`** in *Harness health* until it is

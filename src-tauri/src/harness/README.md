@@ -27,7 +27,9 @@ rows in the registry and no CHP hello.
 | File | Layer | What it is |
 |---|---|---|
 | `contract.rs` | L3 | **The capability registry.** Every dependency cImp has on a harness, ranked by seam (A–D), with what it depends on, what breaks, and how it degrades. The authority; `docs/MAINTENANCE.md`'s drift table is checked against it. |
-| `chp.rs` | L2 | **CHP** — protocol version, the event vocabulary, the `/session/hello` handshake, stale-artifact detection. Wire contract: `docs/CHP.md`. Route handlers live in `offload/loopback.rs`. |
+| `chp.rs` | L2 | **CHP** — protocol version, the event vocabulary, the `/session/hello` handshake, stale-artifact detection. Wire contract: `docs/CHP.md`. |
+| `ingress.rs` | L2 | The registry-wide lookups over the harnesses' own loopback routes: who serves a path, where a request's identity lives, the drift-token key space, and the pre-tool reply budget derived from what the plugins declare. |
+| `_retired/` | — | Data a retired harness left behind that a live code path still compares against — permission-pattern rows for pristine-file reconciliation, and nothing else. No plugin, no descriptor, no registry row. |
 | `canary.rs` | — | L1 canaries: recorded fixtures still produce **substantive** output (not merely parse). |
 | `probe.rs` | — | L2 live probes: the recorded shape is still real, driven against the installed CLI. |
 | `verify.rs` | — | Joins the two when the installed version changes, and advances `claude_last_verified` on its own. |
@@ -118,7 +120,29 @@ A new harness is one directory, one registry row and no changes above L2.
    *injection* hierarchy's — the mechanism lives inside the artifact you emit —
    name it in `scoped_features()` with the `ext` key holding its app-wide L2,
    and core will stop offering it to every other harness.
-9. **A fallback reader** (`<id>/read.rs`) only if the harness cannot push. Tier C
+9. **`routes()`** — only if your harness posts something that is not a CHP body
+   (`harness/<id>/hook.rs`). Each entry is `(method, path, handler)`; core's
+   router appends them after every CHP-neutral arm, so you cannot shadow
+   `/session/hello` or `/mcp/*`, and it writes back your `HookReply` — a status
+   and a body it does not read — so your reply envelope stays yours. Declare
+   `identity_of_request()` if your payload has no room for a CHP envelope and
+   the `(agent, tab, chp)` triple rides headers instead, `drift_vocabulary()`
+   for the ledger tokens your routes report payload drift under,
+   `chp_event_for_route()` / `drift_token_for_capability()` so the quiet
+   detector can speak about capabilities rather than transports, and
+   `hook_reply_timeout()` if a caller of yours waits on the reply — core takes
+   `min(all declared) − margin` as the budget it may spend before answering
+   (`harness::ingress::hook_reply_budget`).
+10. **`permission_patterns()`** — your TUI's prompt grammar
+   (`harness/<id>/prompts.rs`): the substrings that mean "a permission prompt is
+   on screen", "a question menu is on screen", "the harness is working". The
+   detector engine is core and neutral; what it matches on is a transcription of
+   your terminal chrome, so it lives with you, along with the capture recipe and
+   the reasoning for each marker. `legacy_permission_patterns(era)` is the same
+   rows as an earlier release shipped them, for pristine-file reconciliation —
+   append-only, and the one thing a retired harness leaves behind
+   (`harness/_retired/`).
+11. **A fallback reader** (`<id>/read.rs`) only if the harness cannot push. Tier C
    stays possible; it is now contained and declared rather than ambient. If you
    write one — or a canary or probe that speaks its types — it will need L4
    types; add the file to `layering.rs`'s `UPWARD_EXEMPT` with the reason.

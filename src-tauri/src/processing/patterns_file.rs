@@ -44,21 +44,39 @@ pub struct PatternsFile {
 /// first launch and used as the fallback when load fails.
 fn default_file() -> PatternsFile {
     PatternsFile {
-        doc: Some(
-            "Edit this file to add or refine prompt-detection substrings. \
-             Each pattern's `all_of` is a list of substrings that must ALL be \
-             present in the rendered terminal tail for the pattern to match; \
-             the optional `none_of` list vetoes the match when ANY of its \
-             substrings is present (that is how the permission patterns stay \
-             off Claude's select menus). \
-             `kind` is `permission` or `question`. Set `disabled: true` to \
-             keep an entry in the file without enabling it. Capture live \
-             chrome with RUST_LOG=perm_capture=debug. Patterns are tested in \
-             declaration order; first match per kind wins."
-                .to_string(),
-        ),
+        doc: Some(default_doc()),
         patterns: default_patterns(),
     }
+}
+
+/// The `_doc` header shipped inside `patterns.json`.
+///
+/// **V40 Phase C, locked decision 21.** One clause of this used to name
+/// Claude's select menus — a user-facing string in core, describing one
+/// product's TUI. The two neutral halves are cImp's own instructions and stay;
+/// the worked example between them is
+/// [`crate::harness::HarnessPlugin::patterns_doc_note`], composed in registry
+/// order, so a harness with nothing to illustrate contributes nothing and the
+/// header simply gets shorter.
+///
+/// The composed bytes are pinned against the committed seed by
+/// [`tests::the_shipped_seed_is_byte_identical_to_what_the_plugins_compose`].
+fn default_doc() -> String {
+    let notes: String = crate::harness::registry::all()
+        .filter_map(|h| h.plugin())
+        .filter_map(|p| p.patterns_doc_note())
+        .collect();
+    format!(
+        "Edit this file to add or refine prompt-detection substrings. \
+         Each pattern's `all_of` is a list of substrings that must ALL be \
+         present in the rendered terminal tail for the pattern to match; \
+         the optional `none_of` list vetoes the match when ANY of its \
+         substrings is present{notes}. \
+         `kind` is `permission` or `question`. Set `disabled: true` to \
+         keep an entry in the file without enabling it. Capture live \
+         chrome with RUST_LOG=perm_capture=debug. Patterns are tested in \
+         declaration order; first match per kind wins."
+    )
 }
 
 /// Every named era of the shipped `patterns.json`, **newest first**.

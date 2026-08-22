@@ -225,6 +225,20 @@ own hook-input JSON verbatim rather than a CHP body. They are not a second body
 shape on an existing route (compatibility rule 4 forbids that) and they are not
 in the § 5 vocabulary: they are a *transport* for events that already have ids.
 
+**Since V40 Phase C these routes are registered by the harness, not by core.**
+The table below is `harness::claude::hook::ROUTES_TABLE`, returned from
+`HarnessPlugin::routes()`; the loopback's router matches its own CHP-neutral
+arms first and appends every registered plugin's routes after them, so a plugin
+can neither shadow `/session/hello` nor add a route core does not enumerate
+(`loopback::tests::every_loopback_route_declares_what_it_does_about_the_latch`
+covers both halves of the surface). The handler answers a neutral `HookReply` —
+a status and a body — which core writes without reading, so the *"Answers"*
+column below is this harness's envelope and stays inside its directory.
+`POST /permission/event` (§ 4.3) is in that table too: it carries neither
+`agent` nor `tab` because the only thing that has ever posted to it is this
+harness's pre-Phase-J `--notify-hook` shim, which is the same fact § 4.4 already
+recorded.
+
 | Claude event | Route | CHP event it feeds | Answers |
 |---|---|---|---|
 | `UserPromptSubmit` | `POST /claude/hook/user_prompt_submit` | `prompt` | `hookSpecificOutput.additionalContext`, or `{}` |

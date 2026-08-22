@@ -376,6 +376,10 @@ impl HarnessPlugin for ClaudePlugin {
         super::prompts::PATTERNS
     }
 
+    fn patterns_doc_note(&self) -> Option<&'static str> {
+        Some(super::prompts::DOC_NOTE)
+    }
+
     fn legacy_permission_patterns(
         &self,
         era: &str,

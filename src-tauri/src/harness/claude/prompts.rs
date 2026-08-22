@@ -59,6 +59,15 @@ use crate::processing::permission::{PatternKind, PatternSpec};
 /// depend on" finds the retired dependency in the same place as the live one.
 pub const CLAUDE_FOOTER: &str = "Esc to cancel · Tab to amend";
 
+/// This harness's clause in the shipped `patterns.json` header — the worked
+/// example of what a veto list is for.
+///
+/// Reaches the file through `HarnessPlugin::patterns_doc_note`, composed in
+/// registry order between the header's two neutral halves. Its text is pinned
+/// by `patterns_file::tests::the_shipped_seed_is_byte_identical_to_what_the_
+/// plugins_compose`, which is why it carries its own leading space.
+pub const DOC_NOTE: &str = " (that is how the permission patterns stay off Claude's select menus)";
+
 /// The placeholder the pre-V19 default sets shipped as a worked example.
 const ALT_EXAMPLE: &str = "<replace with a substring unique to this prompt shape>";
 

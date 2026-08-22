@@ -855,6 +855,22 @@ pub trait HarnessPlugin: Sync + Send {
         &[]
     }
 
+    /// One clause for the `_doc` header of the shipped `patterns.json`,
+    /// illustrating what this harness's rows use `none_of` for.
+    ///
+    /// Locked decision 21's last sentence. The header used to read "…that is how
+    /// the permission patterns stay off Claude's select menus" from inside
+    /// `processing/patterns_file.rs` — a user-facing string in core, naming one
+    /// product's TUI. The sentence is worth keeping (it is the only place a
+    /// hand-editing user learns what the veto list is FOR), so the harness whose
+    /// menus it describes supplies it.
+    ///
+    /// Composed into the header verbatim and in registry order; a harness that
+    /// declares none contributes nothing.
+    fn patterns_doc_note(&self) -> Option<&'static str> {
+        None
+    }
+
     /// The rows this harness shipped in a **named earlier era** of the on-disk
     /// `patterns.json`, for pristine-file reconciliation.
     ///

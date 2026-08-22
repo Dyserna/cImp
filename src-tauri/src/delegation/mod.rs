@@ -47,7 +47,11 @@ use std::sync::{Mutex, OnceLock};
 use crate::activity::{ActivityEntry, ActivityKind, ActivityRecord, Attribution};
 use crate::state::TabId;
 
-pub use engine::{drive, worker_busy, worker_ready, DriveRequest};
+// `drive` itself is deliberately NOT re-exported (V39 review R-6): every
+// caller with a client behind it must go through `drive_watching`, which is
+// where "the caller went away" is handled. It stays reachable as
+// `engine::drive` for anything that genuinely has no caller to watch.
+pub use engine::{drive_watching, worker_busy, worker_ready, DriveRequest};
 
 // ── vocabulary ──────────────────────────────────────────────────────────────
 

@@ -12341,7 +12341,7 @@ mod tests {
             .find("delegate_admit(")
             .expect("handle_delegate must gate");
         let drive_at = body
-            .find("delegation::drive(")
+            .find("delegation::drive_watching(")
             .expect("handle_delegate must drive");
         assert!(
             gate_at < drive_at,
@@ -19070,23 +19070,59 @@ async fn handle_delegate(
         return write_json(stream, 200, &r).await;
     };
 
-    let reply = crate::delegation::drive(
-        app,
-        crate::delegation::DriveRequest {
-            worker: crate::state::TabId::from_str(&worker_id),
-            driver: Some(driver),
-            mode: crate::delegation::DelegationMode::Explicit,
-            task: body.task,
-            context: body.context,
-            timeout_s: body.timeout_s,
-            // The explicit tool adds NOTHING (locked decision 2a): what the
-            // user asked for is what the worker reads. Only the Phase C facade
-            // passes a note, and only because `offload_task`'s `schema` /
-            // `profile` have no other way through a PTY.
-            format_note: None,
-        },
-    )
-    .await;
+    // V39 review R-6: **watch the caller** while the delegation runs, the same
+    // way `/run` does and with the same reasoning one step further. A worker
+    // tab is single-slot and its keyboard is locked for the whole flight, so a
+    // `delegate_task_*` caller that died — a closed session, a killed child —
+    // used to hold BOTH for the full `delegation.default_timeout_s` (ten
+    // minutes by default) waiting to hand over a reply nobody would read.
+    //
+    // After the request body a well-behaved client sends nothing and does not
+    // half-close its write half until it has the response, so a probe read
+    // returning 0 bytes (or erroring) means the connection went away. No
+    // heartbeat half: unlike `/run` this route answers with one JSON object and
+    // adding a keep-alive stream would change the wire shape for the child.
+    //
+    // What happens on cancel is `drive_watching`'s, shared with the facade: the
+    // engine is TOLD (no key is ever sent — the worker finishes visibly), the
+    // flight is awaited rather than dropped so the slot and lock are released
+    // by their owner, and a pre-claim abandonment mark (R-8) is dropped after.
+    let cancel = CancellationToken::new();
+    let drive_req = crate::delegation::DriveRequest {
+        worker: crate::state::TabId::from_str(&worker_id),
+        driver: Some(driver),
+        mode: crate::delegation::DelegationMode::Explicit,
+        task: body.task,
+        context: body.context,
+        timeout_s: body.timeout_s,
+        // The explicit tool adds NOTHING (locked decision 2a): what the user
+        // asked for is what the worker reads. Only the Phase C facade passes a
+        // note, and only because `offload_task`'s `schema` / `profile` have no
+        // other way through a PTY.
+        format_note: None,
+    };
+    let reply = {
+        let (mut rd, _wr) = stream.split();
+        let flight = crate::delegation::drive_watching(app, drive_req, &cancel);
+        tokio::pin!(flight);
+        loop {
+            let mut probe = [0u8; 1];
+            tokio::select! {
+                biased;
+                r = &mut flight => break r,
+                read = rd.read(&mut probe) => match read {
+                    Ok(0) | Err(_) => {
+                        debug!("delegate loopback: caller disconnected mid-flight; cancelling");
+                        cancel.cancel();
+                        break (&mut flight).await;
+                    }
+                    // A stray byte before the response is unexpected on this
+                    // one-shot protocol; ignore it and keep waiting.
+                    Ok(_) => continue,
+                },
+            }
+        }
+    };
 
     let r = match reply {
         Ok(reply) => DelegateResult {

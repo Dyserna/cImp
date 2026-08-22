@@ -1662,7 +1662,7 @@ impl OffloadService {
         profile: Option<Profile>,
         cancel: &CancellationToken,
     ) -> AppResult<String> {
-        let flight = crate::delegation::drive(
+        let reply = crate::delegation::drive_watching(
             &self.app,
             crate::delegation::DriveRequest {
                 worker: facade.tab().clone(),
@@ -1676,24 +1676,13 @@ impl OffloadService {
                 timeout_s: None,
                 format_note: agent::facade_format_note(schema, profile),
             },
-        );
-        tokio::pin!(flight);
-        let reply = tokio::select! {
-            r = &mut flight => r,
-            _ = cancel.cancelled() => {
-                // Tell the engine, then let it finish tearing down. Never drop
-                // the future: it holds the slot and the lock.
-                //
-                // V39 review R-8: this also marks a worker whose flight has not
-                // been claimed yet, so a cancel during preflight refuses at the
-                // claim instead of typing into the tab.
-                crate::delegation::note_driver_gone(facade.tab());
-                flight.await
-            }
-        };
-        // The mark belongs to THIS attempt (R-8): consumed by the claim if it
-        // got that far, dropped here if it did not.
-        crate::delegation::clear_driver_gone(facade.tab());
+            // V39 review L-7 + R-6: the cancel handling — tell the engine, keep
+            // awaiting its teardown, drop the pre-claim mark afterwards — is
+            // `drive_watching`'s, shared with the explicit `/delegate` route so
+            // the two cannot come to differ.
+            cancel,
+        )
+        .await;
         match reply {
             // V39 review M-11: a schema was a REQUEST, and only a request. A
             // real backend has the answer grammar-constrained by llama-server

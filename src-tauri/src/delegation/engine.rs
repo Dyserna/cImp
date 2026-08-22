@@ -452,6 +452,54 @@ pub async fn worker_ready(app: &AppHandle, worker: &TabId) -> Result<(), String>
     worker_completion_source(agent, worker, &worker_name)
 }
 
+/// **Drive a worker, and stop waiting if the caller goes away** (V39 review
+/// L-7 + R-6).
+///
+/// Every caller of [`drive`] that has a live client behind it — the facade
+/// (`offload_task` over the loopback) and the explicit `delegate_task_*` route
+/// — needs the same three things, and each of them is a way to get it wrong:
+///
+/// 1. **Never drop the flight.** `drive` owns the worker's slot and its
+///    read-only lock; a dropped future leaves both held with no owner, which
+///    is the lock-whose-owner-does-not-exist this module refuses even to
+///    persist. So the cancel path tells the engine and then AWAITS the
+///    teardown — one teardown path, not two.
+/// 2. **Mark, don't interrupt.** The worker is sent nothing (locked decision
+///    6); it finishes its turn visibly and the engine mints the terminal row.
+/// 3. **Drop the mark afterwards.** A pre-claim abandonment mark (review R-8)
+///    belongs to this attempt only.
+///
+/// Generic over the future so the shape can be tested without an `AppHandle` —
+/// see [`drive_watching`] for the call every caller actually makes.
+pub(crate) async fn watch_for_driver_gone<F: std::future::Future>(
+    worker: &TabId,
+    cancel: &tokio_util::sync::CancellationToken,
+    flight: F,
+) -> F::Output {
+    tokio::pin!(flight);
+    let out = tokio::select! {
+        r = &mut flight => r,
+        _ = cancel.cancelled() => {
+            super::note_driver_gone(worker);
+            flight.await
+        }
+    };
+    super::clear_driver_gone(worker);
+    out
+}
+
+/// [`drive`], watched by [`watch_for_driver_gone`]. **The call every driving
+/// path with a client behind it makes**, so the cancel handling is written
+/// once.
+pub async fn drive_watching(
+    app: &AppHandle,
+    req: DriveRequest,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<Reply, DelegationError> {
+    let worker = req.worker.clone();
+    watch_for_driver_gone(&worker, cancel, drive(app, req)).await
+}
+
 /// **Drive one worker tab and return its answer.**
 ///
 /// Every failure is a named [`DelegationError`]; every outcome mints exactly
@@ -1150,6 +1198,41 @@ mod tests {
             "do it\n\nanswer in JSON",
             "no context: the note follows the task directly"
         );
+    }
+
+    /// **A cancelled wait marks the worker and never drops the flight**
+    /// (V39 review L-7 + R-6).
+    ///
+    /// The shape both driving paths share, asserted without an `AppHandle`:
+    /// on cancel it tells the engine and keeps awaiting — because the future it
+    /// is waiting on owns the worker's slot and its read-only lock, and
+    /// dropping it would leave both held by nobody.
+    #[tokio::test]
+    async fn a_cancelled_wait_marks_the_worker_and_never_drops_the_flight() {
+        use std::time::Duration;
+        let worker = TabId::from_str("ai-r6-worker");
+        let _registry = crate::delegation::testing::lock_registry();
+        crate::delegation::testing::claim_and_submit(&worker);
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (tx, rx) = tokio::sync::oneshot::channel::<u8>();
+        let watched = watch_for_driver_gone(&worker, &cancel, async move { rx.await.unwrap() });
+        tokio::pin!(watched);
+
+        cancel.cancel();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut watched)
+                .await
+                .is_err(),
+            "the flight must NOT be dropped on cancel — it holds the slot and the lock"
+        );
+        assert!(
+            super::super::is_driver_gone(&worker),
+            "…and the engine must have been told, so its own wait loop can end the flight"
+        );
+
+        tx.send(7).expect("the flight is still being awaited");
+        assert_eq!(watched.await, 7, "the flight's own answer is returned");
     }
 
     /// **The paste is not a submit; the submit is** (V39 review L-1).

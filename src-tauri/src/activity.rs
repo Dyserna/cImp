@@ -1123,6 +1123,16 @@ static ROOT_KEYS: LazyLock<Mutex<HashMap<PathBuf, String>>> =
 /// a `find_graph_root` ancestor walk, drive-letter vs. verbatim `\\?\` form on
 /// Windows), and canonicalizing both sides makes those compare equal. Falls
 /// back to the path as given (e.g. the directory vanished mid-call).
+///
+/// **#104 item 5: the verbatim prefix is stripped.** `canonicalize` yields the
+/// extended-length form on Windows and the fallback arm yields whatever the
+/// caller spelled, so ONE project reached the store under two keys and a scoped
+/// reader filtering on either spelling silently dropped the other's rows. Both
+/// arms now go through [`crate::fsutil::plain_path`], so the recorded key is the
+/// plain drive-letter form — the spelling the user sees and the one most
+/// existing rows already carry. Rows written under the old verbatim spelling
+/// stay readable because every comparison goes through [`root_key_eq`], which
+/// normalizes the STORED side too.
 pub fn root_key(root: &Path) -> String {
     if let Ok(cache) = ROOT_KEYS.lock() {
         if let Some(key) = cache.get(root) {
@@ -1131,7 +1141,7 @@ pub fn root_key(root: &Path) -> String {
     }
     match std::fs::canonicalize(root) {
         Ok(canon) => {
-            let key = canon.to_string_lossy().to_string();
+            let key = crate::fsutil::plain_path(&canon.to_string_lossy());
             if let Ok(mut cache) = ROOT_KEYS.lock() {
                 // Bounded memo: the key set is tiny in practice; a wholesale
                 // clear on the (unexpected) way past the cap keeps it O(1)
@@ -1143,8 +1153,31 @@ pub fn root_key(root: &Path) -> String {
             }
             key
         }
-        Err(_) => root.to_string_lossy().to_string(),
+        Err(_) => crate::fsutil::plain_path(&root.to_string_lossy()),
     }
+}
+
+/// Whether two recorded root keys name the SAME project.
+///
+/// #104 item 5. Never compare `entry.root` with `==`: the store outlives the
+/// build that wrote it, so it holds rows in the pre-fix extended-length
+/// (verbatim) spelling alongside rows in the plain one, and a raw string
+/// compare splits one project into two lanes — the scoped `graph_history`
+/// filter, the advisor's per-root retain, and the H1 ambiguity predicate all
+/// read one lane and miss the other. Normalizes both sides (verbatim prefix
+/// stripped by [`crate::fsutil::plain_path`], then
+/// [`crate::fsutil::norm_dir_key`]'s separator/trailing-separator/case
+/// folding), so an old row and a new one for one directory compare equal.
+///
+/// An empty key equals only an empty key: the empty string is the honest
+/// "attributed to no project" value (an agent cwd that resolved to no root —
+/// #104 item 2), not a wildcard.
+pub fn root_key_eq(a: &str, b: &str) -> bool {
+    if a.is_empty() || b.is_empty() {
+        return a == b;
+    }
+    crate::fsutil::norm_dir_key(&crate::fsutil::plain_path(a))
+        == crate::fsutil::norm_dir_key(&crate::fsutil::plain_path(b))
 }
 
 /// Current Unix epoch in milliseconds (0 if the clock is before the epoch).
@@ -1322,6 +1355,43 @@ mod tests {
             Path::new("definitely/not/a/real/dir").to_string_lossy()
         );
     }
+
+    /// #104 item 5: one project, ONE lane. `canonicalize` returns the
+    /// extended-length (verbatim) form on Windows while every configured path,
+    /// every fallback arm and every pre-fix row carries the plain one, so the
+    /// store held both spellings for the same directory and a scoped reader
+    /// filtering on either dropped the other's rows.
+    #[test]
+    fn both_spellings_of_one_root_map_to_one_key() {
+        let cwd = std::env::current_dir().expect("cwd");
+        let key = root_key(&cwd);
+        // The key itself is the plain spelling — the one the user sees.
+        assert!(
+            !key.starts_with(VERBATIM),
+            "the recorded key must not carry the verbatim prefix: {key}"
+        );
+        // And a row written by a pre-fix build still resolves to this project.
+        let verbatim = format!("{VERBATIM}{}", key.trim_start_matches(VERBATIM));
+        assert!(
+            root_key_eq(&verbatim, &key),
+            "an old verbatim row must still match {key}"
+        );
+        // Separator and case differences fold too (Windows paths are
+        // case-insensitive), and a trailing separator is not a second project.
+        assert!(root_key_eq(&key, &format!("{key}/")));
+        if cfg!(windows) {
+            assert!(root_key_eq(&key.to_uppercase(), &key));
+        }
+        // An empty key is "attributed to no project", never a wildcard.
+        assert!(root_key_eq("", ""));
+        assert!(!root_key_eq("", &key));
+        assert!(!root_key_eq(&key, ""));
+        // Two genuinely different projects stay different.
+        assert!(!root_key_eq("P:/proj/a", "P:/proj/b"));
+    }
+
+    /// Windows' extended-length prefix (`\\?\`), spelled once here.
+    const VERBATIM: &str = "\\\\?\\";
 
     #[test]
     fn records_newest_first_within_cap() {

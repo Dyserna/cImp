@@ -2307,7 +2307,10 @@ pub async fn graph_history(
             .filter(|c| c.kind == crate::activity::ActivityKind::Graph.as_str())
             .collect();
         if let Some(key) = key {
-            calls.retain(|c| c.root == key);
+            // #104 item 5: NOT `==`. The store holds rows this project wrote
+            // before the key spelling was unified, so a raw compare drops half
+            // of one project's history.
+            calls.retain(|c| crate::activity::root_key_eq(&c.root, &key));
         }
         calls
     })
@@ -3183,7 +3186,7 @@ fn advisor_snapshot_blocking(
     let applied: Vec<crate::settings::AppliedRule> = settings
         .advisor_applied
         .iter()
-        .filter(|a| a.root == root_str)
+        .filter(|a| crate::activity::root_key_eq(&a.root, &root_str))
         .cloned()
         .collect();
 
@@ -3389,7 +3392,9 @@ pub async fn advisor_mark_applied(
     let root_str = root.to_string_lossy().to_string();
     state.settings.mutate(move |cur| {
         cur.advisor_applied
-            .retain(|a| !(a.rule_id == rule_id && a.root == root_str));
+            .retain(|a| {
+                !(a.rule_id == rule_id && crate::activity::root_key_eq(&a.root, &root_str))
+            });
         cur.advisor_applied.push(crate::settings::AppliedRule {
             rule_id,
             root: root_str,

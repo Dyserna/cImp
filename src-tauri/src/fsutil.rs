@@ -245,6 +245,147 @@ pub fn confine_creatable(boundary: &Path, target: &Path) -> Result<Option<PathBu
     }
 }
 
+// ---------------------------------------------------------------------------
+// Shared project-root resolution (#104).
+//
+// A working directory is NOT a project root. Every externally supplied `cwd` —
+// a Claude hook payload's `cwd`, the OpenCode plugin's, an MCP call's, a
+// `run_command` marker directory — arrives from a process cImp does not
+// control, and a sub-agent's shell keeps its cwd across calls: one `cd` into
+// `src-tauri/src/harness` and every later hook reports THAT as its working
+// directory. Taking it as a root attributed activity rows to a directory that
+// is not a project and, worse, minted per-project STATE there (a `<db_subdir>`
+// holding `graph.db` and the workbench's `shadow.git`) — ten such directories
+// under one repo, which is what #104 is.
+//
+// One resolver, used by every such site, so the answer cannot differ by route.
+// ---------------------------------------------------------------------------
+
+/// Which marker ended the [`find_project_root`] walk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RootMarker {
+    /// A `.git` entry — a directory (ordinary clone) or a FILE (a linked
+    /// worktree or a submodule, whose `.git` is a one-line gitdir pointer).
+    Vcs,
+    /// An existing `<db_subdir>` directory — cImp's own per-project state.
+    State,
+}
+
+/// A resolved project root, plus what #104 wants reported about the walk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectRoot {
+    /// The directory to treat as the project.
+    pub root: PathBuf,
+    /// Which marker won.
+    pub marker: RootMarker,
+    /// The `<db_subdir>` directory (the path itself, e.g.
+    /// `<root>/src-tauri/src/harness/.cimp`) found strictly BELOW
+    /// [`Self::root`] during the walk: state minted under an existing project
+    /// root by the defect this resolver closes. Reported (a `warn!` plus an
+    /// Activity row at the call site), **never deleted** — it is the user's
+    /// data and may hold a graph they want.
+    pub stray_state: Option<PathBuf>,
+}
+
+/// Whether `dir` carries a VCS root marker.
+///
+/// `.git` as a **file** counts: that is how git spells a linked worktree and a
+/// submodule, and cImp is routinely run from one (this repo's own fix branch
+/// lives in a worktree). `exists()` rather than `is_dir()` is the whole point.
+fn has_vcs_marker(dir: &Path) -> bool {
+    dir.join(".git").exists()
+}
+
+/// The project root for `start`, walking UP to the nearest ancestor (inclusive)
+/// that carries a root marker. `None` when the whole chain carries none — a
+/// genuinely new, un-VCS'd folder, for which the caller must fall back to a
+/// root it *knows* (the tab's configured directory) or refuse, never mint one.
+///
+/// **Marker precedence — `.git` is STRONG, `<db_subdir>` is WEAK.**
+///
+/// * The nearest ancestor with a `.git` (dir or file) wins outright. Nearest,
+///   so a nested repo or a submodule beats its outer repo for a cwd inside it.
+/// * A `<db_subdir>` directory only wins when **no** `.git` exists anywhere up
+///   the chain (a project kept outside version control, indexed by cImp).
+/// * When both are present, the `.git` root wins and the lower `<db_subdir>` is
+///   returned as [`ProjectRoot::stray_state`].
+///
+/// The asymmetry is deliberate and is what makes the fix retroactive. A
+/// `<db_subdir>` is cImp's own output: after this change it can only exist at a
+/// real root, but the directories the defect already minted are indistinguishable
+/// from a root by their own presence. Treating them as equal markers would let
+/// every stray keep capturing the cwds that created it, forever. `.git` is
+/// evidence the *user* placed; `<db_subdir>` is evidence cImp placed, and cImp
+/// is the thing that was wrong.
+///
+/// A caller whose project legitimately sits at a `<db_subdir>`-only directory
+/// INSIDE a git repo (a sub-project opened as its own tab) is not served by the
+/// walk and must not be: that root is known from the tab's configuration, which
+/// every caller here consults FIRST — see `loopback::external_project_root`.
+///
+/// Purely observational: no directory is created, and nothing is deleted.
+pub fn find_project_root(start: &Path, db_subdir: &str) -> Option<ProjectRoot> {
+    let sub = match db_subdir.trim() {
+        "" => ".cimp",
+        s => s,
+    };
+    let mut weak: Option<PathBuf> = None;
+    for dir in start.ancestors() {
+        // An empty component is what `Path::ancestors` ends on for a relative
+        // path; probing it would test the PROCESS cwd, which is exactly the
+        // "some other directory decides the project" bug in miniature.
+        if dir.as_os_str().is_empty() {
+            break;
+        }
+        if has_vcs_marker(dir) {
+            // `weak` holds the `<sub>` directory itself; it is a stray only
+            // when it does not belong to the root we are about to return.
+            let stray = weak.filter(|w| w.parent() != Some(dir));
+            return Some(ProjectRoot {
+                root: dir.to_path_buf(),
+                marker: RootMarker::Vcs,
+                stray_state: stray,
+            });
+        }
+        if weak.is_none() && dir.join(sub).is_dir() {
+            weak = Some(dir.join(sub));
+        }
+    }
+    weak.map(|state| ProjectRoot {
+        root: state.parent().unwrap_or(&state).to_path_buf(),
+        marker: RootMarker::State,
+        stray_state: None,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Windows verbatim (`\\?\`) prefix normalization.
+//
+// `canonicalize` returns the extended-length form on Windows, so the SAME
+// directory reaches the activity store as `\\?\P:\proj` from any path that was
+// canonicalized and as `P:\proj` from any that was not (the fallback arms, and
+// every caller that passes a configured path straight through). Two spellings
+// are two lanes: a scoped reader filtering on one of them silently drops the
+// other project's rows, which are the same project's rows.
+// ---------------------------------------------------------------------------
+
+/// A path string with Windows' verbatim prefix removed: `\\?\P:\x` → `P:\x`,
+/// `\\?\UNC\server\share` → `\\server\share`. Everything else is returned
+/// unchanged, so this is a no-op on POSIX and on already-plain paths.
+///
+/// The PLAIN spelling is the canonical one, not the verbatim one: it is what
+/// the user sees, what a configured tab directory is written as, and what the
+/// pre-existing rows in the store already mostly carry.
+pub fn plain_path(s: &str) -> String {
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{rest}");
+    }
+    match s.strip_prefix(r"\\?\") {
+        Some(rest) => rest.to_string(),
+        None => s.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -412,5 +553,156 @@ mod tests {
         let err = confine_existing(&root, &root.join("link").join("secret.txt")).unwrap_err();
         assert!(matches!(err, ConfineError::Escaped), "got {err:?}");
         std::fs::remove_dir_all(&base).ok();
+    }
+    // ── #104: a cwd is never a project root by itself ──────────────────────
+
+    /// The defect's own shape: a sub-agent's shell had `cd`'d deep into the
+    /// tree and every later hook reported THAT directory. Resolution must walk
+    /// up to the real root, which here is marked only by cImp's own state dir.
+    #[test]
+    fn a_cwd_deep_in_the_tree_resolves_to_the_root_that_holds_the_state_dir() {
+        let root = temp_root("root-state");
+        std::fs::create_dir_all(root.join(".cimp")).unwrap();
+        let cwd = root.join("src-tauri").join("src").join("harness");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let got = find_project_root(&cwd, ".cimp").expect("a root");
+        assert_eq!(got.root, root);
+        assert_eq!(got.marker, RootMarker::State);
+        assert_eq!(got.stray_state, None);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A repo with no cImp state at all still resolves: `.git` is the marker
+    /// that makes the FIRST call from a sub-directory land on the real root
+    /// instead of minting a second project there.
+    #[test]
+    fn a_cwd_under_a_git_root_resolves_to_the_git_root() {
+        let root = temp_root("root-git");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let cwd = root.join("sub");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let got = find_project_root(&cwd, ".cimp").expect("a root");
+        assert_eq!(got.root, root);
+        assert_eq!(got.marker, RootMarker::Vcs);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A linked worktree's `.git` is a FILE (a `gitdir:` pointer), and this
+    /// repo's own fix branches live in one. `is_dir()` would miss every one of
+    /// them and mint state in the worktree's sub-directories.
+    #[test]
+    fn a_git_file_counts_as_a_marker_so_worktrees_resolve() {
+        let root = temp_root("root-worktree");
+        std::fs::write(root.join(".git"), "gitdir: P:/repo/.git/worktrees/wt\n").unwrap();
+        let cwd = root.join("src").join("deep");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let got = find_project_root(&cwd, ".cimp").expect("a root");
+        assert_eq!(got.root, root);
+        assert_eq!(got.marker, RootMarker::Vcs);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Nearest wins: a nested repo (or submodule) is its own project, so a cwd
+    /// inside it must not be attributed to the repo that contains it.
+    #[test]
+    fn the_nearest_git_marker_wins_over_an_outer_one() {
+        let root = temp_root("root-nested");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let nested = root.join("nested");
+        std::fs::create_dir_all(nested.join(".git")).unwrap();
+        let cwd = nested.join("src");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let got = find_project_root(&cwd, ".cimp").expect("a root");
+        assert_eq!(got.root, nested);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// No marker anywhere up the chain ⇒ no answer. The caller must fall back
+    /// to a root it knows or refuse; inventing one here is how the ten stray
+    /// state directories of #104 were minted.
+    #[test]
+    fn a_cwd_with_no_marker_anywhere_resolves_to_nothing() {
+        let root = temp_root("root-bare");
+        let cwd = root.join("a").join("b");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        assert_eq!(find_project_root(&cwd, ".cimp"), None);
+        // And nothing was created on the way past.
+        assert!(!cwd.join(".cimp").exists());
+        assert!(!root.join(".cimp").exists());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The retroactive half: a state directory the defect already minted must
+    /// NOT capture the cwds below it. The `.git` root wins and the stray is
+    /// reported by path so the user can remove it — never deleted here.
+    #[test]
+    fn a_state_dir_below_a_git_root_loses_and_is_reported_as_stray() {
+        let root = temp_root("root-stray");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let stray_at = root.join("src-tauri").join("src").join("harness");
+        std::fs::create_dir_all(stray_at.join(".cimp")).unwrap();
+
+        let got = find_project_root(&stray_at, ".cimp").expect("a root");
+        assert_eq!(got.root, root);
+        assert_eq!(got.marker, RootMarker::Vcs);
+        assert_eq!(got.stray_state, Some(stray_at.join(".cimp")));
+        // Reported, not removed.
+        assert!(stray_at.join(".cimp").is_dir());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The root's OWN state directory is not a stray — it is the state dir.
+    #[test]
+    fn the_roots_own_state_dir_is_never_reported_as_stray() {
+        let root = temp_root("root-own-state");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join(".cimp")).unwrap();
+        let cwd = root.join("sub");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let got = find_project_root(&cwd, ".cimp").expect("a root");
+        assert_eq!(got.root, root);
+        assert_eq!(got.stray_state, None);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The configured subdirectory name is honoured (`graph.db_subdir` is a
+    /// setting), and the default fills in for an empty one.
+    #[test]
+    fn the_state_marker_follows_the_configured_subdir_name() {
+        let root = temp_root("root-subdir");
+        std::fs::create_dir_all(root.join(".ckg")).unwrap();
+        let cwd = root.join("sub");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        assert_eq!(find_project_root(&cwd, ".ckg").map(|r| r.root), Some(root.clone()));
+        assert_eq!(find_project_root(&cwd, ".cimp"), None);
+        // An empty setting means the default, not "match every directory".
+        std::fs::create_dir_all(root.join(".cimp")).unwrap();
+        assert_eq!(find_project_root(&cwd, "").map(|r| r.root), Some(root.clone()));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// #104 item 5: one project, one spelling. `canonicalize` hands back the
+    /// verbatim form on Windows and the raw path everywhere else, so the store
+    /// held `\\?\P:\proj` and `P:\proj` for the same directory — two lanes.
+    #[test]
+    fn the_verbatim_and_plain_spellings_of_one_path_normalize_to_one() {
+        assert_eq!(plain_path(r"\\?\P:\proj\cctts"), r"P:\proj\cctts");
+        assert_eq!(plain_path(r"P:\proj\cctts"), r"P:\proj\cctts");
+        assert_eq!(
+            plain_path(r"\\?\P:\proj\cctts"),
+            plain_path(r"P:\proj\cctts")
+        );
+        // UNC keeps its share form rather than losing the leading slashes.
+        assert_eq!(plain_path(r"\\?\UNC\server\share\x"), r"\\server\share\x");
+        // POSIX and anything already plain pass through untouched.
+        assert_eq!(plain_path("/home/u/proj"), "/home/u/proj");
+        assert_eq!(plain_path(""), "");
     }
 }

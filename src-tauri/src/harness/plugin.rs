@@ -502,6 +502,313 @@ pub enum PermissionEdge {
     Resolved,
 }
 
+// ── activity (locked decision 18) ───────────────────────────────────────────
+
+/// **How core learns that this harness is busy.**
+///
+/// Locked decision 18. Two answers, and the difference between them is not a
+/// preference — it is whether the harness *tells* cImp (an event stream, a
+/// push) or whether cImp has to *infer* it from the terminal it is painting
+/// into. Core owns the inference machinery either way; what a plugin declares
+/// is which of the two applies and, for the inferring case, the timings the
+/// inference is sized against.
+///
+/// This replaces `pty::manager`'s `oob_drives_activity = matches!(spec.oob,
+/// Some(OobSpec::OpenCodeEvent { .. }))` — core deciding whether to model a
+/// terminal by testing for **one specific harness's** transport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivitySource {
+    /// The harness reports its own turn boundaries — an event stream, a CHP
+    /// push, a reader that emits `StateSignal::HarnessOutputStarted`/`Stopped`
+    /// directly. Core runs **no** TUI heuristic for such a tab: a fullscreen
+    /// startup repaint would otherwise fake a whole turn.
+    OutOfBand,
+    /// Nothing reports turn boundaries, so core infers them from the TUI —
+    /// a busy-footer marker (authoritative while on screen) arbitrated against
+    /// a byte-burst fallback, with the timings below.
+    TuiMarkers(ActivityTuning),
+}
+
+/// The timings core's TUI activity arbitration is sized against, **for one
+/// harness**.
+///
+/// Every value here is a measurement of somebody else's terminal — how often
+/// its spinner repaints, how long its footer blinks out between sub-agent
+/// batches, how long a thinking pause can run with no bytes. They were five
+/// `CLAUDE_*` constants in `pty/tasks.rs` and `state/manager.rs`, which meant
+/// core's avatar was a model of Claude Code's screen and any other harness got
+/// it by accident.
+///
+/// **A `const` table, pinned by a golden test** (`claude::plugin::tests::the_activity_tuning_is_the_pre_v40_constants`):
+/// these numbers were tuned against observed behaviour over several
+/// milestones, and a refactor that rounds one of them is a regression nobody
+/// would see until an avatar flickered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActivityTuning {
+    /// How long a byte burst must be sustained before the timer alone counts
+    /// the child as generating — the fallback for a response that never paints
+    /// the marker.
+    pub burst_min: std::time::Duration,
+    /// Quiet interval that closes a burst once the marker is gone. The marker,
+    /// not this timer, decides Idle while the harness is working.
+    pub quiet: std::time::Duration,
+    /// How long the busy marker must be *continuously absent* before a
+    /// marker-driven session may settle to Idle. Bridges a footer that blinks
+    /// out between sub-agent batches.
+    pub marker_grace: std::time::Duration,
+    /// Safety valve: the marker is still matched but the byte stream has been
+    /// silent this long, so treat it as a ghost and release.
+    pub working_stale: std::time::Duration,
+    /// Backstop for a wedged sub-agent count: a tab sitting in Thinking with
+    /// sub-agents nominally active and the parent producing NO output for this
+    /// long is released to Idle. Must be longer than [`Self::working_stale`],
+    /// so the marker path always concludes first — asserted by
+    /// `harness::plugin::tests::every_stall_backstop_outlasts_its_marker_path`.
+    pub subagents_stall: std::time::Duration,
+}
+
+// ── usage, quota and context (locked decision 19) ───────────────────────────
+
+/// One quota window a harness can report — **declared**, so core never spells
+/// `five_hour` / `seven_day` and a harness with three windows (or none) needs
+/// no core change.
+///
+/// The pre-V40 shape was two named fields on a core struct, which is why the
+/// widget, the IPC mirror and the push file all carried one vendor's
+/// subscription plan in their vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuotaWindowSpec {
+    /// Stable id — the key a reading is matched to, and what a UI keys a row
+    /// on. Never rendered.
+    pub id: &'static str,
+    /// The row label, e.g. `"current session"`.
+    pub label: &'static str,
+    /// The window's duration as the harness names it, e.g. `"(5h)"`. Its own
+    /// column so the labels line up across rows.
+    pub short: &'static str,
+    /// One sentence for the row's tooltip.
+    pub description: &'static str,
+}
+
+/// One billing category a harness reports tokens under.
+///
+/// input / cache_write / cache_read / output is *Claude's* set. A harness that
+/// does not distinguish cache tokens declares fewer, and a category it does
+/// not declare is **absent** from a reading — never present as zero (locked
+/// decision 19; global principle 5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TokenKindSpec {
+    /// Stable id, e.g. `"cache_read"`.
+    pub id: &'static str,
+    /// The label a UI renders for it.
+    pub label: &'static str,
+}
+
+/// **One turn's tokens, by declared category** — and the type whose whole
+/// purpose is that a category nobody reported has **no entry**.
+///
+/// It replaces four `Option<u64>` fields named after one vendor's billing
+/// (`cache_read_input_tokens` and friends). A map rather than a struct because
+/// the set of categories is the harness's declaration
+/// ([`TokenKindSpec`]) and not core's vocabulary; a newtype rather than a bare
+/// map because the absence rule is the contract, and a bare map invites a
+/// `.get(..).unwrap_or(0)` at every consumer — which is exactly the "empty is
+/// not absent" defect (global principle 5) in one line.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct TokenKinds(std::collections::BTreeMap<String, u64>);
+
+impl TokenKinds {
+    /// The count reported for `id`, or `None` — **never zero for absent**.
+    ///
+    /// Rust-side this is read by the tests that pin the absence rule; the
+    /// production consumer of a reading is the frontend, which receives the map
+    /// as JSON. Declared and kept under test anyway, so the next Rust consumer
+    /// reaches for an accessor that cannot spell `unwrap_or(0)` by accident.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn get(&self, id: &str) -> Option<u64> {
+        self.0.get(id).copied()
+    }
+
+    /// Record a reported count. Callers only call it for a value they actually
+    /// received; there is deliberately no "insert a default".
+    pub fn set(&mut self, id: &str, tokens: u64) {
+        self.0.insert(id.to_string(), tokens);
+    }
+
+    /// Whether nothing at all was reported.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The category ids present, in id order. Same posture as [`Self::get`].
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn ids(&self) -> impl Iterator<Item = &str> {
+        self.0.keys().map(String::as_str)
+    }
+}
+
+/// One lane a turn's usage can be attributed to.
+///
+/// The `session` / `agent` split is Claude Code's *sidechain* model (a turn on
+/// the main transcript vs. one in `<sid>/subagents/*.jsonl`, or an inline
+/// `isSidechain:true` line). It is stored in `usage_stat.origin` and rendered
+/// as the Usage donut's lanes; declaring it makes both facts a harness's
+/// statement rather than core's assumption.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TurnOrigin {
+    /// The stored wire string (`"session"` / `"agent"`). Persisted in the
+    /// `usage_stat.origin` column, so a declared id is frozen once written.
+    pub id: &'static str,
+    /// The lane label a UI renders.
+    pub label: &'static str,
+}
+
+/// One quota window's current reading. `used` is 0–100; `resets_at` is an
+/// ISO-8601 timestamp (with timezone), or `None` for a window that reports
+/// none (a window at 0% often does).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct QuotaWindow {
+    pub id: String,
+    pub label: String,
+    /// The window's duration as the harness names it (`"(5h)"`).
+    pub short: String,
+    /// One sentence for the row's tooltip.
+    pub description: String,
+    /// Percentage of the window consumed, 0–100.
+    pub used: f64,
+    pub resets_at: Option<String>,
+}
+
+/// A live context-window reading.
+///
+/// Every field is independently absent: a reading is assembled leniently from
+/// whatever the harness reported, and **absent must render as unknown, never
+/// as zero**. `tokens` carries only the categories that were actually
+/// reported (see [`TokenKindSpec`]).
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ContextReading {
+    /// Percentage of the context window in use (0–100).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used_percentage: Option<f64>,
+    /// Percentage still free, as reported rather than derived.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remaining_percentage: Option<f64>,
+    /// Tokens currently occupying the window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_input_tokens: Option<u64>,
+    /// The window's size in tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window_size: Option<u64>,
+    /// The latest turn's tokens, by declared category id — see [`TokenKinds`].
+    #[serde(default, skip_serializing_if = "TokenKinds::is_empty")]
+    pub tokens: TokenKinds,
+    /// Session metadata the harness reported beside the numbers (session name,
+    /// agent/persona, effort, thinking, fast mode). Opaque to core, keyed by
+    /// the harness's own names; empty when none was reported.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub meta: std::collections::BTreeMap<String, String>,
+}
+
+impl ContextReading {
+    /// True when at least one *number* is present. Metadata alone (a session
+    /// name, an effort string) is not something a context bar can draw, so it
+    /// does not make a reading worth showing — "empty is not absent" (global
+    /// principle 5).
+    pub fn is_substantive(&self) -> bool {
+        self.used_percentage.is_some()
+            || self.remaining_percentage.is_some()
+            || self.total_input_tokens.is_some()
+            || self.context_window_size.is_some()
+            || !self.tokens.is_empty()
+    }
+}
+
+/// What one harness's usage source currently reports.
+///
+/// `windows` empty **and** `context` `None` is a source that exists but has
+/// nothing to say yet (no tab of that harness has reported). That is a
+/// different answer from [`HarnessPlugin::usage_source`] returning `None`,
+/// which is "this harness has no usage source at all" — and the difference is
+/// exactly what stops a harness that cannot report quota from rendering as a
+/// harness sitting at 0%.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+pub struct UsageReading {
+    /// The quota windows that have a current reading, in declared order.
+    pub windows: Vec<QuotaWindow>,
+    /// The live context reading, when one was reported.
+    pub context: Option<ContextReading>,
+    /// True when everything on the reading is aging — nothing is fresh.
+    pub stale: bool,
+    /// True when the quota half is present and aging. False when there is no
+    /// quota data at all (nothing to dim).
+    pub quota_stale: bool,
+    /// True when the context half is present and aging.
+    pub context_stale: bool,
+}
+
+/// Where a harness's usage / quota / context readings come from.
+///
+/// A trait object rather than a data table because a reading is *read* —
+/// Claude's comes off a push file its own status-line child writes, and a
+/// future harness's could come off an API or a CHP event. What core needs is
+/// the declaration (which windows, which token categories, which lanes) plus
+/// one call that produces the current reading.
+pub trait UsageSource: Sync + Send {
+    /// The quota windows this source can report, in display order.
+    fn windows(&self) -> &'static [QuotaWindowSpec];
+    /// The billing categories this harness reports tokens under.
+    fn token_kinds(&self) -> &'static [TokenKindSpec];
+    /// The lanes a turn's usage can be attributed to.
+    fn origins(&self) -> &'static [TurnOrigin];
+    /// The current reading, or `None` when this source has produced nothing
+    /// still worth showing. Must be cheap and must never block for long — a
+    /// widget polls it.
+    fn read(&self) -> Option<UsageReading>;
+    /// Model ids this harness *fabricates* — a pseudo-model stamped on a
+    /// locally generated message (an error, an interrupt) that nobody billed
+    /// for and that must be excluded from "which model ran this session".
+    fn model_sentinels(&self) -> &'static [&'static str] {
+        &[]
+    }
+}
+
+// ── session identity (locked decision 20) ───────────────────────────────────
+
+/// **Which key space a harness's live-session identity lives in.**
+///
+/// Locked decision 20. The live-session registry used to be one map holding
+/// two key spaces at once — a Claude entry keyed by the stable TAB id its
+/// transcript tap runs in, an OpenCode entry keyed by the SESSION id its
+/// plugin POSTs — which is why a `/memory/event` naming a configured tab id
+/// could repoint that tab's session (C-2). Declaring the space makes them two
+/// maps instead of one map plus a collision check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SessionKey {
+    /// Identity is owned by the tab: cImp's own reader binds the session and
+    /// keys the entry by the tab id it runs in. Such a harness's live session
+    /// is never keyed by a value that arrived over the wire.
+    Tab,
+    /// Identity is the session id the harness reports. Entries are keyed by
+    /// that id, which lives in its own space and therefore can never name a
+    /// cImp tab.
+    Session,
+}
+
+
+/// One CLI subcommand a plugin claims — the flag as it appears in `argv`, and
+/// the handler core dispatches to before anything else starts.
+///
+/// A plain `fn` pointer so the table can be a `const`: the alternative is a
+/// `match` on flag strings in `main.rs`, which is the thing locked decision 26
+/// deletes.
+pub struct Subcommand {
+    /// The exact `argv[1]` this claims, e.g. `"--statusline"`.
+    pub flag: &'static str,
+    /// What runs. Returns when the subcommand is done; core then exits.
+    pub run: fn(),
+}
+
 // ── the trait ───────────────────────────────────────────────────────────────
 
 /// Everything core asks *this harness* to do.
@@ -884,6 +1191,83 @@ pub trait HarnessPlugin: Sync + Send {
         &[]
     }
 
+
+    // ── activity, usage, session identity (locked decisions 18, 19, 20) ─────
+
+    /// How core learns this harness is busy — see [`ActivitySource`].
+    ///
+    /// The default is [`ActivitySource::OutOfBand`], and that is the
+    /// fail-closed direction: a harness that has not declared TUI timings does
+    /// not get another harness's spinner model applied to its terminal. The
+    /// cost of the default is an avatar that never leaves Idle, which is a
+    /// visible absence; the cost of the other default would be an avatar
+    /// cycling on somebody else's repaint rate, which reads as a bug in cImp.
+    fn activity_source(&self) -> ActivitySource {
+        ActivitySource::OutOfBand
+    }
+
+    /// This harness's usage / quota / context source, or `None` when it has
+    /// none.
+    ///
+    /// `None` is a first-class answer that a UI must render as *no usage
+    /// source*, never as a harness sitting at 0% — locked decision 19. The
+    /// default is `None` for the same reason every other default here is the
+    /// neutral one: a harness gets a quota widget by declaring a source, not
+    /// by existing.
+    fn usage_source(&self) -> Option<&'static dyn UsageSource> {
+        None
+    }
+
+    /// Whether this harness's MCP client can be PUSHED to — an inbound path
+    /// from the server to the model between turns.
+    ///
+    /// Locked decision 25. The default is `false`, and it is the fail-closed
+    /// one: a harness that cannot receive a push must not have the server
+    /// declare a channel capability it will then drop on the floor. cImp's
+    /// child gates its `initialize` declaration AND its subscription on this,
+    /// so both halves of the registration move together.
+    fn supports_session_push(&self) -> bool {
+        false
+    }
+
+    /// Which key space this harness's live-session identity lives in — see
+    /// [`SessionKey`].
+    ///
+    /// The default is [`SessionKey::Session`]: an id an undeclared harness
+    /// hands cImp is its own session id and lands in the session space, where
+    /// it cannot name a cImp tab. Defaulting to [`SessionKey::Tab`] would let
+    /// a wire value key the tab space, which is the C-2 hazard the declaration
+    /// exists to remove.
+    fn session_key_space(&self) -> SessionKey {
+        SessionKey::Session
+    }
+
+    /// Activity-store `tool` names this harness's own readers file drift
+    /// reports under (`subagent_drift` is Claude's).
+    ///
+    /// Core owns the ring and the advisor rule; which rows are *this harness's*
+    /// drift is the harness's statement. Without it the rows are attributable
+    /// only to `source: "harness"` and every per-harness signal has to guess —
+    /// which is what the pre-V40 code did by handing them all to the default
+    /// harness.
+    fn drift_report_tools(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// Extra CLI subcommands this harness needs cImp itself to answer.
+    ///
+    /// Claude Code runs `cimp --statusline` and pipes its status-line JSON to
+    /// stdin; the flag, the stdin/stdout contract and the shell quoting around
+    /// it are all Claude's, so `main.rs` no longer knows the flag exists — it
+    /// asks every registered plugin whether it claims `argv[1]`.
+    ///
+    /// Handled **before** any Tauri/audio/settings init, so a handler must be
+    /// instant, must never spin up the GUI, and must terminate the process
+    /// itself or return.
+    fn subcommands(&self) -> &'static [Subcommand] {
+        &[]
+    }
+
     // ── sandbox ─────────────────────────────────────────────────────────────
 
     /// Where this harness keeps its own state, as grant rows with a reason each.
@@ -1054,6 +1438,92 @@ mod tests {
 
     /// The default trait body is the fail-closed one: a harness that declares
     /// nothing gets nothing, and in particular is not a delegation worker.
+    /// **Every declared TUI tuning is internally ordered.**
+    ///
+    /// The stall backstop has to outlast the marker path or the avatar is
+    /// released while the busy footer is still on screen; the marker grace has
+    /// to outlast the quiet window or a footer that blinks between sub-agent
+    /// batches settles the avatar to Idle. Before V40 those two orderings were
+    /// stated in prose beside constants in two different files, so nothing
+    /// checked them — and a new harness declaring its own tuning has no prose
+    /// to read at all.
+    #[test]
+    fn every_stall_backstop_outlasts_its_marker_path() {
+        for id in crate::harness::registry::all() {
+            let Some(plugin) = id.plugin() else { continue };
+            let ActivitySource::TuiMarkers(t) = plugin.activity_source() else {
+                continue;
+            };
+            assert!(
+                t.subagents_stall > t.working_stale,
+                "{id}: the sub-agent stall backstop must conclude AFTER the marker path"
+            );
+            assert!(
+                t.marker_grace > t.quiet,
+                "{id}: a marker gap shorter than the grace must not release on quiet alone"
+            );
+            assert!(
+                t.working_stale > t.quiet,
+                "{id}: the stale valve must be the last resort, not the first"
+            );
+            assert!(
+                !t.burst_min.is_zero() && !t.quiet.is_zero(),
+                "{id}: a zero timer is not a fallback, it is a flicker"
+            );
+        }
+    }
+
+    /// **A harness with no usage source says so, and says it exactly once.**
+    ///
+    /// Locked decision 19's whole point: "no usage source" and "a source that
+    /// has reported nothing" are different answers, and neither of them is a
+    /// quota of zero. OpenCode is the standing example — its plugin posts token
+    /// totals to `/memory/event`, but nothing reports a subscription quota or a
+    /// context window, so its widget must be absent rather than empty.
+    #[test]
+    fn a_harness_without_a_usage_source_answers_none_not_zeros() {
+        let with: Vec<_> = crate::harness::registry::all()
+            .filter(|h| h.plugin().and_then(|p| p.usage_source()).is_some())
+            .collect();
+        let without: Vec<_> = crate::harness::registry::all()
+            .filter(|h| h.plugin().and_then(|p| p.usage_source()).is_none())
+            .collect();
+        assert!(
+            !with.is_empty(),
+            "no harness declares a usage source; the widget has no data path at all"
+        );
+        assert!(
+            !without.is_empty(),
+            "every harness declares a usage source — if that becomes true, the `None` arm is \
+             untested and the widget's absence path stops being exercised"
+        );
+        for id in with {
+            let source = id.plugin().unwrap().usage_source().unwrap();
+            assert!(
+                !source.windows().is_empty(),
+                "{id}: a usage source that declares no window can report nothing"
+            );
+            let mut ids: Vec<&str> = source.windows().iter().map(|w| w.id).collect();
+            let n = ids.len();
+            ids.sort_unstable();
+            ids.dedup();
+            assert_eq!(n, ids.len(), "{id}: two windows share an id");
+            for w in source.windows() {
+                assert!(
+                    !w.label.is_empty() && !w.short.is_empty() && !w.description.is_empty(),
+                    "{id}/{}: a window a UI cannot label is a row of numbers with no meaning",
+                    w.id
+                );
+            }
+            for k in source.token_kinds() {
+                assert!(!k.label.is_empty(), "{id}: token category `{}` has no label", k.id);
+            }
+            for o in source.origins() {
+                assert!(!o.label.is_empty(), "{id}: turn origin `{}` has no label", o.id);
+            }
+        }
+    }
+
     #[test]
     fn the_default_plugin_declares_nothing() {
         struct Bare;

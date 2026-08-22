@@ -311,6 +311,24 @@ pub fn all() -> impl Iterator<Item = HarnessId> {
     HARNESSES.iter().map(|d| HarnessId(d.id))
 }
 
+/// The plugin-registered subcommand `argv` names, or `None`.
+///
+/// Locked decision 19/26: `main.rs` used to test for `--statusline` by name,
+/// which made one harness's CLI contract a fact about cImp's own entry point.
+/// It asks here now, and a harness that needs cImp to answer a flag declares it
+/// in [`HarnessPlugin::subcommands`].
+///
+/// Scans the whole of `argv` rather than only `argv[1]`, because that is what
+/// the branch it replaces did (`args().skip(1).any(..)`) — cImp forwards
+/// unrecognised arguments to a Claude tab, so a subcommand flag can arrive
+/// after other args and must still be recognised.
+pub fn subcommand_for(argv: &[String]) -> Option<&'static super::plugin::Subcommand> {
+    HARNESSES
+        .iter()
+        .flat_map(|d| d.plugin.subcommands())
+        .find(|sub| argv.iter().any(|a| a == sub.flag))
+}
+
 /// Every reserved built-in tab id, in canonical order across harnesses.
 ///
 /// The order `[claude, claude-local, opencode]` used to be a literal array in

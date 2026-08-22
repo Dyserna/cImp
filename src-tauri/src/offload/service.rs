@@ -1688,6 +1688,14 @@ impl OffloadService {
             }
         };
         match reply {
+            // V39 review M-11: a schema was a REQUEST, and only a request. A
+            // real backend has the answer grammar-constrained by llama-server
+            // (`agent::schema_response_format`) and then parsed anyway; a
+            // worker tab has neither — cImp does not own its sampler — so the
+            // parse is the only check there is, and without it a schema run
+            // returned prose to a caller that asked for JSON and was told it
+            // got it.
+            Ok(r) if schema.is_some() => facade_json(facade.name(), r.text),
             Ok(r) => Ok(r.text),
             Err(e) => {
                 // The reason is kept where the app can read it — the Events row
@@ -2940,6 +2948,52 @@ fn effective_roots(snap: &OffloadSettings) -> Vec<PathBuf> {
 /// V39 Phase C — whether one resolved backend is routable **for this caller**.
 ///
 /// Readiness is a property of the backend; this is the one place a property of
+/// **A schema request must come back as JSON** (V39 review M-11).
+///
+/// `offload_task`'s schema contract is that the caller gets JSON verbatim. On a
+/// real backend the sampler is constrained to it and `agent::validate_json_
+/// output` re-checks anyway; on a facade there is no sampler to constrain, so
+/// the instruction in `facade_format_note` is a request a worker may answer in
+/// prose — or, far more often, in a fenced block, because that is what a chat
+/// model does with JSON.
+///
+/// So: strip ONE surrounding fence when the whole message is one, then parse.
+/// One fence, and only when it wraps the entire message — anything cleverer
+/// would start editing answers rather than reading them. What comes back is the
+/// stripped, trimmed JSON text, exactly as the schema contract promises.
+///
+/// **Parse only, no schema validation**, which is the standard `offload_task`
+/// already holds real backends to (`validate_json_output` parses and does not
+/// validate) — there is no JSON-Schema validator in this repo, and adding one
+/// on this path would make a facade stricter than the backends it imitates.
+fn facade_json(backend: &str, text: String) -> AppResult<String> {
+    let candidate = strip_one_fence(text.trim());
+    match serde_json::from_str::<serde_json::Value>(candidate) {
+        Ok(_) => Ok(candidate.to_string()),
+        // Named, and backend-shaped like every other facade failure (HIGH-4):
+        // the driver may re-ask or re-route, and either way it must not learn
+        // that a tab was involved.
+        Err(_) => Err(AppError::Offload(format!(
+            "backend `{backend}` returned a non-JSON answer for a schema request"
+        ))),
+    }
+}
+
+/// One surrounding ``` fence, removed — see [`facade_json`]. Returns the input
+/// unchanged when the message is not exactly one fenced block.
+fn strip_one_fence(text: &str) -> &str {
+    let Some(rest) = text.strip_prefix("```") else {
+        return text;
+    };
+    let Some(body) = rest.split_once('\n').map(|(_info, body)| body) else {
+        return text;
+    };
+    match body.trim_end().strip_suffix("```") {
+        Some(inner) => inner.trim(),
+        None => text,
+    }
+}
+
 /// **What the DRIVER is told when a facade run fails** (V39 review HIGH-4).
 ///
 /// `DelegationError`'s own strings are written for the person who set the
@@ -3181,6 +3235,50 @@ mod tests {
             facade_error("b", false, &D::Timeout("x".into())),
             AppError::Offload(_)
         ));
+    }
+
+    /// **A schema is a request, and the answer is checked** (V39 review M-11).
+    ///
+    /// cImp does not own a worker tab's sampler, so the schema instruction is
+    /// a sentence in the request and nothing more. Without this check a schema
+    /// run handed prose to a caller that had asked for JSON — and told it the
+    /// call had succeeded.
+    #[test]
+    fn a_schema_request_gets_json_or_a_named_error() {
+        // Plain JSON: through, verbatim.
+        assert_eq!(
+            facade_json("lan-worker-2", "{\"count\": 3}".to_string()).unwrap(),
+            "{\"count\": 3}"
+        );
+        // The shape a chat model actually produces: one fenced block.
+        assert_eq!(
+            facade_json("lan-worker-2", "```json\n{\"count\": 3}\n```".to_string()).unwrap(),
+            "{\"count\": 3}"
+        );
+        assert_eq!(
+            facade_json("lan-worker-2", "```\n[1, 2]\n```".to_string()).unwrap(),
+            "[1, 2]"
+        );
+        // Prose — the case that used to sail through as a success.
+        for not_json in [
+            "Here is the answer: three.",
+            "```\nnot json at all\n```",
+            "I could not do that.",
+            "",
+        ] {
+            let err = facade_json("lan-worker-2", not_json.to_string())
+                .expect_err("{not_json:?} is not JSON")
+                .to_string();
+            assert!(err.contains("lan-worker-2"), "{err}");
+            assert!(err.contains("non-JSON"), "{err}");
+            // HIGH-4's rule holds here too.
+            for leak in ["tab", "driven", "delegat"] {
+                assert!(!err.contains(leak), "`{leak}` reached the driver: {err}");
+            }
+        }
+        // Prose AROUND a fenced block is not one fenced block: nothing is
+        // edited out of an answer, and the parse then refuses it honestly.
+        assert!(facade_json("b", "Sure:\n```json\n{}\n```".to_string()).is_err());
     }
 
     /// **A facade needs a driver; a real backend does not.**

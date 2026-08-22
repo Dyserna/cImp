@@ -439,6 +439,14 @@ impl HarnessPlugin for ClaudePlugin {
         Some(&super::usage::USAGE)
     }
 
+    /// The shape of a recorded turn — see [`super::usage::TURN_SHAPE`]. Declared
+    /// separately from the quota source above (V40 Phase G): the four billing
+    /// categories and the `session`/`agent` lanes describe a stored
+    /// `usage_stat` row, not a status-line push.
+    fn turn_usage_shape(&self) -> Option<&'static crate::harness::plugin::TurnUsageShape> {
+        Some(&super::usage::TURN_SHAPE)
+    }
+
     /// Claude Code has an inbound MCP path (development channels), which is
     /// what the session-push registration and the `--channel-push` subscription
     /// both gate on.

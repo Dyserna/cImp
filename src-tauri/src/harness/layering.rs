@@ -848,7 +848,7 @@ const UPWARD_EXEMPT: &[(&str, &str)] = &[
         "harness/claude/canary.rs",
         "The L1 canaries assert the Tier-C readers still produce SUBSTANTIVE output, so they \
          necessarily speak the capability types those readers return (`UsageEvent`, \
-         `UsageOrigin`). Since V35 Phase L they are the FALLBACK's proof — which makes them \
+         the declared turn lane). Since V35 Phase L they are the FALLBACK's proof — which makes them \
          more load-bearing, not less: a fallback nobody checks is what makes a primary's \
          failure fatal. They follow the readers. V40 Phase A moved the assertions here from \
          `harness/canary.rs` (locked decision 17); the runner keeps the corpus rules and the \

@@ -1242,7 +1242,7 @@ pub(crate) struct Request {
 /// A hook's body is the harness's own payload — cImp gets no field in it — so
 /// the tab id, the harness discriminator, the CHP version and the hello
 /// declaration ride headers baked into the emitted hook entry at spawn
-/// (`harness::claude_hook`). Every value here is caller-supplied and is
+/// (`harness::claude::hook`). Every value here is caller-supplied and is
 /// validated/bounded at the point of use exactly as the equivalent body fields
 /// are on the CHP routes.
 #[derive(Debug, Default, Clone)]
@@ -2380,7 +2380,7 @@ struct TabLatch {
     /// happened yet?", never "should it happen?". H-2's decode proof still gates
     /// it: `observe` only ever sees session ids the live-session registry
     /// published, and that registry takes Claude ids from
-    /// `oob::claude::LiveSessionGate` (a decoded record naming the session) and
+    /// `harness::claude::read::LiveSessionGate` (a decoded record naming the session) and
     /// OpenCode ids from a `session.created` on the harness's own event stream.
     ///
     /// # Lifetime
@@ -7081,7 +7081,7 @@ async fn handle_session_hello(
 //   has no hook equivalent.
 // * **Sub-agent token usage.** `SubagentStop` carries
 //   `last_assistant_message`, not tokens, and there is no sub-agent transcript
-//   path in any payload — so `SubagentState::scan`'s `UsageOrigin::Agent`
+//   path in any payload — so `SubagentState::scan`'s sub-agent-lane
 //   accounting keeps reading `<session_id>/subagents/agent-*.jsonl`. What
 //   migrates is the LIFECYCLE (which drives the avatar), not the spend.
 
@@ -8376,17 +8376,29 @@ struct MemoryEventBody {
     cache_make: u32,
 }
 
-/// V24 Phase F: from an OpenCode usage POST body, the target session id and the
+/// V24 Phase F: from a harness's usage POST body, the target session id and the
 /// [`crate::graph::UsageEvent::Turn`] to record — or `None` when the body has no
 /// usable data (missing/empty `msg_id`, or all four token totals are zero).
 ///
 /// When `parent_session_id` is present the spend rolls up to the PARENT session
-/// with `origin: Agent` (sub-agent spend is the parent's spend — mirrors the
-/// Claude sub-agent contract); otherwise it's the reporting session with
-/// `origin: Session`. A model id that is absent/empty maps to `None` (unknown
-/// model), matching the Claude tap. Pure, so the mapping is unit-tested without
-/// a live handler.
-fn usage_event_from_body(body: &MemoryEventBody) -> Option<(String, crate::graph::UsageEvent)> {
+/// in the reporting harness's **declared sub-agent lane** (sub-agent spend is
+/// the parent's spend); otherwise it's the reporting session in its declared
+/// main lane. A model id that is absent/empty maps to `None` (unknown model),
+/// matching the Claude tap. Pure, so the mapping is unit-tested without a live
+/// handler.
+///
+/// **V40 Phase G (locked decision 19).** This used to hard-code
+/// `UsageOrigin::Agent` / `::Session` — core writing one harness's two lane
+/// names into another harness's rows. `agent` is the request's asserted harness
+/// id, and the lanes come from that harness's
+/// [`TurnUsageShape`](crate::harness::plugin::TurnUsageShape). A harness that
+/// declares NO shape records **nothing**: guessing a lane for a harness that
+/// never told cImp what its lanes are would put real tokens in a fabricated
+/// bucket, and a dropped row is recoverable where a mis-attributed one is not.
+fn usage_event_from_body(
+    body: &MemoryEventBody,
+    agent: &str,
+) -> Option<(String, crate::graph::UsageEvent)> {
     let msg_id = body.msg_id.clone().filter(|m| !m.is_empty())?;
     // The plugin only forwards COMPLETED turns, so an all-zero body is a
     // degenerate/creation emit — skip it rather than plant an empty turn row.
@@ -8396,9 +8408,12 @@ fn usage_event_from_body(body: &MemoryEventBody) -> Option<(String, crate::graph
     if body.in_tok == 0 && body.out_tok == 0 && body.cache_read == 0 && body.cache_make == 0 {
         return None;
     }
+    let shape = crate::harness::HarnessId::from_id(agent)
+        .and_then(|h| h.plugin())
+        .and_then(|p| p.turn_usage_shape())?;
     let (target, origin) = match body.parent_session_id.as_deref() {
-        Some(p) if !p.is_empty() => (p.to_string(), crate::graph::UsageOrigin::Agent),
-        _ => (body.session_id.clone(), crate::graph::UsageOrigin::Session),
+        Some(p) if !p.is_empty() => (p.to_string(), shape.subagent_origin()?),
+        _ => (body.session_id.clone(), shape.main_origin()?),
     };
     Some((
         target,
@@ -8409,7 +8424,7 @@ fn usage_event_from_body(body: &MemoryEventBody) -> Option<(String, crate::graph
             out_tok: body.out_tok,
             cache_read: body.cache_read,
             cache_make: body.cache_make,
-            origin,
+            origin: origin.to_string(),
         },
     ))
 }
@@ -8524,7 +8539,7 @@ async fn handle_memory_event(
     // `harness/opencode/read.rs`). Distinct body shape (`kind == "usage"`, no `tool`),
     // so it short-circuits the tool-event path below.
     if body.kind.as_deref() == Some("usage") {
-        if let Some((target, event)) = usage_event_from_body(&body) {
+        if let Some((target, event)) = usage_event_from_body(&body, agent) {
             // Roll-up target = the parent when a child (sub-agent) session
             // reported, else the reporting session itself. `record_usage`
             // upserts by `msg_id`, so the plugin's duplicate final emit is
@@ -9745,7 +9760,7 @@ mod tests {
             "in_tok": 100, "out_tok": 40, "cache_read": 20, "cache_make": 5,
         }));
         let (target, event) =
-            usage_event_from_body(&body).expect("well-formed body yields an event");
+            usage_event_from_body(&body, "opencode").expect("well-formed body yields an event");
         assert_eq!(target, "ses_main");
         match &event {
             crate::graph::UsageEvent::Turn {
@@ -9763,7 +9778,7 @@ mod tests {
                     (*in_tok, *out_tok, *cache_read, *cache_make),
                     (100, 40, 20, 5)
                 );
-                assert_eq!(*origin, crate::graph::UsageOrigin::Session);
+                assert_eq!(origin, "session");
             }
             _ => panic!("expected a Turn event"),
         }
@@ -9776,8 +9791,8 @@ mod tests {
         let series = idx.usage_turn_series("ses_main").unwrap();
         assert_eq!(series.len(), 1);
         assert_eq!(series[0].msg_id, "msg_1");
-        assert_eq!(series[0].origin, crate::graph::UsageOrigin::Session);
-        assert_eq!(series[0].in_tok, 100);
+        assert_eq!(series[0].origin, "session");
+        assert_eq!(series[0].tokens.get("input"), Some(100));
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -9791,11 +9806,12 @@ mod tests {
             "msg_id": "msg_a", "model": "qwen3-coder",
             "in_tok": 7, "out_tok": 3, "cache_read": 0, "cache_make": 0,
         }));
-        let (target, event) = usage_event_from_body(&body).expect("child body yields an event");
+        let (target, event) =
+            usage_event_from_body(&body, "opencode").expect("child body yields an event");
         assert_eq!(target, "ses_parent", "spend rolls up to the parent");
         match &event {
             crate::graph::UsageEvent::Turn { origin, .. } => {
-                assert_eq!(*origin, crate::graph::UsageOrigin::Agent);
+                assert_eq!(origin, "agent");
             }
             _ => panic!("expected a Turn event"),
         }
@@ -9808,7 +9824,7 @@ mod tests {
         assert_eq!(idx.usage_turn_series("ses_parent").unwrap().len(), 1);
         assert!(idx.usage_turn_series("ses_child").unwrap().is_empty());
         let series = idx.usage_turn_series("ses_parent").unwrap();
-        assert_eq!(series[0].origin, crate::graph::UsageOrigin::Agent);
+        assert_eq!(series[0].origin, "agent");
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -9819,18 +9835,18 @@ mod tests {
         let no_msg = usage_body(serde_json::json!({
             "kind": "usage", "session_id": "s", "in_tok": 10,
         }));
-        assert!(usage_event_from_body(&no_msg).is_none());
+        assert!(usage_event_from_body(&no_msg, "opencode").is_none());
         // Empty msg_id → no event.
         let empty_msg = usage_body(serde_json::json!({
             "kind": "usage", "session_id": "s", "msg_id": "", "in_tok": 10,
         }));
-        assert!(usage_event_from_body(&empty_msg).is_none());
+        assert!(usage_event_from_body(&empty_msg, "opencode").is_none());
         // All-zero token totals (degenerate/creation emit) → skipped.
         let all_zero = usage_body(serde_json::json!({
             "kind": "usage", "session_id": "s", "msg_id": "m",
             "in_tok": 0, "out_tok": 0, "cache_read": 0, "cache_make": 0,
         }));
-        assert!(usage_event_from_body(&all_zero).is_none());
+        assert!(usage_event_from_body(&all_zero, "opencode").is_none());
     }
 
     #[test]
@@ -9846,13 +9862,13 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("cimp-usage-dup-{}", uuid::Uuid::new_v4()));
         let idx = crate::graph::GraphIndex::open(&dir, ".ckg").expect("open");
         for out in [10u64, 20u64] {
-            let (target, event) = usage_event_from_body(&mk(out)).expect("event");
+            let (target, event) = usage_event_from_body(&mk(out), "opencode").expect("event");
             idx.record_usage_event(&target, "opencode", &event, 100)
                 .unwrap();
         }
         let series = idx.usage_turn_series("ses").unwrap();
         assert_eq!(series.len(), 1, "duplicate msg_id upserts, not appends");
-        assert_eq!(series[0].out_tok, 20, "last emit wins");
+        assert_eq!(series[0].tokens.get("output"), Some(20), "last emit wins");
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -11366,7 +11382,13 @@ mod tests {
     /// through it.
     #[test]
     fn a_contaminated_tab_is_refused_a_delegation_and_a_clean_one_is_not() {
-        let s = scope("claude-deleg", Some("ses"));
+        // Opaque inputs: `delegate_admit` never looks at either string -- the
+        // scoping closure below is stubbed, so the tab id is a key and the
+        // consumer is passed straight through. V39 wrote a real harness id and
+        // a `claude-`prefixed tab here, which read as if the gate knew what a
+        // harness was (V40 Phase G, locked decision 28).
+        const WORKER_TAB: &str = "worker-deleg";
+        let s = scope(WORKER_TAB, Some("ses"));
         // `LatchScope` is not `Clone`, so the closure rebuilds the same scope
         // rather than capturing one — the scope KEY is what the registry joins
         // on, and building it twice from the same inputs is the honest way to
@@ -11375,9 +11397,9 @@ mod tests {
             delegate_admit(
                 reg,
                 DELEGATE_TOOL,
-                "claude",
-                Some("claude-deleg"),
-                |_, _| LatchScoping::Scoped(scope("claude-deleg", Some("ses"))),
+                crate::harness::DEFAULT_HARNESS.token(),
+                Some(WORKER_TAB),
+                |_, _| LatchScoping::Scoped(scope(WORKER_TAB, Some("ses"))),
                 |_| ON,
             )
         };
@@ -14918,7 +14940,7 @@ mod tests {
     /// 2. **even a confirmed rotation cannot clear `contaminated`**, because the
     ///    file the proof is read from is one the attacker writes.
     ///
-    /// Asserted **through** `oob::claude::LiveSessionGate` rather than beside
+    /// Asserted **through** `harness::claude::read::LiveSessionGate` rather than beside
     /// it, so weakening the gate fails this test.
     #[test]
     fn a_forged_rotation_neither_confirms_a_session_nor_clears_contamination() {
@@ -15987,7 +16009,7 @@ mod tests {
     /// user, one not. The armed tab clears; the unarmed one does not. If step 4
     /// silently reverted H-2, the second half fails.
     ///
-    /// The rotation is driven **through** `oob::claude::LiveSessionGate` rather
+    /// The rotation is driven **through** `harness::claude::read::LiveSessionGate` rather
     /// than beside it, so a build that weakened the decode proof (H-2's own
     /// guard) fails here too rather than quietly clearing on a forged file.
     #[test]

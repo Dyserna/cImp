@@ -3,21 +3,35 @@
 // so the normalization/ratio arithmetic is unit-testable without mounting
 // the component (see `usageMath.test.ts`).
 
-import type { TurnUsage } from './graph';
+import type { TokenKinds, TurnUsage } from './graph';
 
 /// The subset of `TurnUsage` the chart math actually needs — lets callers
 /// (and tests) pass plain object literals without the transcript-only
-/// fields (`msg_id`/`model`/`ts_ms`). V16 Feature 8 added `cache_make`
-/// (cache-write) as its own bar segment, so it joined the subset.
-export type TurnTokens = Pick<TurnUsage, 'in_tok' | 'cache_read' | 'cache_make' | 'out_tok' | 'tool_chars'>;
+/// fields (`msg_id`/`model`/`ts_ms`).
+///
+/// **V40 Phase G (locked decision 19).** It was four fixed token fields; it is
+/// the declared-category map now, so a harness that bills three categories (or
+/// six) needs no change here and a category nobody reported has no key rather
+/// than a zero.
+export type TurnTokens = Pick<TurnUsage, 'tokens' | 'tool_chars'>;
 
-/// One turn's total token footprint: input + cache-read + cache-write +
-/// output tokens (exact, from the transcript's `usage` block) plus the
-/// estimated tool tokens (`tool_chars / 4`, rounded). This is what the
-/// stacked bar's height is normalized against — NOT just `in_tok +
-/// out_tok`, since a tool-heavy turn can be dominated by tool-result chars.
+/// Every reported category summed. Absent keys contribute nothing — which is
+/// the same arithmetic as a zero, and the only place where treating absence as
+/// zero is honest: a category nobody billed adds nothing to a total either way.
+/// Non-finite values are skipped rather than poisoning the sum with NaN.
+export function kindsTotal(t: TokenKinds): number {
+  let sum = 0;
+  for (const v of Object.values(t)) if (Number.isFinite(v)) sum += v;
+  return sum;
+}
+
+/// One turn's total token footprint: every reported category (exact, from the
+/// transcript's `usage` block) plus the estimated tool tokens
+/// (`tool_chars / 4`, rounded). This is what the stacked bar's height is
+/// normalized against — NOT just input + output, since a tool-heavy turn can be
+/// dominated by tool-result chars.
 export function turnTotal(t: TurnTokens): number {
-  return t.in_tok + t.cache_read + t.cache_make + t.out_tok + Math.round(t.tool_chars / 4);
+  return kindsTotal(t.tokens) + Math.round(t.tool_chars / 4);
 }
 
 /// The tallest turn's total in `turns` — the stacked-bar chart's
@@ -37,34 +51,48 @@ export function barHeightPct(total: number, max: number): number {
   return Math.min(100, Math.max(0, (total / max) * 100));
 }
 
-/// `cache_read / (cache_read + in_tok)` — the honest cache-hit ratio shown
-/// as a percentage in the Sessions table. `0` when there's no denominator
-/// (no turns recorded yet), matching the backend's
-/// `SessionUsageRow.cache_hit_ratio` computation exactly (see
-/// `GraphIndex::usage_all_sessions`).
-export function cacheHitRatio(cacheRead: number, inTok: number): number {
-  const denom = cacheRead + inTok;
-  return denom > 0 ? cacheRead / denom : 0;
+/// The pricing category ids cImp's price table has rates for. These are
+/// **cImp's own provider vocabulary**, not a harness's: they are literally
+/// `PriceRates`' field names, and the backend's read boundary maps the four
+/// stored `usage_stat` columns onto them (see `graph/index.rs`). What a HARNESS
+/// declares is which of them it reports.
+export const KIND_INPUT = 'input';
+export const KIND_CACHE_WRITE = 'cache_write';
+export const KIND_CACHE_READ = 'cache_read';
+export const KIND_OUTPUT = 'output';
+
+/// `cache_read / (cache_read + input)` — the honest cache-hit ratio shown as a
+/// percentage in the Sessions table.
+///
+/// **`null` when there is no ratio to show**: either the session's harness
+/// declares neither cache-read nor input (nothing to divide) or both are zero
+/// (no denominator). V40 Phase G made this `null` rather than `0`, because "0%
+/// cache hit" is a claim about a session that spent tokens, and a harness that
+/// does not bill cache reads never made it. The backend's
+/// `SessionUsageRow.cache_hit_ratio` still returns `0.0` for the no-denominator
+/// case — it is an `f64` on a struct that cannot carry absence, and this is the
+/// consumer that renders it.
+export function cacheHitRatio(totals: TokenKinds): number | null {
+  const cacheRead = totals[KIND_CACHE_READ];
+  const input = totals[KIND_INPUT];
+  if (cacheRead === undefined && input === undefined) return null;
+  const denom = (cacheRead ?? 0) + (input ?? 0);
+  return denom > 0 ? (cacheRead ?? 0) / denom : null;
 }
 
 /// The four $/MTok rates the session-cost popup multiplies against a
-/// session's `UsageTotals`. Structural subset of the settings-side
-/// `LlmPricingModel` (which additionally carries `provider`/`model`), so a
-/// pricing row can be passed directly.
+/// session's totals. Structural subset of the settings-side `LlmPricingModel`
+/// (which additionally carries `provider`/`model`), so a pricing row can be
+/// passed directly.
+///
+/// Its four field names ARE the four pricing category ids a `TokenKinds` is
+/// keyed by, which is what makes `sessionCost` a direct lookup rather than a
+/// hand-written mapping table (V40 Phase G).
 export interface PriceRates {
   input: number;
   cache_write: number;
   cache_read: number;
   output: number;
-}
-
-/// The token counts a cost is computed from — field names match
-/// `UsageTotals` (`graph.ts`) so a `SessionUsageRow.totals` passes directly.
-export interface CostTokens {
-  in_tok: number;
-  out_tok: number;
-  cache_read: number;
-  cache_make: number;
 }
 
 /// tokens × ($ per million tokens) → dollars. Guards non-finite inputs to 0
@@ -76,17 +104,22 @@ export function costUsd(tokens: number, perMTok: number): number {
 }
 
 /// Per-category dollar cost of a session plus the grand total — the popup's
-/// third table row and the line under it. Category mapping: `in_tok` bills
-/// at the input rate, `cache_make` (cache-creation) at cache_write,
-/// `cache_read` at cache_read, `out_tok` at output.
+/// third table row and the line under it.
+///
+/// **A direct key lookup** since V40 Phase G: a `TokenKinds` is keyed by the
+/// same four pricing ids `PriceRates` names its fields after, so the four-line
+/// `in_tok → input, cache_make → cache_write, …` mapping this used to carry is
+/// gone. An absent category costs $0, which is the one honest reading of
+/// absence here — you cannot be billed for tokens nobody reported.
 export function sessionCost(
-  totals: CostTokens,
+  totals: TokenKinds,
   rates: PriceRates,
 ): { input: number; cache_write: number; cache_read: number; output: number; total: number } {
-  const input = costUsd(totals.in_tok, rates.input);
-  const cache_write = costUsd(totals.cache_make, rates.cache_write);
-  const cache_read = costUsd(totals.cache_read, rates.cache_read);
-  const output = costUsd(totals.out_tok, rates.output);
+  const at = (k: keyof PriceRates): number => costUsd(totals[k] ?? 0, rates[k]);
+  const input = at('input');
+  const cache_write = at('cache_write');
+  const cache_read = at('cache_read');
+  const output = at('output');
   return { input, cache_write, cache_read, output, total: input + cache_write + cache_read + output };
 }
 
@@ -114,38 +147,46 @@ export function matchPricing<T extends PricingRow>(model: string | null | undefi
 /// estimate the token view uses. Values are dollars — the stacked bar's
 /// flex-grow weights in cost mode.
 export function turnCost(
-  t: Pick<TurnUsage, 'in_tok' | 'cache_read' | 'cache_make' | 'out_tok' | 'tool_chars'>,
+  t: TurnTokens,
   rates: PriceRates,
 ): { input: number; cache_read: number; cache_write: number; output: number; tool: number; total: number } {
-  const input = costUsd(t.in_tok, rates.input);
-  const cache_read = costUsd(t.cache_read, rates.cache_read);
-  const cache_write = costUsd(t.cache_make, rates.cache_write);
-  const output = costUsd(t.out_tok, rates.output);
+  const c = sessionCost(t.tokens, rates);
   const tool = costUsd(Math.round(t.tool_chars / 4), rates.input);
-  return { input, cache_read, cache_write, output, tool, total: input + cache_read + cache_write + output + tool };
+  return { ...c, tool, total: c.total + tool };
 }
 
-/// V24 Phase C: one merged run of same-origin turns in the S/A lane under the
+/// V24 Phase C: one merged run of same-lane turns in the lane strip under the
 /// chart. `count` = how many contiguous turns it spans (drives the flex width);
-/// `label` is the single-letter badge (`S` main session / `A` sub-agent).
+/// `label` is the single-letter badge.
 export interface LaneSegment {
-  origin: 'session' | 'agent';
-  label: 'S' | 'A';
+  origin: string;
+  label: string;
   count: number;
 }
 
-/// V24 Phase C: collapse a turn series into contiguous same-origin runs for the
-/// lane. A single-origin session yields exactly one segment; alternating
-/// origins yield one segment per switch. Pure so the segmentation is
-/// unit-testable without mounting the chart. Order matches `turns`.
-export function laneSegments(turns: readonly { origin: 'session' | 'agent' }[]): LaneSegment[] {
+/// The single-letter badge for a lane: the first character of its DECLARED id,
+/// uppercased.
+///
+/// V40 Phase G: this was a `origin === 'agent' ? 'A' : 'S'` ternary — two
+/// letters for two hard-coded lanes. Deriving it from the id keeps `session` →
+/// `S` and `agent` → `A` exactly as they render today while giving any third
+/// lane a badge of its own instead of silently borrowing `S`.
+export function laneLabel(origin: string): string {
+  return (origin.charAt(0) || '?').toUpperCase();
+}
+
+/// V24 Phase C: collapse a turn series into contiguous same-lane runs for the
+/// strip. A single-lane session yields exactly one segment; alternating lanes
+/// yield one segment per switch. Pure so the segmentation is unit-testable
+/// without mounting the chart. Order matches `turns`.
+export function laneSegments(turns: readonly { origin: string }[]): LaneSegment[] {
   const segs: LaneSegment[] = [];
   for (const t of turns) {
     const last = segs[segs.length - 1];
     if (last && last.origin === t.origin) {
       last.count += 1;
     } else {
-      segs.push({ origin: t.origin, label: t.origin === 'agent' ? 'A' : 'S', count: 1 });
+      segs.push({ origin: t.origin, label: laneLabel(t.origin), count: 1 });
     }
   }
   return segs;
@@ -166,10 +207,16 @@ export function laneLabelVisible(count: number, totalTurns: number, laneWidthPx:
   return (laneWidthPx * count) / totalTurns >= LANE_LABEL_MIN_PX;
 }
 
-/// V24 Phase C: the extra class on a chart bar for its turn's origin — the
-/// accent-outline + desaturation treatment applies only to sub-agent turns.
-export function agentBarClass(origin: 'session' | 'agent'): '' | 'agent' {
-  return origin === 'agent' ? 'agent' : '';
+/// V24 Phase C: the extra class on a chart bar for its turn's lane — the
+/// accent-outline + desaturation treatment applies only to fan-out turns.
+///
+/// V40 Phase G: which lanes those are is the harness's DECLARATION
+/// (`harness_usage`'s `origins[].subagent`), passed in, rather than the literal
+/// `origin === 'agent'` this used to test. `subagentOrigins` empty ⇒ no bar is
+/// marked, which is the fail-quiet direction: before the declaration arrives
+/// the chart is un-annotated rather than annotated by guess.
+export function agentBarClass(origin: string, subagentOrigins: readonly string[]): '' | 'agent' {
+  return subagentOrigins.includes(origin) ? 'agent' : '';
 }
 
 /// V24 Phase E: a Sessions-list row's two independent visual states.
@@ -386,28 +433,31 @@ export function decideUsageApply(
 /// the i-th model's selected rates. Pure so the footer figure is testable
 /// without the component.
 export function costGrandTotal(
-  perModel: readonly { totals: CostTokens }[],
+  perModel: readonly { totals: TokenKinds }[],
   rates: (i: number) => PriceRates,
 ): number {
   return perModel.reduce((sum, m, i) => sum + sessionCost(m.totals, rates(i)).total, 0);
 }
 
-/// A Cost-card row's secondary lane-share line — the origin split formatted
-/// with `fmtTok`, e.g. `"main session 12.3k · sub-agents 4.1k tok"`. Both sides
-/// are always shown (a zero reads as `"sub-agents 0"`), so a session with no
-/// fan-out still reads honestly.
+/// A Cost-card row's secondary lane-share line — the per-lane split formatted
+/// with `fmtTok`, e.g. `"main session 12.3k · sub-agents 4.1k tok"`.
 ///
-/// V40 Phase F (locked decision 19): the LANE NAMES are the harness's declared
-/// origins, passed in by the caller, rather than two words written here — the
-/// `session | agent` split is one harness's sidechain model and its wording is
-/// its own. Absent names fall back to the ids, never to another harness's.
+/// `lanes` is the harness's DECLARED origins in declared order; every declared
+/// lane is shown even at 0 (a session with no fan-out still reads honestly, and
+/// the harness declaring the lane is what makes its 0 a real statement). A lane
+/// with no `label` falls back to its id, never to another harness's wording.
+///
+/// V40 Phase F named the lanes from the declaration; **V40 Phase G removed the
+/// two-lane SHAPE** — `origins` was `OriginSplit { session_tok, agent_tok }`,
+/// so a one-lane or three-lane harness could not be printed at all.
 export function originShareLine(
-  origins: { session_tok: number; agent_tok: number },
-  names: { session?: string; agent?: string } = {},
+  origins: Record<string, number>,
+  lanes: readonly { id: string; label?: string }[],
 ): string {
-  const s = names.session ?? 'session';
-  const a = names.agent ?? 'agent';
-  return `${s} ${fmtTok(origins.session_tok)} · ${a} ${fmtTok(origins.agent_tok)} tok`;
+  if (lanes.length === 0) return '';
+  return (
+    lanes.map((l) => `${l.label ?? l.id} ${fmtTok(origins[l.id] ?? 0)}`).join(' · ') + ' tok'
+  );
 }
 
 // ── V28: Overview dashboard donuts ─────────────────────────────────────
@@ -416,33 +466,31 @@ export function originShareLine(
 // cost share. The aggregation + ring geometry is pure so it's testable
 // without mounting the SVG.
 
-/// Per-origin sums of the four EXACT token kinds across a turn series — the
-/// token donut's source. Tool-result chars are excluded on purpose: the
-/// donut shows transcript-exact tokens only; the chars/4 tool estimate
-/// stays a stacked-bar concern (it overlaps the next turn's input anyway).
-export interface OriginKinds {
-  session: CostTokens;
-  agent: CostTokens;
-}
+/// Per-lane sums of the EXACT token categories across a turn series — the
+/// token donut's source. Tool-result chars are excluded on purpose: the donut
+/// shows transcript-exact tokens only; the chars/4 tool estimate stays a
+/// stacked-bar concern (it overlaps the next turn's input anyway).
+///
+/// V40 Phase G: keyed by declared lane id rather than a fixed
+/// `{ session, agent }` pair. `lanes` seeds the declared lanes so one with no
+/// turns still gets a (zero-valued, empty-map) entry and keeps its legend row;
+/// a lane that appears only in the DATA is added as it is met, so a stored row
+/// is never silently dropped because the declaration has not arrived yet.
+export type OriginKinds = Record<string, TokenKinds>;
 
 export function originKindTotals(
-  turns: readonly Pick<TurnUsage, 'in_tok' | 'out_tok' | 'cache_read' | 'cache_make' | 'origin'>[],
+  turns: readonly Pick<TurnUsage, 'tokens' | 'origin'>[],
+  lanes: readonly string[] = [],
 ): OriginKinds {
-  const zero = (): CostTokens => ({ in_tok: 0, out_tok: 0, cache_read: 0, cache_make: 0 });
-  const out: OriginKinds = { session: zero(), agent: zero() };
+  const out: OriginKinds = {};
+  for (const id of lanes) out[id] = {};
   for (const t of turns) {
-    const o = t.origin === 'agent' ? out.agent : out.session;
-    o.in_tok += t.in_tok;
-    o.out_tok += t.out_tok;
-    o.cache_read += t.cache_read;
-    o.cache_make += t.cache_make;
+    const bucket = (out[t.origin] ??= {});
+    for (const [k, v] of Object.entries(t.tokens)) {
+      if (Number.isFinite(v)) bucket[k] = (bucket[k] ?? 0) + v;
+    }
   }
   return out;
-}
-
-/// A CostTokens' four kinds summed — one origin's (or model's) total.
-export function kindsTotal(t: CostTokens): number {
-  return t.in_tok + t.cache_read + t.cache_make + t.out_tok;
 }
 
 /// One drawn donut-ring segment. `a0`/`a1` are the DRAWN angles (radians,

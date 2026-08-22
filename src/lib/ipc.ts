@@ -223,15 +223,23 @@ export interface DeclaredWindow extends DeclaredLabel {
   description: string;
 }
 
-/// The declared SHAPE of a harness's usage source — what it can report, as
+/// One declared turn lane. `subagent` is what tells a UI which lane carries
+/// fan-out spend (the outlined bar, the `A` badge) without recognising the
+/// word `agent` — a harness's own statement rather than a literal in the view.
+export interface DeclaredOrigin extends DeclaredLabel {
+  subagent: boolean;
+}
+
+/// The declared SHAPE of a harness's QUOTA source — what it can report, as
 /// opposed to what it currently does. The bottom bar sizes itself from
-/// `windows.length` (one stacked row per window), and the donut's lane and
-/// category labels come from here rather than from a mirror of one harness's
-/// vocabulary.
+/// `windows.length` (one stacked row per window).
+///
+/// V40 Phase G: the token categories and turn lanes moved OFF this and onto
+/// `HarnessUsage` itself. They describe a RECORDED turn, not a quota reading,
+/// and a harness can do either without the other — which is exactly the case a
+/// shipped harness in the registry is in today.
 export interface UsageSourceInfo {
   windows: DeclaredWindow[];
-  token_kinds: DeclaredLabel[];
-  origins: DeclaredLabel[];
 }
 
 /// One harness's usage answer. **Three distinguishable states** (V40 Phase D):
@@ -248,6 +256,13 @@ export interface UsageSourceInfo {
 /// staleness flag and `stale` is the whole-widget roll-up.
 export interface HarnessUsage {
   source: UsageSourceInfo | null;
+  /// The billing categories this harness reports a RECORDED turn's tokens
+  /// under, in declared order. Empty when it records no turns — INDEPENDENT of
+  /// `source`, which is about quota.
+  token_kinds: DeclaredLabel[];
+  /// The lanes a recorded turn can be attributed to, in declared order — what
+  /// the Usage donut labels its rings with. Empty when it records no turns.
+  origins: DeclaredOrigin[];
   reading: UsageReading | null;
 }
 

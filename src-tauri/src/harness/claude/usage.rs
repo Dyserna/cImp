@@ -84,7 +84,7 @@ use tracing::debug;
 
 use crate::harness::plugin::{
     ContextReading, QuotaWindow, QuotaWindowSpec, TokenKindSpec, TokenKinds, TurnOrigin,
-    UsageReading, UsageSource,
+    TurnUsageShape, UsageReading, UsageSource,
 };
 
 /// One quota window: how much of the limit is used and when it resets.
@@ -704,13 +704,37 @@ const TOKEN_KINDS: &[TokenKindSpec] = &[
     TokenKindSpec { id: "output", label: "Output" },
 ];
 
-/// The two lanes a Claude turn can be attributed to. `agent` is the sidechain:
-/// a turn recorded in `<sid>/subagents/*.jsonl`, or an inline `isSidechain:true`
-/// line. Both ids are persisted in `usage_stat.origin`.
+/// **The one spelling of Claude's main-transcript lane.** Written verbatim into
+/// `usage_stat.origin` by the transcript tap and read back verbatim by the
+/// Usage donut — the value is frozen by the rows already on disk.
+pub const ORIGIN_SESSION: &str = "session";
+
+/// **The one spelling of Claude's sidechain lane** — a turn recorded in
+/// `<sid>/subagents/*.jsonl`, or an inline `isSidechain:true` line in the parent
+/// transcript. Same frozen-by-disk posture as [`ORIGIN_SESSION`].
+pub const ORIGIN_AGENT: &str = "agent";
+
+/// The two lanes a Claude turn can be attributed to. Both ids are persisted in
+/// `usage_stat.origin`, and both are spelled ONCE ([`ORIGIN_SESSION`] /
+/// [`ORIGIN_AGENT`]) so the tap, the declaration and the stored column cannot
+/// drift apart.
 const ORIGINS: &[TurnOrigin] = &[
-    TurnOrigin { id: "session", label: "main session" },
-    TurnOrigin { id: "agent", label: "sub-agents" },
+    TurnOrigin { id: ORIGIN_SESSION, label: "main session", subagent: false },
+    TurnOrigin { id: ORIGIN_AGENT, label: "sub-agents", subagent: true },
 ];
+
+/// **The shape of a recorded Claude turn** — its four billing categories and
+/// its two lanes, handed to core by
+/// [`HarnessPlugin::turn_usage_shape`](crate::harness::plugin::HarnessPlugin::turn_usage_shape).
+///
+/// Declared beside the quota source rather than on it (V40 Phase G): what a
+/// stored `usage_stat` row looks like is a different question from what the
+/// status-line push reports, and only the first one has an answer for every
+/// harness that records turns.
+pub static TURN_SHAPE: TurnUsageShape = TurnUsageShape {
+    token_kinds: TOKEN_KINDS,
+    origins: ORIGINS,
+};
 
 /// Claude Code's pseudo-model, stamped on messages it fabricates locally
 /// (errors, interrupts). Nobody was billed for a `<synthetic>` turn, so it must
@@ -727,14 +751,6 @@ pub static USAGE: ClaudeUsage = ClaudeUsage;
 impl UsageSource for ClaudeUsage {
     fn windows(&self) -> &'static [QuotaWindowSpec] {
         WINDOWS
-    }
-
-    fn token_kinds(&self) -> &'static [TokenKindSpec] {
-        TOKEN_KINDS
-    }
-
-    fn origins(&self) -> &'static [TurnOrigin] {
-        ORIGINS
     }
 
     fn model_sentinels(&self) -> &'static [&'static str] {
@@ -924,32 +940,31 @@ mod tests {
 
         // Every key it can emit is one the source DECLARES, or a UI has a
         // number with no label for it.
-        let declared: Vec<&str> = USAGE.token_kinds().iter().map(|k| k.id).collect();
+        let declared: Vec<&str> = TURN_SHAPE.token_kinds.iter().map(|k| k.id).collect();
         for key in reading.tokens.ids() {
             assert!(declared.contains(&key), "undeclared category `{key}`");
         }
     }
 
     /// The persisted `usage_stat.origin` wire strings are exactly what this
-    /// source declares as its turn origins.
+    /// harness declares as its turn origins, and the tap writes those same
+    /// constants.
     ///
     /// The column is written by the reader and read back by the Usage donut, so
     /// a declared origin that no row can carry (or a stored value nothing
     /// declares) is a lane with no label at one end or no data at the other.
+    /// V40 Phase G: there is no `UsageOrigin` enum to round-trip through any
+    /// more — the id IS the column — so what this pins instead is that the two
+    /// ids are still exactly the two strings already on disk in every user's
+    /// graph, and that the fan-out flag names the sidechain lane.
     #[test]
     fn every_declared_origin_round_trips_the_persisted_column() {
-        use crate::graph::UsageOrigin;
-        let declared: Vec<&str> = USAGE.origins().iter().map(|o| o.id).collect();
+        let declared: Vec<&str> = TURN_SHAPE.origins.iter().map(|o| o.id).collect();
         assert_eq!(declared, vec!["session", "agent"]);
-        for id in declared {
-            assert_eq!(
-                UsageOrigin::from_wire(id).as_str(),
-                id,
-                "`{id}` is declared but is not a value the stored column round-trips"
-            );
-        }
-        assert_eq!(UsageOrigin::Session.as_str(), "session");
-        assert_eq!(UsageOrigin::Agent.as_str(), "agent");
+        assert_eq!(ORIGIN_SESSION, "session");
+        assert_eq!(ORIGIN_AGENT, "agent");
+        assert_eq!(TURN_SHAPE.main_origin(), Some(ORIGIN_SESSION));
+        assert_eq!(TURN_SHAPE.subagent_origin(), Some(ORIGIN_AGENT));
     }
 
     fn push_json(written_at_ms: u64) -> String {

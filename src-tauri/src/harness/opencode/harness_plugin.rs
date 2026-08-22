@@ -26,6 +26,58 @@ pub struct OpenCodePlugin;
 /// The value the registry's descriptor points at.
 pub static PLUGIN: OpenCodePlugin = OpenCodePlugin;
 
+/// **The one spelling of OpenCode's main-session lane**, written verbatim into
+/// `usage_stat.origin`. The same string Claude uses, and deliberately so: the
+/// column is shared, the rows already on disk carry it, and an id is frozen
+/// once written.
+pub(in crate::harness) const ORIGIN_SESSION: &str = "session";
+
+/// **The one spelling of OpenCode's sub-session lane** — the roll-up target for
+/// a turn whose `/memory/event` body carried a `parent_session_id` (the task
+/// tool's child session). Same frozen-by-disk posture as [`ORIGIN_SESSION`].
+pub(in crate::harness) const ORIGIN_AGENT: &str = "agent";
+
+/// The billing categories OpenCode's generated plugin reports per turn.
+///
+/// Four, matching the `in_tok` / `out_tok` / `cache_read` / `cache_make` fields
+/// its `/memory/event` POST body carries (see `templates/plugin.js`, which
+/// derives them from `tok.input`, `tok.output + tok.reasoning`, `cache.read`
+/// and `cache.write`). The ids are cImp's own pricing vocabulary — the same
+/// four the price table has rates for — because that is what the stored columns
+/// mean.
+const TOKEN_KINDS: &[crate::harness::plugin::TokenKindSpec] = &[
+    crate::harness::plugin::TokenKindSpec { id: "input", label: "Input" },
+    crate::harness::plugin::TokenKindSpec { id: "cache_write", label: "Cache write" },
+    crate::harness::plugin::TokenKindSpec { id: "cache_read", label: "Cache read" },
+    crate::harness::plugin::TokenKindSpec { id: "output", label: "Output" },
+];
+
+/// The two lanes an OpenCode turn can be attributed to. The plugin stamps a
+/// child session's POST with `parent_session_id`, and the loopback rolls that
+/// spend up to the parent in the `subagent` lane — the same contract Claude's
+/// sidechain rows follow, declared here rather than assumed by core.
+const ORIGINS: &[crate::harness::plugin::TurnOrigin] = &[
+    crate::harness::plugin::TurnOrigin {
+        id: ORIGIN_SESSION,
+        label: "main session",
+        subagent: false,
+    },
+    crate::harness::plugin::TurnOrigin {
+        id: ORIGIN_AGENT,
+        label: "sub-agents",
+        subagent: true,
+    },
+];
+
+/// **The shape of a recorded OpenCode turn.**
+///
+/// Declared even though [`OpenCodePlugin::usage_source`] is `None`: this
+/// harness reports no subscription quota and no context window, and it still
+/// writes real per-turn token rows. Before V40 Phase G the two facts shared one
+/// declaration, so saying the first forced saying the second.
+pub static TURN_SHAPE: crate::harness::plugin::TurnUsageShape =
+    crate::harness::plugin::TurnUsageShape { token_kinds: TOKEN_KINDS, origins: ORIGINS };
+
 /// This plugin's own id, for the places inside `harness/opencode/` that have to
 /// recognise their own tabs and settings rows. Inside this directory naming
 /// this harness is the point; locked decision 10(a) polices core, not here.
@@ -50,6 +102,16 @@ impl HarnessPlugin for OpenCodePlugin {
     /// that as absence rather than as a harness sitting at 0%.
     fn usage_source(&self) -> Option<&'static dyn crate::harness::plugin::UsageSource> {
         None
+    }
+
+    /// …but it **does** record turns — see [`TURN_SHAPE`].
+    ///
+    /// V40 Phase G. The two declarations were one before, hanging off
+    /// [`crate::harness::plugin::UsageSource`], which made "no quota" mean "no
+    /// token accounting" and left this harness's `usage_stat` rows shaped by
+    /// another harness's declaration.
+    fn turn_usage_shape(&self) -> Option<&'static crate::harness::plugin::TurnUsageShape> {
+        Some(&TURN_SHAPE)
     }
 
     /// Identity is the session id OpenCode reports over the loopback; it lives

@@ -1326,8 +1326,9 @@ pub struct McpAccess {
 }
 
 /// One provider/model price entry: USD per million tokens (MTok) for the four
-/// billing categories the transcripts report (`UsageTotals`' `in_tok` /
-/// `cache_make` / `cache_read` / `out_tok`). Fully user-editable in
+/// billing categories the transcripts report. The four ids are this table's own
+/// field names and the `usage_stat` columns' declared spellings (`input`,
+/// `cache_write`, `cache_read`, `output`). Fully user-editable in
 /// Settings → LLM pricing; the session-cost popup multiplies these against a
 /// session's token totals. `(provider, model)` is the display identity — no
 /// uniqueness is enforced, the popup just lists rows in order.

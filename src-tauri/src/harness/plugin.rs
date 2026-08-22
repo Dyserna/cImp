@@ -682,6 +682,63 @@ pub struct TurnOrigin {
     pub id: &'static str,
     /// The lane label a UI renders.
     pub label: &'static str,
+    /// True for the lane whose spend is a sub-agent's, rolled up to the
+    /// session that spawned it. A harness with no fan-out declares one lane
+    /// with `subagent: false`.
+    ///
+    /// Declared rather than inferred from the id, because the *only* other way
+    /// to know which of two lanes is the fan-out one is to recognise the word
+    /// `"agent"` — which is exactly the vendor literal locked decision 19
+    /// exists to delete. The ingress that rolls a child session's spend up to
+    /// its parent (`offload/loopback.rs`) reads this flag and nothing else.
+    pub subagent: bool,
+}
+
+/// **The shape of a RECORDED turn**: which token categories a harness reports
+/// per turn, and which lanes it attributes them to.
+///
+/// Separate from [`UsageSource`] on purpose, and that separation is the
+/// modelling fix (locked decision 19's remainder). Pre-V40-G the categories and
+/// the lanes hung off the usage *source* — so OpenCode, which answers
+/// `usage_source() == None` because nothing reports its quota or context
+/// window, was declared to record no turns either. It does record them: its
+/// plugin POSTs per-turn token totals to `/memory/event` and rolls a child
+/// session's spend up to `parent_session_id`. Quota is one question ("can this
+/// harness tell me how much of my plan is left?") and turn accounting is
+/// another ("when cImp writes a `usage_stat` row for this harness, what shape
+/// is it?"); a harness may answer either without the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TurnUsageShape {
+    /// The billing categories this harness reports a turn's tokens under. A
+    /// category it does not declare is **absent** from a stored turn's
+    /// [`TokenKinds`], never present as zero.
+    pub token_kinds: &'static [TokenKindSpec],
+    /// The lanes a turn's usage can be attributed to, in display order. The
+    /// ids are persisted verbatim in `usage_stat.origin`.
+    pub origins: &'static [TurnOrigin],
+}
+
+impl TurnUsageShape {
+    /// The id of the lane a sub-agent's spend rolls into, or `None` when this
+    /// harness declares no fan-out lane. First match wins.
+    pub fn subagent_origin(&self) -> Option<&'static str> {
+        self.origins.iter().find(|o| o.subagent).map(|o| o.id)
+    }
+
+    /// The id of the lane a first-party turn belongs to, or `None` when this
+    /// harness declares no such lane (which would make it undeclarable —
+    /// see the shape test). First match wins.
+    pub fn main_origin(&self) -> Option<&'static str> {
+        self.origins.iter().find(|o| !o.subagent).map(|o| o.id)
+    }
+
+    /// Whether this harness declares `id` as a token category. The read
+    /// boundary in `graph/index.rs` asks this per query to decide which stored
+    /// columns become entries in a [`TokenKinds`] — a category the harness
+    /// never declared must not appear as a structural zero.
+    pub fn declares_kind(&self, id: &str) -> bool {
+        self.token_kinds.iter().any(|k| k.id == id)
+    }
 }
 
 /// One quota window's current reading. `used` is 0–100; `resets_at` is an
@@ -772,15 +829,17 @@ pub struct UsageReading {
 /// A trait object rather than a data table because a reading is *read* —
 /// Claude's comes off a push file its own status-line child writes, and a
 /// future harness's could come off an API or a CHP event. What core needs is
-/// the declaration (which windows, which token categories, which lanes) plus
-/// one call that produces the current reading.
+/// the declaration (which windows) plus one call that produces the current
+/// reading.
+///
+/// It does **not** declare token categories or turn lanes any more: those
+/// describe a RECORDED turn, not a quota reading, and live on
+/// [`TurnUsageShape`] behind [`HarnessPlugin::turn_usage_shape`]. Keeping them
+/// here made "records turns" and "reports quota" one answer, which is why a
+/// harness that does the first without the second could not say so.
 pub trait UsageSource: Sync + Send {
     /// The quota windows this source can report, in display order.
     fn windows(&self) -> &'static [QuotaWindowSpec];
-    /// The billing categories this harness reports tokens under.
-    fn token_kinds(&self) -> &'static [TokenKindSpec];
-    /// The lanes a turn's usage can be attributed to.
-    fn origins(&self) -> &'static [TurnOrigin];
     /// The current reading, or `None` when this source has produced nothing
     /// still worth showing. Must be cheap and must never block for long — a
     /// widget polls it.
@@ -1467,6 +1526,23 @@ pub trait HarnessPlugin: Sync + Send {
         None
     }
 
+    /// The shape of a turn cImp RECORDS for this harness — see
+    /// [`TurnUsageShape`].
+    ///
+    /// `None` means this harness produces no per-turn usage rows at all, and it
+    /// is the neutral default for the same reason [`Self::usage_source`]'s is:
+    /// a harness gets a token breakdown by declaring one. Independent of
+    /// `usage_source`: OpenCode declares a shape and no source (it records
+    /// turns, it reports no quota), and the reverse would be equally legal.
+    ///
+    /// The read boundary (`graph/index.rs`) resolves a stored session's harness
+    /// and asks this which categories to emit. A session whose harness declares
+    /// no shape falls back to emitting only the columns that are non-zero — an
+    /// undeclared category is never invented.
+    fn turn_usage_shape(&self) -> Option<&'static TurnUsageShape> {
+        None
+    }
+
     /// Whether this harness's MCP client can be PUSHED to — an inbound path
     /// from the server to the model between turns.
     ///
@@ -1865,13 +1941,80 @@ mod tests {
                     w.id
                 );
             }
-            for k in source.token_kinds() {
+        }
+    }
+
+    /// **Recording turns and reporting quota are separate declarations.**
+    ///
+    /// The V40 Phase G split (locked decision 19's remainder). Before it,
+    /// `token_kinds()` / `origins()` hung off [`UsageSource`], so OpenCode —
+    /// which posts per-turn tokens to `/memory/event` and rolls a child
+    /// session's spend up to its parent, but reports no quota and no context
+    /// window — was modelled as recording nothing. This pins both halves:
+    /// OpenCode still answers *no usage source* (live-verify 14 reads that
+    /// answer, and it must not become a widget at 0%), and it now declares the
+    /// turn shape its rows actually have.
+    #[test]
+    fn a_harness_can_record_turns_without_reporting_quota() {
+        let shaped: Vec<_> = crate::harness::registry::all()
+            .filter(|h| h.plugin().and_then(|p| p.turn_usage_shape()).is_some())
+            .collect();
+        assert!(
+            !shaped.is_empty(),
+            "no harness declares a turn shape; every stored usage row would fall back to non-zero-columns-only and the declaration would have no producer"
+        );
+        for id in &shaped {
+            let shape = id.plugin().unwrap().turn_usage_shape().unwrap();
+            assert!(
+                !shape.token_kinds.is_empty(),
+                "{id}: a turn shape with no token category describes no row"
+            );
+            assert!(
+                !shape.origins.is_empty(),
+                "{id}: a turn shape with no lane cannot attribute a stored row"
+            );
+            let mut kinds: Vec<&str> = shape.token_kinds.iter().map(|k| k.id).collect();
+            let n = kinds.len();
+            kinds.sort_unstable();
+            kinds.dedup();
+            assert_eq!(n, kinds.len(), "{id}: two token categories share an id");
+            for k in shape.token_kinds {
                 assert!(!k.label.is_empty(), "{id}: token category `{}` has no label", k.id);
             }
-            for o in source.origins() {
+            let mut lanes: Vec<&str> = shape.origins.iter().map(|o| o.id).collect();
+            let n = lanes.len();
+            lanes.sort_unstable();
+            lanes.dedup();
+            assert_eq!(n, lanes.len(), "{id}: two turn origins share an id");
+            for o in shape.origins {
                 assert!(!o.label.is_empty(), "{id}: turn origin `{}` has no label", o.id);
             }
+            // A harness with no fan-out declares ONE lane with `subagent:
+            // false`; a harness with fan-out declares that lane plus the
+            // roll-up one. Either way the non-fan-out lane must exist — it is
+            // what `/memory/event` attributes a parent-less turn to, and a
+            // shape without one records nothing rather than guessing.
+            assert!(
+                shape.main_origin().is_some(),
+                "{id}: every declared lane is a sub-agent lane, so a first-party turn has nowhere to go"
+            );
         }
+        // The standing example, named by id because this assertion IS the
+        // separation: OpenCode records turns and reports no quota.
+        let oc = crate::harness::HarnessId::from_id("opencode")
+            .expect("opencode is a registered harness");
+        let p = oc.plugin().expect("opencode has a plugin");
+        assert!(
+            p.usage_source().is_none(),
+            "opencode gained a usage source; live-verify 14 reads `harness_usage(\"opencode\")` answering NO usage source, not a widget at 0%"
+        );
+        let shape = p
+            .turn_usage_shape()
+            .expect("opencode records per-turn tokens through /memory/event");
+        assert!(
+            shape.subagent_origin().is_some(),
+            "opencode's plugin rolls a child session's spend up to `parent_session_id`, so it must declare the lane that roll-up lands in"
+        );
     }
 
     #[test]

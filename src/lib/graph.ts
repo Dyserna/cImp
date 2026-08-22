@@ -614,6 +614,19 @@ export interface ToolUsage {
   calls: number;
 }
 
+/// Tokens by DECLARED billing category id. Mirror of Rust
+/// `harness::plugin::TokenKinds`.
+///
+/// **V40 Phase G (locked decision 19).** This replaced four fixed fields
+/// (`in_tok` / `out_tok` / `cache_read` / `cache_make`) named after one
+/// vendor's billing. The keys are whatever the session's harness declared —
+/// today `input` / `cache_write` / `cache_read` / `output`, cImp's own pricing
+/// vocabulary, which is also `PriceRates`' field names. A category the harness
+/// does not declare is **ABSENT from the object**, not present at 0: read it
+/// with `?? 0` only where a missing category genuinely means "spent nothing",
+/// never where it means "we were never told".
+export type TokenKinds = Record<string, number>;
+
 /// One turn's token breakdown. Mirror of Rust `graph::memory::TurnUsage`
 /// (V14 Phase C/D). `tool_chars` is the estimated tool-result characters
 /// that arrived just before this turn — divide by 4 for the "est. tool"
@@ -621,25 +634,19 @@ export interface ToolUsage {
 export interface TurnUsage {
   msg_id: string;
   model: string | null;
-  in_tok: number;
-  out_tok: number;
-  cache_read: number;
-  cache_make: number;
+  tokens: TokenKinds;
   tool_chars: number;
   ts_ms: number;
-  /// V24 Phase A: whether this turn was the main session or a sub-agent.
-  /// Pre-V24 rows read 'session'. Mirror of Rust `graph::memory::UsageOrigin`.
-  origin: 'session' | 'agent';
+  /// The DECLARED lane this turn was attributed to — the harness's own
+  /// `TurnOrigin.id`, stored verbatim in `usage_stat.origin`. Was
+  /// `'session' | 'agent'`, one harness's sidechain model in core's mirror;
+  /// the labels for these ids come from `harness_usage`.
+  origin: string;
 }
 
-/// Summed token totals across a session's turns. Mirror of Rust
-/// `graph::memory::UsageTotals`.
-export interface UsageTotals {
-  in_tok: number;
-  out_tok: number;
-  cache_read: number;
-  cache_make: number;
-}
+/// Summed token totals across a session's turns — same declared-category map
+/// as `TurnUsage.tokens`.
+export type UsageTotals = TokenKinds;
 
 /// The current (most-recently-active) session's usage readout. Mirror of
 /// Rust `graph::memory::SessionUsage`.
@@ -671,21 +678,18 @@ export interface SessionUsageRow {
   models: string[];
 }
 
-/// V24 Phase B: total tokens (all four categories summed) per usage origin —
-/// how much of a model's session spend was the main session vs. sub-agents.
-/// Mirror of Rust `graph::memory::OriginSplit`.
-export interface OriginSplit {
-  session_tok: number;
-  agent_tok: number;
-}
-
 /// V24 Phase B: one model's contribution to a session — summed totals plus the
-/// session/agent origin split, ordered by tokens desc in
-/// `SessionUsageDetail.per_model`. Mirror of Rust `graph::memory::ModelUsage`.
+/// per-lane split, ordered by tokens desc in `SessionUsageDetail.per_model`.
+/// Mirror of Rust `graph::memory::ModelUsage`.
+///
+/// V40 Phase G: `origins` was `OriginSplit { session_tok, agent_tok }`, a
+/// closed two-lane struct. It is a map keyed by the harness's declared lane id
+/// now, holding total tokens (every category summed) for that lane. A lane this
+/// model recorded no turn in has **no key** — not a key at 0.
 export interface ModelUsage {
   model: string;
   totals: UsageTotals;
-  origins: OriginSplit;
+  origins: Record<string, number>;
 }
 
 /// V24 Phase B: full drill-in detail for one session (any session, not just the

@@ -114,7 +114,7 @@ pub fn check_claude_transcript_usage(raw: &str) -> Result<(), String> {
     );
 
     let Some(ev) =
-        crate::harness::claude::read::parse_usage_line(&lines[0], crate::graph::UsageOrigin::Session)
+        crate::harness::claude::read::parse_usage_line(&lines[0], crate::harness::claude::usage::ORIGIN_SESSION)
     else {
         return Err("claude.transcript.usage: no UsageEvent from an assistant line (`type`, \
                     `message` or `message.id` gone)"
@@ -150,8 +150,8 @@ pub fn check_claude_transcript_usage(raw: &str) -> Result<(), String> {
         "message.usage.cache_creation_input_tokens gone"
     );
     substantive!(
-        origin == crate::graph::UsageOrigin::Session,
-        "the requested UsageOrigin did not survive the parse"
+        origin == crate::harness::claude::usage::ORIGIN_SESSION,
+        "the requested turn origin did not survive the parse"
     );
     Ok(())
 }
@@ -553,7 +553,7 @@ mod tests {
         let lines = json_lines(&raw);
         assert_eq!(lines.len(), 1, "fixture guard: expected one assistant line");
 
-        let ev = crate::harness::claude::read::parse_usage_line(&lines[0], crate::graph::UsageOrigin::Session)
+        let ev = crate::harness::claude::read::parse_usage_line(&lines[0], crate::harness::claude::usage::ORIGIN_SESSION)
             .expect("guard: this fixture models the drift case — a renamed token field must NOT stop the line parsing, that is precisely why it is silent");
 
         let crate::graph::UsageEvent::Turn {

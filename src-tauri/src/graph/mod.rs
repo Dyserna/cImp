@@ -45,16 +45,19 @@ mod watcher;
 pub use builder::parse_file;
 pub use context::{est_tokens, RetrieveResult};
 pub use index::GraphIndex;
-pub use memory::{MemorySnapshot, ProjectFact, UsageEvent, UsageOrigin};
+pub use memory::{MemorySnapshot, ProjectFact, UsageEvent};
 // V14 Phase D: only `UsageSnapshot` itself is named by qualified path outside
 // this module (the `graph_usage` IPC handler's return type). Its nested
 // field types (`Effectiveness`/`SessionUsage`/`SessionUsageRow`/`ToolUsage`/
-// `TurnUsage`/`UsageTotals`) are used structurally, never referenced by their
-// own `crate::graph::…` path — same posture as `MemorySnapshot`'s own nested
+// `TurnUsage`) are used structurally, never referenced by their own
+// `crate::graph::…` path — same posture as `MemorySnapshot`'s own nested
 // `WorkingSetEntry`/`MemNote`/`SessionInfo`, which aren't re-exported here
 // either. V24 Phase B: `SessionUsageDetail` is likewise named by qualified
 // path (the `graph_session_usage` handler's return type); its own nested
-// `ModelUsage`/`OriginSplit` stay structural.
+// `ModelUsage` stays structural. V40 Phase G removed `UsageOrigin` from this
+// list along with the enum: a turn's lane is the harness's declared
+// `TurnOrigin.id`, a plain `String` on the payload, so there is no core type
+// for a producer to import.
 pub use mcp::{
     handle_call as handle_mcp_call, lean_filter, native_surface_sig, offload_query,
     offload_run_check, run_check_spec, semantic_code_spec, semantic_spec, source_for_consumer,

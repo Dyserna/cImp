@@ -53,6 +53,9 @@ use tokio::time::sleep;
 use tracing::{debug, trace, warn};
 
 use super::super::OobContext;
+// V40 Phase G: the two lane ids this harness DECLARES, spelled once in
+// `usage.rs` and written verbatim into `usage_stat.origin`.
+use super::usage::{ORIGIN_AGENT, ORIGIN_SESSION};
 use crate::state::StateSignal;
 
 const POLL: Duration = Duration::from_millis(200);
@@ -791,7 +794,7 @@ async fn drain_new_lines(
                 project_dir,
                 session_id,
                 ctx,
-                crate::graph::UsageOrigin::Session,
+                ORIGIN_SESSION,
             );
             record_commit_events(&obj, commit_calls, project_dir, session_id, ctx);
             // V35 Phase L — **arbitration, and why the dedup set is fed
@@ -1211,13 +1214,18 @@ impl ToolNameRing {
     }
 }
 
-/// Pure: the origin to attribute one transcript line's turn to. `base_origin`
-/// is the caller's default (Session for the parent drain, Agent for a sub-agent
-/// file drain); an inline `isSidechain:true` line — the 1.x sub-agent contract
-/// carried in the parent transcript — is upgraded to Agent regardless.
-fn usage_origin(obj: &Value, base_origin: crate::graph::UsageOrigin) -> crate::graph::UsageOrigin {
+/// Pure: the DECLARED lane to attribute one transcript line's turn to.
+/// `base_origin` is the caller's default ([`ORIGIN_SESSION`] for the parent
+/// drain, [`ORIGIN_AGENT`] for a sub-agent file drain); an inline
+/// `isSidechain:true` line — the 1.x sub-agent contract carried in the parent
+/// transcript — is upgraded to the sidechain lane regardless.
+///
+/// V40 Phase G: these are the ids this harness DECLARES
+/// ([`super::usage::TURN_SHAPE`]), spelled once in `usage.rs`, rather than a
+/// core enum's two variants.
+fn usage_origin(obj: &Value, base_origin: &'static str) -> &'static str {
     if obj.get("isSidechain").and_then(Value::as_bool) == Some(true) {
-        crate::graph::UsageOrigin::Agent
+        ORIGIN_AGENT
     } else {
         base_origin
     }
@@ -1247,7 +1255,7 @@ fn usage_origin(obj: &Value, base_origin: crate::graph::UsageOrigin) -> crate::g
 /// `pub(crate)` for the V35 canary suite (harness/canary.rs).
 pub(crate) fn parse_usage_line(
     obj: &Value,
-    origin: crate::graph::UsageOrigin,
+    origin: &str,
 ) -> Option<crate::graph::UsageEvent> {
     if obj.get("type").and_then(Value::as_str) != Some("assistant") {
         return None;
@@ -1272,7 +1280,7 @@ pub(crate) fn parse_usage_line(
         out_tok: tok("output_tokens"),
         cache_read: tok("cache_read_input_tokens"),
         cache_make: tok("cache_creation_input_tokens"),
-        origin,
+        origin: origin.to_string(),
     })
 }
 
@@ -1598,8 +1606,8 @@ fn spawn_head_fallback(ctx: &OobContext, project_dir: &Path, session_id: &str) {
 /// lines live in `subagents/*.jsonl` and reach this function via
 /// [`SubagentState::scan`] instead.
 /// `base_origin` is the caller's default attribution for the turn: the parent
-/// drain passes [`UsageOrigin::Session`], [`SubagentState::scan`] passes
-/// [`UsageOrigin::Agent`]. Either way an inline `isSidechain:true` line (the
+/// drain passes [`ORIGIN_SESSION`], [`SubagentState::scan`] passes
+/// [`ORIGIN_AGENT`]. Either way an inline `isSidechain:true` line (the
 /// 1.x sub-agent contract, which arrives through the parent drain) is forced to
 /// `Agent` — a sub-agent's tokens are the parent session's spend, tagged as
 /// agent so the S/A chart can split them out. Tool-result rows carry no origin.
@@ -1609,7 +1617,7 @@ fn record_usage(
     project_dir: &Path,
     session_id: &str,
     ctx: &OobContext,
-    base_origin: crate::graph::UsageOrigin,
+    base_origin: &'static str,
 ) {
     if ctx.mem.is_none() {
         return;
@@ -1770,7 +1778,7 @@ impl SubagentState {
                         project_dir,
                         session_id,
                         ctx,
-                        crate::graph::UsageOrigin::Agent,
+                        ORIGIN_AGENT,
                     );
                     record_commit_events(
                         &obj,
@@ -2586,7 +2594,7 @@ mod tests {
                 "input_tokens":100,"output_tokens":20,
                 "cache_read_input_tokens":50,"cache_creation_input_tokens":5}}}"#,
         );
-        let ev = parse_usage_line(&line, crate::graph::UsageOrigin::Session)
+        let ev = parse_usage_line(&line, ORIGIN_SESSION)
             .expect("assistant line with usage yields an event");
         match ev {
             crate::graph::UsageEvent::Turn {
@@ -2606,7 +2614,7 @@ mod tests {
                 assert_eq!(cache_make, 5);
                 assert_eq!(
                     origin,
-                    crate::graph::UsageOrigin::Session,
+                    ORIGIN_SESSION,
                     "origin flows through from the caller"
                 );
             }
@@ -2620,7 +2628,7 @@ mod tests {
         // `usage` block at all: still a Turn event (so the msg_id UPSERT can
         // later overwrite it with real numbers), just with zeroed tokens.
         let line = obj(r#"{"type":"assistant","message":{"id":"m2"}}"#);
-        let ev = parse_usage_line(&line, crate::graph::UsageOrigin::Session)
+        let ev = parse_usage_line(&line, ORIGIN_SESSION)
             .expect("absent usage still yields an event");
         match ev {
             crate::graph::UsageEvent::Turn {
@@ -2645,7 +2653,7 @@ mod tests {
         // A usage block with only some fields present (a plausible partial
         // stream update) — present fields are read, absent ones default to 0.
         let line = obj(r#"{"type":"assistant","message":{"id":"m3","usage":{"input_tokens":7}}}"#);
-        let ev = parse_usage_line(&line, crate::graph::UsageOrigin::Session).unwrap();
+        let ev = parse_usage_line(&line, ORIGIN_SESSION).unwrap();
         match ev {
             crate::graph::UsageEvent::Turn {
                 in_tok,
@@ -2664,36 +2672,35 @@ mod tests {
     #[test]
     fn parse_usage_line_none_for_non_assistant() {
         let line = obj(r#"{"type":"user","message":{"content":"hi"}}"#);
-        assert!(parse_usage_line(&line, crate::graph::UsageOrigin::Session).is_none());
+        assert!(parse_usage_line(&line, ORIGIN_SESSION).is_none());
     }
 
     #[test]
     fn parse_usage_line_none_without_message_id() {
         let line = obj(r#"{"type":"assistant","message":{"usage":{"input_tokens":1}}}"#);
-        assert!(parse_usage_line(&line, crate::graph::UsageOrigin::Session).is_none());
+        assert!(parse_usage_line(&line, ORIGIN_SESSION).is_none());
     }
 
     #[test]
     fn usage_origin_tags_the_three_line_forms() {
-        use crate::graph::UsageOrigin;
         // Parent-transcript line (no sidechain flag) → the caller's Session.
         let parent = obj(r#"{"type":"assistant","message":{"id":"m1"}}"#);
         assert_eq!(
-            usage_origin(&parent, UsageOrigin::Session),
-            UsageOrigin::Session
+            usage_origin(&parent, ORIGIN_SESSION),
+            ORIGIN_SESSION
         );
         // Inline `isSidechain:true` line (1.x sub-agent) → Agent even from the
         // parent drain's Session default.
         let sidechain = obj(r#"{"type":"assistant","isSidechain":true,"message":{"id":"m2"}}"#);
         assert_eq!(
-            usage_origin(&sidechain, UsageOrigin::Session),
-            UsageOrigin::Agent
+            usage_origin(&sidechain, ORIGIN_SESSION),
+            ORIGIN_AGENT
         );
         // Sub-agent transcript FILE line (2.x) → the drain passes Agent; a plain
         // line there (no sidechain flag) stays Agent.
         assert_eq!(
-            usage_origin(&parent, UsageOrigin::Agent),
-            UsageOrigin::Agent
+            usage_origin(&parent, ORIGIN_AGENT),
+            ORIGIN_AGENT
         );
     }
 
@@ -2822,7 +2829,7 @@ mod tests {
             &dir,
             "s1",
             &ctx,
-            crate::graph::UsageOrigin::Session,
+            ORIGIN_SESSION,
         );
         assert_eq!(
             ring.get("toolu_1"),
@@ -2974,7 +2981,7 @@ mod tests {
         assert_eq!(spoken[0].1, "Hello there.");
 
         // Usage tap: `effort` and the unknown usage key don't disturb the counts.
-        let ev = parse_usage_line(&line, crate::graph::UsageOrigin::Session)
+        let ev = parse_usage_line(&line, ORIGIN_SESSION)
             .expect("an `effort`-carrying assistant line still yields a Turn");
         assert_eq!(
             ev,
@@ -2985,7 +2992,7 @@ mod tests {
                 out_tok: 20,
                 cache_read: 50,
                 cache_make: 5,
-                origin: crate::graph::UsageOrigin::Session,
+                origin: ORIGIN_SESSION.to_string(),
             }
         );
 
@@ -3009,7 +3016,7 @@ mod tests {
                 "sessionId":"abc","cwd":"P:\\repo","brandNewField":42}"#,
         );
         assert!(assistant_texts(&fork).is_empty());
-        assert!(parse_usage_line(&fork, crate::graph::UsageOrigin::Session).is_none());
+        assert!(parse_usage_line(&fork, ORIGIN_SESSION).is_none());
         assert!(extract_tool_results(&fork).is_empty());
         assert!(!is_user_prompt(&fork), "not a turn boundary");
 
@@ -3027,7 +3034,7 @@ mod tests {
         // A wholly unknown top-level `type` behaves the same way.
         let alien = obj(r#"{"type":"some-future-record","payload":{"anything":true}}"#);
         assert!(assistant_texts(&alien).is_empty());
-        assert!(parse_usage_line(&alien, crate::graph::UsageOrigin::Session).is_none());
+        assert!(parse_usage_line(&alien, ORIGIN_SESSION).is_none());
         assert!(!is_user_prompt(&alien));
     }
 

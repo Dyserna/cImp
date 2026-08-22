@@ -34,7 +34,7 @@ use super::embed::Embedder;
 use super::index::{GraphIndex, GraphStats, LangCount, SymbolHit};
 use super::memory::{
     Effectiveness, MemorySnapshot, ModelUsage, ProjectFact, SessionUsage, SessionUsageDetail,
-    SessionUsageRow, ToolUsage, TurnUsage, UsageEvent, UsageSnapshot, UsageTotals, WorkingSetEntry,
+    SessionUsageRow, ToolUsage, TurnUsage, UsageEvent, UsageSnapshot, WorkingSetEntry,
 };
 use super::model::Lang;
 use super::parse_file;
@@ -165,7 +165,7 @@ pub struct EmbedderProbe {
 /// for the sibling, and the sibling's tap — which tails the *stalled* tab's
 /// transcript, the newest file — gains a CONFIDENT and WRONG session binding.
 /// The tap therefore refreshes both of its entries from an independent heartbeat
-/// task (`oob::claude::TapHeartbeat`) that no drain-side await can starve; this
+/// task (`harness::claude::read::TapHeartbeat`) that no drain-side await can starve; this
 /// TTL only has to outlast that heartbeat's cadence by a wide margin.
 const LIVE_SESSION_TTL_MS: i64 = 90_000;
 
@@ -1043,7 +1043,7 @@ fn upsert_live_tab_root(
             e.root = key.clone();
             // Kept current rather than sticky: a pinned tap DROPS its pin if
             // the harness never wrote the pinned transcript (see
-            // `oob::claude`'s pin grace), and the tab must degrade back to
+            // `harness::claude::read`'s pin grace), and the tab must degrade back to
             // ambiguous with it.
             e.pinned = pinned;
         })
@@ -1660,17 +1660,24 @@ impl GraphService {
         }
     }
 
-    /// Summed token totals for `session_id` ("turn" rows only). Empty
-    /// defaults on any store error (graph disabled, session unknown, etc.).
-    /// Best-effort like the wrappers below it, but never SILENT: every
-    /// swallowed store error in this block is traced, so a degraded store is
-    /// diagnosable from the log even where the return type can't carry it.
-    pub fn usage_session_totals(&self, root: &Path, session_id: &str) -> UsageTotals {
+    /// Summed token totals for `session_id` ("turn" rows only), by the
+    /// session's harness's declared token categories. Empty defaults on any
+    /// store error (graph disabled, session unknown, etc.) — and an EMPTY map
+    /// is the honest answer there: no category was reported, as opposed to
+    /// four categories reported at zero. Best-effort like the wrappers below
+    /// it, but never SILENT: every swallowed store error in this block is
+    /// traced, so a degraded store is diagnosable from the log even where the
+    /// return type can't carry it.
+    pub fn usage_session_totals(
+        &self,
+        root: &Path,
+        session_id: &str,
+    ) -> crate::harness::plugin::TokenKinds {
         let idx = match self.index_for(root) {
             Ok(idx) => idx,
             Err(e) => {
                 debug!(error = %e, "graph: usage_session_totals open failed");
-                return UsageTotals::default();
+                return crate::harness::plugin::TokenKinds::default();
             }
         };
         idx.usage_session_totals(session_id)
@@ -1822,7 +1829,7 @@ impl GraphService {
             .flatten()
     }
 
-    /// V24 Phase B: per-model token totals + session/agent origin split for
+    /// V24 Phase B: per-model token totals + the per-lane split for
     /// `session_id`, ordered by tokens desc. Empty on any store error.
     pub fn usage_session_model_totals(&self, root: &Path, session_id: &str) -> Vec<ModelUsage> {
         let idx = match self.index_for(root) {
@@ -6392,7 +6399,7 @@ mod tests {
         SessionUsageRow {
             session_id: id.to_string(),
             agent: "claude".to_string(),
-            totals: UsageTotals::default(),
+            totals: crate::harness::plugin::TokenKinds::default(),
             tool_chars: 0,
             cache_hit_ratio: 0.0,
             est_only: false,

@@ -1135,7 +1135,7 @@ const CORE_CAPABILITIES: &[Capability] = &[
              `drift.subagent_transcripts.v1` already lags it and has fired once for real (the \
              Task→Agent rename), which is the evidence this layout moves. V35 Phase L made this \
              row the FALLBACK behind `claude.hook.subagent` — for the LIFECYCLE only. Sub-agent \
-             TOKEN accounting (`SubagentState::scan`'s `UsageOrigin::Agent` rows) and the \
+             TOKEN accounting (`SubagentState::scan`'s sub-agent-lane rows) and the \
              `launch_seen`/`completion_seen` bookkeeping this waiver's drift rule reads are NOT \
              arbitrated and keep running on every tab: no hook payload carries sub-agent tokens \
              or names a sub-agent transcript path, and suppressing the bookkeeping would make \

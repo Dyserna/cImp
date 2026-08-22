@@ -239,7 +239,7 @@ struct Tail {
 }
 
 /// The newest `*.jsonl` under `~/.claude/projects/`, preferring the project the
-/// probe was run in. Path discovery goes through `oob::claude` — the tap's own
+/// probe was run in. Path discovery goes through `harness::claude::read` — the tap's own
 /// helpers — so the probe cannot verify a layout the tap does not read.
 fn newest_transcript() -> Option<PathBuf> {
     let root = crate::harness::claude::read::projects_root()?;
@@ -451,7 +451,7 @@ fn usage_outcome(tail: &Tail) -> Outcome {
             cache_read,
             cache_make,
             ..
-        }) = crate::harness::claude::read::parse_usage_line(line, crate::graph::UsageOrigin::Session)
+        }) = crate::harness::claude::read::parse_usage_line(line, crate::harness::claude::usage::ORIGIN_SESSION)
         else {
             continue;
         };
@@ -499,7 +499,7 @@ fn usage_is_substantive(line: &Value) -> bool {
         in_tok,
         out_tok,
         ..
-    }) = crate::harness::claude::read::parse_usage_line(line, crate::graph::UsageOrigin::Session)
+    }) = crate::harness::claude::read::parse_usage_line(line, crate::harness::claude::usage::ORIGIN_SESSION)
     else {
         return false;
     };

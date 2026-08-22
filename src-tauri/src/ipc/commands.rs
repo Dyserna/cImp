@@ -1106,12 +1106,22 @@ pub async fn stt_list_input_devices() -> AppResult<Vec<String>> {
 ///
 /// * `source: None` — **this harness has no usage source at all.** OpenCode.
 ///   A UI must render that as absence; rendering it as a harness at 0% would be
-///   a number nobody reported (global principle 5).
+///   a number nobody reported (global principle 5). It says nothing about
+///   whether the harness RECORDS turns — see `token_kinds`/`origins` below.
 /// * `source: Some(..), reading: None` — it has one, and nothing has been
 ///   reported yet (no tab of that harness has pushed, or the last push aged
 ///   out).
 /// * `source: Some(..), reading: Some(..)` — the declared windows that have a
 ///   reading, in declared order, plus the live context block.
+///
+/// Beside those three, and **independent of them**, the answer carries the
+/// declared shape of a RECORDED turn: `token_kinds` and `origins`. V40 Phase G
+/// split the two questions, because they had different answers all along —
+/// OpenCode reports no quota and no context window (`source: None`) and still
+/// writes real per-turn token rows with a parent/child lane split. Nesting the
+/// declaration under `source` meant the Usage donut could not label an OpenCode
+/// session's lanes at all. Both lists are EMPTY for a harness that declares no
+/// turn shape.
 ///
 /// An unregistered harness id is an error, not an empty reading: a widget
 /// polling for a harness that does not exist is a bug, and answering it with
@@ -1124,7 +1134,9 @@ pub async fn harness_usage(harness: String) -> AppResult<HarnessUsage> {
             crate::harness::registry::harness_ids().join(", ")
         ))
     })?;
-    let source = id.plugin().and_then(|p| p.usage_source());
+    let plugin = id.plugin();
+    let source = plugin.and_then(|p| p.usage_source());
+    let shape = plugin.and_then(|p| p.turn_usage_shape());
     Ok(HarnessUsage {
         source: source.map(|s| UsageSourceInfo {
             windows: s
@@ -1137,41 +1149,54 @@ pub async fn harness_usage(harness: String) -> AppResult<HarnessUsage> {
                     description: w.description,
                 })
                 .collect(),
-            token_kinds: s
-                .token_kinds()
-                .iter()
-                .map(|k| DeclaredLabel { id: k.id, label: k.label })
-                .collect(),
-            origins: s
-                .origins()
-                .iter()
-                .map(|o| DeclaredLabel { id: o.id, label: o.label })
-                .collect(),
         }),
+        token_kinds: shape
+            .map(|s| {
+                s.token_kinds
+                    .iter()
+                    .map(|k| DeclaredLabel { id: k.id, label: k.label })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        origins: shape
+            .map(|s| {
+                s.origins
+                    .iter()
+                    .map(|o| DeclaredOrigin { id: o.id, label: o.label, subagent: o.subagent })
+                    .collect()
+            })
+            .unwrap_or_default(),
         reading: source.and_then(|s| s.read()),
     })
 }
 
-/// The answer [`harness_usage`] gives. See its docs for the three states.
+/// The answer [`harness_usage`] gives. See its docs for the three source
+/// states and for why the turn shape sits BESIDE them, not inside them.
 #[derive(serde::Serialize)]
 pub struct HarnessUsage {
-    /// What this harness's usage source *can* report — `None` when it has none.
+    /// What this harness's quota source *can* report — `None` when it has none.
     pub source: Option<UsageSourceInfo>,
-    /// What it reports right now.
+    /// The billing categories this harness reports a RECORDED turn's tokens
+    /// under, in declared order. Empty when it records no turns.
+    pub token_kinds: Vec<DeclaredLabel>,
+    /// The lanes a recorded turn can be attributed to, in declared order —
+    /// what the Usage donut labels its rings with. Empty when it records no
+    /// turns.
+    pub origins: Vec<DeclaredOrigin>,
+    /// What the quota source reports right now.
     pub reading: Option<crate::harness::plugin::UsageReading>,
 }
 
-/// The declared shape of a usage source: which windows it can report, which
-/// token categories it bills under, which lanes a turn can belong to.
+/// The declared shape of a QUOTA source: which windows it can report.
 ///
 /// Sent alongside the reading rather than mirrored in the frontend, so a
 /// harness with three quota windows (or one, or none) needs no UI change —
-/// locked decision 19.
+/// locked decision 19. V40 Phase G moved `token_kinds` / `origins` OUT of here:
+/// they describe a stored turn, not a quota reading, and a harness can have
+/// either without the other.
 #[derive(serde::Serialize)]
 pub struct UsageSourceInfo {
     pub windows: Vec<DeclaredWindow>,
-    pub token_kinds: Vec<DeclaredLabel>,
-    pub origins: Vec<DeclaredLabel>,
 }
 
 /// One declared quota window, without a reading.
@@ -1183,12 +1208,22 @@ pub struct DeclaredWindow {
     pub description: &'static str,
 }
 
-/// A declared id with the label a UI renders for it (token categories, turn
-/// origins).
+/// A declared id with the label a UI renders for it (token categories).
 #[derive(serde::Serialize)]
 pub struct DeclaredLabel {
     pub id: &'static str,
     pub label: &'static str,
+}
+
+/// One declared turn lane. Carries `subagent` because that is what tells a UI
+/// which lane gets the fan-out treatment (the outlined bar, the "A" badge)
+/// without recognising the word `"agent"` — the literal locked decision 19
+/// exists to delete.
+#[derive(serde::Serialize)]
+pub struct DeclaredOrigin {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub subagent: bool,
 }
 
 /// Sample the system-monitor stats (CPU / memory / GPU / network) for the
@@ -4428,6 +4463,75 @@ mod tests {
     use crate::settings::{PromptTemplate, Settings};
     use crate::state::{ReadOnlySource, TabId};
 
+    /// **"No quota source" and "records no turns" are two answers, and this
+    /// command gives both** (V40 Phase G, locked decision 19).
+    ///
+    /// The regression this pins is the one the phase exists to remove: the
+    /// declared token categories and turn lanes used to hang off `source`, so a
+    /// harness that reports no quota was also declared to record no turns — and
+    /// the Usage donut had no labels for its sessions' lanes. Live-verify 14
+    /// reads the FIRST half of this (a harness answering *no usage source*, not
+    /// a widget at 0%), so both halves are asserted together.
+    ///
+    /// Names no product: the two harnesses are picked out of the registry by
+    /// what they DECLARE, which is what locked decision 10(a) asks of core.
+    #[tokio::test]
+    async fn harness_usage_reports_a_turn_shape_independently_of_a_quota_source() {
+        let mut quota_only = 0usize;
+        let mut turns_without_quota = 0usize;
+        for id in crate::harness::registry::all() {
+            let answer = super::harness_usage(id.token().to_string())
+                .await
+                .expect("a registered harness answers");
+            let plugin = id.plugin();
+            let has_source = plugin.and_then(|p| p.usage_source()).is_some();
+            let has_shape = plugin.and_then(|p| p.turn_usage_shape()).is_some();
+            assert_eq!(
+                answer.source.is_some(),
+                has_source,
+                "{id}: the `source` half must mirror the declaration exactly"
+            );
+            assert_eq!(
+                !answer.origins.is_empty(),
+                has_shape,
+                "{id}: the lanes must arrive whenever a turn shape is declared"
+            );
+            assert_eq!(
+                !answer.token_kinds.is_empty(),
+                has_shape,
+                "{id}: the categories must arrive whenever a turn shape is declared"
+            );
+            if has_source {
+                quota_only += 1;
+                // The quota half carries WINDOWS and nothing else now.
+                assert!(!answer.source.as_ref().unwrap().windows.is_empty());
+            }
+            if has_shape && !has_source {
+                turns_without_quota += 1;
+                // Exactly the case that was unrepresentable: no quota widget at
+                // all, and still a labelled lane split for its stored rows.
+                assert!(answer.reading.is_none(), "{id}: no source can produce no reading");
+                assert!(
+                    answer.origins.iter().any(|o| o.subagent),
+                    "{id}: it rolls a child session's spend up, so it declares the lane"
+                );
+            }
+        }
+        assert!(quota_only > 0, "no harness declares a quota source at all");
+        assert!(
+            turns_without_quota > 0,
+            "no harness records turns without reporting quota — if that becomes true, this \
+             command's independence has no live example and the two fields can silently \
+             re-couple"
+        );
+    }
+
+    /// An unregistered harness id REJECTS rather than answering an empty shape.
+    #[tokio::test]
+    async fn harness_usage_rejects_an_unregistered_harness() {
+        assert!(super::harness_usage("not-a-harness".to_string()).await.is_err());
+    }
+
     /// **The facade knobs are a NARROW write** (V39 review M-10).
     ///
     /// The popover's old path sent the whole `Settings` document, which can
@@ -4914,7 +5018,11 @@ mod tests {
             ActivityKind::Graph,
             ts_ms,
             "root".to_string(),
-            "claude".to_string(),
+            // An opaque source tag: this test is about the RECENCY window, and
+            // `ActivityEntry::source` is a persisted free string (locked
+            // decision 29). Asking the registry keeps it a real one without
+            // hard-coding which harness happens to be first.
+            crate::harness::DEFAULT_HARNESS.token().to_string(),
             "graph_cycles".to_string(),
             "target".to_string(),
             0,

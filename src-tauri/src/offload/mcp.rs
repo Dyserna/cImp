@@ -2095,7 +2095,15 @@ fn decorate_initialize_channel(result: &mut Value, instructions: &str) {
 /// process had never registered it — every push then silently dropped
 /// client-side but counted as delivered app-side.
 fn session_push_enabled() -> bool {
-    consumer() == "claude" && CHANNEL_PUSH_ARG.load(Ordering::Acquire)
+    // V40 Phase D (locked decision 25): the consumer's PLUGIN answers whether
+    // it has an inbound MCP path at all. This was `consumer() == "claude"` —
+    // core asserting that exactly one harness can receive a push, which is a
+    // fact about that harness rather than about pushing, and which silently
+    // answered `false` for every harness added later.
+    crate::harness::HarnessId::from_consumer(consumer())
+        .and_then(|h| h.plugin())
+        .is_some_and(|p| p.supports_session_push())
+        && CHANNEL_PUSH_ARG.load(Ordering::Acquire)
 }
 
 /// A backend resolved from config to a connectable endpoint, before the

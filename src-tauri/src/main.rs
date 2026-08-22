@@ -34,13 +34,11 @@ mod shell;
 mod spawn_gate;
 mod spawn_ledger;
 mod state;
-mod statusline;
 mod stt;
 mod sysmon;
 mod tabs;
 mod theming;
 mod tts;
-mod usage;
 mod workbench;
 
 use std::collections::{HashMap, HashSet};
@@ -61,14 +59,14 @@ use crate::ipc::commands::{
     compose_templates, compose_templates_global_get, compose_templates_global_set,
     compose_templates_project_get, consume_settings_deep_link, contamination_events, content_clear,
     content_open_folder, detection_check_now, detection_open_rules_folder, detection_revert,
-    detection_status, get_claude_usage, get_system_stats, graph_architecture,
+    detection_status, get_system_stats, graph_architecture,
     graph_context_preview, graph_cycles, graph_dead_exports, graph_fact_add, graph_fact_update,
     graph_facts, graph_history,
     graph_ignore_pick, graph_impact, graph_language_census, graph_memory, graph_memory_clear,
     graph_note_review, graph_note_set_pinned, graph_path, graph_rebuild, graph_rebuild_embeddings,
     graph_session_usage, graph_set_language_enabled, graph_set_watch_paused, graph_status,
     graph_tab_session, graph_test_embedder, graph_usage, graph_usage_advice, graph_viz_ego, graph_viz_file_status,
-    graph_viz_snapshot, harness_mark_verified, harness_run_checks, harness_settings_schema,
+    graph_viz_snapshot, harness_mark_verified, harness_usage, harness_run_checks, harness_settings_schema,
     harness_versions_get, injection_status,
     latch_override, latch_status,
     list_tabs, list_voices,
@@ -279,15 +277,21 @@ fn main() {
         }
     }
 
-    // Status-line subcommand: Claude Code invokes `cimp --statusline`,
-    // pipes the session JSON to our stdin, and reads the rendered context
-    // bar from our stdout. Handle it before any Tauri/audio/settings init
-    // so it's instant and never spins up the GUI. Works under the release
-    // `windows` subsystem too — inherited stdio pipes stay usable; only
-    // console allocation is suppressed.
-    if std::env::args().skip(1).any(|a| a == "--statusline") {
-        statusline::run();
-        return;
+    // Plugin-registered subcommands (V40 Phase D, locked decision 19). Claude
+    // Code invokes `cimp --statusline`, pipes the session JSON to our stdin and
+    // reads the rendered context bar from our stdout — a contract that belongs
+    // to that harness, so the flag, the handler and the shell quoting around it
+    // all live in `harness/claude/statusline.rs` and this loop asks rather than
+    // matches. Handled before any Tauri/audio/settings init so a subcommand is
+    // instant and never spins up the GUI; works under the release `windows`
+    // subsystem too — inherited stdio pipes stay usable, only console
+    // allocation is suppressed.
+    {
+        let argv: Vec<String> = std::env::args().skip(1).collect();
+        if let Some(sub) = harness::registry::subcommand_for(&argv) {
+            (sub.run)();
+            return;
+        }
     }
 
     // ── V35 Phase J: the hook shims are GONE, and these are TOMBSTONES ───────
@@ -597,7 +601,7 @@ fn main() {
     // `tts_speak_selection`/`tts_stop` commands and the TTS worker.
     let speak_session: SpeakSession = Arc::new(AtomicU64::new(0));
     // Shared "suppress AI-tag TTS" flag. Set by Esc (`tts_stop`), cleared by
-    // the state manager on the next `ClaudeOutputStarted`.
+    // the state manager on the next `HarnessOutputStarted`.
     let ai_tts_suppressed: AiTtsSuppressed = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // V6-01 STT handle. The capture + transcription threads are spawned in
@@ -1089,7 +1093,7 @@ fn main() {
             stt_cancel,
             stt_list_models,
             stt_list_input_devices,
-            get_claude_usage,
+            harness_usage,
             get_system_stats,
             settings_get,
             settings_update,

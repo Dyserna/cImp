@@ -396,7 +396,7 @@ fn manifest(driven: &Driven, mode: Mode, present: &[String]) -> String {
 /// Derived from the epoch through `chrono::DateTime::from_timestamp` and
 /// truncated out of the RFC 3339 form — the crate is built with
 /// `default-features = false`, so `Utc::now()` (the `clock` feature) is not
-/// available and this is the same route `usage::mod` already takes.
+/// available and this is the same route `harness::claude::usage` already takes.
 fn today() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

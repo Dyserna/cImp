@@ -432,13 +432,15 @@ html[data-theme="tui"] *::-webkit-scrollbar-thumb:hover {
   background-color: var(--border-strong);
 }
 
-/* StatusBar (bottom strip) — two lines tall to fit the stacked Claude Code
-   usage meter (current + weekly session rows). Drop the filled background;
-   the top border is enough separation. Tighter horizontal padding (1ch
-   instead of 12px) to align with the TUI grid. */
+/* StatusBar (bottom strip) — one 22px line per stacked usage row the running
+   harness declares (V40 Phase D, locked decision 19: `--status-bar-rows` is
+   set from `harness_usage`'s declared window count, and the `2` fallback is
+   the pre-V40 44px for every state where nothing has declared one). Drop the
+   filled background; the top border is enough separation. Tighter horizontal
+   padding (1ch instead of 12px) to align with the TUI grid. */
 html[data-theme="tui"] .status-bar {
-  height: 44px !important;
-  flex: 0 0 44px !important;
+  height: calc(var(--status-bar-rows, 2) * 22px) !important;
+  flex: 0 0 calc(var(--status-bar-rows, 2) * 22px) !important;
   background: transparent !important;
   border-top: 1px solid var(--border-default) !important;
   padding: 0 1ch !important;

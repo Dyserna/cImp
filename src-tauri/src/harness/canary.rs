@@ -3,7 +3,7 @@
 //! # What these assert, and why it is not "does it parse"
 //!
 //! Every reader pinned here is deliberately lenient. `parse_usage_line` ends
-//! each token lookup in `unwrap_or(0)`; `statusline/mod.rs` documents that "a
+//! each token lookup in `unwrap_or(0)`; `harness/claude/statusline.rs` documents that "a
 //! parse failure yields `Input::default()`" and walks the push payload as a raw
 //! `Value` where every field is an `Option`; `Tracker::handle` `match`es on the
 //! SSE event `type` and ignores everything it does not know. That leniency is

@@ -69,13 +69,19 @@
 </div>
 
 <style>
+  /* Height = one 22px row per stacked usage row the running harness's usage
+     source declares (V40 Phase D, locked decision 19). `--status-bar-rows` is
+     set by `UsageMeter` from `harness_usage`'s declared window count; the `2`
+     here is the fallback for every state in which nothing has declared one
+     yet — which is what the hard-coded 44px used to be, so the strip never
+     reflows on startup. */
   .status-bar {
     display: flex;
     flex-direction: row;
     align-items: center;
     justify-content: space-between;
-    height: 44px;
-    flex: 0 0 44px;
+    height: calc(var(--status-bar-rows, 2) * 22px);
+    flex: 0 0 calc(var(--status-bar-rows, 2) * 22px);
     background: var(--surface-sunken);
     border-top: 1px solid var(--border-subtle);
     padding: 0 var(--space-3);

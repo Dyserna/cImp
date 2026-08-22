@@ -272,10 +272,10 @@ pub(crate) fn build_pre_args(
         // both halves together for the same reason.
         let native_web = native_web_for(settings, "claude", tab);
         if super::settings::statusline_enabled(settings) {
-            if let Some(command) = crate::statusline::launch_command() {
+            if let Some(command) = super::statusline::launch_command() {
                 // `refreshInterval` (seconds) re-runs the command on a timer in
                 // addition to event-driven updates, so the `rate_limits` usage
-                // push (see `crate::usage`) keeps flowing — and the bottom-bar
+                // push (see [`super::usage`]) keeps flowing — and the bottom-bar
                 // widget stays fresh — while the tab sits idle. 30s beats the
                 // widget's 90s stale threshold with margin; the render itself
                 // is a local subprocess, so the cost is negligible.

@@ -19,7 +19,7 @@
 // reported" and leaves the rendering of that to the caller, which shows "—" /
 // a hollow track rather than a confident 0%.
 
-import type { UsageSnapshot } from '../ipc';
+import type { UsageReading } from '../ipc';
 
 /// Compact a token count the way the terminal status line does: `940`, `12k`,
 /// `200k`, `1.0M`. Null/non-finite in → `'?'` out, so a formatted figure never
@@ -37,11 +37,15 @@ export function humanizeTokens(n: number | null | undefined): string {
   return `${(n / 1_000_000).toFixed(1)}M`;
 }
 
-/// True when the snapshot carries at least one quota window. Either window is
-/// independently absent-able, and both are absent under API-key auth — the
-/// quota columns are then dropped rather than drawn as placeholders.
-export function hasQuotaData(snap: UsageSnapshot | null | undefined): boolean {
-  return !!(snap?.five_hour || snap?.seven_day);
+/// True when the reading carries at least one quota window.
+///
+/// The backend emits only the windows that HAVE a reading, so this is a length
+/// check rather than a per-window one — a window with nothing to report is
+/// absent from the list instead of present at 0. Under API-key auth the list is
+/// empty (no `rate_limits` in the push at all) and the quota columns are
+/// dropped rather than drawn as placeholders.
+export function hasQuotaData(reading: UsageReading | null | undefined): boolean {
+  return !!reading?.windows?.length;
 }
 
 /// A percentage clamped into the 0–100 a bar can render. Only ever called
@@ -67,6 +71,21 @@ export interface PushCapableTab {
   kind: string;
   id: string;
   command?: string;
+}
+
+/// The harness id whose usage source the widget polls, or `null` when no tab
+/// that can push one is running.
+///
+/// **Phase F replaces this whole block** (locked decision 19: `commandIsClaude`
+/// / `claudePushTabActive` become a registry `usage_push` capability, and the
+/// reserved-id list comes from `harness_list`). Until then the literals stay
+/// where the V40 ledger's section J already tracks them, rather than being
+/// spread to a second file.
+export function usagePushHarness(
+  tabs: readonly PushCapableTab[] | null | undefined,
+  enabledAiTabs: readonly string[] | null | undefined,
+): string | null {
+  return claudePushTabActive(tabs, enabledAiTabs) ? 'claude' : null;
 }
 
 /// Mirror of `tabs::config::command_is(command, "claude")`: match on the

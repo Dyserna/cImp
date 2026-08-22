@@ -5,8 +5,9 @@ import {
   commandIsClaude,
   hasQuotaData,
   humanizeTokens,
+  usagePushHarness,
 } from './contextMeter';
-import type { UsageSnapshot } from '../ipc';
+import type { UsageReading } from '../ipc';
 
 describe('humanizeTokens', () => {
   test('matches the terminal status line buckets', () => {
@@ -27,20 +28,30 @@ describe('humanizeTokens', () => {
 });
 
 describe('hasQuotaData', () => {
-  const w = { utilization: 0, resets_at: null };
+  // A window at a REPORTED zero: the backend emits only windows that have a
+  // reading, so its presence — not its number — is what makes quota drawable.
+  const w = {
+    id: 'five_hour',
+    label: 'current session',
+    short: '(5h)',
+    description: 'Rolling 5-hour session quota',
+    used: 0,
+    resets_at: null,
+  };
+  const base = { stale: false, quota_stale: false, context_stale: false };
 
-  test('either window independently counts', () => {
-    expect(hasQuotaData({ five_hour: w, seven_day: null })).toBe(true);
-    expect(hasQuotaData({ five_hour: null, seven_day: w })).toBe(true);
+  test('any reported window counts, even one at zero', () => {
+    expect(hasQuotaData({ ...base, windows: [w] })).toBe(true);
+    expect(hasQuotaData({ ...base, windows: [{ ...w, id: 'seven_day' }] })).toBe(true);
   });
 
   test('a context-only push carries no quota', () => {
-    const snap: UsageSnapshot = {
-      five_hour: null,
-      seven_day: null,
+    const reading: UsageReading = {
+      ...base,
+      windows: [],
       context: { used_percentage: 12.5 },
     };
-    expect(hasQuotaData(snap)).toBe(false);
+    expect(hasQuotaData(reading)).toBe(false);
     expect(hasQuotaData(null)).toBe(false);
   });
 });
@@ -93,5 +104,21 @@ describe('clampPct', () => {
     expect(clampPct(42.4)).toBe(42.4);
     expect(clampPct(150)).toBe(100);
     expect(clampPct(NaN)).toBe(0);
+  });
+});
+
+describe('usagePushHarness', () => {
+  const claude = { kind: 'ai_tool', id: 'claude', command: 'claude' };
+  const opencode = { kind: 'ai_tool', id: 'opencode', command: 'opencode' };
+
+  test('names the harness whose usage source the widget should poll', () => {
+    expect(usagePushHarness([claude], ['claude'])).toBe('claude');
+  });
+
+  test('is null when nothing running can push a reading', () => {
+    // OpenCode has NO usage source; the widget must not poll — and must never
+    // render a harness that cannot report quota as a harness at 0%.
+    expect(usagePushHarness([opencode], ['opencode'])).toBe(null);
+    expect(usagePushHarness([], [])).toBe(null);
   });
 });

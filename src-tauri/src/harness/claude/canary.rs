@@ -348,7 +348,7 @@ pub fn check_claude_statusline_stdin(payload: &str) -> Result<(), String> {
         "fixture guard: the fixture must carry a non-empty model.display_name, else this canary \
          cannot tell absent from empty"
     );
-    let bar = crate::statusline::render(payload);
+    let bar = crate::harness::claude::statusline::render(payload);
     substantive!(
         bar.contains(display),
         "claude.statusline.stdin: model.display_name no longer reaches the rendered bar (it fell \
@@ -703,7 +703,7 @@ mod tests {
              grew an alias and the positive canary can no longer detect this reshape."
         );
 
-        let bar = crate::statusline::render(&payload);
+        let bar = crate::harness::claude::statusline::render(&payload);
         assert!(
             !bar.contains("25k") && !bar.contains("200k"),
             "guard: this fixture models the drift case — the token pair must be gone from the bar, \

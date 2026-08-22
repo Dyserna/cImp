@@ -2469,7 +2469,7 @@ mod tests {
     /// Two cards for one event would be exactly the noise this phase removes,
     /// and the one that survives has to be the specific one: "the version
     /// moved, go re-run ten minutes of recipes" is the card that trained the
-    /// reflex, "`claude.statusline.stdin` broke, see statusline/mod.rs" is the
+    /// reflex, "`claude.statusline.stdin` broke, see harness/claude/statusline.rs" is the
     /// one worth reading.
     #[test]
     fn a_failed_auto_verify_replaces_the_tripwire_with_a_named_capability() {
@@ -2508,7 +2508,7 @@ mod tests {
         // The card must be actionable: the assertion that failed, and the file
         // that breaks.
         assert!(p.rationale.contains("context_window.used_percentage gone"));
-        assert!(p.rationale.contains("src-tauri/src/statusline/mod.rs"));
+        assert!(p.rationale.contains("src-tauri/src/harness/claude/statusline.rs"));
         assert!(p.rationale.contains("2.2.0"));
     }
 

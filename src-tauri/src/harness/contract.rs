@@ -1148,7 +1148,7 @@ const CORE_CAPABILITIES: &[Capability] = &[
     //     — attribution enrichment, not data. Losing every one of them leaves
     //     the push writing the same numbers; only the M14 multi-tab ownership
     //     of the shared context slot degrades to last-writer-wins, which
-    //     `usage::merge_push` handles by design (`unwrap_or_default()` on the
+    //     `harness::claude::usage::merge_push` handles by design (`unwrap_or_default()` on the
     //     key) rather than by breaking.
     //   * `extract_context`'s `session_name` / `agent.name` / `effort` /
     //     `thinking` / `fast_mode` — display chips. They cannot make a snapshot
@@ -1188,7 +1188,7 @@ const CORE_CAPABILITIES: &[Capability] = &[
             Dep::JsonPath("rate_limits.seven_day.used_percentage"),
             Dep::JsonPath("rate_limits.seven_day.resets_at"),
         ],
-        wired_in: &["src-tauri/src/harness/claude/statusline.rs", "src-tauri/src/statusline/mod.rs"],
+        wired_in: &["src-tauri/src/harness/claude/statusline.rs", "src-tauri/src/harness/claude/statusline.rs"],
         degradation: Degradation::Silent,
         drift_rule: &[],
         canary: Some("claude.statusline.stdin"),

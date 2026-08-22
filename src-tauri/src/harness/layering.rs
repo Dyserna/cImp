@@ -818,12 +818,15 @@ const UPWARD_EXEMPT: &[(&str, &str)] = &[
     // DECLARED fallback since Phase L (design D6) — was real but belongs where it
     // is enforced: the hello (`chp::EVENTS`) and the file's own module docs. An
     // import exemption is only ever about import direction.
-    (
-        "harness/claude/statusline.rs",
-        "The status-line payload IS the usage widget's only data source, and V35 Phase L did not \
-         change that: no hook input carries a context window or a rate-limit block, so \
-         `session.context` stays reserved with no producer (`chp::EVENTS`).",
-    ),
+    // `harness/claude/statusline.rs` was listed here because the status-line
+    // payload IS the usage widget's only data source and the widget lived in
+    // `crate::usage`, an L4 capability. V40 Phase D moved the widget's whole
+    // data path into this directory (`harness/claude/usage.rs`), so the file
+    // imports nothing above L2 and the exemption has nothing left to allow.
+    // The FACT it recorded is unchanged and still true — no hook input carries
+    // a context window or a rate-limit block, so `session.context` stays
+    // reserved with no producer (`chp::EVENTS`) — it is just no longer an
+    // import-direction question.
     (
         "harness/claude/canary.rs",
         "The L1 canaries assert the Tier-C readers still produce SUBSTANTIVE output, so they \
@@ -950,9 +953,12 @@ const IDENTITY_ALLOWLIST: &[(&str, &str)] = &[
          because those strings are in every settings file and every frontend payload; typing \
          them as `HarnessId` would mis-read a pre-split row. Phase A removed the per-harness \
          BRANCHES (`kind`, `is_builtin` are registry lookups now); the variants stay for the \
-         encodings. The `StateSignal::ClaudeOutput*` / `claude_output_active` names are a \
-         different residue — they are renamed to `HarnessOutput*` and become CHP events in \
-         Phase D (locked decisions 18 and 30).",
+         encodings. Phase D took the OTHER residue this row used to name: the signal \
+         vocabulary is `StateSignal::HarnessOutput*` / `SubagentsActiveChanged` now, \
+         served over CHP as well as emitted in-process, and the sub-agent stall \
+         backstop asks the tab's harness for its timing instead of holding one \
+         product's constant (locked decisions 18 and 30). What is left here really is \
+         only the persisted strings.",
     ),
     // ── the MCP consumer vocabulary ────────────────────────────────────────
     // ── the loopback wire ──────────────────────────────────────────────────
@@ -968,25 +974,19 @@ const IDENTITY_ALLOWLIST: &[(&str, &str)] = &[
     // payload it classifies. Core's router appends plugin routes after its own
     // arms and writes back a `HookReply` it does not read.
     // ── the per-harness surfaces later phases own ──────────────────────────
-    (
-        "graph/service.rs",
-        "SESSION IDENTITY (locked decision 20). `live_claude_sessions` filters `e.agent == \
-         \"claude\"` and the tab-binding ambiguity guard is keyed by it, because Claude keys \
-         live sessions by TAB id and OpenCode by SESSION id — one map with two key spaces. \
-         `live_sessions_for(HarnessId)` and a declared `session_key_space()` are what fix it. \
-         Phase A closed the one silent fallback here (`session_agent(..).unwrap_or(\"claude\")` \
-         now skips the provenance row rather than mis-stamping it). Phase D.",
-    ),
-    (
-        "offload/mcp.rs",
-        "`consumer() == \"claude\"` gates the session-push registration \
-         (`--dangerously-load-development-channels` and the child's `--channel-push`), which \
-         locked decision 25 turns into a declared `supports_session_push()` on the plugin — \
-         OpenCode has no MCP inbound path, and that is a fact about OpenCode, not about \
-         Claude. Phase A registry-resolved this child's `--consumer` (a typo now refuses the \
-         proxy start naming the registered ids) and made `delegate_targets` iterate the \
-         registry. Phase D (locked decisions 19 and 25).",
-    ),
+    // `graph/service.rs` left this list in V40 Phase D. Its reason was session
+    // identity (locked decision 20): `live_claude_sessions` filtered `e.agent ==
+    // "claude"`, and the registry was one map holding two key spaces because
+    // Claude keys live sessions by TAB id and OpenCode by SESSION id. Both are
+    // gone — `live_sessions_for(HarnessId)` takes the harness, `LiveKey` carries
+    // the declared `session_key_space()`, and the C-2 collision guard that stood
+    // between them is deleted because the collision is unrepresentable.
+    // `offload/mcp.rs` left this list in V40 Phase D. Its reason was
+    // `consumer() == "claude"` gating the session-push registration
+    // (`--dangerously-load-development-channels` and the child's
+    // `--channel-push`); locked decision 25 makes it a declared
+    // `supports_session_push()` on the plugin, because "has an inbound MCP path"
+    // is a fact about a harness and not about the one that happens to have one.
     // `tabs/config.rs` left this list in V40 Phase C. Its ONE residual was
     // `claude_harness()`, the permission-hook cwd fallback's harness — a Claude
     // mechanism, because only Claude's hook payload has the cwd gap it exists

@@ -9,7 +9,8 @@
 //! | [`hook`] | harness ▸ cImp | the `type: "http"` hook payloads the harness POSTs back, the emitted hook entry that points at them, **and the routes and handlers that receive them** (V40 Phase C) |
 //! | [`prompts`] | harness ▸ cImp | this TUI's prompt grammar — the substrings the neutral `PermissionDetector` matches on, and the reasoning behind each |
 //! | [`read`] | harness ▸ cImp | the LEGACY fallback reader — the transcript JSONL tail (Tier C, retired from the hot path by Phase L) |
-//! | [`statusline`] | harness ▸ cImp | the Claude-shaped stdin payload `cimp --statusline` is handed (Tier C, same) |
+//! | [`statusline`] | both | the `cimp --statusline` subcommand: the injected `statusLine.command`, the rendered bar, and the Claude-shaped stdin payload it is handed (Tier C, same) |
+//! | [`usage`] | harness ▸ cImp | the status-line push file and the [`crate::harness::plugin::UsageSource`] core reads quota, context and token categories through |
 //!
 //! What this harness serves is declared in [`overlay::claude_hello`] and, per
 //! capability, in [`crate::harness::contract::capabilities`]. Adding a harness
@@ -25,6 +26,7 @@ pub mod read;
 pub mod settings;
 pub mod statusline;
 pub mod tools;
+pub mod usage;
 
 pub mod plugin;
 

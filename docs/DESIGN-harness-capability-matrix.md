@@ -114,7 +114,7 @@ surface as of `develop`:
 | `claude.transcript.tool_result` | **C** | `type=="user"`, `tool_result`, `tool_use_id`, `is_error` | `oob/claude.rs` | Silent |
 | `claude.transcript.identity` | **C** | `sessionId`, `version`, `isSidechain`, `isMeta` | `oob/claude.rs` | Silent |
 | `claude.transcript.subagents` | **C** | `subagents/*.jsonl` layout (survived the Task→Agent rename once) | `oob/claude.rs::SubagentFile` | Silent |
-| `claude.statusline.stdin` | **C** | `model.*`, `context_window.*`, `rate_limits` | `statusline/mod.rs` | Silent (blank widget) |
+| `claude.statusline.stdin` | **C** | `model.*`, `context_window.*`, `rate_limits` | `harness/claude/statusline.rs` | Silent (blank widget) |
 | `claude.flag.settings_overlay` | B | `--settings` accepts `hooks`, `statusLine`, `permissions` | `tabs/config.rs`, `settings/injection.rs` | Silent (**no test today**) |
 | `claude.flag.session_id` | B | `--session-id` still exists | `tabs/config.rs` | VisibleOff |
 | `opencode.sse.events` | **C** | `message.updated`, `message.part.{updated,delta}`, `session.{created,idle}`, `properties.{sessionID,messageID,partID}` | `oob/opencode.rs` | Silent |

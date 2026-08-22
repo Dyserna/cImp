@@ -5189,11 +5189,11 @@ pub struct UsageSettings {
     // write. No migration, no schema-version bump — same treatment as
     // `detection_update_classifier_mode` above.
     //
-    // Only the widget went: `usage::extract_push`, the `context_window` slot
-    // in the push file, `get_claude_usage`'s wire shape and the terminal
+    // Only the widget went: the statusline extractor, the `context_window` slot
+    // in the push file, `harness_usage`'s wire shape and the terminal
     // status line all still carry and render the context reading.
     /// How often the frontend re-reads the status-line usage push (a local
-    /// file — see `crate::usage`), in seconds. The UI clamps this to a sane
+    /// file — see `harness::claude::usage`), in seconds. The UI clamps this to a sane
     /// minimum as busy-poll hygiene.
     pub poll_interval_secs: u32,
 }

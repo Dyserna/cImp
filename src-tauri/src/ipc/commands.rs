@@ -1024,7 +1024,7 @@ pub async fn tts_speak_selection(
 pub async fn tts_stop(state: State<'_, AppState>) -> AppResult<()> {
     state.speak_session.store(0, Ordering::SeqCst);
     // Suppress the rest of the current AI-output burst's tagged segments
-    // (those still queued or yet to arrive) until the next `ClaudeOutputStarted`
+    // (those still queued or yet to arrive) until the next `HarnessOutputStarted`
     // clears the flag. Notifications and selection reads are unaffected — they
     // ride other request variants the worker doesn't gate on this flag.
     state.ai_tts_suppressed.store(true, Ordering::SeqCst);
@@ -1097,14 +1097,98 @@ pub async fn stt_list_input_devices() -> AppResult<Vec<String>> {
     crate::stt::list_input_devices()
 }
 
-/// Read the current Claude Code usage snapshot (session 5h + weekly 7d) for
-/// the bottom-bar usage tracker: a local read of the status-line push file
-/// (see `crate::usage`) — no network. `snapshot` is `None` when no Claude tab
-/// has pushed data (or the last push expired) — the frontend hides the widget
-/// in that case. Polled by the frontend on `usage.poll_interval_secs`.
+/// **One harness's usage reading** for the bottom-bar tracker (V40 Phase D,
+/// locked decision 19). Local read, never the network.
+///
+/// This was `get_claude_usage`, a command named after a harness that answered
+/// a payload with `five_hour` / `seven_day` fields in it. It now takes the
+/// harness and answers three distinguishable states, which is the whole point:
+///
+/// * `source: None` — **this harness has no usage source at all.** OpenCode.
+///   A UI must render that as absence; rendering it as a harness at 0% would be
+///   a number nobody reported (global principle 5).
+/// * `source: Some(..), reading: None` — it has one, and nothing has been
+///   reported yet (no tab of that harness has pushed, or the last push aged
+///   out).
+/// * `source: Some(..), reading: Some(..)` — the declared windows that have a
+///   reading, in declared order, plus the live context block.
+///
+/// An unregistered harness id is an error, not an empty reading: a widget
+/// polling for a harness that does not exist is a bug, and answering it with
+/// "nothing to show" would hide it forever.
 #[tauri::command]
-pub async fn get_claude_usage() -> AppResult<crate::usage::UsageResult> {
-    Ok(crate::usage::pushed_usage())
+pub async fn harness_usage(harness: String) -> AppResult<HarnessUsage> {
+    let id = crate::harness::HarnessId::from_id(&harness).ok_or_else(|| {
+        crate::error::AppError::Ipc(format!(
+            "unknown harness `{harness}` — registered: {}",
+            crate::harness::registry::harness_ids().join(", ")
+        ))
+    })?;
+    let source = id.plugin().and_then(|p| p.usage_source());
+    Ok(HarnessUsage {
+        source: source.map(|s| UsageSourceInfo {
+            windows: s
+                .windows()
+                .iter()
+                .map(|w| DeclaredWindow {
+                    id: w.id,
+                    label: w.label,
+                    short: w.short,
+                    description: w.description,
+                })
+                .collect(),
+            token_kinds: s
+                .token_kinds()
+                .iter()
+                .map(|k| DeclaredLabel { id: k.id, label: k.label })
+                .collect(),
+            origins: s
+                .origins()
+                .iter()
+                .map(|o| DeclaredLabel { id: o.id, label: o.label })
+                .collect(),
+        }),
+        reading: source.and_then(|s| s.read()),
+    })
+}
+
+/// The answer [`harness_usage`] gives. See its docs for the three states.
+#[derive(serde::Serialize)]
+pub struct HarnessUsage {
+    /// What this harness's usage source *can* report — `None` when it has none.
+    pub source: Option<UsageSourceInfo>,
+    /// What it reports right now.
+    pub reading: Option<crate::harness::plugin::UsageReading>,
+}
+
+/// The declared shape of a usage source: which windows it can report, which
+/// token categories it bills under, which lanes a turn can belong to.
+///
+/// Sent alongside the reading rather than mirrored in the frontend, so a
+/// harness with three quota windows (or one, or none) needs no UI change —
+/// locked decision 19.
+#[derive(serde::Serialize)]
+pub struct UsageSourceInfo {
+    pub windows: Vec<DeclaredWindow>,
+    pub token_kinds: Vec<DeclaredLabel>,
+    pub origins: Vec<DeclaredLabel>,
+}
+
+/// One declared quota window, without a reading.
+#[derive(serde::Serialize)]
+pub struct DeclaredWindow {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub short: &'static str,
+    pub description: &'static str,
+}
+
+/// A declared id with the label a UI renders for it (token categories, turn
+/// origins).
+#[derive(serde::Serialize)]
+pub struct DeclaredLabel {
+    pub id: &'static str,
+    pub label: &'static str,
 }
 
 /// Sample the system-monitor stats (CPU / memory / GPU / network) for the
@@ -3082,19 +3166,19 @@ fn count_hideable_tool_calls(
 /// map, so a second harness gets a real `drift.version.v1` path for the first
 /// time.
 ///
-/// The SESSION half is not, yet, and this is where that is recorded rather than
-/// hidden: `sessions` / `tokenless_sessions` / `subagent_drift` come from
-/// queries that still filter one agent literal in `graph/service.rs` (locked
-/// decision 20, Phase D). They are attributed to the DEFAULT harness — which is
-/// exactly what they measured before — and every other harness gets zeros, so
-/// its `drift.usage_fields_gone.v1` never trips its sample floor. A rule that
-/// cannot see a harness's sessions must not fire ABOUT them; zero counts are the
-/// honest input for that, and the day the query takes a `HarnessId` this
-/// function is where it lands.
+/// **The SESSION half is per harness too since V40 Phase D** (locked decision
+/// 20). It used to be filled for the default harness only, with zeros for every
+/// other, because the queries behind it had one agent literal inside them —
+/// `drift.usage_fields_gone.v1` therefore never tripped its sample floor for a
+/// second harness, and a rule that cannot fire looks exactly like a rule that
+/// found nothing. `sessions` / `tokenless_sessions` now come from
+/// `GraphIndex::tokenless_sessions(agent)` run once per registered harness, and
+/// `subagent_drift` from the Activity rows each plugin declares it files
+/// (`drift_report_tools`). A harness whose reader files no drift reports gets an
+/// empty list — the truth, rather than a zero-fill that looks like one.
 fn harness_drift_signals(
-    default_sessions: u64,
-    default_tokenless: u64,
-    default_subagent_drift: Vec<String>,
+    sessions: &std::collections::BTreeMap<crate::harness::HarnessId, (u64, u64)>,
+    subagent_drift: &std::collections::BTreeMap<crate::harness::HarnessId, Vec<String>>,
 ) -> crate::advisor::HarnessDriftSignals {
     let map = crate::settings::read_global_harness_map();
     crate::harness::registry::all()
@@ -3103,20 +3187,16 @@ fn harness_drift_signals(
                 .get(id.token())
                 .cloned()
                 .unwrap_or_else(|| crate::settings::read_global_harness_settings(id));
-            let is_default = id == crate::harness::DEFAULT_HARNESS;
+            let (sessions, tokenless_sessions) = sessions.get(&id).copied().unwrap_or((0, 0));
             (
                 id,
                 crate::advisor::DriftSignals {
                     last_seen: row.last_seen,
                     last_verified: row.last_verified,
                     auto_verify: row.auto_verify,
-                    sessions: if is_default { default_sessions } else { 0 },
-                    tokenless_sessions: if is_default { default_tokenless } else { 0 },
-                    subagent_drift: if is_default {
-                        default_subagent_drift.clone()
-                    } else {
-                        Vec::new()
-                    },
+                    sessions,
+                    tokenless_sessions,
+                    subagent_drift: subagent_drift.get(&id).cloned().unwrap_or_default(),
                 },
             )
         })
@@ -3176,8 +3256,7 @@ fn advisor_snapshot_blocking(
     // count `advisor_reread_rate` just scanned for — reuse its sample count
     // instead of a second identical Datalog scan.
     let remind_count = advisor_reread_samples;
-    let (large_reread_pairs, claude_sessions, claude_tokenless_sessions) =
-        graph.drift_db_signals(&root);
+    let (large_reread_pairs, sessions_by_harness) = graph.drift_db_signals(&root);
     // One clone of the activity ring serves both the bypass-rate signal and
     // the contract-drift filter.
     let activity = crate::activity::snapshot();
@@ -3191,14 +3270,28 @@ fn advisor_snapshot_blocking(
         .filter(|e| e.source == "harness" && e.tool == "contract_drift" && e.ts_ms >= since)
         .map(|e| e.target.clone())
         .collect();
-    // V17.1: sub-agent transcript-contract drift reports from the Claude OOB
-    // tap (see `oob::claude::report_subagent_drift`) — same channel
-    // discipline as the shims' contract_drift events above.
-    let subagent_drift: Vec<String> = activity
-        .iter()
-        .filter(|e| e.source == "harness" && e.tool == "subagent_drift" && e.ts_ms >= since)
-        .map(|e| e.target.clone())
-        .collect();
+    // V17.1: sub-agent transcript-contract drift reports filed by a harness's
+    // own reader — same channel discipline as the `contract_drift` events
+    // above. V40 Phase D: attributed to the harness that files them, which each
+    // plugin declares (`drift_report_tools`), because the rule that reads them
+    // runs per harness. A harness whose reader files none has an empty list —
+    // which is the truth, not a zero-fill.
+    let subagent_drift_by_harness: std::collections::BTreeMap<crate::harness::HarnessId, Vec<String>> =
+        crate::harness::registry::all()
+            .map(|h| {
+                let tools = h.plugin().map(|p| p.drift_report_tools()).unwrap_or(&[]);
+                let rows = activity
+                    .iter()
+                    .filter(|e| {
+                        e.source == "harness"
+                            && e.ts_ms >= since
+                            && tools.contains(&e.tool.as_str())
+                    })
+                    .map(|e| e.target.clone())
+                    .collect();
+                (h, rows)
+            })
+            .collect();
 
     // V17 Phase E signals: RECENT calls to any lean-hidden tool in the Activity
     // ring (zero ⇒ the lean-surface rule may fire) and the measured advertised
@@ -3291,7 +3384,7 @@ fn advisor_snapshot_blocking(
         // saying the reader still took the DEFAULT harness's row because every
         // V16 rule was written around Claude's payload shapes. The rules are
         // per-harness now, so this is the whole map.
-        harness: harness_drift_signals(claude_sessions, claude_tokenless_sessions, subagent_drift),
+        harness: harness_drift_signals(&sessions_by_harness, &subagent_drift_by_harness),
         remind_count,
         large_reread_pairs,
         contract_drift,

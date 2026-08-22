@@ -772,7 +772,7 @@ pub enum StateSignal {
     /// one or more agents and none had been running; `active: false` when the
     /// last outstanding agent's result lands. Holds the avatar in Thinking
     /// while agents run so a marker blink between agent batches can't settle it
-    /// to Idle. Emitted by `oob::claude`, which tails the transcript JSONL.
+    /// to Idle. Emitted by `harness::claude::read`, which tails the transcript JSONL.
     SubagentsActiveChanged {
         tab: TabId,
         active: bool,

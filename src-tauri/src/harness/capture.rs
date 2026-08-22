@@ -189,7 +189,7 @@ pub fn captures_root() -> Option<PathBuf> {
 /// `LOCALAPPDATA` and not `APPDATA` on purpose — the roaming profile is
 /// replicated between machines by domain policy, and a corpus derived from one
 /// machine's sessions has no business travelling. Env vars rather than a new
-/// `dirs` dependency, matching `oob::claude::home_dir`'s existing convention;
+/// `dirs` dependency, matching `harness::claude::read::home_dir`'s existing convention;
 /// this also has to work from the `--harness-capture` early dispatch, where
 /// there is no Tauri `AppHandle` to ask.
 fn app_data_root() -> Option<PathBuf> {

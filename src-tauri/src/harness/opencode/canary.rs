@@ -118,7 +118,7 @@ pub async fn check_opencode_sse_events(raw: &str) -> Result<(), String> {
 }
 
 /// A tap context wired to the built-in OpenCode tab, so the per-tab TTS gate is
-/// satisfied and `ctx.speak` actually delivers. Mirrors `oob::opencode`'s own
+/// satisfied and `ctx.speak` actually delivers. Mirrors `harness::opencode::read`'s own
 /// `ctx_with`; kept local rather than hoisted so this module can be read (and
 /// moved, in Phase K) on its own.
 fn opencode_ctx() -> (

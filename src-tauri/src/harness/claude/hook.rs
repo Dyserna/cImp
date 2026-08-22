@@ -545,7 +545,7 @@ pub struct HookInput {
     /// `transcript_path`, `cwd`, `permission_mode` and `hook_event_name` are the
     /// common set — so this is read opportunistically and left empty when
     /// absent. cImp learns Claude's version from the transcript's own top-level
-    /// `version` instead (`oob::claude::cli_version_of`), and the CHP
+    /// `version` instead (`harness::claude::read::cli_version_of`), and the CHP
     /// `harness_version` staleness arm therefore still has no Claude producer.
     /// See `docs/CHP.md` § 6.2.
     #[serde(default)]

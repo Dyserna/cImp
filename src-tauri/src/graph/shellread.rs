@@ -3,7 +3,7 @@
 //! [`whole_file_read`] returns `Some(path)` only when a shell command is
 //! *provably* a pure, whole-file read of exactly one file — the shell
 //! equivalent of a `Read({file_path})` with no offset/limit. It lets the read
-//! advisor's `PreToolUse` **Bash** hook (`harness::claude_hook`) intercept a
+//! advisor's `PreToolUse` **Bash** hook (`harness::claude::hook`) intercept a
 //! `cat`/`Get-Content` of an already-read file the same way it intercepts a
 //! `Read`, and lets the bypass canary (`GraphService::check_bypass`) skip a
 //! command the advisor already accounted for.

@@ -71,7 +71,7 @@
 //! Phase K moves the whole surface in here and locks the shape with tests
 //! ([`layering`]). Until it, "harness knowledge" was spread across nine
 //! locations, none named for it — `oob/{claude,opencode,mod}.rs`,
-//! `statusline/mod.rs`, `tabs/config.rs`, `offload/toolclass.rs` — so the
+//! `harness/claude/statusline.rs`, `tabs/config.rs`, `offload/toolclass.rs` — so the
 //! layering existed only in a design document, which is the state in which a
 //! layering rots. It is now a directory a contributor can be pointed at, with
 //! one sub-directory per harness ([`claude`], [`opencode`]) and a

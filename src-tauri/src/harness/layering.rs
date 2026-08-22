@@ -552,13 +552,6 @@ fn every_registry_entry_is_fully_wired() {
          and its health panel are all checked"
     );
 
-    // The `MAINTENANCE.md` drift table — read as a document, so "the doc has
-    // rows for this harness" is checked against the file rather than a copy.
-    let maintenance = std::fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/MAINTENANCE.md"),
-    )
-    .expect("docs/MAINTENANCE.md is readable");
-
     for d in crate::harness::registry::HARNESSES {
         let dir = d.id;
         let harness = d.harness();
@@ -711,12 +704,31 @@ fn every_registry_entry_is_fully_wired() {
              cannot see is what that panel exists to end"
         );
 
-        // 7. The `MAINTENANCE.md` drift table names its rows.
+        // 7. The plugin's own `README.md` names its rows.
+        //
+        //    V40 Phase G moved the drift table out of `docs/MAINTENANCE.md` and
+        //    into one README per harness (locked decisions 12 and 28), so the
+        //    human twin of these rows ships in the same directory as the code
+        //    they describe — a new harness brings its own and cannot borrow
+        //    another's. `contract::tests::matrix_matches_maintenance_doc` checks
+        //    the same pairing in both directions and by SECTION; this is the
+        //    cheap "the file exists and mentions the row" half that belongs to
+        //    the fully-wired check.
+        let readme_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/harness")
+            .join(dir)
+            .join("README.md");
+        let readme = std::fs::read_to_string(&readme_path).unwrap_or_else(|e| {
+            panic!(
+                "{dir}: no harness/{dir}/README.md ({e}) — every registered \
+                 harness carries the human twin of its rows beside its code"
+            )
+        });
         for id in &rows {
             assert!(
-                maintenance.contains(id),
-                "{dir}: capability `{id}` has no row in docs/MAINTENANCE.md — the human twin of \
-                 the registry has to be editable in the same commit"
+                readme.contains(id),
+                "{dir}: capability `{id}` has no row in harness/{dir}/README.md — the \
+                 human twin of the registry has to be editable in the same commit"
             );
         }
 

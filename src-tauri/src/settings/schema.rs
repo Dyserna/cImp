@@ -820,8 +820,8 @@ fn object_entries(v: Option<&serde_json::Value>, what: &str) -> Vec<(String, ser
 
 /// V16 Feature 0 (contract spikes): the recorded outcomes of the two V11
 /// `TODO(spike)` contracts — the questions no payload reveals and no fixture
-/// can settle, answered by a human running the recipe in `docs/MAINTENANCE.md`
-/// -> "Claude Code / OpenCode CLIs". Plain strings so a hand edit in
+/// can settle, answered by a human running the recipe in the owning harness's
+/// `harness/<id>/README.md` -> "Open spikes". Plain strings so a hand edit in
 /// `settings.json` is always possible.
 ///
 /// **V40 Phase B emptied the version half of this struct.** The five fields

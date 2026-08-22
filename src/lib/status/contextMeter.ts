@@ -59,7 +59,7 @@ export function hasQuotaData(reading: UsageReading | null | undefined): boolean 
 /// with a reported value; absence is handled by the caller (hollow track).
 /// The percentage *text* is clamped through this too, so a payload reporting
 /// 143% can't print a number the bar beside it contradicts (the terminal
-/// renderer clamps the same way — `statusline/mod.rs`).
+/// renderer clamps the same way — `harness/claude/statusline.rs`).
 export function clampPct(p: number): number {
   if (!Number.isFinite(p)) return 0;
   return Math.min(100, Math.max(0, p));

@@ -1,11 +1,14 @@
 //! V35 Phase A — the machine-readable harness capability registry.
 //!
 //! One source of truth for everything cImp depends on from a harness it does
-//! not control, replacing the prose table in `docs/MAINTENANCE.md` §
-//! *Claude Code / OpenCode CLIs* as the **authority**. The prose table stays
-//! (it carries the human "how to check" narrative) but is now
-//! generated-checked against this list by
-//! [`tests::matrix_matches_maintenance_doc`], so the two can no longer drift.
+//! not control, and the **authority** over the prose that describes it. Since
+//! V40 Phase G that prose lives with the harness: each registered harness's
+//! rows are its own `harness/<id>/README.md` § *Drift watch*, and only the
+//! harness-NEUTRAL rows stay in `docs/MAINTENANCE.md`. The prose carries the
+//! human "how to check" narrative and is checked against this list, in both
+//! directions and per owner, by [`tests::matrix_matches_maintenance_doc`] — so
+//! a row cannot drift from the registry, name a retired id, or cover two
+//! harnesses at once.
 //!
 //! # Rank by seam, not by feature
 //!
@@ -1099,7 +1102,7 @@ const CORE_CAPABILITIES: &[Capability] = &[
         waiver: Some(
             "No L1 fixture canary (Phase B covered the four readers with a *function* to drive; \
              these four fields have no single reader). The V35 Phase D LIVE probe covers it \
-             instead, reading `sessionId` through `oob::claude::record_names_session` and \
+             instead, reading `sessionId` through `harness::claude::read::record_names_session` and \
              `version` through `cli_version_of` on a real transcript tail. Deliberately NOT \
              linked to `drift.harness_version.v1`: that rule is *fed* by `version`, so losing the \
              field silences the tripwire instead of firing it — the inverse of a lagging \
@@ -1575,7 +1578,7 @@ const CORE_CAPABILITIES: &[Capability] = &[
         canary: None,
         probe: None,
         waiver: Some(
-            "No fixture and no automatable probe: proving a worker completes needs a REAL turn on              a real TUI, which is the same class as the E1/D0 spikes. Covered meanwhile by (a)              the fail-closed gate itself — preflight refuses a tab with no completion signal and              no input profile rather than typing into it, (b) the recorded spike outcome in              `harness_versions.input_profile_status`, which this row's gate reads, and (c) V39              live-verify recipes 1, 2 and 10. Owner: whoever closes V39 Phase D.",
+            "No fixture and no automatable probe: proving a worker completes needs a REAL turn on              a real TUI, which is the same class as the E1/D0 spikes. Covered meanwhile by (a)              the fail-closed gate itself — preflight refuses a tab with no completion signal and              no input profile rather than typing into it, (b) the recorded spike outcome in              `Settings.harness[<id>].input_profile_status`, which this row's gate reads, and (c) V39              live-verify recipes 1, 2 and 10. Owner: whoever closes V39 Phase D.",
         ),
         controls: &[],
         drift_token: None,
@@ -1751,7 +1754,7 @@ pub fn gate(id: &str, settings: &Settings) -> Gate {
 ///
 /// V40 Phase B, amendment 0-f. `delegation.worker` reads a recorded spike
 /// outcome that used to be ONE scalar for every harness
-/// (`harness_versions.input_profile_status`), which was two defects wearing one
+/// (`Settings.harness[<id>].input_profile_status`), which was two defects wearing one
 /// field: a `"fail"` recorded against one TUI removed every `delegate_task_*`
 /// tool and refused delegation for every harness, and a `"pass"` recorded
 /// against Claude silently vouched for a harness nobody had ever typed into.
@@ -1952,19 +1955,50 @@ mod tests {
     use std::collections::BTreeSet;
     use std::path::Path;
 
-    /// The prose drift table, embedded at compile time so it cannot drift from
-    /// the registry silently — same two-sources-of-truth pattern as
-    /// `checks/mod.rs`'s `TS_TYPES` and `graph/memory.rs`. Path is relative to
-    /// this file (`src-tauri/src/harness/`), up to the repo root.
-    const MAINTENANCE_MD: &str = include_str!("../../../docs/MAINTENANCE.md");
+    /// **Where a capability's prose row lives** — one document per owner.
+    ///
+    /// V40 Phase G split the single `docs/MAINTENANCE.md` drift table three
+    /// ways, because a row about Claude Code is not maintenance advice about
+    /// cImp: a registered harness's rows are `harness/<id>/README.md`, and only
+    /// the harness-NEUTRAL rows ([`Harness::ANY`], today `delegation.worker`)
+    /// stay in `MAINTENANCE.md`. Read at runtime rather than `include_str!`d,
+    /// because the path is derived from the registry — adding a harness must
+    /// widen this check by adding a directory, not by editing a literal here.
+    fn drift_doc_for(h: Harness) -> (String, String) {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let rel = match h.id() {
+            Some(id) => format!("src/harness/{id}/README.md"),
+            None => "../docs/MAINTENANCE.md".to_string(),
+        };
+        let text = std::fs::read_to_string(root.join(&rel)).unwrap_or_else(|e| {
+            panic!(
+                "{rel} is the drift-row document for harness `{}` and could not be \
+                 read: {e}. Every registered harness owns one (locked decision 12); \
+                 a new descriptor needs the README beside it.",
+                h.token()
+            )
+        });
+        (rel, text)
+    }
 
-    /// The heading that opens the drift-table section. The section runs to the
-    /// next `## ` (h2) heading.
-    const SECTION_HEADING: &str = "### Claude Code / OpenCode CLIs";
+    /// The heading that opens the drift-table section in each of those
+    /// documents. The section runs to the next `## ` (h2) heading; in a plugin
+    /// README the table IS an h2, so the scan starts after the heading line.
+    const PLUGIN_SECTION_HEADING: &str = "## Drift watch — capability rows";
+    const NEUTRAL_SECTION_HEADING: &str = "### Registered harness CLIs";
 
-    /// Prefixes a capability id can start with. Used to tell registry ids apart
+    /// Prefixes a capability id can start with, used to tell registry ids apart
     /// from the many other backticked tokens in the same table cells.
-    const ID_PREFIXES: [&str; 4] = ["claude.", "opencode.", "perm.", "delegation."];
+    ///
+    /// **Derived from the registry itself** rather than hand-kept: every id's
+    /// own namespace is a prefix, so a harness added later widens the scan by
+    /// that fact alone and a neutral namespace (`perm.`, `delegation.`) needs
+    /// no edit here either.
+    fn id_prefixes() -> BTreeSet<String> {
+        capabilities()
+            .map(|c| format!("{}.", c.id.split('.').next().unwrap_or(c.id)))
+            .collect()
+    }
 
     /// Every backtick-delimited token in `line`. Scans for pairs, so an unmatched
     /// trailing backtick yields nothing rather than swallowing the rest.
@@ -1987,19 +2021,22 @@ mod tests {
     /// known prefixes and is made only of `[a-z0-9_.]`. That rejects the other
     /// backticked prose in the same cells (`opencode --version`,
     /// `.opencode/plugin`, `harness/opencode/read.rs:692`, `drift.payload.v1`, …).
-    fn looks_like_id(tok: &str) -> bool {
-        ID_PREFIXES.iter().any(|p| tok.starts_with(p))
+    fn looks_like_id(prefixes: &BTreeSet<String>, tok: &str) -> bool {
+        prefixes.iter().any(|p| tok.starts_with(p.as_str()))
             && tok
                 .bytes()
                 .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'.')
     }
 
-    /// The `| … |` rows of the drift table, sliced out of `MAINTENANCE.md`.
-    fn drift_table_rows() -> Vec<&'static str> {
-        let start = MAINTENANCE_MD
-            .find(SECTION_HEADING)
-            .unwrap_or_else(|| panic!("MAINTENANCE.md no longer has a `{SECTION_HEADING}` section"));
-        let body = &MAINTENANCE_MD[start + SECTION_HEADING.len()..];
+    /// The `| … |` rows of one document's drift table.
+    ///
+    /// The section runs from `heading` to the next `## ` (h2), so the plugin
+    /// READMEs' own h2 heading is skipped past before the scan starts.
+    fn drift_table_rows(doc: &str, path: &str, heading: &str) -> Vec<String> {
+        let start = doc
+            .find(heading)
+            .unwrap_or_else(|| panic!("{path} no longer has a `{heading}` section"));
+        let body = &doc[start + heading.len()..];
         let end = body
             .lines()
             .scan(0usize, |off, l| {
@@ -2013,51 +2050,91 @@ mod tests {
         body[..end]
             .lines()
             .filter(|l| l.starts_with('|'))
+            .map(str::to_string)
             .collect()
     }
 
     /// Both sources of truth for the harness dependency surface must name the
-    /// same capabilities. The registry is the authority; the `MAINTENANCE.md`
-    /// drift table carries the human narrative and now leads each row with the
-    /// ids it describes. Prose can no longer drift from code in either
-    /// direction: a new registry row with no doc row fails here, and a doc row
-    /// naming a retired id fails here too.
+    /// same capabilities, **and each row must live with its owner**.
+    ///
+    /// The registry is the authority; the prose carries the human narrative and
+    /// leads each row with the ids it describes. V40 Phase G made "with its
+    /// owner" part of the contract: a Claude row belongs in
+    /// `harness/claude/README.md`, an OpenCode row in
+    /// `harness/opencode/README.md`, and only a [`Harness::ANY`] row stays in
+    /// `docs/MAINTENANCE.md`. Three consequences, each a failure here:
+    ///
+    /// * a new registry row with no doc row anywhere — the old check;
+    /// * a doc row naming a retired id — also the old check;
+    /// * **a row covering two harnesses at once** — new. The single
+    ///   `claude.input.profile, opencode.input.profile` row V39 wrote could not
+    ///   be split between two READMEs, so it was split into two rows. A future
+    ///   combined row lands in one harness's README naming another harness's
+    ///   id, and fails as "named by a doc row but not owned by that document".
     #[test]
     fn matrix_matches_maintenance_doc() {
-        let registry: BTreeSet<&str> = capabilities().map(|c| c.id).collect();
+        let all: BTreeSet<&str> = capabilities().map(|c| c.id).collect();
         assert_eq!(
-            registry.len(),
+            all.len(),
             capabilities().count(),
             "duplicate capability id in the registry — ids are the join key and must be unique"
         );
+        let prefixes = id_prefixes();
 
-        let mut doc: BTreeSet<&str> = BTreeSet::new();
-        let mut doc_count = 0usize;
-        for row in drift_table_rows() {
-            for tok in backticked(row) {
-                if looks_like_id(tok) {
-                    doc_count += 1;
-                    doc.insert(tok);
+        // Every owner that has at least one row, plus every registered harness,
+        // so a harness whose README lost its table fails rather than passing by
+        // having nothing to compare.
+        let mut owners: BTreeSet<Harness> = capabilities().map(|c| c.harness).collect();
+        owners.extend(crate::harness::registry::HARNESSES.iter().map(|d| d.id));
+
+        for owner in owners {
+            let expected: BTreeSet<&str> = capabilities()
+                .filter(|c| c.harness == owner)
+                .map(|c| c.id)
+                .collect();
+            let (path, doc) = drift_doc_for(owner);
+            let heading = if owner.id().is_some() {
+                PLUGIN_SECTION_HEADING
+            } else {
+                NEUTRAL_SECTION_HEADING
+            };
+            let mut found: BTreeSet<&str> = BTreeSet::new();
+            let mut count = 0usize;
+            let rows = drift_table_rows(&doc, &path, heading);
+            for row in &rows {
+                for tok in backticked(row) {
+                    if looks_like_id(&prefixes, tok) {
+                        count += 1;
+                        // Borrow the registry's `'static` spelling so the sets
+                        // compare by id rather than by row-local slice.
+                        if let Some(id) = all.iter().find(|id| **id == tok) {
+                            found.insert(id);
+                        } else {
+                            found.insert(Box::leak(tok.to_string().into_boxed_str()));
+                        }
+                    }
                 }
             }
-        }
-        assert_eq!(
-            doc.len(),
-            doc_count,
-            "a capability id appears in more than one MAINTENANCE.md drift-table row; each id \
-             must live in exactly one row"
-        );
+            assert_eq!(
+                found.len(),
+                count,
+                "{path}: a capability id appears in more than one drift-table row; \
+                 each id must live in exactly one row"
+            );
 
-        let missing: Vec<&str> = registry.difference(&doc).copied().collect();
-        let extra: Vec<&str> = doc.difference(&registry).copied().collect();
-        assert!(
-            missing.is_empty() && extra.is_empty(),
-            "harness capability registry and the MAINTENANCE.md drift table disagree.\n  \
-             in the registry but no drift-table row claims them: {missing:?}\n  \
-             named by a drift-table row but not in the registry: {extra:?}\n\
-             Fix by editing BOTH sides in the same commit (docs/MAINTENANCE.md \
-             § 'Claude Code / OpenCode CLIs', leading 'Capability id(s)' column)."
-        );
+            let missing: Vec<&str> = expected.difference(&found).copied().collect();
+            let extra: Vec<&str> = found.difference(&expected).copied().collect();
+            assert!(
+                missing.is_empty() && extra.is_empty(),
+                "the capability registry and {path} — `{heading}` disagree about \
+                 harness `{}`.\n  owned by this harness but no row in {path} claims \
+                 them: {missing:?}\n  named by a row in {path} but not owned by it \
+                 (retired id, or a row covering another harness — split it): \
+                 {extra:?}\nFix by editing BOTH sides in the same commit; the leading \
+                 column is 'Capability id(s)'.",
+                owner.token()
+            );
+        }
     }
 
     /// A `Silent` capability with no canary, no live probe and no explicit

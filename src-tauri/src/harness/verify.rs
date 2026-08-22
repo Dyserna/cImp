@@ -203,7 +203,7 @@ fn verify_until(harness: Harness, deadline: Instant) -> Report {
     // regressing. Runs first for that reason: if the fixtures no longer parse
     // substantively the probes cannot tell us anything the canaries have not
     // already said, and it costs milliseconds to know.
-    for id in crate::harness::canary::EMBEDDED {
+    for id in crate::harness::canary::embedded() {
         let Some(cap) = contract::get(id) else {
             // Unreachable in a built binary — `canary::tests::
             // embedded_canaries_are_exactly_the_declared_ones` pins the join —

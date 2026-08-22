@@ -11,7 +11,9 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::harness::plugin::{alloc_loopback_port, GrantCtx, HarnessPlugin, InputProfile, ProbeOutput};
+use crate::harness::plugin::{
+    alloc_loopback_port, Canary, GrantCtx, HarnessPlugin, InputProfile, ProbeOutput,
+};
 use crate::harness::reader::OobSpec;
 use crate::sandbox::{GrantAccess, GrantRow};
 use crate::settings::{AiToolTabConfig, Settings};
@@ -240,6 +242,10 @@ impl HarnessPlugin for OpenCodePlugin {
 
     fn recorded_version(&self, hv: &crate::settings::HarnessVersions) -> String {
         hv.opencode_last_seen.trim().to_string()
+    }
+
+    fn canaries(&self) -> &'static [Canary] {
+        super::canary::CANARIES
     }
 
     fn probe(&self) -> ProbeOutput {

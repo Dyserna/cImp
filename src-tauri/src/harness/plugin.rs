@@ -159,6 +159,54 @@ pub struct ProbeOutput {
     pub version: String,
 }
 
+// ── canaries (locked decision 17) ───────────────────────────────────────────
+
+/// One **L1 canary**: a committed fixture, and the assertion that the reader
+/// behind one capability still produces substantive output from it.
+///
+/// Declared by the plugin rather than matched on in core (V40 Phase A, locked
+/// decision 17). The three fields are the three things the neutral runner needs
+/// and cannot know: *which* capability this proves, *what* bytes it proves it
+/// against, and *how*.
+///
+/// **A canary id IS a capability id** — never a third namespace. That is what
+/// lets `canary::tests::embedded_canaries_are_exactly_the_declared_ones`
+/// set-compare the declared canaries against the registry's `canary` column in
+/// both directions, mechanically, instead of against a hand-maintained list.
+pub struct Canary {
+    /// The [`crate::harness::contract::Capability::id`] this canary proves.
+    pub id: &'static str,
+    /// The fixture, `include_str!`-embedded so the check runs from a RELEASE
+    /// binary: a runtime canary must never be able to degrade to "fixture not
+    /// found ⇒ skipped". Handed to [`Self::run`] by the runner, so the bytes the
+    /// corpus walker checks and the bytes the shipped canary reads are the same
+    /// value rather than two consts that could part company.
+    pub fixture: &'static str,
+    /// That fixture's `<harness>/<version>/<name>` path under
+    /// `src-tauri/fixtures/harness/`.
+    ///
+    /// Carried beside the bytes so the corpus walker can check the embedded
+    /// copy against the committed file without a second, hand-kept pair list —
+    /// which is exactly what the old list was, and it had grown a hole.
+    // Read by `canary::tests::the_embedded_fixtures_are_the_committed_files` —
+    // the corpus check IS its consumer, the same shape `Capability`'s
+    // documentation-only columns carry.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fixture_path: &'static str,
+    /// The assertion. Returns `Err(detail)` on drift; `detail` is what the
+    /// *Harness health* panel and `cimp --harness-canary` print verbatim.
+    ///
+    /// Takes the fixture rather than closing over it, which is what lets the
+    /// **negative** twin drive this exact function against a `_synthetic/` drift
+    /// model: "the canary fires" is then proven about the production path, not
+    /// about a copy of it.
+    ///
+    /// A plain `fn` pointer rather than a closure type, so the table can be a
+    /// `const` and the runner's dispatch is a lookup rather than a `match`. An
+    /// `async` reader is wrapped by its own entry (see OpenCode's).
+    pub run: fn(&str) -> Result<(), String>,
+}
+
 // ── the trait ───────────────────────────────────────────────────────────────
 
 /// Everything core asks *this harness* to do.
@@ -304,6 +352,19 @@ pub trait HarnessPlugin: Sync + Send {
     /// recorded for it at all.
     fn last_verified(&self, _hv: &crate::settings::HarnessVersions) -> Option<String> {
         None
+    }
+
+    // ── canaries (locked decision 17) ───────────────────────────────────────
+
+    /// This harness's L1 canaries — the fixture-backed substantiveness checks
+    /// that run every `cargo test` AND inside the shipped binary whenever this
+    /// harness's version changes.
+    ///
+    /// Empty is an ordinary answer for a harness cImp only pushes to; it means
+    /// the registry declares no `canary: Some(..)` row for it, and the
+    /// set-comparison in `canary.rs` holds either way.
+    fn canaries(&self) -> &'static [Canary] {
+        &[]
     }
 
     // ── probes (locked decision 17) ─────────────────────────────────────────

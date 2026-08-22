@@ -728,11 +728,20 @@ const UPWARD_EXEMPT: &[(&str, &str)] = &[
          `session.context` stays reserved with no producer (`chp::EVENTS`).",
     ),
     (
-        "harness/canary.rs",
+        "harness/claude/canary.rs",
         "The L1 canaries assert the Tier-C readers still produce SUBSTANTIVE output, so they \
-         necessarily speak the capability types those readers return. Since V35 Phase L they are \
-         the FALLBACK's proof — which makes them more load-bearing, not less: a fallback nobody \
-         checks is what makes a primary's failure fatal. They follow the readers.",
+         necessarily speak the capability types those readers return (`UsageEvent`, \
+         `UsageOrigin`). Since V35 Phase L they are the FALLBACK's proof — which makes them \
+         more load-bearing, not less: a fallback nobody checks is what makes a primary's \
+         failure fatal. They follow the readers. V40 Phase A moved the assertions here from \
+         `harness/canary.rs` (locked decision 17); the runner keeps the corpus rules and the \
+         dispatcher and names nothing above the seam, which is why its own entry is gone.",
+    ),
+    (
+        "harness/opencode/canary.rs",
+        "The same, one layer over: OpenCode's canary drives `Tracker::handle` to the end of \
+         the chain, and the end of that chain is `crate::tts` — proving the turn is SPOKEN is \
+         the whole assertion, so the speech type is the canary's vocabulary too.",
     ),
     (
         "harness/claude/probe.rs",

@@ -14,6 +14,7 @@
 //! capability, in [`crate::harness::contract::CAPABILITIES`]. Adding a harness
 //! is adding a sibling of this directory — see `harness/README.md`.
 
+pub mod canary;
 pub mod hook;
 pub mod input;
 pub mod overlay;

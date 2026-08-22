@@ -1550,10 +1550,14 @@ pub async fn settings_update(
     // consumer names whose spawn injection changed.
     let now_spawn_sig = crate::tabs::spawn_inject_sig(&now);
     if now_spawn_sig != was_spawn_sig {
-        // V40 Phase A (locked decision 8): iterate the map instead of reading
-        // slots 0 and 1. A positional pair meant a harness with no slot got NO
-        // restart hint when a spawn-baked setting changed — the exact failure
-        // the mechanism exists to prevent, and one that compiled.
+        // Locked decision 8: iterate the map instead of reading slots 0 and 1.
+        // A positional pair meant a harness with no slot got NO restart hint
+        // when a spawn-baked setting changed — the exact failure the mechanism
+        // exists to prevent, and one that compiled. Phase A made it a
+        // registry-sized `PerHarness`; Phase B made it the
+        // `BTreeMap<HarnessId, Value>` the decision asks for, and folded every
+        // plugin's `spawn_baked` `ext` rows into it automatically, so the flag
+        // and its hint are one declaration.
         let consumers: Vec<&'static str> = now_spawn_sig
             .iter()
             .filter(|(h, v)| was_spawn_sig.get(*h) != Some(*v))

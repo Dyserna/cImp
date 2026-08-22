@@ -733,6 +733,14 @@ describe('rowStatus — delegation transitions', () => {
     expect(rowStatus(dlg('worker_exited', false))).toBe('failed');
   });
 
+  it('renders a `driver_gone` row as the failure it is', () => {
+    // V39 review L-7: a new transition — the caller's connection died while the
+    // worker was working. It has no word of its own on purpose: like `timeout`
+    // and `worker_exited`, `failed` plus the row's own reason says it, and a
+    // synonym would dilute the three words that DO mean something.
+    expect(rowStatus(dlg('driver_gone', false))).toBe('failed');
+  });
+
   it('renders a `cancelled` row an older build wrote', () => {
     // The vocabulary is a contract with rows already on disk: the transition is
     // reserved and unreachable today, and must still render rather than throw.

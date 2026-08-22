@@ -1638,11 +1638,20 @@ impl OffloadService {
     ///   `delegation.default_timeout_s`, which is about how long a person's tab
     ///   may take, not by `offload_timeout_secs`, which is about an HTTP call.
     ///   The loopback heartbeats keep the caller's connection alive meanwhile.
-    /// * **No cancellation token.** The documented failure mode for "driver went
-    ///   away" is that the worker finishes visibly and mints its `done` row with
-    ///   nobody to receive it — cImp never sends a key to stop a worker
-    ///   (decision 6), so there is nothing a cancel could do except stop
-    ///   recording what the tab is going to do anyway.
+    /// # The cancellation token IS honoured (V39 review L-7)
+    ///
+    /// It was not, and the cost was a disconnected caller holding this facade's
+    /// slot AND the global offload permit behind it for the whole delegation
+    /// deadline — ten minutes on the default, during which the pool is one slot
+    /// short for everyone else.
+    ///
+    /// What it does NOT do is cancel by dropping the future: `drive` owns the
+    /// worker's slot and its read-only lock, and a dropped future would leave
+    /// both held with no owner. It sets the engine's own `driver_gone` flag and
+    /// then WAITS for the engine to tear itself down (one poll tick), so there
+    /// is exactly one teardown path. The worker is sent nothing and finishes
+    /// visibly — decision 6 is untouched, and the terminal row is minted with
+    /// the flight time it actually took.
     async fn run_facade(
         &self,
         facade: &HarnessTabBackend,
@@ -1651,8 +1660,9 @@ impl OffloadService {
         tab: Option<&str>,
         schema: Option<&serde_json::Value>,
         profile: Option<Profile>,
+        cancel: &CancellationToken,
     ) -> AppResult<String> {
-        let reply = crate::delegation::drive(
+        let flight = crate::delegation::drive(
             &self.app,
             crate::delegation::DriveRequest {
                 worker: facade.tab().clone(),
@@ -1666,8 +1676,17 @@ impl OffloadService {
                 timeout_s: None,
                 format_note: agent::facade_format_note(schema, profile),
             },
-        )
-        .await;
+        );
+        tokio::pin!(flight);
+        let reply = tokio::select! {
+            r = &mut flight => r,
+            _ = cancel.cancelled() => {
+                // Tell the engine, then let it finish tearing down. Never drop
+                // the future: it holds the slot and the lock.
+                crate::delegation::note_driver_gone(facade.tab());
+                flight.await
+            }
+        };
         match reply {
             Ok(r) => Ok(r.text),
             Err(e) => {
@@ -1814,7 +1833,15 @@ impl OffloadService {
         // path; it hands over and waits.
         if let Handle::HarnessTab(facade) = &entry.handle {
             return self
-                .run_facade(facade, instructions, context, tab, schema.as_ref(), profile)
+                .run_facade(
+                    facade,
+                    instructions,
+                    context,
+                    tab,
+                    schema.as_ref(),
+                    profile,
+                    cancel,
+                )
                 .await;
         }
 
@@ -2945,6 +2972,13 @@ fn facade_error(backend: &str, busy: bool, e: &crate::delegation::DelegationErro
         D::Cancelled(_) => {
             AppError::Offload(format!("the request to backend `{backend}` was cancelled"))
         }
+        // V39 review L-7: the caller itself went away, so nobody is left to
+        // read this — but it is mapped like every other variant rather than
+        // left to a wildcard, because a variant that reaches a `_` arm is a
+        // variant nobody decided about.
+        D::DriverGone(_) => AppError::Offload(format!(
+            "the request to backend `{backend}` was abandoned by its caller"
+        )),
         D::WorkerExited(_) => AppError::Offload(format!(
             "backend `{backend}` went away while the task was running"
         )),
@@ -3111,6 +3145,7 @@ mod tests {
             D::Refused(leaky.into()),
             D::Timeout(leaky.into()),
             D::Cancelled(leaky.into()),
+            D::DriverGone(leaky.into()),
             D::WorkerExited(leaky.into()),
             D::NoText(leaky.into()),
         ] {

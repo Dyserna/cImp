@@ -102,6 +102,15 @@ pub mod transition {
     /// written by an earlier build must still render.
     pub const CANCELLED: &str = "cancelled";
     pub const TAKEOVER: &str = "takeover";
+    /// **The DRIVER went away while the turn was in flight** (V39 review L-7).
+    ///
+    /// Distinct from [`CANCELLED`], which stays reserved for a driver that
+    /// *asks* to withdraw — a surface that still does not exist. This one is
+    /// not asked for: the caller's connection died (a facade run whose
+    /// `offload_task` client disconnected), and cImp stops waiting so the
+    /// global offload permit and the worker's slot are not held for the rest of
+    /// the deadline. The worker finishes visibly; no key is ever sent.
+    pub const DRIVER_GONE: &str = "driver_gone";
     pub const WORKER_EXITED: &str = "worker_exited";
     pub const ROLE_MOVED: &str = "role_moved";
 
@@ -116,6 +125,7 @@ pub mod transition {
         TIMEOUT,
         CANCELLED,
         TAKEOVER,
+        DRIVER_GONE,
         WORKER_EXITED,
         ROLE_MOVED,
     ];
@@ -141,6 +151,10 @@ pub enum DelegationError {
     /// the same fact seen from the other end, and it rides this variant's
     /// reason into the row rather than minting a second one.
     Cancelled(String),
+    /// The caller went away while the turn was in flight (V39 review L-7):
+    /// the driver's connection died, so there is nobody left to hand the reply
+    /// to. cImp stops waiting; the worker is sent nothing and finishes visibly.
+    DriverGone(String),
     /// The worker's subprocess exited while the turn was in flight.
     WorkerExited(String),
     /// The turn completed and its text was not substantive (locked decision
@@ -161,6 +175,7 @@ impl DelegationError {
             // See the variant, and `transition::CANCELLED`: a take-over is ONE
             // row, minted where the user acted.
             DelegationError::Cancelled(_) => transition::TAKEOVER,
+            DelegationError::DriverGone(_) => transition::DRIVER_GONE,
             DelegationError::WorkerExited(_) => transition::WORKER_EXITED,
         }
     }
@@ -171,6 +186,7 @@ impl DelegationError {
             DelegationError::Refused(r)
             | DelegationError::Timeout(r)
             | DelegationError::Cancelled(r)
+            | DelegationError::DriverGone(r)
             | DelegationError::WorkerExited(r)
             | DelegationError::NoText(r) => r.as_str(),
         };
@@ -222,6 +238,11 @@ struct InFlight {
     submit_ms: Option<u64>,
     /// Set by [`take_over`]. The wait loop notices and ends as `cancelled`.
     taken_over: bool,
+    /// Set by [`note_driver_gone`]: the caller's connection died (V39 review
+    /// L-7). The wait loop notices and ends the flight rather than holding the
+    /// worker's slot — and the global offload permit behind it — until the
+    /// deadline.
+    driver_gone: bool,
     /// Set by [`note_worker_gone`] when the worker TAB is closed.
     ///
     /// A separate flag from the state mirror's `exited`, and it has to be:
@@ -313,6 +334,11 @@ fn view(f: &InFlight) -> InFlightView {
 
 /// Whether `tab` is currently **driving** something — the acyclic check's
 /// forward direction (locked decision 9).
+///
+/// The engine asks it inside [`claim_checked`] instead (V39 review M-8: the
+/// question and the claim must be one locked step), so this reader is the
+/// stand-alone form the tests and any future surface use.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn is_driving(tab: &TabId) -> bool {
     registry(|r| r.in_flight.values().any(|f| &f.driver == tab))
 }
@@ -329,6 +355,7 @@ pub fn is_driven(tab: &TabId) -> bool {
 /// walk carries its own visited set anyway, because a cycle here must be a
 /// refusal rather than a hang (the cycle cannot form through this module, but
 /// the bound is free and the failure it prevents is not).
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn depth_from(tab: &TabId) -> u8 {
     registry(|r| depth_in(r, tab))
 }
@@ -359,6 +386,7 @@ fn depth_in(r: &Registry, tab: &TabId) -> u8 {
 
 /// The chain a driver already sits in, as tab ids, for a refusal that **names
 /// the cycle** rather than saying "busy".
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn chain_from(tab: &TabId) -> Vec<String> {
     registry(|r| chain_in(r, tab))
 }
@@ -388,6 +416,9 @@ fn chain_in(r: &Registry, tab: &TabId) -> Vec<String> {
 /// `Err(reason)` when it is already held — the loser of a race between two
 /// drivers is refused `busy`, never queued (locked decision 9). Returns the new
 /// delegation's id on success.
+/// The unchecked claim — [`claim_checked`] is what the engine uses. Kept for
+/// the tests, which set up registry states directly.
+#[cfg_attr(not(test), allow(dead_code))]
 #[allow(clippy::too_many_arguments)]
 fn claim(
     worker: &TabId,
@@ -519,6 +550,7 @@ fn claim_in(
                 deadline_ms,
                 submit_ms: None,
                 taken_over: false,
+                driver_gone: false,
                 worker_gone: false,
                 awaiting_prompt: false,
             },
@@ -628,6 +660,30 @@ pub fn take_over(worker: &TabId) -> Option<InFlightView> {
 /// Whether the user has taken this delegation over.
 fn is_taken_over(worker: &TabId) -> bool {
     registry(|r| r.in_flight.get(worker).is_some_and(|f| f.taken_over))
+}
+
+/// **The driver went away** (V39 review L-7) — its `offload_task` client
+/// disconnected, so nothing is waiting for this reply any more.
+///
+/// Sets a flag the wait loop reads, exactly like [`take_over`]: **no key is
+/// sent**, the worker finishes its turn visibly, and the engine's own path
+/// releases the lock and mints the one terminal row. Returns whether a
+/// delegation was actually in flight.
+///
+/// A no-op otherwise, so the caller can call it blind on a cancelled future.
+pub fn note_driver_gone(worker: &TabId) -> bool {
+    registry(|r| match r.in_flight.get_mut(worker) {
+        Some(f) => {
+            f.driver_gone = true;
+            true
+        }
+        None => false,
+    })
+}
+
+/// Whether the driver has gone away under this delegation.
+fn is_driver_gone(worker: &TabId) -> bool {
+    registry(|r| r.in_flight.get(worker).is_some_and(|f| f.driver_gone))
 }
 
 /// **The worker tab was closed.** Called from the tab-lifecycle paths, beside
@@ -1098,6 +1154,29 @@ mod tests {
         });
     }
 
+    /// **A driver that went away ends the flight** (V39 review L-7).
+    ///
+    /// Same shape as a take-over — a flag, and nothing else. What it must NOT
+    /// be is a dropped future: dropping `drive()` mid-await would leave the
+    /// worker's slot claimed and its keyboard locked with no owner, which is
+    /// exactly the lock-whose-owner-does-not-exist this module refuses to
+    /// persist for the same reason.
+    #[test]
+    fn a_driver_that_went_away_is_its_own_signal() {
+        with_clean_registry(|| {
+            assert!(
+                !note_driver_gone(&worker()),
+                "nothing in flight: a no-op, so a cancelled caller can call it blind"
+            );
+            claim_one(&worker(), &driver(), 100).expect("claim");
+            assert!(!is_driver_gone(&worker()));
+            assert!(note_driver_gone(&worker()));
+            assert!(is_driver_gone(&worker()));
+            release(&worker());
+            assert!(!is_driver_gone(&worker()), "released with the slot");
+        });
+    }
+
     /// **A closed worker tab is noticed immediately, not at the deadline.**
     ///
     /// The state mirror cannot answer this: closing a tab drops its row, so a
@@ -1164,6 +1243,7 @@ mod tests {
             DelegationError::Refused("worker is busy".into()),
             DelegationError::Timeout("deadline".into()),
             DelegationError::Cancelled("user took over".into()),
+            DelegationError::DriverGone("the caller disconnected".into()),
             DelegationError::WorkerExited("process gone".into()),
             DelegationError::NoText("worker produced no text".into()),
         ] {

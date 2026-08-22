@@ -49,8 +49,8 @@ use crate::settings::{Settings, TabConfig};
 use crate::state::TabId;
 
 use super::{
-    claim_checked, deadline_of, is_taken_over, is_worker_gone, mark_submitted, note_prompt,
-    record_row, release, take_completion, transition, DelegationError, DelegationMode,
+    claim_checked, deadline_of, is_driver_gone, is_taken_over, is_worker_gone, mark_submitted,
+    note_prompt, record_row, release, take_completion, transition, DelegationError, DelegationMode,
 };
 
 /// How often the wait loop re-reads the world.
@@ -821,6 +821,24 @@ async fn run_flight(
             ));
         }
 
+        // V39 review L-7: the DRIVER went away — its `offload_task` client
+        // disconnected. Stop waiting: the reply has nowhere to go, and the
+        // alternative is holding this worker's slot and the global offload
+        // permit behind it for the rest of the deadline (up to ten minutes on
+        // the default). Read here, beside the take-over, because it is the same
+        // kind of fact: somebody stopped needing this turn. NO key is sent —
+        // the worker finishes visibly, exactly as the design's "driver tab
+        // closes while waiting" row says.
+        if is_driver_gone(worker) {
+            if relaxed && auto_lock {
+                state.read_only.set_prompt_relaxed(worker, false);
+            }
+            return Err(DelegationError::DriverGone(format!(
+                "the caller went away while tab `{worker_name}` was working — cImp stopped \
+                 waiting and sent it nothing; the turn finishes in its own tab"
+            )));
+        }
+
         // TWO ways a worker can go away, and they need two checks: the
         // subprocess exiting (the mirror sees `SubprocessExited`) and the TAB
         // being closed (which drops the mirror row entirely, so the mirror's
@@ -1139,7 +1157,7 @@ mod tests {
         let alive = mirror.flags(&tab);
         assert_eq!(
             alive,
-            crate::state::TabActivityFlags::default(),
+            Default::default(),
             "a restart re-seeds the whole row, not just `exited`"
         );
         assert!(

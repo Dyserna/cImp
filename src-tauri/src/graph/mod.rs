@@ -61,7 +61,7 @@ pub use mcp::{
     // V38 F-3: the consumer-aware builder replaced the blind one here. `tools()`
     // itself stays (the app's own surface measurement calls it), it is simply no
     // longer something a consumer-serving caller may reach for by accident.
-    surface_stats, tool_specs, tools_for as mcp_tools_for, LEAN_HIDDEN,
+    surface_stats, tool_specs, tools_for as mcp_tools_for, LEAN_HIDDEN, UNKNOWN_SOURCE,
 };
 pub use memory::{SessionUsageDetail, UsageSnapshot};
 pub use model::*;

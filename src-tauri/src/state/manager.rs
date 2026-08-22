@@ -517,6 +517,15 @@ impl TabId {
     /// don't carry `TabKind` explicitly (PTY processor, launch-spec
     /// builder) branch without threading a separate metadata table.
     pub fn kind(&self) -> TabKind {
+        // V40 Phase A: "is this a reserved AI tab id" is the registry's
+        // question, not a variant list — a harness added later brings its tab
+        // ids with it, and this stops being a place to remember. `Ai(_)` is the
+        // spawned duplicate, which is an AI tab by construction.
+        if matches!(self, TabId::Ai(_))
+            || crate::harness::HarnessId::from_tab_id(self.as_str()).is_some()
+        {
+            return TabKind::AiTool;
+        }
         match self {
             TabId::Claude | TabId::ClaudeLocal | TabId::OpenCode | TabId::Ai(_) => TabKind::AiTool,
             // The reserved dashboards reuse Shell-kind for processing/state
@@ -561,7 +570,7 @@ impl TabId {
     /// close `×`; the spawn `+` is additionally gated on AI-tool kind).
     /// `tabs::registry`'s `is_builtin_id` delegates here.
     pub fn is_builtin(&self) -> bool {
-        matches!(self, TabId::Claude | TabId::ClaudeLocal | TabId::OpenCode)
+        crate::harness::HarnessId::from_tab_id(self.as_str()).is_some()
             || self.is_reserved_dashboard()
     }
 }

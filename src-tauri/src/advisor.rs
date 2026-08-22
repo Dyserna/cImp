@@ -598,12 +598,10 @@ fn capability_notice(
     proposed: &str,
     rationale: String,
 ) -> Proposal {
-    use crate::harness::contract::Harness;
-    let harness = match cap.harness {
-        Harness::Claude => "Claude Code",
-        Harness::OpenCode => "OpenCode",
-        Harness::Any => "any attached harness",
-    };
+    // V40 Phase A: the label is the descriptor's. Core rendering a harness's
+    // NAME by matching on its identity is the shape locked decision 10(a)
+    // forbids — and it is how a third harness would have read as "OpenCode".
+    let harness = cap.harness.label();
     Proposal {
         setting: setting.to_string(),
         current,

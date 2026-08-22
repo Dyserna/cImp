@@ -323,7 +323,11 @@ pub fn tool_specs() -> Vec<GraphToolSpec> {
 /// `checks` being non-empty, so a project with checks configured but the
 /// graph off still gets it.
 pub fn tools() -> Vec<Value> {
-    tools_for("claude")
+    tools_for(
+        crate::harness::DEFAULT_HARNESS
+            .id()
+            .expect("DEFAULT_HARNESS names a registered harness"),
+    )
 }
 
 /// [`tools`] for one named consumer (`"claude"` / `"opencode"`).
@@ -493,6 +497,8 @@ fn delegation_sig(settings: &crate::settings::Settings) -> u64 {
             match c.delegation_role {
                 crate::settings::DelegationRole::Manual => {
                     crate::tabs::tab_consumer(c).hash(&mut h);
+                    // `None` (an unregistered command) hashes distinctly from
+                    // every harness id, which is what it is.
                     c.id.hash(&mut h);
                     c.name.hash(&mut h);
                 }
@@ -678,17 +684,40 @@ pub fn surface_stats() -> SurfaceStats {
     stats
 }
 
-/// The activity/memory **source** string for a consumer name — the value
-/// carried through the activity ring and used to scope the `context_*` memory
-/// tools to the calling agent. `"opencode"` stays itself; anything else
-/// (Claude, or unset) is `"claude"`.
+/// The activity/memory **source** string for a consumer name — the value carried
+/// through the activity ring and used to scope the `context_*` memory tools to
+/// the calling agent.
+///
+/// A registered harness resolves to its own id; cImp's own in-app consumers
+/// keep their names. **V40 Phase A: anything else is [`UNKNOWN_SOURCE`], not
+/// Claude** (locked decision 2). This used to be `if opencode { opencode } else
+/// { claude }`, so a forged or hand-run child asserting any consumer at all got
+/// Claude's activity badge and Claude's memory scope — a misattribution in the
+/// view whose entire job is attribution, and a read of another agent's sessions.
+/// The unknown source filters to no sessions, which is the fail-closed answer.
+///
+/// An ABSENT consumer is a different question and has a different answer: it is
+/// resolved by the caller to [`crate::harness::DEFAULT_HARNESS`], which is a
+/// documented wire-compatibility promise rather than a guess.
 pub fn source_for_consumer(consumer: &str) -> &'static str {
-    if consumer.eq_ignore_ascii_case("opencode") {
-        "opencode"
-    } else {
-        "claude"
+    if let Some(id) = crate::harness::HarnessId::from_consumer(consumer).and_then(|h| h.id()) {
+        return id;
+    }
+    match consumer.trim().to_ascii_lowercase().as_str() {
+        // cImp's OWN consumers. Neither is a harness and neither has a
+        // `harness/<id>/` directory; both are names the activity feed already
+        // shows, so they are spelled here beside the registry lookup rather
+        // than smuggled into it.
+        "offload" => "offload",
+        "audit" => "audit",
+        _ => UNKNOWN_SOURCE,
     }
 }
+
+/// The activity source for a caller whose asserted consumer names nothing cImp
+/// serves. Its own token so a row can say "cImp does not know who this was"
+/// instead of naming a product that did not make the call.
+pub const UNKNOWN_SOURCE: &str = "unknown";
 
 /// Map an activity source to the memory agent the `context_*` tools scope to:
 /// a tab agent (`claude`/`opencode`) filters to its own sessions; the offload

@@ -522,8 +522,18 @@ pub fn note_harness_version(harness: &str, version: &str) {
     if version.is_empty() {
         return;
     }
+    // V40 Phase A: a version note for a harness nobody registered is dropped,
+    // loudly enough to find in a log rather than silently. The two field names
+    // are still Claude's and OpenCode's — locked decision 5 turns them into a
+    // map in Phase B — so the writes stay here, but the DISPATCH is the
+    // registry's and an unknown id can no longer land on a `_ => {}` that reads
+    // like an intentional no-op.
+    let Some(id) = crate::harness::HarnessId::from_id(harness).and_then(|h| h.id()) else {
+        tracing::debug!(harness, "version note for an unregistered harness; dropped");
+        return;
+    };
     let mut claude_changed = false;
-    let res = mutate_global_harness_versions(|hv| match harness {
+    let res = mutate_global_harness_versions(|hv| match id {
         "claude" => {
             claude_changed = hv.claude_last_seen != version;
             hv.claude_last_seen = version.to_string();
@@ -1840,7 +1850,7 @@ fn restore_enabled_ai_builtins(settings: &mut Settings) -> bool {
     // Iterate in canonical order (claude → claude-local → opencode) so
     // successive insertions land in the right relative
     // slot regardless of the user's `enabled_ai_tabs` ordering.
-    let order = [AiTabId::Claude, AiTabId::ClaudeLocal, AiTabId::OpenCode];
+    let order = crate::settings::canonical_ai_tab_order();
     let mut changed = false;
     for &id in &order {
         if !settings.enabled_ai_tabs.contains(&id) {

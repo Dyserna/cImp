@@ -458,10 +458,19 @@ impl AuditState {
     /// [`begin_scan`](Self::begin_scan), not here.
     pub fn consumer_exposed(&self, consumer: &str) -> bool {
         let ca = self.settings.current().code_audit;
+        // V40 Phase A (locked decision 2): an UNRECOGNISED consumer is not
+        // exposed. It used to fall through to `expose_claude`, so a caller
+        // asserting any token at all was gated by a checkbox belonging to a
+        // harness it is not — the fail-OPEN direction on a question about
+        // reaching a scanner. The three names below are still literals because
+        // `expose_claude` / `expose_opencode` / `expose_offload` is a settings
+        // FIELD TRIO that locked decision 25 turns into a `PerHarness` in Phase
+        // B; the dispatch moves with the fields, not before them.
         match consumer {
             "opencode" => ca.expose_opencode,
             "offload" => ca.expose_offload,
-            _ => ca.expose_claude,
+            "claude" => ca.expose_claude,
+            _ => false,
         }
     }
 

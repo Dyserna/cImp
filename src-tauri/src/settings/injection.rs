@@ -1305,12 +1305,25 @@ pub enum Consumer {
 }
 
 impl Consumer {
-    /// The consumer a tab whose command is `command` launches.
-    pub fn for_command(command: &str) -> Self {
-        if crate::tabs::config::command_is(command, "claude") {
-            Consumer::Claude
-        } else {
-            Consumer::Opencode
+    /// The consumer a tab whose command is `command` launches, or `None` when
+    /// the command names no registered harness.
+    ///
+    /// **V40 Phase A made this fallible** (locked decision 2). It used to answer
+    /// `Opencode` for anything that was not Claude, so a tab pointed at a third
+    /// CLI had OpenCode's injection hierarchy resolved for it — the wrong
+    /// spawn-baked flags, silently. A tab that is not a registered harness has
+    /// no consumer, and every caller now says so.
+    pub fn for_command(command: &str) -> Option<Self> {
+        let id = crate::harness::HarnessId::from_command(command)?.id()?;
+        Self::from_agent(id)
+    }
+
+    /// The consumer for a CHP `agent` token, or `None`.
+    pub fn from_agent(agent: &str) -> Option<Self> {
+        match agent {
+            "claude" => Some(Consumer::Claude),
+            "opencode" => Some(Consumer::Opencode),
+            _ => None,
         }
     }
 
@@ -1417,7 +1430,7 @@ pub fn spawn_sig(s: &Settings, consumer: Consumer) -> serde_json::Value {
         .tabs
         .iter()
         .filter_map(|t| match t {
-            TabConfig::AiTool(c) if Consumer::for_command(&c.command) == consumer => Some(c),
+            TabConfig::AiTool(c) if Consumer::for_command(&c.command) == Some(consumer) => Some(c),
             _ => None,
         })
         .collect();
@@ -2424,7 +2437,7 @@ mod tests {
         s.tabs
             .iter()
             .find_map(|t| match t {
-                TabConfig::AiTool(c) if Consumer::for_command(&c.command) == consumer => {
+                TabConfig::AiTool(c) if Consumer::for_command(&c.command) == Some(consumer) => {
                     Some(c.id.clone())
                 }
                 _ => None,

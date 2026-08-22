@@ -1307,12 +1307,31 @@ impl AiTabId {
     /// `integrity_check` so re-adding a previously-disabled AI tab lands in
     /// the same slot every time.
     pub fn canonical_order(self) -> usize {
-        match self {
-            Self::Claude => 0,
-            Self::ClaudeLocal => 1,
-            Self::OpenCode => 2,
-        }
+        // V40 Phase A: the registry's canonical order, not a literal ranking.
+        // A reserved tab id no descriptor claims sorts last rather than
+        // colliding with slot 0 — an unknown built-in is not "the first one".
+        canonical_ai_tab_order()
+            .iter()
+            .position(|&id| id == self)
+            .unwrap_or(usize::MAX)
     }
+}
+
+/// The reserved AI tab ids in **canonical tab-bar order**, flattened out of the
+/// registry (`claude` → `claude-local` → `opencode` today).
+///
+/// V40 Phase A: this used to be a literal `[AiTabId::Claude, ..]` array written
+/// out in three places (`persistence::restore_enabled_ai_builtins`,
+/// `ipc::tab_lifecycle`, and `AiTabId::canonical_order`), which is three places
+/// a new harness's tab could be forgotten and only one of them would have said
+/// so. The order is the descriptors' declaration order and each descriptor's own
+/// `tab_ids` order — so a harness owns where its tabs sit relative to its own,
+/// and the registry owns where harnesses sit relative to each other.
+pub fn canonical_ai_tab_order() -> Vec<AiTabId> {
+    crate::harness::registry::canonical_tab_ids()
+        .into_iter()
+        .filter_map(AiTabId::from_id)
+        .collect()
 }
 
 impl Settings {

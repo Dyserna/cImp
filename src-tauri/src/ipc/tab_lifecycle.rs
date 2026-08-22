@@ -1105,7 +1105,7 @@ pub async fn set_enabled_ai_tabs(
 
     // Canonical add order: claude → claude-local → opencode so insertions
     // land in the right relative slot.
-    let canonical = [AiTabId::Claude, AiTabId::ClaudeLocal, AiTabId::OpenCode];
+    let canonical = crate::settings::canonical_ai_tab_order();
 
     // 1. Add any newly-enabled tabs.
     for &id in &canonical {

@@ -3,13 +3,12 @@
 //! channel. The registry is the single seam through which the IPC layer
 //! interacts with multi-tab subprocess state.
 
-/// `pub(crate)` only so `settings::injection::Consumer::for_command` can reuse
-/// [`config::command_is`] (#48). The launch path's own split — `build_pre_args`
-/// is Claude-only, `build_opencode_config` takes everything else — is what the
-/// per-consumer spawn signature has to partition tabs by, and a second copy of
-/// "is this a claude tab" in the settings module is exactly the kind of mirror
-/// #47 spent a milestone removing. Items inside the module keep their own
-/// visibility; nothing new is public.
+/// `pub(crate)` so the launch composer's harness-neutral helpers are reachable
+/// from the plugins and from `settings::injection` (#48). Since V40 Phase A the
+/// "which harness is this tab" question is answered by
+/// [`crate::harness::HarnessId::from_command`] alone, so no module keeps a copy
+/// of it. Items inside the module keep their own visibility; nothing new is
+/// public.
 pub(crate) mod config;
 pub mod registry;
 

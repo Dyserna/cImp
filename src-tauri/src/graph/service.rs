@@ -3052,14 +3052,22 @@ impl GraphService {
         // so `GraphIndex::advisor_reread_rate` can precisely check whether the
         // agent re-read this exact file afterward. Reaching a remind means the
         // agent has already read this file at least once this session
-        // (`read_seen` held its prior hash), so the session row normally exists;
-        // `"claude"` is a safe default if the lookup somehow misses.
-        let agent = idx
-            .session_agent(sid)
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| "claude".to_string());
-        let _ = idx.record_mem_event(sid, &agent, "remind", rel, None, None, ts, None);
+        // (`read_seen` held its prior hash), so the session row normally exists.
+        // V40 Phase A (locked decisions 2/20): a MISSING agent is no longer
+        // recorded as Claude's. A `mem_event` stamped with the wrong agent is
+        // worse than one that is absent - `advisor_reread_rate` reads these rows
+        // per agent, so a mis-stamped row moves a statistic about a harness that
+        // did not produce it. The remind itself is unaffected; only the
+        // provenance row is skipped, and the log line says so.
+        match idx.session_agent(sid).ok().flatten() {
+            Some(agent) => {
+                let _ = idx.record_mem_event(sid, &agent, "remind", rel, None, None, ts, None);
+            }
+            None => tracing::debug!(
+                session = %sid,
+                "no agent recorded for this session; skipping the remind provenance row rather                  than attributing it to a harness that may not have produced it"
+            ),
+        }
         // Activity: `chars` is the reminder's actual size (what we returned),
         // consistent with every other graph tool's honest response-size figure —
         // not a fabricated token estimate.

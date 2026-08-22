@@ -311,15 +311,22 @@ pub const LEDGER: &[SpawnSite] = &[
                  leg has exactly one legitimate holder.",
     },
     SpawnSite {
-        file: "tabs/config.rs",
-        symbol: "note_opencode_version",
+        // V40 Phase A moved this out of `tabs/config.rs` and behind
+        // `HarnessPlugin::note_version`: WHICH harness has a version to read
+        // at spawn, and how, is that harness's fact. The spawn itself is
+        // unchanged - same argv, same one-shot, same gate - so the row moves
+        // with it rather than being rewritten (locked decision 29: the argv
+        // strings come from the plugin, the rows stay).
+        file: "harness/opencode/harness_plugin.rs",
+        symbol: "note_version",
         spawns: "opencode --version",
         class: HostSpawn,
         count: 1,
         reason: "A one-shot version probe run once per tab spawn to feed the harness-version \
-                 tripwire. Fixed single argument; best-effort in every direction. The env \
-                 composed a few lines away in this same file is the TAB spawn's env, which \
-                 keeps its `env_remove` discipline (C2 applies to `run_command` only).",
+                 tripwire. Fixed single argument; best-effort in every direction. The env the \
+                 TAB spawn is composed with keeps its `env_remove` discipline (C2 applies to \
+                 `run_command` only); this child inherits the app's own environment and takes \
+                 no argument from a model.",
     },
     SpawnSite {
         file: "workbench/git.rs",
@@ -519,7 +526,10 @@ mod tests {
                 "pty/sandboxed_conpty.rs",
                 include_str!("pty/sandboxed_conpty.rs"),
             ),
-            ("tabs/config.rs", include_str!("tabs/config.rs")),
+            (
+                "harness/opencode/harness_plugin.rs",
+                include_str!("harness/opencode/harness_plugin.rs"),
+            ),
             ("workbench/git.rs", include_str!("workbench/git.rs")),
         ]
         .into_iter()
@@ -643,7 +653,7 @@ mod tests {
             "graph/gitcmd.rs",
             "checks/gitls.rs",
             "audit/mod.rs",
-            "tabs/config.rs",
+            "harness/opencode/harness_plugin.rs",
             "procutil.rs",
             "ipc/commands.rs",
             "offload/mcp_host.rs",

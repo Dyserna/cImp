@@ -29,14 +29,7 @@ use crate::error::{AppError, AppResult};
 // a tab spawns, and what a setting means; what left is how each harness is
 // told. The tests below still drive both through `build_launch_spec`, so they
 // stayed with the composition they assert on.
-use crate::harness::claude::hook as claude_hook;
-use crate::harness::claude::overlay::build_pre_args;
-use crate::harness::opencode::config::{
-    build_opencode_config, write_opencode_instructions, CONFIG_ENV,
-};
-use crate::harness::opencode::plugin::write_opencode_plugin;
 use crate::pty::{resolve_command, PtyLaunchSpec};
-use crate::settings::injection::Consumer as InjConsumer;
 use crate::settings::{AiToolTabConfig, Settings, TabConfig};
 use crate::state::TabId;
 
@@ -109,18 +102,28 @@ fn build_ai_tool_spec(
     // shared last-writer-wins file a sibling instance may have overwritten —
     // exactly as `write_opencode_plugin` reads it for the same reason.
     let endpoint = crate::offload::loopback::read_own_discovery();
-    let pre_args = build_pre_args(cfg, settings, tab.as_str(), endpoint.as_ref());
+    // V40 Phase A: which harness this tab is, resolved ONCE, here — the
+    // function that already knew. Everything harness-specific below is asked of
+    // its plugin; `None` is a tab whose command matches no registered harness,
+    // which gets the neutral launch path and no harness wiring at all.
+    let harness = crate::harness::HarnessId::from_command(&cfg.command);
+    let plugin = harness.and_then(|h| h.plugin());
+    let pre_args = plugin
+        .map(|p| p.pre_args(cfg, settings, tab.as_str(), endpoint.as_ref()))
+        .unwrap_or_default();
     let mut extra_args = build_extra_args(cfg, settings, invocation_args);
     let working_dir = ai_working_dir(cfg, launch_cwd);
-    // V19: OpenCode reads its guidance from a file referenced in the injected
-    // config (`instructions`), so write that managed file at launch — kept off
-    // the pure `compose_ai_env` path so the config builder stays test-safe.
-    if command_is(&cfg.command, "opencode") {
-        write_opencode_instructions(cfg, settings);
-        // V10: drop the dependency-free injection/memory plugin into the
-        // project's `.opencode/plugin/`, baking in the current loopback port +
-        // token. Uses `working_dir` (the project root the TUI opens).
-        write_opencode_plugin(&working_dir, settings, tab.as_str());
+    // The files this harness needs on disk before its tab launches (OpenCode's
+    // managed instructions file and its generated plugin). Kept off the pure
+    // `compose_ai_env` path so the config builders stay test-safe.
+    if let Some(p) = plugin {
+        p.write_artifacts(cfg, settings, tab.as_str(), &working_dir);
+        // V16 Feature 1: record the harness version this spawn is about to run,
+        // for the drift tripwire. Fire-and-forget by contract — a version note
+        // must never delay a tab launch. It used to sit inside the OpenCode arm
+        // of `resolve_oob_source`, which made "is this harness versioned at
+        // spawn" a property of where the call happened to be written.
+        p.note_version(&cfg.command);
     }
     // The child's environment is composed FIRST, because since 2026-08-17 the
     // OpenCode tap's credential is read back out of it: the effective server
@@ -132,7 +135,7 @@ fn build_ai_tool_spec(
     // the `--port`/`--hostname` the fullscreen TUI hosts its event server on
     // (which the adapter taps). Mutates `extra_args`, so it runs on the real
     // launch path only — the pure `build_extra_args` stays test-stable.
-    let oob = resolve_oob_source(cfg, &working_dir, &mut extra_args, &env);
+    let oob = plugin.and_then(|p| p.resolve_oob(cfg, &working_dir, &mut extra_args, &env));
     let env_remove = ai_env_removals(cfg);
     Ok(PtyLaunchSpec {
         tab,
@@ -153,136 +156,49 @@ fn build_ai_tool_spec(
         // something else) gets `None` and is not sandboxed: a grant table nobody
         // wrote is not a boundary, it is a tool that fails to start for reasons
         // the user cannot see.
-        harness: harness_of(&cfg.command),
+        harness,
     })
 }
 
-/// [`crate::sandbox::tabs::Harness`] for an AI tab's configured command.
+/// V30 (review M9): environment markers of a harness session cImp was launched
+/// from, stripped from every AI tab's child.
 ///
-/// Uses [`command_is`] — the ONE spelling of "which harness is this" in the
-/// codebase — so the sandbox's grant table and the injection layer can never
-/// disagree about what a tab is.
-fn harness_of(command: &str) -> Option<crate::sandbox::tabs::Harness> {
-    use crate::sandbox::tabs::Harness;
-    if command_is(command, "claude") {
-        // `claude-local` is the same binary with a synthesized provider env, so
-        // it is the same harness with the same state directories.
-        Some(Harness::Claude)
-    } else if command_is(command, "opencode") {
-        Some(Harness::OpenCode)
-    } else {
-        None
-    }
-}
-
-/// V30 (review M9): environment markers of the Claude Code session cImp was
-/// launched from, stripped from every AI tab's child.
-///
-/// Launching cImp from inside a Claude Code session is routine during
-/// development, and the child then inherits that session's harness markers. The
-/// load-bearing one is `CLAUDE_CODE_CHILD_SESSION`: a Claude spawned with it set
-/// runs with **no transcript, no history, no session records** (spike-documented
-/// in `docs/MILESTONE-V30-mcp-channels.md`), which silently blinds the
-/// out-of-band tap — no TTS, no usage, no live-session registry entry, no V28
-/// per-tab scoping, and no log anywhere saying why. The other two are the
-/// generic "you are running inside Claude Code" markers a fresh, user-facing tab
-/// must not claim to be under; leaving them set has a tool infer a parent
-/// session that has nothing to do with this tab.
+/// Launching cImp from inside a harness session is routine during development,
+/// and the child then inherits that session's markers. The load-bearing one is
+/// Claude's `CLAUDE_CODE_CHILD_SESSION`: a Claude spawned with it set runs with
+/// **no transcript, no history, no session records** (spike-documented in
+/// `docs/MILESTONE-V30-mcp-channels.md`), which silently blinds the out-of-band
+/// tap — no TTS, no usage, no live-session registry entry, no V28 per-tab
+/// scoping, and no log anywhere saying why. The others are the generic "you are
+/// running inside <harness>" markers a fresh, user-facing tab must not claim to
+/// be under.
 ///
 /// Deliberately NOT a settings knob and deliberately not `env_clear`: this is a
 /// fixed, minimal list of harness markers, so it needs no `spawn_inject_sig`
 /// entry (nothing about it can change between spawns) and it cannot strip
 /// anything the user's own environment legitimately carries.
-const HARNESS_ENV_VARS: [&str; 3] = [
-    "CLAUDE_CODE_CHILD_SESSION",
-    "CLAUDECODE",
-    "CLAUDE_CODE_ENTRYPOINT",
-];
+///
+/// **V40 Phase A: the union of every descriptor's `env_strip`**, not a literal
+/// array. The variables are one harness's names, so they belong to that
+/// harness's row; stripping *every* registered harness's markers from *every* AI
+/// tab is deliberate and unchanged — an OpenCode tab launched from inside a
+/// Claude session inherits the same misleading markers.
+fn harness_env_vars() -> Vec<&'static str> {
+    crate::harness::HARNESSES
+        .iter()
+        .flat_map(|d| d.env_strip.iter().copied())
+        .collect()
+}
 
 /// The strip list for one AI tab: [`HARNESS_ENV_VARS`] minus anything the user
 /// set explicitly on the tab — a per-tab `env` entry is an instruction, not an
 /// accident, and `PtyManager` applies additions after removals anyway.
 fn ai_env_removals(cfg: &AiToolTabConfig) -> Vec<String> {
-    HARNESS_ENV_VARS
-        .iter()
-        .filter(|k| !cfg.env.contains_key(**k))
-        .map(|k| (*k).to_string())
+    harness_env_vars()
+        .into_iter()
+        .filter(|k| !cfg.env.contains_key(*k))
+        .map(|k| k.to_string())
         .collect()
-}
-
-/// V20: pick the out-of-band TTS source for an AI tab, and for OpenCode inject
-/// the loopback `--port`/`--hostname` its TUI exposes the event stream on.
-///
-/// - **Claude** (`claude` / `claude-local`): tail the project's transcript
-///   JSONL rooted at `working_dir`.
-/// - **OpenCode**: allocate a free loopback port, append `--port <N>
-///   --hostname 127.0.0.1` (appended last so it wins over any user `--port`),
-///   and tap `http://127.0.0.1:<N>/event`. If no port can be allocated, the
-///   tab still launches — just without automatic TTS.
-/// - **Anything else**: no source.
-///
-/// `env` is the environment this child will be spawned with, and it is read
-/// (never written) for exactly one thing: the OpenCode server credential the tap
-/// must authenticate with, resolved by the harness so this function spells none
-/// of that harness's variable names. See
-/// [`crate::harness::opencode::config::server_auth_from_env`].
-fn resolve_oob_source(
-    cfg: &AiToolTabConfig,
-    working_dir: &Path,
-    extra_args: &mut Vec<String>,
-    env: &HashMap<String, String>,
-) -> Option<crate::harness::OobSpec> {
-    if command_is(&cfg.command, "claude") {
-        // V34: pin this tab's session id. `--session-id <uuid>` is the only
-        // per-process discriminator Claude Code offers, and without one the
-        // tap can only tail the newest `*.jsonl` under a project-derived root
-        // — which two Claude tabs on one project share, making every tab-keyed
-        // identity claim from either unprovable (V28 decision 4a). Generated
-        // here, next to the `OobSpec` that carries it, so the flag on the
-        // child's argv and the file the tap follows can never disagree.
-        //
-        // Skipped when the tab's own args already choose a session: `--resume`
-        // and friends name a conversation that already exists, so a second
-        // selector would either be rejected or silently fight the user's. Such
-        // a tab keeps the pre-V34 newest-wins binding (and its ambiguity).
-        let pinned_session = if args_select_session(extra_args) {
-            tracing::debug!(
-                tab = %cfg.id,
-                "claude tab selects its own session; leaving it unpinned"
-            );
-            None
-        } else {
-            let sid = uuid::Uuid::new_v4().to_string();
-            extra_args.push("--session-id".to_string());
-            extra_args.push(sid.clone());
-            Some(sid)
-        };
-        return Some(crate::harness::OobSpec::ClaudeTranscript {
-            project_dir: working_dir.to_path_buf(),
-            pinned_session,
-        });
-    }
-    if command_is(&cfg.command, "opencode") {
-        // V16 Feature 1: record the OpenCode version for the harness
-        // tripwire. Spawn-time only (the event stream carries no version);
-        // fire-and-forget on a plain thread so a slow/hung `--version` can
-        // never delay the tab launch.
-        note_opencode_version(&cfg.command);
-        let port = alloc_loopback_port()?;
-        extra_args.push("--port".to_string());
-        extra_args.push(port.to_string());
-        extra_args.push("--hostname".to_string());
-        extra_args.push("127.0.0.1".to_string());
-        return Some(crate::harness::OobSpec::OpenCodeEvent {
-            port,
-            // 2026-08-17: the credential for the server this child is about to
-            // host, taken from the environment it will be spawned with — so the
-            // tap authenticates with the password the server will read, and the
-            // secret rides neither argv nor a URL.
-            auth: crate::harness::opencode::config::server_auth_from_env(env),
-        });
-    }
-    None
 }
 
 /// The directory an AI tab launches in: its per-tab `cwd` override, else the
@@ -342,6 +258,15 @@ pub(crate) fn ai_tab_dir(
 /// configured-but-closed tab must not degrade a running one — so it is fed by
 /// the running taps themselves (`GraphService::mark_live_tab_root`), not by this
 /// list.
+fn claude_harness() -> Option<crate::harness::HarnessId> {
+    // The permission-hook cwd fallback is a CLAUDE mechanism: the hook payload
+    // it backs carries no cwd, and only Claude's hooks have that gap. Named
+    // here, once, with this note — locked decision 22's rule for a residual
+    // that a later phase moves behind the plugin (`identity_of_request`, Phase
+    // C), rather than a bare literal in a filter.
+    crate::harness::HarnessId::from_id("claude")
+}
+
 pub(crate) fn claude_tab_dirs(
     settings: &Settings,
     launch_cwd: &Path,
@@ -350,7 +275,7 @@ pub(crate) fn claude_tab_dirs(
         .tabs
         .iter()
         .filter_map(|t| match t {
-            TabConfig::AiTool(c) if command_is(&c.command, "claude") => {
+            TabConfig::AiTool(c) if crate::harness::HarnessId::from_command(&c.command) == claude_harness() => {
                 Some((c.id.clone(), ai_working_dir(c, launch_cwd)))
             }
             _ => None,
@@ -358,94 +283,33 @@ pub(crate) fn claude_tab_dirs(
         .collect()
 }
 
-/// V16 Feature 1: run `opencode --version` once per tab spawn and record the
-/// first output line into the global `harness_versions` tripwire state.
-/// Best-effort in every direction: unresolvable binary, spawn failure, or
-/// junk output all just skip the note (`note_harness_version` also ignores
-/// empty strings and no-ops on an unchanged version).
-fn note_opencode_version(command: &str) {
-    let Ok(binary) = resolve_command(command) else {
-        return;
-    };
-    std::thread::spawn(move || {
-        let mut cmd = std::process::Command::new(binary);
-        cmd.arg("--version");
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            // CREATE_NO_WINDOW, same convention as every spawned subprocess.
-            cmd.creation_flags(0x0800_0000);
-        }
-        // The stdio `output()` would have chosen implicitly, written down: it
-        // spawns with stdin null and both output streams piped. Made explicit
-        // so this can go through the spawn gate as a *spawn* — wrapping the
-        // synchronous `output()` instead would hold the shared guard for the
-        // whole run of `opencode --version`, and a long shared hold blocks the
-        // sandbox's exclusive window (see `spawn_gate`).
-        cmd.stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        let Ok(out) = crate::spawn_gate::spawn_std(&mut cmd).and_then(|c| c.wait_with_output())
-        else {
-            return;
-        };
-        // `opencode --version` prints a bare version (e.g. "1.4.2"); take the
-        // first line defensively in case a future build adds a banner.
-        let version = String::from_utf8_lossy(&out.stdout);
-        let version = version.lines().next().unwrap_or("").trim().to_string();
-        crate::settings::note_harness_version("opencode", &version);
-    });
-}
-
-/// Reserve a free loopback TCP port by binding `127.0.0.1:0` and reading the
-/// OS-assigned port, then releasing it. There is a small window between release
-/// and OpenCode re-binding it, but on loopback at launch this is reliable in
-/// practice; a collision just means the event tap fails to connect and the tab
-/// has no automatic TTS (it still works otherwise).
-fn alloc_loopback_port() -> Option<u16> {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .ok()
-        .and_then(|l| l.local_addr().ok())
-        .map(|addr| addr.port())
-}
-
-/// True when `command` resolves to the named binary, comparing on the
-/// file stem so `"claude"`, `"claude.exe"`, and `"/usr/bin/claude"` all
-/// match `"claude"`. AI launch behavior keys off this (and
-/// `use_local_provider`) rather than the `TabId` variant, so a `+`-spawned
-/// duplicate — which copies its template's `command` — gets identical
-/// treatment to the reserved tab it came from.
-pub(crate) fn command_is(command: &str, name: &str) -> bool {
-    Path::new(command)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .map(|s| s.eq_ignore_ascii_case(name))
-        .unwrap_or(false)
-}
-
-/// Which CONSUMER a configured AI tab belongs to — `"claude"` or `"opencode"`,
-/// the two-word vocabulary `graph::source_for_consumer` normalises to and the
-/// latch registry keys by.
+/// Which HARNESS a configured AI tab belongs to, or `None`.
 ///
-/// The split is [`command_is`]`(command, "claude")`, which is not a new
-/// judgement: it is the same test `build_pre_args` (Claude-only) and
-/// `build_opencode_config` (everything else) already make at spawn, and the one
-/// `injection_hygiene_applies` and the pinned-facts addendum make. This function
-/// exists so there is ONE spelling of it.
+/// The one spelling of "which harness is this tab" above the seam — a thin
+/// forward to [`crate::harness::HarnessId::from_command`], kept as a named
+/// function because the *tab* is the unit callers hold.
 ///
-/// **V33 C5 (F-4) is why that matters now.** `loopback::is_configured_tab`
+/// **`None` is a first-class answer, and V40 Phase A is what made it one**
+/// (locked decision 2). This used to be `tab_consumer`, returning
+/// `"claude"` for a Claude command and **`"opencode"` for everything else** —
+/// so a tab pointed at any other CLI (a wrapper script, a third harness) was
+/// classified as OpenCode, became eligible for its Manual delegation slot, and
+/// would be typed into with OpenCode's paste profile. Every one of its callers
+/// now propagates the `None`.
+///
+/// **V33 C5 (F-4) is why one spelling matters.** `loopback::is_configured_tab`
 /// verifies a caller's asserted `(consumer, tab)` pair against this, so a tab
-/// classified one way at spawn and the other way at verification would be
-/// launched with hooks whose `--tab` its own beacons could not key. Classifying
-/// both ends through this function is what keeps the pair verifiable — a tab
-/// with a wrapper command (`claude-code.cmd`) is "opencode" to BOTH ends, which
-/// is honest: it already receives no Claude hook injection at all.
-pub(crate) fn tab_consumer(cfg: &AiToolTabConfig) -> &'static str {
-    if command_is(&cfg.command, "claude") {
-        "claude"
-    } else {
-        "opencode"
-    }
+/// classified one way at spawn and another way at verification would be launched
+/// with hooks whose `--tab` its own beacons could not key. Classifying both ends
+/// through this function is what keeps the pair verifiable.
+pub(crate) fn tab_harness(cfg: &AiToolTabConfig) -> Option<crate::harness::HarnessId> {
+    crate::harness::HarnessId::from_command(&cfg.command)
+}
+
+/// [`tab_harness`] as the CHP `agent` token, for the callers that key a map or a
+/// wire field by it. `None` means the same thing it does there: not a harness.
+pub(crate) fn tab_consumer(cfg: &AiToolTabConfig) -> Option<&'static str> {
+    tab_harness(cfg).and_then(|h| h.id())
 }
 
 /// The two "is the Code Audit MCP server advertised to this consumer" gates,
@@ -580,213 +444,28 @@ pub(crate) fn read_advisor_gate_blocked(s: &Settings) -> bool {
     crate::harness::contract::gate(crate::harness::contract::CAP_PRETOOLUSE_DENY, s).blocked
 }
 
-/// Per-consumer spawn-injection signature — `[claude, opencode]`. Captures
-/// every Settings-derived input that reaches an AI tab only at spawn (the
-/// `--mcp-config` server set, the `compose_capability_guidance` gates, the
-/// `--settings` statusline/hooks overlay, the `claude_local` env for
+/// Per-harness spawn-injection signature.
+///
+/// Captures every Settings-derived input that reaches an AI tab **only at
+/// spawn** (the `--mcp-config` server set, the `compose_capability_guidance`
+/// gates, the `--settings` statusline/hooks overlay, the `claude_local` env for
 /// local-provider tabs, the OpenCode plugin's baked flags and the injected
-/// `local-llama` provider). Compared across a Settings save to decide whether
-/// a "restart the AI tab" hint is due. Coarse by design: any difference means
-/// a fresh tab would be launched differently from the one still running.
-pub(crate) fn spawn_inject_sig(s: &Settings) -> [serde_json::Value; 2] {
-    // Guidance addendum gates, shared verbatim by both consumers (Claude's
-    // `--append-system-prompt` and OpenCode's managed instructions file).
-    //
-    // V32 Phase D's injection-hygiene paragraph has no entry of its own on
-    // purpose, and V37 Phase F changed WHICH entry covers it. Its gate used to
-    // be `advertises_offload_to_{claude,opencode}` (the old first element of
-    // each `"mcp"` array below); it is now `consumer_hygiene_for` alone, whose
-    // L1/L2/L3 cells all ride `injection::spawn_sig` — carried by the
-    // `"injection"` entry at the bottom of each consumer object. So a flip that
-    // adds or removes the paragraph still always moves this signature. A future
-    // addendum with an independent gate does need its own slot here.
-    let guidance = serde_json::json!([
-        s.offload.enabled && s.offload.inject_guidance,
-        s.graph.enabled,
-        s.graph.enabled && s.graph.semantic_search,
-        s.graph.enabled && s.graph.promote_pinned_facts,
-    ]);
-    // V35 Phase E: the E1 hard block is now the capability matrix's gate, asked
-    // by id (`harness::contract::gate`) instead of a bespoke helper on
-    // `HarnessVersions`. Same verdict, same fail-closed semantics — see the
-    // overlay builder below for the full note.
-    let read_hook = s.graph.enabled && s.graph.read_advisor && !read_advisor_gate_blocked(s);
-    let post_edit = s.graph.enabled && s.graph.auto_check && !s.checks.is_empty();
-    // `claude_local` env vars are synthesized at spawn, but only for Claude
-    // tabs that opted in — irrelevant edits shouldn't nag.
-    let local_env = s
-        .tabs
-        .iter()
-        .any(|t| {
-            matches!(t, TabConfig::AiTool(c)
-                if c.use_local_provider && command_is(&c.command, "claude"))
-        })
-        .then(|| {
-            serde_json::json!([
-                s.claude_local.base_url,
-                s.claude_local.auth_token,
-                s.claude_local.model_alias,
-            ])
-        });
-    // V33 Phase B: the tab sandbox is baked at spawn in the most literal sense —
-    // an OS boundary is put around the process at `CreateProcessW` time and
-    // cannot be added to or removed from a running one. Without a slot here,
-    // ticking "Also sandbox AI tabs" would leave every open tab unconfined with
-    // no restart hint, and the user would reasonably believe the switch took.
-    //
-    // The EFFECTIVE value, per the rule at the top of this object: `tabs` alone
-    // changes no spawn while the master switch is off. `extra_grant_dirs` rides
-    // along because the grants are applied during preparation, so editing the
-    // list cannot widen a boundary that already exists. `allow_network` is
-    // deliberately ABSENT: it does not govern tabs (a sandboxed tab always has
-    // egress, decision B3), and nagging every tab to restart for a knob that
-    // cannot reach them is how a restart hint stops being read.
-    let sandbox = serde_json::json!([
-        s.sandbox.enabled && s.sandbox.tabs,
-        s.sandbox.extra_grant_dirs,
-    ]);
-    let claude = serde_json::json!({
-        // V37 Phase F: ONE element, not two. The `cimp-offload` entry is now
-        // written into every AI tab's harness config unconditionally, so the
-        // element that used to carry `advertises_offload_to_claude` was a
-        // constant — and worse, a constant assembled from `any_claude_mcp()`,
-        // which is exactly the live-propagating input this phase removed from
-        // the spawn-baked set. Keeping it would have nagged the user to restart
-        // every tab for an MCP access flip that now takes effect where they are
-        // standing. The audit child IS still gated, so its element stays.
-        "mcp": [advertises_audit_to_claude(s)],
-        "guidance": guidance.clone(),
-        "sandbox": sandbox.clone(),
-        "statusline": s.statusline.enabled,
-        // The `--settings` hooks overlay gates, in `build_pre_args` order:
-        // UserPromptSubmit, PreCompact, PreToolUse Read, PreToolUse Bash,
-        // PreToolUse pre-mutation checkpoint (V33 Phase F), PostToolUse
-        // auto-check.
-        //
-        // V35 Phase J's `SessionStart` hello needs **no slot of its own**: it is
-        // emitted whenever any other hook is, and its `serves`/`cannot`
-        // declaration is computed from exactly these booleans plus
-        // `native_web` (carried by `"injection"` below) and
-        // `notify_hooks`/`workbench.checkpoints` (already here). So every input
-        // that can change what the hello says already moves this signature.
-        //
-        // **2026-08-17 changed the SHAPE of three emitted entries and needs no
-        // new slot either, which is a fact worth checking rather than assuming**
-        // (the rule at the top of this object demands an entry per
-        // Settings-derived value BAKED into an artifact, and all three are):
-        //   * the taint beacon became `type: "http"` — its gate is still
-        //     `native_web == Sensor && loopback_needed()`, carried by
-        //     `"injection"` (every tab's resolved mode) + `"notify_hooks"`;
-        //   * the pre-mutation checkpoint became `type: "http"` — its gate is
-        //     still `workbench.checkpoints && loopback_needed()`, and both halves
-        //     are already here (the fifth `hooks` slot, and `"notify_hooks"`);
-        //   * the new `PostToolUseFailure` entry rides `tool_result_hook`
-        //     (`graph.enabled && loopback_needed()`), and `graph.enabled` already
-        //     moves `"guidance"` and three `hooks` slots.
-        // A restart hint therefore still fires for every input that can change
-        // what a fresh tab writes.
-        "hooks": [
-            s.graph.enabled && (s.graph.context_injection || s.workbench.checkpoints),
-            s.graph.enabled && s.graph.context_injection && s.graph.compaction_context,
-            read_hook,
-            read_hook && s.graph.read_advisor_shell,
-            // V33 Phase F. Spawn-baked like every other hook entry, so without
-            // a slot here toggling `workbench.checkpoints` mid-session would
-            // leave every running Claude tab permanently checkpoint-blind (or
-            // still checkpointing) with no restart hint. `loopback_needed()`
-            // rides the `notify_hooks` key below and covers the second half of
-            // this gate; the entry here is the first half, which nothing else
-            // in this signature carries — `workbench.checkpoints` reaches the
-            // UserPromptSubmit slot only in combination with `graph.enabled`,
-            // so on a graph-off install that slot cannot move at all.
-            s.workbench.checkpoints,
-            post_edit,
-        ],
-        // NC-2 + H2 fix: the `Notification` / `PermissionDenied` pair. Injected
-        // whenever the loopback they POST into actually runs, so the value is
-        // Settings-derived (offload / graph / Code Audit MCP) even though there
-        // is no permission-detection toggle of its own. Flipping any of those
-        // features changes how a FRESH Claude tab launches — hook-primary vs.
-        // regex-only permission detection — so a running tab is owed a restart
-        // hint. Kept as its own key rather than a sixth `hooks` slot so the
-        // array above keeps mapping 1:1 to the gated `build_pre_args` entries.
-        "notify_hooks": s.loopback_needed(),
-        "local_env": local_env,
-        // V30 Phase A: the session-push flag pair — Claude's
-        // `--dangerously-load-development-channels` and the `cimp-offload`
-        // child's own `--channel-push`. Claude-only (OpenCode has no MCP inbound
-        // path) and baked at spawn, so it is exactly the kind of Settings-gated
-        // injection the rule at the top of this object demands an entry for:
-        // without it, toggling `session_push` mid-session leaves every running
-        // tab silently unregistered (or registered) with no restart hint.
-        //
-        // The EFFECTIVE value, which since V37 Phase F IS the raw toggle: the
-        // `cimp-offload` server is injected into every AI tab, so a
-        // `session_push` flip always changes argv (both the client
-        // `--dangerously-load-development-channels server:cimp-offload` pair and
-        // the child's own `--channel-push`). The old second conjunct
-        // (`advertises_offload_to_claude`) existed to avoid nagging when no
-        // server was injected; there is no such case any more, and leaving it
-        // would have smuggled `any_claude_mcp()` back into the spawn-baked set.
-        "channels": s.offload.session_push,
-        // V32 Phase F (locked decision 14) + Phase G (locked decision 16): the
-        // native-web visibility mode AND the consumer-hygiene switch, both
-        // spawn-baked, both resolved PER TAB through the three-level hierarchy.
-        //
-        // `injection::spawn_sig` carries the master switch, the spawn-baked L2
-        // flags THIS consumer reads and every CLAUDE tab's L3 cells plus its
-        // resolved mode, so a flip at any of the three levels moves this
-        // signature and raises the restart hint. Live features (latch,
-        // spotlighting, detection, SSRF, budgets, canary, quarantine) are
-        // deliberately absent: they take effect on the next call, and a restart
-        // nag for a change that needs no restart is how a hint stops being read.
-        //
-        // #48 (F-x): per-consumer, not the shared blob it used to be. An
-        // OpenCode-only flip — the Phase H gate, or a native-web override on an
-        // OpenCode tab — was marking Claude tabs dirty and nagging them to
-        // restart for a change that cannot reach them.
-        "injection": crate::settings::injection::spawn_sig(s, InjConsumer::Claude),
-    });
-    let opencode = serde_json::json!({
-        // V37 Phase F: ONE element — see the Claude half above.
-        "mcp": [advertises_audit_to_opencode(s)],
-        "guidance": guidance,
-        "sandbox": sandbox,
-        // `write_opencode_plugin` inputs: plugin presence + its baked
-        // CIMP_INJECT_ENABLED / CIMP_AUTO_CHECK_ENABLED flags.
-        //
-        // V32 Phase F: plugin PRESENCE is no longer `graph.enabled` alone —
-        // sensor mode needs the plugin too (`opencode_plugin_wanted`).
-        // V32 Phase G: that predicate is now per-tab, and its native-web half is
-        // fully covered by the `"injection"` entry below (which carries every
-        // tab's resolved mode), so only the app-wide graph half belongs here.
-        "plugin": [
-            s.graph.enabled,
-            s.graph.enabled && s.graph.context_injection,
-            post_edit,
-            // V33 Phase F: the pre-mutation checkpoint flag, and the fourth
-            // disjunct of `opencode_plugin_wanted`. It is app-wide (not part of
-            // the injection hierarchy), so it cannot ride the `"injection"`
-            // entry below and needs a slot of its own — without one, toggling
-            // checkpoints would change what a fresh OpenCode tab writes with no
-            // restart hint, which is the exact failure `opencode_plugin_wanted`
-            // documents.
-            s.workbench.checkpoints,
-        ],
-        // The injected `local-llama` provider block (`build_opencode_config`).
-        "provider": s
-            .offload
-            .resolve_opencode_provider()
-            .map(|p| serde_json::json!([p.base_url, p.model, p.api_key])),
-        // V32 Phase F: `sensor` bakes the beacon handler's flag into the
-        // plugin, `deny` writes `permission.webfetch/websearch = "deny"` into
-        // `OPENCODE_CONFIG_CONTENT` — both spawn-time, like the Claude half.
-        // V32 Phase G: the per-tab fragment, now scoped to the OPENCODE tabs
-        // and to the features this consumer reads (#48, F-x) — which is all
-        // three, since the Phase H gate lives in the generated plugin.
-        "injection": crate::settings::injection::spawn_sig(s, InjConsumer::Opencode),
-    });
-    [claude, opencode]
+/// `local-llama` provider). Compared across a Settings save to decide whether a
+/// "restart the AI tab" hint is due. Coarse by design: any difference means a
+/// fresh tab would be launched differently from the one still running.
+///
+/// **V40 Phase A replaced the `[Value; 2]`** (locked decisions 8 and 25). It was
+/// read POSITIONALLY by the restart-hint consumer, so a harness with no slot
+/// meant a spawn-baked setting could flip with no restart hint and no diff —
+/// the failure the mechanism exists to prevent. A [`PerHarness`] is sized by the
+/// registry, so a missing slot is a compile error, and each half is now built by
+/// the plugin that knows what it bakes.
+///
+/// [`PerHarness`]: crate::harness::PerHarness
+pub(crate) fn spawn_inject_sig(s: &Settings) -> crate::harness::PerHarness<serde_json::Value> {
+    crate::harness::PerHarness::from_fn(|h| {
+        h.plugin().map(|p| p.spawn_sig(s)).unwrap_or(serde_json::Value::Null)
+    })
 }
 
 /// Compose the capability-guidance addendum shared by Claude
@@ -822,13 +501,23 @@ pub(crate) fn compose_capability_guidance(cfg: &AiToolTabConfig, settings: &Sett
     // this consumer's exposure flag — the flag decides whether that tool is
     // advertised at all, and a paragraph recommending a tool the session cannot
     // see is worse than no paragraph.
+    // V40 Phase A: a tab that runs no registered harness gets no per-agent
+    // guidance. `tool_steering_for` / `commands_exposed_to` / `fact_promotion_
+    // block` are all keyed by the CHP agent token, and there is no honest token
+    // for a command nobody registered — resolving one would mean asking a
+    // question about a harness this tab is not.
+    // `None` = a tab that runs no registered harness. The neutral nudges below
+    // still compose (they name no agent); only the per-agent gates are skipped,
+    // because there is no honest CHP token to resolve them under.
     let agent = tab_consumer(cfg);
-    if tool_steering_for(settings, agent, &cfg.id) {
+    if agent.is_some_and(|a| tool_steering_for(settings, a, &cfg.id)) {
         if !addendum.is_empty() {
             addendum.push_str("\n\n");
         }
         addendum.push_str(&tool_steering_guidance(
-            settings.tool_plugins.commands_exposed_to(agent),
+            settings
+                .tool_plugins
+                .commands_exposed_to(agent.expect("gated on `agent` being Some")),
         ));
     }
     if settings.offload.enabled && settings.offload.inject_guidance {
@@ -857,7 +546,9 @@ pub(crate) fn compose_capability_guidance(cfg: &AiToolTabConfig, settings: &Sett
             .cwd
             .clone()
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-        if let Some(block) = fact_promotion_block(&root, settings, agent, &cfg.id) {
+        if let Some(block) =
+            agent.and_then(|a| fact_promotion_block(&root, settings, a, &cfg.id))
+        {
             if !addendum.is_empty() {
                 addendum.push_str("\n\n");
             }
@@ -898,11 +589,13 @@ pub(crate) fn compose_capability_guidance(cfg: &AiToolTabConfig, settings: &Sett
 /// is for the permission pins.
 ///
 /// Still consumer-specific, because `consumer_hygiene_for` resolves per tab and
-/// per agent. Non-Claude commands are treated as OpenCode, matching how
-/// `build_pre_args` (Claude-only) and `build_opencode_config` (everything else)
-/// already split.
+/// per agent. **V40 Phase A**: a command that names no registered harness is
+/// no longer "treated as OpenCode" — it has no consumer, so it gets no
+/// paragraph, which is the same answer the rest of its launch path gives it.
 fn injection_hygiene_applies(cfg: &AiToolTabConfig, settings: &Settings) -> bool {
-    consumer_hygiene_for(settings, tab_consumer(cfg), &cfg.id)
+    // V40 Phase A: a tab that runs no registered harness has no consumer, so
+    // there is no hygiene setting resolved for it and no paragraph to inject.
+    tab_consumer(cfg).is_some_and(|agent| consumer_hygiene_for(settings, agent, &cfg.id))
 }
 
 /// V12 Phase E: the `## cImp project facts` launch-time addendum — PINNED
@@ -1176,47 +869,27 @@ fn build_extra_args(
     _settings: &Settings,
     invocation_args: &[String],
 ) -> Vec<String> {
+    let plugin = crate::harness::HarnessId::from_command(&cfg.command).and_then(|h| h.plugin());
     let mut out: Vec<String> = Vec::new();
 
-    // V20: OpenCode launches in its native fullscreen (alternate-screen) TUI —
-    // no `--mini`. The earlier inline forcing (`--mini`) was dropped because the
-    // reduced palette hid commands like `/connect`; cImp now drives every AI tab
-    // fullscreen and sources TTS out-of-band (OpenCode's `GET /event` stream),
-    // not by scraping the linear terminal stream. See MILESTONE-V20.
-    //
-    // D-8 (maintenance 2026-08-04): cImp does not merely decline to inject
-    // `--mini` — it must actively strip a user-supplied one from an OpenCode
-    // tab's stored `args`. `resolve_oob_source` unconditionally appends
-    // `--port <N> --hostname 127.0.0.1` to every OpenCode launch (that port is
-    // the TTS event tap), and `opencode --mini --port N` HARD-FAILS: the two
-    // flags are mutually exclusive. So the combination is reachable — the
-    // v19→v20 migration stripped `--mini` from stored args once, but nothing
-    // stops it coming back via a hand-edited settings file, a `.cimp.custom.
-    // config.json` overlay, or a settings file carried over from another
-    // machine. Dropping it keeps the tab launchable (the flag is inert under
-    // V20 anyway) instead of handing the user an opaque OpenCode usage error;
-    // the launch log records the correction.
-    let mini_guard = command_is(&cfg.command, "opencode");
+    // A harness may REFUSE one of the tab's stored arguments (OpenCode's
+    // `--mini`, which its own launch flags make fatal). The refusal is a
+    // correction with a log line, not a launch failure — see
+    // `HarnessPlugin::arg_is_rejected`.
     for arg in cfg.args.iter().filter(|s| !s.is_empty()) {
-        if mini_guard && is_mini_flag(arg) {
-            tracing::warn!(
-                tab = %cfg.id,
-                arg = %arg,
-                "opencode tab: dropping `--mini` from args — cImp launches OpenCode \
-                 fullscreen with `--port` for the TTS event tap, and OpenCode rejects \
-                 `--mini` combined with `--port`. Remove it from the tab's args.",
-            );
+        if let Some(why) = plugin.and_then(|p| p.arg_is_rejected(arg)) {
+            tracing::warn!(tab = %cfg.id, arg = %arg, why, "dropping an argument this harness refuses");
             continue;
         }
         out.push(arg.clone());
     }
 
-    // cimp is documented as a drop-in replacement for `claude`, so
-    // invocation args (`cimp --resume <id>`, etc.) flow into every
-    // Claude tab. OpenCode's model/provider selection arrives via the
-    // injected config, not flags, so we only forward invocation args to
-    // Claude tabs.
-    if command_is(&cfg.command, "claude") {
+    // cImp is documented as a drop-in replacement for one harness's binary, so
+    // invocation args (`cimp --resume <id>`, etc.) flow into that harness's
+    // tabs. A harness that selects its model and session through config rather
+    // than flags declares `false` and gets none of them — forwarding another
+    // CLI's flags into it is how a tab fails to launch.
+    if plugin.is_some_and(|p| p.accepts_passthrough_argv()) {
         for arg in invocation_args {
             if !arg.is_empty() {
                 out.push(arg.clone());
@@ -1224,40 +897,6 @@ fn build_extra_args(
         }
     }
     out
-}
-
-/// D-8: does `arg` set OpenCode's `--mini` flag? Matches the bare flag and the
-/// `--mini=<value>` form (clap accepts both for a bool flag), so neither
-/// spelling can survive into a launch that also carries `--port`.
-fn is_mini_flag(arg: &str) -> bool {
-    arg == "--mini" || arg.starts_with("--mini=")
-}
-
-/// V34: does this arg list already choose which conversation Claude Code runs?
-///
-/// If so, cImp must not add a `--session-id` of its own — the user's selector
-/// names an existing session, and ours would either be rejected outright or
-/// silently compete with it. The tab then keeps the pre-V34 newest-wins
-/// binding, which is correct-if-ambiguous rather than confidently wrong.
-///
-/// Matches the `=` spellings too (`--resume=<id>`), same as [`is_mini_flag`],
-/// and the short forms Claude Code documents (`-c`, `-r`). Erring toward
-/// over-matching is deliberate: a false positive costs only the pin, while a
-/// false negative hands the child two conflicting session selectors.
-fn args_select_session(args: &[String]) -> bool {
-    const SELECTORS: [&str; 7] = [
-        "--session-id",
-        "--resume",
-        "-r",
-        "--continue",
-        "-c",
-        "--fork-session",
-        "--from-pr",
-    ];
-    args.iter().any(|a| {
-        let head = a.split_once('=').map_or(a.as_str(), |(k, _)| k);
-        SELECTORS.contains(&head)
-    })
 }
 
 /// V1.4-07 / V14: compose the spawn environment for an AI tab. Per-tab
@@ -1291,146 +930,18 @@ fn compose_ai_env(
     endpoint: Option<&crate::offload::loopback::Discovery>,
 ) -> HashMap<String, String> {
     let mut env: HashMap<String, String> = HashMap::new();
-
-    // ── V35 Phase J: the bearer token for Claude's `type: "http"` hooks ──────
-    //
-    // Every emitted hook entry sends `Authorization: Bearer $CIMP_HOOK_TOKEN`
-    // and names that variable in `allowedEnvVars`; the harness substitutes it
-    // from its OWN environment, which is this map. An unlisted or unset name
-    // substitutes to the empty string, so a missing value here is a silent 401
-    // on every hook — which is why it is set unconditionally for a Claude tab
-    // whenever this instance has a loopback at all, rather than being ANDed with
-    // the per-hook gates.
-    //
-    // **Env rather than a literal in the overlay**, which is where the OpenCode
-    // side puts it (`opencode_plugin_source` bakes it into a file). The overlay
-    // is an argv value — `--settings <json>` — and argv is readable by every
-    // process running as this user with no effort at all. That is not a trust
-    // boundary either way (`docs/CHP.md` § 2: the token means *a local process*,
-    // never *cImp's own child*), so this is defence in depth, not containment.
-    //
-    // Not Settings-derived — the token is per app launch — so it needs no
-    // `spawn_inject_sig` entry, same reasoning as `CIMP_TAB_ID` below.
-    if command_is(&cfg.command, "claude") {
-        if let Some(disc) = endpoint {
-            env.insert(claude_hook::TOKEN_ENV.to_string(), disc.token.clone());
-        }
+    // Everything harness-specific — the hook bearer token, the injected config
+    // document, the server credential, the local-provider variables — is the
+    // plugin's (V40 locked decision 4). A tab whose command matches no
+    // registered harness gets none of it, which is the point: synthesizing one
+    // harness's variables into another's child is how a launch fails for reasons
+    // the user cannot see.
+    if let Some(p) = crate::harness::HarnessId::from_command(&cfg.command).and_then(|h| h.plugin())
+    {
+        p.compose_env(cfg, settings, tab, endpoint, &mut env);
     }
-
-    // V20: Claude Code runs in its native fullscreen (alternate-screen) TUI —
-    // cImp no longer sets `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN`. The old
-    // inline forcing existed so the scrape pipeline could find `[[TTS]]` markers
-    // and keep mouse gestures local; both concerns are retired. TTS for AI tabs
-    // is now sourced out-of-band (Claude's transcript JSONL), and the terminal
-    // hosts the fullscreen app like any other terminal would. See MILESTONE-V20.
-
-    // V19: OpenCode launch env. Now that the renderer is fullscreen (no
-    // `--mini`), this still (1) injects the session-scoped config as one
-    // `OPENCODE_CONFIG_CONTENT` env var — the env-var analog of Claude's
-    // `--mcp-config` / `--settings` / `--append-system-prompt` CLI flags — and
-    // (2) quiets terminal features that fight cImp's own selection/title
-    // handling. Set before the per-tab `env` merge below so a user can override
-    // any of these per tab.
-    if command_is(&cfg.command, "opencode") {
-        let config = build_opencode_config(cfg, settings, tab);
-        // V35 Phase K: the env var's NAME is OpenCode's, so it is spelled once,
-        // in `harness/opencode/config.rs`, beside the document it carries.
-        env.insert(CONFIG_ENV.to_string(), config.to_string());
-        // ── 2026-08-17: authenticate the TUI's own HTTP server ───────────────
-        //
-        // The fullscreen TUI hosts an HTTP server on the `--port` below, and
-        // until today cImp depended on that server accepting UNAUTHENTICATED
-        // loopback calls — capability `opencode.route.noauth`, whose second edge
-        // was that any local process could `POST /session/:id/message` into a
-        // live session and start an agent turn. Upstream's documented answer is
-        // these two variables, and the whole mechanism lives in
-        // `harness/opencode/config.rs`: the names are OpenCode's, so this file
-        // spells neither of them (the same rule `CONFIG_ENV` above follows, and
-        // the layering scan enforces it now that both are `Dep::ConfigKey`s).
-        //
-        // A FRESH password per spawn, never persisted, never in argv, and read
-        // back out of this map by `resolve_oob_source` so the tap presents the
-        // credential the child will actually use. Not Settings-derived, so it
-        // owes no `spawn_inject_sig` entry — same reasoning as the Claude hook
-        // token above and `CIMP_TAB_ID` below.
-        for (name, value) in
-            crate::harness::opencode::config::server_auth_env(
-                &crate::harness::opencode::config::new_server_password(),
-            )
-        {
-            env.insert(name, value);
-        }
-        // V32 Phase F: the generated plugin's only channel to its own tab
-        // identity. OpenCode's `tool.execute.before` input carries a session id
-        // but no tab and no cwd (the E2 spike's finding), and the latch registry
-        // is keyed by (agent, tab) — so without this the beacon has nothing to
-        // engage. Claude's side needs no equivalent: its hook command bakes
-        // `--tab <id>` into argv.
-        //
-        // Unconditional and NOT Settings-derived (the tab id is config-derived
-        // and stable), so it needs no `spawn_inject_sig` entry of its own —
-        // same reasoning as the `--tab` MCP child argument.
-        env.insert("CIMP_TAB_ID".to_string(), tab.to_string());
-        env.insert(
-            "OPENCODE_EXPERIMENTAL_DISABLE_COPY_ON_SELECT".to_string(),
-            "1".to_string(),
-        );
-        env.insert(
-            "OPENCODE_DISABLE_TERMINAL_TITLE".to_string(),
-            "1".to_string(),
-        );
-        // Windows: OpenCode shells out via Git Bash. Pass the path through when
-        // the parent environment already names it, so the child finds it.
-        if let Ok(bash) = std::env::var("OPENCODE_GIT_BASH_PATH") {
-            if !bash.is_empty() {
-                env.insert("OPENCODE_GIT_BASH_PATH".to_string(), bash);
-            }
-        }
-    }
-
-    // ── `CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS` is DELIBERATELY NOT SET ────────
-    //
-    // Do not re-add it. Maintenance D-2 (2026-08-04) pinned it to `0` for every
-    // Claude tab to disable Claude Code's ~2-minute MCP auto-backgrounding,
-    // because cImp's loopback proxy and offload/audit result handling were
-    // assumed to require a *synchronous* MCP return and several `cimp-offload`
-    // tools (offload_task, offload_batch, security_audit, quality_audit, graph
-    // indexing) routinely run past it.
-    //
-    // V30 Phase 0 test T4 (2026-08-05, Claude Code 2.1.222 — see
-    // `docs/MILESTONE-V30-mcp-channels.md`) live-verified that assumption is
-    // wrong: a backgrounded MCP call's **complete result text** arrives in a
-    // `<task-notification>` message, losing nothing, and the child's
-    // synchronous NDJSON pipeline is unaffected because backgrounding is purely
-    // client-side. Blocking the harness for minutes per call was the more
-    // expensive half of that trade, so V30 Phase C removed the kill switch and
-    // Claude tabs now use native auto-backgrounding (spike decision 2). The
-    // keepalive alternative is not available either — T5 proved
-    // `notifications/progress` does NOT reset the stall timer.
-    //
-    // The var was unconditional (never a user setting), so its removal needs no
-    // `spawn_inject_sig` change. A user who wants the old behaviour can still
-    // set it per tab; the per-tab `env` merge below passes it straight through.
-
-    // Claude against a local provider: synthesize `ANTHROPIC_*` env. OpenCode's
-    // local provider arrives inside `OPENCODE_CONFIG_CONTENT` (a `provider`
-    // block, see `build_opencode_config`), not as env vars, so it is handled
-    // there rather than here.
-    if cfg.use_local_provider && command_is(&cfg.command, "claude") {
-        let cl = &settings.claude_local;
-        if !cl.base_url.is_empty() {
-            env.insert("ANTHROPIC_BASE_URL".to_string(), cl.base_url.clone());
-        }
-        if !cl.auth_token.is_empty() {
-            env.insert("ANTHROPIC_AUTH_TOKEN".to_string(), cl.auth_token.clone());
-        }
-        if !cl.model_alias.is_empty() {
-            // Claude Code primarily uses --model flag for model selection, but
-            // ANTHROPIC_MODEL is honored by some proxies; setting both is harmless.
-            env.insert("ANTHROPIC_MODEL".to_string(), cl.model_alias.clone());
-        }
-    }
-    // Per-tab env wins over synthesized values.
+    // Per-tab env wins over synthesized values — the user's most specific scope,
+    // applied last so no plugin can overwrite it.
     for (k, v) in &cfg.env {
         env.insert(k.clone(), v.clone());
     }
@@ -1439,6 +950,28 @@ fn compose_ai_env(
 
 #[cfg(test)]
 mod tests {
+    // The Claude hook-route vocabulary and OpenCode's config writers: the
+    // production launch path reaches them through each harness's plugin now,
+    // but the tests below assert on the ARTIFACTS both produce, so they name
+    // them directly (a test that quotes a payload is a recorded input, which is
+    // why `layering.rs`'s literal scan skips test text).
+    use crate::harness::claude::hook as claude_hook;
+    use crate::harness::opencode::config::build_opencode_config;
+
+    /// What `build_ai_tool_spec` does for the out-of-band source, in one line —
+    /// V40 Phase A moved the bodies behind `HarnessPlugin::resolve_oob`, and the
+    /// tests below drive the whole path (classify, then ask) rather than one
+    /// harness's half, which is what they were always about.
+    fn resolve_oob_source(
+        cfg: &AiToolTabConfig,
+        working_dir: &Path,
+        extra_args: &mut Vec<String>,
+        env: &HashMap<String, String>,
+    ) -> Option<crate::harness::OobSpec> {
+        crate::harness::HarnessId::from_command(&cfg.command)
+            .and_then(|h| h.plugin())
+            .and_then(|p| p.resolve_oob(cfg, working_dir, extra_args, env))
+    }
     use super::*;
     use crate::settings::{
         ai_tab_inheriting_injection, default_claude_tab, default_opencode_tab,
@@ -3296,7 +2829,7 @@ mod tests {
     fn tool_steering_renders_run_command_only_when_that_tool_is_exposed() {
         use crate::settings::injection::Feature;
         for cfg in [claude_cfg(), opencode_cfg()] {
-            let agent = tab_consumer(&cfg);
+            let agent = tab_consumer(&cfg).expect("a shipped harness tab");
 
             // Off: no paragraph at all, and (with every other feature off) no
             // addendum from this source.
@@ -3380,7 +2913,7 @@ mod tests {
     fn tool_steering_still_renders_with_the_injection_master_switch_off() {
         use crate::settings::injection::{Feature, Override};
         for cfg in [claude_cfg(), opencode_cfg()] {
-            let agent = tab_consumer(&cfg);
+            let agent = tab_consumer(&cfg).expect("a shipped harness tab");
 
             let mut s = Settings::default();
             s.set_master_for_test(false);
@@ -4259,58 +3792,6 @@ mod tests {
             vec!["--mini".to_string()],
             "non-opencode tabs keep their own args verbatim",
         );
-    }
-
-    #[test]
-    fn args_select_session_spots_every_documented_selector() {
-        for sel in [
-            "--session-id",
-            "--resume",
-            "-r",
-            "--continue",
-            "-c",
-            "--fork-session",
-            "--from-pr",
-        ] {
-            assert!(
-                args_select_session(&[sel.to_string()]),
-                "{sel} must suppress the pin"
-            );
-        }
-        // `=` spellings count too, long and short.
-        assert!(args_select_session(&["--resume=abc123".to_string()]));
-        assert!(args_select_session(&["-r=abc123".to_string()]));
-        // ...and the selector is found wherever it sits in the list.
-        assert!(args_select_session(&[
-            "--model".to_string(),
-            "opus".to_string(),
-            "--continue".to_string(),
-        ]));
-    }
-
-    #[test]
-    fn args_select_session_does_not_over_match_ordinary_flags() {
-        // A false positive only costs the pin, but a flag that merely starts
-        // with a selector's letters must not silently disable per-tab identity.
-        assert!(!args_select_session(&[]));
-        assert!(!args_select_session(&[
-            "--model".to_string(),
-            "opus".to_string()
-        ]));
-        assert!(!args_select_session(&["--resumable".to_string()]));
-        assert!(!args_select_session(&["--continue-on-error".to_string()]));
-    }
-
-    #[test]
-    fn is_mini_flag_matches_both_spellings() {
-        assert!(is_mini_flag("--mini"));
-        assert!(is_mini_flag("--mini=true"));
-        assert!(is_mini_flag("--mini=false"));
-        // Near misses stay put.
-        assert!(!is_mini_flag("--minimal"));
-        assert!(!is_mini_flag("--mini-mode"));
-        assert!(!is_mini_flag("-m"));
-        assert!(!is_mini_flag("mini"));
     }
 
     #[test]
@@ -7032,28 +6513,29 @@ console.log("OK: the swap reached neither the gate nor the beacon");
     ///
     /// # Why the paths here are BUILT, not spelled
     ///
-    /// The first version of this test asserted on the literal
-    /// `C:\Users\x\.local\bin\claude.exe` and passed on Windows while failing on
-    /// the Linux CI runner, because [`command_is`] resolves through
-    /// `Path::file_stem` and **`\` is not a separator on Linux** — so that whole
-    /// string is one file name whose stem is `C:\Users\x\.local\bin\claude`. The
-    /// defect was entirely in the fixture (see
+    /// The first version of this test asserted on a literal Windows path and
+    /// passed on Windows while failing on the Linux CI runner, because the
+    /// lookup resolves through `Path::file_stem` and a backslash is not a
+    /// separator on Linux — so that whole string is one file name. The defect
+    /// was entirely in the fixture (see
     /// [`every_default_ai_tab_carries_a_harness_on_every_platform`] for the
-    /// production-surface guard), and the standing rule it broke is: a path in a
-    /// test fixture is built with `Path::join` so the separators are the running
-    /// platform's, or it is not a path at all.
+    /// production-surface guard), and the standing rule it broke is: a path in
+    /// a test fixture is built with `Path::join` so the separators are the
+    /// running platform's, or it is not a path at all.
     #[test]
     fn only_ai_tool_tabs_carry_a_harness_and_shell_tabs_never_do() {
-        use crate::sandbox::tabs::Harness;
+        use crate::harness::HarnessId;
+        let claude = HarnessId::from_id("claude");
+        let opencode = HarnessId::from_id("opencode");
         // The bare configured names — what settings actually hold, and identical
         // on every platform. `claude-local` is a TAB id whose COMMAND is
         // `claude`, so it is the same harness with the same state directories.
-        assert_eq!(harness_of("claude"), Some(Harness::Claude));
-        assert_eq!(harness_of("opencode"), Some(Harness::OpenCode));
+        assert_eq!(HarnessId::from_command("claude"), claude);
+        assert_eq!(HarnessId::from_command("opencode"), opencode);
         // Case-insensitive, and an extension is stripped. No separator in these,
         // so they mean the same thing on both platforms.
-        assert_eq!(harness_of("CLAUDE.EXE"), Some(Harness::Claude));
-        assert_eq!(harness_of("OpenCode"), Some(Harness::OpenCode));
+        assert_eq!(HarnessId::from_command("CLAUDE.EXE"), claude);
+        assert_eq!(HarnessId::from_command("OpenCode"), opencode);
 
         // A fully-qualified path, spelled the way THIS platform spells one.
         let resolved = std::path::Path::new("home")
@@ -7062,25 +6544,26 @@ console.log("OK: the swap reached neither the gate nor the beacon");
             .join("bin")
             .join(if cfg!(windows) { "claude.exe" } else { "claude" });
         assert_eq!(
-            harness_of(&resolved.to_string_lossy()),
-            Some(Harness::Claude),
+            HarnessId::from_command(&resolved.to_string_lossy()),
+            claude,
             "a resolved harness path must be recognised on {}",
             std::env::consts::OS
         );
 
         // Anything else is NOT sandboxed: a grant table nobody wrote is not a
         // boundary, it is a tool that fails to start invisibly.
-        assert_eq!(harness_of("bash"), None);
-        assert_eq!(harness_of("aider"), None);
-        assert_eq!(harness_of(""), None);
+        assert_eq!(HarnessId::from_command("bash"), None);
+        assert_eq!(HarnessId::from_command("aider"), None);
+        assert_eq!(HarnessId::from_command(""), None);
 
-        // …and the split agrees with the one the injection layer makes, so the
-        // sandbox's grant table and the injected config can never disagree about
-        // what a tab is.
+        // …and the split the SANDBOX makes is the split the INJECTION layer
+        // makes, because since V40 Phase A there is only one — both ends ask
+        // `HarnessId::from_command`, so a tab's grant table and its injected
+        // config can never disagree about what it is.
         for command in ["claude", "opencode", "bash"] {
             assert_eq!(
-                harness_of(command) == Some(Harness::Claude),
-                command_is(command, "claude"),
+                HarnessId::from_command(command).and_then(|h| h.id()),
+                crate::settings::injection::Consumer::for_command(command).map(|c| c.agent()),
                 "{command}: the sandbox and the injection layer disagree"
             );
         }
@@ -7134,7 +6617,7 @@ console.log("OK: the swap reached neither the gate nor the beacon");
             };
             seen += 1;
             assert!(
-                harness_of(&cfg.command).is_some(),
+                crate::harness::HarnessId::from_command(&cfg.command).is_some(),
                 "the default AI tab `{}` (command `{}`) carries no harness on {} — it would \
                  spawn with NO sandbox and NO skip row explaining why",
                 cfg.id,

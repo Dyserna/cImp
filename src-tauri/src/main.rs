@@ -184,6 +184,45 @@ fn attach_parent_console() {
 #[cfg(not(windows))]
 fn attach_parent_console() {}
 
+/// Resolve `--consumer <name>` against the registry (V40 locked decision 2).
+///
+/// The **default stays `"claude"`** on the command line: a shim or a hand-run
+/// child from before the flag existed omits it, and refusing those would break
+/// backward compatibility for no gain — see
+/// [`crate::harness::DEFAULT_HARNESS`], which carries the full rationale. What
+/// changed is that the value is now *resolved*: a token nobody declared fails
+/// the proxy start with the registered list in the message, instead of silently
+/// serving Claude's tool set to a child that asked for something else.
+fn resolve_consumer(args: &[String]) -> Result<&'static str, String> {
+    let named = args
+        .iter()
+        .position(|a| a == "--consumer")
+        .and_then(|i| args.get(i + 1))
+        .map(|s| s.trim());
+    let Some(named) = named.filter(|s| !s.is_empty()) else {
+        return Ok(crate::harness::DEFAULT_HARNESS
+            .id()
+            .expect("DEFAULT_HARNESS names a registered harness"));
+    };
+    // `offload` is cImp's OWN in-app consumer, not a harness: the offload worker
+    // calls the proxy with it. It is a registered token in the MCP host's
+    // vocabulary and has no `harness/<id>/` directory, so it is accepted here
+    // beside the registry's ids rather than smuggled into the registry.
+    if named.eq_ignore_ascii_case("offload") {
+        return Ok("offload");
+    }
+    match crate::harness::HarnessId::from_consumer(named) {
+        Some(h) => Ok(h.id().expect("from_consumer never answers ANY")),
+        None => {
+            let known: Vec<&str> = crate::harness::registry::harness_ids();
+            Err(format!(
+                "cimp: --consumer {named:?} names no registered harness. Registered: {} (plus                  `offload`, cImp's own in-app consumer). A consumer token decides which MCP                  servers this child may reach, so an unrecognised one is refused rather than                  defaulted.",
+                known.join(", ")
+            ))
+        }
+    }
+}
+
 fn main() {
     // `--help`/`--version` guard: agents reflexively probe unknown CLIs with
     // `cimp --help`, and before this guard every such invocation fell through
@@ -321,12 +360,13 @@ fn main() {
     // launch path's `extra_args`.
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--offload-mcp") {
-        let consumer = args
-            .iter()
-            .position(|a| a == "--consumer")
-            .and_then(|i| args.get(i + 1))
-            .map(String::as_str)
-            .unwrap_or("claude");
+        let consumer = match resolve_consumer(&args) {
+            Ok(c) => c,
+            Err(msg) => {
+                eprintln!("{msg}");
+                std::process::exit(2);
+            }
+        };
         // V28: `--tab <tab-id>` names the cImp tab this per-tab child serves, so
         // the app can resolve the tab's CURRENT session for the `context_*`
         // memory tools. Absent (hand-run child, or one spawned before the
@@ -358,12 +398,13 @@ fn main() {
     // the same optional `--consumer <name>` (default `claude`); the app's
     // loopback re-checks that consumer's expose toggle on every run.
     if args.iter().any(|a| a == "--code-audit-mcp") {
-        let consumer = args
-            .iter()
-            .position(|a| a == "--consumer")
-            .and_then(|i| args.get(i + 1))
-            .map(String::as_str)
-            .unwrap_or("claude");
+        let consumer = match resolve_consumer(&args) {
+            Ok(c) => c,
+            Err(msg) => {
+                eprintln!("{msg}");
+                std::process::exit(2);
+            }
+        };
         // V32 C-1b: `--tab <id>` names the cImp tab this child serves, so
         // `/audit/run` can gate the scan on that tab's taint latch. Until the
         // 2026-08-07 review this child deliberately carried no identity and the

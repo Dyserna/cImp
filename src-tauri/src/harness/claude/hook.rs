@@ -67,6 +67,23 @@
 //! **`terminalSequence` is never emitted.** It is a hook-output field that
 //! writes escape sequences into the PTY cImp renders; it is not a CHP capability
 //! and no handler here may produce one (design § 5.2, pinned by a test).
+//!
+//! # V40 Phase C: the ingress, end to end
+//!
+//! Locked decisions 15, 21 and 22. Until this phase the payload MECHANICS lived
+//! here and the dispatch did not: `offload/loopback.rs` held twelve
+//! `("POST", "/claude/hook/*")` arms, ~900 lines of `handle_claude_*` bodies
+//! reading Claude-only payload fields, the five `*_from_hook` converters, the
+//! drift-token vocabulary, the `X-CIMP-*` identity special-case inside core's
+//! CHP observer, and the whole `Notification` classification chain — plus a
+//! `claude_hook` import at 28 sites.
+//!
+//! All of it is below. Core keeps the wire (read the request, write the reply),
+//! the latch, the ledger and one core per capability, and reaches this file
+//! through [`ROUTES_TABLE`] and the neutral `HarnessPlugin` methods. What core
+//! gained is a [`HookReply`]: a status and a body it serializes without
+//! reading, because "Claude answers hook-output JSON and OpenCode answers
+//! `{ok:true}`" is not something core may know.
 
 use serde::Deserialize;
 use std::path::Path;
@@ -228,7 +245,7 @@ pub const ROUTE_PRE_TOOL_USE_TAINT: &str = "/claude/hook/pre_tool_use_taint";
 /// **The one route in this family whose handler must FINISH its work before it
 /// replies.** "The checkpoint precedes the tool call" rests on the tool not
 /// starting until the hook resolves, so the handler awaits the snapshot (bounded
-/// by `loopback::TOOL_CHECKPOINT_BUDGET`, 1800 ms) and only then answers 200.
+/// by `harness::ingress::hook_reply_budget()`, 1800 ms today) and only then answers 200.
 /// That is the shim's 2 s reply wait expressed the other way round: the app is
 /// now on the *inside* of the wait rather than being polled across a socket by a
 /// process that had to guess how long to listen.
@@ -356,12 +373,12 @@ pub const TIMEOUT_SECS: u64 = 1;
 /// Deliberately the value the deleted `--checkpoint-beacon` hook entry carried,
 /// and for the same reason: it is a ceiling over a wait that is *supposed* to
 /// happen, not a budget for a round trip. The app abandons an unfinished
-/// snapshot at `loopback::TOOL_CHECKPOINT_BUDGET` (1800 ms) and answers, so this
+/// snapshot at `harness::ingress::hook_reply_budget()` (1800 ms today) and answers, so this
 /// is a backstop for a wedged listener rather than the mechanism — the same
 /// two-timer relationship the shim had, with the outer timer now enforced by the
 /// harness instead of by a process that had to guess. A test pins the ordering
-/// (`5 s > TOOL_CHECKPOINT_BUDGET`), because the two constants live in different
-/// files and nothing else keeps them ordered.
+/// (`5 s > hook_reply_budget()`), because the ceiling and the budget live in
+/// different modules and nothing else keeps them ordered.
 ///
 /// Everything else stays at [`TIMEOUT_SECS`]: 1 s is right for a hook that must
 /// not delay a turn, and would be wrong here — a checkpoint abandoned at 1 s on
@@ -1206,7 +1223,7 @@ pub const DRIFT_TOKENS: &[&str] = &[
 /// **Why headers.** A hook's body is the harness's own payload — cImp gets no
 /// field in it — so the identity rides headers baked into the emitted hook entry
 /// at spawn. Core used to special-case this by asking
-/// `claude_hook::is_hook_route(route)`; it asks every plugin now, and this is
+/// `hook::is_hook_route(route)`; it asks every plugin now, and this is
 /// this harness's answer (`HarnessPlugin::identity_of_request`).
 ///
 /// Every value is caller-supplied and is validated/bounded at the point of use
@@ -1986,7 +2003,7 @@ async fn handle_claude_taint_beacon(
 /// **undocumented**, which is why the row was Tier D and is why this migration
 /// is the row's closing condition rather than a tidy-up.
 ///
-/// The wait stays bounded by the app's own [`TOOL_CHECKPOINT_BUDGET`] (1800 ms),
+/// The wait stays bounded by the app's own the app's derived reply budget (1800 ms today),
 /// under the entry's pinned 5 s ceiling: past the budget the snapshot is
 /// abandoned unwritten and the miss is surfaced as its own Activity event
 /// (`workbench` / `checkpoint_missed`), because a checkpoint that might contain

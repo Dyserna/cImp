@@ -505,7 +505,7 @@ pub(crate) fn build_pre_args(
             // documented mechanism that makes `permissionDecision` expressible —
             // so the ordering the feature's whole claim rests on is upstream's
             // written contract rather than an observed behaviour. The app still
-            // bounds itself (`loopback::TOOL_CHECKPOINT_BUDGET`, 1800 ms) and
+            // bounds itself (`harness::ingress::hook_reply_budget()`, 1800 ms today) and
             // abandons an unfinished snapshot rather than writing a row that
             // might contain the change it claims to predate; the entry's
             // `timeout` is 5 s, a backstop over that (see

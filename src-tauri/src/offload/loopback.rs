@@ -5411,7 +5411,7 @@ async fn handle_context_retrieve(
 /// *after* those destructive reads already happened:
 ///
 /// - the Claude harness discards the hook's reply outright at 1 s
-///   ([`claude_hook::TIMEOUT_SECS`]);
+///   ([`crate::harness::claude::hook::TIMEOUT_SECS`]);
 /// - the OpenCode plugin aborts its `/context/retrieve` fetch at **600 ms**
 ///   (`AbortSignal.timeout(600)` in `templates/plugin.js` — the five deleted
 ///   shims' own `context_hook::TIMEOUT` number, "a slow/cold index never
@@ -5471,7 +5471,7 @@ fn merge_files_used(parked: Vec<String>, fresh: Vec<String>) -> Vec<String> {
 
 /// The prompt tap's whole effect, shared by `/context/retrieve` (the CHP body a
 /// pre-upgrade shim or the OpenCode plugin posts) and
-/// [`claude_hook::ROUTE_USER_PROMPT_SUBMIT`] (the raw `UserPromptSubmit` payload
+/// [`crate::harness::claude::hook::ROUTE_USER_PROMPT_SUBMIT`] (the raw `UserPromptSubmit` payload
 /// the harness posts since V35 Phase J).
 ///
 /// Extracted rather than duplicated: this is the only place the checkpoint
@@ -5745,7 +5745,7 @@ fn tool_checkpoint_is_mutating(harness: &str, tool: &str) -> bool {
 /// — and the harness runs the tool the moment they do. A snapshot still staging
 /// past that point is racing the very edit it exists to precede, so this route
 /// hands [`WorkbenchService::on_tool`](crate::workbench::WorkbenchService::on_tool)
-/// a deadline of [`TOOL_CHECKPOINT_BUDGET`] and the snapshot writes **nothing**
+/// a deadline of [`tool_checkpoint_budget`] and the snapshot writes **nothing**
 /// once it is spent. The alternative — let the caller give up and let the app
 /// commit the row anyway — is the failure this amendment exists to close: a
 /// checkpoint that sometimes contains the change it claims to predate silently
@@ -5822,7 +5822,7 @@ async fn handle_tool_checkpoint(
 
 /// **The pre-tool checkpoint itself** — the core both out-of-process fire seams
 /// reach: this route's harness-neutral body (the OpenCode plugin) and
-/// [`claude_hook::ROUTE_PRE_TOOL_USE_CHECKPOINT`]'s Claude hook payload.
+/// [`crate::harness::claude::hook::ROUTE_PRE_TOOL_USE_CHECKPOINT`]'s Claude hook payload.
 ///
 /// Split out on 2026-08-17, when the Claude side stopped being a shim POSTing to
 /// the route and became a handler beside it. One core, so the two transports
@@ -5834,7 +5834,7 @@ async fn handle_tool_checkpoint(
 /// Returns `checkpointed`: the trigger settled and nothing about this call is
 /// unaccounted for — true for a checkpoint created, a dedup hit and a throttled
 /// call; false for a non-mutating name, checkpoints off, no service, or a
-/// snapshot abandoned against [`TOOL_CHECKPOINT_BUDGET`]. `settings` is passed in
+/// snapshot abandoned against [`tool_checkpoint_budget`]. `settings` is passed in
 /// rather than read here so a handler resolves identity and policy under ONE
 /// snapshot.
 pub(crate) async fn tool_checkpoint_core(
@@ -6133,7 +6133,7 @@ async fn handle_context_compaction(
 }
 
 /// The compaction carry-over block, **after** the gate — shared by
-/// `/context/compaction` and [`claude_hook::ROUTE_PRE_COMPACT`].
+/// `/context/compaction` and [`crate::harness::claude::hook::ROUTE_PRE_COMPACT`].
 ///
 /// The gate itself deliberately stays in each handler rather than moving in
 /// here: the route-enumeration test (`every_loopback_route_declares_what_it_does_
@@ -6239,7 +6239,7 @@ async fn handle_should_read(
 
 /// The read advisor's verdict, **after** the gate — `Some(reminder)` for a
 /// `remind`, `None` for a `pass`. Shared by `/context/should_read` and
-/// [`claude_hook::ROUTE_PRE_TOOL_USE`]; see [`compaction_block`] for why the
+/// [`crate::harness::claude::hook::ROUTE_PRE_TOOL_USE`]; see [`compaction_block`] for why the
 /// gate stays at each route rather than moving in here.
 pub(crate) fn should_read_verdict(app: &AppHandle, body: &ShouldReadBody) -> Option<String> {
     let graph = app.try_state::<Arc<crate::graph::GraphService>>()?;
@@ -6513,7 +6513,7 @@ async fn handle_contract_drift(stream: &mut TcpStream, req: &Request) -> AppResu
 /// under the same token that capability's payload drift uses.
 fn note_chp(app: &AppHandle, route: &str, req: &Request) {
     // **V40 Phase C, locked decision 22.** This used to read
-    // `claude_hook::is_hook_route(route)` — core deciding, by naming one
+    // `hook::is_hook_route(route)` — core deciding, by naming one
     // harness, where a request's identity lives. The question is now asked of
     // the registry: a plugin whose ingress puts its identity outside the body
     // answers for its own routes, and `None` from all of them means "read the
@@ -7942,7 +7942,7 @@ async fn handle_post_edit(stream: &mut TcpStream, app: &AppHandle, req: &Request
 
 /// The auto-check diff for one edit, **after** the gate — including V33 C4's
 /// root admission, which is part of the work rather than part of the latch gate.
-/// Shared by `/context/post_edit` and [`claude_hook::ROUTE_POST_TOOL_USE`]; see
+/// Shared by `/context/post_edit` and [`crate::harness::claude::hook::ROUTE_POST_TOOL_USE`]; see
 /// [`compaction_block`] for why the latch gate stays at each route.
 pub(crate) async fn post_edit_diagnostics(
     app: &AppHandle,
@@ -8552,7 +8552,7 @@ async fn handle_mcp_call(
 /// reaches for a HARNESS-NATIVE web tool — and, until 2026-08-17, by the
 /// `cimp --taint-beacon` Claude shim, which a tab open across that upgrade may
 /// still be running. Claude's current path is
-/// [`claude_hook::ROUTE_PRE_TOOL_USE_TAINT`], whose handler carries Claude's own
+/// [`crate::harness::claude::hook::ROUTE_PRE_TOOL_USE_TAINT`], whose handler carries Claude's own
 /// hook payload and reaches [`latch_beacon_core`] directly rather than through
 /// this body. Every field except `tab` is descriptive; `tab` is the only one the
 /// latch actually needs.
@@ -8678,7 +8678,7 @@ async fn handle_latch_beacon(
 
 /// **The taint engagement itself** — the core both fire seams reach: this
 /// route's harness-neutral body (the OpenCode plugin) and
-/// [`claude_hook::ROUTE_PRE_TOOL_USE_TAINT`]'s Claude hook payload.
+/// [`crate::harness::claude::hook::ROUTE_PRE_TOOL_USE_TAINT`]'s Claude hook payload.
 ///
 /// Split out on 2026-08-17, when the Claude side stopped being a shim POSTing to
 /// the route and became a handler beside it. One core, so the two transports

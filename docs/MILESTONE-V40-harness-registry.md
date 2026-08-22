@@ -1,16 +1,20 @@
 # V40 — Harness registry and the V35 leftovers (everything harness-specific moves behind the plugin)
 
-**Status:** APPROVED DESIGN (2026-08-22) — Phase 0 (#102) DONE 2026-08-22 on develop `5e2d87d` (post-V39); amendments 0-a…0-g below folded into decisions 2, 4, 5, 9, 17, 24, 27. Phase A next.
+**Status:** **IMPLEMENTED THROUGH PHASE G** (2026-08-22, branch `feat/v40-harness-registry`). Phases 0 and A-G are done; **Phase H (#100) = RC + the live-verify below**, which is the milestone's only remaining gate. Amendments 0-a...0-g are folded into decisions 2, 4, 5, 9, 17, 24 and 27; every ruling taken during implementation is in *What changed vs the design*. The row-level appendix (`docs/V40-harness-residue-ledger.md`) was DELETED in Phase G: every row is moved, or allowlisted with a reason in `harness/layering.rs` / `src/lib/harnessIdentity.test.ts`, and the layering tests are the durable record.
 GitHub: umbrella #101, milestone 14; phases 0 #102 · A #93 · B #94 · C #95 · D #96 ·
 E #97 · F #98 · G #99 · H #100.
 **Sequencing:** after V39 ships and is live-verified. **V41 — Codex CLI** is
 the consumer: it is the first harness added *through* this registry, and it
 does not start until V40 is merged, released and the live-verify below is
-green. V40 itself adds no harness and changes no behaviour for Claude Code or
-OpenCode; it is a refactor with one schema migration (35 → 36), one CHP minor
-bump (new neutral events, decision 30), two new enforcing tests, and a
-row-level worklist in `docs/V40-harness-residue-ledger.md` (the appendix —
-retired when the milestone closes).
+green. V40 adds no harness; it is a refactor with one schema migration
+(35 → 36), one CHP minor bump (new neutral events, decision 30), three new
+enforcing tests (10a, 10b and their frontend twin), and the short list of
+deliberate behaviour changes in *What changed vs the design* below — read that
+before treating "no behaviour change" as the whole story. It was driven by a
+row-level worklist, `docs/V40-harness-residue-ledger.md`, which Phase G
+DELETED: every row is now either moved behind the plugin interface or
+allowlisted with a reason the layering tests check in both directions, and
+those tests are the durable record the appendix was a stand-in for.
 
 **Scope (user ruling 2026-08-22):** not just "what a third harness touches"
 but **everything harness-specific V35 left in core** — the activity
@@ -289,7 +293,7 @@ harness by name — plus tests that make the README's claim true.
     registered harness id" instead of "`claude` or `opencode`".
 13. **No behaviour change for Claude Code or OpenCode.** Every moved
     function keeps its text and its tests (Phase K rule); the plugin goldens
-    under `fixtures/plugin-goldens/opencode/` stay byte-identical; the V39
+    under `fixtures/harness/opencode/goldens/` stay byte-identical; the V39
     `InputProfile` and `delegate_task_<id>` generation consume the registry
     but produce the same tool set. The live-verify is a regression pass, not
     a feature pass.
@@ -504,7 +508,7 @@ appendix; the decision is the contract.
     becomes an accent token per harness; `CAP_PRETOOLUSE_DENY` moves behind
     the registry *together with* the test that pins it
     (`the_gated_capability_ids_reach_the_frontend`).
-28. **Fixtures and docs follow the code.** `fixtures/plugin-goldens/opencode/`
+28. **Fixtures and docs follow the code.** `fixtures/harness/opencode/goldens/`
     → `fixtures/harness/opencode/goldens/`; the Claude TUI scrapes in
     `processing/permission.rs:753-1020` → `fixtures/harness/claude/<ver>/tui/`;
     `docs/spikes/v20/*.ndjson|json|log` (raw payloads, unpinned, unread by any
@@ -710,7 +714,7 @@ run reviewable.
   4 harness-templated + 5 neutral, complete-by-construction test both ways);
   `GRAPH_GUIDANCE` templated through `HarnessPlugin::tool_for_role` with
   byte-identical goldens for Claude and a two-word diff for OpenCode
-  (`fixtures/plugin-goldens/<id>/system-prompt-addendum.txt`); the attachment
+  (`fixtures/harness/<id>/goldens/system-prompt-addendum.txt`); the attachment
   line left `compose/attachments.ts` for the `harness_instructions` IPC;
   `decorate_initialize` / `push_notification_method` / `mcp_protocol_version`
   and `Consumer::conservative_grant` landed; `preflight()` retired
@@ -728,6 +732,15 @@ run reviewable.
   rewritten; the generic `HarnessExtForm`; `UsageMeter`/`usageMath`/
   `contextMeter` over declared windows/categories/origins; feature-mounted
   panels. Allowlist 10(a) shrinks to the decision-29 set.
+  **DONE 2026-08-22.** `harness_list` publishes the roster, the affordances and
+  two derived tables; `src/lib/harness.ts` is the frontend's only mirror (one
+  declared identity, `BOOTSTRAP_RESERVED_TAB_IDS`, asserted equal to
+  `fixtures/harness/registry.json` in both directions); `src/lib/harnessIdentity.test.ts`
+  is 10(a)'s frontend twin, and its allowlist is down to five rows — the
+  registry mirror, a persisted settings key, a sprite set, a palette name and
+  the theme metadata that pairs them. The dashboard's lane LABELS became the
+  harness's declared origins; the lane SHAPE did not, and that remainder is
+  Phase G's.
 - **G (#99) — Fixtures + docs truth pass** (decisions 12, 28). Fixture moves,
   `harness/<id>/README.md` with the parity test repointed, `CHP.md` /
   `ARCHITECTURE.md` / `MAINTENANCE.md` / `DESIGN.md` / `README.md` /
@@ -735,6 +748,21 @@ run reviewable.
   "registry" drift row pointing at the two tests. The appendix ledger is
   deleted in this phase (its rows are now either moved or allowlisted with
   a reason).
+  **DONE 2026-08-22.** `fixtures/harness/<id>/goldens/` →
+  `fixtures/harness/<id>/goldens/`, so one directory per harness holds its
+  scrapes, its synthetic renames and the goldens of the artifact cImp writes
+  for it. The drift table left `MAINTENANCE.md` for
+  `harness/claude/README.md` and `harness/opencode/README.md`;
+  `matrix_matches_maintenance_doc` reads all three documents and pairs each
+  capability with the document its OWNER owns, which is what split V39's
+  combined `*.input.profile` row and is what makes a future combined row fail.
+  `HARNESS-NATIVE-TOOLS.md` gained a machine-checked § of `native_tools()`.
+  The three neutral model-visible strings left `tabs/config.rs` for the
+  decision-24 inventory (`OFFLOAD_GUIDANCE`, the injection-hygiene contract and
+  the three tool-steering sentences — the `run_command` half is its own slot
+  because it is separately withheld). Decision 19's remainder landed: the
+  `graph/` usage payload speaks declared `TurnOrigin`s and `TokenKinds` instead
+  of a two-lane struct and four vendor-named fields. The ledger is deleted.
 - **H (#100) — Live-verify** (regression pass, below), RC, then V41 opens.
 
 ## What a new harness is (the truthful README list, post-V40)
@@ -764,7 +792,89 @@ kinds, health panel, probe runner, audit consumers, Settings UI, tab
 naming, MCP exposure — is harness-neutral, consumes the plugin through the
 interface, and tests 10(a)/10(b)/11 fail if a harness literal reappears.
 
-## Live-verify
+## What changed vs the design
+
+Every ruling taken inside a phase's discretion, or against the letter of a
+locked decision, in one place — so the design above reads as what was approved
+and this section reads as what was built.
+
+1. **`SurfaceDigest` never existed.** Decision 25's `PerHarness<T>` list named
+   `SurfaceDigest{claude,opencode}` (`mcp_host.rs:237`) as one of the
+   fixed-arity-2 structures to replace. There is no such type in the tree; the
+   ledger row was written from a sweep that mis-read the surface. Everything
+   else in that list was real and was replaced.
+2. **Routes and bodies moved together in Phase C.** Decision 15 said the plugin
+   registers the *route table*; the design's § 4 sentence that the handlers
+   "stay in `offload/loopback.rs`" was overturned by decisions 15 and 22 read
+   together, so the ~900 lines of `handle_claude_*` bodies,
+   `PermissionEventBody` and `classify_permission_event` went into
+   `harness/claude/hook.rs` with the routes. `loopback.rs` left BOTH allowlists
+   as a result, which is strictly better than the exemption the design assumed
+   it would keep.
+3. **Decision 24's `native_tools().arg_names()` is Phase C's
+   `memory_arg_keys()`.** The tool-argument aliasing chain
+   (`file_path`/`filePath`/`notebook_path`/`path`) was already a per-harness
+   declaration by the time Phase E read the decision; adding a second accessor
+   for the same table would have been a third vocabulary for one question.
+4. **`LITERAL_ALLOWLIST` keeps one row, permanently.** `graph/index.rs` is
+   exempted for `"tool_result"` — cImp's OWN `kind`-column discriminator in the
+   usage table, chosen years before a Claude payload field took the same
+   spelling. It is a word collision, not a dependency, and neither side is
+   cImp's to rename. Any text that says the literal allowlist empties is wrong:
+   it shrinks to exactly this row.
+5. **`QuotaWindow` has six fields, not two.** Decision 19 described "a rolling
+   usage quota"; the type the UI actually needs carries `id`, `label`, `short`,
+   `description`, `used` and `resets_at`, because the widget renders a name, a
+   duration, a tooltip and a reset time beside the percentage.
+6. **`opencode_native_gate` is a frozen wire key.** Decision 6 folds the
+   feature into the owning plugin's `settings_schema()`, and it did — but the
+   settings-file key keeps its spelling, because it is a `TabInjectionOverrides`
+   field on disk in every user's settings and a `/status` row name. Which
+   harness owns the feature is `harness_list`'s `scoped_features`; nothing reads
+   the key as an identity. Same exemption Rust gives `settings/schema.rs`.
+7. **`harness_settings_schema` was subsumed by `harness_list`.** Decision 7
+   anticipated a second IPC command for the declared settings fields. One
+   roster call that already carries the descriptor, the affordances and the
+   feature set carries the schema too; a second command would have been a second
+   thing to keep in step with the first.
+8. **`offload_derive_opencode_provider` → `offload_derive_local_provider`.** The
+   "Add to OpenCode" path is a `ConfigWriter` on the plugin now (decision 26),
+   so the IPC command that drives it names the capability rather than the
+   harness that happens to have one.
+9. **Amendment 0-f landed in Phase B, not Phase C.** `input_profile_status` was
+   one global scalar for all harnesses; it is a `Settings.harness[<id>]` row,
+   which put it in the settings-map phase rather than the drift phase. The
+   `delegation.worker` gate reads the *neutral* verdict across every harness
+   that declares an input profile, and skips those that do not.
+10. **A neutral health panel is a second source, not a descriptor.** Decision 9
+    said `PANELS = HARNESSES.iter()`. It is that plus one non-harness panel,
+    because dropping it would hide the `delegation.worker` gate — the registry's
+    first `Harness::ANY` row, which belongs to no directory.
+11. **`probe::IMPLEMENTED` stayed in core** as the declared report order, even
+    though decision 17 moved the probe BODIES behind the plugin. The order a
+    report is read in is cImp's presentation, not a harness's claim.
+12. **`NotebookEdit` is recorded `mutates_fs: false`.** Noted because it looks
+    like a defect and is not one to fix here: the four `true` rows are exactly
+    the names in the `PreToolUse` matcher V33 Phase F installed, and a test pins
+    that direction. Widening the set is a V33 decision with a live-verify, not a
+    V40 rename.
+13. **Behaviour changes that are intended, and are the only ones.** V40 is a
+    refactor, but these are visible and were each ruled deliberately:
+    `GRAPH_GUIDANCE` now names each harness's own tools (an OpenCode session is
+    told `read`/`bash`, not `Read`/`Bash`); the `harness` settings block is
+    **machine** scope; auto-verify and every version-keyed drift rule run **per
+    harness**, so `version_signature` is per harness and a Claude version notice
+    dismissed before the upgrade re-fires once after it; an unregistered
+    consumer, tool or harness is refused or fails closed (`mutates_fs` is `true`
+    for an unknown name); an AI tab whose command matches no registered harness
+    gets `ActivitySource::OutOfBand` and no TUI activity inference; an OpenCode
+    `/memory/event` session id is accepted into the session key space even when
+    it collides with a tab id, because the two spaces are now distinct; CHP is
+    at 2, so a tab open across the upgrade reports `old_plugin` until restarted;
+    a harness with no `spawn_sig` slot used to get no restart hint at all and
+    now gets one.
+
+## Live-verify — Phase H (#100), the milestone's remaining gate
 
 Regression pass on a fresh RC, both harnesses, fresh tabs (spawn-baked
 artifacts are regenerated):
@@ -843,6 +953,67 @@ artifacts are regenerated):
 19. CHP (decision 30): a tab spawned by the previous RC's artifact (stale
     CHP minor) still talks to the new binary; the health panel marks it
     stale by version, not broken.
+
+20. **Settings scope (decision 5).** The `harness` block is **machine** scope,
+    not user scope: after the 35 → 36 migration, confirm the per-harness rows
+    are in the machine settings file and that a user-scope file carrying an old
+    `claude_local` / `statusline` / `expose_commands_*` pair no longer shadows
+    them. A second machine with a fresh profile gets defaults, not the first
+    machine's values.
+21. **Restart hint for a harness with no spawn-baked settings.** Before Phase B
+    a harness with no `spawn_sig` slot got **no** hint when a spawn-baked
+    setting changed. Flip a spawn-baked setting that applies to such a tab and
+    confirm the hint now names it.
+22. **Instruction inventory (decision 24, extended in Phase G).** Diff the
+    `--append-system-prompt` blob a Claude tab receives against the previous RC:
+    byte-identical, including the injection-hygiene paragraph, the tool-steering
+    sentences and the offload nudge, which moved into
+    `harness::instructions` in Phase G. Then turn `expose_commands` OFF for that
+    harness and confirm the `run_command` sentence is **absent entirely** rather
+    than softened — it is a separately inventoried slot because it is separately
+    withheld. `harness_instructions` over IPC lists every slot for a tab.
+23. **Usage payload shape (decision 19 remainder).** On the same transcript as
+    the previous RC, the session-usage donut, its lanes and the per-model cost
+    breakdown show the **same numbers** for a Claude session — the payload now
+    carries declared `TurnOrigin` ids and a `TokenKinds` map instead of
+    `OriginSplit { session_tok, agent_tok }` and four vendor-named fields, and
+    the fixture test pins the arithmetic, but only a live session proves the
+    render. Then open the same view on an **OpenCode** session: its lanes are
+    labelled from its own declared origins, and a category it does not report is
+    **absent**, never a zero bar.
+24. **`harness_usage` absence, again.** `harness_usage("opencode")` still
+    answers *no usage source* (not zeros) even though the harness now declares
+    token kinds and origins for its recorded turns. The quota meter renders
+    nothing for it; the donut still renders.
+25. **Fixture relocation.** `cimp --harness-canary` and the plugin-golden tests
+    read `fixtures/harness/<id>/goldens/`; regenerate an OpenCode tab's plugin
+    and confirm the on-disk artifact still matches the golden byte for byte
+    (`CIMP_BLESS_PLUGIN_GOLDENS=1` must produce **no** diff).
+26. **The docs a reader lands on.** From `docs/MAINTENANCE.md` § *Registered
+    harness CLIs*, follow the link to each harness's `README.md` and confirm the
+    spike recipes and the *Mark verified* flow read correctly against the
+    shipped build. `cargo test matrix_matches_maintenance_doc` is the machine
+    half; this is the "can a maintainer actually run it" half.
+27. **`HARNESS-NATIVE-TOOLS.md` twin.** The machine-checked section matches
+    `native_tools()` for both harnesses (a test asserts it); spot-check that the
+    prose recipes around it still describe the shipped `native_web_visibility`
+    behaviour in `sensor` and `deny`.
+28. **The version notice re-fires exactly once.** `version_signature` is per
+    harness now. On a profile where a Claude version notice had been dismissed
+    before this upgrade, confirm it re-fires **once** after it and stays
+    dismissed thereafter — and that dismissing Claude's does not dismiss
+    OpenCode's.
+29. **Unknown everything, one pass.** In one session: a tab whose command is
+    `foo` (no OOB reader, no TUI activity inference, no `delegate_task_foo`); a
+    tool name from a hello-less source (classified mutating); `cimp --consumer
+    codex` (refused, naming the registered ids); a settings file carrying
+    `harness.codex = {...}` by hand (preserved, not shown, no error). Each is a
+    fail-closed path and none of them may be answered with Claude's behaviour.
+30. **Nothing regressed that Phase G only touched on paper.** Re-run the V39
+    delegation regression (live-verify 8) after the Phase G test rewrites, and
+    diff `tools/list` against the previous RC one more time — Phase G rewrote
+    the V39 test literals over the registry, and a test that stopped asserting
+    what it used to assert is invisible to `cargo test`.
 
 ## V41 preview — Codex CLI (not part of V40)
 

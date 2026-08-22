@@ -818,6 +818,15 @@ pub(crate) struct Tracker {
     turn_last_text: Option<String>,
     /// messageIDs already spoken (don't double-flush on idle).
     flushed: HashSet<String>,
+    /// messageID -> the session that produced it.
+    ///
+    /// **A sub-agent's messages ride the same stream as the tab's own** (the
+    /// V28 finding), and V39's completion feed made that a correctness
+    /// problem rather than a scoping one: a child session's assistant message
+    /// buffered as "the turn's answer" would be handed to the driver as the
+    /// worker's reply. Kept beside `assistant`/`flushed` and bounded the same
+    /// way — one entry per assistant message id.
+    msg_session: HashMap<String, String>,
     /// Whether we've emitted ClaudeOutputStarted without a matching Stopped.
     working: bool,
     /// V28 + V30 (review M7/M8): the tab's session facts — current MAIN session,
@@ -860,6 +869,14 @@ impl Tracker {
                     if let Some(id) = info.get("id").and_then(Value::as_str) {
                         if self.assistant.insert(id.to_string()) {
                             self.assistant_order.push(id.to_string());
+                        }
+                        // Which session this message belongs to — read here
+                        // because `message.updated` is the one event that
+                        // announces the message, and `flush` (which decides
+                        // whether it may become a delegation's answer) has no
+                        // event to read.
+                        if let Some(sid) = props.get("sessionID").and_then(Value::as_str) {
+                            self.msg_session.insert(id.to_string(), sid.to_string());
                         }
                         self.set_working(ctx, true);
                         // Present-but-null must read as "not completed": a
@@ -916,7 +933,10 @@ impl Tracker {
             // would go mute the day upstream drops it — the Tier-C failure mode
             // this whole layer exists to make legible — and honouring only the
             // new one would go mute on every currently-installed build.
-            "session.idle" => self.close_turn(ctx).await,
+            "session.idle" => {
+                let main = self.is_main_session(props.get("sessionID").and_then(Value::as_str));
+                self.close_turn(ctx, main).await
+            }
             "session.status" => {
                 // `properties.status.type` is `"busy"` or `"idle"`. Only idle
                 // closes the turn: a busy status is the OPENING of one, and
@@ -929,7 +949,9 @@ impl Tracker {
                     .and_then(|s| s.get("type"))
                     .and_then(Value::as_str);
                 if status == Some("idle") {
-                    self.close_turn(ctx).await;
+                    let main =
+                        self.is_main_session(props.get("sessionID").and_then(Value::as_str));
+                    self.close_turn(ctx, main).await;
                 }
             }
             _ => {}
@@ -946,7 +968,7 @@ impl Tracker {
     /// message ids, [`Self::set_working`] is edge-triggered, and clearing an
     /// already-cleared map speaks nothing. Pinned by
     /// `both_turn_over_signals_do_not_double_speak`.
-    async fn close_turn(&mut self, ctx: &OobContext) {
+    async fn close_turn(&mut self, ctx: &OobContext, main_session: bool) {
         self.flush_all(ctx).await;
         // V39 Phase B + review HIGH-1: delegation's completion signal, and the
         // ONLY place this reader files one. It is filed HERE — after
@@ -962,8 +984,18 @@ impl Tracker {
         // also fires for turns this tab never spoke in, and minting an empty
         // completion for one would report "the worker said nothing" for a turn
         // the worker never started.
-        if let Some(text) = self.turn_last_text.take() {
-            ctx.note_turn_text(&text);
+        //
+        // …and only the TAB's OWN session may end its turn. Sub-agent sessions
+        // ride the same stream and raise their own `session.idle` /
+        // `session.status:idle` mid-turn (the V28 finding, V39 review): a child
+        // idle used to file whatever the tab had said so far as the delegation's
+        // answer — HIGH-1's failure mode through another door. The buffer is
+        // deliberately LEFT INTACT here: the turn is still running, and the main
+        // session's own idle files it.
+        if main_session {
+            if let Some(text) = self.turn_last_text.take() {
+                ctx.note_turn_text(&text);
+            }
         }
         self.set_working(ctx, false);
         // Turn over: whatever part state is still buffered belongs to
@@ -975,6 +1007,39 @@ impl Tracker {
         self.part_snapshot.clear();
         self.part_type.clear();
         self.msg_parts.clear();
+    }
+
+    /// **Is this the TAB's own session?** — the identity half of the
+    /// delegation completion feed (V39 review).
+    ///
+    /// Answered from the same [`TabSessions`] facts the push path uses, so
+    /// there is one notion of "this tab's session" rather than two: `children`
+    /// is the append-only set of sub-agent sessions (learned from a
+    /// `session.created` carrying `parentID`, or from `verify_main_session`'s
+    /// HTTP probe answering [`SessionVerdict::Child`]), and `main` is the last
+    /// session the tab was bound to.
+    ///
+    /// Two deliberate fail-OPEN answers, both matching what the rest of this
+    /// reader already does with the same uncertainty:
+    ///
+    /// * `None` — the event carries no `sessionID` at all. Every session-scoped
+    ///   event on this stream carries one (the spike-0a capture), so this is a
+    ///   shape nobody has seen; treating it as foreign would silently stop
+    ///   delegations completing on a build that changed the envelope.
+    /// * a session that is neither a known child nor the current `main` — a
+    ///   child whose `session.created` this tap missed. `track_live_session`
+    ///   runs before every match arm and has already re-pointed `main` at it,
+    ///   so this case collapses into "it is main"; it is named here because the
+    ///   fail-open direction is a decision, not an accident.
+    fn is_main_session(&self, sid: Option<&str>) -> bool {
+        let Some(sid) = sid else {
+            return true;
+        };
+        let facts = lock_sessions(&self.sessions);
+        if facts.children.contains(sid) {
+            return false;
+        }
+        facts.main.as_deref().map(|m| m == sid).unwrap_or(true)
     }
 
     /// V28 (issue #13) — OpenCode's half of the per-tab session identity.
@@ -1122,7 +1187,13 @@ impl Tracker {
             // buffer it, and let `close_turn` file the last one. TTS is
             // unchanged and deliberately so — speaking each message as it
             // completes is what makes speech track the tab.
-            self.turn_last_text = Some(out.clone());
+            //
+            // A CHILD session's message is never the tab's answer, so it is
+            // spoken (unchanged) but not buffered: otherwise the tab's own idle
+            // would file a sub-agent's last words as the worker's reply.
+            if self.is_main_session(self.msg_session.get(mid).map(String::as_str)) {
+                self.turn_last_text = Some(out.clone());
+            }
             ctx.speak(&out).await;
         }
     }
@@ -1314,6 +1385,134 @@ mod tests {
         })
         .collect();
         assert_eq!(spoken.len(), 2, "both messages are still spoken: {spoken:?}");
+    }
+
+    /// **Only the TAB's own session ends its turn** (V39 review, HIGH-1's
+    /// failure mode through another door).
+    ///
+    /// Sub-agent sessions ride the same `/event` stream as the tab's own — the
+    /// V28 finding — and they raise their own `session.idle` mid-turn. That
+    /// idle used to reach `close_turn` unfiltered, filing whatever the tab had
+    /// said so far as the delegation's answer: the driver got a preamble, the
+    /// slot was released, and the worker was still working. The child's own
+    /// messages must not be buffered as the answer either.
+    ///
+    /// TTS is asserted unchanged: all three messages are still spoken as they
+    /// complete, sub-agent included.
+    #[tokio::test]
+    async fn a_child_sessions_idle_does_not_end_the_tabs_turn() {
+        let (ctx, mut tts_rx, _sig) = ctx_with("ai-child-idle");
+        let worker = TabId::from_str("ai-child-idle");
+        let _registry = crate::delegation::testing::lock_registry();
+        crate::delegation::testing::claim_and_submit(&worker);
+        let mut t = Tracker::default();
+
+        let say = |sid: &str, mid: &str, pid: &str, text: &str| {
+            (
+                ev(&format!(
+                    r#"{{"type":"message.updated","properties":{{"sessionID":"{sid}","info":{{"id":"{mid}","role":"assistant","time":{{"created":1}}}}}}}}"#
+                )),
+                ev(&format!(
+                    r#"{{"type":"message.part.updated","properties":{{"sessionID":"{sid}","part":{{"id":"{pid}","type":"text","messageID":"{mid}","text":"{text}"}}}}}}"#
+                )),
+                ev(&format!(
+                    r#"{{"type":"message.updated","properties":{{"sessionID":"{sid}","info":{{"id":"{mid}","role":"assistant","time":{{"created":1,"completed":2}}}}}}}}"#
+                )),
+            )
+        };
+
+        // The tab's own turn opens.
+        let (a, b, c) = say("ses_main", "m1", "p1", "Reading that file first.");
+        t.handle(&a, &ctx).await;
+        t.handle(&b, &ctx).await;
+        t.handle(&c, &ctx).await;
+
+        // It launches a sub-agent, which announces itself with a parent.
+        t.handle(
+            &ev(r#"{"type":"session.created","properties":{"sessionID":"ses_child","info":{"id":"ses_child","parentID":"ses_main"}}}"#),
+            &ctx,
+        )
+        .await;
+        let (a, b, c) = say("ses_child", "mc", "pc", "sub-agent chatter");
+        t.handle(&a, &ctx).await;
+        t.handle(&b, &ctx).await;
+        t.handle(&c, &ctx).await;
+
+        // The SUB-AGENT goes idle. The tab's turn is still running.
+        t.handle(
+            &ev(r#"{"type":"session.idle","properties":{"sessionID":"ses_child"}}"#),
+            &ctx,
+        )
+        .await;
+        assert!(
+            crate::delegation::testing::take(&worker).is_none(),
+            "a sub-agent's idle must not end the tab's turn"
+        );
+        // The same through the replacement signal, which a single turn can also
+        // raise — honouring one and not the other would leave the door open.
+        t.handle(
+            &ev(r#"{"type":"session.status","properties":{"sessionID":"ses_child","status":{"type":"idle"}}}"#),
+            &ctx,
+        )
+        .await;
+        assert!(
+            crate::delegation::testing::take(&worker).is_none(),
+            "…and not through `session.status` either"
+        );
+
+        // The tab's own answer, then its own idle.
+        let (a, b, c) = say("ses_main", "m2", "p2", "It exports three symbols.");
+        t.handle(&a, &ctx).await;
+        t.handle(&b, &ctx).await;
+        t.handle(&c, &ctx).await;
+        t.handle(
+            &ev(r#"{"type":"session.idle","properties":{"sessionID":"ses_main"}}"#),
+            &ctx,
+        )
+        .await;
+        assert_eq!(
+            crate::delegation::testing::take(&worker).as_deref(),
+            Some("It exports three symbols."),
+            "the completion is the MAIN session's last message"
+        );
+        assert!(
+            crate::delegation::testing::take(&worker).is_none(),
+            "filed exactly once"
+        );
+
+        // TTS unchanged: every message is still spoken as it completes.
+        let spoken: Vec<String> = std::iter::from_fn(|| match tts_rx.try_recv() {
+            Ok(TtsRequest::Synthesize { text, .. }) => Some(text),
+            _ => None,
+        })
+        .collect();
+        assert_eq!(spoken.len(), 3, "all three messages are spoken: {spoken:?}");
+        assert!(
+            spoken.iter().any(|t| t.contains("sub-agent chatter")),
+            "the sub-agent is still spoken — only the COMPLETION is filtered: {spoken:?}"
+        );
+    }
+
+    /// The identity rule itself, including its two fail-open answers.
+    #[test]
+    fn only_a_non_child_session_can_end_the_tabs_turn() {
+        let t = Tracker::default();
+        // Nothing known yet: an unbound tab must not stop completing.
+        assert!(t.is_main_session(Some("ses_main")));
+        assert!(t.is_main_session(None), "no sessionID at all is not foreign");
+
+        {
+            let mut facts = lock_sessions(&t.sessions);
+            facts.main = Some("ses_main".to_string());
+            facts.children.insert("ses_child".to_string());
+        }
+        assert!(t.is_main_session(Some("ses_main")));
+        assert!(!t.is_main_session(Some("ses_child")), "a known child never ends the turn");
+        assert!(
+            !t.is_main_session(Some("ses_other")),
+            "a session the tab is not bound to is not the tab's turn"
+        );
+        assert!(t.is_main_session(None), "still fail-open with facts known");
     }
 
     #[tokio::test]

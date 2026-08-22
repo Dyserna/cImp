@@ -1075,25 +1075,20 @@ impl OffloadService {
     /// consumer. V19: parameterized by `Consumer` so the same loopback serves
     /// Claude and OpenCode children from their respective access flags.
     pub async fn mcp_tool_descriptors(&self, consumer: Consumer) -> Vec<serde_json::Value> {
-        let defs = match consumer {
+        // This loopback proxy only serves the interactive HARNESS children; the
+        // offload worker reaches the host in-process, never via this route. An
+        // unexpected `offload` query value therefore can't arrive in practice —
+        // it is answered under `Consumer::conservative_grant` (V40 locked
+        // decision 25, where the rule is written down) rather than leaking the
+        // offload set. V38 Phase F: `Audit` lands here for the same reason and
+        // never in practice — the audit fan-out advertises nothing and calls a
+        // name its manifest already fixed, so it has no `tools/list` at all.
+        let defs = match consumer.proxied() {
             Consumer::Harness(h) => self.host.tool_defs_for(h).await,
-            // This loopback proxy only serves the interactive HARNESS children;
-            // the offload worker reaches the host in-process, never via this
-            // route. An unexpected `offload` query value therefore can't arrive
-            // in practice — it is answered under `Consumer::conservative_grant`
-            // (V40 locked decision 25, where the rule is written down) rather
-            // than leaking the offload set.
-            //
-            // V38 Phase F: `Audit` lands here for the same reason and never in
-            // practice — the audit fan-out advertises nothing and calls a name
-            // its manifest already fixed, so it has no `tools/list` at all.
-            Consumer::Offload | Consumer::Audit => match Consumer::conservative_grant() {
-                Consumer::Harness(h) => self.host.tool_defs_for(h).await,
-                // Unreachable by construction (the rule answers a harness) and
-                // fail-closed if it ever stopped being: advertise nothing rather
-                // than guess.
-                _ => Vec::new(),
-            },
+            // Unreachable by construction (`proxied` answers a harness) and
+            // fail-closed if it ever stopped being: advertise nothing rather
+            // than guess.
+            _ => Vec::new(),
         };
         defs.into_iter()
             .map(|d| {
@@ -1174,16 +1169,17 @@ impl OffloadService {
         audit: &dyn outbound::ScopeAudit,
     ) -> Result<String, super::mcp_host::HostError> {
         // See `mcp_tool_descriptors`: `offload` never legitimately reaches
-        // this proxy.
-        let consumer = match consumer {
-            Consumer::Harness(h) => Consumer::Harness(h),
-            // V38 Phase F: `Audit` cannot reach this route either — the fan-out
-            // calls the host directly, in-process. Both fold onto
-            // `Consumer::conservative_grant` (V40 locked decision 25), so a stray
-            // query value can never widen a grant by naming a consumer this proxy
-            // does not serve.
-            Consumer::Offload | Consumer::Audit => Consumer::conservative_grant(),
-        };
+        // this proxy. V38 Phase F: `Audit` cannot reach this route either — the
+        // fan-out calls the host directly, in-process. Both fold onto
+        // `Consumer::conservative_grant` (V40 locked decision 25), so a stray
+        // query value can never widen a grant by naming a consumer this proxy
+        // does not serve.
+        //
+        // V40 review H-1: the fold is `Consumer::proxied` now, and the LOOPBACK
+        // ROUTE applies it *before* it derives the taint-latch key. This call is
+        // the defence-in-depth copy, for any caller reaching the service without
+        // going through `loopback::proxy_identity`.
+        let consumer = consumer.proxied();
         let snap = self.settings.current();
         let agent = crate::graph::source_for_consumer(consumer.source());
         let policy = outbound::Policy::from_settings(

@@ -1050,6 +1050,35 @@ impl Consumer {
         Consumer::Harness(crate::harness::DEFAULT_HARNESS)
     }
 
+    /// Fold an in-app consumer onto [`Self::conservative_grant`] — **the one
+    /// place that fold happens**, so a route that resolves a grant and a route
+    /// that resolves an identity can never disagree about which harness one
+    /// request is being judged as.
+    ///
+    /// # Why this is a method and not three copies of a `match`
+    ///
+    /// V40 review finding H-1: `handle_mcp_call` derived the taint-latch key
+    /// from the RAW query token (`?consumer=offload` ⇒ activity source
+    /// `"offload"` ⇒ no configured tab ⇒ no latch scope ⇒ the documented
+    /// fail-open) while `OffloadService::mcp_call` folded the same request onto
+    /// **Claude's** granted server set. One request, two identities: Claude's
+    /// servers with Claude's latch disabled, and the EXTERNAL budget uncharged.
+    /// Develop had no such spelling because `source_for_consumer` answered
+    /// `"claude"` for every token it did not recognise.
+    ///
+    /// Folding at the route means the latch key is `source()` of the *folded*
+    /// consumer, so `conservative_grant()` can never hand out a harness's server
+    /// set without that harness's latch applying to the same call.
+    pub(crate) fn proxied(self) -> Consumer {
+        match self {
+            Consumer::Harness(h) => Consumer::Harness(h),
+            // See the variant docs: neither reaches this proxy legitimately —
+            // the offload worker and the audit fan-out call the host
+            // in-process.
+            Consumer::Offload | Consumer::Audit => Consumer::conservative_grant(),
+        }
+    }
+
     /// Parse the `--consumer` discriminator the per-session child is launched
     /// with.
     ///
@@ -1107,6 +1136,23 @@ impl Consumer {
             Consumer::Offload => "offload",
             // The same word `record_audit_run` stamps on the `audit` lane, so a
             // reader following one scan across two lanes sees one name for it.
+            Consumer::Audit => "audit",
+        }
+    }
+
+    /// The `--consumer` token this consumer is spelled with on the wire — the
+    /// vocabulary [`Self::parse`], `HarnessId::from_consumer` and
+    /// `graph::mcp::commands_exposed_to` all read.
+    ///
+    /// Distinct from [`Self::source`], which is the ACTIVITY vocabulary: a
+    /// descriptor's `consumer` and its `id` are separate fields, and a harness
+    /// is free to spell them differently. Used by `loopback::proxy_identity`'s
+    /// callers to hand the resolved-and-folded identity downstream as a token
+    /// rather than re-forwarding the caller's raw claim.
+    pub(crate) fn token(self) -> &'static str {
+        match self {
+            Consumer::Harness(h) => h.descriptor().map(|d| d.consumer).unwrap_or_else(|| h.token()),
+            Consumer::Offload => "offload",
             Consumer::Audit => "audit",
         }
     }

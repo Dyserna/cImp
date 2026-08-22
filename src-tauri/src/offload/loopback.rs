@@ -1631,13 +1631,21 @@ async fn handle_run(
     // funnel). `LatchRoute::Native` — this route serves cImp's own tools, never
     // a proxied server's content.
     let tool = offload_tool_name(body.tool.as_deref());
+    // V40 review H-1: the same one-resolution funnel `/mcp/call` uses. This
+    // route's gate is `LatchRoute::Native` over `offload_task`/`offload_batch`
+    // — the V32 C-1c gate whose doc paragraph above describes the `.env`
+    // exfiltration it closes — so a consumer token that resolved to no tab
+    // scope disabled exactly that gate.
+    let Some((_, run_agent)) = proxy_identity(body.consumer.as_deref()) else {
+        let r = RunResult {
+            ok: false,
+            text: None,
+            error: Some(unknown_consumer_message()),
+        };
+        return write_json(stream, 400, &r).await;
+    };
     let settings = live_settings(app);
-    let scoping = latch_scope(
-        app,
-        &settings,
-        crate::graph::source_for_consumer(body.consumer.as_deref().unwrap_or(crate::harness::DEFAULT_HARNESS.token())),
-        body.tab.as_deref(),
-    );
+    let scoping = latch_scope(app, &settings, run_agent, body.tab.as_deref());
     if let LatchScoping::Unknown(tab) = &scoping {
         warn!(
             target: "offload",
@@ -1678,11 +1686,7 @@ async fn handle_run(
     // stale claim, and a checkpoint is the one record that exists to be trusted
     // after an incident, so it degrades to "cannot attribute" rather than to
     // "some other tab".
-    let checkpoint_tab = match tab_identity(
-        &settings,
-        crate::graph::source_for_consumer(body.consumer.as_deref().unwrap_or(crate::harness::DEFAULT_HARNESS.token())),
-        body.tab.as_deref(),
-    ) {
+    let checkpoint_tab = match tab_identity(&settings, run_agent, body.tab.as_deref()) {
         TabIdentity::Configured(t) => Some(t.to_string()),
         TabIdentity::Anonymous | TabIdentity::Unknown(_) => None,
     };
@@ -4894,7 +4898,23 @@ async fn handle_graph_run(stream: &mut TcpStream, app: &AppHandle, req: &Request
             return write_json(stream, 200, &r).await;
         }
     };
-    let consumer = body.consumer.as_deref().unwrap_or(crate::harness::DEFAULT_HARNESS.token());
+    // V40 review H-1: ONE identity for this call. `proxy_identity` folds an
+    // in-app consumer onto `Consumer::conservative_grant` and refuses a token
+    // nobody declared — before this, `?consumer=offload` reached the
+    // `LatchRoute::Native` gate with an activity source that names no
+    // configured tab (so no latch, no attribution) and `?consumer=<garbage>`
+    // did the same with nothing refusing it. The FOLDED token goes downstream,
+    // so `run_command`'s exposure switch, the memory agent scope, the activity
+    // source and the latch all answer about the same harness.
+    let Some((resolved, consumer_source)) = proxy_identity(body.consumer.as_deref()) else {
+        let r = RunResult {
+            ok: false,
+            text: None,
+            error: Some(unknown_consumer_message()),
+        };
+        return write_json(stream, 400, &r).await;
+    };
+    let consumer = resolved.token();
     // V28: resolve the calling TAB to the session it currently reports, so the
     // `context_*` memory tools scope to this tab's own session instead of "the
     // most recent session for this agent" (two same-agent tabs used to share —
@@ -4930,12 +4950,7 @@ async fn handle_graph_run(stream: &mut TcpStream, app: &AppHandle, req: &Request
         };
         return write_json(stream, 200, &r).await;
     };
-    let scoping = latch_scope(
-        app,
-        &settings,
-        crate::graph::source_for_consumer(consumer),
-        body.tab.as_deref(),
-    );
+    let scoping = latch_scope(app, &settings, consumer_source, body.tab.as_deref());
     // #48 F-20: resolved BEFORE `into_scope()` collapses `Anonymous` and
     // `Unknown` into one `None`. That collapse is right for the latch (both fail
     // open) and wrong for the row, which has to say which of the three this call
@@ -5001,7 +5016,7 @@ async fn handle_graph_run(stream: &mut TcpStream, app: &AppHandle, req: &Request
                 spotlight_recall: crate::settings::injection::effective(
                     crate::settings::injection::Feature::Spotlighting,
                     crate::settings::injection::Scope::for_tab(
-                        crate::graph::source_for_consumer(consumer),
+                        consumer_source,
                         body.tab.as_deref(),
                     ),
                     &settings,
@@ -8662,8 +8677,10 @@ async fn handle_mcp_list(
     // another's grants (locked decision 2). An empty list, not an error: a
     // `tools/list` that 400s would break the child's handshake, while an empty
     // one is the honest answer to "what may this caller reach".
-    let tools = match consumer_of(req) {
-        Some(c) => service.mcp_tool_descriptors(c).await,
+    // V40 review H-1: through the same funnel `/mcp/call` resolves its grant
+    // with, so a token that is callable is exactly a token that is listed.
+    let tools = match proxy_identity(query_param(&req.path, "consumer")) {
+        Some((c, _)) => service.mcp_tool_descriptors(c).await,
         None => Vec::new(),
     };
     write_json(stream, 200, &serde_json::json!({ "tools": tools })).await
@@ -8696,10 +8713,21 @@ async fn handle_mcp_call(
             return write_json(stream, 400, &r).await;
         }
     };
-    // Normalized through the same `source_for_consumer` vocabulary
-    // `/graph_run` uses, so one tab keys one latch from both routes.
-    let agent =
-        crate::graph::source_for_consumer(query_param(&req.path, "consumer").unwrap_or(crate::harness::DEFAULT_HARNESS.token()));
+    // V40 review H-1: the GRANT and the LATCH KEY are resolved together, here,
+    // before anything is charged or gated — `proxy_identity` folds an in-app
+    // consumer onto `Consumer::conservative_grant` and derives `agent` from the
+    // FOLDED consumer, so a request served Claude's server set is judged under
+    // Claude's latch. Refused (not degraded) for a token nobody declared:
+    // locked decision 2, and refusing here means an unattributable caller
+    // cannot spend a tab's budget either.
+    let Some((consumer, agent)) = proxy_identity(query_param(&req.path, "consumer")) else {
+        return write_json(
+            stream,
+            400,
+            &serde_json::json!({ "error": unknown_consumer_message() }),
+        )
+        .await;
+    };
     // V32 Phase G: ONE settings read here, so the tab-id check, the latch, the
     // budget, detection and the envelope all resolve under the same snapshot —
     // a mid-call settings save must not leave a result screened by one posture
@@ -8791,22 +8819,6 @@ async fn handle_mcp_call(
     // chokepoint and to the detection boundary so neither can flood a capped
     // feed on a loop. See `TabAudit`.
     let audit = TabAudit(scope.as_ref(), agent);
-    let Some(consumer) = consumer_of(req) else {
-        // Locked decision 2: a token nobody declared reaches no server. Refused
-        // here, before the call is charged, so an unattributable caller cannot
-        // spend a tab's budget either.
-        return write_json(
-            stream,
-            400,
-            &serde_json::json!({
-                "error": format!(
-                    "unknown consumer; this proxy serves {} (plus `offload`, cImp's own                      in-app consumer)",
-                    crate::harness::registry::harness_ids().join(", ")
-                )
-            }),
-        )
-        .await;
-    };
     let called = service
         .mcp_call(
             consumer,
@@ -9433,8 +9445,8 @@ pub fn injection_status(settings: &crate::settings::Settings) -> serde_json::Val
 ///
 /// Deliberately no percent-decoding: every value on these routes is composed by
 /// cImp itself (consumer names, tab ids — `[a-z0-9-]`), never by a user or a
-/// browser. Matches the pre-V30 behaviour of [`consumer_of`], which this now
-/// backs.
+/// browser. Matches the pre-V30 behaviour of [`consumer_from_token`], which
+/// this now backs.
 fn query_param<'a>(path: &'a str, key: &str) -> Option<&'a str> {
     let (_, query) = path.split_once('?')?;
     query.split('&').find_map(|kv| {
@@ -9443,20 +9455,54 @@ fn query_param<'a>(path: &'a str, key: &str) -> Option<&'a str> {
     })
 }
 
-/// Parse the `?consumer=<name>` query value off a request path into a
-/// [`Consumer`].
+/// Parse a `consumer` discriminator into a [`Consumer`], from wherever the
+/// route carries it — the `?consumer=` query string on `/mcp/*`, the request
+/// BODY on `/run` and `/graph_run`.
 ///
 /// **Absent** ⇒ [`crate::harness::DEFAULT_HARNESS`]: the pre-V30 child sends no
-/// query at all, and that child was Claude's. **Unknown** ⇒ `None`, and the two
-/// routes that ask advertise nothing and refuse — these are grant-bearing
+/// query at all, and that child was Claude's. **Unknown** ⇒ `None`, and every
+/// route that asks advertises nothing and refuses — these are grant-bearing
 /// questions, and until V40 Phase A a typo'd token was answered with Claude's
 /// granted server set.
-fn consumer_of(req: &Request) -> Option<Consumer> {
-    Consumer::parse(query_param(&req.path, "consumer").unwrap_or_else(|| {
+fn consumer_from_token(token: Option<&str>) -> Option<Consumer> {
+    Consumer::parse(token.unwrap_or_else(|| {
         crate::harness::DEFAULT_HARNESS
             .id()
             .expect("DEFAULT_HARNESS names a registered harness")
     }))
+}
+
+/// **The single identity resolution for a grant-bearing loopback route** (V40
+/// review finding H-1).
+///
+/// Answers the resolved-and-folded [`Consumer`] the call is judged under AND
+/// the `source_for_consumer` token its taint latch, its EXTERNAL budget, its
+/// injection scope and its activity attribution key off — from ONE resolution,
+/// so the two can never name different harnesses.
+///
+/// `None` for a token no registered harness and no in-app consumer claims: a
+/// grant question, refused rather than degraded. Before this funnel,
+/// `?consumer=offload` resolved to Claude's granted server set (via
+/// [`Consumer::conservative_grant`]) while its latch key resolved to the
+/// activity source `"offload"`, which names no configured tab — so the latch,
+/// the budget and the attribution all fell through their documented fail-open
+/// while the *grant* stayed Claude's. `?consumer=<garbage>` did the same on
+/// `/run` and `/graph_run`, where nothing refused it at all.
+fn proxy_identity(token: Option<&str>) -> Option<(Consumer, &'static str)> {
+    let consumer = consumer_from_token(token)?.proxied();
+    Some((consumer, crate::graph::source_for_consumer(consumer.source())))
+}
+
+/// The refusal a grant-bearing route answers a token nobody declared with
+/// (locked decision 2). One text, so `/mcp/call`, `/run` and `/graph_run` all
+/// name the same registered list.
+fn unknown_consumer_message() -> String {
+    format!(
+        "unknown consumer; this proxy serves {} (plus `offload`, cImp's own in-app consumer). \
+         A consumer token decides which MCP servers a caller may reach and which tab's taint \
+         latch judges the call, so an unrecognised one is refused rather than defaulted.",
+        crate::harness::registry::harness_ids().join(", ")
+    )
 }
 
 /// Render one `event: push` SSE frame from a [`PushNotice`].
@@ -9706,11 +9752,102 @@ mod tests {
             cimp: CimpHeaders::default(),
             body: Vec::new(),
         };
-        assert_eq!(consumer_of(&legacy), Some(Consumer::Harness(crate::harness::DEFAULT_HARNESS)));
+        assert_eq!(
+            consumer_from_token(query_param(&legacy.path, "consumer")),
+            Some(Consumer::Harness(crate::harness::DEFAULT_HARNESS))
+        );
         assert!(!matches!(
             query_param(&legacy.path, "channels"),
             Some("1") | Some("true")
         ));
+    }
+
+    // ── V40 review H-1: ONE identity per grant-bearing route ──────────────
+
+    /// The grant a call is served under and the taint latch that judges it
+    /// name the **same harness**, on every route that resolves a consumer.
+    ///
+    /// The regression: `?consumer=offload` was folded onto Claude's granted
+    /// server set by [`Consumer::conservative_grant`] while its latch key was
+    /// derived from the RAW token, resolving to the activity source
+    /// `"offload"` — which is no configured tab of any harness, so
+    /// `latch_scope` answered `Unknown`, `LatchRegistry::gate` took its
+    /// documented fail-open and the EXTERNAL budget went uncharged. Claude's
+    /// servers with Claude's latch switched off, on `/mcp/call`, `/run` and
+    /// `/graph_run` alike. Develop had no such spelling, because its
+    /// `source_for_consumer` answered `"claude"` for every token it did not
+    /// recognise.
+    #[test]
+    fn a_grant_bearing_route_resolves_one_identity_for_the_grant_and_the_latch() {
+        // A registered harness resolves to itself, and keys its own latch.
+        for h in crate::harness::registry::all() {
+            let token = h
+                .descriptor()
+                .expect("a registered id has a descriptor")
+                .consumer;
+            let (consumer, agent) =
+                proxy_identity(Some(token)).expect("a registered consumer resolves");
+            assert_eq!(consumer, Consumer::Harness(h));
+            assert_eq!(agent, h.token(), "{token}'s latch key is its own");
+        }
+
+        // Absent: the pre-V30 wire-compatibility default, not a guess.
+        let (consumer, agent) = proxy_identity(None).expect("an absent consumer resolves");
+        assert_eq!(consumer, Consumer::Harness(crate::harness::DEFAULT_HARNESS));
+        assert_eq!(agent, crate::harness::DEFAULT_HARNESS.token());
+
+        // cImp's OWN in-app consumer. It is still served under
+        // `conservative_grant()` — and the latch key is now THAT harness's.
+        let (consumer, agent) = proxy_identity(Some("offload")).expect("`offload` resolves");
+        assert_eq!(consumer, Consumer::conservative_grant());
+        let Consumer::Harness(served_as) = consumer else {
+            panic!("`conservative_grant` answers a harness");
+        };
+        assert_eq!(
+            agent,
+            served_as.token(),
+            "an in-app consumer served out of a harness's grants must be judged under \
+             that harness's latch"
+        );
+        assert_ne!(agent, "offload");
+        assert_ne!(agent, crate::graph::UNKNOWN_SOURCE);
+
+        // A token nobody declared is REFUSED — not degraded to an unscoped,
+        // ungated, unattributed call (locked decision 2).
+        for token in ["codex", "audit", "", "claude-code", "unknown", "  "] {
+            assert_eq!(
+                proxy_identity(Some(token)),
+                None,
+                "{token:?} names nothing this proxy serves and must be refused"
+            );
+        }
+    }
+
+    /// The structural half of the finding: every grant-bearing handler must go
+    /// through [`proxy_identity`], so a route added later cannot re-open the
+    /// split by deriving its latch key from the caller's raw claim.
+    #[test]
+    fn every_grant_bearing_handler_resolves_through_proxy_identity() {
+        let src = include_str!("loopback.rs");
+        for (handler, route) in [
+            ("async fn handle_mcp_list(", "/mcp/list"),
+            ("async fn handle_mcp_call(", "/mcp/call"),
+            ("async fn handle_run(", "/run"),
+            ("async fn handle_graph_run(", "/graph_run"),
+        ] {
+            let start = src
+                .find(handler)
+                .unwrap_or_else(|| panic!("`{handler}` still exists"));
+            let rest = &src[start..];
+            // Handler items are the only things at column 0 in this file, so
+            // a newline followed by a column-0 `}` closes this one.
+            let end = rest.find("\n}\n").unwrap_or(rest.len());
+            assert!(
+                rest[..end].contains("proxy_identity("),
+                "{route} must resolve its consumer through `proxy_identity` — the grant \
+                 and the taint latch have to name one harness (V40 review H-1)"
+            );
+        }
     }
 
     /// The wire contract the child's SSE parser depends on: one `event:` line,

@@ -1020,12 +1020,21 @@ pub enum Consumer {
 
 impl Consumer {
     /// Parse the `--consumer` discriminator the per-session child is launched
-    /// with. Unknown / absent ⇒ Claude (the original, default consumer).
-    pub fn parse(s: &str) -> Self {
+    /// with.
+    ///
+    /// **V40 Phase A made this fallible** (locked decision 2). It used to answer
+    /// `Claude` for anything it did not recognise, so a child asserting any
+    /// token at all was served Claude's granted server set — a grant question
+    /// answered fail-OPEN by a typo. An ABSENT value is a different question
+    /// with a different answer: the caller resolves it to
+    /// [`crate::harness::DEFAULT_HARNESS`], which is a documented
+    /// wire-compatibility promise rather than a guess.
+    pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
-            "opencode" => Consumer::Opencode,
-            "offload" => Consumer::Offload,
-            _ => Consumer::Claude,
+            "opencode" => Some(Consumer::Opencode),
+            "offload" => Some(Consumer::Offload),
+            "claude" => Some(Consumer::Claude),
+            _ => None,
         }
     }
 

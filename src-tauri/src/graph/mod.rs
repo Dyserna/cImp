@@ -61,8 +61,13 @@ pub use mcp::{
     // V38 F-3: the consumer-aware builder replaced the blind one here. `tools()`
     // itself stays (the app's own surface measurement calls it), it is simply no
     // longer something a consumer-serving caller may reach for by accident.
-    surface_stats, tool_specs, tools_for as mcp_tools_for, LEAN_HIDDEN, UNKNOWN_SOURCE,
+    surface_stats, tool_specs, tools_for as mcp_tools_for, LEAN_HIDDEN,
 };
+// V40 Phase A: the activity source for a caller whose asserted consumer names
+// nothing cImp serves. Named separately because it is read by the loopback's own
+// test, not by the graph's consumers.
+#[cfg(test)]
+pub use mcp::UNKNOWN_SOURCE;
 pub use memory::{SessionUsageDetail, UsageSnapshot};
 pub use model::*;
 pub use service::{EmbedderProbe, GraphService, GraphStatus, LangCensus, RebuildOrigin};

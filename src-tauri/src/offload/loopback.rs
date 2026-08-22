@@ -9324,7 +9324,14 @@ async fn handle_mcp_list(
     service: &Arc<OffloadService>,
     req: &Request,
 ) -> AppResult<()> {
-    let tools = service.mcp_tool_descriptors(consumer_of(req)).await;
+    // An unrecognised consumer advertises NOTHING rather than inheriting
+    // another's grants (locked decision 2). An empty list, not an error: a
+    // `tools/list` that 400s would break the child's handshake, while an empty
+    // one is the honest answer to "what may this caller reach".
+    let tools = match consumer_of(req) {
+        Some(c) => service.mcp_tool_descriptors(c).await,
+        None => Vec::new(),
+    };
     write_json(stream, 200, &serde_json::json!({ "tools": tools })).await
 }
 
@@ -9450,9 +9457,25 @@ async fn handle_mcp_call(
     // chokepoint and to the detection boundary so neither can flood a capped
     // feed on a loop. See `TabAudit`.
     let audit = TabAudit(scope.as_ref(), agent);
+    let Some(consumer) = consumer_of(req) else {
+        // Locked decision 2: a token nobody declared reaches no server. Refused
+        // here, before the call is charged, so an unattributable caller cannot
+        // spend a tab's budget either.
+        return write_json(
+            stream,
+            400,
+            &serde_json::json!({
+                "error": format!(
+                    "unknown consumer; this proxy serves {} (plus `offload`, cImp's own                      in-app consumer)",
+                    crate::harness::registry::harness_ids().join(", ")
+                )
+            }),
+        )
+        .await;
+    };
     let called = service
         .mcp_call(
-            consumer_of(req),
+            consumer,
             &body.name,
             body.arguments,
             cwd.as_deref(),
@@ -10065,9 +10088,19 @@ fn query_param<'a>(path: &'a str, key: &str) -> Option<&'a str> {
 }
 
 /// Parse the `?consumer=<name>` query value off a request path into a
-/// [`Consumer`]. Absent / unknown ⇒ Claude (the original default).
-fn consumer_of(req: &Request) -> Consumer {
-    Consumer::parse(query_param(&req.path, "consumer").unwrap_or("claude"))
+/// [`Consumer`].
+///
+/// **Absent** ⇒ [`crate::harness::DEFAULT_HARNESS`]: the pre-V30 child sends no
+/// query at all, and that child was Claude's. **Unknown** ⇒ `None`, and the two
+/// routes that ask advertise nothing and refuse — these are grant-bearing
+/// questions, and until V40 Phase A a typo'd token was answered with Claude's
+/// granted server set.
+fn consumer_of(req: &Request) -> Option<Consumer> {
+    Consumer::parse(query_param(&req.path, "consumer").unwrap_or_else(|| {
+        crate::harness::DEFAULT_HARNESS
+            .id()
+            .expect("DEFAULT_HARNESS names a registered harness")
+    }))
 }
 
 /// Render one `event: push` SSE frame from a [`PushNotice`].
@@ -10311,7 +10344,7 @@ mod tests {
             cimp: CimpHeaders::default(),
             body: Vec::new(),
         };
-        assert_eq!(consumer_of(&legacy), Consumer::Claude);
+        assert_eq!(consumer_of(&legacy), Some(Consumer::Claude));
         assert!(!matches!(
             query_param(&legacy.path, "channels"),
             Some("1") | Some("true")

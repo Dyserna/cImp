@@ -79,11 +79,12 @@ import { openConfigureTabDialog } from './dialog/store';
 import { clearTabError, setTabError } from './tabs/errorState';
 import { isShellTab, isAppRenderedTab, type TabId } from './tabs/types';
 import {
+  courtesyRefusal,
   readOnlyAdvice,
   readOnlyExempt,
-  readOnlyReason,
   readOnlyRefusalMessage,
 } from './delegation';
+import { isPromptRelaxed } from './delegationPrompt';
 import { showToast } from './toast';
 
 /// V39 Phase A: when each tab last told the user its keyboard is locked.
@@ -993,7 +994,16 @@ export function createTerminal(
     // Mouse WHEEL reports are exempt too — scrolling is reading, and under an
     // alt-screen TUI the wheel goes to the program rather than to xterm's own
     // buffer. Clicks and drags are not: they activate controls.
-    const lockReason = readOnlyReason(get(settingsStore), tabId);
+    //
+    // V39 review R-4: a standing prompt on a DRIVEN tab opens the keyboard for
+    // the answer (locked decision 5), whatever the persisted lock says — the
+    // backend already allows it, and swallowing here meant the one prompt only
+    // the user can answer could not be answered at all.
+    const lockReason = courtesyRefusal(
+      get(settingsStore),
+      tabId,
+      isPromptRelaxed(tabId),
+    );
     if (lockReason && !readOnlyExempt(data)) {
       noteReadOnlyRefusal(tabId, `This tab is ${lockReason}.`);
       return;

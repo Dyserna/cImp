@@ -6,6 +6,7 @@ import {
   displacedToast,
   drivenReason,
   FACADE_NAME_TAKEN,
+  courtesyRefusal,
   defaultFacadeName,
   facadeBackends,
   elapsedLabel,
@@ -27,6 +28,7 @@ import {
   type DelegationRole,
   type TabAccess,
 } from './delegation';
+import { isPromptRelaxed, setPromptRelaxedTabs } from './delegationPrompt';
 import { defaultSettings, type Settings } from './settings/types';
 
 /// V39 Phase A — the communication glyph and the read-only lock.
@@ -621,6 +623,50 @@ describe('facadeBackends', () => {
     expect(defaultFacadeName('t1')).toBe(defaultFacadeName('t1'));
     expect(defaultFacadeName('t1')).not.toBe(defaultFacadeName('t2'));
     expect(defaultFacadeName('t1')).toMatch(/^worker-[0-9a-f]{4}$/);
+  });
+});
+
+describe('courtesyRefusal', () => {
+  /// **V39 review R-4, and the end-to-end half of M-5.** The backend opens the
+  /// keyboard while a driven worker holds a prompt (locked decision 5), but the
+  /// terminal's courtesy gate swallowed the keystroke before `pty_write` was
+  /// ever reached — so on a tab the user had ALSO locked by hand, the one
+  /// prompt only the user can answer could not be answered, and the delegation
+  /// ran to its deadline reporting "worker awaiting permission".
+  it('forwards the answer to a standing prompt on a user-locked driven tab', () => {
+    const locked = withTabReadOnly(settingsWith(), 'claude', true);
+    expect(readOnlyReason(locked, 'claude')).toBe(READ_ONLY_USER_REASON);
+    // Driven, and the worker is waiting on the user.
+    expect(courtesyRefusal(locked, 'claude', true)).toBeNull();
+  });
+
+  it('still refuses when no prompt is standing', () => {
+    const locked = withTabReadOnly(settingsWith(), 'claude', true);
+    expect(courtesyRefusal(locked, 'claude', false)).toBe(READ_ONLY_USER_REASON);
+  });
+
+  it('says nothing about a tab that was never locked', () => {
+    expect(courtesyRefusal(settingsWith(), 'claude', false)).toBeNull();
+    expect(courtesyRefusal(settingsWith(), 'claude', true)).toBeNull();
+  });
+});
+
+describe('the prompt-relaxed mirror', () => {
+  /// The module exists to break an import cycle (`delegationState` → `terminals`
+  /// already), so what is worth pinning is that it is a plain snapshot: replaced
+  /// wholesale, exactly like the store the `delegation-changed` payload feeds.
+  it('replaces the set wholesale, like the snapshot it comes from', () => {
+    setPromptRelaxedTabs(['claude', 'opencode']);
+    expect(isPromptRelaxed('claude')).toBe(true);
+    expect(isPromptRelaxed('opencode')).toBe(true);
+    expect(isPromptRelaxed('claude-local')).toBe(false);
+
+    setPromptRelaxedTabs(['claude-local']);
+    expect(isPromptRelaxed('claude')).toBe(false);
+    expect(isPromptRelaxed('claude-local')).toBe(true);
+
+    setPromptRelaxedTabs([]);
+    expect(isPromptRelaxed('claude-local')).toBe(false);
   });
 });
 

@@ -144,6 +144,30 @@ export function readOnlyReason(settings: Settings, tabId: string): string | null
   return accessOf(settings, tabId) === 'ro' ? READ_ONLY_USER_REASON : null;
 }
 
+/// **What the terminal's courtesy gate should refuse** (V39 review R-4).
+///
+/// `readOnlyReason` answers from the PERSISTED lock alone, which is right for
+/// the glyph and wrong for the keyboard: locked decision 5 opens the keyboard
+/// while the worker holds a prompt, because the user's answer is the only
+/// thing that lets that turn finish. The backend implements exactly that
+/// (`ReadOnlyEntry::prompt_relaxed`), but the gate ran first and swallowed the
+/// keystroke before `pty_write` was ever called — so on a tab the user had also
+/// locked by hand, the prompt could not be answered and the delegation ran to
+/// its deadline reporting "worker awaiting permission".
+///
+/// `promptRelaxed` comes from the in-flight mirror (`delegationPrompt.ts`).
+/// When `delegation.auto_read_only` is off there is no engine lock to relax and
+/// a user lock still refuses — server-side, with its own reason — which is the
+/// honest answer for a tab whose owner locked it and turned the relaxation off.
+export function courtesyRefusal(
+  settings: Settings,
+  tabId: string,
+  promptRelaxed: boolean,
+): string | null {
+  if (promptRelaxed) return null;
+  return readOnlyReason(settings, tabId);
+}
+
 /// Clone `settings` with one AI tab's `read_only` flag changed.
 ///
 /// Used by the popover for its optimistic local update; the durable write goes

@@ -11,6 +11,7 @@ import { get, readable, writable, type Readable, type Writable } from 'svelte/st
 import { listen } from '@tauri-apps/api/event';
 import { delegationStatuses } from './ipc';
 import { writeLocalEcho, type DelegationChanged, type InFlightView } from './delegation';
+import { setPromptRelaxedTabs } from './delegationPrompt';
 import { getTerminal } from './terminals';
 import type { TabId } from './tabs/types';
 
@@ -48,6 +49,16 @@ function apply(rows: [string, InFlightView][]): void {
   for (const [tab, view] of rows) next[tab] = view;
   const previous = get(delegationInFlight);
   delegationInFlight.set(next);
+  // V39 review R-4: the terminal's read-only courtesy gate needs the standing
+  // -prompt fact synchronously, inside `onData`, and cannot import this module
+  // (it is imported BY this one, for the local echo). The flag module in
+  // between is the whole of the arrangement. Replaced wholesale, like the
+  // store above and for the same reason: the payload is a snapshot.
+  setPromptRelaxedTabs(
+    Object.entries(next)
+      .filter(([, view]) => view.awaiting_prompt)
+      .map(([tab]) => tab),
+  );
 
   // Locked decision 2a's local echo. Fired here rather than in a component
   // because it must happen ONCE per flight, on the edge — a component that

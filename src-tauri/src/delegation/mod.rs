@@ -330,49 +330,57 @@ pub fn is_driven(tab: &TabId) -> bool {
 /// refusal rather than a hang (the cycle cannot form through this module, but
 /// the bound is free and the failure it prevents is not).
 pub fn depth_from(tab: &TabId) -> u8 {
-    registry(|r| {
-        let mut seen: Vec<TabId> = vec![tab.clone()];
-        let mut depth: u8 = 0;
-        let mut cur = tab.clone();
-        loop {
-            let Some(next) = r
-                .in_flight
-                .iter()
-                .find(|(_, f)| f.driver == cur)
-                .map(|(w, _)| w.clone())
-            else {
-                return depth;
-            };
-            if seen.contains(&next) || depth == u8::MAX {
-                return depth;
-            }
-            seen.push(next.clone());
-            cur = next;
-            depth = depth.saturating_add(1);
+    registry(|r| depth_in(r, tab))
+}
+
+/// [`depth_from`] against a registry the caller already holds — so the cycle
+/// check and the claim can run under ONE lock (V39 review M-8).
+fn depth_in(r: &Registry, tab: &TabId) -> u8 {
+    let mut seen: Vec<TabId> = vec![tab.clone()];
+    let mut depth: u8 = 0;
+    let mut cur = tab.clone();
+    loop {
+        let Some(next) = r
+            .in_flight
+            .iter()
+            .find(|(_, f)| f.driver == cur)
+            .map(|(w, _)| w.clone())
+        else {
+            return depth;
+        };
+        if seen.contains(&next) || depth == u8::MAX {
+            return depth;
         }
-    })
+        seen.push(next.clone());
+        cur = next;
+        depth = depth.saturating_add(1);
+    }
 }
 
 /// The chain a driver already sits in, as tab ids, for a refusal that **names
 /// the cycle** rather than saying "busy".
 pub fn chain_from(tab: &TabId) -> Vec<String> {
-    registry(|r| {
-        let mut out = vec![tab.as_str().to_string()];
-        let mut cur = tab.clone();
-        while let Some(next) = r
-            .in_flight
-            .iter()
-            .find(|(_, f)| f.driver == cur)
-            .map(|(w, _)| w.clone())
-        {
-            if out.contains(&next.as_str().to_string()) {
-                break;
-            }
-            out.push(next.as_str().to_string());
-            cur = next;
+    registry(|r| chain_in(r, tab))
+}
+
+/// [`chain_from`] against a registry the caller already holds — see
+/// [`depth_in`].
+fn chain_in(r: &Registry, tab: &TabId) -> Vec<String> {
+    let mut out = vec![tab.as_str().to_string()];
+    let mut cur = tab.clone();
+    while let Some(next) = r
+        .in_flight
+        .iter()
+        .find(|(_, f)| f.driver == cur)
+        .map(|(w, _)| w.clone())
+    {
+        if out.contains(&next.as_str().to_string()) {
+            break;
         }
-        out
-    })
+        out.push(next.as_str().to_string());
+        cur = next;
+    }
+    out
 }
 
 /// Claim the worker's single slot, atomically.
@@ -391,6 +399,93 @@ fn claim(
     deadline_ms: u64,
 ) -> Result<u64, String> {
     registry(|r| {
+        claim_in(
+            r,
+            worker,
+            driver,
+            driver_name,
+            driver_agent,
+            mode,
+            now_ms,
+            deadline_ms,
+        )
+    })
+}
+
+/// **The acyclic check, the depth bound and the claim, under ONE lock**
+/// (locked decision 9, V39 review M-8).
+///
+/// They used to be four separate registry acquisitions in `drive`, with the
+/// whole of preflight in between — and the window that opened is not the usual
+/// "two drivers, one worker" (the per-worker slot closes that one by itself,
+/// because both claims key on the same tab). It is **A→B and B→A racing**:
+/// both drivers pass a cycle check that is true at the moment it runs, then
+/// both claim DIFFERENT workers, and the cycle the check exists to prevent is
+/// now in the registry with two flights holding it.
+///
+/// The refusal strings are unchanged, and their order is the order `drive`
+/// asked them in.
+#[allow(clippy::too_many_arguments)]
+fn claim_checked(
+    worker: &TabId,
+    worker_name: &str,
+    driver: TabId,
+    driver_name: String,
+    driver_agent: String,
+    mode: DelegationMode,
+    now_ms: u64,
+    deadline_ms: u64,
+    max_depth: u8,
+) -> Result<u64, String> {
+    registry(|r| {
+        if r.in_flight.contains_key(&driver) {
+            return Err(format!(
+                "tab `{}` is currently being driven, so it may not drive another tab (chain: {})",
+                driver.as_str(),
+                chain_in(r, &driver).join(" -> ")
+            ));
+        }
+        if r.in_flight.values().any(|f| &f.driver == worker) {
+            return Err(format!(
+                "worker tab `{worker_name}` is currently driving another tab, so it may not be \
+                 driven (chain: {})",
+                chain_in(r, worker).join(" -> ")
+            ));
+        }
+        let depth = depth_in(r, &driver).saturating_add(1);
+        if depth > max_depth {
+            return Err(format!(
+                "this delegation would nest {depth} deep and `delegation.max_depth` is {max_depth} \
+                 (chain: {})",
+                chain_in(r, &driver).join(" -> ")
+            ));
+        }
+        claim_in(
+            r,
+            worker,
+            driver,
+            driver_name,
+            driver_agent,
+            mode,
+            now_ms,
+            deadline_ms,
+        )
+    })
+}
+
+/// The claim itself, against a registry the caller holds.
+#[allow(clippy::too_many_arguments)]
+fn claim_in(
+    r: &mut Registry,
+    worker: &TabId,
+    driver: TabId,
+    driver_name: String,
+    driver_agent: String,
+    mode: DelegationMode,
+    now_ms: u64,
+    deadline_ms: u64,
+) -> Result<u64, String> {
+    {
         if let Some(held) = r.in_flight.get(worker) {
             return Err(format!(
                 "busy: tab `{}` is already being driven by `{}` (since {} ms ago)",
@@ -429,7 +524,7 @@ fn claim(
             },
         );
         Ok(id)
-    })
+    }
 }
 
 /// Release the worker's slot and drop any unclaimed completion.
@@ -849,6 +944,117 @@ mod tests {
                 chain_from(&driver()),
                 vec![driver().as_str().to_string(), worker().as_str().to_string()]
             );
+        });
+    }
+
+    /// **A→B and B→A cannot both proceed** (locked decision 9, V39 review
+    /// M-8).
+    ///
+    /// The per-worker slot does NOT cover this race: the two claims key on
+    /// different workers, so both used to succeed and the cycle the check
+    /// exists to prevent ended up in the registry with two flights holding it.
+    /// What closes it is that the check and the claim are one locked step.
+    ///
+    /// Run repeatedly, and with a barrier, because the window the old code left
+    /// open was the whole of preflight — a single unsynchronised attempt proves
+    /// nothing either way.
+    #[test]
+    fn two_tabs_delegating_to_each_other_cannot_both_proceed() {
+        use std::sync::{Arc, Barrier};
+        with_clean_registry(|| {
+            for _ in 0..64 {
+                registry(|r| {
+                    r.in_flight.clear();
+                    r.completions.clear();
+                });
+                let gate = Arc::new(Barrier::new(2));
+                let one = {
+                    let gate = gate.clone();
+                    std::thread::spawn(move || {
+                        gate.wait();
+                        claim_checked(
+                            &TabId::Claude,
+                            "the worker",
+                            TabId::OpenCode,
+                            "B".to_string(),
+                            "opencode".to_string(),
+                            DelegationMode::Explicit,
+                            100,
+                            1_000,
+                            4,
+                        )
+                    })
+                };
+                let two = {
+                    let gate = gate.clone();
+                    std::thread::spawn(move || {
+                        gate.wait();
+                        claim_checked(
+                            &TabId::OpenCode,
+                            "the worker",
+                            TabId::Claude,
+                            "A".to_string(),
+                            "claude".to_string(),
+                            DelegationMode::Explicit,
+                            100,
+                            1_000,
+                            4,
+                        )
+                    })
+                };
+                let (a, b) = (one.join().unwrap(), two.join().unwrap());
+                assert!(
+                    a.is_ok() ^ b.is_ok(),
+                    "exactly one of A->B and B->A may proceed, got {a:?} / {b:?}"
+                );
+                let loser = if a.is_err() { a } else { b };
+                let reason = loser.unwrap_err();
+                assert!(
+                    reason.contains("chain:"),
+                    "the loser's refusal names the chain: {reason}"
+                );
+                assert_eq!(
+                    registry(|r| r.in_flight.len()),
+                    1,
+                    "the loser claimed nothing"
+                );
+            }
+        });
+    }
+
+    /// The depth bound is asked under the same lock, and refuses by name.
+    #[test]
+    fn the_depth_bound_is_checked_where_the_slot_is_taken() {
+        with_clean_registry(|| {
+            // `max_depth: 1` is the default — one hop, no nesting.
+            claim_checked(
+                &worker(),
+                "the worker",
+                driver(),
+                "A".to_string(),
+                "opencode".to_string(),
+                DelegationMode::Explicit,
+                100,
+                1_000,
+                1,
+            )
+            .expect("the first hop is within the bound");
+            // Same DRIVER, a second worker: the driver is not itself driven, so
+            // the refusal that fires is the depth bound rather than the cycle.
+            let too_deep = claim_checked(
+                &TabId::ClaudeLocal,
+                "the second worker",
+                driver(),
+                "A".to_string(),
+                "opencode".to_string(),
+                DelegationMode::Explicit,
+                100,
+                1_000,
+                1,
+            )
+            .expect_err("a second hop is not");
+            assert!(too_deep.contains("would nest 2 deep"), "{too_deep}");
+            assert!(too_deep.contains("chain:"), "{too_deep}");
         });
     }
 

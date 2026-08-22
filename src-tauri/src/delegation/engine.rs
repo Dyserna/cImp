@@ -49,9 +49,8 @@ use crate::settings::{Settings, TabConfig};
 use crate::state::TabId;
 
 use super::{
-    chain_from, claim, deadline_of, depth_from, is_driven, is_driving, is_taken_over,
-    is_worker_gone, mark_submitted, note_prompt, record_row, release, take_completion, transition,
-    DelegationError, DelegationMode,
+    claim_checked, deadline_of, is_taken_over, is_worker_gone, mark_submitted, note_prompt,
+    record_row, release, take_completion, transition, DelegationError, DelegationMode,
 };
 
 /// How often the wait loop re-reads the world.
@@ -577,31 +576,14 @@ pub async fn drive(app: &AppHandle, req: DriveRequest) -> Result<Reply, Delegati
         return Err(deny(reason));
     }
 
-    // 8. Acyclic, and within `delegation.max_depth` (locked decision 9). Both
-    //    directions, and the refusal NAMES the chain.
-    if is_driven(&driver) {
-        return Err(deny(format!(
-            "tab `{}` is currently being driven, so it may not drive another tab (chain: {})",
-            driver.as_str(),
-            chain_from(&driver).join(" -> ")
-        )));
-    }
-    if is_driving(&req.worker) {
-        return Err(deny(format!(
-            "worker tab `{worker_name}` is currently driving another tab, so it may not be driven \
-             (chain: {})",
-            chain_from(&req.worker).join(" -> ")
-        )));
-    }
-    let max_depth = settings.delegation.max_depth;
-    let depth = depth_from(&driver).saturating_add(1);
-    if depth > max_depth {
-        return Err(deny(format!(
-            "this delegation would nest {depth} deep and `delegation.max_depth` is {max_depth} \
-             (chain: {})",
-            chain_from(&driver).join(" -> ")
-        )));
-    }
+    // 8. Acyclic, and within `delegation.max_depth` (locked decision 9) —
+    //    **asked below, inside the claim** (V39 review M-8). Both directions
+    //    and the depth bound are properties of the registry, and asking them
+    //    here, under their own lock, left the whole of the remaining preflight
+    //    between the answer and the claim that depends on it: A→B and B→A
+    //    racing both passed, then claimed DIFFERENT workers, and the cycle
+    //    existed. `claim_checked` asks and claims under one lock, which also
+    //    makes the claim the LAST preflight step — nothing can refuse after it.
 
     // 9 + 10. Free: no output burst in progress, no prompt standing, and
     //     nothing the user has half-typed and not sent. (Pasting into a composer
@@ -643,16 +625,20 @@ pub async fn drive(app: &AppHandle, req: DriveRequest) -> Result<Reply, Delegati
         .unwrap_or(settings.delegation.default_timeout_s)
         .max(1);
     let deadline = now.saturating_add(timeout_s.saturating_mul(1000));
-    if let Err(busy) = claim(
+    // The acyclic check, the depth bound and the slot, atomically (M-8). Every
+    // refusal it can answer is worded exactly as the four separate checks were.
+    if let Err(refusal) = claim_checked(
         &req.worker,
+        &worker_name,
         driver.clone(),
         driver_name.clone(),
         driver_agent.to_string(),
         req.mode,
         now,
         deadline,
+        settings.delegation.max_depth,
     ) {
-        return Err(deny(busy));
+        return Err(deny(refusal));
     }
 
     // Everything past this point owns the slot and must release it on EVERY

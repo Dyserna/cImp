@@ -28,7 +28,7 @@
 //! program: [`OPENCODE_PLUGIN_KEYS`] (which slots exist) and
 //! [`opencode_plugin_values`] (what fills them, from reviewed Rust, through
 //! serde). The move is proven to be a pure refactor of generation by the
-//! byte-identical goldens under `fixtures/plugin-goldens/opencode/`, captured
+//! byte-identical goldens under `fixtures/harness/opencode/goldens/`, captured
 //! from the pre-Phase-M `format!()` generator; see `templates/README.md`.
 
 use std::path::Path;
@@ -358,7 +358,7 @@ pub(crate) const OPENCODE_PLUGIN_KEYS: [&str; 18] = [
 ///
 /// V35 Phase M: this is now [`OPENCODE_PLUGIN_TEMPLATE`] rendered with
 /// [`opencode_plugin_values`]. It is a **pure refactor of generation** — the
-/// goldens under `fixtures/plugin-goldens/opencode/` were captured from the
+/// goldens under `fixtures/harness/opencode/goldens/` were captured from the
 /// pre-Phase-M `format!()` generator and are asserted byte for byte here
 /// (`the_template_renders_the_pre_phase_m_goldens_byte_for_byte`), so nothing
 /// about the emitted file changed with the move.
@@ -642,8 +642,9 @@ mod tests {
     fn goldens_dir() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("fixtures")
-            .join("plugin-goldens")
+            .join("harness")
             .join("opencode")
+            .join("goldens")
     }
 
     /// **The Phase M guarantee.** These three files were emitted by the

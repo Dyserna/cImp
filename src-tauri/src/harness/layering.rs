@@ -727,11 +727,12 @@ fn every_registry_entry_is_fully_wired() {
         {
             let goldens = Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("fixtures")
-                .join("plugin-goldens")
-                .join(dir);
+                .join("harness")
+                .join(dir)
+                .join("goldens");
             assert!(
                 goldens.is_dir(),
-                "{dir}: declares FileArtifact but has no fixtures/plugin-goldens/{dir}/ — the \
+                "{dir}: declares FileArtifact but has no fixtures/harness/{dir}/goldens/ — the \
                  artifact it writes would change with no diff to review"
             );
         }

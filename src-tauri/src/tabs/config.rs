@@ -2892,8 +2892,9 @@ mod tests {
         for (dir, cfg) in [("claude", claude_cfg()), ("opencode", opencode_cfg())] {
             let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("fixtures")
-                .join("plugin-goldens")
+                .join("harness")
                 .join(dir)
+                .join("goldens")
                 .join("system-prompt-addendum.txt");
             let golden = std::fs::read_to_string(&path)
                 .unwrap_or_else(|e| panic!("{}: {e}", path.display()))

@@ -47,7 +47,7 @@ F checkpoint trigger ride the same handler. Only the plugin sits in OpenCode's
 own tool path — cImp merely computes the verdict — so nothing on the app side
 can detect a plugin that loads but skips the `throw`.
 
-Every edit here must also change `src-tauri/fixtures/plugin-goldens/opencode/`,
+Every edit here must also change `src-tauri/fixtures/harness/opencode/goldens/`,
 which holds three byte-identical renderings. That is the review artifact: read
 the golden diff, do not re-bless it to clear a red test. See that directory's
 `MANIFEST.toml`.

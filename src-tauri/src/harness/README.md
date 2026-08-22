@@ -172,7 +172,7 @@ change.
 
 Since Phase M the enforcement is a `throw` in a `.js` file you can open and
 read, and every edit to it shows up twice — once in the template, once in the
-byte-identical goldens under `src-tauri/fixtures/plugin-goldens/opencode/`.
+byte-identical goldens under `src-tauri/fixtures/harness/opencode/goldens/`.
 Re-blessing a golden without reading its diff defeats the entire arrangement.
 
 ## Reading list

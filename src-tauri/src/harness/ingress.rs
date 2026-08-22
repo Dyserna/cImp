@@ -223,6 +223,43 @@ mod tests {
         }
     }
 
+    /// **Every inverted wire default names a route core actually serves**, and
+    /// resolves to the harness that claimed it.
+    ///
+    /// The failure this guards is silent in both directions: rename the route
+    /// and `wire_default` falls back to `DEFAULT_HARNESS`, so an identity-less
+    /// OpenCode body would be attributed to Claude and a `/latch/state` answer
+    /// would gate the wrong tab's native tools; claim a route nobody serves and
+    /// the declaration is decoration. Neither shows up as an error anywhere.
+    #[test]
+    fn every_inverted_wire_default_names_a_route_that_exists() {
+        let core = crate::offload::loopback::core_route_paths();
+        let mut claimed = 0usize;
+        for h in registry::all() {
+            let Some(p) = h.plugin() else { continue };
+            for r in p.legacy_wire_default_routes() {
+                assert!(
+                    core.contains(r) || route("POST", r).is_some(),
+                    "{h}: claims `{r}` as its identity-less default, and nothing serves it"
+                );
+                assert_eq!(
+                    wire_default(r),
+                    h,
+                    "`{r}` resolves to a harness other than the one that claimed it"
+                );
+                claimed += 1;
+            }
+        }
+        assert!(
+            claimed >= 2,
+            "the two inverted defaults (`/memory/event`, `/latch/state`) stopped being declared              — they would silently read as the DEFAULT harness, which is what locked decision 22              calls the load-bearing asymmetry"
+        );
+        // …and everything else takes the documented compatibility default.
+        for neutral in ["/context/retrieve", "/latch/beacon", "/mcp/call"] {
+            assert_eq!(wire_default(neutral), super::super::DEFAULT_HARNESS);
+        }
+    }
+
     /// The drift key space is bounded and non-empty, and nothing in it is
     /// caller-supplied.
     #[test]

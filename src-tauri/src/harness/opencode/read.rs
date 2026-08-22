@@ -815,7 +815,13 @@ pub(crate) struct Tracker {
     /// sees, so "I'll read that file first." was returned as the reply and the
     /// worker's slot was released while it was still working. The text is
     /// buffered here instead and filed once, from [`Tracker::close_turn`].
-    turn_last_text: Option<String>,
+    ///
+    /// Carries the moment the text was PRODUCED (V39 review R-3). The
+    /// completion feed correlates by time — a completion older than the
+    /// delegation's submit belongs to an earlier turn — and filing a buffer
+    /// stamped at FILE time defeats that: text this tab produced before a
+    /// delegation existed would look like its reply.
+    turn_last_text: Option<(String, u64)>,
     /// messageIDs already spoken (don't double-flush on idle).
     flushed: HashSet<String>,
     /// messageID -> the session that produced it.
@@ -993,8 +999,8 @@ impl Tracker {
         // deliberately LEFT INTACT here: the turn is still running, and the main
         // session's own idle files it.
         if main_session {
-            if let Some(text) = self.turn_last_text.take() {
-                ctx.note_turn_text(&text);
+            if let Some((text, at_ms)) = self.turn_last_text.take() {
+                ctx.note_turn_text_at(&text, at_ms);
             }
         }
         self.set_working(ctx, false);
@@ -1192,7 +1198,7 @@ impl Tracker {
             // spoken (unchanged) but not buffered: otherwise the tab's own idle
             // would file a sub-agent's last words as the worker's reply.
             if self.is_main_session(self.msg_session.get(mid).map(String::as_str)) {
-                self.turn_last_text = Some(out.clone());
+                self.turn_last_text = Some((out.clone(), crate::activity::now_ms()));
             }
             ctx.speak(&out).await;
         }
@@ -1216,6 +1222,20 @@ impl Tracker {
     fn set_working(&mut self, ctx: &OobContext, working: bool) {
         if working == self.working {
             return;
+        }
+        // **V39 review R-3: a new turn starts with an empty buffer.**
+        //
+        // `close_turn` deliberately LEAVES the buffer when a child session
+        // idles (the tab's turn is still running), and it also releases the
+        // Thinking edge — so the next `message.updated` opens a new turn with
+        // the previous one's text still held. If that turn then produced no
+        // text of its own (a tool-only turn, an interrupt), the tab's own idle
+        // filed the STALE text, and a delegation submitted in between received
+        // words the worker had said before it ever asked. The rising edge is
+        // the one place that means "a turn is beginning", for every path that
+        // reaches it.
+        if working {
+            self.turn_last_text = None;
         }
         self.working = working;
         let tab = ctx.tab.clone();
@@ -1491,6 +1511,89 @@ mod tests {
             spoken.iter().any(|t| t.contains("sub-agent chatter")),
             "the sub-agent is still spoken — only the COMPLETION is filtered: {spoken:?}"
         );
+    }
+
+    /// **A stale buffer never becomes the next turn's reply** (V39 review
+    /// R-3).
+    ///
+    /// `close_turn` leaves the buffer when a CHILD session idles — right, the
+    /// tab's turn is still running — but it also releases the Thinking edge, so
+    /// the next turn opened with the previous one's text still held. A turn
+    /// that then produced no text of its own (a tool-only turn, an interrupt)
+    /// filed the stale text on the tab's own idle, and a delegation submitted
+    /// in between received words the worker had said before it ever asked.
+    #[tokio::test]
+    async fn a_stale_buffer_never_becomes_the_next_turns_reply() {
+        let (ctx, mut tts_rx, _sig) = ctx_with("ai-stale-buffer");
+        let worker = TabId::from_str("ai-stale-buffer");
+        let _registry = crate::delegation::testing::lock_registry();
+        let mut t = Tracker::default();
+
+        // Turn 1, before any delegation exists: the tab says something.
+        t.handle(
+            &ev(r#"{"type":"message.updated","properties":{"sessionID":"ses_main","info":{"id":"m1","role":"assistant","time":{"created":1}}}}"#),
+            &ctx,
+        )
+        .await;
+        t.handle(
+            &ev(r#"{"type":"message.part.updated","properties":{"sessionID":"ses_main","part":{"id":"p1","type":"text","messageID":"m1","text":"An answer to an earlier question."}}}"#),
+            &ctx,
+        )
+        .await;
+        t.handle(
+            &ev(r#"{"type":"message.updated","properties":{"sessionID":"ses_main","info":{"id":"m1","role":"assistant","time":{"created":1,"completed":2}}}}"#),
+            &ctx,
+        )
+        .await;
+        // A sub-agent idles: the buffer is deliberately kept, the Thinking edge
+        // is released.
+        t.handle(
+            &ev(r#"{"type":"session.created","properties":{"sessionID":"ses_child","info":{"id":"ses_child","parentID":"ses_main"}}}"#),
+            &ctx,
+        )
+        .await;
+        t.handle(
+            &ev(r#"{"type":"session.idle","properties":{"sessionID":"ses_child"}}"#),
+            &ctx,
+        )
+        .await;
+
+        // NOW a delegation is submitted, and the next turn produces no text of
+        // its own — it only calls a tool.
+        crate::delegation::testing::claim_and_submit(&worker);
+        t.handle(
+            &ev(r#"{"type":"message.updated","properties":{"sessionID":"ses_main","info":{"id":"m2","role":"assistant","time":{"created":3}}}}"#),
+            &ctx,
+        )
+        .await;
+        t.handle(
+            &ev(r#"{"type":"message.part.updated","properties":{"sessionID":"ses_main","part":{"id":"p2","type":"tool","messageID":"m2","text":""}}}"#),
+            &ctx,
+        )
+        .await;
+        t.handle(
+            &ev(r#"{"type":"message.updated","properties":{"sessionID":"ses_main","info":{"id":"m2","role":"assistant","time":{"created":3,"completed":4}}}}"#),
+            &ctx,
+        )
+        .await;
+        t.handle(
+            &ev(r#"{"type":"session.idle","properties":{"sessionID":"ses_main"}}"#),
+            &ctx,
+        )
+        .await;
+
+        assert!(
+            crate::delegation::testing::take(&worker).is_none(),
+            "the previous turn's words are not this delegation's reply"
+        );
+        // TTS is untouched: turn 1 was spoken when it happened, turn 2 said
+        // nothing to speak.
+        let spoken: Vec<String> = std::iter::from_fn(|| match tts_rx.try_recv() {
+            Ok(TtsRequest::Synthesize { text, .. }) => Some(text),
+            _ => None,
+        })
+        .collect();
+        assert_eq!(spoken.len(), 1, "only the first turn had prose: {spoken:?}");
     }
 
     /// The identity rule itself, including its two fail-open answers.

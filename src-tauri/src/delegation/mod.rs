@@ -606,7 +606,22 @@ fn mark_submitted(worker: &TabId, at_ms: u64) {
 /// "the worker said nothing" into "the worker never answered", i.e. a timeout
 /// minutes later instead of an immediate, accurate refusal.
 pub fn note_assistant_text(tab: &TabId, text: &str) {
-    let at_ms = crate::activity::now_ms();
+    note_assistant_text_at(tab, text, crate::activity::now_ms())
+}
+
+/// [`note_assistant_text`], with the moment the text was PRODUCED rather than
+/// the moment it was filed (V39 review R-3).
+///
+/// Correlation is by time (locked decision 10: a completion recorded before the
+/// request was submitted belongs to an earlier turn), so a producer that
+/// BUFFERS — the OpenCode reader holds a turn's last message until the turn is
+/// over — must file the buffer's own timestamp. Stamping at file time made a
+/// message produced before the delegation existed look like its reply, because
+/// the file happened afterwards.
+///
+/// A reader that does not buffer passes `now`, which is what
+/// [`note_assistant_text`] does for it.
+pub fn note_assistant_text_at(tab: &TabId, text: &str, at_ms: u64) {
     registry(|r| {
         if !r.in_flight.contains_key(tab) {
             return;
@@ -979,6 +994,35 @@ mod tests {
             assert_eq!(take_completion(&worker()).as_deref(), Some("the actual reply"));
             // Claimed exactly once.
             assert_eq!(take_completion(&worker()), None);
+        });
+    }
+
+    /// **A buffered completion is correlated by when it was PRODUCED** (V39
+    /// review R-3).
+    ///
+    /// The OpenCode reader holds a turn's last message until the turn is over,
+    /// so the moment it files is not the moment the worker spoke. Filed with
+    /// the file time, text produced before a delegation existed passed the
+    /// submit-time floor and was handed to the driver as its reply.
+    #[test]
+    fn a_buffered_completion_carries_the_time_it_was_produced() {
+        with_clean_registry(|| {
+            claim_one(&worker(), &driver(), 100).expect("claim");
+            mark_submitted(&worker(), 2_000);
+            // Buffered at 1_000 — before this delegation typed anything — and
+            // filed now. The file time would have passed the floor; the
+            // production time must not.
+            note_assistant_text_at(&worker(), "words from an earlier turn", 1_000);
+            assert_eq!(
+                take_completion(&worker()),
+                None,
+                "text produced before the request cannot be its reply, whenever it is filed"
+            );
+            note_assistant_text_at(&worker(), "the actual reply", 3_000);
+            assert_eq!(
+                take_completion(&worker()).as_deref(),
+                Some("the actual reply")
+            );
         });
     }
 

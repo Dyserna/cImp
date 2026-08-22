@@ -262,6 +262,14 @@ impl OobContext {
         crate::delegation::note_assistant_text(&self.tab, text);
     }
 
+    /// [`Self::note_turn_text`] for a reader that BUFFERED the text: `at_ms` is
+    /// when the worker produced it, not when this call is made (V39 review
+    /// R-3). Correlation is by time, so a buffer filed with the wrong one can
+    /// hand an earlier turn's words to a delegation that started after them.
+    pub fn note_turn_text_at(&self, text: &str, at_ms: u64) {
+        crate::delegation::note_assistant_text_at(&self.tab, text, at_ms);
+    }
+
     /// Speak one block of assistant prose from THIS reader.
     ///
     /// V35 Phase L moved the composition itself — escape hygiene, markdown

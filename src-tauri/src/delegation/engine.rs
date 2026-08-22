@@ -684,7 +684,6 @@ pub async fn drive(app: &AppHandle, req: DriveRequest) -> Result<Reply, Delegati
         &typed,
         profile,
         auto_lock,
-        &driver,
     )
     .await;
 
@@ -778,7 +777,6 @@ async fn run_flight(
     typed: &str,
     profile: crate::harness::InputProfile,
     auto_lock: bool,
-    driver: &TabId,
 ) -> Result<(String, u64), DelegationError> {
     // The correlation floor is taken BEFORE the write: a worker that answers
     // fast must not have its completion filed as "earlier than our request".
@@ -815,9 +813,10 @@ async fn run_flight(
         // win over a completion that landed in the same tick.
         if is_taken_over(worker) {
             if relaxed && auto_lock {
-                // Leave nothing engaged behind us; `drive` clears it too, but
-                // the two must agree even if this path is reached first.
-                state.read_only.set_driven(worker, None);
+                // Leave nothing relaxed behind us; `drive`'s `set_driven(None)`
+                // clears it too, but the two must agree even if this path is
+                // reached first.
+                state.read_only.set_prompt_relaxed(worker, false);
             }
             // Decision 6's own words, and the ONE string this outcome has: the
             // driver reads it as its tool result and the `takeover` row
@@ -854,16 +853,18 @@ async fn run_flight(
         let awaiting = flags.awaiting_prompt();
         let (_, changed) = note_prompt(worker, awaiting, PROMPT_GRACE.as_millis() as u64);
         if changed && auto_lock {
-            if awaiting {
-                state.read_only.set_driven(worker, None);
-                relaxed = true;
-            } else {
-                // The signal has a consumer: the lock re-engages on the falling
-                // edge. A relaxation nobody re-engages would be a delegation
-                // that silently gave the keyboard back for the rest of its run.
-                state.read_only.set_driven(worker, Some(driver.clone()));
-                relaxed = false;
-            }
+            // V39 review M-5: a DEDICATED relaxation flag, not "clear the
+            // engine's lock for the duration". Clearing it let
+            // `ReadOnlyEntry::source` fall back to a `User` lock the tab was
+            // already carrying — so on a user-read-only tab the prompt only the
+            // user can answer could not be answered, and the flight ran to its
+            // deadline reporting "worker awaiting permission". It also dropped
+            // the driver identity the banner and Take over read.
+            state.read_only.set_prompt_relaxed(worker, awaiting);
+            // The signal has a consumer: the lock re-engages on the falling
+            // edge. A relaxation nobody re-engages would be a delegation that
+            // silently gave the keyboard back for the rest of its run.
+            relaxed = awaiting;
         }
         if changed {
             publish(app);

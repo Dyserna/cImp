@@ -68,6 +68,21 @@ impl ReadOnlySource {
 struct ReadOnlyEntry {
     user: bool,
     driven_by: Option<TabId>,
+    /// **A prompt is standing on this tab, so the keyboard is open for it**
+    /// (locked decision 5, V39 review M-5).
+    ///
+    /// A separate flag rather than "clear `driven_by` for the duration", which
+    /// is what the engine used to do: a tab whose USER lock was also set then
+    /// fell back to `ReadOnlySource::User` and the keyboard stayed refused —
+    /// so the one prompt only the user can answer could not be answered, and
+    /// the delegation ran to its deadline reporting "worker awaiting
+    /// permission". Clearing it also lost the row's `driven_by` for the
+    /// duration, which the banner and the take-over path read.
+    ///
+    /// Lives and dies with the flight: [`ReadOnlyTabs::set_driven`] clears it
+    /// whenever the engine's lock is released, so it can never outlive the
+    /// prompt that justified it.
+    prompt_relaxed: bool,
 }
 
 impl ReadOnlyEntry {
@@ -75,6 +90,12 @@ impl ReadOnlyEntry {
     /// answer to "why did my keystroke bounce", and it names who to take over
     /// from.
     fn source(&self) -> Option<ReadOnlySource> {
+        // Decision 5 outranks both locks while a prompt stands: answering the
+        // prompt the worker addressed to the USER is the only way this turn
+        // completes, and neither lock is worth more than the turn.
+        if self.prompt_relaxed {
+            return None;
+        }
         match (&self.driven_by, self.user) {
             (Some(by), _) => Some(ReadOnlySource::Driven { by: by.clone() }),
             (None, true) => Some(ReadOnlySource::User),
@@ -83,6 +104,10 @@ impl ReadOnlyEntry {
     }
 
     fn is_clear(&self) -> bool {
+        // `prompt_relaxed` is deliberately not consulted: it only ever holds
+        // inside a flight, and `set_driven(None)` clears it on the way out. A
+        // row that was nothing but a relaxation would be a leak, and dropping
+        // it here is what makes that impossible.
         !self.user && self.driven_by.is_none()
     }
 }
@@ -155,7 +180,24 @@ impl ReadOnlyTabs {
     /// closed by ordering rather than by timing.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn set_driven(&self, tab: &TabId, by: Option<TabId>) {
-        self.mutate(tab, |e| e.driven_by = by);
+        self.mutate(tab, |e| {
+            // Releasing the engine's lock ends any prompt relaxation with it:
+            // the relaxation is a property of a flight, and a flight that has
+            // ended cannot be relaxing anything.
+            if by.is_none() {
+                e.prompt_relaxed = false;
+            }
+            e.driven_by = by;
+        });
+    }
+
+    /// **Open (or re-close) the keyboard for a standing prompt** (locked
+    /// decision 5). Called by the delegation engine on the prompt's rising and
+    /// falling edges; the engine's own lock stays recorded throughout, so the
+    /// banner keeps naming the driver and Take over keeps working.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn set_prompt_relaxed(&self, tab: &TabId, on: bool) {
+        self.mutate(tab, |e| e.prompt_relaxed = on);
     }
 
     /// Drop a closed tab's row. Called from `close_tab` next to the other
@@ -2229,6 +2271,64 @@ mod tests {
             Some(ReadOnlySource::Driven { by: other() }),
             "settings has no opinion about the engine's transient lock"
         );
+    }
+
+    /// **A standing prompt opens the keyboard whichever lock is on the tab**
+    /// (locked decision 5, V39 review M-5).
+    ///
+    /// The relaxation used to be "clear `driven_by`", so a tab that also
+    /// carried the user's own sticky lock fell straight back to
+    /// `ReadOnlySource::User` and stayed refused — the one prompt only the user
+    /// can answer could not be answered, and the flight ran to its deadline
+    /// reporting "worker awaiting permission". Both sources are asserted here
+    /// because the defect was visible in only one of them.
+    #[test]
+    fn a_standing_prompt_opens_the_keyboard_for_both_lock_sources() {
+        for user_lock in [false, true] {
+            let ro = ReadOnlyTabs::default();
+            ro.set_user(&tab(), user_lock);
+            ro.set_driven(&tab(), Some(other()));
+            assert_eq!(
+                ro.read_only(&tab()),
+                Some(ReadOnlySource::Driven { by: other() })
+            );
+
+            ro.set_prompt_relaxed(&tab(), true);
+            assert_eq!(
+                ro.read_only(&tab()),
+                None,
+                "user_lock={user_lock}: the prompt must be answerable"
+            );
+
+            ro.set_prompt_relaxed(&tab(), false);
+            assert_eq!(
+                ro.read_only(&tab()),
+                Some(ReadOnlySource::Driven { by: other() }),
+                "the lock re-engages on the falling edge"
+            );
+        }
+    }
+
+    /// The relaxation cannot outlive the flight that justified it — and the
+    /// engine's lock is still recorded throughout it, so the banner keeps
+    /// naming the driver and Take over keeps working.
+    #[test]
+    fn a_relaxation_dies_with_the_flight_and_never_hides_the_driver() {
+        let ro = ReadOnlyTabs::default();
+        ro.set_user(&tab(), true);
+        ro.set_driven(&tab(), Some(other()));
+        ro.set_prompt_relaxed(&tab(), true);
+        // Released mid-prompt (a take-over, a timeout): the user's own lock is
+        // back, not silently lifted by a relaxation nobody cleared.
+        ro.set_driven(&tab(), None);
+        assert_eq!(ro.read_only(&tab()), Some(ReadOnlySource::User));
+
+        // …and a tab whose only state was a relaxation leaves no row behind.
+        let ro = ReadOnlyTabs::default();
+        ro.set_driven(&tab(), Some(other()));
+        ro.set_prompt_relaxed(&tab(), true);
+        ro.set_driven(&tab(), None);
+        assert_eq!(ro.read_only(&tab()), None);
     }
 
     #[test]

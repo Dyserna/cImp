@@ -273,6 +273,19 @@ struct Registry {
     completions: HashMap<TabId, Completion>,
     /// Monotonic id source for [`InFlight::id`].
     next_id: u64,
+    /// Workers whose caller went away **before the slot was claimed** (V39
+    /// review R-8).
+    ///
+    /// `note_driver_gone` can only set a flag on a flight that exists, and a
+    /// cancel that arrives while `drive` is still in preflight has no flight to
+    /// set it on — so it did nothing, the claim went ahead, the request was
+    /// typed into the worker and the delegation ran to its deadline for a
+    /// caller that had already hung up.
+    ///
+    /// The mark is consumed by [`claim_in`], and cleared by
+    /// [`clear_driver_gone`] when the call that set it finishes — so it is
+    /// sticky for exactly one attempt and can never poison the next one.
+    abandoned: std::collections::HashSet<TabId>,
 }
 
 fn registry<T>(f: impl FnOnce(&mut Registry) -> T) -> T {
@@ -517,6 +530,16 @@ fn claim_in(
     deadline_ms: u64,
 ) -> Result<u64, String> {
     {
+        // V39 review R-8: the caller went away while preflight ran. Refuse
+        // before the claim, which is before the lock is engaged and before a
+        // byte is typed — the whole point of the mark is that this tab is left
+        // exactly as it was.
+        if r.abandoned.remove(worker) {
+            return Err(format!(
+                "the caller went away before the request was typed — nothing was sent to tab `{}`",
+                worker.as_str()
+            ));
+        }
         if let Some(held) = r.in_flight.get(worker) {
             return Err(format!(
                 "busy: tab `{}` is already being driven by `{}` (since {} ms ago)",
@@ -712,8 +735,24 @@ pub fn note_driver_gone(worker: &TabId) -> bool {
             f.driver_gone = true;
             true
         }
-        None => false,
+        // V39 review R-8: nothing in flight YET. The caller hung up while
+        // preflight was still running, so the mark waits for the claim rather
+        // than being dropped — see `Registry::abandoned`.
+        None => {
+            r.abandoned.insert(worker.clone());
+            false
+        }
     })
+}
+
+/// Drop a pre-claim abandonment mark (V39 review R-8).
+///
+/// Called by the driving path once its attempt is over, whatever the outcome:
+/// the mark exists to be consumed by THIS attempt's claim, and a mark that
+/// outlived it would refuse the next delegation into the same worker for a
+/// caller that is long gone.
+pub fn clear_driver_gone(worker: &TabId) {
+    registry(|r| r.abandoned.remove(worker));
 }
 
 /// Whether the driver has gone away under this delegation.
@@ -884,6 +923,7 @@ pub(crate) mod testing {
         registry(|r| {
             r.in_flight.clear();
             r.completions.clear();
+            r.abandoned.clear();
         });
     }
 
@@ -1287,14 +1327,63 @@ mod tests {
         with_clean_registry(|| {
             assert!(
                 !note_driver_gone(&worker()),
-                "nothing in flight: a no-op, so a cancelled caller can call it blind"
+                "nothing in flight: the ANSWER is `false`, so a cancelled caller can call it blind"
             );
+            // …though since V39 review R-8 it also leaves a mark for the claim
+            // that has not happened yet. That mark belongs to the attempt that
+            // set it, and its caller drops it when the attempt ends.
+            clear_driver_gone(&worker());
             claim_one(&worker(), &driver(), 100).expect("claim");
             assert!(!is_driver_gone(&worker()));
             assert!(note_driver_gone(&worker()));
             assert!(is_driver_gone(&worker()));
             release(&worker());
             assert!(!is_driver_gone(&worker()), "released with the slot");
+        });
+    }
+
+    /// **A caller that hangs up during preflight is not typed to** (V39 review
+    /// R-8).
+    ///
+    /// `note_driver_gone` sets a flag on a flight, and a cancel arriving before
+    /// the slot is claimed has no flight to set it on — so it was a no-op, the
+    /// request was typed into the worker, and the delegation ran to its
+    /// deadline for a caller that had already gone. The mark now waits for the
+    /// claim and is consumed there: before the lock, before the paste.
+    #[test]
+    fn a_caller_that_hangs_up_during_preflight_is_refused_at_the_claim() {
+        with_clean_registry(|| {
+            assert!(
+                !note_driver_gone(&worker()),
+                "nothing in flight — the answer is still `false`, and now it also marks"
+            );
+            let refused = claim_one(&worker(), &driver(), 100)
+                .expect_err("the claim must consume the mark and refuse");
+            assert!(
+                refused.contains("went away before the request was typed"),
+                "{refused}"
+            );
+            assert!(
+                !is_driven(&worker()),
+                "nothing was claimed, so nothing was locked and nothing was typed"
+            );
+            // Consumed, not sticky: the next delegation into the same worker is
+            // a different call and must not inherit this one's refusal.
+            assert!(claim_one(&worker(), &driver(), 200).is_ok());
+        });
+    }
+
+    /// …and a mark whose call ended before the claim reached it is cleared
+    /// rather than left for the next one.
+    #[test]
+    fn an_abandonment_mark_does_not_outlive_its_attempt() {
+        with_clean_registry(|| {
+            note_driver_gone(&worker());
+            clear_driver_gone(&worker());
+            assert!(
+                claim_one(&worker(), &driver(), 100).is_ok(),
+                "the mark belonged to a call that is over"
+            );
         });
     }
 

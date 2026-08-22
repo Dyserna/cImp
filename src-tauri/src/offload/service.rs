@@ -1683,10 +1683,17 @@ impl OffloadService {
             _ = cancel.cancelled() => {
                 // Tell the engine, then let it finish tearing down. Never drop
                 // the future: it holds the slot and the lock.
+                //
+                // V39 review R-8: this also marks a worker whose flight has not
+                // been claimed yet, so a cancel during preflight refuses at the
+                // claim instead of typing into the tab.
                 crate::delegation::note_driver_gone(facade.tab());
                 flight.await
             }
         };
+        // The mark belongs to THIS attempt (R-8): consumed by the claim if it
+        // got that far, dropped here if it did not.
+        crate::delegation::clear_driver_gone(facade.tab());
         match reply {
             // V39 review M-11: a schema was a REQUEST, and only a request. A
             // real backend has the answer grammar-constrained by llama-server

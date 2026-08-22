@@ -651,6 +651,26 @@ fn take_completion(worker: &TabId) -> Option<String> {
 /// out, so a take-over cannot leave a half-torn-down delegation behind.
 pub fn take_over(worker: &TabId) -> Option<InFlightView> {
     registry(|r| {
+        // V39 review L-3: a flight whose reply has already landed cannot be
+        // taken over. The engine takes the completion, then screens and records
+        // it — during which the slot is still held, so a click in that window
+        // used to flag a flight that was already finished: the UI said "you
+        // took it back", the driver received its answer anyway, and NO row was
+        // minted for the take-over (the engine was past the branch that would
+        // have written one). Answering `None` makes the UI say the true thing:
+        // "it had already finished".
+        //
+        // "Landed" is decision 10's correlation rule, not "a completion exists"
+        // — an earlier turn's tail sitting in the slot is not this delegation's
+        // reply, and must not make its take-over a no-op.
+        let submit_ms = r.in_flight.get(worker)?.submit_ms;
+        let landed = match (submit_ms, r.completions.get(worker)) {
+            (Some(submitted), Some(c)) => c.at_ms >= submitted,
+            _ => false,
+        };
+        if landed {
+            return None;
+        }
         let f = r.in_flight.get_mut(worker)?;
         f.taken_over = true;
         Some(view(f))
@@ -1140,6 +1160,63 @@ mod tests {
         });
     }
 
+    /// **A take-over that arrives after the reply cancels nothing** (V39
+    /// review L-3).
+    ///
+    /// The slot is still held while the engine screens and records the reply,
+    /// so a click in that window flagged a flight that was already over: the UI
+    /// claimed "you took it back", the driver got its answer regardless, and no
+    /// `takeover` row was ever minted — the engine had passed the branch that
+    /// writes one. `None` is the honest answer, and it is the one the UI
+    /// already renders as "it had already finished".
+    #[test]
+    fn a_take_over_after_the_reply_landed_reports_nothing_to_cancel() {
+        with_clean_registry(|| {
+            claim_one(&worker(), &driver(), 100).expect("claim");
+            mark_submitted(&worker(), 0);
+            assert!(
+                take_over(&worker()).is_some(),
+                "before the reply lands, a take-over takes"
+            );
+            registry(|r| {
+                r.in_flight
+                    .get_mut(&worker())
+                    .expect("in flight")
+                    .taken_over = false;
+            });
+            // An EARLIER turn's tail lands in the slot: not this delegation's
+            // reply, so a take-over still takes.
+            note_assistant_text(&worker(), "someone else's answer");
+            registry(|r| {
+                r.completions.get_mut(&worker()).expect("recorded").at_ms = 0;
+            });
+            registry(|r| {
+                r.in_flight.get_mut(&worker()).expect("in flight").submit_ms = Some(10);
+            });
+            assert!(
+                take_over(&worker()).is_some(),
+                "a pre-submit completion is not this flight's reply"
+            );
+            registry(|r| {
+                r.in_flight
+                    .get_mut(&worker())
+                    .expect("in flight")
+                    .taken_over = false;
+            });
+            // The worker's answer lands; the engine is now screening it.
+            note_assistant_text(&worker(), "the answer");
+            assert_eq!(
+                take_over(&worker()),
+                None,
+                "there is nothing left to cancel — the reply is already in"
+            );
+            assert!(
+                !is_taken_over(&worker()),
+                "and nothing was flagged, so no `takeover` row can be minted for it"
+            );
+        });
+    }
+
     /// **Take-over sets a flag and nothing else.** No key is written anywhere
     /// on this path — the worker finishes what it is doing, visibly.
     #[test]
@@ -1278,13 +1355,36 @@ mod tests {
     /// be changed deliberately.
     #[test]
     fn nothing_mints_a_cancelled_row() {
-        let files = [
-            ("delegation/mod.rs", include_str!("mod.rs")),
-            ("delegation/engine.rs", include_str!("engine.rs")),
-            ("ipc/commands.rs", include_str!("../ipc/commands.rs")),
-            ("offload/loopback.rs", include_str!("../offload/loopback.rs")),
-        ];
-        for (name, src) in files {
+        // V39 review L-4: the whole tree, not four files somebody remembered.
+        // The failure this guards against is a SECOND writer appearing
+        // ELSEWHERE, and a hardcoded list is blind to exactly that — the file
+        // it does not name is the file the next writer lands in.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files: Vec<(String, String)> = Vec::new();
+        let mut stack = vec![root.clone()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("src is readable").flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                    let name = path
+                        .strip_prefix(&root)
+                        .unwrap_or(&path)
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    // CRLF-safe: CI checks the tree out with CRLF and the
+                    // offsets `rustsrc` reports are into the stripped text.
+                    files.push((name, std::fs::read_to_string(&path).expect("utf-8")));
+                }
+            }
+        }
+        assert!(
+            files.len() > 50,
+            "the scan must actually have walked the tree, found {}",
+            files.len()
+        );
+        for (name, src) in files.iter().map(|(n, s)| (n.as_str(), s.as_str())) {
             let src = src.replace('\r', "");
             let code = crate::rustsrc::code_of(name, &src);
             let mut body = String::new();

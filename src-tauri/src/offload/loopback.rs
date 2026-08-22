@@ -6270,8 +6270,45 @@ fn hook_admit(
 /// `claude`: `--precompact-hook` and `--read-hook` are installed only into
 /// Claude's settings overlay, and a `post_edit` body with no `agent` is a shim
 /// from a build before this field existed, which was a Claude shim.
+///
+/// **EMPTY counts as absent** (V40 review finding M-4). `identity_of_request`
+/// answers `req.cimp.agent.clone().unwrap_or_default()` and
+/// `chp::Envelope::agent_token` answers `.unwrap_or("")`, so an artifact from
+/// before the discriminator existed arrives here as `Some("")`, not `None`. On
+/// develop `source_for_consumer("")` was `"claude"` and the guard never
+/// mattered; since V40 it is `UNKNOWN_SOURCE`, which names no configured tab
+/// and fails every gate open. Whitespace-only counts as empty, so `" "` cannot
+/// walk past it either — but a token that has any content is passed through
+/// UNTRIMMED, because `HarnessId::from_consumer`'s no-trim is a locked decision
+/// and `" opencode "` must keep answering `unknown`.
 fn hook_agent(agent: Option<&str>) -> &'static str {
-    crate::graph::source_for_consumer(agent.unwrap_or(crate::harness::DEFAULT_HARNESS.token()))
+    crate::graph::source_for_consumer(
+        agent
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or(crate::harness::DEFAULT_HARNESS.token()),
+    )
+}
+
+/// The agent key an identity-less body on `route` resolves to — [`hook_agent`]
+/// for the routes whose default is the ROUTE's, not the app's.
+///
+/// One funnel for the three places that read a body-supplied discriminator and
+/// fall back to [`crate::harness::ingress::wire_default`] (`/memory/event`,
+/// `/latch/state`, and the CHP observer), so the handler and the observer on one
+/// request cannot answer differently — the disagreement V40 review M-4 found on
+/// `/memory/event`, where the handler read `opencode` and `note_chp` read
+/// `unknown` from the same bytes.
+///
+/// Empty is absent here for the same reason it is in [`hook_agent`]; an
+/// unresolvable token stays `UNKNOWN_SOURCE`, which is V40's deliberate
+/// narrowing and not what this funnel is about.
+fn wire_agent(route: &str, token: Option<&str>) -> &'static str {
+    match token.filter(|s| !s.trim().is_empty()) {
+        Some(t) => crate::graph::source_for_consumer(t),
+        None => crate::graph::source_for_consumer(
+            crate::harness::ingress::wire_default(route).token(),
+        ),
+    }
 }
 
 /// A `POST /context/compaction` request body (the Claude `PreCompact` shim).
@@ -6745,7 +6782,15 @@ fn note_chp(app: &AppHandle, route: &str, req: &Request) {
             tab,
         )
     };
-    let agent = crate::graph::source_for_consumer(&agent_token);
+    // V40 review M-4: through the same funnel the HANDLERS use, and empty is
+    // absent. Both identity readers answer the empty string rather than `None`
+    // for a body with no discriminator (`identity_of_request` is
+    // `unwrap_or_default()`, `Envelope::agent_token` is `unwrap_or("")`), so a
+    // pre-upgrade artifact resolved to `UNKNOWN_SOURCE` — which fails
+    // `is_configured_tab` and silently switched OFF stale-artifact recording and
+    // the quiet-capability detector for exactly the artifacts they exist to
+    // catch.
+    let agent = wire_agent(route, Some(agent_token.as_str()));
     // The quiet pass runs FIRST and on every POST, including the ones the
     // `already_seen` shortcut below returns early from — a tab whose `chp` has
     // not changed is precisely the steady state in which a hook goes silent.
@@ -8539,10 +8584,7 @@ async fn handle_memory_event(
     else {
         return write_json(stream, 200, &ok).await;
     };
-    let agent = body
-        .agent
-        .as_deref()
-        .unwrap_or_else(|| crate::harness::ingress::wire_default(MEMORY_EVENT_ROUTE).token());
+    let agent = wire_agent(MEMORY_EVENT_ROUTE, body.agent.as_deref());
     // C-2 (2026-08-07 review) used to read settings here, once for the whole
     // request, so the three live-session writes below could refuse a key that
     // named a configured tab. V40 Phase D removed the read with the check: the
@@ -9305,11 +9347,7 @@ async fn handle_latch_state(
             return write_json(stream, 400, &r).await;
         }
     };
-    let agent = crate::graph::source_for_consumer(
-        body.consumer
-            .as_deref()
-            .unwrap_or_else(|| crate::harness::ingress::wire_default(LATCH_STATE_ROUTE).token()),
-    );
+    let agent = wire_agent(LATCH_STATE_ROUTE, body.consumer.as_deref());
     let settings = live_settings(app);
     let scoping = latch_scope(app, &settings, agent, body.tab.as_deref());
     // #48: the verdict comes from the resolved injection scope, which is
@@ -17873,6 +17911,66 @@ mod tests {
         assert_eq!(
             hook_agent(Some(" opencode ")),
             crate::graph::UNKNOWN_SOURCE
+        );
+        // **V40 review M-4: EMPTY is ABSENT, not unknown.** Both identity
+        // readers answer `""` rather than `None` for a body with no
+        // discriminator — `identity_of_request` is `unwrap_or_default()`,
+        // `chp::Envelope::agent_token` is `unwrap_or("")` — so an artifact from
+        // before the field existed arrives as `Some("")`. On develop
+        // `source_for_consumer("")` was `"claude"` and this never mattered;
+        // resolving it to `unknown` switched CHP stale-artifact recording and
+        // the quiet-hook detector off for exactly the pre-upgrade artifacts they
+        // exist to catch.
+        assert_eq!(hook_agent(Some("")), "claude");
+        assert_eq!(hook_agent(Some("   ")), "claude");
+    }
+
+    /// The same rule on the two routes whose identity-less default is the
+    /// ROUTE's rather than the app's, and on the CHP observer that reads the
+    /// same bytes (V40 review M-4).
+    ///
+    /// The disagreement this closes: on `/memory/event` an identity-less body
+    /// was `opencode` to the handler and `unknown` to the observer, on ONE
+    /// request. Both go through `wire_agent` now.
+    #[test]
+    fn an_identity_less_body_resolves_to_its_routes_declared_default() {
+        for route in [MEMORY_EVENT_ROUTE, LATCH_STATE_ROUTE] {
+            let declared = crate::harness::ingress::wire_default(route).token();
+            assert_eq!(wire_agent(route, None), declared, "{route}");
+            assert_eq!(wire_agent(route, Some("")), declared, "{route}: empty");
+            assert_eq!(wire_agent(route, Some(" ")), declared, "{route}: blank");
+        }
+        // A route nobody claims takes the app default…
+        assert_eq!(wire_agent("/context/compaction", Some("")), "claude");
+        // …and a token with content is still resolved, or refused, on its own
+        // merits: V40's `unknown` narrowing is not what this funnel is about.
+        assert_eq!(wire_agent(MEMORY_EVENT_ROUTE, Some("claude")), "claude");
+        assert_eq!(
+            wire_agent(MEMORY_EVENT_ROUTE, Some("codex")),
+            crate::graph::UNKNOWN_SOURCE
+        );
+
+        // The actual pre-upgrade artifact, end to end: a `/context/compaction`
+        // body with a tab and a session and NO `agent`. Both identity readers
+        // hand `note_chp` an empty token, and it has to land on a real harness
+        // or the tab's stale-artifact report and quiet-hook detection are off.
+        let body = br#"{"tab":"claude","session_id":"s","chp":1}"#;
+        let (env, tab) = crate::harness::chp::envelope("/context/compaction", body)
+            .expect("a body with a tab is observable");
+        assert_eq!(env.agent_token(), "", "precondition: the reader answers empty");
+        assert_eq!(tab, "claude");
+        assert_eq!(
+            wire_agent("/context/compaction", Some(env.agent_token())),
+            "claude"
+        );
+
+        let req = request_for_test("POST", "/claude/hook/pre_compact", Some("claude"), Some(1));
+        let id = crate::harness::ingress::identity_of_request("/claude/hook/pre_compact", &req)
+            .expect("the Claude plugin claims its own hook route");
+        assert_eq!(id.agent, "", "precondition: the reader answers empty");
+        assert_eq!(
+            wire_agent("/claude/hook/pre_compact", Some(id.agent.as_str())),
+            "claude"
         );
     }
 

@@ -33,3 +33,21 @@ path, latch gating incl. the facade path via `offload_task`'s own gate, facade
 synthesis never persisted, plugin-layer literals/gate/fail-closed, UI snapshot
 semantics, spawn signature) is in the reviewer's report; the orchestrator spot-checked
 the single write path, lock-before-write, and the attribution-line reach independently.
+
+## Verification pass (same reviewer, over `4fc007e..6c160e6`)
+
+17/18 CLOSED; M-5 PARTIAL (frontend courtesy gate still swallowed the prompt answer). Regressions introduced by the fixes — **all ruled FIX**:
+
+| id | sev | finding |
+|---|---|---|
+| R-1 | MED | fenced `{}`/`[]`/`null` treated as scaffold → correct "none found" answer reported as no text |
+| R-2 | MED | Claude: user-prompt line in the same drain pass wipes an ended-but-unfiled turn |
+| R-3 | MED | OpenCode: child idle leaves stale `turn_last_text` + clears `working` → stale text filed as the next reply; `at_ms` stamped at file time |
+| R-4 | MED | M-5 end-to-end: frontend gate ignores `prompt_relaxed` |
+| R-5 | LOW | `pty_restart` reset races a late `SubprocessExited` |
+| R-6 | LOW | `/delegate` has no disconnect probe (L-7 covered the facade only) |
+| R-7 | LOW | OpenCode SSE close speaks but never files the buffered turn |
+| R-8 | LOW | facade cancel before the slot claim is a no-op |
+| R-9 | LOW | text-less turn files nothing → timeout instead of `NoText` |
+
+Accepted residual: a child session whose `session.created` was dropped can momentarily be taken as main (self-healing on the parent's next event).

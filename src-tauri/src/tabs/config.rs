@@ -20,8 +20,10 @@
 //! var carrying the equivalent `mcp` / `instructions` JSON
 //! (see `compose_ai_env` + `build_opencode_config`).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
+
+use serde_json::Value;
 
 use crate::error::{AppError, AppResult};
 // V35 Phase K: the two generated harness artifacts moved into `harness/`, one
@@ -341,13 +343,14 @@ pub(crate) fn tab_consumer(cfg: &AiToolTabConfig) -> Option<&'static str> {
 /// to restart), the `"channels"` entry lost its `advertises_offload_to_claude`
 /// conjunct, and [`injection_hygiene_applies`] lost the advertise gate under its
 /// feature switch.
-pub(crate) fn advertises_audit_to_claude(s: &Settings) -> bool {
-    s.code_audit.enabled && s.code_audit.expose_claude
-}
-
-pub(crate) fn advertises_audit_to_opencode(s: &Settings) -> bool {
-    s.code_audit.enabled && s.code_audit.expose_opencode
-}
+// `advertises_audit_to_{claude,opencode}` and `read_advisor_gate_blocked` moved
+// to `harness::plugin` in V40 Phase B. Both existed here only because the
+// per-harness settings they read were core fields, and both were called by the
+// plugins — an UPWARD edge from `harness/<id>/` into `tabs::config` for two
+// one-line predicates. `audit_advertised(settings, harness)` is one body over
+// the settings map instead of two bodies over a field pair, and the read-advisor
+// gate is now asked of `harness::contract` directly, beside the row that
+// declares it.
 
 // ── V32 Phase F — native-web visibility (locked decision 14) ───────────────
 
@@ -410,62 +413,67 @@ pub(crate) fn tool_steering_for(s: &Settings, agent: &str, tab: &str) -> bool {
     )
 }
 
-/// V32 Phase H (locked decision 17): whether the generated OpenCode plugin
-/// should carry its native-tool GATE, for one tab.
-///
-/// Spawn-baked — the flag is compiled into the plugin file — so it rides
-/// `spawn_inject_sig` through `injection::spawn_sig`. Deliberately **not** ANDed
-/// here with the taint-latch feature: that composition is resolved live, per
-/// query, at the loopback (`native_gate_verdict`), so switching the latch off
-/// stops the denials immediately instead of waiting for a tab restart.
-pub(crate) fn opencode_native_gate_for(s: &Settings, tab: &str) -> bool {
-    crate::settings::injection::effective(
-        crate::settings::injection::Feature::OpencodeNativeGate,
-        crate::settings::injection::Scope::Tab {
-            agent: "opencode",
-            tab,
-        },
-        s,
-    )
-}
-
-/// Whether the harness capability matrix currently BLOCKS the read advisor's
-/// `PreToolUse` deny (V35 Phase E).
-///
-/// One named helper for the two call sites in this file — the overlay builder
-/// that installs the hook, and [`spawn_inject_sig`], which must move whenever
-/// that decision does — so the capability id is spelled once here rather than
-/// twice. It replaced `HarnessVersions::e1_blocked()`: the interpretation of
-/// `e1_status` (fail-closed on anything unrecognized) now lives in
-/// `harness::contract::gate` alongside the row that declares the contract, and
-/// the same query serves the Settings window over IPC instead of the frontend
-/// re-implementing the rule.
-pub(crate) fn read_advisor_gate_blocked(s: &Settings) -> bool {
-    crate::harness::contract::gate(crate::harness::contract::CAP_PRETOOLUSE_DENY, s).blocked
-}
+// `opencode_native_gate_for` moved to `harness::opencode::plugin` in V40 Phase
+// B. It resolved `Feature::HarnessNativeGate` under `Scope::Tab { agent:
+// "opencode" }` — core spelling one harness's name to answer a question about a
+// file only that harness's plugin writes — and both its callers were already
+// inside `harness/opencode/`.
 
 /// Per-harness spawn-injection signature.
 ///
 /// Captures every Settings-derived input that reaches an AI tab **only at
 /// spawn** (the `--mcp-config` server set, the `compose_capability_guidance`
-/// gates, the `--settings` statusline/hooks overlay, the `claude_local` env for
-/// local-provider tabs, the OpenCode plugin's baked flags and the injected
-/// `local-llama` provider). Compared across a Settings save to decide whether a
-/// "restart the AI tab" hint is due. Coarse by design: any difference means a
-/// fresh tab would be launched differently from the one still running.
+/// gates, the `--settings` statusline/hooks overlay, the local-provider env,
+/// the OpenCode plugin's baked flags and the injected `local-llama` provider).
+/// Compared across a Settings save to decide whether a "restart the AI tab"
+/// hint is due. Coarse by design: any difference means a fresh tab would be
+/// launched differently from the one still running.
 ///
 /// **V40 Phase A replaced the `[Value; 2]`** (locked decisions 8 and 25). It was
 /// read POSITIONALLY by the restart-hint consumer, so a harness with no slot
 /// meant a spawn-baked setting could flip with no restart hint and no diff —
-/// the failure the mechanism exists to prevent. A [`PerHarness`] is sized by the
-/// registry, so a missing slot is a compile error, and each half is now built by
-/// the plugin that knows what it bakes.
+/// the failure the mechanism exists to prevent.
 ///
-/// [`PerHarness`]: crate::harness::PerHarness
-pub(crate) fn spawn_inject_sig(s: &Settings) -> crate::harness::PerHarness<serde_json::Value> {
-    crate::harness::PerHarness::from_fn(|h| {
-        h.plugin().map(|p| p.spawn_sig(s)).unwrap_or(serde_json::Value::Null)
-    })
+/// **V40 Phase B made it the `BTreeMap<HarnessId, Value>` decision 8 asks for**,
+/// and added the half a plugin can no longer forget: every field a plugin
+/// declares `spawn_baked` in `settings_schema()` is folded in here
+/// automatically, under the `"ext"` key. The flag and its restart-hint entry
+/// are now ONE declaration — which closes the class V32 F-27 and V38 M-3 both
+/// landed in, where a spawn-baked control shipped with no signature entry and
+/// flipping it silently left every running tab on the old value.
+pub(crate) fn spawn_inject_sig(s: &Settings) -> BTreeMap<crate::harness::HarnessId, Value> {
+    crate::harness::registry::all()
+        .map(|h| (h, harness_spawn_sig(s, h)))
+        .collect()
+}
+
+/// One harness's slot: what its plugin composes, plus its declared spawn-baked
+/// `ext` values.
+///
+/// The two halves are kept distinct in the object (`"ext"` is its own key)
+/// rather than merged, so a plugin that declares an ext key sharing a name with
+/// one of its hand-built entries cannot silently shadow it.
+fn harness_spawn_sig(s: &Settings, h: crate::harness::HarnessId) -> Value {
+    let Some(plugin) = h.plugin() else {
+        return Value::Null;
+    };
+    let mut sig = plugin.spawn_sig(s);
+    let baked: BTreeMap<&str, Value> = plugin
+        .settings_schema()
+        .iter()
+        .filter(|f| f.spawn_baked)
+        .map(|f| (f.key, s.harness_ext(h, f.key)))
+        .collect();
+    // An object is what every plugin returns today; a plugin that returned
+    // something else would still get its ext half, wrapped, rather than losing
+    // it to a silently skipped insert.
+    match sig.as_object_mut() {
+        Some(obj) => {
+            obj.insert("ext".to_string(), serde_json::json!(baked));
+        }
+        None => sig = serde_json::json!({ "own": sig, "ext": baked }),
+    }
+    sig
 }
 
 /// Compose the capability-guidance addendum shared by Claude
@@ -514,10 +522,12 @@ pub(crate) fn compose_capability_guidance(cfg: &AiToolTabConfig, settings: &Sett
         if !addendum.is_empty() {
             addendum.push_str("\n\n");
         }
+        // V40 Phase B: the `run_command` half of the paragraph is gated by
+        // THIS tab's harness row. `agent` is `Some` here (the `if` above) and
+        // it came from `tab_consumer`, so the registry lookup cannot miss.
+        let harness = agent.and_then(crate::harness::HarnessId::from_id);
         addendum.push_str(&tool_steering_guidance(
-            settings
-                .tool_plugins
-                .commands_exposed_to(agent.expect("gated on `agent` being Some")),
+            harness.is_some_and(|h| settings.harness_settings(h).expose_commands),
         ));
     }
     if settings.offload.enabled && settings.offload.inject_guidance {
@@ -973,6 +983,14 @@ mod tests {
             .and_then(|p| p.resolve_oob(cfg, working_dir, extra_args, env))
     }
     use super::*;
+
+    /// A registered harness by id — **tests only**. The spawn-signature map is
+    /// keyed by `HarnessId` since V40 Phase B, and these tests were written
+    /// against the positional pair it replaced, so each one now names the
+    /// harness its assertion was always about.
+    fn h(id: &str) -> crate::harness::HarnessId {
+        crate::harness::HarnessId::from_id(id).expect("registered harness")
+    }
     use crate::settings::{
         ai_tab_inheriting_injection, default_claude_tab, default_opencode_tab,
     };
@@ -1082,7 +1100,7 @@ mod tests {
     #[test]
     fn injects_statusline_overlay_for_claude_when_enabled() {
         let mut settings = Settings::default();
-        settings.statusline.enabled = true;
+        settings.set_ext("claude", "statusline", serde_json::json!(true));
         let args = build_pre_args(&claude_cfg(), &settings, "claude", Some(&hook_endpoint()));
 
         let overlay = settings_overlay(&args).expect("statusLine overlay present");
@@ -1101,7 +1119,7 @@ mod tests {
     #[test]
     fn no_statusline_overlay_when_disabled() {
         let mut settings = Settings::default();
-        settings.statusline.enabled = false;
+        settings.set_ext("claude", "statusline", serde_json::json!(false));
         let args = build_pre_args(&claude_cfg(), &settings, "claude", Some(&hook_endpoint()));
         // With the statusline off and no loopback (H2 gated the NC-2 permission
         // hooks on it), the overlay has nothing to carry and no `--settings`
@@ -1146,7 +1164,7 @@ mod tests {
     #[test]
     fn no_context_hook_when_injection_off() {
         let mut settings = Settings::default();
-        settings.statusline.enabled = false;
+        settings.set_ext("claude", "statusline", serde_json::json!(false));
         settings.graph.enabled = true;
         settings.graph.context_injection = false;
         let args = build_pre_args(&claude_cfg(), &settings, "claude", Some(&hook_endpoint()));
@@ -1269,7 +1287,7 @@ mod tests {
     #[test]
     fn context_hook_overlay_installed_when_checkpoints_on_even_if_injection_off() {
         let mut settings = Settings::default();
-        settings.statusline.enabled = false;
+        settings.set_ext("claude", "statusline", serde_json::json!(false));
         settings.graph.enabled = true;
         settings.graph.context_injection = false;
         settings.workbench.checkpoints = true;
@@ -1300,7 +1318,7 @@ mod tests {
     #[test]
     fn the_context_hook_carries_its_own_tab_id() {
         let mut settings = Settings::default();
-        settings.statusline.enabled = false;
+        settings.set_ext("claude", "statusline", serde_json::json!(false));
         settings.graph.enabled = true;
         settings.graph.context_injection = true;
         let entry = |tab: &str| {
@@ -1327,7 +1345,7 @@ mod tests {
     #[test]
     fn no_context_hook_when_checkpoints_on_but_graph_disabled() {
         let mut settings = Settings::default();
-        settings.statusline.enabled = false;
+        settings.set_ext("claude", "statusline", serde_json::json!(false));
         settings.graph.enabled = false;
         settings.workbench.checkpoints = true;
         let args = build_pre_args(&claude_cfg(), &settings, "claude", Some(&hook_endpoint()));
@@ -1386,7 +1404,7 @@ mod tests {
     #[test]
     fn every_context_hook_carries_the_tab_its_route_gates_on() {
         let mut settings = Settings::default();
-        settings.statusline.enabled = false;
+        settings.set_ext("claude", "statusline", serde_json::json!(false));
         settings.graph.enabled = true;
         settings.graph.context_injection = true;
         settings.graph.compaction_context = true;
@@ -1466,7 +1484,7 @@ mod tests {
     #[test]
     fn no_postedit_hook_when_auto_check_off_or_no_checks_configured() {
         let mut settings = Settings::default();
-        settings.statusline.enabled = false;
+        settings.set_ext("claude", "statusline", serde_json::json!(false));
         settings.graph.enabled = true;
         settings.graph.auto_check = false;
         settings.checks = vec![crate::checks::CheckDef::default()];
@@ -1481,7 +1499,7 @@ mod tests {
         assert!(!post_tool_use_has_auto_check(&overlay), "{}", overlay["hooks"]);
 
         let mut settings2 = Settings::default();
-        settings2.statusline.enabled = false;
+        settings2.set_ext("claude", "statusline", serde_json::json!(false));
         settings2.graph.enabled = true;
         settings2.graph.auto_check = true;
         settings2.checks = Vec::new();
@@ -1595,7 +1613,7 @@ mod tests {
         // Barest settings that start the loopback: graph on, everything else
         // (statusline, injection, advisors, auto-check) off.
         let mut settings = Settings::default();
-        settings.statusline.enabled = false;
+        settings.set_ext("claude", "statusline", serde_json::json!(false));
         settings.graph.enabled = true;
         settings.graph.context_injection = false;
         settings.workbench.checkpoints = false;
@@ -1653,18 +1671,18 @@ mod tests {
     fn permission_hooks_have_a_spawn_inject_sig_entry() {
         let settings = Settings::default();
         let sig = spawn_inject_sig(&settings);
-        let hooks = sig[0]["hooks"].as_array().expect("claude hooks sig array");
+        let hooks = sig[&h("claude")]["hooks"].as_array().expect("claude hooks sig array");
         // The six GATED hook entries (five, plus V33 Phase F's pre-mutation
         // checkpoint beacon) — all off by default.
         assert_eq!(hooks.len(), 6, "unexpected hook-gate count: {hooks:?}");
         assert!(hooks.iter().all(|g| g == &serde_json::Value::Bool(false)));
         // The NC-2 pair rides its own key and tracks `loopback_needed()`.
-        assert_eq!(sig[0]["notify_hooks"], serde_json::json!(false));
+        assert_eq!(sig[&h("claude")]["notify_hooks"], serde_json::json!(false));
         let mut with_graph = Settings::default();
         with_graph.graph.enabled = true;
         let sig2 = spawn_inject_sig(&with_graph);
-        assert_eq!(sig2[0]["notify_hooks"], serde_json::json!(true));
-        assert_ne!(sig[0], sig2[0], "the flip must change the signature");
+        assert_eq!(sig2[&h("claude")]["notify_hooks"], serde_json::json!(true));
+        assert_ne!(sig[&h("claude")], sig2[&h("claude")], "the flip must change the signature");
 
         // V33 Phase F: `workbench.checkpoints` alone must move the signature.
         // It is the half no other entry carries — the UserPromptSubmit slot
@@ -1679,7 +1697,7 @@ mod tests {
         );
         let sig3 = spawn_inject_sig(&with_cp);
         assert_ne!(
-            sig[0], sig3[0],
+            sig[&h("claude")], sig3[&h("claude")],
             "toggling workbench.checkpoints must raise the restart hint — the \
              PreToolUse checkpoint beacon is baked at spawn"
         );
@@ -1772,7 +1790,7 @@ mod tests {
         // gates the surface at list time, not at launch.
         let mut spiked = Settings::default();
         spiked.tabs.push(claude_tab_inheriting());
-        spiked.harness_versions.input_profile_status = "fail".to_string();
+        spiked.harness_row("claude").input_profile_status = "fail".to_string();
         assert_eq!(sig, spawn_inject_sig(&spiked));
     }
 
@@ -1877,7 +1895,7 @@ mod tests {
     #[test]
     fn statusline_and_context_hook_share_one_overlay() {
         let mut settings = Settings::default();
-        settings.statusline.enabled = true;
+        settings.set_ext("claude", "statusline", serde_json::json!(true));
         settings.graph.enabled = true;
         settings.graph.context_injection = true;
         let args = build_pre_args(&claude_cfg(), &settings, "claude", Some(&hook_endpoint()));
@@ -1917,7 +1935,7 @@ mod tests {
         let mut settings = Settings::default();
         // Every overlay-producing gate on at once — the biggest overlay
         // `build_pre_args` can build.
-        settings.statusline.enabled = true;
+        settings.set_ext("claude", "statusline", serde_json::json!(true));
         settings.workbench.checkpoints = true;
         settings.graph.enabled = true;
         settings.graph.context_injection = true;
@@ -2013,7 +2031,7 @@ mod tests {
     /// produces. Returns `(hooks, every http hook object in it)`.
     fn maxed_overlay() -> (serde_json::Value, Vec<serde_json::Value>) {
         let mut settings = Settings::default();
-        settings.statusline.enabled = true;
+        settings.set_ext("claude", "statusline", serde_json::json!(true));
         settings.workbench.checkpoints = true;
         settings.graph.enabled = true;
         settings.graph.context_injection = true;
@@ -2222,7 +2240,7 @@ mod tests {
         // …and the one thing a maxed overlay still cannot serve, because the
         // native-web mode defaults to `sensor` only when it is set to it.
         let mut off = Settings::default();
-        off.statusline.enabled = false;
+        off.set_ext("claude", "statusline", serde_json::json!(false));
         off.graph.enabled = true;
         off.set_native_web_mode_for_test(NativeWebVisibility::Off);
         let args = build_pre_args(&claude_cfg(), &off, "claude", Some(&hook_endpoint()));
@@ -2307,7 +2325,7 @@ mod tests {
     #[test]
     fn no_endpoint_means_no_http_hooks_at_all() {
         let mut settings = Settings::default();
-        settings.statusline.enabled = true;
+        settings.set_ext("claude", "statusline", serde_json::json!(true));
         settings.graph.enabled = true;
         settings.graph.context_injection = true;
         settings.workbench.checkpoints = true;
@@ -2688,7 +2706,7 @@ mod tests {
         // (its config arrives via OPENCODE_CONFIG_CONTENT), so its pre-args stay
         // empty even with the global toggle on.
         let mut settings = Settings::default();
-        settings.statusline.enabled = true;
+        settings.set_ext("claude", "statusline", serde_json::json!(true));
         let args = build_pre_args(&opencode_cfg(), &settings, "opencode", Some(&hook_endpoint()));
         assert!(
             args.is_empty(),
@@ -2702,7 +2720,7 @@ mod tests {
         // (graph/offload) still feeds --append-system-prompt; with the status
         // line also on, both pre-arg pairs are present.
         let mut settings = Settings::default();
-        settings.statusline.enabled = true;
+        settings.set_ext("claude", "statusline", serde_json::json!(true));
         settings.graph.enabled = true;
         let args = build_pre_args(&claude_cfg(), &settings, "claude", Some(&hook_endpoint()));
 
@@ -2843,7 +2861,10 @@ mod tests {
 
             // On, `run_command` exposed (the shipped default): both parts.
             let on = Settings::default();
-            assert!(on.tool_plugins.commands_exposed_to(agent), "the default is on");
+            assert!(
+                on.harness_row_of(agent).expose_commands,
+                "the default is on"
+            );
             let text = compose_capability_guidance(&cfg, &on);
             assert!(text.contains(TOOL_STEERING_CHECKS), "{agent}: {text}");
             assert!(text.contains(TOOL_STEERING_COMMANDS), "{agent}: {text}");
@@ -2851,8 +2872,8 @@ mod tests {
 
             // On, exposure off for THIS consumer: the run_check half only.
             let mut hidden = Settings::default();
-            hidden.tool_plugins.expose_commands_claude = false;
-            hidden.tool_plugins.expose_commands_opencode = false;
+            hidden.harness_row("claude").expose_commands = false;
+            hidden.harness_row("opencode").expose_commands = false;
             let text = compose_capability_guidance(&cfg, &hidden);
             assert!(text.contains(TOOL_STEERING_CHECKS), "{agent}: {text}");
             assert!(
@@ -2865,9 +2886,9 @@ mod tests {
             // commands must not touch this one's paragraph.
             let mut other_hidden = Settings::default();
             if agent == "claude" {
-                other_hidden.tool_plugins.expose_commands_opencode = false;
+                other_hidden.harness_row("opencode").expose_commands = false;
             } else {
-                other_hidden.tool_plugins.expose_commands_claude = false;
+                other_hidden.harness_row("claude").expose_commands = false;
             }
             assert!(
                 compose_capability_guidance(&cfg, &other_hidden).contains(TOOL_STEERING_COMMANDS),
@@ -2953,8 +2974,8 @@ mod tests {
             // …and the `run_command` half is still gated on the exposure flag.
             let mut hidden = Settings::default();
             hidden.set_master_for_test(false);
-            hidden.tool_plugins.expose_commands_claude = false;
-            hidden.tool_plugins.expose_commands_opencode = false;
+            hidden.harness_row("claude").expose_commands = false;
+            hidden.harness_row("opencode").expose_commands = false;
             let text = compose_capability_guidance(&cfg, &hidden);
             assert!(text.contains(TOOL_STEERING_CHECKS), "{agent}: {text}");
             assert!(!text.contains("run_command"), "{agent}: {text}");
@@ -3162,7 +3183,7 @@ mod tests {
     fn the_code_audit_child_carries_its_own_tab_id() {
         let mut settings = Settings::default();
         settings.code_audit.enabled = true;
-        settings.code_audit.expose_claude = true;
+        settings.harness_row("claude").expose_code_audit = true;
         for tab in ["claude", "claude-local"] {
             let args = build_pre_args(&claude_cfg(), &settings, tab, Some(&hook_endpoint()));
             let i = args.iter().position(|a| a == "--mcp-config").unwrap();
@@ -3183,7 +3204,7 @@ mod tests {
         // carries `--consumer opencode`.
         let mut oc = Settings::default();
         oc.code_audit.enabled = true;
-        oc.code_audit.expose_opencode = true;
+        oc.harness_row("opencode").expose_code_audit = true;
         let cfg = build_opencode_config(&opencode_cfg(), &oc, "opencode-2");
         let cmd: Vec<String> = cfg["mcp"]["cimp-code-audit"]["command"]
             .as_array()
@@ -3241,8 +3262,8 @@ mod tests {
         assert!(!settings.offload.enabled);
         assert!(!settings.graph.enabled);
         assert!(settings.offload.mcp_servers.is_empty());
-        assert!(!settings.offload.any_claude_mcp());
-        assert!(!settings.offload.any_opencode_mcp());
+        assert!(!settings.offload.any_harness_mcp());
+        assert!(!settings.offload.any_harness_mcp());
 
         // Claude.
         let args = build_pre_args(&claude_cfg(), &settings, "claude", Some(&hook_endpoint()));
@@ -3296,8 +3317,12 @@ mod tests {
         let claude_before = build_pre_args(&claude_cfg(), &base, "claude", Some(&hook_endpoint()));
         let oc_before = build_opencode_config(&opencode_cfg(), &base, "opencode");
         for mutate in [
-            |m: &mut crate::settings::McpServerConfig| m.claude_access = true,
-            |m: &mut crate::settings::McpServerConfig| m.opencode_access = true,
+            |m: &mut crate::settings::McpServerConfig| {
+                m.access = crate::settings::access_for_test(&[("claude", true)]);
+            },
+            |m: &mut crate::settings::McpServerConfig| {
+                m.access = crate::settings::access_for_test(&[("opencode", true)]);
+            },
             |m: &mut crate::settings::McpServerConfig| m.offload_access = true,
             |m: &mut crate::settings::McpServerConfig| m.enabled = false,
         ] {
@@ -3372,7 +3397,7 @@ mod tests {
         settings.offload.mcp_servers = vec![crate::settings::McpServerConfig {
             name: "duckduckgo".to_string(),
             url: "http://host:1/mcp".to_string(),
-            claude_access: true,
+            access: crate::settings::access_for_test(&[("claude", true)]),
             offload_access: false,
             ..Default::default()
         }];
@@ -3423,7 +3448,7 @@ mod tests {
         // audit KEY, not about `--mcp-config`.
         let mut settings = Settings::default();
         settings.code_audit.enabled = false;
-        assert!(settings.code_audit.expose_claude, "default is opted-in");
+        assert!(settings.harness_row_of("claude").expose_code_audit, "default is opted-in");
         let args = build_pre_args(&claude_cfg(), &settings, "claude", Some(&hook_endpoint()));
         let i = args.iter().position(|a| a == "--mcp-config").unwrap();
         let cfg: serde_json::Value = serde_json::from_str(&args[i + 1]).unwrap();
@@ -3437,7 +3462,7 @@ mod tests {
         // unconditional proxy child, so this asserts the audit key's absence.
         let mut settings = Settings::default();
         settings.code_audit.enabled = true;
-        settings.code_audit.expose_claude = false;
+        settings.harness_row("claude").expose_code_audit = false;
         let args = build_pre_args(&claude_cfg(), &settings, "claude", Some(&hook_endpoint()));
         let i = args.iter().position(|a| a == "--mcp-config").unwrap();
         let cfg: serde_json::Value = serde_json::from_str(&args[i + 1]).unwrap();
@@ -3530,8 +3555,8 @@ mod tests {
                 || !opencode_mcp["cimp-code-audit"].is_null();
             let offload_surface = settings.offload.enabled
                 || settings.graph.enabled
-                || settings.offload.any_claude_mcp()
-                || settings.offload.any_opencode_mcp();
+                || settings.offload.any_harness_mcp()
+                || settings.offload.any_harness_mcp();
             if audit_advertised || offload_surface {
                 assert!(
                     settings.loopback_needed(),
@@ -3819,7 +3844,7 @@ mod tests {
             s.offload.enabled = true;
             s.graph.enabled = true;
             s.code_audit.enabled = true;
-            s.code_audit.expose_opencode = true;
+            s.harness_row("opencode").expose_code_audit = true;
             s
         }] {
             let cfg = build_opencode_config(&opencode_cfg(), &settings, "opencode");
@@ -3842,7 +3867,7 @@ mod tests {
             s.offload.enabled = true;
             s.graph.enabled = true;
             s.code_audit.enabled = true;
-            s.code_audit.expose_opencode = true;
+            s.harness_row("opencode").expose_code_audit = true;
             s
         }] {
             let cfg = build_opencode_config(&opencode_cfg(), &settings, "opencode");
@@ -4003,8 +4028,8 @@ mod tests {
             let mut s = Settings::default();
             s.set_native_web_mode_for_test(NativeWebVisibility::parse(mode));
             let sig = spawn_inject_sig(&s);
-            assert_ne!(sig[0], base[0], "claude signature must move for {mode}");
-            assert_ne!(sig[1], base[1], "opencode signature must move for {mode}");
+            assert_ne!(sig[&h("claude")], base[&h("claude")], "claude signature must move for {mode}");
+            assert_ne!(sig[&h("opencode")], base[&h("opencode")], "opencode signature must move for {mode}");
             // V32 Phase G: the mode moved out of a top-level `native_web` key
             // and into the `injection` fragment, where it sits as the
             // native-web feature's L2 alongside the master switch, the
@@ -4018,8 +4043,8 @@ mod tests {
             // joining that set moved `native_web` off index 0 — a positional
             // read here would have failed for a reason that has nothing to do
             // with native-web visibility.
-            for consumer in [0, 1] {
-                let l2 = sig[consumer]["injection"]["l2"]
+            for consumer in [h("claude"), h("opencode")] {
+                let l2 = sig[&consumer]["injection"]["l2"]
                     .as_array()
                     .expect("the l2 array")
                     .clone();
@@ -4152,11 +4177,11 @@ mod tests {
         // L1.
         let mut s = with_tab();
         s.set_master_for_test(false);
-        assert_ne!(spawn_inject_sig(&s)[0], base[0], "the master switch");
+        assert_ne!(spawn_inject_sig(&s)[&h("claude")], base[&h("claude")], "the master switch");
         // L2 for consumer hygiene (native-web's L2 is covered above).
         let mut s = with_tab();
         s.set_l2_for_test(crate::settings::injection::Feature::ConsumerHygiene, false);
-        assert_ne!(spawn_inject_sig(&s)[1], base[1], "consumer hygiene L2");
+        assert_ne!(spawn_inject_sig(&s)[&h("opencode")], base[&h("opencode")], "consumer hygiene L2");
         // L3, per tab, for every spawn-baked feature that HAS a tab cell.
         // Derived, not hand-listed (#48, M-3): a hand-list is how spotlighting
         // stayed out of this test for a whole milestone.
@@ -4363,7 +4388,7 @@ mod tests {
             // on since V39, so it has to be silenced for the two-disjunct
             // property below to be about the two disjuncts it names.
             s.set_l2_for_test(
-                crate::settings::injection::Feature::OpencodeNativeGate,
+                crate::settings::injection::Feature::HarnessNativeGate,
                 false,
             );
             s.set_native_web_mode_for_test(NativeWebVisibility::parse(mode));
@@ -4393,8 +4418,8 @@ mod tests {
         let mut sensor = off.clone();
         sensor.set_native_web_mode_for_test(NativeWebVisibility::Sensor);
         assert_ne!(
-            spawn_inject_sig(&off)[1],
-            spawn_inject_sig(&sensor)[1],
+            spawn_inject_sig(&off)[&h("opencode")],
+            spawn_inject_sig(&sensor)[&h("opencode")],
             "a mode flip with the graph off must still raise the restart hint"
         );
     }
@@ -5510,7 +5535,7 @@ console.log("OK: the swap reached neither the gate nor the beacon");
         // V39 ships this L2 on, so the baseline has to state the `off` it is
         // about rather than borrow a default that has moved.
         s.set_l2_for_test(
-            crate::settings::injection::Feature::OpencodeNativeGate,
+            crate::settings::injection::Feature::HarnessNativeGate,
             false,
         );
         assert!(
@@ -5518,7 +5543,7 @@ console.log("OK: the swap reached neither the gate nor the beacon");
             "nothing wants it yet — the baseline"
         );
         s.set_l2_for_test(
-            crate::settings::injection::Feature::OpencodeNativeGate,
+            crate::settings::injection::Feature::HarnessNativeGate,
             true,
         );
         assert!(
@@ -5527,12 +5552,12 @@ console.log("OK: the swap reached neither the gate nor the beacon");
         );
         // …and a per-tab `On` over an app-wide `off` does the same, for that tab.
         s.set_l2_for_test(
-            crate::settings::injection::Feature::OpencodeNativeGate,
+            crate::settings::injection::Feature::HarnessNativeGate,
             false,
         );
         s.set_tab_override_for_test(
             &id,
-            crate::settings::injection::Feature::OpencodeNativeGate,
+            crate::settings::injection::Feature::HarnessNativeGate,
             crate::settings::injection::Override::On,
         )
         .expect("the OpenCode tab carries a native-gate cell");
@@ -5648,7 +5673,7 @@ console.log("OK: the swap reached neither the gate nor the beacon");
         s.set_native_web_mode_for_test(NativeWebVisibility::Off);
         // The Phase H gate is a disjunct of its own and ships on since V39.
         s.set_l2_for_test(
-            crate::settings::injection::Feature::OpencodeNativeGate,
+            crate::settings::injection::Feature::HarnessNativeGate,
             false,
         );
         assert!(!opencode_plugin_wanted(&s, &id), "the baseline");
@@ -5661,8 +5686,8 @@ console.log("OK: the swap reached neither the gate nor the beacon");
              OpenCode tab with the graph off silently loses its rewind points"
         );
         assert_ne!(
-            spawn_inject_sig(&s)[1],
-            before[1],
+            spawn_inject_sig(&s)[&h("opencode")],
+            before[&h("opencode")],
             "…and the flip is spawn-baked, so it owes the tab a restart hint"
         );
     }
@@ -5752,20 +5777,20 @@ console.log("OK: the swap reached neither the gate nor the beacon");
         // write of the value already stored proves nothing.
         let mut l2 = base.clone();
         l2.set_l2_for_test(
-            crate::settings::injection::Feature::OpencodeNativeGate,
+            crate::settings::injection::Feature::HarnessNativeGate,
             false,
         );
-        assert_ne!(spawn_inject_sig(&l2)[1], before[1], "L2 flip");
+        assert_ne!(spawn_inject_sig(&l2)[&h("opencode")], before[&h("opencode")], "L2 flip");
 
         let mut l3 = base.clone();
         let id = ai_tab_id(&l3, 0);
         l3.set_tab_override_for_test(
             &id,
-            crate::settings::injection::Feature::OpencodeNativeGate,
+            crate::settings::injection::Feature::HarnessNativeGate,
             crate::settings::injection::Override::Off,
         )
         .expect("the OpenCode tab carries a native-gate cell");
-        assert_ne!(spawn_inject_sig(&l3)[1], before[1], "L3 flip");
+        assert_ne!(spawn_inject_sig(&l3)[&h("opencode")], before[&h("opencode")], "L3 flip");
     }
 
     #[test]
@@ -5813,7 +5838,7 @@ console.log("OK: the swap reached neither the gate nor the beacon");
         // is pinned by `the_code_audit_child_carries_its_own_tab_id`.
         let mut audit = Settings::default();
         audit.code_audit.enabled = true;
-        audit.code_audit.expose_opencode = true;
+        audit.harness_row("opencode").expose_code_audit = true;
         let cfg = build_opencode_config(&opencode_cfg(), &audit, "opencode");
         let argv: Vec<&str> = cfg["mcp"]["cimp-code-audit"]["command"]
             .as_array()
@@ -5920,7 +5945,7 @@ console.log("OK: the swap reached neither the gate nor the beacon");
         // this asserts the audit KEY rather than the block's absence.
         let mut settings = Settings::default();
         settings.code_audit.enabled = true;
-        settings.code_audit.expose_opencode = false;
+        settings.harness_row("opencode").expose_code_audit = false;
         let cfg = build_opencode_config(&opencode_cfg(), &settings, "opencode");
         assert!(
             cfg["mcp"].get("cimp-code-audit").is_none(),
@@ -5985,12 +6010,17 @@ console.log("OK: the swap reached neither the gate nor the beacon");
         // A registered snapshot ⇒ a `provider.local-llama` block pointing at the
         // local endpoint + `model` selecting it, so the tab is ready on open.
         let mut settings = Settings::default();
-        settings.offload.opencode_provider = Some(crate::settings::OpencodeLocalProvider {
+        settings.set_ext(
+            "opencode",
+            "provider",
+            serde_json::to_value(crate::settings::OpencodeLocalProvider {
             base_url: "http://127.0.0.1:8080/v1".to_string(),
             model: "Qwen3-Q4".to_string(),
             api_key: String::new(),
             source_command: "llama-server -m Qwen3-Q4.gguf --port 8080".to_string(),
-        });
+            })
+            .expect("provider serializes"),
+        );
         let config = build_opencode_config(&opencode_cfg(), &settings, "opencode");
         let prov = &config["provider"]["local-llama"];
         assert_eq!(prov["npm"], "@ai-sdk/openai-compatible");
@@ -6012,7 +6042,7 @@ console.log("OK: the swap reached neither the gate nor the beacon");
         // primary Local backend's command, even with no stored snapshot.
         let mut settings = Settings::default();
         settings.offload.enabled = true;
-        settings.offload.opencode_provider_auto = true;
+        settings.set_ext("opencode", "provider_auto", serde_json::json!(true));
         settings.offload.backends = vec![crate::settings::OffloadBackend {
             name: "local".to_string(),
             enabled: true,
@@ -6301,24 +6331,25 @@ console.log("OK: the swap reached neither the gate nor the beacon");
         // Claude-only: the `--settings` statusline overlay. Flipped relative
         // to the default (it ships enabled), not hardcoded.
         let mut s = Settings::default();
-        s.statusline.enabled = !s.statusline.enabled;
+        let was = s.harness_ext(h("claude"), "statusline").as_bool().expect("a bool row");
+        s.set_ext("claude", "statusline", serde_json::json!(!was));
         let sig = spawn_inject_sig(&s);
-        assert_ne!(sig[0], base[0], "statusline flip must move the Claude sig");
-        assert_eq!(sig[1], base[1], "statusline is Claude-only");
+        assert_ne!(sig[&h("claude")], base[&h("claude")], "statusline flip must move the Claude sig");
+        assert_eq!(sig[&h("opencode")], base[&h("opencode")], "statusline is Claude-only");
 
         // Both consumers: guidance + MCP + plugin follow the graph toggle.
         let mut s = Settings::default();
         s.graph.enabled = true;
         let with_graph = spawn_inject_sig(&s);
-        assert_ne!(with_graph[0], base[0]);
-        assert_ne!(with_graph[1], base[1]);
+        assert_ne!(with_graph[&h("claude")], base[&h("claude")]);
+        assert_ne!(with_graph[&h("opencode")], base[&h("opencode")]);
 
         // Both consumers: context injection = Claude hook gate + the
         // OpenCode plugin's baked CIMP_INJECT_ENABLED flag.
         s.graph.context_injection = true;
         let sig = spawn_inject_sig(&s);
-        assert_ne!(sig[0], with_graph[0]);
-        assert_ne!(sig[1], with_graph[1]);
+        assert_ne!(sig[&h("claude")], with_graph[&h("claude")]);
+        assert_ne!(sig[&h("opencode")], with_graph[&h("opencode")]);
 
         // The checkpoint gates. Claude: the prompt-hook gate widens (injection
         // off) AND V33 Phase F's pre-mutation `PreToolUse` beacon appears.
@@ -6331,9 +6362,9 @@ console.log("OK: the swap reached neither the gate nor the beacon");
         s.graph.enabled = true;
         s.workbench.checkpoints = true;
         let sig = spawn_inject_sig(&s);
-        assert_ne!(sig[0], with_graph[0], "checkpoints widen the hook gate");
+        assert_ne!(sig[&h("claude")], with_graph[&h("claude")], "checkpoints widen the hook gate");
         assert_ne!(
-            sig[1], with_graph[1],
+            sig[&h("opencode")], with_graph[&h("opencode")],
             "the plugin's pre-mutation checkpoint flag is baked at spawn, so a \
              checkpoint flip owes an OpenCode tab a restart hint too"
         );
@@ -6341,16 +6372,16 @@ console.log("OK: the swap reached neither the gate nor the beacon");
         // `claude_local` edits count only once a Claude tab opted into the
         // local provider.
         let mut s = Settings::default();
-        s.claude_local.base_url = "http://localhost:4000".to_string();
+        s.set_ext("claude", "local.base_url", serde_json::json!("http://localhost:4000".to_string()));
         assert_eq!(
-            spawn_inject_sig(&s)[0],
-            base[0],
+            spawn_inject_sig(&s)[&h("claude")],
+            base[&h("claude")],
             "no tab uses the local provider yet"
         );
         let mut tab = claude_cfg();
         tab.use_local_provider = true;
         s.tabs.push(TabConfig::AiTool(tab));
-        assert_ne!(spawn_inject_sig(&s)[0], base[0]);
+        assert_ne!(spawn_inject_sig(&s)[&h("claude")], base[&h("claude")]);
 
         // Claude-only: V30 Phase A session-push registration. This is THE
         // guard demanded by the rule in `spawn_inject_sig` — the flags are baked
@@ -6361,11 +6392,11 @@ console.log("OK: the swap reached neither the gate nor the beacon");
         s.offload.session_push = true;
         let sig = spawn_inject_sig(&s);
         assert_ne!(
-            sig[0], offload_on[0],
+            sig[&h("claude")], offload_on[&h("claude")],
             "session_push must move the Claude sig"
         );
         assert_eq!(
-            sig[1], offload_on[1],
+            sig[&h("opencode")], offload_on[&h("opencode")],
             "channels are Claude-only — OpenCode has no MCP inbound path"
         );
 
@@ -6380,8 +6411,8 @@ console.log("OK: the swap reached neither the gate nor the beacon");
         let bare_base = spawn_inject_sig(&bare);
         bare.offload.session_push = true;
         assert_ne!(
-            spawn_inject_sig(&bare)[0],
-            bare_base[0],
+            spawn_inject_sig(&bare)[&h("claude")],
+            bare_base[&h("claude")],
             "the proxy child always exists ⇒ session_push always changes argv"
         );
 
@@ -6424,8 +6455,12 @@ console.log("OK: the swap reached neither the gate nor the beacon");
             let before = spawn_inject_sig(&base);
             let mut flips: Vec<Settings> = Vec::new();
             for grant in [
-                |m: &mut crate::settings::McpServerConfig| m.claude_access = true,
-                |m: &mut crate::settings::McpServerConfig| m.opencode_access = true,
+                |m: &mut crate::settings::McpServerConfig| {
+                    m.access = crate::settings::access_for_test(&[("claude", true)]);
+                },
+                |m: &mut crate::settings::McpServerConfig| {
+                    m.access = crate::settings::access_for_test(&[("opencode", true)]);
+                },
                 |m: &mut crate::settings::McpServerConfig| m.offload_access = true,
             ] {
                 let mut after = base.clone();
@@ -6452,7 +6487,10 @@ console.log("OK: the swap reached neither the gate nor the beacon");
                 // Every key but `notify_hooks` must be untouched — compared by
                 // overwriting that one key, so a NEW moving key fails here.
                 let mut normalized = sig.clone();
-                normalized[0]["notify_hooks"] = before[0]["notify_hooks"].clone();
+                normalized
+                    .get_mut(&h("claude"))
+                    .expect("claude has a slot")["notify_hooks"] =
+                    before[&h("claude")]["notify_hooks"].clone();
                 assert_eq!(
                     normalized, before,
                     "{label}: only `notify_hooks` may move on the first grant \
@@ -6476,12 +6514,12 @@ console.log("OK: the swap reached neither the gate nor the beacon");
         s.sandbox.enabled = true;
         let sandboxed = spawn_inject_sig(&s);
         assert_ne!(
-            sandboxed[0], base[0],
+            sandboxed[&h("claude")], base[&h("claude")],
             "turning tab sandboxing on must move the Claude sig — a running tab cannot be \
              confined retroactively"
         );
         assert_ne!(
-            sandboxed[1], base[1],
+            sandboxed[&h("opencode")], base[&h("opencode")],
             "…and the OpenCode sig: the switch is not per-consumer"
         );
         // The grant table is applied during preparation, so editing it cannot
@@ -6563,7 +6601,7 @@ console.log("OK: the swap reached neither the gate nor the beacon");
         for command in ["claude", "opencode", "bash"] {
             assert_eq!(
                 HarnessId::from_command(command).and_then(|h| h.id()),
-                crate::settings::injection::Consumer::for_command(command).map(|c| c.agent()),
+                crate::harness::HarnessId::from_command(command).and_then(|h| h.id()),
                 "{command}: the sandbox and the injection layer disagree"
             );
         }

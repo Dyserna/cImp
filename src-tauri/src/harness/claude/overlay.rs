@@ -23,8 +23,7 @@ use crate::harness::claude::hook as claude_hook;
 use crate::settings::injection::NativeWebMode as NativeWebVisibility;
 use crate::settings::{AiToolTabConfig, Settings};
 use crate::tabs::config::{
-    advertises_audit_to_claude, compose_capability_guidance, native_web_for,
-    read_advisor_gate_blocked, CHANNEL_PUSH_FLAG, CHANNEL_REGISTRATION_FLAG,
+    compose_capability_guidance, native_web_for, CHANNEL_PUSH_FLAG, CHANNEL_REGISTRATION_FLAG,
     CHANNEL_REGISTRATION_TARGET,
 };
 
@@ -139,7 +138,7 @@ fn claude_hello(settings: &Settings, flags: ClaudeHookFlags) -> claude_hook::Hel
     hello.declare(
         flags.read_advisor,
         chp::EV_CONTEXT_SHOULD_READ,
-        if read_advisor_gate_blocked(settings) {
+        if crate::harness::plugin::read_advisor_gate_blocked(settings) {
             "the read advisor is BLOCKED by the capability matrix — `claude.hook.pretooluse_deny` \
              is recorded as failed, so a deny's reason would never reach the model"
         } else {
@@ -272,7 +271,7 @@ pub(crate) fn build_pre_args(
         // V32 Phase G: resolved for THIS tab, so a per-tab override reaches
         // both halves together for the same reason.
         let native_web = native_web_for(settings, "claude", tab);
-        if settings.statusline.enabled {
+        if super::settings::statusline_enabled(settings) {
             if let Some(command) = crate::statusline::launch_command() {
                 // `refreshInterval` (seconds) re-runs the command on a timer in
                 // addition to event-driven updates, so the `rate_limits` usage
@@ -335,7 +334,7 @@ pub(crate) fn build_pre_args(
             // effect on the next tab launch, not the next app restart.
             let read_hook = settings.graph.enabled
                 && settings.graph.read_advisor
-                && !read_advisor_gate_blocked(settings);
+                && !crate::harness::plugin::read_advisor_gate_blocked(settings);
             // V17 Phase B: a second matcher intercepts a whole-file shell read
             // (`cat FILE`) of an already-read file via the SAME route (which
             // dispatches on `tool_name`).
@@ -834,7 +833,7 @@ pub(crate) fn build_pre_args(
                 serde_json::json!({ "command": exe, "args": child_args }),
             );
         }
-        if advertises_audit_to_claude(settings) {
+        if crate::harness::plugin::audit_advertised(settings, super::plugin::me()) {
             // V32 C-1b: `--tab <id>` here for the same reason as on the offload
             // child, and NOT for the same purpose. The audit child resolves no
             // memory scope — it takes no arguments and always scans the app's

@@ -19,6 +19,7 @@ pub mod input;
 pub mod plugin;
 pub mod probe;
 pub mod read;
+pub mod settings;
 pub mod tools;
 
 pub use harness_plugin::PLUGIN;

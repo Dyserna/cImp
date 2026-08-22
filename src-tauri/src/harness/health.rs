@@ -363,23 +363,25 @@ fn run_view(run: &RunSummary) -> RunView {
 /// **The** Harness health query — everything the Settings panel renders,
 /// grouped by harness and ordered riskiest-tier-first inside each group.
 ///
-/// `settings` must already carry a FRESH `harness_versions` (the caller layers
-/// the physical-global read in, exactly as `harness_versions_get` does for the
-/// gates): the versions and the auto-verify record are written out-of-band by
-/// the tap and the verify worker, so a snapshot from app start would show a
-/// panel that is stale in precisely the situation the panel exists for.
+/// `settings` must already carry a FRESH `harness` map and `harness_versions`
+/// (the caller layers the physical-global read in, exactly as
+/// `harness_versions_get` does for the gates): the versions and the
+/// auto-verify record are written out-of-band by the tap and the verify worker,
+/// so a snapshot from app start would show a panel that is stale in precisely
+/// the situation the panel exists for.
 pub fn health(settings: &Settings) -> Vec<HarnessHealth> {
     let gates = contract::gates(settings);
-    let hv = &settings.harness_versions;
     panel_labels()
         .into_iter()
         .map(|(harness, label)| {
             let run = verify::last_run(harness);
-            // Claude is the only harness with a persisted record: Phase F runs
-            // on `claude_last_seen` changing, and there is deliberately no
-            // second stored field (that would be the Settings schema bump this
-            // phase is not allowed — and does not need).
-            let record = harness.plugin().and_then(|p| p.auto_verify_record(hv));
+            // V40 Phase B: every harness has a row, so this is a map read and
+            // not a plugin call any more. Before it, `auto_verify_record` was a
+            // trait method whose only job was to know that Claude's record
+            // lived in a field called `claude_auto_verify` and that no other
+            // harness had one at all.
+            let row = settings.harness_settings(harness);
+            let record = row.auto_verify.as_ref();
             let mut rows: Vec<&'static Capability> =
                 contract::capabilities().filter(|c| c.harness == harness).collect();
             rows.sort_by_key(|c| risk_rank(c.tier));
@@ -405,10 +407,7 @@ pub fn health(settings: &Settings) -> Vec<HarnessHealth> {
                     last_verify: last_verify(c, run.as_ref(), record),
                 })
                 .collect();
-            let last_seen = harness
-                .plugin()
-                .map(|p| p.recorded_version(hv))
-                .unwrap_or_default();
+            let last_seen = row.last_seen.trim().to_string();
             HarnessHealth {
                 harness: harness_name(harness),
                 label,
@@ -419,7 +418,7 @@ pub fn health(settings: &Settings) -> Vec<HarnessHealth> {
                 // line and its stale-plugin list are one reading of one value.
                 stale_plugins: chp::stale_for(harness_name(harness), &last_seen),
                 last_seen,
-                last_verified: harness.plugin().and_then(|p| p.last_verified(hv)),
+                last_verified: Some(row.last_verified.clone()),
                 auto_verify: record.cloned(),
                 last_run: run.as_ref().map(run_view),
                 capabilities,
@@ -436,10 +435,10 @@ mod tests {
 
     fn settings_with(record: Option<AutoVerify>) -> Settings {
         let mut s = Settings::default();
-        s.harness_versions.claude_last_seen = "2.2.0".to_string();
-        s.harness_versions.claude_last_verified = "2.1.0".to_string();
-        s.harness_versions.opencode_last_seen = "1.19.0".to_string();
-        s.harness_versions.claude_auto_verify = record;
+        s.harness_row("claude").last_seen = "2.2.0".to_string();
+        s.harness_row("claude").last_verified = "2.1.0".to_string();
+        s.harness_row("opencode").last_seen = "1.19.0".to_string();
+        s.harness_row("claude").auto_verify = record;
         s
     }
 
@@ -675,9 +674,15 @@ mod tests {
         let claude = health.iter().find(|p| p.harness == "claude").unwrap();
         assert_eq!(claude.auto_verify.as_ref().unwrap().at_ms, 4242);
         assert_eq!(claude.last_verified.as_deref(), Some("2.1.0"));
-        // OpenCode has no verified column and no record — `None`, not `""`.
+        // **V40 Phase B: OpenCode HAS a verified column now** — every harness
+        // does, because the record is a `harness[<id>]` row rather than two
+        // Claude-named fields. It is EMPTY here, which is the honest answer
+        // ("never verified"), and it is a different state from the `None` this
+        // used to assert: `None` meant "this harness cannot record one at all",
+        // which was a fact about the schema, not about OpenCode.
         let oc = health.iter().find(|p| p.harness == "opencode").unwrap();
-        assert!(oc.last_verified.is_none() && oc.auto_verify.is_none());
+        assert_eq!(oc.last_verified.as_deref(), Some(""));
+        assert!(oc.auto_verify.is_none(), "no run has been recorded for it");
         assert_eq!(oc.last_seen, "1.19.0");
     }
 

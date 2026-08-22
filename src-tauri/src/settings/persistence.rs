@@ -47,8 +47,8 @@ use crate::settings::schema::{
     starter_prompt_templates, AiTabId, HarnessVersions, LayoutNodePersisted, LlmPricingModel,
     McpCategory, McpServerConfig, PromptTemplate, RemoteBackendTemplate, ServerCommandTemplate,
     Settings, TabConfig,
-    CLAUDE_LOCAL_TAB_ID, CLAUDE_TAB_ID, CODE_AUDIT_TAB_ID, CODE_QUALITY_TAB_ID, EVENTS_TAB_ID,
-    GRAPH_MONITOR_TAB_ID, GRAPH_VIEW_TAB_ID, OFFLOAD_SERVER_TAB_ID, OPENCODE_TAB_ID,
+    CODE_AUDIT_TAB_ID, CODE_QUALITY_TAB_ID, EVENTS_TAB_ID, GRAPH_MONITOR_TAB_ID,
+    GRAPH_VIEW_TAB_ID, OFFLOAD_SERVER_TAB_ID,
     SHELL_DEFAULT_TAB_ID, TOOL_ACTIVITY_TAB_ID, WORKBENCH_TAB_ID,
 };
 use crate::pricing::{pricing_rows_since, PRICING_GENERATION};
@@ -389,10 +389,22 @@ fn read_settings_or_default(path: &Path) -> Settings {
     if !path.exists() {
         return Settings::default();
     }
-    fs::read_to_string(path)
+    let mut s: Settings = fs::read_to_string(path)
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    // **THE parse boundary for the harness map** (V40 Phase B, locked decision
+    // 6). Every typed read of a settings file in this module goes through here
+    // — the load path, the out-of-band readers, the read-modify-write helpers —
+    // so a declared `ext` key whose stored value its kind rejects is replaced by
+    // the declared default exactly once, wherever the file was read from.
+    //
+    // Deliberately NOT in `integrity_check`: that runs only on load-from-disk,
+    // and `mutate_global_harness` would then read a hand-edited
+    // `"statusline": "yes"`, write it straight back, and hand the launch path a
+    // string every reader answers `false` for.
+    s.normalize_harness_settings();
+    s
 }
 
 fn write_prompt_templates_to(path: &Path, templates: Vec<PromptTemplate>) -> AppResult<()> {
@@ -450,7 +462,9 @@ fn write_llm_pricing_to(path: &Path, pricing: Vec<LlmPricingModel>) -> AppResult
 /// shows up through the mtime), otherwise a metadata stat is the entire
 /// cost. In-process writers ([`mutate_global_harness_versions`]) refresh the
 /// cache directly so a same-timestamp write can't serve a stale value.
-static HV_CACHE: std::sync::Mutex<Option<(std::time::SystemTime, HarnessVersions)>> =
+type HarnessMap = std::collections::BTreeMap<String, crate::settings::HarnessSettings>;
+
+static HV_CACHE: std::sync::Mutex<Option<(std::time::SystemTime, HarnessVersions, HarnessMap)>> =
     std::sync::Mutex::new(None);
 
 /// V16 Feature 1: harness version + contract state, read straight from the
@@ -466,88 +480,151 @@ pub fn read_global_harness_versions() -> HarnessVersions {
         return HarnessVersions::default();
     };
     if let Ok(cache) = HV_CACHE.lock() {
-        if let Some((cached_at, hv)) = cache.as_ref() {
+        if let Some((cached_at, hv, _)) = cache.as_ref() {
             if *cached_at == mtime {
                 return hv.clone();
             }
         }
     }
-    let hv = read_settings_or_default(&path).harness_versions;
+    let s = read_settings_or_default(&path);
+    let hv = s.harness_versions;
     if let Ok(mut cache) = HV_CACHE.lock() {
-        *cache = Some((mtime, hv.clone()));
+        *cache = Some((mtime, hv.clone(), s.harness));
     }
     hv
 }
 
-/// Mutate the global `harness_versions` state in place (read-modify-write on
-/// the physical global file, every other field preserved — mirror of
-/// [`write_global_prompt_templates`]). Returns the post-mutation state.
-/// No-ops (no disk write) when the mutation leaves the state unchanged, so
-/// background callers polling a version can call this freely.
-pub fn mutate_global_harness_versions(
-    mutate: impl FnOnce(&mut HarnessVersions),
-) -> AppResult<HarnessVersions> {
+/// V40 Phase B: the per-harness settings map, read straight from the physical
+/// global file — the same out-of-band discipline (and the same cache) as
+/// [`read_global_harness_versions`], and for the same reason: `harness` carries
+/// the version the transcript tap observed and the auto-verify record, both
+/// written by background threads that must never land in a project overlay
+/// diff.
+pub fn read_global_harness_map() -> HarnessMap {
+    let Ok(path) = global_path() else {
+        return crate::settings::default_harness_settings();
+    };
+    let Ok(mtime) = fs::metadata(&path).and_then(|m| m.modified()) else {
+        return crate::settings::default_harness_settings();
+    };
+    if let Ok(cache) = HV_CACHE.lock() {
+        if let Some((cached_at, _, map)) = cache.as_ref() {
+            if *cached_at == mtime {
+                return map.clone();
+            }
+        }
+    }
+    let s = read_settings_or_default(&path);
+    let map = s.harness.clone();
+    if let Ok(mut cache) = HV_CACHE.lock() {
+        *cache = Some((mtime, s.harness_versions, map.clone()));
+    }
+    map
+}
+
+/// One harness's row out of [`read_global_harness_map`], defaults included.
+///
+/// The read every out-of-band consumer wants: `Settings::harness_settings`
+/// resolves declared defaults for an absent key, and a raw map lookup would
+/// answer `None` where the accessor answers the default.
+pub fn read_global_harness_settings(
+    harness: crate::harness::HarnessId,
+) -> crate::settings::HarnessSettings {
+    let mut probe = crate::settings::Settings::default();
+    probe.harness = read_global_harness_map();
+    probe.harness_settings(harness).clone()
+}
+
+/// Mutate ONE harness's row in the physical global file, out of band.
+///
+/// The `mutate_global_harness_versions` pattern, and it exists for the same
+/// two reasons: `harness` is in [`OVERLAY_BANNED_KEYS`] so a Settings save can
+/// never carry it, and the writers here (the version tap, the auto-verify
+/// worker, *Mark verified*) run on background threads where a full
+/// `save_settings` would race the user's own edits. No-op when the mutation
+/// changes nothing, so a change-guarded caller can poll freely.
+pub fn mutate_global_harness(
+    harness: crate::harness::HarnessId,
+    mutate: impl FnOnce(&mut crate::settings::HarnessSettings),
+) -> AppResult<crate::settings::HarnessSettings> {
+    let Some(id) = harness.id() else {
+        return Err(AppError::Settings(
+            "harness settings write for an id no registry claims".to_string(),
+        ));
+    };
     let path = global_path()?;
     let mut settings = read_settings_or_default(&path);
-    let before = settings.harness_versions.clone();
-    mutate(&mut settings.harness_versions);
-    if settings.harness_versions == before {
+    let row = settings
+        .harness
+        .entry(id.to_string())
+        .or_insert_with(|| crate::settings::HarnessSettings::defaults_for(harness));
+    let before = row.clone();
+    mutate(row);
+    if *row == before {
         return Ok(before);
     }
-    let after = settings.harness_versions.clone();
+    let after = row.clone();
+    let map = settings.harness.clone();
+    let hv = settings.harness_versions.clone();
     save_to(&path, &settings)?;
-    // Refresh the read cache under the post-write mtime — never leave it
-    // holding the pre-write value for a same-timestamp write.
     if let Ok(mtime) = fs::metadata(&path).and_then(|m| m.modified()) {
         if let Ok(mut cache) = HV_CACHE.lock() {
-            *cache = Some((mtime, after.clone()));
+            *cache = Some((mtime, hv, map));
         }
     }
     Ok(after)
 }
 
+// `mutate_global_harness_versions` is gone with the five fields it wrote (V40
+// Phase B). Every one of them — the two versions, the verified stamp, the
+// auto-verify record, the input-profile spike — is a `harness[<id>]` row now,
+// written through [`mutate_global_harness`]. What is LEFT on `HarnessVersions`
+// (`e1_status`, `d0_status`) has never had a writer in the app: both are
+// recorded by hand after a manual spike, which is what their docs say, so a
+// writer nothing called was a function pretending there was a path.
+
 /// Record a harness version observation (V16 Feature 1's tripwire input).
-/// `harness` is `"claude"` (from the OOB transcript tap) or `"opencode"`
-/// (from `opencode --version` at tab spawn). Change-guarded — safe to call
-/// once per session/spawn without file churn.
+/// `harness` is a registry id — Claude's comes from the OOB transcript tap,
+/// OpenCode's from `opencode --version` at tab spawn. Change-guarded — safe to
+/// call once per session/spawn without file churn.
 ///
-/// V35 Phase F: a **changed** `claude_last_seen` is also the first of the two
-/// auto-verify triggers (the other is the startup check). It fires from here
-/// rather than from the tap because this is the one place the observation is
-/// actually recorded — a caller-side trigger would miss the hand-edit and
-/// spawn-time paths, and would fire on the no-op re-observations this function
-/// exists to swallow. The call is non-blocking (it spawns a detached worker) so
-/// the tap is never delayed by a probe.
+/// V35 Phase F: a **changed** version is also the first of the two auto-verify
+/// triggers (the other is the startup check). It fires from here rather than
+/// from the tap because this is the one place the observation is actually
+/// recorded — a caller-side trigger would miss the hand-edit and spawn-time
+/// paths, and would fire on the no-op re-observations this function exists to
+/// swallow. The call is non-blocking (it spawns a detached worker) so the tap
+/// is never delayed by a probe.
+///
+/// **V40 Phase B: one write, whatever the harness.** Phase A had already made
+/// the DISPATCH registry-driven; what remained was a two-arm `match id` over
+/// `claude_last_seen` / `opencode_last_seen` — a field pair with only one
+/// half wired to the auto-verify trigger, so OpenCode's version moving recorded
+/// a string and did nothing else. Both halves are `harness[<id>].last_seen`
+/// now, and the trigger fires for whichever harness changed.
 pub fn note_harness_version(harness: &str, version: &str) {
     let version = version.trim();
     if version.is_empty() {
         return;
     }
-    // V40 Phase A: a version note for a harness nobody registered is dropped,
-    // loudly enough to find in a log rather than silently. The two field names
-    // are still Claude's and OpenCode's — locked decision 5 turns them into a
-    // map in Phase B — so the writes stay here, but the DISPATCH is the
-    // registry's and an unknown id can no longer land on a `_ => {}` that reads
-    // like an intentional no-op.
-    let Some(id) = crate::harness::HarnessId::from_id(harness).and_then(|h| h.id()) else {
+    // A version note for a harness nobody registered is dropped, loudly enough
+    // to find in a log rather than landing on a `_ => {}` that reads like an
+    // intentional no-op.
+    let Some(id) = crate::harness::HarnessId::from_id(harness) else {
         tracing::debug!(harness, "version note for an unregistered harness; dropped");
         return;
     };
-    let mut claude_changed = false;
-    let res = mutate_global_harness_versions(|hv| match id {
-        "claude" => {
-            claude_changed = hv.claude_last_seen != version;
-            hv.claude_last_seen = version.to_string();
-        }
-        "opencode" => hv.opencode_last_seen = version.to_string(),
-        _ => {}
+    let mut changed = false;
+    let res = mutate_global_harness(id, |row| {
+        changed = row.last_seen != version;
+        row.last_seen = version.to_string();
     });
     if let Err(e) = res {
         tracing::warn!("failed to record {harness} version {version}: {e}");
         return;
     }
-    if claude_changed {
-        crate::harness::verify::on_claude_version_changed();
+    if changed {
+        crate::harness::verify::on_version_changed(id);
     }
 }
 
@@ -767,7 +844,18 @@ fn read_overlay(path: &Path, quarantine: bool) -> Option<Value> {
 /// is sufficient alone: banning the key still leaves a compromised *global*
 /// file able to name `~/.ssh`, and screening paths still leaves
 /// `sandbox.enabled` flippable.
-const OVERLAY_BANNED_KEYS: &[&str] = &["llm_pricing", "harness_versions", "sandbox"];
+// V40 Phase B added `harness`. It is machine scope for two reasons that hold
+// jointly: half its fields are written OUT OF BAND by background threads (the
+// version the tap observed, the auto-verify record) and a Settings save
+// carrying a stale snapshot of those would stomp them; and the other half —
+// each plugin's `ext` — configures the harness INSTALL on this machine (where
+// its local proxy is, whether its status line is on, what provider block cImp
+// derived for it), which is not a property of the project you happen to have
+// open. Every one of those settings was already documented as global before the
+// map existed. The write-through that keeps the Settings window's edits
+// reaching disk is `sync_harness_into`, the `sync_sandbox_into` pattern.
+const OVERLAY_BANNED_KEYS: &[&str] =
+    &["llm_pricing", "harness_versions", "harness", "sandbox"];
 
 fn strip_overlay_banned(v: &mut Value) {
     if let Value::Object(map) = v {
@@ -1222,6 +1310,57 @@ fn keys_other_than(obj: &serde_json::Map<String, Value>, keep: &[&str]) -> Vec<S
 /// "machine scope" means for a plugin the user has only just configured — but
 /// nothing is ever removed here: a plugin whose file is temporarily missing must
 /// keep its state (see [`crate::settings::ToolPluginsSettings`]).
+/// Write the live per-harness map through to the physical global file.
+///
+/// Deliberately **excludes the out-of-band fields** (`last_seen`,
+/// `last_verified`, `auto_verify`) rather than copying the whole row: the
+/// Settings window holds a snapshot taken when it opened, and the transcript
+/// tap or the auto-verify worker may have written a newer version to disk in
+/// between. Copying the snapshot's copy of those would be a Settings save
+/// silently reverting a version observation — the `prompt_templates`
+/// stale-snapshot defect (V14 review, HIGH/data loss) in a different field.
+/// Those three have their own writer, [`mutate_global_harness`].
+///
+/// Everything the user CAN edit — `expose_commands`, `expose_code_audit`,
+/// `input_profile_status` (a recorded human judgement, entered by hand) and the
+/// plugin `ext` block — is copied. Rows for harnesses this build does not know
+/// are left exactly as the disk has them.
+fn sync_harness_into(disk_global: &mut Settings, current: &Settings) -> bool {
+    let mut changed = false;
+    for (id, live) in &current.harness {
+        let Some(harness) = crate::harness::HarnessId::from_id(id) else {
+            // An unregistered id in the live map came from the disk file in the
+            // first place (nothing else can create one) and is already there.
+            continue;
+        };
+        let disk = disk_global
+            .harness
+            .entry(id.clone())
+            .or_insert_with(|| {
+                changed = true;
+                crate::settings::HarnessSettings::defaults_for(harness)
+            });
+        for (field, value) in [
+            (&mut disk.expose_commands, live.expose_commands),
+            (&mut disk.expose_code_audit, live.expose_code_audit),
+        ] {
+            if *field != value {
+                *field = value;
+                changed = true;
+            }
+        }
+        if disk.input_profile_status != live.input_profile_status {
+            disk.input_profile_status = live.input_profile_status.clone();
+            changed = true;
+        }
+        if disk.ext != live.ext {
+            disk.ext = live.ext.clone();
+            changed = true;
+        }
+    }
+    changed
+}
+
 fn sync_tool_plugin_state_into(disk_global: &mut Settings, current: &Settings) -> bool {
     let mut changed = false;
     let cur = &current.tool_plugins;
@@ -1233,19 +1372,11 @@ fn sync_tool_plugin_state_into(disk_global: &mut Settings, current: &Settings) -
         disk_global.tool_plugins.project_paths = cur.project_paths.clone();
         changed = true;
     }
-    // V38 F-3: the two `command`-kind exposure switches. Machine scope like the
-    // enables above, so this is the ONLY place a UI toggle of them can land —
-    // the overlay strip (an allow-list) drops them from a project diff, and
-    // without this line the checkbox would flip in memory and be gone on the
-    // next launch.
-    if disk_global.tool_plugins.expose_commands_claude != cur.expose_commands_claude {
-        disk_global.tool_plugins.expose_commands_claude = cur.expose_commands_claude;
-        changed = true;
-    }
-    if disk_global.tool_plugins.expose_commands_opencode != cur.expose_commands_opencode {
-        disk_global.tool_plugins.expose_commands_opencode = cur.expose_commands_opencode;
-        changed = true;
-    }
+    // V38 F-3's two `command`-kind exposure switches used to be synced here.
+    // They are `harness[<id>].expose_commands` since V40 Phase B and ride
+    // `sync_harness_into` — still machine scope, still the only place a UI
+    // toggle of them can land, and now one loop over the registry instead of
+    // two named fields.
     for (plugin_key, live) in &cur.plugins {
         let disk = disk_global
             .tool_plugins
@@ -1500,7 +1631,16 @@ pub fn save(settings: &Settings, launch_cwd: &Path, global: &Settings) -> AppRes
             // `variables`/`parameters`, so this is the only place the rest can
             // land — see the block comment above `strip_overlay_tool_plugins`.
             let plugins_changed = sync_tool_plugin_state_into(&mut disk, settings);
-            if templates_changed || registry_changed || sandbox_changed || plugins_changed {
+            // V40 Phase B: the per-harness map. Banned from overlays (it is
+            // machine scope and half of it is written out of band), so the
+            // global file is the ONLY place a harness settings edit can land.
+            let harness_changed = sync_harness_into(&mut disk, settings);
+            if templates_changed
+                || registry_changed
+                || sandbox_changed
+                || plugins_changed
+                || harness_changed
+            {
                 if let Err(e) = save_to(&gpath, &disk) {
                     tracing::warn!(error = %e, "settings: machine-scope global write-through failed");
                 }
@@ -2082,11 +2222,17 @@ pub fn reconcile_reserved_tabs(settings: &mut Settings) -> bool {
     changed
 }
 
-/// All three reserved AI tab ids. Used by the integrity check's "is this
-/// id one of our reserved AI builtins?" loops; a single source of truth
-/// keeps the `ai_builtins` membership check, the `use_local_provider`
-/// expectation table, and the drop-disabled-tab pass in sync.
-const AI_BUILTIN_IDS: [&str; 3] = [CLAUDE_TAB_ID, CLAUDE_LOCAL_TAB_ID, OPENCODE_TAB_ID];
+/// Every reserved AI tab id — **a view over the registry**, not a list.
+///
+/// Used by the integrity check's "is this id one of our reserved AI builtins?"
+/// loops. V40 Phase B replaced `const AI_BUILTIN_IDS: [&str; 3]`: the fixed
+/// arity was the defect, not the literals. A harness registering a tab id
+/// would have left it outside the membership check — so its tab would never be
+/// forced `builtin: true`, never be restored at its canonical position, and
+/// never be dropped when disabled, all silently.
+fn ai_builtin_ids() -> Vec<&'static str> {
+    crate::harness::registry::canonical_tab_ids()
+}
 
 /// Reconcile the `tabs` array with `enabled_ai_tabs`. Every enabled AI
 /// id is forced present and marked `builtin: true`; every reserved AI
@@ -2108,17 +2254,28 @@ const AI_BUILTIN_IDS: [&str; 3] = [CLAUDE_TAB_ID, CLAUDE_LOCAL_TAB_ID, OPENCODE_
 pub fn integrity_check(settings: &mut Settings) -> bool {
     let mut changed = false;
 
-    // 0. Empty enabled_ai_tabs is invalid — repair to [claude].
+    // 0. Empty enabled_ai_tabs is invalid — repair to the registry's default
+    //    harness's default tab. V40 Phase B: it used to be a literal
+    //    `[AiTabId::Claude]`, which made ONE harness load-bearing for the app
+    //    booting at all.
     if settings.enabled_ai_tabs.is_empty() {
-        settings.enabled_ai_tabs = vec![AiTabId::Claude];
+        let fallback = crate::harness::DEFAULT_HARNESS
+            .descriptor()
+            .and_then(|d| d.tab_ids.first())
+            .and_then(|id| AiTabId::from_id(id))
+            .unwrap_or(AiTabId::Claude);
+        settings.enabled_ai_tabs = vec![fallback];
         changed = true;
-        tracing::warn!("integrity: enabled_ai_tabs was empty; reset to [claude]");
+        tracing::warn!(
+            tab = fallback.as_str(),
+            "integrity: enabled_ai_tabs was empty; reset to the default harness's tab"
+        );
     }
 
     // 1. Force builtin: true on every reserved AI id if it exists with
     //    builtin: false. Defends against hand-edits trying to flip the flag.
     for tab in settings.tabs.iter_mut() {
-        if AI_BUILTIN_IDS.contains(&tab.id()) && !tab.builtin() {
+        if ai_builtin_ids().contains(&tab.id()) && !tab.builtin() {
             tab.set_builtin(true);
             changed = true;
             tracing::warn!(
@@ -2307,6 +2464,7 @@ fn leftmost_pane_id(node: &LayoutNodePersisted) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::schema::{CLAUDE_LOCAL_TAB_ID, CLAUDE_TAB_ID, OPENCODE_TAB_ID};
     use std::path::PathBuf;
 
     fn fake_default_shell() -> ShellSpec {

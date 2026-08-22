@@ -866,23 +866,16 @@ const IDENTITY_ALLOWLIST: &[(&str, &str)] = &[
     // ── settings: persisted wire forms and frozen migrations ───────────────
     (
         "settings/schema.rs",
-        "PERSISTED WIRE FORMS. `CLAUDE_TAB_ID` / `CLAUDE_LOCAL_TAB_ID` / `OPENCODE_TAB_ID` and \
-         `AiTabId`'s serde renames are what is on disk in every user's settings file, and \
-         `RETIRED_TAB_IDS` is a migration input. Locked decision 3 keeps their encodings; what \
-         moved in Phase A is the ORDER (`canonical_ai_tab_order` is a registry view) and the \
-         ranking (`AiTabId::canonical_order`). The remaining per-harness FIELDS \
-         (`claude_local`, `statusline`, `expose_commands_claude/opencode`, \
-         `claude_access/opencode_access`, `harness_versions.*`) go behind the plugin's `ext` \
-         with the 35 -> 36 migration. Phase B (locked decisions 5 and 6).",
-    ),
-    (
-        "settings/persistence.rs",
-        "FROZEN HISTORY plus the field pairs Phase B replaces. The historical migrations \
-         describe old on-disk shapes and must keep their literals (locked decision 14); \
-         `note_harness_version`'s two writes are `claude_last_seen` / `opencode_last_seen`, a \
-         field PAIR that becomes `Settings.harness[<id>]` in Phase B — Phase A moved the \
-         DISPATCH (an unregistered id is now dropped with a log line instead of landing on a \
-         `_ => {}`), the fields move with the schema bump. Phase B (locked decision 5).",
+        "PERSISTED WIRE FORMS, and after Phase B that is ALL that is left. `CLAUDE_TAB_ID` / \
+         `CLAUDE_LOCAL_TAB_ID` / `OPENCODE_TAB_ID` and `AiTabId`'s serde renames are what is on \
+         disk in every user's settings file, and `RETIRED_TAB_IDS` is a migration input; locked \
+         decisions 3 and 29 keep their encodings. `default_{claude,claude_local,opencode}_tab`'s \
+         `command:` strings are the same class — a reserved tab's seeded command IS its wire \
+         form — and become the descriptor's `default_tab(tab_id)` in a later phase. Phase A took \
+         the ORDER (`canonical_ai_tab_order` is a registry view) and the ranking; Phase B took \
+         every per-harness FIELD (`claude_local`, `statusline`, `expose_commands_*`, \
+         `code_audit.expose_*`, `claude_access`/`opencode_access`, `harness_versions.*`) into \
+         `Settings::harness` and the plugins' `ext`.",
     ),
     // ── state: a persisted tab id is a persisted tab id ────────────────────
     (
@@ -897,24 +890,6 @@ const IDENTITY_ALLOWLIST: &[(&str, &str)] = &[
          Phase D (locked decisions 18 and 30).",
     ),
     // ── the MCP consumer vocabulary ────────────────────────────────────────
-    (
-        "offload/mcp_host.rs",
-        "The `Consumer` ENUM has a variant per harness, which locked decision 25 replaces with \
-         `PerHarness` in Phase B. Until the variants go, the join between them and the registry \
-         has to be spelled once — `Consumer::for_harness` / `Consumer::harness` are that one \
-         place, and Phase A pointed `tool_defs_for(HarnessId)` and the grant path through them. \
-         `Consumer::parse`'s unknown-token fallback and the `claude_access`/`opencode_access` \
-         field pair go with the settings map. Phase B (locked decisions 5 and 25).",
-    ),
-    (
-        "settings/injection.rs",
-        "The injection hierarchy's own `Consumer` enum, same shape and same phase as the MCP \
-         host's. Phase A made `Consumer::for_command` FALLIBLE (an unregistered command no \
-         longer resolves as OpenCode) and added `from_agent`; what remains is the two-variant \
-         vocabulary itself and `Scope::Tab { agent: \"opencode\" }` in the OpenCode native-web \
-         gate, which is `Feature::OpencodeNativeGate` — a plugin-scoped feature in Phase B. \
-         Phase B (locked decisions 5, 6 and 25).",
-    ),
     // ── the loopback wire ──────────────────────────────────────────────────
     (
         "offload/loopback.rs",
@@ -948,14 +923,15 @@ const IDENTITY_ALLOWLIST: &[(&str, &str)] = &[
     ),
     (
         "tabs/config.rs",
-        "TWO residuals, both named in place. `claude_harness()` is the permission-hook cwd \
+        "ONE residual, named in place. `claude_harness()` is the permission-hook cwd \
          fallback's harness — a Claude mechanism, because only Claude's hook payload has the \
          cwd gap it exists for — and it moves behind `identity_of_request()` in Phase C \
-         (locked decision 22). `opencode_native_gate_for`'s `Scope::Tab { agent: \
-         \"opencode\" }` is `Feature::OpencodeNativeGate`, a plugin-scoped feature in Phase B \
-         (locked decision 6). Everything else this file used to know — the ten branches, the \
-         env strip list, the spawn signature, the OOB resolver, the artifact writes — is \
-         behind `HarnessPlugin` as of Phase A.",
+         (locked decision 22). Phase B took the other one: `opencode_native_gate_for`'s \
+         `Scope::Tab { agent: \"opencode\" }` is `harness::opencode::plugin::native_gate_for` \
+         now, resolving `Feature::HarnessNativeGate` — a feature whose SCOPE the declaring \
+         plugin states (locked decision 6). Everything else this file used to know — the ten \
+         branches, the env strip list, the spawn signature, the OOB resolver, the artifact \
+         writes, the two audit-exposure predicates — is behind `HarnessPlugin` as of Phase B.",
     ),
     (
         "ipc/tab_lifecycle.rs",
@@ -964,14 +940,6 @@ const IDENTITY_ALLOWLIST: &[(&str, &str)] = &[
          `HarnessPlugin::preflight()`, with Claude's \"not gated\" becoming a declared `Ok` \
          rather than an absence. Phase A already replaced this file's canonical-order array \
          with the registry view. Phase F.",
-    ),
-    (
-        "audit/runner.rs",
-        "`consumer_exposed` reads the `code_audit.expose_claude` / `_opencode` / `_offload` \
-         field TRIO, which locked decision 25 turns into a `PerHarness` plus the neutral \
-         offload slot. Phase A closed its silent fallback — an unrecognised consumer is now \
-         NOT exposed, where it used to inherit `expose_claude` (fail-open, on a question about \
-         reaching a scanner). The field names move with the settings map. Phase B.",
     ),
 ];
 

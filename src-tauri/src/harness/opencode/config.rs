@@ -23,7 +23,7 @@ use std::path::Path;
 use crate::settings::injection::NativeWebMode as NativeWebVisibility;
 use crate::settings::{AiToolTabConfig, Settings};
 use crate::tabs::config::{
-    advertises_audit_to_opencode, compose_capability_guidance, consumer_hygiene_for,
+    compose_capability_guidance, consumer_hygiene_for,
     native_web_for,
 };
 
@@ -502,7 +502,7 @@ pub(crate) fn build_opencode_config(
                 }),
             );
         }
-        if advertises_audit_to_opencode(settings) {
+        if crate::harness::plugin::audit_advertised(settings, super::harness_plugin::me()) {
             mcp.insert(
                 "cimp-code-audit".to_string(),
                 serde_json::json!({
@@ -540,7 +540,7 @@ pub(crate) fn build_opencode_config(
     // `llama-server`'s OpenAI-compatible endpoint and points `model` at it so a
     // freshly opened tab is ready to work. `None` ⇒ no `provider`/`model` keys,
     // exactly as before (default install / never registered).
-    if let Some(provider) = settings.offload.resolve_opencode_provider() {
+    if let Some(provider) = super::settings::resolve_provider(settings) {
         if !provider.base_url.is_empty() && !provider.model.is_empty() {
             let mut options = serde_json::Map::new();
             options.insert(

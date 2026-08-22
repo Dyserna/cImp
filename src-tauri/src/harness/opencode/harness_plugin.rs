@@ -26,6 +26,13 @@ pub struct OpenCodePlugin;
 /// The value the registry's descriptor points at.
 pub static PLUGIN: OpenCodePlugin = OpenCodePlugin;
 
+/// This plugin's own id, for the places inside `harness/opencode/` that have to
+/// recognise their own tabs and settings rows. Inside this directory naming
+/// this harness is the point; locked decision 10(a) polices core, not here.
+pub(in crate::harness) fn me() -> crate::harness::HarnessId {
+    crate::harness::HarnessId::from_id("opencode").expect("opencode is a registered harness")
+}
+
 impl HarnessPlugin for OpenCodePlugin {
     fn input_profile(&self) -> Option<InputProfile> {
         Some(super::input::input_profile())
@@ -202,7 +209,7 @@ impl HarnessPlugin for OpenCodePlugin {
         let post_edit = s.graph.enabled && s.graph.auto_check && !s.checks.is_empty();
         serde_json::json!({
             // V37 Phase F: ONE element — see the Claude half.
-            "mcp": [crate::tabs::config::advertises_audit_to_opencode(s)],
+            "mcp": [crate::harness::plugin::audit_advertised(s, me())],
             "guidance": crate::harness::plugin::guidance_gates(s),
             "sandbox": crate::harness::plugin::sandbox_gates(s),
             // `write_opencode_plugin` inputs: plugin presence + its baked
@@ -224,25 +231,38 @@ impl HarnessPlugin for OpenCodePlugin {
                 // `"injection"` entry below and needs a slot of its own.
                 s.workbench.checkpoints,
             ],
-            // The injected `local-llama` provider block (`build_opencode_config`).
-            "provider": s
-                .offload
-                .resolve_opencode_provider()
+            // The RESOLVED `local-llama` provider block
+            // (`build_opencode_config`). The two stored rows behind it —
+            // `ext["provider"]` and `ext["provider_auto"]` — ride the automatic
+            // `ext` half of the signature, but the resolution is not a stored
+            // value: with auto-sync on it is re-derived from the primary Local
+            // backend's command, so an edit to THAT command has to move the
+            // signature too.
+            "provider": super::settings::resolve_provider(s)
                 .map(|p| serde_json::json!([p.base_url, p.model, p.api_key])),
             // V32 Phase F: `sensor` bakes the beacon handler's flag into the
             // plugin, `deny` writes `permission.webfetch/websearch = "deny"`
             // into `OPENCODE_CONFIG_CONTENT` — both spawn-time, like the Claude
             // half. V32 Phase G: the per-tab fragment, now scoped to the
             // OPENCODE tabs and to the features this consumer reads (#48, F-x).
-            "injection": crate::settings::injection::spawn_sig(
-                s,
-                crate::settings::injection::Consumer::Opencode,
-            ),
+            "injection": crate::settings::injection::spawn_sig(s, me()),
         })
     }
 
-    fn recorded_version(&self, hv: &crate::settings::HarnessVersions) -> String {
-        hv.opencode_last_seen.trim().to_string()
+    fn settings_schema(&self) -> &'static [crate::harness::plugin::SettingField] {
+        super::settings::FIELDS
+    }
+
+    /// V32 Phase H's native-tool gate: the mechanism is a
+    /// `tool.execute.before` handler inside the plugin file cImp generates for
+    /// THIS harness, so no other consumer can be subject to it — and before
+    /// V40 Phase B, `Consumer::reads` said so with a `self == Consumer::Opencode`
+    /// comparison in core.
+    fn scoped_features(&self) -> &'static [crate::harness::plugin::ScopedFeature] {
+        &[crate::harness::plugin::ScopedFeature {
+            feature: crate::settings::injection::Feature::HarnessNativeGate,
+            ext_key: super::settings::NATIVE_GATE,
+        }]
     }
 
     fn native_tools(&self) -> &'static [NativeTool] {

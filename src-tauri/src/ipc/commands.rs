@@ -1397,10 +1397,12 @@ fn apply_incoming_settings(cur: &mut Settings, mut incoming: Settings) {
     // it and the registry supplies the manifest default — which is what made the
     // old top-up (`reconcile_audit_tools`, appending missing built-ins to a
     // persisted array) unnecessary rather than merely moved.
-    // V21: when OpenCode local-llama auto-sync is on and the local server is
-    // enabled, re-derive the provider snapshot if the primary Local command
-    // changed (no-op otherwise), so the OpenCode tab tracks command edits.
-    cur.offload.sync_opencode_provider_on_save();
+    // V21: when a harness declares a config writer that tracks cImp's own
+    // offload command, re-derive its snapshot if the primary Local command
+    // changed (no-op otherwise). V40 Phase B moved the two settings behind the
+    // OpenCode plugin, so this calls the plugin's own sync rather than a method
+    // on `OffloadSettings` named after one harness.
+    crate::harness::opencode::settings::sync_provider_on_save(cur);
 }
 
 #[tauri::command]
@@ -3100,6 +3102,7 @@ fn advisor_snapshot_blocking(
     // noting a version mid-run — are visible without a restart (mtime-cached,
     // so the 2s poll doesn't re-parse the file every tick).
     let hv = crate::settings::read_global_harness_versions();
+    let drift_row = crate::settings::read_global_harness_settings(crate::harness::DEFAULT_HARNESS);
     // `remind_count` (drift.read_hook_silent.v1) is the same total-remind-rows
     // count `advisor_reread_rate` just scanned for — reuse its sample count
     // instead of a second identical Datalog scan.
@@ -3210,13 +3213,22 @@ fn advisor_snapshot_blocking(
         graph: settings.graph.clone(),
         dismissed: settings.advisor_dismissed.clone(),
         applied,
-        claude_last_seen: hv.claude_last_seen,
-        claude_last_verified: hv.claude_last_verified,
-        // V35 Phase F: read from the same fresh physical-global snapshot as the
-        // two versions above — the auto-verify worker writes all three
-        // out-of-band, so a record only a second old must be visible to the
-        // very next 2s advisor poll without a restart.
-        claude_auto_verify: hv.claude_auto_verify,
+        // V40 Phase B: the three drift signals come out of
+        // `harness[<id>]` now, read from the same fresh physical-global
+        // snapshot (the auto-verify worker writes all three out of band, so a
+        // record a second old must be visible to the very next 2s advisor poll
+        // without a restart).
+        //
+        // Still the DEFAULT harness's row, and still spelled with Claude's
+        // names on `Signals`: every V16 drift rule in `advisor.rs` is written
+        // around Claude's payload shapes (§ H of the residue ledger), and
+        // making them per-harness is Phase C's `HarnessDriftSignals`. Reading
+        // one harness's row here is the honest interim — it is exactly what the
+        // fields held before — and it is one line to widen once the rules are
+        // neutral.
+        claude_last_seen: drift_row.last_seen.clone(),
+        claude_last_verified: drift_row.last_verified.clone(),
+        claude_auto_verify: drift_row.auto_verify.clone(),
         remind_count,
         large_reread_pairs,
         claude_sessions,
@@ -3302,6 +3314,11 @@ pub async fn harness_versions_get(state: State<'_, AppState>) -> AppResult<Harne
     let versions = crate::settings::read_global_harness_versions();
     let mut settings = state.settings.current();
     settings.harness_versions = versions.clone();
+    // V40 Phase B: the versions, the auto-verify records and the recorded spike
+    // outcomes all live in `harness` now, and all three are written out of band
+    // — so the panel has to be computed against a FRESH read of that map for
+    // exactly the reason it already was for `harness_versions`.
+    settings.harness = crate::settings::read_global_harness_map();
     Ok(HarnessStatus {
         capability_gates: crate::harness::contract::gates(&settings),
         // V35 Phase G: computed against the SAME fresh-versions settings as the
@@ -3341,18 +3358,34 @@ pub async fn harness_run_checks(harness: String) -> AppResult<bool> {
 }
 
 /// V16 Feature 1: the Advisor card's "Mark verified" action — stamp the
-/// currently-seen Claude Code version as the last-verified one (the user
-/// just re-ran the MAINTENANCE.md contract checks). Also mirrors the change
-/// into the live settings so the open Settings window sees it without a
-/// restart.
+/// currently-seen version of `harness` as the last-verified one (the user just
+/// re-ran the MAINTENANCE.md contract checks). Also mirrors the change into the
+/// live settings so the open Settings window sees it without a restart.
+///
+/// **V40 Phase B: it takes a harness.** It used to write `claude_last_verified`
+/// with no argument at all, so the OpenCode row of the health panel had no
+/// action that could ever clear it. `None` is the DEFAULT harness — the
+/// documented wire-compatibility default (locked decision 22), which keeps the
+/// existing frontend call site working unchanged until Phase F passes the id
+/// the button sits under.
 #[tauri::command]
-pub async fn harness_mark_verified(state: State<'_, AppState>) -> AppResult<()> {
-    let after = crate::settings::mutate_global_harness_versions(|hv| {
-        hv.claude_last_verified = hv.claude_last_seen.clone();
+pub async fn harness_mark_verified(
+    state: State<'_, AppState>,
+    harness: Option<String>,
+) -> AppResult<()> {
+    let id = match harness.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(name) => crate::harness::HarnessId::from_id(name).ok_or_else(|| {
+            AppError::Ipc(format!("harness_mark_verified: {name:?} is not a harness"))
+        })?,
+        None => crate::harness::DEFAULT_HARNESS,
+    };
+    let after = crate::settings::mutate_global_harness(id, |row| {
+        row.last_verified = row.last_seen.clone();
     })?;
-    state
-        .settings
-        .mutate(move |cur| cur.harness_versions = after);
+    let key = id.token().to_string();
+    state.settings.mutate(move |cur| {
+        cur.harness.insert(key.clone(), after.clone());
+    });
     Ok(())
 }
 

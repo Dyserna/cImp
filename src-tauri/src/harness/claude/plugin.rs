@@ -35,7 +35,7 @@ pub(in crate::harness) fn id() -> Option<HarnessId> {
 /// This plugin's own id, for the places inside `harness/claude/` that have to
 /// recognise their own tabs. Inside this directory naming this harness is the
 /// point; locked decision 10(a) polices core, not here.
-fn me() -> HarnessId {
+pub(in crate::harness) fn me() -> HarnessId {
     id().expect("claude is a registered harness")
 }
 
@@ -112,18 +112,18 @@ impl HarnessPlugin for ClaudePlugin {
 
         // Claude against a local provider: synthesize `ANTHROPIC_*` env.
         if cfg.use_local_provider {
-            let cl = &settings.claude_local;
-            if !cl.base_url.is_empty() {
-                env.insert("ANTHROPIC_BASE_URL".to_string(), cl.base_url.clone());
+            let [base_url, auth_token, model_alias] = super::settings::local_provider(settings);
+            if !base_url.is_empty() {
+                env.insert("ANTHROPIC_BASE_URL".to_string(), base_url);
             }
-            if !cl.auth_token.is_empty() {
-                env.insert("ANTHROPIC_AUTH_TOKEN".to_string(), cl.auth_token.clone());
+            if !auth_token.is_empty() {
+                env.insert("ANTHROPIC_AUTH_TOKEN".to_string(), auth_token);
             }
-            if !cl.model_alias.is_empty() {
+            if !model_alias.is_empty() {
                 // Claude Code primarily uses --model flag for model selection,
                 // but ANTHROPIC_MODEL is honored by some proxies; setting both
                 // is harmless.
-                env.insert("ANTHROPIC_MODEL".to_string(), cl.model_alias.clone());
+                env.insert("ANTHROPIC_MODEL".to_string(), model_alias);
             }
         }
     }
@@ -173,7 +173,7 @@ impl HarnessPlugin for ClaudePlugin {
         // `HarnessVersions`. Same verdict, same fail-closed semantics.
         let read_hook = s.graph.enabled
             && s.graph.read_advisor
-            && !crate::tabs::config::read_advisor_gate_blocked(s);
+            && !crate::harness::plugin::read_advisor_gate_blocked(s);
         let post_edit = s.graph.enabled && s.graph.auto_check && !s.checks.is_empty();
         // `claude_local` env vars are synthesized at spawn, but only for Claude
         // tabs that opted in — irrelevant edits shouldn't nag.
@@ -184,13 +184,7 @@ impl HarnessPlugin for ClaudePlugin {
                 matches!(t, TabConfig::AiTool(c)
                     if c.use_local_provider && HarnessId::from_command(&c.command) == Some(me()))
             })
-            .then(|| {
-                serde_json::json!([
-                    s.claude_local.base_url,
-                    s.claude_local.auth_token,
-                    s.claude_local.model_alias,
-                ])
-            });
+            .then(|| serde_json::json!(super::settings::local_provider(s)));
         serde_json::json!({
             // V37 Phase F: ONE element, not two. The `cimp-offload` entry is now
             // written into every AI tab's harness config unconditionally, so the
@@ -199,10 +193,17 @@ impl HarnessPlugin for ClaudePlugin {
             // which is exactly the live-propagating input that phase removed from
             // the spawn-baked set. The audit child IS still gated, so its element
             // stays.
-            "mcp": [crate::tabs::config::advertises_audit_to_claude(s)],
+            "mcp": [crate::harness::plugin::audit_advertised(s, me())],
             "guidance": guidance,
             "sandbox": sandbox,
-            "statusline": s.statusline.enabled,
+            // V40 Phase B: the `ext` half of the signature is added by
+            // `spawn_inject_sig` from the `spawn_baked` column of
+            // `settings_schema()` — `statusline` and the three `local.*` rows
+            // are in there automatically, so this object no longer names them.
+            // `local_env` STAYS, because it is not the raw values: it is
+            // `Some(values)` only while a tab actually opted into the local
+            // provider, so editing the proxy URL with no such tab open raises
+            // no hint.
             // The `--settings` hooks overlay gates, in `build_pre_args` order:
             // UserPromptSubmit, PreCompact, PreToolUse Read, PreToolUse Bash,
             // PreToolUse pre-mutation checkpoint (V33 Phase F), PostToolUse
@@ -257,26 +258,12 @@ impl HarnessPlugin for ClaudePlugin {
             // hierarchy. Live features are deliberately absent: they take effect
             // on the next call, and a restart nag for a change that needs no
             // restart is how a hint stops being read.
-            "injection": crate::settings::injection::spawn_sig(
-                s,
-                crate::settings::injection::Consumer::Claude,
-            ),
+            "injection": crate::settings::injection::spawn_sig(s, me()),
         })
     }
 
-    fn recorded_version(&self, hv: &crate::settings::HarnessVersions) -> String {
-        hv.claude_last_seen.trim().to_string()
-    }
-
-    fn auto_verify_record<'a>(
-        &self,
-        hv: &'a crate::settings::HarnessVersions,
-    ) -> Option<&'a crate::settings::AutoVerify> {
-        hv.claude_auto_verify.as_ref()
-    }
-
-    fn last_verified(&self, hv: &crate::settings::HarnessVersions) -> Option<String> {
-        Some(hv.claude_last_verified.clone())
+    fn settings_schema(&self) -> &'static [crate::harness::plugin::SettingField] {
+        super::settings::FIELDS
     }
 
     fn native_tools(&self) -> &'static [NativeTool] {

@@ -129,7 +129,7 @@
 //!
 //! [`Feature::spawn_baked`] names the features whose value is baked into a tab
 //! when it launches: [`Feature::NativeWeb`], [`Feature::ConsumerHygiene`],
-//! Phase H's [`Feature::OpencodeNativeGate`] (whose flag is compiled into the
+//! Phase H's [`Feature::HarnessNativeGate`] (whose flag is compiled into the
 //! generated OpenCode plugin), and — since #48's M-3 — [`Feature::Spotlighting`],
 //! which `tabs::config::fact_promotion_block` reads at launch to decide whether
 //! the pinned-memory addendum enters the system prompt ENVELOPED. Their L2 *and*
@@ -236,9 +236,17 @@ pub enum Feature {
     /// paragraph that listed them would move the spawn signature on every
     /// registry edit.
     ToolSteering,
-    /// V32 Phase H (locked decision 17): the OpenCode plugin's
-    /// `tool.execute.before` handler *denying* the harness's own native tools
-    /// against the tab's taint latch, rather than only beaconing on them.
+    /// V32 Phase H (locked decision 17): a harness plugin's own
+    /// `tool.execute.before`-style handler *denying* the harness's own native
+    /// tools against the tab's taint latch, rather than only beaconing on them.
+    ///
+    /// **Harness-scoped since V40 Phase B** (locked decision 6). The mechanism
+    /// lives inside a file cImp generates FOR one harness, so it can only ever
+    /// reach the harnesses that declare it (`HarnessPlugin::scoped_features`),
+    /// and its app-wide L2 is that plugin's `ext` row rather than a core field.
+    /// Core used to spell the scope as `self == Consumer::Opencode` in
+    /// `Consumer::reads`, which is the shape this milestone removes: it named a
+    /// harness to answer a question the harness itself can declare.
     ///
     /// **Its L2 default was `false` until V39** — decision 17's reasoning was
     /// that whole-surface denial of `bash`/`read`/`edit` materially changes
@@ -252,7 +260,15 @@ pub enum Feature {
     /// Spawn-baked (the flag is compiled into the generated plugin) and
     /// tab-scoped only: it is delivered by an OpenCode plugin, so the offload
     /// worker has no row for it and neither does any non-OpenCode consumer.
-    OpencodeNativeGate,
+    ///
+    /// The serde rename is the same frozen wire form [`Feature::key`] returns —
+    /// it is a `TabInjectionOverrides` field name in every settings file — so
+    /// the two spellings agree even though the VARIANT is neutral. `key()` and
+    /// the serde form must match: `feature_keys_are_unique_and_round_trip` is
+    /// what says so, because the Settings matrix writes by key and reads back
+    /// by serde.
+    #[serde(rename = "opencode_native_gate")]
+    HarnessNativeGate,
     /// Stripping terminal control sequences out of external text cImp composes
     /// into non-HTML sinks. App-wide: TTS and toasts are global surfaces.
     TerminalEscapeHygiene,
@@ -274,7 +290,12 @@ impl Feature {
             Feature::NativeWeb => "native_web",
             Feature::ConsumerHygiene => "consumer_hygiene",
             Feature::ToolSteering => "tool_steering",
-            Feature::OpencodeNativeGate => "opencode_native_gate",
+            // A FROZEN wire key. It is a `TabInjectionOverrides` field name in
+            // every settings file, an `L2Flags` cell and a frontend mirror
+            // member; renaming it with the variant would have been a schema
+            // change for a rename. `Feature::key` is documented as the stable
+            // wire/UI key and this is what stable means.
+            Feature::HarnessNativeGate => "opencode_native_gate",
             Feature::TerminalEscapeHygiene => "terminal_escape_hygiene",
         }
     }
@@ -292,7 +313,7 @@ impl Feature {
             Feature::NativeWeb => "Native-web visibility",
             Feature::ConsumerHygiene => "Consumer hygiene",
             Feature::ToolSteering => "Managed-tool steering",
-            Feature::OpencodeNativeGate => "OpenCode native-tool gating",
+            Feature::HarnessNativeGate => "Harness native-tool gating",
             Feature::TerminalEscapeHygiene => "Terminal escape hygiene",
         }
     }
@@ -310,7 +331,7 @@ impl Feature {
     /// Every V32 control before Phase H defaulted `true`, and one predicate read
     /// that as a law: "any feature resolving off means protection is REDUCED"
     /// ([`protection_reduced`], and its frontend twin `reducedFeaturesFor`).
-    /// [`Feature::OpencodeNativeGate`] broke it — locked decision 17 shipped it
+    /// [`Feature::HarnessNativeGate`] broke it — locked decision 17 shipped it
     /// **default off**, because whole-surface denial of `bash`/`read`/`edit`
     /// materially changes everyday tab UX and is an opt-in posture, not a
     /// baseline. Without this predicate a fresh install would have raised the
@@ -340,7 +361,7 @@ impl Feature {
             | Feature::NativeWeb
             | Feature::ConsumerHygiene
             | Feature::ToolSteering
-            | Feature::OpencodeNativeGate
+            | Feature::HarnessNativeGate
             | Feature::TerminalEscapeHygiene => true,
         }
     }
@@ -385,7 +406,7 @@ impl Feature {
             | Feature::MemoryQuarantine
             | Feature::NativeWeb
             | Feature::ConsumerHygiene
-            | Feature::OpencodeNativeGate
+            | Feature::HarnessNativeGate
             | Feature::TerminalEscapeHygiene => true,
         }
     }
@@ -404,7 +425,7 @@ impl Feature {
             | Feature::NativeWeb
             | Feature::ConsumerHygiene
             | Feature::ToolSteering
-            | Feature::OpencodeNativeGate => true,
+            | Feature::HarnessNativeGate => true,
             Feature::Canary | Feature::TerminalEscapeHygiene => false,
         }
     }
@@ -430,7 +451,7 @@ impl Feature {
             | Feature::NativeWeb
             | Feature::ConsumerHygiene
             | Feature::ToolSteering
-            | Feature::OpencodeNativeGate
+            | Feature::HarnessNativeGate
             | Feature::TerminalEscapeHygiene => false,
         }
     }
@@ -456,7 +477,7 @@ impl Feature {
     /// "does the user owe this control a restart?", and *any* spawn-baked
     /// component is enough to answer yes.
     ///
-    /// [`Feature::OpencodeNativeGate`] joins the pair in Phase H: its flag is
+    /// [`Feature::HarnessNativeGate`] joins the pair in Phase H: its flag is
     /// baked into the generated OpenCode plugin, and the plugin is written at
     /// tab spawn.
     ///
@@ -478,7 +499,7 @@ impl Feature {
             // The steering paragraph is written into the launch addendum beside
             // the hygiene one, so it owes the same restart hint.
             | Feature::ToolSteering
-            | Feature::OpencodeNativeGate
+            | Feature::HarnessNativeGate
             // #48 (M-3): baked by `fact_promotion_block` into the launch
             // addendum. Also live at the proxy — see the note above.
             | Feature::Spotlighting => true,
@@ -803,7 +824,7 @@ impl TabInjectionOverrides {
             Feature::NativeWeb => self.native_web,
             Feature::ConsumerHygiene => self.consumer_hygiene,
             Feature::ToolSteering => self.tool_steering,
-            Feature::OpencodeNativeGate => self.opencode_native_gate,
+            Feature::HarnessNativeGate => self.opencode_native_gate,
             Feature::Canary | Feature::TerminalEscapeHygiene => Override::Inherit,
         }
     }
@@ -827,7 +848,7 @@ impl TabInjectionOverrides {
             Feature::NativeWeb => self.native_web = value,
             Feature::ConsumerHygiene => self.consumer_hygiene = value,
             Feature::ToolSteering => self.tool_steering = value,
-            Feature::OpencodeNativeGate => self.opencode_native_gate = value,
+            Feature::HarnessNativeGate => self.opencode_native_gate = value,
             Feature::Canary | Feature::TerminalEscapeHygiene => return None,
         }
         Some(())
@@ -862,7 +883,7 @@ impl WorkerInjectionOverrides {
             | Feature::NativeWeb
             | Feature::ConsumerHygiene
             | Feature::ToolSteering
-            | Feature::OpencodeNativeGate
+            | Feature::HarnessNativeGate
             | Feature::TerminalEscapeHygiene => Override::Inherit,
         }
     }
@@ -882,7 +903,7 @@ impl WorkerInjectionOverrides {
             | Feature::NativeWeb
             | Feature::ConsumerHygiene
             | Feature::ToolSteering
-            | Feature::OpencodeNativeGate
+            | Feature::HarnessNativeGate
             | Feature::TerminalEscapeHygiene => return None,
         }
         Some(())
@@ -1042,12 +1063,56 @@ fn scope_override(feature: Feature, scope: Scope<'_>, s: &Settings) -> Override 
     }
 }
 
+/// Every `(harness, ext key)` row declaring `feature` as harness-scoped.
+///
+/// Derived from the registry (`HarnessPlugin::scoped_features`) rather than
+/// from a list in core — so "is this feature scoped at all?" is answered by the
+/// harnesses that deliver it, a feature nobody declares stays app-wide, and a
+/// feature two harnesses declare reaches both.
+fn scoped_feature_rows(feature: Feature) -> Vec<(crate::harness::HarnessId, &'static str)> {
+    crate::harness::registry::all()
+        .filter_map(|h| {
+            let sf = h
+                .plugin()?
+                .scoped_features()
+                .iter()
+                .find(|sf| sf.feature == feature)?;
+            Some((h, sf.ext_key))
+        })
+        .collect()
+}
+
+/// The app-wide L2 of a harness-scoped feature, or `None` when the feature is
+/// not scoped at all.
+///
+/// `any` rather than `all`: this answers "is the app-wide CEILING up for
+/// anyone". Per-harness resolution happens one level down, at `Scope::Tab`,
+/// where the tab's own harness is known and [`harness_reads`] has already
+/// filtered the feature out for a harness that does not declare it.
+fn scoped_feature_l2(feature: Feature, s: &Settings) -> Option<bool> {
+    let rows = scoped_feature_rows(feature);
+    if rows.is_empty() {
+        return None;
+    }
+    Some(rows.iter().any(|(h, key)| s.harness_ext_bool(*h, key)))
+}
+
 /// The app-wide L2 answer for `feature`.
 ///
 /// **This function and [`InjectionSettings`]'s declaration are the only places
 /// in the crate that read these raw fields** — and since #44 that is enforced by
 /// their `pub(in crate::settings)` visibility rather than watched by a scan.
 fn feature_l2(feature: Feature, s: &Settings) -> bool {
+    // V40 Phase B: a harness-scoped feature's L2 is the DECLARING plugin's
+    // `ext` row — core stores no app-wide flag for a control that only reaches
+    // one harness. `any` rather than `all` because the question this answers is
+    // "is the app-wide ceiling up for anyone", and a second harness declaring
+    // the same feature must not be able to hold the first one's ceiling down;
+    // per-harness resolution happens one level up, at `Scope::Tab`, where the
+    // tab's own harness is known.
+    if let Some(l2) = scoped_feature_l2(feature, s) {
+        return l2;
+    }
     let inj = &s.offload.injection;
     match feature {
         Feature::TaintLatch => inj.taint_latch_enabled,
@@ -1059,8 +1124,13 @@ fn feature_l2(feature: Feature, s: &Settings) -> bool {
         Feature::MemoryQuarantine => inj.memory_quarantine_enabled,
         Feature::ConsumerHygiene => inj.consumer_hygiene_enabled,
         Feature::ToolSteering => inj.tool_steering_enabled,
-        Feature::OpencodeNativeGate => inj.opencode_native_gate_enabled,
         Feature::TerminalEscapeHygiene => inj.terminal_escape_hygiene_enabled,
+        // Unreachable while any harness declares it — `scoped_feature_l2`
+        // answered above. Reached only if every plugin dropped the declaration,
+        // and then `false` is the honest answer: a mechanism no harness
+        // delivers has no app-wide ceiling to raise, and `true` would put a
+        // control in the Settings matrix that nothing implements.
+        Feature::HarnessNativeGate => false,
         // No boolean of its own — the tri-mode IS the L2 (module docs).
         Feature::NativeWeb => native_web_l2(s) != NativeWebMode::Off,
     }
@@ -1291,95 +1361,58 @@ pub fn armed_outside_the_worker(feature: Feature, s: &Settings) -> bool {
 
 // ── Spawn signature + introspection ───────────────────────────────────────
 
-/// Which AI consumer a spawn signature is being built for.
+/// Whether `feature`'s spawn-baked value reaches `harness`'s launch at all.
 ///
-/// The split matches how `tabs::config` already divides the launch path:
-/// `build_pre_args` is Claude-only, `build_opencode_config` /
-/// `write_opencode_plugin` take everything else. So the two consumers' tab sets
-/// PARTITION the AI tabs — no tab belongs to neither, which is what keeps the
-/// per-consumer signatures from dropping a row between them.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Consumer {
-    Claude,
-    Opencode,
-}
-
-impl Consumer {
-    /// The consumer a tab whose command is `command` launches, or `None` when
-    /// the command names no registered harness.
-    ///
-    /// **V40 Phase A made this fallible** (locked decision 2). It used to answer
-    /// `Opencode` for anything that was not Claude, so a tab pointed at a third
-    /// CLI had OpenCode's injection hierarchy resolved for it — the wrong
-    /// spawn-baked flags, silently. A tab that is not a registered harness has
-    /// no consumer, and every caller now says so.
-    pub fn for_command(command: &str) -> Option<Self> {
-        let id = crate::harness::HarnessId::from_command(command)?.id()?;
-        Self::from_agent(id)
-    }
-
-    /// The consumer for a CHP `agent` token, or `None`.
-    pub fn from_agent(agent: &str) -> Option<Self> {
-        match agent {
-            "claude" => Some(Consumer::Claude),
-            "opencode" => Some(Consumer::Opencode),
-            _ => None,
-        }
-    }
-
-    /// This consumer in the normalized agent vocabulary the rest of the crate
-    /// keys on (`tabs::config::tab_consumer`,
-    /// `ToolPluginsSettings::commands_exposed_to`, the latch registry). One
-    /// spelling, so a per-consumer settings lookup cannot disagree with the
-    /// scope the same tab resolves through.
-    pub fn agent(self) -> &'static str {
-        match self {
-            Consumer::Claude => "claude",
-            Consumer::Opencode => "opencode",
-        }
-    }
-
-    /// Whether `feature`'s spawn-baked value reaches this consumer's launch at
-    /// all.
-    ///
-    /// Exhaustive, so a new [`Feature`] cannot be added without an answer here —
-    /// and the answer defaults to nothing: a control that reaches neither
-    /// consumer would simply never raise a hint, which is why the match names
-    /// every variant rather than falling through.
-    fn reads(self, feature: Feature) -> bool {
-        match feature {
-            // Claude reads the mode in `build_pre_args` (the beacon hook, and
-            // `permissions.deny` in `deny` mode); OpenCode bakes it into the
-            // plugin's beacon flag and its pinned permission block.
-            Feature::NativeWeb => true,
-            // The hygiene paragraph is Claude's `--append-system-prompt` and
-            // OpenCode's managed instructions file; the pinned permission block
-            // is OpenCode's alone.
-            Feature::ConsumerHygiene => true,
-            // The steering paragraph rides the SAME channel as the hygiene one,
-            // for both consumers — `compose_capability_guidance` composes them
-            // one after the other.
-            Feature::ToolSteering => true,
-            // Phase H's gate exists only inside the generated OpenCode plugin.
-            // This is the row the shared blob was nagging Claude tabs about.
-            Feature::OpencodeNativeGate => self == Consumer::Opencode,
-            // #48 (M-3): BOTH consumers bake it. `fact_promotion_block` is
-            // called for `claude` and for `opencode` alike (the `agent`
-            // parameter), landing in `--append-system-prompt` on one side and
-            // the managed instructions file on the other — so an L2 flip owes
-            // both a hint, and an L3 flip owes the tab's own consumer one.
-            Feature::Spotlighting => true,
-            // Live features never reach a spawn signature at all — filtered out
-            // by `Feature::spawn_baked` before this is asked — but naming them
-            // keeps the match total.
-            Feature::TaintLatch
-            | Feature::Detection
-            | Feature::SsrfGuard
-            | Feature::FetchBudgets
-            | Feature::Canary
-            | Feature::MemoryQuarantine
-            | Feature::TerminalEscapeHygiene => false,
-        }
+/// **V40 Phase B deleted the `Consumer` enum this was a method on.** It had
+/// exactly two variants, `Claude` and `Opencode`, with `for_command` /
+/// `from_agent` / `agent()` re-deriving what [`crate::harness::HarnessId`]
+/// already answers — a second identity vocabulary that had to be kept in step
+/// with the registry by hand. The one thing it carried that a `HarnessId` does
+/// not is this predicate, so this is what is left of it.
+///
+/// Exhaustive over [`Feature`], so a new one cannot be added without an answer
+/// here — and the answer defaults to nothing: a control that reaches no harness
+/// would simply never raise a hint, which is why the match names every variant
+/// rather than falling through.
+pub fn harness_reads(harness: crate::harness::HarnessId, feature: Feature) -> bool {
+    match feature {
+        // Claude reads the mode in `build_pre_args` (the beacon hook, and
+        // `permissions.deny` in `deny` mode); OpenCode bakes it into the
+        // plugin's beacon flag and its pinned permission block.
+        Feature::NativeWeb => true,
+        // The hygiene paragraph is Claude's `--append-system-prompt` and
+        // OpenCode's managed instructions file; the pinned permission block
+        // is OpenCode's alone.
+        Feature::ConsumerHygiene => true,
+        // The steering paragraph rides the SAME channel as the hygiene one,
+        // for both consumers — `compose_capability_guidance` composes them
+        // one after the other.
+        Feature::ToolSteering => true,
+        // Phase H's gate exists only inside a generated harness plugin. This is
+        // the row the shared blob was nagging Claude tabs about — and before
+        // V40 Phase B, core answered it with `self == Consumer::Opencode`. It
+        // is the declaring plugin's answer now, so a third harness that ships
+        // such a gate is covered by declaring it and a harness that does not is
+        // never nagged.
+        Feature::HarnessNativeGate => scoped_feature_rows(feature)
+            .iter()
+            .any(|(h, _)| *h == harness),
+        // #48 (M-3): BOTH consumers bake it. `fact_promotion_block` is
+        // called for `claude` and for `opencode` alike (the `agent`
+        // parameter), landing in `--append-system-prompt` on one side and
+        // the managed instructions file on the other — so an L2 flip owes
+        // both a hint, and an L3 flip owes the tab's own consumer one.
+        Feature::Spotlighting => true,
+        // Live features never reach a spawn signature at all — filtered out
+        // by `Feature::spawn_baked` before this is asked — but naming them
+        // keeps the match total.
+        Feature::TaintLatch
+        | Feature::Detection
+        | Feature::SsrfGuard
+        | Feature::FetchBudgets
+        | Feature::Canary
+        | Feature::MemoryQuarantine
+        | Feature::TerminalEscapeHygiene => false,
     }
 }
 
@@ -1416,7 +1449,7 @@ impl Consumer {
 /// change. [`Feature::ToolSteering`]'s `tool_plugins.expose_commands_*` flag
 /// rides for the same reason and is scoped the same way — see the comment at
 /// its site below, including why the tool REGISTRY deliberately stays out.
-pub fn spawn_sig(s: &Settings, consumer: Consumer) -> serde_json::Value {
+pub fn spawn_sig(s: &Settings, harness: crate::harness::HarnessId) -> serde_json::Value {
     // The spawn-baked features this consumer reads, in `Feature::ALL` order.
     // Driven by `Feature::spawn_baked` rather than by a hand-written pair, so a
     // future spawn-baked control gets its restart hint by declaring itself —
@@ -1424,13 +1457,17 @@ pub fn spawn_sig(s: &Settings, consumer: Consumer) -> serde_json::Value {
     let features: Vec<Feature> = Feature::ALL
         .iter()
         .copied()
-        .filter(|f| f.spawn_baked() && consumer.reads(*f))
+        .filter(|f| f.spawn_baked() && harness_reads(harness, *f))
         .collect();
     let consumer_tabs: Vec<_> = s
         .tabs
         .iter()
         .filter_map(|t| match t {
-            TabConfig::AiTool(c) if Consumer::for_command(&c.command) == Some(consumer) => Some(c),
+            TabConfig::AiTool(c)
+                if crate::harness::HarnessId::from_command(&c.command) == Some(harness) =>
+            {
+                Some(c)
+            }
             _ => None,
         })
         .collect();
@@ -1467,7 +1504,7 @@ pub fn spawn_sig(s: &Settings, consumer: Consumer) -> serde_json::Value {
     let commands_exposed = consumer_tabs
         .iter()
         .any(|c| effective(Feature::ToolSteering, Scope::tab_only(&c.id), s))
-        .then(|| s.tool_plugins.commands_exposed_to(consumer.agent()));
+        .then(|| s.harness_settings(harness).expose_commands);
     // The app-wide L2 input for each of those features. The native-web entry is
     // the tri-mode string — that IS its L2 (the module docs' reconciliation
     // note), and it carries `sensor` vs `deny`, which a boolean would lose.
@@ -1723,6 +1760,12 @@ impl Settings {
     /// default `sensor`. A test that needs `deny` sets the mode itself — that
     /// is a posture, not an on/off.
     pub(crate) fn set_l2_for_test(&mut self, feature: Feature, on: bool) {
+        if !scoped_feature_rows(feature).is_empty() {
+            for (h, key) in scoped_feature_rows(feature) {
+                self.set_harness_ext(h, key, serde_json::Value::Bool(on));
+            }
+            return;
+        }
         let inj = &mut self.offload.injection;
         match feature {
             Feature::TaintLatch => inj.taint_latch_enabled = on,
@@ -1734,8 +1777,10 @@ impl Settings {
             Feature::MemoryQuarantine => inj.memory_quarantine_enabled = on,
             Feature::ConsumerHygiene => inj.consumer_hygiene_enabled = on,
             Feature::ToolSteering => inj.tool_steering_enabled = on,
-            Feature::OpencodeNativeGate => inj.opencode_native_gate_enabled = on,
             Feature::TerminalEscapeHygiene => inj.terminal_escape_hygiene_enabled = on,
+            // Unreachable while any harness declares it — the scoped branch
+            // above answered. Kept total for the same reason `feature_l2` is.
+            Feature::HarnessNativeGate => {}
             Feature::NativeWeb => {
                 self.offload.native_web_visibility = if on {
                     NativeWebMode::Sensor.as_str().to_string()
@@ -1950,7 +1995,7 @@ mod tests {
 
     /// V39: the feature that USED to ship off, end to end through the hierarchy.
     ///
-    /// Locked decision 17 shipped [`Feature::OpencodeNativeGate`] with its L2
+    /// Locked decision 17 shipped [`Feature::HarnessNativeGate`] with its L2
     /// `false`, because whole-surface denial of `bash`/`read`/`edit` changes
     /// everyday tab UX. V39 keeps that judgement and relocates it: the app-wide
     /// level is on with every other sub-protection, and the opt-in is the tab's
@@ -1963,7 +2008,7 @@ mod tests {
     /// - a tab that opts IN gets it, and its neighbours do not.
     #[test]
     fn the_opencode_native_gate_is_now_app_wide_on_and_opted_into_per_tab() {
-        let f = Feature::OpencodeNativeGate;
+        let f = Feature::HarnessNativeGate;
         assert!(f.default_enabled(), "V39: every sub-protection ships on");
         assert!(f.spawn_baked(), "its flag is baked into the plugin");
         assert!(f.has_tab_scope());
@@ -2433,11 +2478,22 @@ mod tests {
     }
 
     /// The id of the first tab whose command launches `consumer`.
-    fn tab_of(s: &Settings, consumer: Consumer) -> String {
+    /// V40 Phase B: the tests kept the two-name vocabulary they were written
+    /// in; these resolve it through the registry instead of an enum.
+    fn claude_h() -> crate::harness::HarnessId {
+        crate::harness::HarnessId::from_id("claude").expect("registered")
+    }
+    fn opencode_h() -> crate::harness::HarnessId {
+        crate::harness::HarnessId::from_id("opencode").expect("registered")
+    }
+
+    fn tab_of(s: &Settings, consumer: crate::harness::HarnessId) -> String {
         s.tabs
             .iter()
             .find_map(|t| match t {
-                TabConfig::AiTool(c) if Consumer::for_command(&c.command) == Some(consumer) => {
+                TabConfig::AiTool(c)
+                    if crate::harness::HarnessId::from_command(&c.command) == Some(consumer) =>
+                {
                     Some(c.id.clone())
                 }
                 _ => None,
@@ -2465,60 +2521,60 @@ mod tests {
     /// restart?", so it belongs here.
     #[test]
     fn the_spawn_signature_tracks_only_spawn_baked_levels() {
-        use Consumer::{Claude, Opencode};
+        let (claude, opencode) = (claude_h(), opencode_h());
         let base = settings_both_consumers();
-        let before = |c: Consumer| spawn_sig(&base, c);
+        let before = |c: crate::harness::HarnessId| spawn_sig(&base, c);
 
         type Mutate = Box<dyn Fn(&mut Settings)>;
-        let moves: Vec<(&str, Mutate, &[Consumer])> = vec![
+        let moves: Vec<(&str, Mutate, Vec<crate::harness::HarnessId>)> = vec![
             (
                 "native-web L2 (the mode)",
                 Box::new(|s: &mut Settings| s.set_native_web_mode_for_test(NativeWebMode::Deny)),
-                &[Claude, Opencode],
+                vec![claude, opencode],
             ),
             (
                 "native-web L3 on the Claude tab",
                 Box::new(|s: &mut Settings| {
-                    let id = tab_of(s, Claude);
+                    let id = tab_of(s, claude_h());
                     set_tab_override(s, &id, Feature::NativeWeb, Override::Off);
                 }),
-                &[Claude],
+                vec![claude],
             ),
             (
                 "native-web L3 on the OpenCode tab",
                 Box::new(|s: &mut Settings| {
-                    let id = tab_of(s, Opencode);
+                    let id = tab_of(s, opencode_h());
                     set_tab_override(s, &id, Feature::NativeWeb, Override::Off);
                 }),
-                &[Opencode],
+                vec![opencode],
             ),
             (
                 "consumer-hygiene L2",
                 Box::new(|s: &mut Settings| s.set_l2_for_test(Feature::ConsumerHygiene, false)),
-                &[Claude, Opencode],
+                vec![claude, opencode],
             ),
             (
                 "consumer-hygiene L3 on the Claude tab",
                 Box::new(|s: &mut Settings| {
-                    let id = tab_of(s, Claude);
+                    let id = tab_of(s, claude_h());
                     set_tab_override(s, &id, Feature::ConsumerHygiene, Override::Off);
                 }),
-                &[Claude],
+                vec![claude],
             ),
             // The managed-tool steering paragraph rides the same channel as the
             // hygiene one, for both consumers.
             (
                 "tool-steering L2",
                 Box::new(|s: &mut Settings| s.set_l2_for_test(Feature::ToolSteering, false)),
-                &[Claude, Opencode],
+                vec![claude, opencode],
             ),
             (
                 "tool-steering L3 on the Claude tab",
                 Box::new(|s: &mut Settings| {
-                    let id = tab_of(s, Claude);
+                    let id = tab_of(s, claude_h());
                     set_tab_override(s, &id, Feature::ToolSteering, Override::Off);
                 }),
-                &[Claude],
+                vec![claude],
             ),
             // V32 Phase H: both levels of the OpenCode native gate. Its flag is
             // compiled into the generated plugin, so a flip that does not move
@@ -2530,16 +2586,16 @@ mod tests {
                 // writing `true` here would assert that a no-op flip moves a
                 // signature. The property under test is unchanged — one level of
                 // one control, and exactly which consumers may notice.
-                Box::new(|s: &mut Settings| s.set_l2_for_test(Feature::OpencodeNativeGate, false)),
-                &[Opencode],
+                Box::new(|s: &mut Settings| s.set_l2_for_test(Feature::HarnessNativeGate, false)),
+                vec![opencode],
             ),
             (
                 "opencode-native-gate L3",
                 Box::new(|s: &mut Settings| {
-                    let id = tab_of(s, Opencode);
-                    set_tab_override(s, &id, Feature::OpencodeNativeGate, Override::Off);
+                    let id = tab_of(s, opencode_h());
+                    set_tab_override(s, &id, Feature::HarnessNativeGate, Override::Off);
                 }),
-                &[Opencode],
+                vec![opencode],
             ),
             // #48 (M-3): spotlighting is BOTH live and spawn-baked. The baked
             // half is `fact_promotion_block`'s decision to envelope the pinned-
@@ -2549,27 +2605,27 @@ mod tests {
             (
                 "spotlighting L2 (the memory addendum is baked)",
                 Box::new(|s: &mut Settings| s.set_l2_for_test(Feature::Spotlighting, false)),
-                &[Claude, Opencode],
+                vec![claude, opencode],
             ),
             (
                 "spotlighting L3 on the Claude tab",
                 Box::new(|s: &mut Settings| {
-                    let id = tab_of(s, Claude);
+                    let id = tab_of(s, claude_h());
                     set_tab_override(s, &id, Feature::Spotlighting, Override::Off);
                 }),
-                &[Claude],
+                vec![claude],
             ),
             (
                 // L1 reaches every launch there is, so both objects carry it.
                 "the global master",
                 Box::new(|s: &mut Settings| s.set_master_for_test(false)),
-                &[Claude, Opencode],
+                vec![claude, opencode],
             ),
         ];
         for (name, mutate, expect) in moves {
             let mut s = settings_both_consumers();
             mutate(&mut s);
-            for c in [Claude, Opencode] {
+            for c in [claude, opencode] {
                 let moved = spawn_sig(&s, c) != before(c);
                 assert_eq!(
                     moved,
@@ -2599,7 +2655,7 @@ mod tests {
         for (name, mutate) in stays {
             let mut s = settings_both_consumers();
             mutate(&mut s);
-            for c in [Claude, Opencode] {
+            for c in [claude, opencode] {
                 assert_eq!(
                     spawn_sig(&s, c),
                     before(c),
@@ -2626,41 +2682,41 @@ mod tests {
     /// mean nothing.
     #[test]
     fn tool_steering_rides_the_expose_flag_but_not_the_tool_registry() {
-        use Consumer::{Claude, Opencode};
+        let (claude, opencode) = (claude_h(), opencode_h());
         let base = settings_both_consumers();
-        let claude_before = spawn_sig(&base, Claude);
-        let opencode_before = spawn_sig(&base, Opencode);
+        let claude_before = spawn_sig(&base, claude);
+        let opencode_before = spawn_sig(&base, opencode);
 
         let mut s = settings_both_consumers();
-        s.tool_plugins.expose_commands_claude = false;
+        s.harness_row("claude").expose_commands = false;
         assert_ne!(
-            spawn_sig(&s, Claude),
+            spawn_sig(&s, claude),
             claude_before,
-            "hiding `run_command` from Claude changes the paragraph a fresh Claude tab is \
+            "hiding `run_command` from claude changes the paragraph a fresh claude tab is \
              launched with"
         );
         assert_eq!(
-            spawn_sig(&s, Opencode),
+            spawn_sig(&s, opencode),
             opencode_before,
             "…and cannot reach an OpenCode tab, so it must not nag one"
         );
 
         let mut s = settings_both_consumers();
-        s.tool_plugins.expose_commands_opencode = false;
-        assert_ne!(spawn_sig(&s, Opencode), opencode_before);
-        assert_eq!(spawn_sig(&s, Claude), claude_before);
+        s.harness_row("opencode").expose_commands = false;
+        assert_ne!(spawn_sig(&s, opencode), opencode_before);
+        assert_eq!(spawn_sig(&s, claude), claude_before);
 
         // With the feature resolved off for every tab, the flag cannot change
         // what any fresh tab writes — and a nag for a change with no effect is
         // how a restart hint stops being read.
         let mut off = settings_both_consumers();
         off.set_l2_for_test(Feature::ToolSteering, false);
-        let claude_off = spawn_sig(&off, Claude);
-        let opencode_off = spawn_sig(&off, Opencode);
-        off.tool_plugins.expose_commands_claude = false;
-        off.tool_plugins.expose_commands_opencode = false;
-        assert_eq!(spawn_sig(&off, Claude), claude_off, "steering off ⇒ the flag is inert");
-        assert_eq!(spawn_sig(&off, Opencode), opencode_off);
+        let claude_off = spawn_sig(&off, claude);
+        let opencode_off = spawn_sig(&off, opencode);
+        off.harness_row("claude").expose_commands = false;
+        off.harness_row("opencode").expose_commands = false;
+        assert_eq!(spawn_sig(&off, claude), claude_off, "steering off ⇒ the flag is inert");
+        assert_eq!(spawn_sig(&off, opencode), opencode_off);
 
         // The registry itself: none of these may move either object.
         type Mutate = Box<dyn Fn(&mut Settings)>;
@@ -2721,12 +2777,12 @@ mod tests {
             let mut s = settings_both_consumers();
             mutate(&mut s);
             assert_eq!(
-                spawn_sig(&s, Claude),
+                spawn_sig(&s, claude),
                 claude_before,
-                "{name} is a LIVE surface change — it must not move the Claude spawn signature"
+                "{name} is a LIVE surface change — it must not move the claude spawn signature"
             );
             assert_eq!(
-                spawn_sig(&s, Opencode),
+                spawn_sig(&s, opencode),
                 opencode_before,
                 "{name} is a LIVE surface change — it must not move the OpenCode spawn signature"
             );
@@ -2760,7 +2816,7 @@ mod tests {
     #[test]
     fn the_per_consumer_split_partitions_the_tabs_and_covers_every_feature() {
         let s = settings_both_consumers();
-        let ids = |c: Consumer| -> Vec<String> {
+        let ids = |c: crate::harness::HarnessId| -> Vec<String> {
             spawn_sig(&s, c)["tabs"]
                 .as_array()
                 .expect("tabs array")
@@ -2768,8 +2824,8 @@ mod tests {
                 .map(|row| row[0].as_str().expect("tab id").to_string())
                 .collect()
         };
-        let mut union = ids(Consumer::Claude);
-        union.extend(ids(Consumer::Opencode));
+        let mut union = ids(claude_h());
+        union.extend(ids(opencode_h()));
         union.sort();
         let mut all: Vec<String> = s
             .tabs
@@ -2785,7 +2841,7 @@ mod tests {
         // …and every spawn-baked feature is read by at least one of them.
         for f in Feature::ALL.iter().filter(|f| f.spawn_baked()) {
             assert!(
-                Consumer::Claude.reads(*f) || Consumer::Opencode.reads(*f),
+                harness_reads(claude_h(), *f) || harness_reads(opencode_h(), *f),
                 "{} is spawn-baked but reaches no consumer, so no hint would ever fire",
                 f.key()
             );
@@ -2869,6 +2925,12 @@ mod tests {
             let json = serde_json::to_string(f).unwrap();
             assert_eq!(json, format!("\"{}\"", f.key()));
             assert_eq!(serde_json::from_str::<Feature>(&json).unwrap(), *f);
+            // The key is the WIRE value, not the variant's name in disguise.
+            // V40 Phase B renamed `OpencodeNativeGate` to `HarnessNativeGate`
+            // (core may not name a harness) and deliberately did NOT rename its
+            // key, which is a `TabInjectionOverrides` field in every settings
+            // file and a member of the frontend's spawn-baked mirror. That the
+            // two can differ is the point of `key()` existing.
         }
         // No `seen.len() == Feature::ALL.len()` line here any more: it was
         // tautological (the loop pushes once per entry, and the uniqueness
@@ -3014,7 +3076,7 @@ mod tests {
         // Decision 17's shape: an L2 `off` with one tab hardened over it. Since
         // V39 this L2 ships ON like every other, so the test states the `off`
         // itself rather than borrowing a default that has moved.
-        let f = Feature::OpencodeNativeGate;
+        let f = Feature::HarnessNativeGate;
         s.set_l2_for_test(f, false);
 
         // Nothing overridden: the app-wide answer is the L2 value, decided at

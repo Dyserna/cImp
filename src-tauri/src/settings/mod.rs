@@ -23,8 +23,9 @@ mod schema;
 
 pub use broadcaster::SettingsHandle;
 pub use persistence::{
-    apply_portable_avatar_paths, load_readonly, mutate_global_harness_versions,
-    note_harness_version, read_global_harness_versions, read_global_llm_pricing,
+    apply_portable_avatar_paths, load_readonly, mutate_global_harness, note_harness_version,
+    read_global_harness_map, read_global_harness_settings, read_global_harness_versions,
+    read_global_llm_pricing,
     read_global_prompt_templates, read_project_prompt_templates, reconcile_reserved_tabs,
     write_global_llm_pricing, write_global_prompt_templates,
 };

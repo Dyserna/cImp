@@ -334,7 +334,7 @@ pub fn tools() -> Vec<Value> {
 ///
 /// V38 F-3 split the consumer out because the surface stopped being the same
 /// for both: `run_command` is advertised per consumer
-/// ([`crate::settings::ToolPluginsSettings::commands_exposed_to`]), so a
+/// ([`commands_exposed_to`]), so a
 /// consumer-blind builder would show a Claude tab what the user only enabled
 /// for OpenCode. The `--offload-mcp` child knows its own consumer (its
 /// `--consumer` argv) and calls this; [`tools`] keeps the old signature for the
@@ -567,7 +567,21 @@ fn commands_advertised(
     consumer: &str,
     names: &[String],
 ) -> bool {
-    settings.tool_plugins.commands_exposed_to(consumer) && !names.is_empty()
+    commands_exposed_to(settings, consumer) && !names.is_empty()
+}
+
+/// Whether `run_command` is advertised to the harness behind this `--consumer`
+/// token.
+///
+/// V40 Phase B replaced `ToolPluginsSettings::commands_exposed_to`, whose rule
+/// was "anything not OpenCode is Claude" — so a token nobody registered was
+/// answered out of Claude's switch, fail-OPEN, on a question about whether a
+/// model may run commands. An unregistered token is **not exposed**: the same
+/// direction Phase A took for `audit::runner::consumer_exposed`, and the same
+/// reason.
+fn commands_exposed_to(settings: &crate::settings::Settings, consumer: &str) -> bool {
+    crate::harness::HarnessId::from_consumer(consumer)
+        .is_some_and(|h| settings.harness_settings(h).expose_commands)
 }
 
 /// The advertised `tool` enum for `run_command` — the runnable `command`-kind
@@ -586,8 +600,12 @@ fn command_tool_names(settings: &crate::settings::Settings) -> Vec<String> {
 fn commands_sig(settings: &crate::settings::Settings) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    settings.tool_plugins.expose_commands_claude.hash(&mut h);
-    settings.tool_plugins.expose_commands_opencode.hash(&mut h);
+    // Every registered harness's switch, in registry order — a fixed pair here
+    // meant a third harness's flip moved no fingerprint and re-advertised
+    // nothing.
+    for harness in crate::harness::registry::all() {
+        settings.harness_settings(harness).expose_commands.hash(&mut h);
+    }
     let names = command_tool_names(settings);
     names.len().hash(&mut h);
     for name in &names {
@@ -1937,7 +1955,7 @@ async fn run_command_inner(
     // outright), so a user who unchecks the box would otherwise keep serving
     // calls from every session already running — the `code_audit` exposure
     // flags' per-run re-check, for the same reason.
-    if !settings.tool_plugins.commands_exposed_to(consumer) {
+    if !commands_exposed_to(settings, consumer) {
         return Err(
             "run_command is not exposed to this consumer — re-enable it under Settings → Tool \
              Plugins if you meant to allow it"
@@ -3469,7 +3487,7 @@ mod run_check_tests {
         assert!(!super::commands_advertised(&s, "opencode", &[]));
 
         let mut off_for_claude = Settings::default();
-        off_for_claude.tool_plugins.expose_commands_claude = false;
+        off_for_claude.harness_row("claude").expose_commands = false;
         assert!(!super::commands_advertised(&off_for_claude, "claude", &names));
         assert!(
             super::commands_advertised(&off_for_claude, "opencode", &names),
@@ -3477,14 +3495,22 @@ mod run_check_tests {
         );
 
         let mut off_for_opencode = Settings::default();
-        off_for_opencode.tool_plugins.expose_commands_opencode = false;
+        off_for_opencode.harness_row("opencode").expose_commands = false;
         assert!(!super::commands_advertised(&off_for_opencode, "opencode", &names));
         assert!(super::commands_advertised(&off_for_opencode, "claude", &names));
 
-        // An unrecognized consumer reads as Claude, the same way
-        // `source_for_consumer` classifies it — one mapping, not two.
-        assert!(super::commands_advertised(&off_for_opencode, "", &names));
+        // **V40 Phase B: an unrecognized consumer is NOT exposed.** It used
+        // to read as Claude — so a token nobody registered was answered out of
+        // Claude's switch, fail-OPEN, on a question about whether a model may
+        // run commands. Both cases below are now `false` for the same reason,
+        // which is the whole behaviour change: the answer no longer depends on
+        // a harness the caller is not.
+        assert!(!super::commands_advertised(&off_for_opencode, "", &names));
         assert!(!super::commands_advertised(&off_for_claude, "", &names));
+        assert!(
+            !super::commands_advertised(&Settings::default(), "not-a-harness", &names),
+            "a typo'd consumer token must not inherit another harness's switch"
+        );
     }
 
     /// The advertised schema enumerates exactly the runnable tools, and `tool`
@@ -3560,9 +3586,9 @@ mod run_check_tests {
     fn surface_fingerprint_tracks_the_command_exposure_switches() {
         let base = super::SurfaceFingerprint::of(&Settings::default());
         let mut claude_off = Settings::default();
-        claude_off.tool_plugins.expose_commands_claude = false;
+        claude_off.harness_row("claude").expose_commands = false;
         let mut opencode_off = Settings::default();
-        opencode_off.tool_plugins.expose_commands_opencode = false;
+        opencode_off.harness_row("opencode").expose_commands = false;
         assert_ne!(base, super::SurfaceFingerprint::of(&claude_off));
         assert_ne!(base, super::SurfaceFingerprint::of(&opencode_off));
         assert_ne!(
@@ -3583,7 +3609,7 @@ mod run_check_tests {
     #[tokio::test]
     async fn a_call_is_refused_when_the_consumer_is_not_exposed() {
         let mut settings = Settings::default();
-        settings.tool_plugins.expose_commands_claude = false;
+        settings.harness_row("claude").expose_commands = false;
         let err = super::run_command_inner(
             &std::env::temp_dir(),
             &settings,

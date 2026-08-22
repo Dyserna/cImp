@@ -446,11 +446,10 @@ pub(crate) fn drive_order() -> Vec<Harness> {
 /// settings file. The fallback stamp for [`drive`] — never the primary, because
 /// a stale record would file today's shapes under yesterday's release.
 fn recorded_version(harness: Harness) -> String {
-    let hv = crate::settings::read_global_harness_versions();
-    harness
-        .plugin()
-        .map(|p| p.recorded_version(&hv))
-        .unwrap_or_default()
+    crate::settings::read_global_harness_settings(harness)
+        .last_seen
+        .trim()
+        .to_string()
 }
 
 /// `--json`: a flat array of the same records the human report prints, one per

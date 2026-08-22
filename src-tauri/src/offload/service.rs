@@ -1076,18 +1076,21 @@ impl OffloadService {
     /// Claude and OpenCode children from their respective access flags.
     pub async fn mcp_tool_descriptors(&self, consumer: Consumer) -> Vec<serde_json::Value> {
         let defs = match consumer {
-            Consumer::Opencode => self.host.tool_defs_for(consumer.harness()).await,
-            // This loopback proxy only serves the interactive Claude/OpenCode
-            // children; the offload worker reaches the host in-process, never via
-            // this route. An unexpected `offload` query value therefore can't
-            // arrive in practice — fall back to the Claude set (the conservative,
-            // claude_access-guarded default) rather than leaking the offload set.
+            Consumer::Harness(h) => self.host.tool_defs_for(h).await,
+            // This loopback proxy only serves the interactive HARNESS children;
+            // the offload worker reaches the host in-process, never via this
+            // route. An unexpected `offload` query value therefore can't arrive
+            // in practice — fall back to the default harness's set (the
+            // conservative, grant-guarded default) rather than leaking the
+            // offload set.
             //
             // V38 Phase F: `Audit` lands here for the same reason and never in
             // practice — the audit fan-out advertises nothing and calls a name
             // its manifest already fixed, so it has no `tools/list` at all.
-            Consumer::Claude | Consumer::Offload | Consumer::Audit => {
-                self.host.tool_defs_for(Consumer::Claude.harness()).await
+            Consumer::Offload | Consumer::Audit => {
+                self.host
+                    .tool_defs_for(crate::harness::DEFAULT_HARNESS)
+                    .await
             }
         };
         defs.into_iter()
@@ -1171,12 +1174,14 @@ impl OffloadService {
         // See `mcp_tool_descriptors`: `offload` never legitimately reaches
         // this proxy; fall back to the Claude-guarded set.
         let consumer = match consumer {
-            Consumer::Opencode => Consumer::Opencode,
+            Consumer::Harness(h) => Consumer::Harness(h),
             // V38 Phase F: `Audit` cannot reach this route either — the fan-out
-            // calls the host directly, in-process. Folded onto the Claude-guarded
-            // default with the worker, so a stray query value can never widen a
-            // grant by naming a consumer this proxy does not serve.
-            Consumer::Claude | Consumer::Offload | Consumer::Audit => Consumer::Claude,
+            // calls the host directly, in-process. Folded onto the DEFAULT
+            // harness's grants with the worker, so a stray query value can never
+            // widen a grant by naming a consumer this proxy does not serve.
+            Consumer::Offload | Consumer::Audit => {
+                Consumer::Harness(crate::harness::DEFAULT_HARNESS)
+            }
         };
         let snap = self.settings.current();
         let agent = crate::graph::source_for_consumer(consumer.source());

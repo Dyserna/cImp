@@ -1668,6 +1668,41 @@ pub const GATED: &[&str] = &[CAP_PRETOOLUSE_DENY, CAP_DELEGATION_WORKER];
 /// `"unverified"` too, because the gate's posture is
 /// opt-in-until-proven-broken, not blocked-until-proven-working. The two are
 /// NOT interchangeable and must never be merged.
+/// The input-profile spike outcome this gate should read.
+///
+/// For a named harness: its own row. For [`Harness::ANY`]: the answer to "can
+/// delegation happen at all", which is the status of the best-placed candidate
+/// — a `"pass"` if any harness that declares an input profile has a
+/// non-blocking row, and otherwise the first blocking row, so the reason the
+/// user is shown names a real recorded outcome rather than a synthesized one.
+///
+/// A harness that declares NO input profile is skipped: it is not a worker
+/// whatever its row says, so letting it decide the neutral verdict would be a
+/// gate answered by a harness the mechanism never touches.
+fn worker_spike_status(settings: &Settings, harness: Harness) -> String {
+    if harness != Harness::ANY {
+        return settings
+            .harness_settings(harness)
+            .input_profile_status
+            .clone();
+    }
+    let mut first_blocking: Option<String> = None;
+    for h in crate::harness::registry::all() {
+        if h.plugin().and_then(|p| p.input_profile()).is_none() {
+            continue;
+        }
+        let status = settings.harness_settings(h).input_profile_status.clone();
+        if !spike_status_blocks(status.trim()) {
+            return status;
+        }
+        first_blocking.get_or_insert(status);
+    }
+    // No candidate at all ⇒ the neutral answer is the default, which does not
+    // block: "nobody has run the spike" is not "the spike failed", and the
+    // no-profile case is refused one layer up with a better message.
+    first_blocking.unwrap_or_else(|| crate::settings::SPIKE_UNVERIFIED.to_string())
+}
+
 fn spike_status_blocks(status: &str) -> bool {
     let s = status.trim().to_ascii_lowercase();
     !(s.is_empty() || s == "unverified" || s == "pass")
@@ -1687,6 +1722,27 @@ fn spike_status_blocks(status: &str) -> bool {
 /// [`tests::every_gated_capability_can_actually_block`] proves each declared
 /// gate really can block.
 pub fn gate(id: &str, settings: &Settings) -> Gate {
+    gate_for(id, settings, Harness::ANY)
+}
+
+/// [`gate`], asked **about one harness**.
+///
+/// V40 Phase B, amendment 0-f. `delegation.worker` reads a recorded spike
+/// outcome that used to be ONE scalar for every harness
+/// (`harness_versions.input_profile_status`), which was two defects wearing one
+/// field: a `"fail"` recorded against one TUI removed every `delegate_task_*`
+/// tool and refused delegation for every harness, and a `"pass"` recorded
+/// against Claude silently vouched for a harness nobody had ever typed into.
+/// The status is `Settings::harness[<id>].input_profile_status` now, and the
+/// callers that know whose worker they are asking about pass it.
+///
+/// [`Harness::ANY`] is the *neutral* question — "can delegation happen at
+/// all?" — and it is answered by whether ANY harness that could be a worker (it
+/// declares an input profile) has a non-blocking row. That is what the Settings
+/// gate list and the health panel want: a single blocked row there would
+/// otherwise claim delegation is off while a perfectly good worker sits
+/// available.
+pub fn gate_for(id: &str, settings: &Settings, harness: Harness) -> Gate {
     // Resolve through the registry so the returned `id` is the row's own
     // `&'static str` — the join key itself, not a caller-supplied lookalike.
     let Some(cap) = get(id) else {
@@ -1724,15 +1780,23 @@ pub fn gate(id: &str, settings: &Settings) -> Gate {
         // fields interpreted by two different rules is how one of them ends up
         // meaning something nobody wrote down.
         //
-        // ONE gate for both harnesses, on purpose. A TUI that split a paste
-        // into two turns would corrupt the task silently, and the recorded
-        // status is a human's judgement about "typing a turn works here" — not
-        // a per-vendor measurement cImp can take. Per-harness availability is
-        // still expressed, one layer up: a harness with no `input.rs` has no
-        // profile, so `harness::input_profile` answers `None` and that harness
-        // is not a worker regardless of this verdict.
+        // **PER HARNESS since V40 Phase B** (amendment 0-f). It was one gate
+        // for every harness, and the argument for that — "the recorded status
+        // is a human's judgement about typing a turn, not a per-vendor
+        // measurement" — was wrong in both directions: a human runs the spike
+        // against ONE TUI, so a `"fail"` recorded against one product disabled
+        // delegation for every other one, and a `"pass"` recorded against
+        // Claude vouched for a harness nobody had ever typed into. The row is
+        // the worker's own now; a caller with no worker in hand asks the
+        // neutral question (see [`gate_for`]).
+        //
+        // The other half of per-harness availability is unchanged and still one
+        // layer up: a harness with no `input.rs` has no profile, so
+        // `harness::input_profile` answers `None` and that harness is not a
+        // worker regardless of this verdict.
         CAP_DELEGATION_WORKER => {
-            let status = settings.harness_versions.input_profile_status.trim();
+            let status = worker_spike_status(settings, harness);
+            let status = status.trim();
             if spike_status_blocks(status) {
                 Gate {
                     id: cap.id,
@@ -1744,8 +1808,8 @@ pub fn gate(id: &str, settings: &Settings) -> Gate {
                          turns — and the worker would answer the wrong question without anything \
                          failing. Delegation is off: no `delegate_task_*` tool is advertised and \
                          no tab can be driven. Re-run the check in MAINTENANCE.md -> harness \
-                         contracts and record the outcome in \
-                         `harness_versions.input_profile_status`."
+                         contracts and record the outcome in that harness's \
+                         `harness[<id>].input_profile_status`."
                     ),
                 }
             } else {
@@ -2104,11 +2168,21 @@ mod tests {
         s
     }
 
-    /// V39 Phase B: settings with the input-profile spike outcome set, and
-    /// nothing else touched — the delegation gate's one input.
+    /// V39 Phase B: settings with the input-profile spike outcome set on
+    /// EVERY harness, and nothing else touched.
+    ///
+    /// Every row, because the tests below drive the NEUTRAL question ("can
+    /// delegation happen at all?") and V40 Phase B made that the OR over the
+    /// candidate harnesses — a fixture that set one row would be asserting
+    /// about a harness the neutral gate is allowed to look past. The per-harness
+    /// question has its own test.
     fn settings_with_input_profile(status: &str) -> Settings {
         let mut s = Settings::default();
-        s.harness_versions.input_profile_status = status.to_string();
+        for h in crate::harness::registry::all() {
+            s.harness_settings_mut(h)
+                .expect("registered")
+                .input_profile_status = status.to_string();
+        }
         s
     }
 
@@ -2232,6 +2306,48 @@ mod tests {
         // delegation off, nor the reverse. They gate different features.
         assert!(!gate(CAP_DELEGATION_WORKER, &settings_with_e1("fail")).blocked);
         assert!(!gate(CAP_PRETOOLUSE_DENY, &settings_with_input_profile("fail")).blocked);
+    }
+
+    /// **V40 Phase B, amendment 0-f: the gate resolves the WORKER's row.**
+    ///
+    /// One scalar for every harness was two defects in one field. A `"fail"`
+    /// recorded against one TUI refused delegation to every other one; a
+    /// `"pass"` recorded against Claude silently vouched for a harness nobody
+    /// had ever typed into. Both directions, plus the neutral question's
+    /// contract: `Harness::ANY` asks "can delegation happen AT ALL", so one
+    /// blocked harness must not make it claim delegation is off while a good
+    /// worker sits available.
+    #[test]
+    fn the_delegation_gate_resolves_the_workers_own_row() {
+        let claude = Harness::from_id("claude").expect("registered");
+        let opencode = Harness::from_id("opencode").expect("registered");
+
+        let mut s = Settings::default();
+        s.harness_settings_mut(claude)
+            .expect("registered")
+            .input_profile_status = "fail".to_string();
+
+        assert!(
+            gate_for(CAP_DELEGATION_WORKER, &s, claude).blocked,
+            "the harness whose spike failed is blocked"
+        );
+        assert!(
+            !gate_for(CAP_DELEGATION_WORKER, &s, opencode).blocked,
+            "…and no other harness is, which is the whole amendment"
+        );
+        assert!(
+            !gate(CAP_DELEGATION_WORKER, &s).blocked,
+            "the neutral question is `can delegation happen at all`, and it can"
+        );
+
+        // Every candidate blocked ⇒ the neutral question blocks too, quoting a
+        // real recorded status rather than a synthesized one.
+        s.harness_settings_mut(opencode)
+            .expect("registered")
+            .input_profile_status = "fail".to_string();
+        let g = gate(CAP_DELEGATION_WORKER, &s);
+        assert!(g.blocked);
+        assert!(g.reason.contains("fail"), "got: {}", g.reason);
     }
 
     /// **The registry's first `ANY` row exists and is the one meant.**

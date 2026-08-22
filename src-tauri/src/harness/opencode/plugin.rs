@@ -36,7 +36,30 @@ use std::path::Path;
 use crate::settings::injection::NativeWebMode as NativeWebVisibility;
 use crate::settings::{Settings, TabConfig};
 use super::config::git_exclude_opencode;
-use crate::tabs::config::{native_web_for, opencode_native_gate_for};
+use crate::tabs::config::native_web_for;
+
+/// V32 Phase H (locked decision 17): whether the generated plugin file should
+/// carry its native-tool GATE, for one tab.
+///
+/// Spawn-baked — the flag is compiled into the plugin file — so it rides
+/// `spawn_inject_sig` through `injection::spawn_sig`. Deliberately **not** ANDed
+/// here with the taint-latch feature: that composition is resolved live, per
+/// query, at the loopback (`native_gate_verdict`), so switching the latch off
+/// stops the denials immediately instead of waiting for a tab restart.
+///
+/// V40 Phase B moved it here from `tabs::config`, where the `Scope::Tab
+/// { agent: "opencode" }` it builds was core naming one harness to answer a
+/// question about a file only this directory writes.
+fn native_gate_for(s: &crate::settings::Settings, tab: &str) -> bool {
+    crate::settings::injection::effective(
+        crate::settings::injection::Feature::HarnessNativeGate,
+        crate::settings::injection::Scope::Tab {
+            agent: super::harness_plugin::me().token(),
+            tab,
+        },
+        s,
+    )
+}
 
 /// Filename stem of the generated OpenCode plugin, one file **per tab**.
 ///
@@ -130,7 +153,7 @@ pub(crate) fn write_opencode_plugin(working_dir: &Path, settings: &Settings, tab
             inject: inject_enabled,
             auto_check: auto_check_enabled,
             beacon: native_web_for(settings, "opencode", tab) == NativeWebVisibility::Sensor,
-            native_gate: opencode_native_gate_for(settings, tab),
+            native_gate: native_gate_for(settings, tab),
             // V33 Phase F: the app-wide checkpoint switch, the same one
             // `WorkbenchService::checkpoints_enabled` reads and the same one
             // that gates Claude's pre-mutation checkpoint hook. No graph
@@ -220,7 +243,7 @@ pub(crate) fn opencode_plugin_wanted(s: &Settings, tab: &str) -> bool {
         // would delete the file carrying a gate the user switched ON — the
         // security control vanishing because an unrelated feature moved, which
         // is precisely what this predicate exists to prevent.
-        || opencode_native_gate_for(s, tab)
+        || native_gate_for(s, tab)
         // V33 Phase F: the pre-mutation checkpoint POST. The FOURTH disjunct the
         // note above warns about — so `spawn_inject_sig`'s opencode `"plugin"`
         // array gained a matching `s.workbench.checkpoints` entry in the same

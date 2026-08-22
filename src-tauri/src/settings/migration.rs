@@ -341,6 +341,11 @@ const MIGRATION_STEPS: &[MigrationStep] = &[
         detect: looks_v34,
         transform: migrate_v34_to_v35_step,
     },
+    MigrationStep {
+        from_version: "v35",
+        detect: looks_v35,
+        transform: migrate_v35_to_v36_step,
+    },
 ];
 
 // --- Uniform-signature wrappers -------------------------------------------
@@ -2887,10 +2892,254 @@ fn migrate_v34_to_v35(value: &mut Value) {
         }
     }
 
-    // Final cascade step ⇒ stamp CURRENT (35).
+    // Stamps a *literal* 35 (not `CURRENT_SCHEMA_VERSION`): the v35 → v36 step
+    // runs next in the same cascade pass and gates on `schema_version == 35`.
     root.insert(
         "schema_version".to_string(),
         Value::Number(serde_json::Number::from(35u8)),
+    );
+}
+
+fn looks_v35(value: &Value) -> bool {
+    value
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .is_some_and(|v| v == 35)
+}
+
+fn migrate_v35_to_v36_step(value: &mut Value, _shell: &ShellSpec) {
+    migrate_v35_to_v36(value)
+}
+
+/// The two harness ids the v35 file format had FIELDS for.
+///
+/// A frozen list, like every other constant in this module (locked decision
+/// 14). It describes the shape of files written before V40 Phase B, and a v35
+/// file cannot have carried a field for a harness that did not exist when it
+/// was written — so rebuilding it from the live registry would make this step
+/// look for `codex_last_seen` in files that never had one, and would change
+/// what a v35 file becomes the day a harness is added.
+const HARNESSES_V36: &[&str] = &["claude", "opencode"];
+
+/// v35 → v36 (V40 Phase B, locked decisions 5 and 6): **the per-harness
+/// settings map**.
+///
+/// Every `*_claude` / `*_opencode` field PAIR in the v35 format becomes one
+/// `harness.<id>` row, and every setting only one harness read becomes an `ext`
+/// key on that row:
+///
+/// | v35 | v36 |
+/// |---|---|
+/// | `tool_plugins.expose_commands_{claude,opencode}` | `harness.<id>.expose_commands` |
+/// | `code_audit.expose_{claude,opencode}` | `harness.<id>.expose_code_audit` |
+/// | `harness_versions.{claude,opencode}_last_seen` | `harness.<id>.last_seen` |
+/// | `harness_versions.claude_last_verified` | `harness.claude.last_verified` |
+/// | `harness_versions.claude_auto_verify` | `harness.claude.auto_verify` |
+/// | `harness_versions.input_profile_status` | `harness.<id>.input_profile_status` (**copied to every row**) |
+/// | `offload.mcp_servers[].{claude,opencode}_access` | `…[].access.<id>.enabled` |
+/// | `statusline.enabled` | `harness.claude.ext["statusline"]` |
+/// | `claude_local.{base_url,auth_token,model_alias}` | `harness.claude.ext["local.*"]` |
+/// | `offload.opencode_provider{,_auto}` | `harness.opencode.ext["provider"{,"_auto"}]` |
+/// | `offload.injection.opencode_native_gate_enabled` | `harness.opencode.ext["native_gate"]` |
+///
+/// Three properties this step deliberately has:
+///
+/// * **Absent stays absent.** A key the file does not carry is not written —
+///   the typed load resolves it from `HarnessSettings::defaults_for`, which is
+///   what makes a harness added LATER need no migration at all. Backfilling
+///   defaults here would be this step deciding what a future harness's default
+///   is, at the moment it happens to run.
+/// * **`input_profile_status` is copied to every row, not moved to one.** It
+///   was a single scalar for all harnesses and the recorded spike was run
+///   against whichever harnesses the user actually had, so copying is the
+///   honest carry-over; moving it to one row would silently reset the other to
+///   `"unverified"` and turn delegation off for it after an upgrade.
+/// * **Nothing is deleted that a `#[serde(default)]` container would not
+///   ignore anyway.** The old keys ARE removed, so the file stops carrying two
+///   copies of the same fact; a value that fails to read as the expected type
+///   is skipped rather than coerced, leaving the default in place.
+fn migrate_v35_to_v36(value: &mut Value) {
+    let Some(root) = value.as_object_mut() else {
+        return;
+    };
+
+    // ── the core per-harness block ─────────────────────────────────────────
+    let mut rows: serde_json::Map<String, Value> = serde_json::Map::new();
+    for id in HARNESSES_V36 {
+        rows.insert((*id).to_string(), Value::Object(serde_json::Map::new()));
+    }
+
+    fn put(rows: &mut serde_json::Map<String, Value>, id: &str, key: &str, v: Value) {
+        if let Some(row) = rows.get_mut(id).and_then(Value::as_object_mut) {
+            row.insert(key.to_string(), v);
+        }
+    }
+
+    // `expose_commands_*` out of `tool_plugins`.
+    if let Some(tp) = root.get_mut("tool_plugins").and_then(Value::as_object_mut) {
+        for id in HARNESSES_V36 {
+            if let Some(v) = tp.remove(&format!("expose_commands_{id}")) {
+                if v.is_boolean() {
+                    put(&mut rows, id, "expose_commands", v);
+                }
+            }
+        }
+    }
+    // `expose_*` out of `code_audit` (`expose_offload` stays — the offload
+    // worker is not a harness).
+    if let Some(ca) = root.get_mut("code_audit").and_then(Value::as_object_mut) {
+        for id in HARNESSES_V36 {
+            if let Some(v) = ca.remove(&format!("expose_{id}")) {
+                if v.is_boolean() {
+                    put(&mut rows, id, "expose_code_audit", v);
+                }
+            }
+        }
+    }
+    // The version/verify block.
+    if let Some(hv) = root.get_mut("harness_versions").and_then(Value::as_object_mut) {
+        for id in HARNESSES_V36 {
+            if let Some(v) = hv.remove(&format!("{id}_last_seen")) {
+                if v.is_string() {
+                    put(&mut rows, id, "last_seen", v);
+                }
+            }
+            if let Some(v) = hv.remove(&format!("{id}_last_verified")) {
+                if v.is_string() {
+                    put(&mut rows, id, "last_verified", v);
+                }
+            }
+            if let Some(v) = hv.remove(&format!("{id}_auto_verify")) {
+                if !v.is_null() {
+                    put(&mut rows, id, "auto_verify", v);
+                }
+            }
+        }
+        // ONE scalar, copied to EVERY row — see the doc comment.
+        if let Some(v) = hv.remove("input_profile_status") {
+            if v.is_string() {
+                for id in HARNESSES_V36 {
+                    put(&mut rows, id, "input_profile_status", v.clone());
+                }
+            }
+        }
+    }
+
+    // ── the plugin `ext` blocks ────────────────────────────────────────────
+    let mut ext: serde_json::Map<String, Value> = serde_json::Map::new();
+    for id in HARNESSES_V36 {
+        ext.insert((*id).to_string(), Value::Object(serde_json::Map::new()));
+    }
+    fn put_ext(ext: &mut serde_json::Map<String, Value>, id: &str, key: &str, v: Value) {
+        if let Some(row) = ext.get_mut(id).and_then(Value::as_object_mut) {
+            row.insert(key.to_string(), v);
+        }
+    }
+
+    if let Some(sl) = root.remove("statusline") {
+        if let Some(enabled) = sl.get("enabled").filter(|v| v.is_boolean()) {
+            put_ext(&mut ext, "claude", "statusline", enabled.clone());
+        }
+    }
+    if let Some(cl) = root.remove("claude_local") {
+        for field in ["base_url", "auth_token", "model_alias"] {
+            if let Some(v) = cl.get(field).filter(|v| v.is_string()) {
+                put_ext(&mut ext, "claude", &format!("local.{field}"), v.clone());
+            }
+        }
+    }
+    if let Some(off) = root.get_mut("offload").and_then(Value::as_object_mut) {
+        if let Some(v) = off.remove("opencode_provider") {
+            if v.is_object() || v.is_null() {
+                put_ext(&mut ext, "opencode", "provider", v);
+            }
+        }
+        if let Some(v) = off.remove("opencode_provider_auto") {
+            if v.is_boolean() {
+                put_ext(&mut ext, "opencode", "provider_auto", v);
+            }
+        }
+        if let Some(inj) = off.get_mut("injection").and_then(Value::as_object_mut) {
+            if let Some(v) = inj.remove("opencode_native_gate_enabled") {
+                if v.is_boolean() {
+                    put_ext(&mut ext, "opencode", "native_gate", v);
+                }
+            }
+        }
+        // ── per-server access pair → `access` map ──────────────────────────
+        if let Some(servers) = off.get_mut("mcp_servers").and_then(Value::as_array_mut) {
+            for server in servers.iter_mut() {
+                let Some(obj) = server.as_object_mut() else {
+                    continue;
+                };
+                let mut access = serde_json::Map::new();
+                for id in HARNESSES_V36 {
+                    if let Some(v) = obj.remove(&format!("{id}_access")) {
+                        if let Some(on) = v.as_bool() {
+                            access.insert(
+                                (*id).to_string(),
+                                serde_json::json!({ "enabled": on }),
+                            );
+                        }
+                    }
+                }
+                if !access.is_empty() {
+                    obj.insert("access".to_string(), Value::Object(access));
+                }
+            }
+        }
+    }
+
+    for (id, block) in ext {
+        if let Some(obj) = block.as_object() {
+            if obj.is_empty() {
+                continue;
+            }
+        }
+        put(&mut rows, &id, "ext", block);
+    }
+
+    // Merge into whatever `harness` block the file already had — a hand-written
+    // one, or a `harness.codex` key from a newer build the user downgraded
+    // from. Existing keys WIN: a value the user (or a newer cImp) already put
+    // in the new shape must not be overwritten by a stale copy of the old one.
+    let existing = root
+        .remove("harness")
+        .and_then(|v| match v {
+            Value::Object(o) => Some(o),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let mut merged = serde_json::Map::new();
+    for (id, row) in rows {
+        let Some(row_obj) = row.as_object() else {
+            continue;
+        };
+        if row_obj.is_empty() && !existing.contains_key(&id) {
+            // Nothing carried over and nothing there: leave the key absent so
+            // the typed load supplies the declared defaults.
+            continue;
+        }
+        let mut out = row_obj.clone();
+        if let Some(Value::Object(prior)) = existing.get(&id) {
+            for (k, v) in prior {
+                out.insert(k.clone(), v.clone());
+            }
+        }
+        merged.insert(id, Value::Object(out));
+    }
+    // Rows for harnesses this step knows nothing about ride through untouched.
+    for (id, v) in existing {
+        merged.entry(id).or_insert(v);
+    }
+    if !merged.is_empty() {
+        root.insert("harness".to_string(), Value::Object(merged));
+    }
+
+    // Final cascade step ⇒ stamp CURRENT (36).
+    root.insert(
+        "schema_version".to_string(),
+        Value::Number(serde_json::Number::from(36u8)),
     );
 }
 
@@ -3954,7 +4203,10 @@ mod tests {
             ));
         }
         // The pre-existing access flags are untouched by the step.
-        assert!(s.offload.mcp_servers[0].claude_access);
+        assert!(s.offload.mcp_servers[0]
+            .access
+            .get("claude")
+            .is_some_and(|a| a.enabled));
         assert!(!s.offload.mcp_servers[1].offload_access);
     }
 
@@ -4308,7 +4560,7 @@ mod tests {
                 (step.transform)(&mut v, &shell);
             }
         }
-        assert_eq!(v["schema_version"], json!(35));
+        assert_eq!(v["schema_version"], json!(36));
         assert_eq!(v["tabs"][0]["injection_overrides"]["taint_latch"], json!("inherit"));
     }
 
@@ -4351,7 +4603,7 @@ mod tests {
             "tool_plugins": { "plugins": {}, "project_paths": {}, "global_paths": {} },
             "code_audit": { "tools": [{ "id": "semgrep", "enabled": false }] },
         }));
-        assert_eq!(a["schema_version"], json!(35));
+        assert_eq!(a["schema_version"], json!(36));
         assert!(a["code_audit"].get("tools").is_none(), "the array still moves");
         assert_eq!(
             a["tool_plugins"]["plugins"]["cimp-audit@1"]["tools"]["semgrep"]["enabled"],
@@ -4372,7 +4624,7 @@ mod tests {
             },
             "code_audit": { "enabled": true },
         }));
-        assert_eq!(b["schema_version"], json!(35));
+        assert_eq!(b["schema_version"], json!(36));
         assert_eq!(
             b["tool_plugins"]["plugins"]["cimp-audit@1"]["tools"]["semgrep"]["parameters"],
             json!(["--foo"])

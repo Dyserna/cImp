@@ -432,6 +432,20 @@ impl<T: serde::Serialize> PerHarness<T> {
     }
 }
 
+/// Build a `PerHarness<bool>` from `(id, value)` pairs — **tests only**.
+///
+/// Naming harnesses is what a test fixture is for (`layering`'s identity scan
+/// drops test regions for exactly this reason); what must not happen is a
+/// production path spelling one.
+#[cfg(test)]
+pub fn per_harness_for_test(pairs: &[(&str, bool)]) -> PerHarness<bool> {
+    PerHarness::from_fn(|h| {
+        h.id()
+            .and_then(|id| pairs.iter().find(|(name, _)| *name == id))
+            .is_some_and(|(_, on)| *on)
+    })
+}
+
 impl<T: Default + Copy> Default for PerHarness<T> {
     fn default() -> Self {
         PerHarness::filled(T::default())

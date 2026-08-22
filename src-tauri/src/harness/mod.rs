@@ -111,6 +111,8 @@ pub mod verify;
 pub use plugin::{HarnessPlugin, InputProfile};
 pub use reader::{spawn, OobContext, OobSpec};
 pub use registry::{HarnessId, PerHarness, DEFAULT_HARNESS, HARNESSES};
+#[cfg(test)]
+pub use registry::per_harness_for_test;
 
 /// **The harness-neutral input-profile lookup** (V39 locked decision 16, moved
 /// behind the plugin by V40 Phase A, amendment 0-a).

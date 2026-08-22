@@ -214,6 +214,142 @@ pub struct NativeTool {
     pub memory_kind: Option<(&'static str, MemArg)>,
 }
 
+// ── declared settings (locked decision 6) ───────────────────────────────────
+
+/// What a declared `ext` field HOLDS — the parse-boundary check and the widget
+/// the generic Settings form renders, in one declaration.
+///
+/// Deliberately a small closed set. A harness setting that needed a bespoke
+/// widget would be a harness-shaped UI in core again, which is the thing this
+/// milestone is removing; [`Self::Json`] is the escape hatch and it renders
+/// nothing (see its docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingKind {
+    /// A checkbox.
+    Bool,
+    /// A whole number.
+    Int,
+    /// A free-text line.
+    Text,
+    /// A filesystem path. Stored and validated as text; the form offers a
+    /// picker.
+    Path,
+    /// One of a fixed list of tokens.
+    Enum(&'static [&'static str]),
+    /// An opaque value **cImp itself writes** — a derived block the user never
+    /// types (OpenCode's `local-llama` provider is the case). The generic form
+    /// does not render it; validation only checks that it is `null` or an
+    /// object, because its shape is the plugin's business and core does not
+    /// know it.
+    Json,
+}
+
+impl SettingKind {
+    /// Whether `v` is an acceptable value for this kind.
+    ///
+    /// **The parse boundary, not a suggestion** (global principle 4). A
+    /// declared schema is a claim about a file the user can hand-edit; without
+    /// a post-hoc check the claim holds only as long as nobody edits the file,
+    /// and a `"statusline": "yes"` would reach the launch path as a
+    /// `serde_json::Value::String` that every reader silently answers `false`
+    /// for.
+    pub fn accepts(self, v: &serde_json::Value) -> bool {
+        match self {
+            SettingKind::Bool => v.is_boolean(),
+            SettingKind::Int => v.is_i64() || v.is_u64(),
+            SettingKind::Text | SettingKind::Path => v.is_string(),
+            SettingKind::Enum(options) => {
+                v.as_str().is_some_and(|s| options.contains(&s))
+            }
+            SettingKind::Json => v.is_null() || v.is_object(),
+        }
+    }
+}
+
+/// A declared default, as data — so [`SettingField`] can be a `const` table.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SettingDefault {
+    Bool(bool),
+    Int(i64),
+    Text(&'static str),
+    /// No value: an empty [`SettingKind::Json`] block.
+    Null,
+}
+
+impl SettingDefault {
+    /// This default as the JSON that lands in the stored `ext` map.
+    pub fn to_json(self) -> serde_json::Value {
+        match self {
+            SettingDefault::Bool(b) => serde_json::Value::Bool(b),
+            SettingDefault::Int(i) => serde_json::Value::Number(i.into()),
+            SettingDefault::Text(s) => serde_json::Value::String(s.to_string()),
+            SettingDefault::Null => serde_json::Value::Null,
+        }
+    }
+}
+
+/// One field in a harness's own settings namespace
+/// (`Settings.harness[<id>].ext`).
+///
+/// Locked decision 6: a setting only ONE harness reads is that harness's, and
+/// core stores it opaquely. Core never names a key — it validates the stored
+/// object against this table at the parse boundary, renders the section from
+/// it, folds the [`Self::spawn_baked`] ones into the spawn signature, and
+/// otherwise hands the value straight back to the plugin that declared it.
+///
+/// The consequence worth stating: a harness that adds a setting adds a row
+/// here and nothing else. No `Settings` field, no migration (an absent key
+/// reads its default), no restart-hint wiring, no Settings-window markup.
+pub struct SettingField {
+    /// The key inside `ext`. Unique per harness; dotted grouping (`local.
+    /// base_url`) is a convention the form reads as a section, not a nested
+    /// object.
+    pub key: &'static str,
+    /// What it holds — see [`SettingKind`].
+    pub kind: SettingKind,
+    /// The form's label.
+    pub label: &'static str,
+    /// One sentence under the control. May be empty.
+    pub hint: &'static str,
+    /// The value an absent key reads as.
+    ///
+    /// **This is what makes a later harness need no migration** (locked
+    /// decision 5): the 35 -> 36 step copies what EXISTS, and everything that
+    /// does not exist resolves here instead of being backfilled.
+    pub default: SettingDefault,
+    /// Whether this value reaches the harness only at SPAWN.
+    ///
+    /// `true` puts it in that harness's `spawn_inject_sig` slot automatically,
+    /// which closes the "spawn-baked setting with no signature entry" class
+    /// that V38 M-3 and V32 F-27 both landed in: the flag and the signature are
+    /// now one declaration instead of two lists that could disagree.
+    pub spawn_baked: bool,
+    /// Whether the value is a credential.
+    ///
+    /// Redacted by [`crate::settings::HarnessSettings`]'s `Debug` — the same
+    /// defense-in-depth the hand-rolled `ClaudeLocalSettings::fmt` carried
+    /// before its three fields became `ext` rows, kept so an accidental
+    /// `?settings` log line cannot leak an auth token to the rolling log.
+    pub secret: bool,
+}
+
+/// One injection-hierarchy feature a harness declares itself subject to, with
+/// the `ext` key holding its app-wide L2.
+///
+/// Both halves are the plugin's, and that is the point: `Feature` is core's
+/// vocabulary, the ext key is the harness's, and the JOIN between them is
+/// declared by the only party that knows both. Core resolves a scoped feature's
+/// L2 by asking every plugin for its row — it never spells the key, and it
+/// keeps no list of which features are scoped.
+pub struct ScopedFeature {
+    /// The core feature this harness delivers.
+    pub feature: crate::settings::injection::Feature,
+    /// This harness's `ext` key holding that feature's app-wide L2. Must be a
+    /// [`SettingKind::Bool`] row in [`HarnessPlugin::settings_schema`] —
+    /// asserted by `layering::every_registry_entry_is_fully_wired`.
+    pub ext_key: &'static str,
+}
+
 // ── canaries (locked decision 17) ───────────────────────────────────────────
 
 /// One **L1 canary**: a committed fixture, and the assertion that the reader
@@ -377,36 +513,39 @@ pub trait HarnessPlugin: Sync + Send {
         serde_json::Value::Null
     }
 
-    // ── drift record (settings field pairs; the map lands in Phase B) ───────
+    // ── declared settings (locked decision 6) ───────────────────────────────
 
-    /// The version cImp last recorded for this harness, out of the global
-    /// tripwire state.
+    /// This harness's OWN settings — the fields core stores in
+    /// `Settings.harness[<id>].ext` and never names.
     ///
-    /// Reads a field pair that locked decision 5 turns into a map in Phase B.
-    /// It is here rather than in core for the reason the whole milestone exists
-    /// for: `hv.claude_last_seen` is a *Claude* name, and core reading it
-    /// through a `match` is the shape that made adding a harness a scavenger
-    /// hunt. Empty when there has never been an observation.
-    fn recorded_version(&self, _hv: &crate::settings::HarnessVersions) -> String {
-        String::new()
+    /// V40 Phase B. What used to be here instead was `recorded_version` /
+    /// `auto_verify_record` / `last_verified`: three plugin methods whose only
+    /// job was to read `hv.claude_last_seen`-shaped field PAIRS out of core on
+    /// core's behalf. The pairs are a `BTreeMap<HarnessId, HarnessSettings>`
+    /// now, so core reads the row directly and the methods are gone — the
+    /// interface should carry what core cannot know, and "which of my two
+    /// fields holds my version" was never that.
+    ///
+    /// What core genuinely cannot know is the rest: whether this harness has a
+    /// status line, a local-provider block, a native-tool gate. Those are the
+    /// rows. An empty table is an ordinary answer — such a harness gets an
+    /// empty Settings section and no ext keys, with no work anywhere.
+    fn settings_schema(&self) -> &'static [SettingField] {
+        &[]
     }
 
-    /// This harness's persisted auto-verify record, if it has one.
+    /// Injection-hierarchy features this harness — and only harnesses that
+    /// declare them — is subject to.
     ///
-    /// Claude is the only harness with one today: V35 Phase F runs on
-    /// `claude_last_seen` changing, and there is deliberately no second stored
-    /// field. `None` is therefore an ordinary answer, not a gap.
-    fn auto_verify_record<'a>(
-        &self,
-        _hv: &'a crate::settings::HarnessVersions,
-    ) -> Option<&'a crate::settings::AutoVerify> {
-        None
-    }
-
-    /// When this harness's contracts were last confirmed by a human, if that is
-    /// recorded for it at all.
-    fn last_verified(&self, _hv: &crate::settings::HarnessVersions) -> Option<String> {
-        None
+    /// The mechanism behind a scoped feature lives inside the harness's own
+    /// config or plugin (OpenCode's `tool.execute.before` gate is the case), so
+    /// asking a Claude tab about it produced a restart hint for a control that
+    /// could not reach it. Core derives "is this feature scoped at all?" from
+    /// this list across the registry rather than holding one of its own, so a
+    /// feature nobody declares stays app-wide and a feature two harnesses
+    /// declare reaches both.
+    fn scoped_features(&self) -> &'static [ScopedFeature] {
+        &[]
     }
 
     // ── native tool vocabulary (locked decision 16) ─────────────────────────
@@ -503,6 +642,32 @@ pub trait HarnessPlugin: Sync + Send {
 }
 
 // ── neutral launch helpers ──────────────────────────────────────────────────
+
+/// Whether the `cimp-code-audit` MCP server is advertised to `harness`'s tabs.
+///
+/// V40 Phase B. It replaced `tabs::config::advertises_audit_to_claude` /
+/// `_to_opencode` — two identical bodies differing only in which half of the
+/// `code_audit.expose_*` field pair they read, called from inside
+/// `harness/<id>/`, which made the pair an upward edge as well as a pair. One
+/// body over `Settings::harness[<id>].expose_code_audit` is both.
+///
+/// ANDed with the master switch here, once, so no caller can advertise the
+/// server for a harness while Code Audit itself is off.
+pub fn audit_advertised(s: &Settings, harness: crate::harness::HarnessId) -> bool {
+    s.code_audit.enabled && s.harness_settings(harness).expose_code_audit
+}
+
+/// Whether the capability matrix currently BLOCKS the read advisor's
+/// `PreToolUse` deny (V35 Phase E).
+///
+/// One named helper for the call sites that install the hook and the ones that
+/// put it in a spawn signature — the two must move together — so the capability
+/// id is spelled once. Lives here rather than in `tabs::config` since V40 Phase
+/// B: its readers are all inside `harness/`, and asking core to ask
+/// `harness::contract` on their behalf was a detour with an upward edge in it.
+pub fn read_advisor_gate_blocked(s: &Settings) -> bool {
+    crate::harness::contract::gate(crate::harness::contract::CAP_PRETOOLUSE_DENY, s).blocked
+}
 
 /// The capability-guidance gates **every** harness's spawn signature carries.
 ///

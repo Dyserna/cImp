@@ -3198,15 +3198,26 @@ fn delegate_targets(
     own_tab: Option<&str>,
 ) -> Vec<(&'static str, String, String)> {
     use crate::settings::{DelegationRole, TabConfig};
-    if crate::harness::contract::gate(crate::harness::contract::CAP_DELEGATION_WORKER, settings)
-        .blocked
-    {
-        return Vec::new();
-    }
     let mut out = Vec::new();
     for harness in crate::harness::registry::all() {
         let Some(id) = harness.id() else { continue };
         if harness.plugin().and_then(|p| p.input_profile()).is_none() {
+            continue;
+        }
+        // **V40 Phase B, amendment 0-f: the gate is asked per harness.** It was
+        // asked ONCE, above the loop, against a single scalar shared by every
+        // harness — so a `"fail"` recorded against one TUI removed every
+        // `delegate_task_*` tool, including for harnesses the spike had never
+        // been run against, and a `"pass"` recorded against one vouched for all
+        // of them. Now a blocked harness drops out of the set and the others
+        // stay advertised.
+        if crate::harness::contract::gate_for(
+            crate::harness::contract::CAP_DELEGATION_WORKER,
+            settings,
+            harness,
+        )
+        .blocked
+        {
             continue;
         }
         let manual = settings.tabs.iter().find_map(|t| match t {
@@ -3475,18 +3486,55 @@ mod delegate_tool_tests {
         );
     }
 
-    /// **A blocked worker gate removes the whole set** - the fail-closed half
-    /// of locked decision 16, observed where the model would see it.
+    /// **A blocked worker gate removes that harness's tool** - the fail-closed
+    /// half of locked decision 16, observed where the model would see it.
     #[test]
     fn a_blocked_worker_gate_advertises_nothing() {
         let mut s = settings_with_manual(crate::settings::CLAUDE_TAB_ID);
         assert_eq!(delegate_targets(&s, None).len(), 1);
-        s.harness_versions.input_profile_status = "fail".to_string();
+        s.harness_row("claude").input_profile_status = "fail".to_string();
         assert!(
             delegate_targets(&s, None).is_empty(),
-            "a recorded input-profile failure must remove every delegation tool, not just refuse \
-             at call time"
+            "a recorded input-profile failure must remove that harness's delegation tool, not \
+             just refuse at call time"
         );
+    }
+
+    /// **V40 Phase B, amendment 0-f: the failure is scoped to the harness it
+    /// was recorded against.**
+    ///
+    /// The status used to be ONE scalar for every harness, which is two defects
+    /// in one field: a `"fail"` recorded against Claude's TUI removed the
+    /// OpenCode tool as well (a worker the user could have used, gone with no
+    /// explanation naming it), and a `"pass"` recorded against Claude vouched
+    /// for a TUI nobody had typed into. Both directions are checked here.
+    #[test]
+    fn a_blocked_worker_gate_removes_only_that_harness() {
+        let mut s = settings_with_manual(crate::settings::CLAUDE_TAB_ID);
+        s.tabs.push(crate::settings::TabConfig::AiTool({
+            let crate::settings::TabConfig::AiTool(mut c) =
+                crate::settings::default_opencode_tab()
+            else {
+                unreachable!("the default OpenCode tab is an AI tab")
+            };
+            c.delegation_role = crate::settings::DelegationRole::Manual;
+            c
+        }));
+        assert_eq!(delegate_targets(&s, None).len(), 2, "both are workers");
+
+        // Claude's spike failed; OpenCode's did not.
+        s.harness_row("claude").input_profile_status = "fail".to_string();
+        let left = delegate_targets(&s, None);
+        assert_eq!(left.len(), 1, "only the failing harness drops out: {left:?}");
+        assert_eq!(left[0].0, "opencode");
+
+        // …and the reverse: Claude passing does not vouch for OpenCode.
+        let mut s2 = s.clone();
+        s2.harness_row("claude").input_profile_status = "pass".to_string();
+        s2.harness_row("opencode").input_profile_status = "fail".to_string();
+        let left = delegate_targets(&s2, None);
+        assert_eq!(left.len(), 1, "{left:?}");
+        assert_eq!(left[0].0, "claude");
     }
 
     // ── V39 Phase C — the facade in the tool prose ──────────────────────────

@@ -9878,7 +9878,7 @@ fn beacon_row(origin: outbound::Origin, tool: &str, out: &BeaconOutcome) -> Flag
 ///
 /// It is the AND of two features, and the second one is the point:
 ///
-/// - [`Feature::OpencodeNativeGate`] — the Phase H switch itself (default off).
+/// - [`Feature::HarnessNativeGate`] — the Phase H switch itself (default off).
 /// - [`Feature::TaintLatch`] — because this gate enforces *the latch's*
 ///   boundary on tools cImp does not route. With the latch feature off the
 ///   registry stops engaging (see [`GatePolicy`]), so the latch label the plugin
@@ -9897,7 +9897,7 @@ fn native_gate_verdict(
     s: crate::settings::injection::Scope<'_>,
 ) -> bool {
     use crate::settings::injection::{effective, Feature};
-    effective(Feature::OpencodeNativeGate, s, settings)
+    effective(Feature::HarnessNativeGate, s, settings)
         && effective(Feature::TaintLatch, s, settings)
 }
 
@@ -10353,7 +10353,7 @@ mod tests {
             cimp: CimpHeaders::default(),
             body: Vec::new(),
         };
-        assert_eq!(consumer_of(&legacy), Some(Consumer::Claude));
+        assert_eq!(consumer_of(&legacy), Some(Consumer::Harness(crate::harness::DEFAULT_HARNESS)));
         assert!(!matches!(
             query_param(&legacy.path, "channels"),
             Some("1") | Some("true")
@@ -13542,11 +13542,11 @@ mod tests {
         // Stated rather than assumed: this L2 shipped `false` under locked
         // decision 17 and ships `true` since V39, and the properties below are
         // about the transitions, not about the shipping value.
-        s.set_l2_for_test(Feature::OpencodeNativeGate, false);
+        s.set_l2_for_test(Feature::HarnessNativeGate, false);
         assert!(!native_gate_verdict(&s, scope.injection()));
 
         // The app-wide L2.
-        s.set_l2_for_test(Feature::OpencodeNativeGate, true);
+        s.set_l2_for_test(Feature::HarnessNativeGate, true);
         assert!(native_gate_verdict(&s, scope.injection()));
 
         // The taint latch is what this gate enforces — with that feature off
@@ -13557,8 +13557,8 @@ mod tests {
         s.set_l2_for_test(Feature::TaintLatch, true);
 
         // The usual way in: L2 off app-wide, one tab's L3 `On`.
-        s.set_l2_for_test(Feature::OpencodeNativeGate, false);
-        s.set_tab_override_for_test(&id, Feature::OpencodeNativeGate, Override::On)
+        s.set_l2_for_test(Feature::HarnessNativeGate, false);
+        s.set_tab_override_for_test(&id, Feature::HarnessNativeGate, Override::On)
             .expect("the OpenCode tab carries a native-gate cell");
         assert!(
             native_gate_verdict(&s, scope.injection()),
@@ -13608,12 +13608,12 @@ mod tests {
         // Off app-wide ⇒ off for a stale id. (The regression was invisible in
         // this direction, which is why #45 shipped.) The `off` is written here
         // rather than inherited from a default: V39 ships this L2 on.
-        s.set_l2_for_test(Feature::OpencodeNativeGate, false);
+        s.set_l2_for_test(Feature::HarnessNativeGate, false);
         assert!(!native_gate_verdict(&s, stale.injection()));
 
         // ON app-wide ⇒ ON for a stale id. This is the assertion that fails if
         // the hard-off comes back.
-        s.set_l2_for_test(Feature::OpencodeNativeGate, true);
+        s.set_l2_for_test(Feature::HarnessNativeGate, true);
         assert!(
             native_gate_verdict(&s, stale.injection()),
             "a stale tab id must inherit the app-wide verdict, not report off"

@@ -1194,7 +1194,7 @@ const CORE_CAPABILITIES: &[Capability] = &[
             Dep::JsonPath("rate_limits.seven_day.used_percentage"),
             Dep::JsonPath("rate_limits.seven_day.resets_at"),
         ],
-        wired_in: &["src-tauri/src/harness/claude/statusline.rs", "src-tauri/src/harness/claude/statusline.rs"],
+        wired_in: &["src-tauri/src/harness/claude/statusline.rs"],
         degradation: Degradation::Silent,
         drift_rule: &[],
         canary: Some("claude.statusline.stdin"),
@@ -2189,6 +2189,22 @@ mod tests {
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
         let mut missing: Vec<String> = Vec::new();
         for c in capabilities() {
+            // rc.9 live-verify (#100 A7): `claude.statusline.stdin` carried the
+            // same path twice after the Phase D move, and the Settings window
+            // renders `wired_in` (and `controls`) through a KEYED `{#each}` —
+            // Svelte throws on a duplicate key, which aborted the whole Harness
+            // health section. A duplicate is a data error the UI cannot recover
+            // from, so it fails here.
+            for (what, list) in [("wired_in", c.wired_in), ("controls", c.controls)] {
+                let mut seen = std::collections::BTreeSet::new();
+                for entry in list {
+                    assert!(
+                        seen.insert(*entry),
+                        "{}: `{what}` lists {entry:?} twice — the Settings window keys its                          rows by it and refuses to render the page",
+                        c.id
+                    );
+                }
+            }
             assert!(
                 !c.wired_in.is_empty(),
                 "{}: a capability with no consumer is a dependency nothing needs — delete the \

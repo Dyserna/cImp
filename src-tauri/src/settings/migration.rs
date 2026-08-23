@@ -3298,16 +3298,13 @@ fn migrate_v35_to_v36(value: &mut Value) {
                 // `http://localhost:4000` and the tab connected to a proxy the
                 // user never configured. Merged per key instead, with prior
                 // still winning on a collision.
-                match (k.as_str(), out.get_mut(k)) {
-                    ("ext", Some(Value::Object(carried))) => {
-                        if let Value::Object(prior_ext) = v {
-                            for (ek, ev) in prior_ext {
-                                carried.insert(ek.clone(), ev.clone());
-                            }
-                            continue;
+                if let ("ext", Some(Value::Object(carried))) = (k.as_str(), out.get_mut(k)) {
+                    if let Value::Object(prior_ext) = v {
+                        for (ek, ev) in prior_ext {
+                            carried.insert(ek.clone(), ev.clone());
                         }
+                        continue;
                     }
-                    _ => {}
                 }
                 out.insert(k.clone(), v.clone());
             }

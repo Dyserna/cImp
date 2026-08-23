@@ -109,7 +109,8 @@ use crate::settings::{
     TabConfig,
 };
 use crate::state::{
-    spawn_state_manager, ReadOnlyTabs, StateEvent, StateSignal, TabId, TabKind, TabMeta,
+    spawn_state_manager, ReadOnlyTabs, StateEvent, StateManagerWiring, StateSignal, TabId, TabKind,
+    TabMeta,
 };
 use crate::stt::SttHandle;
 use crate::tabs::{TabRegistry, TabRegistryHandle};
@@ -737,12 +738,14 @@ fn main() {
                 spawn_state_manager(
                     app.handle().clone(),
                     rx,
-                    state_events_for_setup.clone(),
-                    input_lengths_for_setup.clone(),
-                    tab_activity_for_setup.clone(),
-                    tab_metas.clone(),
-                    initial_active_for_state,
-                    ai_tts_suppressed_for_state.clone(),
+                    StateManagerWiring {
+                        state_events: state_events_for_setup.clone(),
+                        input_lengths: input_lengths_for_setup.clone(),
+                        activity: tab_activity_for_setup.clone(),
+                        tab_metas: tab_metas.clone(),
+                        initial_active: initial_active_for_state,
+                        ai_tts_suppressed: ai_tts_suppressed_for_state.clone(),
+                    },
                 );
             }
             if let Some(rx) = tts_rx_for_setup

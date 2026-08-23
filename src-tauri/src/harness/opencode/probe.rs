@@ -30,9 +30,9 @@ use crate::harness::opencode::tools::{OPENCODE_NATIVE_REVIEWED_UNGATED, OPENCODE
 /// seconds is the brief's figure and is ~5× the observed cold start; past it
 /// the probe reports `unknown`, never a failure.
 const SERVE_READY_TIMEOUT: Duration = Duration::from_secs(10);
-/// Gap between readiness polls while the server boots.
+/// Read/write timeout on one loopback request to that server. The gap between
+/// readiness polls is the runner's [`SERVE_POLL_INTERVAL`], imported above.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(5);
-/// How long to allow `claude --help` before giving up (⇒ `unknown`).
 
 // ── minimal blocking HTTP ───────────────────────────────────────────────────
 

@@ -7,7 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.53.0-rc.6] — 2026-08-23
+## [0.53.0-rc.8] — 2026-08-23
+
+_rc.6 and rc.7 were tagged but never built: rc.6 failed CI on a Linux-only path test, CRLF-checked-out goldens and clippy; rc.7 failed only the ignored-test rename tripwire (the node-backed tests moved module in Phase G). rc.8 is rc.6 plus those four `fix(ci)` commits._
+
+## [0.53.0-rc.7] — 2026-08-23 (not built)
+
+## [0.53.0-rc.6] — 2026-08-23 (not built)
 
 ### Added
 

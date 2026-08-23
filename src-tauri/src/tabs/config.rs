@@ -331,35 +331,36 @@ pub(crate) fn tab_consumer(cfg: &AiToolTabConfig) -> Option<&'static str> {
     tab_harness(cfg).and_then(|h| h.id())
 }
 
-/// The two "is the Code Audit MCP server advertised to this consumer" gates,
-/// factored out so the injection sites below and the restart-hint edge detector
-/// in `ipc::commands::settings_update` can never drift apart. The audit child is
-/// injected only at TAB SPAWN (`--mcp-config` / `OPENCODE_CONFIG_CONTENT`), so a
-/// running AI tab keeps its old server set until restarted — any edit that flips
-/// one of these must surface a restart hint.
-///
-/// # V37 Phase F — the offload pair is gone, and that is the point
-///
-/// There used to be FOUR gates here. `advertises_offload_to_claude` /
-/// `advertises_offload_to_opencode` (`offload.enabled ∨ graph.enabled ∨
-/// any_{claude,opencode}_mcp()`) decided whether the `cimp-offload` proxy child
-/// was written into a tab's harness config. **It is now unconditional for AI
-/// tabs**, so the predicates had no callers left and were deleted rather than
-/// left as a constant-true trap for the next reader.
-///
-/// The reason is the V37 no-restart story: a tab spawned while all three
-/// disjuncts were false had no stdio child at all, hence no `tools/listChanged`
-/// relay, hence no way for a later MCP access grant to reach the running
-/// session — the one case contract C5's propagation could not serve. Injecting
-/// the child always costs an idle process per AI tab and buys live propagation
-/// for every toggle. The child's `tools/list` is assembled at call time, so a
-/// tab with nothing enabled advertises an EMPTY list.
-///
-/// The knock-on effects, all of them, are: the two `spawn_inject_sig` `"mcp"`
-/// slots lost their offload element (an MCP access flip no longer nags every tab
-/// to restart), the `"channels"` entry lost its `advertises_offload_to_claude`
-/// conjunct, and [`injection_hygiene_applies`] lost the advertise gate under its
-/// feature switch.
+// The two "is the Code Audit MCP server advertised to this consumer" gates,
+// factored out so the injection sites below and the restart-hint edge detector
+// in `ipc::commands::settings_update` can never drift apart. The audit child is
+// injected only at TAB SPAWN (`--mcp-config` / `OPENCODE_CONFIG_CONTENT`), so a
+// running AI tab keeps its old server set until restarted — any edit that flips
+// one of these must surface a restart hint.
+//
+// # V37 Phase F — the offload pair is gone, and that is the point
+//
+// There used to be FOUR gates here. `advertises_offload_to_claude` /
+// `advertises_offload_to_opencode` (`offload.enabled ∨ graph.enabled ∨
+// any_{claude,opencode}_mcp()`) decided whether the `cimp-offload` proxy child
+// was written into a tab's harness config. **It is now unconditional for AI
+// tabs**, so the predicates had no callers left and were deleted rather than
+// left as a constant-true trap for the next reader.
+//
+// The reason is the V37 no-restart story: a tab spawned while all three
+// disjuncts were false had no stdio child at all, hence no `tools/listChanged`
+// relay, hence no way for a later MCP access grant to reach the running
+// session — the one case contract C5's propagation could not serve. Injecting
+// the child always costs an idle process per AI tab and buys live propagation
+// for every toggle. The child's `tools/list` is assembled at call time, so a
+// tab with nothing enabled advertises an EMPTY list.
+//
+// The knock-on effects, all of them, are: the two `spawn_inject_sig` `"mcp"`
+// slots lost their offload element (an MCP access flip no longer nags every tab
+// to restart), the `"channels"` entry lost its `advertises_offload_to_claude`
+// conjunct, and [`injection_hygiene_applies`] lost the advertise gate under its
+// feature switch.
+//
 // `advertises_audit_to_{claude,opencode}` and `read_advisor_gate_blocked` moved
 // to `harness::plugin` in V40 Phase B. Both existed here only because the
 // per-harness settings they read were core fields, and both were called by the

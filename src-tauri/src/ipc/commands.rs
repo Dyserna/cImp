@@ -490,7 +490,7 @@ fn take_wheel_report(s: &str) -> Option<&str> {
         let cb = (chars.next()? as u32).checked_sub(32)?;
         let _x = chars.next()?;
         let _y = chars.next()?;
-        return is_wheel_button(cb).then(|| chars.as_str());
+        return is_wheel_button(cb).then_some(chars.as_str());
     }
     None
 }

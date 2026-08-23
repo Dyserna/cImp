@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::processing::permission::{default_patterns, PatternSpec, PermissionPattern};
+use crate::processing::permission::{default_patterns, PermissionPattern};
 
 const PATTERNS_FILE_NAME: &str = "patterns.json";
 
@@ -139,12 +139,12 @@ fn legacy_default_sets() -> Vec<(&'static str, Vec<PermissionPattern>)> {
             let mut rows: Vec<PermissionPattern> = crate::harness::registry::all()
                 .filter_map(|h| h.plugin())
                 .flat_map(|p| p.legacy_permission_patterns(era))
-                .map(PatternSpec::to_pattern)
+                .map(|p| p.to_pattern())
                 .collect();
             rows.extend(
                 crate::harness::_retired::legacy_permission_patterns(era)
                     .into_iter()
-                    .map(PatternSpec::to_pattern),
+                    .map(|p| p.to_pattern()),
             );
             (era, rows)
         })

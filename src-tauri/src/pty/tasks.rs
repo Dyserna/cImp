@@ -29,17 +29,17 @@ const PERMISSION_SCAN_TAIL: usize = 1000;
 /// 200ms stability and 500ms max-hold thresholds fire promptly.
 const FLUSH_TICK: Duration = Duration::from_millis(50);
 
-/// **Activity (avatar Thinking) detection is a model of somebody else's
-/// terminal, and the timings that size it are the harness's** — V40 Phase D,
-/// locked decision 18. They arrive as an [`ActivityTuning`] on
-/// [`ActivitySource::TuiMarkers`]; what stays here is the machinery.
-///
-/// Detection is primarily content-based: the harness's busy-footer marker
-/// (`claude_working` matches Claude Code's `esc to interrupt`) is present for
-/// exactly as long as a request is in flight, and while it shows we hold
-/// `output_active` regardless of the byte stream — so a thinking pause (these
-/// TUIs routinely emit nothing for >0.5 s mid-response) no longer collapses the
-/// avatar to Idle. The tuning's two byte timers are backstops only.
+// **Activity (avatar Thinking) detection is a model of somebody else's
+// terminal, and the timings that size it are the harness's** — V40 Phase D,
+// locked decision 18. They arrive as an [`ActivityTuning`] on
+// [`ActivitySource::TuiMarkers`]; what stays here is the machinery.
+//
+// Detection is primarily content-based: the harness's busy-footer marker
+// (`claude_working` matches Claude Code's `esc to interrupt`) is present for
+// exactly as long as a request is in flight, and while it shows we hold
+// `output_active` regardless of the byte stream — so a thinking pause (these
+// TUIs routinely emit nothing for >0.5 s mid-response) no longer collapses the
+// avatar to Idle. The tuning's two byte timers are backstops only.
 
 /// Grace window after a real PTY resize during which the byte-burst
 /// activity fallback is ignored. A resize pulses SIGWINCH and the child

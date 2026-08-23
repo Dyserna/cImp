@@ -263,10 +263,20 @@ mod tests {
     /// it and then fails if what was on disk differed, so the drift is a red
     /// `cargo test` with the fix already applied to the working tree: re-run,
     /// commit the fixture.
+    ///
+    /// A carriage return is stripped from the on-disk side before comparing.
+    /// The file is stored LF and `.gitattributes` pins the checkout to LF too,
+    /// but line endings are a fact about how Git checked the tree out
+    /// (`core.autocrlf`), not about the registry — and this test *writes* on a
+    /// mismatch, so a CRLF checkout would otherwise rewrite the fixture and fail
+    /// CI over a difference that is not drift. Same reasoning as
+    /// `processing::patterns_file`'s byte-identity test.
     #[test]
     fn the_committed_registry_fixture_matches_the_registry() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(FIXTURE);
-        let before = std::fs::read_to_string(&path).unwrap_or_default();
+        let before = std::fs::read_to_string(&path)
+            .unwrap_or_default()
+            .replace('\r', "");
         let now = rendered();
         if before != now {
             if let Some(dir) = path.parent() {

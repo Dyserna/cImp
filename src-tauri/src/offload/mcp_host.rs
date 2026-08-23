@@ -4036,6 +4036,38 @@ fn confine_filesystem(cfg: &McpServerConfig, args: &mut Vec<String>, allowed_roo
     }
 }
 
+/// A registered harness by id — the tests may NAME a harness, they just may not
+/// construct one out of thin air. `expect` because a build whose registry does
+/// not know these two ids is one `every_registry_entry_is_fully_wired` fails.
+#[cfg(test)]
+fn harness_id(id: &str) -> crate::harness::HarnessId {
+    crate::harness::HarnessId::from_id(id).expect("a registered harness id")
+}
+
+/// A harness consumer by id — **tests only**. `Consumer::Harness(..)` replaced
+/// the `Claude` / `Opencode` variants in V40 Phase B; the tests name the
+/// harness they were always about.
+#[cfg(test)]
+fn consumer_of_test(id: &str) -> Consumer {
+    Consumer::Harness(harness_id(id))
+}
+
+/// One harness's grant out of a `PerHarness<bool>` — **tests only**.
+#[cfg(test)]
+fn granted_for_test(access: &crate::harness::PerHarness<bool>, id: &str) -> bool {
+    access.get(harness_id(id)).copied().unwrap_or(false)
+}
+
+/// One harness's surface digest — **tests only**. Keyed, never positional: the
+/// positional read is the defect locked decision 25 removed.
+#[cfg(test)]
+fn digest_for_test(fp: &McpSurfaceFingerprint, id: &str) -> u64 {
+    fp.harness
+        .get(harness_id(id))
+        .copied()
+        .expect("registered harness")
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -6121,36 +6153,4 @@ mod tests {
         assert!(!host.rescreen(detection::Config::default()).await);
         assert_eq!(host.tool_defs_for(harness_id("claude")).await.len(), 1);
     }
-}
-
-/// A registered harness by id — the tests may NAME a harness, they just may not
-/// construct one out of thin air. `expect` because a build whose registry does
-/// not know these two ids is one `every_registry_entry_is_fully_wired` fails.
-#[cfg(test)]
-fn harness_id(id: &str) -> crate::harness::HarnessId {
-    crate::harness::HarnessId::from_id(id).expect("a registered harness id")
-}
-
-/// A harness consumer by id — **tests only**. `Consumer::Harness(..)` replaced
-/// the `Claude` / `Opencode` variants in V40 Phase B; the tests name the
-/// harness they were always about.
-#[cfg(test)]
-fn consumer_of_test(id: &str) -> Consumer {
-    Consumer::Harness(harness_id(id))
-}
-
-/// One harness's grant out of a `PerHarness<bool>` — **tests only**.
-#[cfg(test)]
-fn granted_for_test(access: &crate::harness::PerHarness<bool>, id: &str) -> bool {
-    access.get(harness_id(id)).copied().unwrap_or(false)
-}
-
-/// One harness's surface digest — **tests only**. Keyed, never positional: the
-/// positional read is the defect locked decision 25 removed.
-#[cfg(test)]
-fn digest_for_test(fp: &McpSurfaceFingerprint, id: &str) -> u64 {
-    fp.harness
-        .get(harness_id(id))
-        .copied()
-        .expect("registered harness")
 }

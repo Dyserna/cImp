@@ -30,6 +30,7 @@ use crate::harness::probe::{Outcome, ProbeResult, SERVE_POLL_INTERVAL};
 
 // ── timings and bounds, all deliberate ──────────────────────────
 
+/// How long to allow `claude --help` before giving up (⇒ `unknown`).
 const HELP_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// How much of the newest transcript to read, from the END. A transcript grows

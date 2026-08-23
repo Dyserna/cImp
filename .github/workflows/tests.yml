@@ -136,12 +136,12 @@ jobs:
       # `--ignored`.
       #
       # Only the node-backed ones can run here, deliberately:
-      #  * `tabs::config::tests::the_gate_cache_survives_a_beacon_racing_an_in_flight_query`
-      #    (H-1), `tabs::config::tests::the_gate_refuses_local_tools_while_the_beacon_is_in_flight`
+      #  * `harness::opencode::plugin::tests::the_gate_cache_survives_a_beacon_racing_an_in_flight_query`
+      #    (H-1), `harness::opencode::plugin::tests::the_gate_refuses_local_tools_while_the_beacon_is_in_flight`
       #    (M-15) and
-      #    `tabs::config::tests::the_gate_refuses_native_web_from_a_contaminated_but_unlatched_tab`
+      #    `harness::opencode::plugin::tests::the_gate_refuses_native_web_from_a_contaminated_but_unlatched_tab`
       #    (F-13) and
-      #    `tabs::config::tests::the_gate_and_beacon_survive_a_fetch_swap_after_load`
+      #    `harness::opencode::plugin::tests::the_gate_and_beacon_survive_a_fetch_swap_after_load`
       #    (V33 C6 / H-7 — the only executable proof that binding `fetch` at
       #    plugin load actually survives a later `globalThis.fetch` swap; every
       #    other test of that template greps the emitted source, which cannot
@@ -170,10 +170,10 @@ jobs:
         run: |
           # The node-backed ones, run below one at a time.
           $nodeBacked = @(
-            'tabs::config::tests::the_gate_cache_survives_a_beacon_racing_an_in_flight_query',
-            'tabs::config::tests::the_gate_refuses_local_tools_while_the_beacon_is_in_flight',
-            'tabs::config::tests::the_gate_refuses_native_web_from_a_contaminated_but_unlatched_tab',
-            'tabs::config::tests::the_gate_and_beacon_survive_a_fetch_swap_after_load'
+            'harness::opencode::plugin::tests::the_gate_cache_survives_a_beacon_racing_an_in_flight_query',
+            'harness::opencode::plugin::tests::the_gate_refuses_local_tools_while_the_beacon_is_in_flight',
+            'harness::opencode::plugin::tests::the_gate_refuses_native_web_from_a_contaminated_but_unlatched_tab',
+            'harness::opencode::plugin::tests::the_gate_and_beacon_survive_a_fetch_swap_after_load'
           )
           $expected = ($nodeBacked + @(
             'tts::engine::tests::synthesizes',

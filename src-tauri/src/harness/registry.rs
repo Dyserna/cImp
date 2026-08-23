@@ -126,10 +126,15 @@ impl HarnessId {
     /// **`None` is a first-class answer** (locked decision 2): a tab whose
     /// command is neither is a *shell tab*, not a Claude tab. Six sites used to
     /// answer Claude here and every one of them was a silent misattribution.
+    ///
+    /// **Both separators are split, on every platform.** The command is a value
+    /// out of a settings file, not a path this build produced, so a Windows
+    /// spelling (`C:\bin\claude.exe`) can reach a Linux build through a synced
+    /// or hand-edited `settings.json` — and `Path::file_stem` would hand back
+    /// the whole string there, classifying a Claude tab as a shell tab.
     pub fn from_command(command: &str) -> Option<HarnessId> {
-        let stem = std::path::Path::new(command)
-            .file_stem()
-            .and_then(|s| s.to_str())?;
+        let file = command.rsplit(['/', '\\']).next().unwrap_or(command);
+        let stem = std::path::Path::new(file).file_stem().and_then(|s| s.to_str())?;
         descriptors()
             .find(|d| d.binaries.iter().any(|b| b.eq_ignore_ascii_case(stem)))
             .map(|d| HarnessId(d.id))
@@ -529,7 +534,7 @@ pub fn passthrough_harness() -> Option<HarnessId> {
         .iter()
         .filter(|d| d.plugin.accepts_passthrough_argv());
     let first = takers.next()?;
-    takers.next().is_none().then(|| HarnessId(first.id))
+    takers.next().is_none().then_some(HarnessId(first.id))
 }
 
 /// Every reserved built-in tab id, in canonical order across harnesses.
@@ -601,9 +606,9 @@ impl<T: Copy> PerHarness<T> {
 impl<T> PerHarness<T> {
     /// One slot per harness, computed in registry order.
     pub fn from_fn(mut f: impl FnMut(HarnessId) -> T) -> Self {
-        let mut slots: Vec<T> = HARNESSES.iter().map(|d| f(HarnessId(d.id))).collect();
+        let slots: Vec<T> = HARNESSES.iter().map(|d| f(HarnessId(d.id))).collect();
         // `COUNT == HARNESSES.len()` by construction; `try_into` cannot fail.
-        let arr: [T; COUNT] = match slots.drain(..).collect::<Vec<T>>().try_into() {
+        let arr: [T; COUNT] = match slots.try_into() {
             Ok(a) => a,
             Err(_) => unreachable!("PerHarness is sized by the registry it iterates"),
         };

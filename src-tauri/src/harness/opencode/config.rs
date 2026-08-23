@@ -580,80 +580,6 @@ pub(crate) fn build_opencode_config(
     serde_json::Value::Object(config)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::HashMap;
-
-    // The rest of this module's tests live in `tabs::config`'s test module (see
-    // the note there): they drive the emitted config through the tab-spawn
-    // composition and share ~30 helpers with it. These four are pure functions
-    // over a string, so they live with the code.
-
-    /// The generated password can never be the value that DISABLES auth.
-    #[test]
-    fn a_generated_server_password_is_never_empty_and_never_repeats() {
-        let a = new_server_password();
-        let b = new_server_password();
-        assert!(!a.is_empty(), "an empty password disables auth upstream");
-        assert_eq!(a.len(), 32, "32 hex chars of UUIDv4 entropy: {a}");
-        assert!(a.chars().all(|c| c.is_ascii_hexdigit()), "{a}");
-        assert_ne!(a, b, "the password must be per spawn, not per build");
-    }
-
-    /// The header is `Basic base64("opencode:<password>")` — and an empty
-    /// password yields NO header rather than a header for the empty string,
-    /// because upstream reads an empty password as "auth off".
-    #[test]
-    fn the_basic_header_encodes_the_username_pair_and_refuses_an_empty_password() {
-        use base64::prelude::*;
-        let header = server_basic_auth("s3cret").expect("a non-empty password has a header");
-        let encoded = header
-            .strip_prefix("Basic ")
-            .expect("the scheme is Basic, not Bearer");
-        assert_eq!(
-            String::from_utf8(BASE64_STANDARD.decode(encoded).expect("base64")).expect("utf8"),
-            format!("{SERVER_USERNAME}:s3cret"),
-        );
-        assert_eq!(server_basic_auth(""), None);
-    }
-
-    /// The reader's credential comes from the child's COMPOSED environment, so a
-    /// per-tab override (which wins at spawn) cannot leave the tap
-    /// authenticating with a password the server never saw.
-    #[test]
-    fn the_readers_credential_follows_the_childs_effective_environment() {
-        let mut env: HashMap<String, String> = HashMap::new();
-        assert_eq!(server_auth_from_env(&env), None, "no variable ⇒ no header");
-        env.insert(SERVER_PASSWORD_ENV.to_string(), String::new());
-        assert_eq!(
-            server_auth_from_env(&env),
-            None,
-            "an empty password disables auth upstream, so it must not produce a header"
-        );
-        env.insert(SERVER_PASSWORD_ENV.to_string(), "theirs".to_string());
-        assert_eq!(
-            server_auth_from_env(&env),
-            server_basic_auth("theirs"),
-            "the tap must authenticate with the password the CHILD will use"
-        );
-    }
-
-    /// The two variables are set as a pair, with the username pinned to the
-    /// value the header is built from.
-    #[test]
-    fn the_spawn_env_pairs_the_password_with_the_username_it_is_encoded_under() {
-        let pairs = server_auth_env("pw");
-        assert_eq!(
-            pairs,
-            [
-                (SERVER_PASSWORD_ENV.to_string(), "pw".to_string()),
-                (SERVER_USERNAME_ENV.to_string(), SERVER_USERNAME.to_string()),
-            ]
-        );
-    }
-}
-
 // ── the local-provider block (V40 Phase E, locked decision 26) ──────────────
 //
 // Moved verbatim from `offload/server.rs`, where it was the last OpenCode
@@ -771,4 +697,78 @@ pub(crate) fn model_id_from_path(path: &str) -> String {
         .or_else(|| base.strip_suffix(".GGUF"))
         .unwrap_or(base)
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    // The rest of this module's tests live in `tabs::config`'s test module (see
+    // the note there): they drive the emitted config through the tab-spawn
+    // composition and share ~30 helpers with it. These four are pure functions
+    // over a string, so they live with the code.
+
+    /// The generated password can never be the value that DISABLES auth.
+    #[test]
+    fn a_generated_server_password_is_never_empty_and_never_repeats() {
+        let a = new_server_password();
+        let b = new_server_password();
+        assert!(!a.is_empty(), "an empty password disables auth upstream");
+        assert_eq!(a.len(), 32, "32 hex chars of UUIDv4 entropy: {a}");
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()), "{a}");
+        assert_ne!(a, b, "the password must be per spawn, not per build");
+    }
+
+    /// The header is `Basic base64("opencode:<password>")` — and an empty
+    /// password yields NO header rather than a header for the empty string,
+    /// because upstream reads an empty password as "auth off".
+    #[test]
+    fn the_basic_header_encodes_the_username_pair_and_refuses_an_empty_password() {
+        use base64::prelude::*;
+        let header = server_basic_auth("s3cret").expect("a non-empty password has a header");
+        let encoded = header
+            .strip_prefix("Basic ")
+            .expect("the scheme is Basic, not Bearer");
+        assert_eq!(
+            String::from_utf8(BASE64_STANDARD.decode(encoded).expect("base64")).expect("utf8"),
+            format!("{SERVER_USERNAME}:s3cret"),
+        );
+        assert_eq!(server_basic_auth(""), None);
+    }
+
+    /// The reader's credential comes from the child's COMPOSED environment, so a
+    /// per-tab override (which wins at spawn) cannot leave the tap
+    /// authenticating with a password the server never saw.
+    #[test]
+    fn the_readers_credential_follows_the_childs_effective_environment() {
+        let mut env: HashMap<String, String> = HashMap::new();
+        assert_eq!(server_auth_from_env(&env), None, "no variable ⇒ no header");
+        env.insert(SERVER_PASSWORD_ENV.to_string(), String::new());
+        assert_eq!(
+            server_auth_from_env(&env),
+            None,
+            "an empty password disables auth upstream, so it must not produce a header"
+        );
+        env.insert(SERVER_PASSWORD_ENV.to_string(), "theirs".to_string());
+        assert_eq!(
+            server_auth_from_env(&env),
+            server_basic_auth("theirs"),
+            "the tap must authenticate with the password the CHILD will use"
+        );
+    }
+
+    /// The two variables are set as a pair, with the username pinned to the
+    /// value the header is built from.
+    #[test]
+    fn the_spawn_env_pairs_the_password_with_the_username_it_is_encoded_under() {
+        let pairs = server_auth_env("pw");
+        assert_eq!(
+            pairs,
+            [
+                (SERVER_PASSWORD_ENV.to_string(), "pw".to_string()),
+                (SERVER_USERNAME_ENV.to_string(), SERVER_USERNAME.to_string()),
+            ]
+        );
+    }
 }

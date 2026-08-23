@@ -858,6 +858,16 @@ and this section reads as what was built.
 11. **`probe::IMPLEMENTED` stayed in core** as the declared report order, even
     though decision 17 moved the probe BODIES behind the plugin. The order a
     report is read in is cImp's presentation, not a harness's claim.
+    **Amended in Phase I (#107 item 3):** half of that held and half did not.
+    The ORDER is still core's — `probe::implemented_probes()` concatenates in
+    `drive_order()`, and `the_report_order_is_the_drive_order` pins the result
+    byte-for-byte against the pre-Phase-I report. The CONTENT was a second copy
+    of what each plugin's `probe()` emits, living where a plugin change could
+    not reach it: adding an id there and forgetting core's list made the runner
+    append the result as *undeclared*, and dropping one made the runner
+    fabricate an `unknown` blaming `harness/probe.rs` for a change that never
+    touched it. Each harness declares its own ids in
+    `HarnessPlugin::probes()` now, beside the function that emits them.
 12. **`NotebookEdit` is recorded `mutates_fs: false`.** Noted because it looks
     like a defect and is not one to fix here: the four `true` rows are exactly
     the names in the `PreToolUse` matcher V33 Phase F installed, and a test pins

@@ -37,7 +37,7 @@
 //!
 //! # What is probed, and what is only enumerated
 //!
-//! [`IMPLEMENTED`] holds the rows this phase actually drives — the ones
+//! [`implemented_probes`] holds the rows this phase actually drives — the ones
 //! reachable without scripting a model turn. [`declared_unprobed`] holds the
 //! others, each with the reason it cannot be, and they are **printed**
 //! as `unknown` rather than silently omitted: a dependency that stops being
@@ -210,26 +210,36 @@ pub(crate) fn tier_name(t: Seam) -> &'static str {
 // ── what this phase drives, and what it only enumerates ─────────────────────
 
 /// The capability ids [`run`] actually drives against an installed CLI, in the
-/// order it drives them. `opencode.tool_registry` is first on purpose: it is
-/// the security-relevant one, the standing manual maintenance obligation, and
-/// the reason Phase D exists at all.
-const IMPLEMENTED: &[&str] = &[
-    "opencode.tool_registry",
-    "opencode.route.noauth",
-    "claude.flag.session_id",
-    "claude.flag.settings_overlay",
-    "claude.transcript.usage",
-    "claude.transcript.tool_result",
-    "claude.transcript.identity",
-    // V35 Phase L. Driven for the same one-tail cost as the three above, and
-    // worth driving precisely BECAUSE it is now a fallback: a fallback nobody
-    // checks is what turns the primary's failure into a mute tab.
-    "claude.transcript.assistant_text",
-    // V39. Same tail again, and the same argument one step further: this row's
-    // loss is invisible even in the tab — only a driver waiting on a delegation
-    // ever notices, ten minutes later.
-    "claude.transcript.stop_reason",
-];
+/// order it drives them — **each harness's slice declared by its own plugin**
+/// (V40 Phase I, issue #107 item 3).
+///
+/// This was a hand-kept array here holding both harnesses' ids. Locked decision
+/// 11 justified keeping it in core as "the declared report order… cImp's
+/// presentation, not a harness's claim", and the order half of that is right —
+/// but the CONTENT was a second copy of what each plugin's `probe()` emits, in
+/// core, where a plugin change could not reach it. Adding a probe id there and
+/// forgetting this list made the runner append the result as *undeclared*;
+/// removing one made the runner fabricate an `unknown` blaming "a defect in
+/// harness/probe.rs" for a change that never touched this file.
+///
+/// So the order stays cImp's and the content moves:
+/// [`crate::harness::plugin::HarnessPlugin::probes`] per harness, concatenated
+/// in [`drive_order`] — which is the registry's declaration order, re-sorted by
+/// the registry's own `probes_share_one_child` declaration. Concatenating in
+/// that order rather than bare registry order is what keeps the report
+/// byte-identical to the pre-Phase-I one (OpenCode's two rows first), and it is
+/// the honest order anyway: it is the order the probes actually ran in.
+/// `the_report_order_is_the_drive_order` pins it.
+fn implemented_rows() -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = Vec::new();
+    for harness in drive_order() {
+        if let Some(p) = harness.plugin() {
+            out.extend(p.probes().iter().copied());
+        }
+    }
+    out
+}
+
 
 /// Every other registry row, with the reason this phase does not drive it.
 /// These are emitted as `unknown` — enumerated, not faked and not omitted.
@@ -276,7 +286,10 @@ fn declared_unprobed_rows() -> Vec<(&'static str, &'static str)> {
 /// by `contract.rs`'s `probes_and_the_matrix_agree`.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn implemented_probes() -> &'static [&'static str] {
-    IMPLEMENTED
+    // Built once, like `declared_unprobed`: the registry and the plugins are
+    // `'static` data, so the joined view is too.
+    static IDS: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+    IDS.get_or_init(implemented_rows)
 }
 
 /// The ids this module enumerates as a permanent `unknown`. Deliberately a
@@ -319,12 +332,14 @@ pub fn run(args: &[String]) -> i32 {
     }
 
     // The report is assembled in DECLARED order, not in the order the probe
-    // functions happened to answer. That is what makes [`IMPLEMENTED`]
+    // functions happened to answer. That is what makes [`implemented_probes`]
     // load-bearing at runtime rather than a list the cross-check compares
-    // against nothing: a declared probe whose function stopped emitting a row
-    // becomes a loud `unknown` here instead of vanishing from the report.
+    // against nothing: a probe a plugin DECLARES but whose function stopped
+    // emitting a row becomes a loud `unknown` here instead of vanishing from
+    // the report — and since Phase I the declaration and the function are in
+    // the same file, so the `unknown` names the right place to look.
     let mut results: Vec<ProbeResult> = Vec::new();
-    for id in IMPLEMENTED {
+    for id in implemented_probes() {
         match produced.iter().position(|r| r.id == *id) {
             Some(at) => results.push(produced.remove(at)),
             None => results.push(ProbeResult::new(
@@ -366,7 +381,7 @@ pub fn run(args: &[String]) -> i32 {
 /// The auto-verify that runs on a Claude version change has no business
 /// spawning `opencode serve`, and vice versa — so the split lives here, beside
 /// the probe functions, rather than being re-derived by the caller from
-/// [`IMPLEMENTED`] and the registry's `harness` column. [`run`] uses it too, so
+/// [`implemented_probes`] and the registry's `harness` column. [`run`] uses it too, so
 /// there is exactly one mapping from harness to probe functions.
 ///
 /// Only rows this module actually DRIVES are returned. `DECLARED_UNPROBED` is
@@ -583,8 +598,51 @@ mod tests {
         }
         assert_eq!(
             implemented.len(),
-            IMPLEMENTED.len(),
-            "duplicate id in IMPLEMENTED"
+            implemented_probes().len(),
+            "two plugins declare the same probe id — the runner's declared-order pass would take              the first harness's result for both, and the second's would be appended as an              undeclared extra"
         );
+    }
+
+    /// **The report order is the drive order, and it has not moved** (V40 Phase
+    /// I, issue #107 item 3).
+    ///
+    /// `implemented_probes()` is a concatenation of two plugins' declarations
+    /// now, where it was one hand-kept array in this file. The array WAS the
+    /// report order of `cimp --harness-canary` and its `--json` twin, which
+    /// people read top-to-bottom and pipe into `jq`, so "the same list" is not
+    /// enough — it has to be the same list in the same order.
+    ///
+    /// Pinned literally rather than recomputed from the plugins, because a test
+    /// that derives the expectation the same way the code does asserts nothing.
+    #[test]
+    fn the_report_order_is_the_drive_order() {
+        assert_eq!(
+            implemented_probes(),
+            [
+                "opencode.tool_registry",
+                "opencode.route.noauth",
+                "claude.flag.session_id",
+                "claude.flag.settings_overlay",
+                "claude.transcript.usage",
+                "claude.transcript.tool_result",
+                "claude.transcript.identity",
+                "claude.transcript.assistant_text",
+                "claude.transcript.stop_reason",
+            ],
+            "the `--harness-canary` report order changed — OpenCode's rows lead because its              probes share one `opencode serve` child (`probes_share_one_child`), which is what              `drive_order()` sorts on"
+        );
+        // …and every declared id is one this harness's `probe()` can actually
+        // emit: the plugin declaring a row it never produces is the failure the
+        // runner turns into an `unknown` blaming a defect, so it is worth
+        // catching at the declaration.
+        for h in crate::harness::registry::all() {
+            let Some(p) = h.plugin() else { continue };
+            for id in p.probes() {
+                assert!(
+                    id.starts_with(&format!("{h}.")),
+                    "{h} declares probe `{id}`, which is not one of its own capability ids"
+                );
+            }
+        }
     }
 }

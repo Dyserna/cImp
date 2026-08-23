@@ -85,7 +85,7 @@ The real tree at HEAD:
 | `harness/health.rs` | L3 | Read-model for Settings → *Harness health*. Joins registry rows against gate verdicts, the stored auto-verify record and the last in-process run — one panel per harness, plus a neutral `Harness::ANY` panel. |
 | `harness/verify.rs` | L3 | Auto-verify, **per harness**: iterates the registry, and on one harness's CLI version change runs that harness's L1 + L2 and advances its own `last_verified`. |
 | `harness/chp.rs` | L2 | **CHP** — `CHP_VERSION`, the event vocabulary (`EVENTS`), the `/session/hello` peer registry, arbitration (`served`), the quiet detector (`note_event`), stale-artifact classification (`stale_for`). |
-| `harness/probe.rs` | — | The L2 probe **runner**: the report shape, the outcome model, `IMPLEMENTED` (the declared report order) and the neutral declared-unprobed row. The probe *bodies* live in each plugin. |
+| `harness/probe.rs` | — | The L2 probe **runner**: the report shape, the outcome model, the declared report order (`implemented_probes()`, a concatenation of each plugin's `probes()` in drive order — V40 Phase I) and the neutral declared-unprobed row. The probe *ids and bodies* live in each plugin. |
 | `harness/canary.rs` | — | The L1 canary **runner** and corpus rules; the assertions live in each plugin's `canary.rs`. |
 | `harness/capture.rs` | — | The capture-on-success corpus, so a break starts with a diff. |
 | `harness/render.rs` | L1 | `{{key}}` substitution for text artifacts, and the one place a value gets JSON-quoted (`json_lit`). |
@@ -520,7 +520,8 @@ The other consistency tests, all in `contract.rs`:
 |---|---|
 | `matrix_matches_maintenance_doc` | Registry ↔ `MAINTENANCE.md` drift table id-set equality, both directions, uniqueness on both sides. Prose cannot drift from code. |
 | `wired_in_paths_exist` | A declared consumer path that no longer resolves — i.e. a refactor that moved the code and left the row pointing at nothing. |
-| `probes_and_the_matrix_agree` | Every row is in exactly one of `probe::IMPLEMENTED` / `probe::declared_unprobed()`; a row cannot fall out of both and stop being counted. |
+| `probes_and_the_matrix_agree` | Every row is in exactly one of `probe::implemented_probes()` / `probe::declared_unprobed()`; a row cannot fall out of both and stop being counted. |
+| `the_report_order_is_the_drive_order` | The nine driven ids, in the order `--harness-canary` prints them, pinned literally — so moving the ids into the plugins did not move the report. |
 | `tcb_controls_are_declared_exactly_once` | Each control id names exactly one *place* enforcement executes. |
 | `every_gated_capability_can_actually_block` / `no_gate_blocks_outside_the_declared_list` | `GATED` and the `gate` match arms agree — an entry no arm can block is a gate that does not exist; an arm not listed is a gate no UI can see. |
 | `a_blocked_gate_always_says_why` | A block with a blank reason (global principle 5). |
@@ -570,9 +571,9 @@ now declared-unconstructed, kept for the next one). Modelling the last
 two as failures would recreate exactly the alarm fatigue the milestone exists to
 remove — `drift.harness_version.v1` fired on every CLI auto-update until the
 rational response became clicking *Mark verified* without running anything.
-Nine rows are driven (`probe::IMPLEMENTED`, which is also the **declared report
-order** — so a report cannot silently become "whatever the probe functions
-happened to answer"); nineteen are enumerated as `unknown` with the reason, one
+Nine rows are driven (`probe::implemented_probes()`, which is also the
+**declared report order** — so a report cannot silently become "whatever the
+probe functions happened to answer"); nineteen are enumerated as `unknown` with the reason, one
 neutral and eighteen contributed by the two plugins' own `declared_unprobed()`
 — printed, not omitted, because a dependency that stops being listed is one that
 stopped being counted. Note the split: the runner drives the loop, holds the
@@ -928,9 +929,14 @@ answers: *"no probe can settle this"* is a claim that needs writing down, and a
 probe that silently stopped emitting a row must not be mistaken for one.
 `probe::DECLARED_UNPROBED_NEUTRAL` keeps only the rows no plugin owns — the ones
 stated about a *tab* — and `probe::declared_unprobed()` is the joined view.
-`probe::IMPLEMENTED` likewise stays in core: it is the **declared report
-order**, so a report cannot silently become "whatever the probe functions
-happened to answer".
+The **declared report order** likewise stays in core, so a report cannot
+silently become "whatever the probe functions happened to answer" — but V40
+Phase I moved its CONTENT out: `probe::implemented_probes()` concatenates each
+plugin's own `probes()` in `drive_order()`. The order is cImp's presentation;
+which ids a harness drives is that harness's claim, and keeping the second copy
+in core meant a plugin could add a probe the runner then reported as
+*undeclared*, or drop one the runner then blamed on "a defect in
+harness/probe.rs".
 
 > **Fails until you do:**
 > `every_silent_degradation_has_a_canary_or_a_probe_or_a_waiver`,

@@ -1377,6 +1377,28 @@ pub trait HarnessPlugin: Sync + Send {
         ProbeOutput::default()
     }
 
+    /// The capability ids [`Self::probe`] drives, **in the order it emits
+    /// them** (V40 Phase I, issue #107 item 3).
+    ///
+    /// Declared rather than listed in core. `probe::IMPLEMENTED` used to be one
+    /// hand-kept array in `harness/probe.rs` holding both harnesses' ids —
+    /// which meant a plugin could add a probe id its harness emits and the
+    /// runner would append it to the report as an *undeclared* result, or lose
+    /// one and have the runner fabricate an `unknown` naming a defect in a file
+    /// the change never touched. Locked decision 11 kept it in core as "the
+    /// declared report order"; Phase I is the correction: the ORDER is still
+    /// cImp's (the runner concatenates in registry drive order), but the CONTENT
+    /// of each harness's slice is that harness's claim, beside the function that
+    /// makes it.
+    ///
+    /// Empty is an ordinary answer — a harness with no L2 probes drives nothing
+    /// and enumerates its rows through [`Self::declared_unprobed`] instead.
+    /// `probes_and_the_matrix_agree` still holds the joined view to the registry
+    /// in both directions.
+    fn probes(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// Whether this harness's probes share **one expensive child process**, in
     /// which case the runner drives it before harnesses whose probes are
     /// independent.

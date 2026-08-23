@@ -423,6 +423,28 @@ impl HarnessPlugin for ClaudePlugin {
         ProbeOutput { results, observed, version }
     }
 
+    /// The ids [`Self::probe`] emits, in emission order: the two `--help` flag
+    /// rows `probe_claude_flags` answers, then the five transcript rows
+    /// `probe_claude_transcript` reads off one tail.
+    fn probes(&self) -> &'static [&'static str] {
+        &[
+            "claude.flag.session_id",
+            "claude.flag.settings_overlay",
+            "claude.transcript.usage",
+            "claude.transcript.tool_result",
+            "claude.transcript.identity",
+            // V35 Phase L. Driven for the same one-tail cost as the three
+            // above, and worth driving precisely BECAUSE it is now a fallback:
+            // a fallback nobody checks is what turns the primary's failure into
+            // a mute tab.
+            "claude.transcript.assistant_text",
+            // V39. Same tail again, and the same argument one step further:
+            // this row's loss is invisible even in the tab — only a driver
+            // waiting on a delegation ever notices, ten minutes later.
+            "claude.transcript.stop_reason",
+        ]
+    }
+
     fn declared_unprobed(&self) -> &'static [(&'static str, &'static str)] {
         DECLARED_UNPROBED
     }

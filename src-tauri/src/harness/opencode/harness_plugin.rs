@@ -405,6 +405,13 @@ impl HarnessPlugin for OpenCodePlugin {
         true
     }
 
+    /// The ids [`Self::probe`] emits, in emission order. `tool_registry` is
+    /// first on purpose: it is the security-relevant one, the standing manual
+    /// maintenance obligation, and the reason the probe phase exists at all.
+    fn probes(&self) -> &'static [&'static str] {
+        &["opencode.tool_registry", "opencode.route.noauth"]
+    }
+
     fn declared_unprobed(&self) -> &'static [(&'static str, &'static str)] {
         DECLARED_UNPROBED
     }

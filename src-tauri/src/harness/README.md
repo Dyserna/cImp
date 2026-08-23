@@ -117,10 +117,15 @@ each claim.
    needs a negative twin: the same fixture with one load-bearing field renamed,
    proving the positive one is load-bearing. `_synthetic/` fixtures carry a
    `MANIFEST.toml` like every other.
-7. **`probe()` / `declared_unprobed()`** — what can be driven against the
-   *installed* CLI (`harness/<id>/probe.rs`), and what cannot, each with the
-   reason. The runner in `probe.rs` iterates the registry; it spawns nothing
-   itself, so a spawn you add there needs a `spawn_ledger::LEDGER` row.
+7. **`probes()` / `probe()` / `declared_unprobed()`** — the ids you drive
+   against the *installed* CLI in the order you emit them, the code that drives
+   them (`harness/<id>/probe.rs`), and the rows that cannot be driven with the
+   reason for each. `probes()` is what the `--harness-canary` report is
+   assembled from (V40 Phase I): declare an id your `probe()` never emits and
+   the report carries a loud `unknown` for it; emit one you did not declare and
+   it lands as an undeclared extra. The runner in `probe.rs` iterates the
+   registry and owns only the ORDER; it spawns nothing itself, so a spawn you
+   add there needs a `spawn_ledger::LEDGER` row.
 8. **`settings_schema()`** — the settings only YOUR harness has
    (`harness/<id>/settings.rs`), one `SettingField` per key: kind, label, hint,
    default, and whether it is `spawn_baked` or a `secret`. Core stores them

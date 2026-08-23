@@ -475,10 +475,14 @@ fn harness_spawn_sig(s: &Settings, h: crate::harness::HarnessId) -> Value {
         return Value::Null;
     };
     let mut sig = plugin.spawn_sig(s);
+    // V40 review M-4 (parity lens): a `spawn_baked` value that cannot reach any
+    // tab's launch under these settings is left OUT, so editing it raises no
+    // hint. Only the declaring plugin can answer that — see
+    // `HarnessPlugin::spawn_baked_reaches_a_launch`, whose default is `true`.
     let baked: BTreeMap<&str, Value> = plugin
         .settings_schema()
         .iter()
-        .filter(|f| f.spawn_baked)
+        .filter(|f| f.spawn_baked && plugin.spawn_baked_reaches_a_launch(s, f.key))
         .map(|f| (f.key, s.harness_ext(h, f.key)))
         .collect();
     // An object is what every plugin returns today; a plugin that returned
@@ -1630,19 +1634,20 @@ mod tests {
                     &Settings::default(),
                     h("claude"),
                 ),
-                // The automatic half: this harness's `spawn_baked` declarations,
-                // at their declared defaults. `statusline` used to be a
-                // hand-written `"statusline"` key on the object above; the three
-                // `local.*` rows never had an entry of their own at all — they
-                // rode `local_env`, which is `null` until a tab opts in, so
-                // editing the proxy URL with no such tab moved nothing. Both are
-                // covered by the declaration now.
-                "ext": {
-                    "statusline": true,
-                    "local.base_url": "http://localhost:4000",
-                    "local.auth_token": "sk-dummy",
-                    "local.model_alias": "",
-                },
+                // The automatic half: this harness's `spawn_baked` declarations
+                // that reach a launch, at their declared defaults. `statusline`
+                // used to be a hand-written `"statusline"` key on the object
+                // above and is covered by the declaration now.
+                //
+                // The three `local.*` rows are ABSENT, and that is the answer,
+                // not an omission (V40 review M-4, parity lens): they are
+                // synthesized into `ANTHROPIC_*` only for a tab that opted into
+                // the local provider, so with no such tab in this fixture they
+                // reach no launch and editing the proxy URL must raise no hint —
+                // which is exactly what `local_env: null` above says. They
+                // rejoin the object the moment a tab opts in
+                // (`a_local_provider_tab_brings_the_local_rows_into_the_signature`).
+                "ext": { "statusline": true },
             }),
             "the Claude spawn signature moved for a DEFAULT settings file"
         );
@@ -1673,13 +1678,28 @@ mod tests {
     fn an_ext_flip_moves_only_the_declaring_harnesss_slot() {
         let base = spawn_inject_sig(&Settings::default());
 
-        for (id, key, flipped) in [
-            ("claude", "statusline", serde_json::json!(false)),
-            ("claude", "local.base_url", serde_json::json!("http://elsewhere:1")),
-            ("opencode", "native_gate", serde_json::json!(false)),
-            ("opencode", "provider_auto", serde_json::json!(true)),
+        // The `local.*` rows reach a launch only for a tab that opted in (V40
+        // review M-4), so this fixture carries one — otherwise the flip
+        // correctly moves NOTHING and the test would be asserting the opposite
+        // of `a_local_url_edit_with_no_local_tab_raises_no_hint` below.
+        let mut with_local = Settings::default();
+        with_local.tabs.push(crate::settings::default_claude_local_tab());
+        let base_local = spawn_inject_sig(&with_local);
+
+        for (id, key, flipped, fixture, baseline) in [
+            ("claude", "statusline", serde_json::json!(false), Settings::default(), &base),
+            (
+                "claude",
+                "local.base_url",
+                serde_json::json!("http://elsewhere:1"),
+                with_local.clone(),
+                &base_local,
+            ),
+            ("opencode", "native_gate", serde_json::json!(false), Settings::default(), &base),
+            ("opencode", "provider_auto", serde_json::json!(true), Settings::default(), &base),
         ] {
-            let mut s = Settings::default();
+            let base = baseline;
+            let mut s = fixture;
             s.set_ext(id, key, flipped);
             let sig = spawn_inject_sig(&s);
             let moved: Vec<&str> = sig
@@ -1693,6 +1713,81 @@ mod tests {
                 "flipping `{id}.ext.{key}` must move exactly that harness's slot"
             );
         }
+    }
+
+    /// **A spawn-baked value that reaches no launch raises no hint** (V40
+    /// review finding M-4, parity lens).
+    ///
+    /// The local-provider rows are synthesized into `ANTHROPIC_*` only for a tab
+    /// that opted in. Before V40 they had no signature entry of their own — they
+    /// rode the gated `local_env` element — so editing the proxy URL with no
+    /// such tab open was correctly silent. Declaring them `spawn_baked` made
+    /// core fold them in unconditionally, and a hint that fires for a change
+    /// that changes nothing is a hint nobody reads.
+    #[test]
+    fn a_local_url_edit_with_no_local_tab_raises_no_hint() {
+        let claude = h("claude");
+        let keys = crate::harness::claude::settings::LOCAL_KEYS;
+
+        // No local-provider tab: the rows are absent and an edit moves nothing.
+        let base = spawn_inject_sig(&Settings::default());
+        for key in keys {
+            assert!(
+                base[&claude]["ext"].get(*key).is_none(),
+                "`{key}` reaches no launch here and must not be in the signature"
+            );
+            let mut s = Settings::default();
+            s.set_ext("claude", key, serde_json::json!("http://elsewhere:1"));
+            assert_eq!(
+                spawn_inject_sig(&s),
+                base,
+                "editing `{key}` with no local-provider tab must raise no restart hint"
+            );
+        }
+
+        // …and the moment a tab opts in, every one of them is back and live.
+        let mut opted = Settings::default();
+        opted.tabs.push(crate::settings::default_claude_local_tab());
+        let with_tab = spawn_inject_sig(&opted);
+        assert_ne!(
+            with_tab[&claude], base[&claude],
+            "opting a tab into the local provider IS a spawn-time change"
+        );
+        for key in keys {
+            assert!(
+                with_tab[&claude]["ext"].get(*key).is_some(),
+                "`{key}` must rejoin the signature once a tab opts in"
+            );
+            let mut s = opted.clone();
+            s.set_ext("claude", key, serde_json::json!("http://elsewhere:1"));
+            assert_ne!(
+                spawn_inject_sig(&s)[&claude],
+                with_tab[&claude],
+                "editing `{key}` with a local-provider tab open MUST raise the hint"
+            );
+        }
+    }
+
+    /// The mask and the schema name the same rows.
+    ///
+    /// `LOCAL_KEYS` is what `spawn_baked_reaches_a_launch` filters on; a key
+    /// that fell out of it would be folded into the signature unconditionally
+    /// again, silently.
+    #[test]
+    fn the_local_keys_are_exactly_the_declared_local_rows() {
+        use crate::harness::plugin::HarnessPlugin as _;
+        let declared: Vec<&str> = crate::harness::claude::plugin::PLUGIN
+            .settings_schema()
+            .iter()
+            .map(|f| f.key)
+            .filter(|k| k.starts_with("local."))
+            .collect();
+        assert_eq!(
+            declared,
+            crate::harness::claude::settings::LOCAL_KEYS.to_vec(),
+            "`LOCAL_KEYS` and the declared `local.*` rows must be the same list"
+        );
+        assert!(!declared.is_empty(), "this harness declares no local rows");
     }
 
     /// H2: the hooks are Settings-DEPENDENT and baked at spawn, so

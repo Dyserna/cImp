@@ -402,12 +402,71 @@ pub fn spawn_startup_check() {
 /// field pair. `None` in the overwhelmingly common already-verified case, which
 /// is what keeps the startup check free.
 fn pending_harness() -> Option<(Harness, String)> {
-    for harness in crate::harness::registry::all() {
-        let row = crate::settings::read_global_harness_settings(harness);
-        let seen = row.last_seen.trim().to_string();
-        if !seen.is_empty() && seen != row.last_verified.trim() {
-            return Some((harness, seen));
+    pending_harness_excluding(&[])
+}
+
+/// [`pending_harness`], skipping the (harness, version) pairs this worker has
+/// already answered for.
+fn pending_harness_excluding(ran: &[(Harness, String)]) -> Option<(Harness, String)> {
+    // V40 review M-2 (parity lens): a harness whose reserved tabs are all
+    // DISABLED is not probed. `verify` runs the harness's own CLI —
+    // `opencode serve` binds a port, `claude --help` starts a process — and the
+    // 35 -> 36 migration hands every harness a `last_seen` (carried over from
+    // `harness_versions.<id>_last_seen`) with an EMPTY `last_verified`, because
+    // auto-verify only ever recorded one harness before V40. So the first
+    // post-upgrade launch spawned a child for a harness the user may have
+    // turned off months ago, with nothing on screen to explain it.
+    let enabled = crate::settings::read_global_enabled_ai_tabs();
+    let rows: Vec<(Harness, String, String)> = crate::harness::registry::all()
+        .filter(|harness| harness_has_enabled_tab(*harness, &enabled))
+        .map(|harness| {
+            let row = crate::settings::read_global_harness_settings(harness);
+            (
+                harness,
+                row.last_seen.trim().to_string(),
+                row.last_verified.trim().to_string(),
+            )
+        })
+        .collect();
+    next_pending(&rows, ran)
+}
+
+/// Whether any of `harness`'s reserved tab ids is in the enabled list.
+///
+/// An EMPTY list means the settings file has not been read (no global file
+/// yet — a fresh install before the first save), not "the user disabled
+/// everything": the integrity check refuses an empty `enabled_ai_tabs` and
+/// repairs it to the first registered harness's first tab. Treated as "do not
+/// probe", which is the conservative direction for spawning a child process.
+fn harness_has_enabled_tab(harness: Harness, enabled: &[crate::settings::AiTabId]) -> bool {
+    harness
+        .descriptor()
+        .is_some_and(|d| d.tab_ids.iter().any(|t| enabled.iter().any(|e| e.as_str() == *t)))
+}
+
+/// The selection itself, over `(harness, last_seen, last_verified)` rows —
+/// pure, so the starvation this fixes is testable without a settings file.
+///
+/// **V40 review finding M-1.** The worker held the memo and answered it with
+/// `return`: with the first harness FAILING (a failure leaves
+/// `seen != verified`, which is deliberate — see `spawn_startup_check`) and the
+/// second pending, round 0 ran the first, round 1 asked again, got the first
+/// back, hit the memo and returned. The second harness was never verified at
+/// all, for as long as the first kept failing — the exact case the memo's own
+/// comment said it existed to handle. The memo belongs in the LOOKUP: a pair
+/// already answered is skipped, not a reason to stop.
+fn next_pending(
+    rows: &[(Harness, String, String)],
+    ran: &[(Harness, String)],
+) -> Option<(Harness, String)> {
+    for (harness, seen, verified) in rows {
+        if seen.is_empty() || seen == verified {
+            continue;
         }
+        if ran.iter().any(|(h, v)| h == harness && v == seen) {
+            continue;
+        }
+        return Some((*harness, seen.clone()));
     }
     None
 }
@@ -521,12 +580,13 @@ fn worker(why: &'static str) {
     // as "already ran", and never verify it.
     let mut ran: Vec<(Harness, String)> = Vec::new();
     for round in 0..MAX_ROUNDS {
-        let Some((harness, seen)) = pending_harness() else {
+        // V40 review M-1: the memo is applied by the LOOKUP, so an already-
+        // answered (and still failing) harness is SKIPPED rather than ending
+        // the worker — which is what used to starve every harness after the
+        // first failing one.
+        let Some((harness, seen)) = pending_harness_excluding(&ran) else {
             return;
         };
-        if ran.iter().any(|(h, v)| *h == harness && v == &seen) {
-            return;
-        }
         tracing::info!(
             trigger = why,
             round,
@@ -945,6 +1005,100 @@ mod tests {
         // from a pass.
         assert_eq!(got.answers[0].outcome.label(), "unknown");
         assert_eq!(got.answers[1].outcome.label(), "fail");
+    }
+
+    /// **A failing harness must not starve the ones behind it** (V40 review
+    /// finding M-1).
+    ///
+    /// A failed run deliberately leaves `seen != verified` (see
+    /// `spawn_startup_check`), so the first harness stays pending forever. The
+    /// worker held its already-answered memo and answered a hit with `return`,
+    /// which meant: round 0 verifies harness A, round 1 asks again, gets A
+    /// back, hits the memo, and the worker STOPS — harness B is never verified,
+    /// for as long as A keeps failing. Its own comment said the memo existed to
+    /// stop exactly that.
+    #[test]
+    fn a_failing_harness_does_not_starve_the_next_one() {
+        let ids: Vec<Harness> = crate::harness::registry::all().collect();
+        assert!(ids.len() >= 2, "this test needs two registered harnesses");
+        let (a, b) = (ids[0], ids[1]);
+        // Both pending: A observed 1.0 with nothing verified, B observed 2.0.
+        let rows = vec![
+            (a, "1.0".to_string(), String::new()),
+            (b, "2.0".to_string(), String::new()),
+        ];
+
+        // Round 0 answers A.
+        let first = next_pending(&rows, &[]).expect("A is pending");
+        assert_eq!(first, (a, "1.0".to_string()));
+
+        // A FAILS, so the rows are unchanged. Round 1 must answer B.
+        let ran = vec![first.clone()];
+        let second = next_pending(&rows, &ran).expect("B is still pending");
+        assert_eq!(second, (b, "2.0".to_string()));
+
+        // Both answered ⇒ nothing left, and the worker ends.
+        let ran = vec![first, second];
+        assert_eq!(next_pending(&rows, &ran), None);
+    }
+
+    /// **A harness whose tabs are all disabled is not probed** (V40 review
+    /// finding M-2, parity lens).
+    ///
+    /// `verify` runs the harness's OWN CLI — one of them binds a port — and the
+    /// 35 -> 36 migration gives every harness a `last_seen` carried over from
+    /// `harness_versions.<id>_last_seen` with an EMPTY `last_verified`, because
+    /// auto-verify only ever recorded one harness before V40. So the first
+    /// post-upgrade launch spawned a child for a harness the user may have
+    /// turned off months ago, with nothing on screen to explain it.
+    #[test]
+    fn a_harness_with_no_enabled_tab_is_not_probed() {
+        let ids: Vec<Harness> = crate::harness::registry::all().collect();
+        assert!(ids.len() >= 2, "this test needs two registered harnesses");
+        let (a, b) = (ids[0], ids[1]);
+        let tab_of = |h: Harness| {
+            crate::settings::AiTabId::from_id(
+                h.descriptor().expect("registered").tab_ids[0],
+            )
+            .expect("10(b) requires every reserved tab id to have a variant")
+        };
+
+        assert!(harness_has_enabled_tab(a, &[tab_of(a)]));
+        assert!(!harness_has_enabled_tab(b, &[tab_of(a)]));
+        // An empty list is "settings not read yet", and the conservative answer
+        // to "should cImp spawn a child process" is no.
+        assert!(!harness_has_enabled_tab(a, &[]));
+        // Every reserved tab of a harness counts, not only the first.
+        for h in [a, b] {
+            for t in h.descriptor().expect("registered").tab_ids {
+                let one = crate::settings::AiTabId::from_id(t).expect("has a variant");
+                assert!(harness_has_enabled_tab(h, &[one]), "{h}: {t}");
+            }
+        }
+    }
+
+    /// The ordinary cases the selection also has to get right: an empty
+    /// `last_seen` is "never observed", not "pending", and an equal pair is
+    /// verified.
+    #[test]
+    fn next_pending_skips_unobserved_and_verified_rows() {
+        let ids: Vec<Harness> = crate::harness::registry::all().collect();
+        let (a, b) = (ids[0], ids[1]);
+        assert_eq!(
+            next_pending(
+                &[
+                    (a, String::new(), String::new()),
+                    (b, "2.0".to_string(), "2.0".to_string()),
+                ],
+                &[]
+            ),
+            None
+        );
+        // …and a re-observed version after a pass is pending again.
+        assert_eq!(
+            next_pending(&[(b, "2.1".to_string(), "2.0".to_string())], &[]),
+            Some((b, "2.1".to_string()))
+        );
     }
 
     /// Single-flight: the second trigger while one is in flight is dropped, and

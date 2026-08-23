@@ -276,4 +276,39 @@ mod tests {
             assert!(!t.trim().is_empty(), "an empty drift token would key the ledger on nothing");
         }
     }
+
+    /// **The drift tokens are PERSISTED ledger keys, pinned from outside the
+    /// file that declares them** (V40 review finding W-1, parity lens).
+    ///
+    /// The declaring module's own test scans its own source for each token's
+    /// literal — which the `pub const` definition satisfies, so the check has
+    /// held nothing since it was written: renaming `"compact_hook"` would pass
+    /// it. These strings key `drift.payload.v1` rows and the notices a user has
+    /// DISMISSED, so a rename orphans the stored records and resurrects every
+    /// dismissal at once. Written out here, in a different file, so a rename is
+    /// a decision somebody takes rather than one that happens.
+    ///
+    /// Adding a harness ADDS tokens and that is ordinary; this asserts the
+    /// existing spellings are still spelled.
+    #[test]
+    fn the_persisted_drift_token_spellings_are_pinned() {
+        let tokens: BTreeSet<&str> = drift_tokens().into_iter().collect();
+        for expected in [
+            "checkpoint_beacon",
+            "compact_hook",
+            "context_hook",
+            "notify_hook",
+            "post_edit_hook",
+            "read_hook",
+            "stop_hook",
+            "subagent_hook",
+            "taint_beacon",
+            "tool_result_hook",
+        ] {
+            assert!(
+                tokens.contains(expected),
+                "`{expected}` is a persisted drift-ledger key and a dismissal signature; it is                  no longer declared by any harness, so every row and every dismissal stored                  under it is orphaned"
+            );
+        }
+    }
 }

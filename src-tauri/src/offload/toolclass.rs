@@ -397,7 +397,10 @@ pub const TABLE: &[ClassRow] = &[
     // registry; keeping one harness's vocabulary here meant core answered for
     // `Edit` and, through a `_` arm, for every harness it had never heard of.
     // Read a native name through `harness::native`, which asks the plugin for
-    // the request's source and fails closed when it cannot identify one.
+    // the request's source and fails closed when it cannot identify one — and,
+    // since V40 review M-7, which is also what [`classify`] falls through to
+    // before it answers EXTERNAL, so the class a plugin declares is the class
+    // the latch enforces.
 ];
 
 /// The class of `name`. **Unknown ⇒ [`ToolClass::External`]** — the locked
@@ -405,11 +408,22 @@ pub const TABLE: &[ClassRow] = &[
 /// server's `<server>__<tool>` ids are unknown here and must land in the most
 /// restrictive class, never be inferred into a trusted one.
 pub fn classify(name: &str) -> ToolClass {
-    TABLE
-        .iter()
-        .find(|r| r.name == name)
-        .map(|r| r.class)
-        .unwrap_or(ToolClass::External)
+    if let Some(row) = TABLE.iter().find(|r| r.name == name) {
+        return row.class;
+    }
+    // **A harness's OWN natives answer from their own declaration** (V40 review
+    // finding M-7). Phase A moved Claude's four `LocalCapability` rows out of
+    // this table and into `native_tools()` — correctly — but nothing read the
+    // declaration back, so `Edit` fell to the unknown-⇒-EXTERNAL default below.
+    // That default is not a neutral loss here: [`Latch::blocks`] REFUSES
+    // `LocalCapability` under an EXTERNAL latch and ADMITS `External`, and
+    // [`Latch::engage`] moves an open tab to `External` rather than `Local` for
+    // it — so a tainted session's `Edit` stopped being refused and an ordinary
+    // `Edit` started marking its tab externally-contaminated.
+    //
+    // The unknown-⇒-EXTERNAL invariant is untouched: it governs names NOBODY
+    // declares, which is still every proxied `<server>__<tool>` id.
+    crate::harness::native::declared_class(name).unwrap_or(ToolClass::External)
 }
 
 /// **#48, finding M-2** — whether a model-supplied `name` can reach a native
@@ -1602,6 +1616,48 @@ mod tests {
         assert!(PROFILE_TOOL_NOTE.contains("code"));
         assert!(PROFILE_TOOL_NOTE.contains("NEVER include secrets"));
         assert!(PROFILE_TOOL_NOTE.contains("prompt exfiltration cannot be blocked"));
+    }
+
+    /// **The pre-V40 classes for the harness-native names** — live-verify 9a's
+    /// golden, written out (V40 review finding M-7, parity lens).
+    ///
+    /// Phase A moved Claude's four `LocalCapability` rows out of `TABLE` and
+    /// into `native_tools()`, and nothing read the declaration back, so
+    /// `classify("Edit")` fell to unknown-⇒-EXTERNAL. That is not a neutral
+    /// loss: [`Latch::blocks`] refuses `LocalCapability` under an EXTERNAL latch
+    /// and ADMITS `External`, and [`Latch::engage`] moves an open tab to
+    /// `External` rather than `Local` for it — so a tainted session's `Edit`
+    /// stopped being refused, and an ordinary `Edit` started marking its own tab
+    /// externally-contaminated.
+    ///
+    /// A GOLDEN: a diff here is a containment answer changing.
+    #[test]
+    fn harness_native_names_classify_from_their_own_declaration() {
+        // Claude's four, the ones develop carried in `TABLE`.
+        for name in ["Edit", "Write", "Bash", "MultiEdit"] {
+            assert_eq!(classify(name), ToolClass::LocalCapability, "{name}");
+            // …and the two properties that class buys, spelled out.
+            assert!(
+                Latch::External.blocks(classify(name)),
+                "{name} must be refused under an EXTERNAL latch"
+            );
+            let mut latch = Latch::Open;
+            assert!(latch.engage(classify(name)), "{name} must move an open latch");
+            assert_eq!(
+                latch,
+                Latch::Local,
+                "{name} must engage the LOCAL latch, not the external one"
+            );
+        }
+        // OpenCode's own file/shell ids answer from ITS declaration, which is
+        // the same class for the same kind of tool — and was `External` on
+        // develop only because no table carried them at all.
+        for name in ["edit", "write", "bash", "patch"] {
+            assert_eq!(classify(name), ToolClass::LocalCapability, "{name}");
+        }
+        // The invariant is untouched for names NOBODY declares.
+        assert_eq!(classify("nothing_declares_this"), ToolClass::External);
+        assert_eq!(classify("ddg__fetch_content"), ToolClass::External);
     }
 
     /// The reason this is a SECOND table: `classify`'s unknown-⇒-EXTERNAL

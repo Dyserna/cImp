@@ -547,6 +547,27 @@ pub fn read_global_harness_map() -> HarnessMap {
     map
 }
 
+/// The reserved AI tab ids the user has enabled, read straight from the
+/// physical global file (V40 review finding M-2, parity lens).
+///
+/// The out-of-band consumer is the auto-verify worker, which runs on a plain
+/// thread with no `SettingsHandle` and decides whether to spawn a harness's own
+/// CLI to probe it. Deliberately the GLOBAL value rather than a project-merged
+/// one: this answers "does this machine use that harness at all", and a
+/// background probe is not worth reading a project overlay to decide.
+///
+/// Uncached — it is asked at most a handful of times per launch, and the
+/// `HV_CACHE` above is keyed to the two harness structures.
+pub fn read_global_enabled_ai_tabs() -> Vec<crate::settings::AiTabId> {
+    let Ok(path) = global_path() else {
+        return Vec::new();
+    };
+    if !path.exists() {
+        return Vec::new();
+    }
+    read_settings_or_default(&path).enabled_ai_tabs
+}
+
 /// One harness's row out of [`read_global_harness_map`], defaults included.
 ///
 /// The read every out-of-band consumer wants: `Settings::harness_settings`
@@ -563,10 +584,11 @@ pub fn read_global_harness_settings(
 /// Mutate ONE harness's row in the physical global file, out of band.
 ///
 /// The `mutate_global_harness_versions` pattern, and it exists for the same
-/// two reasons: `harness` is in [`OVERLAY_BANNED_KEYS`] so a Settings save can
-/// never carry it, and the writers here (the version tap, the auto-verify
-/// worker, *Mark verified*) run on background threads where a full
-/// `save_settings` would race the user's own edits. No-op when the mutation
+/// two reasons: these fields are stripped from a project overlay by
+/// [`strip_overlay_harness`] so a Settings save can never carry them, and the
+/// writers here (the version tap, the auto-verify worker, *Mark verified*) run
+/// on background threads where a full `save_settings` would race the user's own
+/// edits. No-op when the mutation
 /// changes nothing, so a change-guarded caller can poll freely.
 pub fn mutate_global_harness(
     harness: crate::harness::HarnessId,

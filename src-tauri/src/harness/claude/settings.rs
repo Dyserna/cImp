@@ -33,6 +33,15 @@ pub const LOCAL_AUTH_TOKEN: &str = "local.auth_token";
 /// `ext` key: local-provider model alias (was `claude_local.model_alias`).
 pub const LOCAL_MODEL_ALIAS: &str = "local.model_alias";
 
+/// The three keys above, as one list.
+///
+/// They share a fate that no other declared field has: they are synthesized
+/// into `ANTHROPIC_*` **only for a tab that opted into the local provider**, so
+/// the plugin masks them out of its spawn signature when no such tab exists
+/// (V40 review M-4, parity lens). Spelled once, so the mask and the schema
+/// cannot drift; `the_local_keys_are_exactly_the_declared_local_rows` pins it.
+pub const LOCAL_KEYS: &[&str] = &[LOCAL_BASE_URL, LOCAL_AUTH_TOKEN, LOCAL_MODEL_ALIAS];
+
 /// Claude Code's declared settings, in the order the Settings section renders
 /// them.
 pub const FIELDS: &[SettingField] = &[

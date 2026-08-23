@@ -4245,13 +4245,17 @@ mod tests {
     /// used to cost an undeclared task its web tools for good.
     ///
     /// **V40 Phase A** moved Claude's three natives out of `TABLE` into
-    /// `harness/claude/tools.rs` (locked decision 16), so in cImp's own routed
-    /// vocabulary they are now ordinary unknown names. The property this test
-    /// is about is unchanged and is asserted for all six below: no refusal, no
-    /// latch movement, in either latch state. What changed is WHICH rule
-    /// delivers it for the three — `dispatchable == false` before, A-1's
-    /// unknown-EXTERNAL-is-a-typo rule now — and the two agree, which is the
-    /// reason `table_matches_the_native_dispatch_surface` pins both directions.
+    /// `harness/claude/tools.rs` (locked decision 16), and **V40 review M-7 made
+    /// `classify` read that declaration back** — so they are LOCAL-CAPABILITY
+    /// again, as they were on develop, which is what the loopback proxy's latch
+    /// needs (an EXTERNAL-latched session's `Edit` must be refused).
+    ///
+    /// The property THIS test is about is unchanged through all of it, and the
+    /// rule that delivers it is [`LatchRoute::can_execute`]'s
+    /// `dispatchable(name)` half, not the class: on the worker's `Native` route
+    /// a name no dispatcher serves is a hallucination whatever it classifies as,
+    /// so it is neither refused nor allowed to move the latch. Asserted below in
+    /// both latch states, for all six.
     #[test]
     fn a_classified_name_no_dispatcher_serves_does_not_latch_the_task() {
         // The three hook identities are still CLASSIFIED — `unrouted` is not
@@ -4263,11 +4267,12 @@ mod tests {
                 "{name} must stay classified"
             );
         }
-        // Claude's natives are classified by their HARNESS now, and by cImp's
-        // routed table not at all — which is the honest answer for a name no
-        // cImp dispatcher serves.
+        // Claude's natives are classified by their HARNESS's declaration
+        // (V40 review M-7) and dispatched by nothing here — which is the pair
+        // this test turns on: the class is what the PROXY's latch enforces, and
+        // `dispatchable` is what tells the WORKER the name is not a call at all.
         for name in ["Bash", "Edit", "Write"] {
-            assert_eq!(toolclass::classify(name), ToolClass::External, "{name}");
+            assert_eq!(toolclass::classify(name), ToolClass::LocalCapability, "{name}");
             assert!(!toolclass::dispatchable(name), "{name}");
         }
         for name in [

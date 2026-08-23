@@ -73,6 +73,19 @@ pub(in crate::harness) fn me() -> HarnessId {
     id().expect("claude is a registered harness")
 }
 
+/// Whether any configured tab of THIS harness opted into the local provider.
+///
+/// The one condition under which the `local.*` rows reach a launch at all —
+/// read by both halves of the spawn signature (the gated `local_env` element
+/// and `spawn_baked_reaches_a_launch`), so the two cannot disagree about when
+/// editing the proxy URL is worth a restart hint.
+fn any_local_provider_tab(s: &Settings) -> bool {
+    s.tabs.iter().any(|t| {
+        matches!(t, TabConfig::AiTool(c)
+            if c.use_local_provider && HarnessId::from_command(&c.command) == Some(me()))
+    })
+}
+
 impl HarnessPlugin for ClaudePlugin {
     fn input_profile(&self) -> Option<InputProfile> {
         Some(super::input::input_profile())
@@ -202,6 +215,23 @@ impl HarnessPlugin for ClaudePlugin {
         })
     }
 
+    /// The three `local.*` rows reach a launch only for a tab that opted into
+    /// the local provider (V40 review M-4, parity lens).
+    ///
+    /// They are synthesized into `ANTHROPIC_BASE_URL` / `_AUTH_TOKEN` /
+    /// `_MODEL` in `compose_env`, and only there. Before V40 they had no
+    /// signature entry of their own — they rode the gated `local_env` element
+    /// below — so editing the proxy URL with no local-provider tab open raised
+    /// no restart hint. Declaring them `spawn_baked` made core fold them in
+    /// unconditionally, which turned a correct silence into a hint for a change
+    /// that changes nothing.
+    fn spawn_baked_reaches_a_launch(&self, s: &Settings, key: &str) -> bool {
+        if !super::settings::LOCAL_KEYS.contains(&key) {
+            return true;
+        }
+        any_local_provider_tab(s)
+    }
+
     fn spawn_sig(&self, s: &Settings) -> serde_json::Value {
         let guidance = crate::harness::plugin::guidance_gates(s);
         let sandbox = crate::harness::plugin::sandbox_gates(s);
@@ -214,14 +244,8 @@ impl HarnessPlugin for ClaudePlugin {
         let post_edit = s.graph.enabled && s.graph.auto_check && !s.checks.is_empty();
         // `claude_local` env vars are synthesized at spawn, but only for Claude
         // tabs that opted in — irrelevant edits shouldn't nag.
-        let local_env = s
-            .tabs
-            .iter()
-            .any(|t| {
-                matches!(t, TabConfig::AiTool(c)
-                    if c.use_local_provider && HarnessId::from_command(&c.command) == Some(me()))
-            })
-            .then(|| serde_json::json!(super::settings::local_provider(s)));
+        let local_env =
+            any_local_provider_tab(s).then(|| serde_json::json!(super::settings::local_provider(s)));
         serde_json::json!({
             // V37 Phase F: ONE element, not two. The `cimp-offload` entry is now
             // written into every AI tab's harness config unconditionally, so the

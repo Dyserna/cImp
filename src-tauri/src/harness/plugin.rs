@@ -1169,6 +1169,28 @@ pub trait HarnessPlugin: Sync + Send {
         serde_json::Value::Null
     }
 
+    /// Whether a DECLARED `spawn_baked` field's value actually reaches a launch
+    /// under these settings.
+    ///
+    /// Core folds every `spawn_baked` field into the signature automatically
+    /// (`tabs::config::harness_spawn_sig`), which is what closed the class where
+    /// a control shipped with no signature entry. **V40 review finding M-4
+    /// (parity lens)** is the other edge of the same knife: a value that cannot
+    /// reach ANY tab's launch under the current settings then moves the
+    /// signature anyway, and the user is told to restart their tabs for a change
+    /// that changes nothing. Claude Code's three `local.*` rows are the case —
+    /// they are synthesized into `ANTHROPIC_*` only for a tab that opted into the
+    /// local provider, and before V40 editing the proxy URL with no such tab
+    /// raised no hint at all.
+    ///
+    /// Only the declaring plugin can answer it, and the default is `true`:
+    /// a spawn-baked field reaches a launch unless its own harness says
+    /// otherwise. A plugin that gets this wrong loses a hint it should have
+    /// raised, so the override is a deliberate act with its own test.
+    fn spawn_baked_reaches_a_launch(&self, _settings: &Settings, _key: &str) -> bool {
+        true
+    }
+
     // ── declared settings (locked decision 6) ───────────────────────────────
 
     /// This harness's OWN settings — the fields core stores in

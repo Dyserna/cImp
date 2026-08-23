@@ -5931,11 +5931,47 @@ fn tool_checkpoint_is_mutating(harness: &str, tool: &str) -> bool {
     crate::harness::native::mutates_fs(crate::harness::HarnessId::from_id(harness), tool)
 }
 
+/// The identity check `POST /workbench/tool_checkpoint` makes before anything is
+/// staged — the harness token this call is attributed to, or the refusal.
+///
+/// **V40 review finding M-6 (parity lens).** The route's own doc claims a
+/// forged POST "cannot get a destructive call waved through by naming a harness
+/// cImp does not know", and the opposite was true: an unregistered token
+/// resolves to `UNKNOWN_SOURCE`, `mutates_fs` fails CLOSED for it — which is
+/// right for a name inside a known harness's vocabulary and wrong for a source
+/// that has no vocabulary — so EVERY tool name from an unidentified caller was
+/// "mutating" and minted a snapshot attributed to `unknown:<whatever>`. Bounded
+/// by the throttle and the tree-sha dedup, but a checkpoint is the one record
+/// that exists to be trusted after an incident, and an unattributable row in it
+/// is worse than no row.
+///
+/// An ABSENT `agent` is a different question with a different answer: it is a
+/// shim from a build before the field existed, and it resolves to
+/// [`crate::harness::DEFAULT_HARNESS`] exactly as every other hook body does.
+///
+/// Split out so the decision is testable without a `TcpStream`.
+fn checkpoint_source_admits(agent: Option<&str>) -> Result<&'static str, String> {
+    let harness = hook_agent(agent);
+    if crate::harness::HarnessId::from_id(harness).is_some() {
+        return Ok(harness);
+    }
+    Err(format!(
+        "`agent` names no registered harness ({}), so this call cannot be attributed to one. A          checkpoint is the record a restore is judged against; an unattributable row in it is          worse than no row.",
+        crate::harness::registry::harness_ids().join(", ")
+    ))
+}
+
 /// `POST /workbench/tool_checkpoint` (V33 Phase F): take a Workbench checkpoint
 /// **immediately before** a filesystem-mutating tool call, attributed to that
 /// exact call.
 ///
-/// # Why the tool name is re-checked here
+/// # Why identity and the tool name are both re-checked here
+///
+/// **Identity first** (V40 review M-6): a body whose `agent` names no
+/// registered harness is refused with a 400, because `mutates_fs` fails CLOSED
+/// for an unknown vocabulary — which is right for a name inside a known
+/// harness's table and wrong for a source that has no table, where it made
+/// EVERY tool name mutating. See [`checkpoint_source_admits`].
 ///
 /// Both callers pre-filter — Claude's hook is installed with an
 /// `Edit|Write|MultiEdit|Bash` matcher, the plugin consults a baked
@@ -6028,6 +6064,16 @@ async fn handle_tool_checkpoint(
         )
         .await;
     };
+    // V40 review M-6: identity BEFORE anything is staged. See
+    // `checkpoint_source_admits`.
+    if let Err(msg) = checkpoint_source_admits(body.agent.as_deref()) {
+        return write_json(
+            stream,
+            400,
+            &serde_json::json!({ "ok": false, "error": msg }),
+        )
+        .await;
+    }
     let checkpointed = tool_checkpoint_core(
         app,
         &live_settings(app),
@@ -14798,6 +14844,44 @@ mod tests {
         // all. Now it fails closed, for `Bash` and for anything else.
         assert!(tool_checkpoint_is_mutating(hook_agent(Some("nonsense")), "Bash"));
         assert!(tool_checkpoint_is_mutating(hook_agent(Some("nonsense")), "Read"));
+    }
+
+    /// **An unidentified source is REFUSED at the checkpoint route, not treated
+    /// as mutating** (V40 review finding M-6, parity lens).
+    ///
+    /// `mutates_fs` fails closed for a harness with no vocabulary, which is the
+    /// right answer to "is this NAME mutating" and the wrong answer to "may this
+    /// CALLER mint a checkpoint": it made every tool name from a forged POST
+    /// mutating, and each one staged a snapshot attributed to
+    /// `unknown:<whatever>`. Bounded by the throttle and the tree-sha dedup, but
+    /// a checkpoint is the record a restore is judged against, and the route's
+    /// own doc claimed a POST naming a harness cImp does not know could not get
+    /// through it.
+    #[test]
+    fn an_unidentified_checkpoint_source_is_refused() {
+        // Every registered harness is admitted, under its own token.
+        for h in crate::harness::registry::all() {
+            let id = h.id().expect("registered");
+            assert_eq!(checkpoint_source_admits(Some(id)).as_deref(), Ok(id));
+        }
+        // ABSENT is the pre-CHP shim, and still resolves to the wire default.
+        assert_eq!(
+            checkpoint_source_admits(None).as_deref(),
+            Ok(crate::harness::DEFAULT_HARNESS.token())
+        );
+        assert!(checkpoint_source_admits(Some("")).is_ok(), "empty is absent (M-4)");
+
+        // …and everything else is refused, with the registered list in the
+        // message. `offload` and `audit` included: they are cImp's own in-app
+        // consumers, neither runs tools in a harness's vocabulary, and neither
+        // has any business staging a pre-tool checkpoint.
+        for token in ["codex", "unknown", "offload", "audit", "claude-code", " claude "] {
+            let err = checkpoint_source_admits(Some(token))
+                .expect_err(&format!("{token:?} must be refused"));
+            for h in crate::harness::registry::all() {
+                assert!(err.contains(h.id().expect("registered")), "{err}");
+            }
+        }
     }
 
     /// **The registry's bound, made real.** `latches()`'s doc claimed the map

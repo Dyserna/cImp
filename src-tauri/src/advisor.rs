@@ -951,6 +951,19 @@ fn seen_for(sig: &Signals, harness: crate::harness::HarnessId) -> String {
         .unwrap_or_default()
 }
 
+/// The dismissal signature a version-keyed notice is stored under:
+/// `"<harness token>:<version>"`, with `"unknown"` for a harness that has never
+/// been observed.
+///
+/// **A PERSISTED wire form**, not an internal join key: it lands in
+/// `Settings::advisor_dismissed[].signature`, so changing the separator, the
+/// order or the empty-version sentinel resurrects every dismissed version
+/// notice on the next launch. V40 Phase C changed it (it was the bare version,
+/// app-wide) and that re-fire is a recorded, intended one-off — the next change
+/// would not be. Pinned by a literal in
+/// `tests::the_version_notice_signature_is_the_stored_wire_form` (V40 review
+/// finding W-2, parity lens), which is the only thing standing between a tidy
+/// refactor here and every user's dismissals coming back.
 fn version_signature(harness: crate::harness::HarnessId, seen: &str) -> String {
     let seen = if seen.is_empty() { "unknown" } else { seen };
     format!("{}:{seen}", harness.token())
@@ -2317,6 +2330,35 @@ mod tests {
     /// cannot come to share a dismissal without this turning red.
     fn version_key(seen: &str) -> String {
         version_signature(crate::harness::DEFAULT_HARNESS, seen)
+    }
+
+    /// **The dismissal signature's wire form, as a literal** (V40 review
+    /// finding W-2, parity lens).
+    ///
+    /// `version_signature` builds a string that is STORED in
+    /// `Settings::advisor_dismissed`, and every test that touched it went
+    /// through `version_key`, which calls the function under test — so the
+    /// separator, the field order and the empty-version sentinel were pinned by
+    /// nothing at all. Changing any of them resurrects every dismissed version
+    /// notice on the next launch, for every user, silently.
+    #[test]
+    fn the_version_notice_signature_is_the_stored_wire_form() {
+        let default = crate::harness::DEFAULT_HARNESS;
+        // The shipped default harness, written out. A rename of the token is a
+        // migration, not an edit.
+        assert_eq!(version_signature(default, "2.1.232"), "claude:2.1.232");
+        // An unobserved harness gets the sentinel, not an empty tail that would
+        // collide with a real signature ending in `:`.
+        assert_eq!(version_signature(default, ""), "claude:unknown");
+        // …and the SHAPE holds for every registered harness: token, one colon,
+        // version. Two harnesses on one version must never share a dismissal.
+        let mut seen = std::collections::BTreeSet::new();
+        for h in crate::harness::registry::all() {
+            let sig = version_signature(h, "9.9.9");
+            assert_eq!(sig, format!("{}:9.9.9", h.token()));
+            assert_eq!(sig.matches(':').count(), 1, "{sig}");
+            assert!(seen.insert(sig.clone()), "two harnesses share `{sig}`");
+        }
     }
 
     /// Every consolidated detector resolves to a capability the notice can be

@@ -74,11 +74,34 @@ pub fn memory_kind(harness: Option<HarnessId>, name: &str) -> Option<(&'static s
 /// Answering `External` for `todowrite` would refuse a to-do list under a LOCAL
 /// latch — a partial, arbitrary gate, which the V32 E2 spike showed is worse
 /// than none.
-// Declared now, gated later: the hook that would REFUSE a native tool is a
-// later phase, and the column has to exist before something can read it.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn class(harness: HarnessId, name: &str) -> Option<ToolClass> {
     row(harness, name)?.class
+}
+
+/// The class ANY registered harness declares for `name` — the harness-neutral
+/// question [`crate::offload::toolclass::classify`] has to answer, since its
+/// signature carries no source.
+///
+/// **V40 review finding M-7 (parity lens), and the column's first production
+/// consumer.** Phase A moved Claude's four `LocalCapability` rows (`Edit`,
+/// `Write`, `Bash`, `MultiEdit`) out of `toolclass::TABLE` and into
+/// `native_tools()` — correctly, they are a harness's vocabulary and not
+/// cImp's — but nothing then read the declaration back, so `classify("Edit")`
+/// fell to the table's unknown-⇒-EXTERNAL default. That default is not a
+/// neutral loss: `Latch::blocks` REFUSES `LocalCapability` under an EXTERNAL
+/// latch and ADMITS `External`, and `Latch::engage` moves an open tab to
+/// `External` rather than `Local` for it. So a tainted session's `Edit` stopped
+/// being refused and an ordinary `Edit` started marking the tab
+/// externally-contaminated. Live-verify 9a asserts the pre-V40 classes, which
+/// is this.
+///
+/// Every harness's declarations are consulted, not one named here: the two
+/// vocabularies are disjoint by construction (capitalised vs lowercase ids) and
+/// a name only one harness declares is that harness's claim about it. First
+/// declaration wins, and `no_two_harnesses_declare_one_native_name_differently`
+/// refuses a registry where that could matter.
+pub fn declared_class(name: &str) -> Option<ToolClass> {
+    super::registry::all().find_map(|h| class(h, name))
 }
 
 #[cfg(test)]
@@ -87,6 +110,49 @@ mod tests {
 
     fn h(id: &str) -> HarnessId {
         HarnessId::from_id(id).unwrap_or_else(|| panic!("{id} is registered"))
+    }
+
+    /// **No two harnesses may declare one native name with different classes**
+    /// (V40 review M-7).
+    ///
+    /// `declared_class` takes the FIRST declaration, so two harnesses claiming
+    /// one name differently would have the registry's order decide a gate.
+    /// Today the two vocabularies are disjoint (capitalised vs lowercase), and
+    /// this refuses a registry where they stop being.
+    #[test]
+    fn no_two_harnesses_declare_one_native_name_differently() {
+        let mut seen: std::collections::BTreeMap<&str, (Option<ToolClass>, &str)> =
+            Default::default();
+        for h in super::super::registry::all() {
+            let Some(p) = h.plugin() else { continue };
+            for t in p.native_tools() {
+                if let Some((class, owner)) = seen.insert(t.name, (t.class, h.token())) {
+                    assert_eq!(
+                        class,
+                        t.class,
+                        "`{}` is declared by both `{owner}` and `{}` with different classes —                          `declared_class` takes the first, so the registry's ORDER would decide                          a gate",
+                        t.name,
+                        h.token()
+                    );
+                }
+            }
+        }
+        assert!(!seen.is_empty(), "no harness declares a native tool");
+    }
+
+    /// The declared class reaches the neutral lookup — the pre-V40 answer for
+    /// the four rows Phase A moved out of `toolclass::TABLE`.
+    #[test]
+    fn declared_class_answers_for_every_harnesss_own_vocabulary() {
+        assert_eq!(
+            declared_class("Edit"),
+            Some(ToolClass::LocalCapability),
+            "the pre-V40 class, restored"
+        );
+        assert_eq!(declared_class("edit"), Some(ToolClass::LocalCapability));
+        // A name no harness declares has no answer here — the caller's own
+        // default decides, and `toolclass::classify`'s is EXTERNAL.
+        assert_eq!(declared_class("nothing_declares_this"), None);
     }
 
     /// The defect this module exists for, as an assertion: a name from a source

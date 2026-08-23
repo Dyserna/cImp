@@ -7,7 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.53.0-rc.6] — 2026-08-23
+## [0.53.0-rc.7] — 2026-08-23
+
+_rc.6 was tagged but never built: its CI run failed on a Linux-only path test, CRLF-checked-out goldens and clippy. rc.7 is rc.6 plus those three `fix(ci)` commits._
+
+## [0.53.0-rc.6] — 2026-08-23 (not built)
 
 ### Added
 

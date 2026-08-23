@@ -774,7 +774,12 @@ cImp-side work, and none of it can be made data, because it *is* the harness:
    args, artifact writer, `spawn_sig`. **Design work**; nothing can make a
    harness's wire shape data.
 2. One `HarnessDescriptor` entry — id, label, binaries, tab ids, consumer,
-   features, sandbox grant rows, default tab template.
+   features, sandbox grant rows, default tab template. **Plus, for now, one
+   variant per reserved tab id in three core enums** (`AiTabId` — including
+   `ALL` — `TabId::from_str`/`as_str`, and `default_ai_tab`): `enabled_ai_tabs`
+   is a `Vec<AiTabId>` on disk, so the roster is not yet data all the way down.
+   10(b) fails naming the id if you forget, and closing it properly is a
+   recorded residual.
 3. `settings_schema()` — the harness's own settings fields (decision 6);
    `routes()` if it pushes (decision 15); `native_tools()` (decision 16);
    `input_profile()` if it can be a delegation worker (decision 4, V39) —
@@ -861,8 +866,9 @@ and this section reads as what was built.
 13. **Behaviour changes that are intended, and are the only ones.** V40 is a
     refactor, but these are visible and were each ruled deliberately:
     `GRAPH_GUIDANCE` now names each harness's own tools (an OpenCode session is
-    told `read`/`bash`, not `Read`/`Bash`); the `harness` settings block is
-    **machine** scope; auto-verify and every version-keyed drift rule run **per
+    told `read`/`bash`, not `Read`/`Bash`); the `harness` settings block splits
+    **per field** (see 17 below — this said "machine scope" and the review
+    corrected it); auto-verify and every version-keyed drift rule run **per
     harness**, so `version_signature` is per harness and a Claude version notice
     dismissed before the upgrade re-fires once after it; an unregistered
     consumer, tool or harness is refused or fails closed (`mutates_fs` is `true`
@@ -896,6 +902,67 @@ and this section reads as what was built.
     absence and it has no other consumer), so this is a frontend reading of the
     same number, for token-less sessions only.
 
+17. **The `harness` block is scoped PER FIELD, not machine-wide** (review
+    finding M-2 — this ruling replaces the one Phase B took). Phase B put
+    `harness` in `OVERLAY_BANNED_KEYS`, and the comment justifying it —
+    *"every one of those settings was already documented as global"* — was
+    false. Five of them were per-project on develop: `statusline.enabled`,
+    `claude_local.*`, `code_audit.expose_<id>`,
+    `offload.opencode_provider{,_auto}` and
+    `offload.injection.opencode_native_gate_enabled`. Banning the container
+    narrowed all five silently, and the first post-upgrade save deleted the
+    project's values with no Events row and no warning.
+
+    The split, enforced by `strip_overlay_harness` (the `strip_overlay_tool_plugins`
+    shape, and it NAMES what it drops):
+
+    * **machine** — `last_seen`, `last_verified`, `auto_verify` (written out of
+      band, and a Settings save carrying a window-open snapshot of them would
+      stomp a newer observation), `input_profile_status` (a spike recorded
+      against the CLI installed on *this* machine), and `expose_commands` (a
+      capability grant, already machine scope before V40 as
+      `tool_plugins.expose_commands_<id>` — a project config file lives inside
+      the sandbox boundary a confined tool can write);
+    * **project** — `expose_code_audit` and the whole plugin `ext` block,
+      exactly as their pre-V40 spellings were.
+
+    `sync_harness_into` writes through only the machine half, and
+    `the_two_halves_of_harness_scope_agree` refuses a field that fell out of
+    both (which would be unsavable).
+
+18. **A spawn-baked value that reaches no launch does not move the signature**
+    (review finding P-M-4). Core folds every `spawn_baked` field into
+    `spawn_inject_sig` automatically, which is what closed the
+    control-with-no-signature-entry class — and its other edge is that a value
+    which cannot reach any tab's launch then raises a restart hint for a change
+    that changes nothing. Claude Code's three `local.*` rows are the case: they
+    are synthesized into `ANTHROPIC_*` only for a tab that opted into the local
+    provider, and before V40 editing the proxy URL with no such tab raised
+    nothing. `HarnessPlugin::spawn_baked_reaches_a_launch` lets the declaring
+    plugin mask them; the default is `true`, so a plugin loses a hint only
+    deliberately.
+
+19. **The tab-id enums are joined to the registry by a test, not by data**
+    (review finding M-3). Decision 3 kept `AiTabId` / `TabId`'s wire encodings
+    and turned their per-harness `match` arms into registry lookups. The arms
+    themselves did not move, because `Vec<AiTabId>` on disk is a wire format and
+    widening it to `Vec<String>` is a schema change. What exists instead is the
+    join: 10(b) fails, naming the id, if a descriptor declares a `tab_ids` entry
+    with no `AiTabId` variant, no `TabId::from_str` arm or no `default_ai_tab`
+    arm, and `AiTabId::ALL` closes the other direction. See the residual below
+    for what that leaves open.
+
+20. **A harness's declared native class is what the latch enforces** (review
+    finding P-M-7). Phase A moved Claude's four `LocalCapability` rows out of
+    `toolclass::TABLE` into `native_tools()` — correctly — but nothing read the
+    declaration back, so `classify("Edit")` fell to the table's
+    unknown-⇒-EXTERNAL default. `classify` falls through to
+    `harness::native::declared_class` before answering EXTERNAL, which restores
+    the pre-V40 answer for Claude's four and extends the same rule to every
+    harness's own vocabulary. The unknown-⇒-EXTERNAL invariant is untouched: it
+    governs names NOBODY declares, which is still every proxied
+    `<server>__<tool>` id.
+
 **Recorded residuals — real, bounded, and NOT closed by this milestone:**
 
 * **Lane colour is still a fixed pair.** `usage_color_session` /
@@ -912,6 +979,25 @@ and this section reads as what was built.
   IPC, so sub-agent bars are un-outlined until `harness_usage` answers rather
   than outlined by guessing `"agent"`. The lane strip is unaffected — it keys
   CSS off the stored lane id, as it always did.
+* **`enabled_ai_tabs` is still `Vec<AiTabId>`, a closed enum.** Ruling 19 above
+  makes a half-wired third harness fail 10(b) by name instead of failing at V41
+  runtime, which is the tripwire — not the close. The close is
+  `HarnessDescriptor::default_tab(tab_id)` plus `Vec<String>` validated against
+  `canonical_tab_ids()`, and it is a settings-schema change with a migration.
+  Until it lands, *What a new harness is* item 2 owes one more line: **its
+  variants** (`AiTabId`, `TabId::from_str`/`as_str`, `default_ai_tab`), which
+  are the one thing outside `harness/<id>/` a new harness still needs.
+
+* **A project overlay is never schema-migrated.** Ruling 17 restores the SCOPE,
+  so a per-project `harness.<id>.ext` value works and sticks. It does not
+  migrate an overlay written before schema 36: the pre-36 spellings
+  (`statusline.enabled`, `claude_local.*`, `code_audit.expose_<id>`,
+  `offload.opencode_provider*`) are unknown keys to a 36 reader and are dropped
+  on the next save, exactly as any other unknown key is. Pre-existing and
+  documented for the overlay format generally (see the `tool_plugins` legacy-data
+  note in `settings/persistence.rs`); the user re-sets those five once, per
+  project, and it holds.
+
 * **`MemoryEventBody` still lives in `offload/loopback.rs`.** It is one
   harness's wire payload verbatim, and the ledger's destination for it was
   `usage_source()`. It names no harness id, so both allowlists stay clean and
@@ -999,12 +1085,13 @@ artifacts are regenerated):
     CHP minor) still talks to the new binary; the health panel marks it
     stale by version, not broken.
 
-20. **Settings scope (decision 5).** The `harness` block is **machine** scope,
-    not user scope: after the 35 → 36 migration, confirm the per-harness rows
-    are in the machine settings file and that a user-scope file carrying an old
-    `claude_local` / `statusline` / `expose_commands_*` pair no longer shadows
-    them. A second machine with a fresh profile gets defaults, not the first
-    machine's values.
+20. **Settings scope (decision 5, corrected by review finding M-2 — see ruling
+    17).** The `harness` block splits per FIELD. After the 35 → 36 migration,
+    confirm the per-harness rows are in the machine settings file, that a
+    user-scope file carrying an old `claude_local` / `statusline` /
+    `expose_commands_*` pair no longer shadows them, and that a second machine
+    with a fresh profile gets defaults rather than the first machine's values.
+    The project half is item 32.
 21. **Restart hint for a harness with no spawn-baked settings.** Before Phase B
     a harness with no `spawn_sig` slot got **no** hint when a spawn-baked
     setting changed. Flip a spawn-baked setting that applies to such a tab and
@@ -1059,6 +1146,41 @@ artifacts are regenerated):
     diff `tools/list` against the previous RC one more time — Phase G rewrote
     the V39 test literals over the registry, and a test that stopped asserting
     what it used to assert is invisible to `cargo test`.
+
+### Added by the 2026-08-22 review (see `docs/reviews/code-review-V40-2026-08-22.md`)
+
+31. **One identity per grant-bearing route (H-1).** With a tab latched
+    `external`, drive `/mcp/list`, `/mcp/call`, `/run` and `/graph_run` under
+    `?consumer=offload` and under `?consumer=codex`. `offload` must be served
+    under the default harness's grants **and refused by that harness's latch**;
+    `codex` must be refused (400) on all four, naming the registered ids. Item
+    29 covers the tab, the tool name, the proxy start and the settings file, and
+    none of these routes.
+32. **The project half of the settings scope (M-2, and the other half of item
+    20).** A `.cimp/config.json` carrying `harness.<id>.ext.statusline = false`
+    and `harness.<id>.expose_code_audit = false`: both take effect for that
+    project, survive a Settings save, and the same file's `last_seen` /
+    `expose_commands` are dropped **with an Events row naming them**.
+33. **The pre-roster frame (F-1/F-2/F-3).** Open the Settings window with
+    `harness_list` failing or deliberately slow: a "Loading the harness
+    registry…" line, then a banner with *Try again* that recovers without a
+    reload. Never an unlabelled AI-tab checkbox (ticking one kills a PTY), and
+    never a restart hint on the first edit afterwards.
+34. **No probe for a harness nobody enabled (P-M-2).** On a profile whose second
+    harness's tab is disabled, the first post-upgrade launch spawns **no** probe
+    child for it (its CLI never runs); *Run checks now* on that row still does,
+    because that is a user asking.
+35. **The restart hint only for what reaches a launch (P-M-4).** With no
+    local-provider tab: edit the local base URL → **no** hint. Tick a tab's *Use
+    local provider*, edit it again → the hint fires, naming that harness only.
+36. **The native class the latch enforces (P-M-7).** In a tab latched
+    `external`, a native `Edit` is refused by the latch (this branch admitted it
+    before the fix). In an untainted tab, an ordinary `Edit` leaves the tab's
+    latch at `local`, not `external`.
+37. **Eyes-on, not a fix (L-9).** `/latch/state` with a garbage `consumer`
+    answers the documented fail-open shape (`latch:"open"`). Confirm the shipped
+    plugin never sends one — it hard-codes its consumer — and that the `gate`
+    half still reflects the resolved app-wide verdict.
 
 ## V41 preview — Codex CLI (not part of V40)
 

@@ -659,6 +659,14 @@ mod tests {
     /// milestone exit criterion is about. Regenerate deliberately with
     /// `CIMP_BLESS_PLUGIN_GOLDENS=1 cargo test --bin cimp byte_for_byte` and read
     /// the diff; never to make a red test green.
+    ///
+    /// "Byte for byte" means *the bytes the generator emits*, so a carriage
+    /// return is stripped from both sides: whether the template and the goldens
+    /// arrive CRLF is a fact about how Git checked the tree out
+    /// (`core.autocrlf`), not about the plugin. `.gitattributes` pins the whole
+    /// fixture tree to LF so it should not arise — this is the belt to that
+    /// braces, and the same normalization
+    /// `processing::patterns_file`'s byte-identity test does.
     #[test]
     fn the_template_renders_the_pre_phase_m_goldens_byte_for_byte() {
         let bless = std::env::var("CIMP_BLESS_PLUGIN_GOLDENS").is_ok();
@@ -679,8 +687,8 @@ mod tests {
                 )
             });
             assert_eq!(
-                rendered,
-                golden,
+                rendered.replace('\r', ""),
+                golden.replace('\r', ""),
                 "{}: the rendered plugin no longer matches its golden. If the change is INTENDED, \
                  re-bless with CIMP_BLESS_PLUGIN_GOLDENS=1 and review the .js diff — this file is \
                  inside the TCB (design § 5, D7).",

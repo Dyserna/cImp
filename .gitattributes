@@ -14,18 +14,28 @@
 # Line-ending translation would silently break both. Keep them LF everywhere.
 detection/** text eol=lf
 
-# V35 Phase M: the generated-plugin TEMPLATE and its byte-identical goldens.
-# `harness::opencode::plugin` asserts render(template, flags) equals each golden
-# byte for byte, and the rendered text is written into a project's
-# `.opencode/plugin/`. Neither should depend on how a contributor's Git checked
-# the template out, so both stay LF everywhere — same reasoning as the detection
-# bundle above, one layer up.
+# V35 Phase M: the generated-plugin TEMPLATE. `harness::opencode::plugin`
+# asserts render(template, flags) equals each golden byte for byte, and the
+# rendered text is written into a project's `.opencode/plugin/`. Neither should
+# depend on how a contributor's Git checked the template out, so both stay LF
+# everywhere — same reasoning as the detection bundle above, one layer up.
 src-tauri/src/harness/opencode/templates/plugin.js text eol=lf
-src-tauri/fixtures/plugin-goldens/** text eol=lf
 
-# V40 Phase C: the Claude TUI rendered-tail scrapes. `processing::permission`
-# `include_str!`s them and feeds them to the detector unchanged, so a CRLF
-# checkout would change the very bytes the pattern rows are matched against —
-# and `permission_body()` slices one of them by its exact footer suffix. Same
-# reasoning as the plugin goldens above.
-src-tauri/fixtures/harness/*/*/tui/** text eol=lf
+# The whole harness fixture tree is BYTE-EXACT, and every kind of file under it
+# is compared or embedded verbatim by a test:
+#   * `<id>/goldens/plugin.*.js` — the pre-Phase-M plugin goldens, asserted
+#     against the rendered template (they lived under fixtures/plugin-goldens/
+#     until V40 Phase G moved them here, which is how they lost their rule and
+#     started failing the Windows runner's `core.autocrlf=true` checkout);
+#   * `registry.json` — written by `harness::info`'s parity test and imported by
+#     vitest, so a CRLF checkout made the Rust test rewrite it and fail;
+#   * `<id>/<version>/tui/**` — the Claude TUI rendered-tail scrapes.
+#     `processing::permission` `include_str!`s them and feeds them to the
+#     detector unchanged, and `permission_body()` slices one by its exact footer
+#     suffix, so translated line endings change the matched bytes themselves;
+#   * `<id>/<version>/*.jsonl` / `*.json` — canary corpora, `include_str!`d and
+#     compared against the committed file by `harness::canary`;
+#   * `MANIFEST.toml` — parsed beside each corpus.
+# One rule for the tree, so a fixture added tomorrow inherits it instead of
+# reintroducing the Phase G gap.
+src-tauri/fixtures/** text eol=lf

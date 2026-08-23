@@ -1,13 +1,13 @@
 # V40 — Harness registry and the V35 leftovers (everything harness-specific moves behind the plugin)
 
-**Status:** **IMPLEMENTED THROUGH PHASE G** (2026-08-22, branch `feat/v40-harness-registry`). Phases 0 and A-G are done; **Phase H (#100) = RC + the live-verify below**, which is the milestone's only remaining gate. Amendments 0-a...0-g are folded into decisions 2, 4, 5, 9, 17, 24 and 27; every ruling taken during implementation is in *What changed vs the design*. The row-level appendix (`docs/V40-harness-residue-ledger.md`) was DELETED in Phase G: every row is moved, or allowlisted with a reason in `harness/layering.rs` / `src/lib/harnessIdentity.test.ts`, and the layering tests are the durable record.
+**Status:** **IMPLEMENTED THROUGH PHASE I** (2026-08-23). Phases 0 and A-G merged to `develop` at `d1d8676` and shipped in v0.53.0-rc.6; **Phase I (#107) = the post-review residual closures**, on branch `feat/v40-i-residuals`. **Phase H (#100) = RC + the live-verify below**, which is the milestone's only remaining gate. Amendments 0-a...0-g are folded into decisions 2, 4, 5, 9, 17, 24 and 27; every ruling taken during implementation is in *What changed vs the design*. The row-level appendix (`docs/V40-harness-residue-ledger.md`) was DELETED in Phase G: every row is moved, or allowlisted with a reason in `harness/layering.rs` / `src/lib/harnessIdentity.test.ts`, and the layering tests are the durable record.
 GitHub: umbrella #101, milestone 14; phases 0 #102 · A #93 · B #94 · C #95 · D #96 ·
 E #97 · F #98 · G #99 · H #100.
 **Sequencing:** after V39 ships and is live-verified. **V41 — Codex CLI** is
 the consumer: it is the first harness added *through* this registry, and it
 does not start until V40 is merged, released and the live-verify below is
-green. V40 adds no harness; it is a refactor with one schema migration
-(35 → 36), one CHP minor bump (new neutral events, decision 30), three new
+green. V40 adds no harness; it is a refactor with two schema migrations
+(35 → 36 in Phase B, 36 → 37 in Phase I), one CHP minor bump (new neutral events, decision 30), three new
 enforcing tests (10a, 10b and their frontend twin), and the short list of
 deliberate behaviour changes in *What changed vs the design* below — read that
 before treating "no behaviour change" as the whole story. It was driven by a
@@ -959,8 +959,17 @@ and this section reads as what was built.
     widening it to `Vec<String>` is a schema change. What exists instead is the
     join: 10(b) fails, naming the id, if a descriptor declares a `tab_ids` entry
     with no `AiTabId` variant, no `TabId::from_str` arm or no `default_ai_tab`
-    arm, and `AiTabId::ALL` closes the other direction. See the residual below
-    for what that leaves open.
+    arm, and `AiTabId::ALL` closes the other direction.
+    **Superseded by Phase I (#107 item 1):** the join is data now, not a test.
+    `HarnessDescriptor::tabs` is a `&[BuiltinTab]` carrying each reserved tab's
+    id, name, seeded command and local-provider flag; `AiTabId` is a newtype
+    over the registry's own `&'static str`, `TabId::Harness(&'static str)`
+    replaced the three variants, and `default_ai_tab` is one constructor over
+    the `BuiltinTab` row. Wire forms are unchanged, and the seeded configs are
+    byte-identical. 10(b) keeps its assertions for the SHIPPED harnesses, and
+    `an_unshipped_descriptor_round_trips_through_the_tab_machinery` drives a
+    `#[cfg(test)]` descriptor no build ships (`zeta`) through the real
+    production functions with no enum edit.
 
 20. **A harness's declared native class is what the latch enforces** (review
     finding P-M-7). Phase A moved Claude's four `LocalCapability` rows out of
@@ -973,47 +982,51 @@ and this section reads as what was built.
     governs names NOBODY declares, which is still every proxied
     `<server>__<tool>` id.
 
-**Recorded residuals — real, bounded, and NOT closed by this milestone:**
+**Recorded residuals — real, bounded, and NOT closed by this milestone.**
+*Five of them were closed by Phase I (#107) on 2026-08-23; what is left below is
+what Phase I did not close, each with the reason.*
 
-* **Lane colour is still a fixed pair.** `usage_color_session` /
-  `usage_color_agent` are settings fields, so a third declared lane gets the
-  second lane's swatch and no donut CSS rule of its own. The donut, its legend,
-  the lane strip and the share line are otherwise fully lane-general. Closing
-  it is a settings change (a colour per declared lane), and it belongs to
-  whoever adds the third lane.
+* **Closed in Phase I (#107).** Lane colour as a fixed pair (item 4),
+  `enabled_ai_tabs` / `AiTabId` / `TabId` / `default_ai_tab` as closed enums
+  (item 1), `probe::IMPLEMENTED` as a hand-kept list in core (item 3),
+  `MemoryEventBody` in `offload/loopback.rs` (item 2) and the un-migrated
+  project overlay (item 5). See the Phase I live-verify items below, and the
+  commit messages on `feat/v40-i-residuals` for what each one turned into.
 * **The Cost card's four columns and the Sessions row's four stats are keyed
   off the price table**, which has exactly four rates. A category a harness
   does not declare renders `0` there rather than shifting the table out from
   under the `$/MTok` row beside it. Same for the stacked bar's five segments.
+  **Deliberate, decision 29** — these are cImp's pricing vocabulary, not a
+  harness's declaration, and Phase I left them alone on purpose.
 * **`agentBarClass` fails quiet for one paint.** The declared lanes arrive over
   IPC, so sub-agent bars are un-outlined until `harness_usage` answers rather
-  than outlined by guessing `"agent"`. The lane strip is unaffected — it keys
-  CSS off the stored lane id, as it always did.
-* **`enabled_ai_tabs` is still `Vec<AiTabId>`, a closed enum.** Ruling 19 above
-  makes a half-wired third harness fail 10(b) by name instead of failing at V41
-  runtime, which is the tripwire — not the close. The close is
-  `HarnessDescriptor::default_tab(tab_id)` plus `Vec<String>` validated against
-  `canonical_tab_ids()`, and it is a settings-schema change with a migration.
-  Until it lands, *What a new harness is* item 2 owes one more line: **its
-  variants** (`AiTabId`, `TabId::from_str`/`as_str`, `default_ai_tab`), which
-  are the one thing outside `harness/<id>/` a new harness still needs.
-
-* **A project overlay is never schema-migrated.** Ruling 17 restores the SCOPE,
-  so a per-project `harness.<id>.ext` value works and sticks. It does not
-  migrate an overlay written before schema 36: the pre-36 spellings
-  (`statusline.enabled`, `claude_local.*`, `code_audit.expose_<id>`,
-  `offload.opencode_provider*`) are unknown keys to a 36 reader and are dropped
-  on the next save, exactly as any other unknown key is. Pre-existing and
-  documented for the overlay format generally (see the `tool_plugins` legacy-data
-  note in `settings/persistence.rs`); the user re-sets those five once, per
-  project, and it holds.
-
-* **`MemoryEventBody` still lives in `offload/loopback.rs`.** It is one
-  harness's wire payload verbatim, and the ledger's destination for it was
-  `usage_source()`. It names no harness id, so both allowlists stay clean and
-  the layering tests are satisfied — but the row shape is that plugin's, and
-  moving it behind `routes()` is the honest finish. Not a V40 defect; a
-  recorded next step.
+  than outlined by guessing `"agent"`. Phase I's lane colours have the same
+  property by construction — a lane not yet in `declaredOrigins` takes a slot
+  after the declared ones rather than stealing slot 0 — so the one-paint window
+  is now the only place either of them is visible. Bounded and preferred to
+  guessing; not closed.
+* **`load_readonly` migrates neither file.** The `cimp --offload-mcp` child
+  reads the global settings raw and merges the raw overlay, so a legacy pair is
+  at least *consistent*; Phase I deliberately did not add overlay migration
+  there, because migrating only the overlay would merge a v37-shaped diff onto a
+  v36-shaped baseline. Closing it means a no-write variant of
+  `migrate_if_needed` for the global too. Pinned in both directions by
+  `the_load_path_migrates_the_overlay_and_the_child_reader_does_not`.
+* **An overlay written before schema 37 is placed by the GLOBAL file's stated
+  version, and only on the launch where the global itself migrates.** From
+  Phase I onward `save` stamps every overlay with the schema it was written in,
+  so the entry point is exact forever after — but an overlay already on disk
+  carries no stamp, and once the global has been rewritten at CURRENT there is
+  nothing left to infer from. In practice the one migrating launch fixes it in
+  memory and the user's next save writes the current shape; a user who upgrades,
+  never saves anything in that project, and relaunches gets the stale merge
+  again. Bounded, and the alternative (writing the overlay back on load) is the
+  rule the phase was told to keep.
+* **The overlay cascade refuses to start below schema 10.** Below
+  `schema_version` the detectors are presence archaeology, and the v1.2/v1.3
+  transforms answer a partial object by inserting whole `layout` / `terminal`
+  blocks — the silent data loss the pre-Phase-I skip was protecting against.
+  An overlay that old predates every shape the current reader knows anyway.
 
 ## Live-verify — Phase H (#100), the milestone's remaining gate
 
@@ -1191,6 +1204,42 @@ artifacts are regenerated):
     answers the documented fail-open shape (`latch:"open"`). Confirm the shipped
     plugin never sends one — it hard-codes its consumer — and that the `gate`
     half still reflects the resolved app-wide verdict.
+
+### Added by Phase I (#107, 2026-08-23) — the residual closures
+
+38. **A user's usage donut did not change colour (item 4).** On a profile that
+    upgrades across schema 36 → 37: the Code Intelligence tab's token donut,
+    its legend dots, the S/A lane strip and the sub-agent bars' outline are the
+    same colours as before the upgrade — `#30363d` for the main lane, `#3b6ea5`
+    for sub-agents, or whatever the user had picked, which the migration moved
+    into `graph.usage_lane_colors`. Pick a new colour in either card and confirm
+    it recolours BOTH and survives a restart. On a profile that never picked
+    one, confirm `usage_lane_colors` is **absent** from the settings file (the
+    palette slot is the answer, not a stored copy of it).
+39. **A stale project overlay applies again (item 5).** In a project whose
+    `.cimp/config.json` predates schema 36 (or hand-write one carrying
+    `{"claude_local": {"base_url": "http://x:9000"}, "statusline":
+    {"enabled": false}}`), launch: the value takes effect for that project, the
+    log carries `project overlay migrated in memory`, and **the file on disk is
+    unchanged** until a Settings save — after which it carries the v37 shape
+    plus a `schema_version` stamp. Confirm no `.bak` file appears beside it.
+40. **The memory ingress still records (item 2).** With an OpenCode tab: run a
+    few tool calls and complete a turn, then confirm the session's Events rows
+    and its usage donut (turn tokens, not est-only) are the same as the previous
+    RC's for the same work — the body moved into the plugin, so this is the one
+    path where "compiles and the tests pass" is furthest from "still records".
+    A sub-agent turn must still roll up to the parent session's row.
+41. **The probe report reads the same (item 3).** `cimp --harness-canary` and
+    `--harness-canary --json`: nine driven rows, OpenCode's two first, in the
+    same order as the previous RC — the ids are concatenated from the two
+    plugins now.
+42. **A third harness's tab is not needed to see item 1 work**, but the
+    user-visible half is: disable and re-enable each AI built-in from Settings
+    and confirm each lands back at its canonical tab-bar position, that
+    `Reset to default` on each AI tab restores the same name, command and
+    notification texts as before, and that a hand-edited `enabled_ai_tabs`
+    naming an unknown id still quarantines the settings file rather than
+    booting with a tab missing.
 
 ## V41 preview — Codex CLI (not part of V40)
 

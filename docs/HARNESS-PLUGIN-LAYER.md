@@ -101,6 +101,7 @@ The real tree at HEAD:
 | `harness/opencode/config.rs` | L1 | cImp ▸ OpenCode: `OPENCODE_CONFIG_CONTENT`, the managed instructions file, the pinned permission block, the per-spawn server-auth env pair. |
 | `harness/opencode/tools.rs` | L1 | The reviewed table of OpenCode's **own** tool ids — what the plugin's gate and beacon match on. |
 | `harness/opencode/read.rs` | L1 | OpenCode's fallback reader — the `GET /event` SSE tap (Tier C). |
+| `harness/opencode/hook.rs` | L1 | OpenCode ▸ cImp: the `POST /memory/event` body the generated plugin sends — its tool events and, since V24 Phase F, its only exact-token usage ingress. Reads it into the neutral `plugin::MemoryEvent` core records (V40 Phase I). |
 | `harness/_retired/` | — | Data a retired harness left behind. No descriptor, no plugin, no tab, no code path; the leading underscore is what says so, and `every_registry_entry_is_fully_wired` skips it by that convention alone. |
 | `harness/layering.rs` | — | The four tests that keep all of the above true (`#[cfg(test)]`). |
 

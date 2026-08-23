@@ -367,7 +367,9 @@ that plugin's README.
 
 **New local loopback routes** (`offload/loopback.rs`), same authenticated-
 localhost trust model as `/graph_run`: `POST /context/retrieve` (gated on
-`context_injection`) and `POST /memory/event` (OpenCode's memory ingress).
+`context_injection`) and `POST /memory/event` (OpenCode's memory ingress —
+its BODY is `harness/opencode/hook.rs` since V40 Phase I; core keeps the route
+and the recording and receives a neutral `plugin::MemoryEvent`).
 
 ---
 

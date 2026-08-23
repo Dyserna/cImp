@@ -6,6 +6,7 @@
 //! | [`plugin`] | cImp ▸ harness | the generated `.opencode/plugin/cimp-inject-<tab>.js`: its source, the per-tab flags baked into it, when it is written or swept, and the CHP hello it opens with |
 //! | [`tools`] | cImp ▸ harness | the reviewed table of the harness's OWN tool ids — the names the generated plugin's gate and beacon match on |
 //! | [`read`] | harness ▸ cImp | the LEGACY fallback reader — the `GET /event` SSE tap (Tier C, retired from the hot path by Phase L) |
+//! | [`hook`] | harness ▸ cImp | the `POST /memory/event` body the generated plugin sends — its tool events and (V24 Phase F) the only exact-token usage ingress this harness has |
 //!
 //! The generated plugin is inside the TCB (design § 5, D7): the V32 Phase H
 //! native-tool refusal is a `throw` in its `tool.execute.before`, and only the
@@ -15,6 +16,7 @@
 pub mod canary;
 pub mod config;
 pub mod harness_plugin;
+pub mod hook;
 pub mod input;
 pub mod plugin;
 pub mod probe;

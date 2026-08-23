@@ -454,6 +454,73 @@ impl HookReply {
     }
 }
 
+/// **What a harness's memory-ingress body MEANS**, once its plugin has read it
+/// (V40 Phase I, issue #107 item 2).
+///
+/// `POST /memory/event` carries one harness's wire payload — `msg_id`,
+/// `in_tok`, `parent_session_id`, `tool`, `args` — and until Phase I core
+/// declared that struct itself, in `offload/loopback.rs`, and read every field
+/// of it. It named no harness *id*, so both layering allowlists stayed clean
+/// and the tests were satisfied; the row SHAPE was still that plugin's, which
+/// is the same defect one allowlist row further along. A second harness with a
+/// different body shape would have had nowhere to put it but core.
+///
+/// So the wire struct is the plugin's ([`HarnessPlugin::memory_event`]) and
+/// this is what core receives: session identity, and one of four things worth
+/// recording. Core keeps the recording — the graph writes, the live-session
+/// registry, the `cwd` resolution — because those are cImp's, and because
+/// keeping them here would put `crate::graph` inside `harness/`, which is the
+/// dependency direction `harness_modules_do_not_import_capabilities` exists to
+/// refuse.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemoryEvent {
+    /// The project directory the reporting harness says it is in. Resolved to
+    /// a real project root by core before any store is opened (#104).
+    pub cwd: Option<String>,
+    /// The reporting session. **Not** necessarily the session the spend is
+    /// attributed to — see [`MemoryEventKind::Turn::target`].
+    pub session_id: String,
+    /// What this body is.
+    pub kind: MemoryEventKind,
+}
+
+/// The four things a [`MemoryEvent`] can be.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MemoryEventKind {
+    /// A completed assistant turn's real token totals.
+    Turn {
+        /// The session the spend is attributed to: the PARENT when a sub-agent
+        /// reported (its spend is the parent's), else the reporting session.
+        target: String,
+        /// The declared lane it lands in — one of this harness's own
+        /// [`TurnOrigin`] ids, chosen by the plugin from its own
+        /// [`TurnUsageShape`]. Core never picks a lane.
+        origin: &'static str,
+        /// The upsert key: a streamed transcript can report the same id
+        /// repeatedly as its totals fill in, and only the last should survive.
+        msg_id: String,
+        model: Option<String>,
+        in_tok: u32,
+        out_tok: u32,
+        cache_read: u32,
+        cache_make: u32,
+    },
+    /// A **sub-agent's** tool call. Recorded against nobody — a child's tool
+    /// events are the child's working set, not the parent's — but the parent
+    /// stays live, because the child's activity is the parent still working.
+    SubagentTool { parent: String },
+    /// A first-party tool call: the harness's own tool name and its serialized
+    /// input arguments.
+    Tool {
+        tool: String,
+        args: serde_json::Value,
+    },
+    /// The body parsed and says nothing this route records. A 200, not an
+    /// error: the producer is a hook that fires on every tool call, and making
+    /// it handle a refusal for the ordinary case would be noise with no reader.
+    Nothing,
+}
+
 /// The future one [`Route`] handler returns.
 ///
 /// Boxed because the table is a `const` of `fn` pointers: an `async fn`'s
@@ -1422,6 +1489,25 @@ pub trait HarnessPlugin: Sync + Send {
     }
 
     // ── hook ingress (locked decisions 15 and 22) ───────────────────────────
+
+    /// **Read this harness's `POST /memory/event` body** (V40 Phase I, issue
+    /// #107 item 2).
+    ///
+    /// * `None` — this harness serves no memory ingress. Core answers 200 and
+    ///   records nothing: the route exists for the harnesses whose tool and
+    ///   usage events cImp cannot read any other way, and a harness cImp taps
+    ///   in-process has nothing to say here.
+    /// * `Some(Err(why))` — the body did not parse. Core answers 400 with
+    ///   `why`, which is what the producer needs to see.
+    /// * `Some(Ok(event))` — the neutral [`MemoryEvent`] core records.
+    ///
+    /// The plugin picks the lane (out of its own [`TurnUsageShape`]) and the
+    /// roll-up target; core does the recording. Splitting it there is what
+    /// keeps `crate::graph` out of `harness/` while still putting the wire
+    /// struct beside the generator that emits it.
+    fn memory_event(&self, _body: &[u8]) -> Option<Result<MemoryEvent, String>> {
+        None
+    }
 
     /// The loopback routes this harness owns.
     ///

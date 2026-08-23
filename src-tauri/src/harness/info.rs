@@ -31,7 +31,7 @@
 use serde::Serialize;
 
 use super::plugin::{HarnessAffordances, LocalProviderVar, SettingKind};
-use super::registry::{HarnessDescriptor, HarnessFeature, HARNESSES};
+use super::registry::{descriptors, HarnessDescriptor, HarnessFeature};
 
 /// One harness, as the window sees it. Wire mirror of [`HarnessDescriptor`] +
 /// [`HarnessAffordances`].
@@ -43,7 +43,7 @@ pub struct HarnessInfo {
     /// What a human calls it.
     pub label: &'static str,
     /// Reserved built-in tab ids, in canonical order.
-    pub tab_ids: &'static [&'static str],
+    pub tab_ids: Vec<&'static str>,
     /// The binaries whose file stem identifies this harness — what the
     /// frontend's "which harness runs in this tab?" lookup compares against.
     pub binaries: &'static [&'static str],
@@ -191,7 +191,7 @@ fn one(d: &'static HarnessDescriptor) -> HarnessInfo {
     HarnessInfo {
         id: d.id,
         label: d.label,
-        tab_ids: d.tab_ids,
+        tab_ids: d.tab_ids().collect(),
         binaries: d.binaries,
         features: d.features.iter().copied().map(feature_token).collect(),
         consumer: d.consumer,
@@ -235,12 +235,16 @@ fn one(d: &'static HarnessDescriptor) -> HarnessInfo {
 
 /// Every registered harness, in declaration order — what `harness_list` serves.
 pub fn harness_list() -> Vec<HarnessInfo> {
-    HARNESSES.iter().map(one).collect()
+    // `registry::descriptors()` rather than `HARNESSES` so a scoped test
+    // harness reaches the window payload too (V40 Phase I) — in a release
+    // build the two are the same iterator.
+    descriptors().map(one).collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::registry::HARNESSES;
 
     /// The path the fixture lives at, relative to `src-tauri/`.
     const FIXTURE: &str = "fixtures/harness/registry.json";

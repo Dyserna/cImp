@@ -982,10 +982,10 @@ fn the_updater_gate_delegates_to_a_named_predicate_and_changes_no_verdict() {
     use crate::settings::injection::{
         armed_anywhere, armed_outside_the_worker, effective, Feature, Override, Scope,
     };
-    use crate::settings::{default_ai_tab, AiTabId, Settings, TabConfig};
+    use crate::settings::{default_ai_tab, Settings, TabConfig};
 
     let with_tab = || {
-        let mut t = default_ai_tab(AiTabId::Claude);
+        let mut t = default_ai_tab(crate::settings::ai_tab_id("claude"));
         if let TabConfig::AiTool(c) = &mut t {
             c.id = "f38-tab".to_string();
         }

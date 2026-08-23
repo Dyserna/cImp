@@ -497,7 +497,11 @@ impl Default for Settings {
             // F-12: denied by default — the remote worker does not get to run
             // this project's commands until the user says so.
             checks_allow_remote_worker: false,
-            enabled_ai_tabs: vec![AiTabId::Claude],
+            // V40 Phase I: the FIRST REGISTERED harness's first built-in tab,
+            // not a literal `[ai_tab_id("claude")]` — the same rule
+            // `integrity_check` repairs an empty list to, so a fresh install and
+            // a repaired one agree without either naming a product.
+            enabled_ai_tabs: canonical_ai_tab_order().into_iter().take(1).collect(),
             logging: LoggingSettings::default(),
             prompt_templates: Vec::new(),
             templates_seeded: false,
@@ -1477,65 +1481,61 @@ impl LogRetention {
 /// exists so `enabled_ai_tabs` can be a strongly-typed `Vec<AiTabId>` instead
 /// of an untyped string list.
 ///
-/// **This enum is still closed, and the registry is what fills it** (V40 review
-/// finding M-3). Locked decision 3 kept the wire encodings and turned the
-/// per-harness `match` arms into registry lookups; the arms below are the half
-/// that did not move, because `Vec<AiTabId>` on disk is a wire format and
-/// widening it to `Vec<String>` is a schema change, not a refactor. What DOES
-/// exist is the join: `layering::every_registry_entry_is_fully_wired` (10(b))
-/// fails, naming the id, if a descriptor declares a `tab_ids` entry that has no
-/// variant here, no `TabId::from_str` arm and no `default_ai_tab` arm — so a
-/// third harness cannot ship half-wired, silently dropped from
-/// [`canonical_ai_tab_order`] and un-enableable by the user. Closing it
-/// properly is `HarnessDescriptor::default_tab(tab_id)` plus a
-/// `Vec<String>` `enabled_ai_tabs`, and it is a recorded residual.
+/// **V40 Phase I (issue #107 item 1): a newtype over the registry's own tab id,
+/// not a closed enum.** It used to be three variants keyed to the two shipped
+/// harnesses, and review finding M-3 was that nothing joined them to the
+/// registry: a third descriptor compiled, and then its tab was dropped from
+/// [`canonical_ai_tab_order`], could not be held by `enabled_ai_tabs`, had no
+/// `default_ai_tab` arm, and fell through `TabId::from_str` to `Shell` while
+/// `TabId::kind()` called it `AiTool`. Phase A added a test that FAILED in that
+/// case; this closes the case instead, so all a new harness's tab needs is its
+/// [`crate::harness::registry::BuiltinTab`] row.
 ///
-/// V19 ships a single OpenCode tab (not a cloud/local pair like Claude):
-/// OpenCode addresses many providers as `provider/model`, switches between
-/// them in-session, and reads global config/credentials, so a local variant
-/// would be redundant — the one tab covers cloud and local.
-#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq, Hash)]
-#[serde(rename_all = "kebab-case")]
-pub enum AiTabId {
-    Claude,
-    ClaudeLocal,
-    // Explicit rename: serde's kebab-case would split the camelCase variant
-    // name into `open-code`, but the wire format must be the single-word tab id
-    // `opencode` (matching OPENCODE_TAB_ID, the migration output, and the
-    // frontend literals). A mismatch quarantines settings on load — see the
-    // round-trip test.
-    #[serde(rename = "opencode")]
-    OpenCode,
-}
+/// The **wire format is unchanged** (locked decisions 3 and 29): it serializes
+/// as the bare tab-id string and refuses one no descriptor claims — exactly what
+/// the derived enum impl did, `opencode`'s explicit `#[serde(rename)]` included,
+/// because the spelling now comes from the descriptor rather than from a variant
+/// name serde would have split into `open-code`.
+///
+/// The inner `&'static str` is the registry's, so an `AiTabId` cannot be
+/// fabricated: [`Self::from_id`] is the only constructor, and it is a lookup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct AiTabId(&'static str);
 
 impl AiTabId {
-    /// Every variant, in declaration order.
+    /// Every reserved AI tab, in canonical order, is [`canonical_ai_tab_order`].
     ///
-    /// Hand-kept, and pinned in both directions by
-    /// `the_ai_tab_enum_and_the_registry_are_the_same_list`: a variant with no
-    /// descriptor and a descriptor with no variant both fail a test rather than
-    /// producing a tab nothing can enable.
-    pub const ALL: &'static [AiTabId] = &[Self::Claude, Self::ClaudeLocal, Self::OpenCode];
-
+    /// There used to be a hand-kept `const ALL` beside it, pinned against the
+    /// registry by `the_ai_tab_enum_and_the_registry_are_the_same_list`. It IS
+    /// the registry now, so the second list — and the test that watched the two
+    /// for drift — are gone with the drift they watched.
     pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Claude => CLAUDE_TAB_ID,
-            Self::ClaudeLocal => CLAUDE_LOCAL_TAB_ID,
-            Self::OpenCode => OPENCODE_TAB_ID,
-        }
+        self.0
     }
 
-    /// Over [`Self::ALL`] rather than a second literal table: the id spellings
-    /// live in [`Self::as_str`] once, so the two cannot drift.
+    /// The reserved tab this id names, or `None` for a string no descriptor
+    /// claims (a shell id, an `ai-<uuid>` duplicate, a retired id).
     pub fn from_id(id: &str) -> Option<Self> {
-        Self::ALL.iter().copied().find(|t| t.as_str() == id)
+        crate::harness::registry::builtin_tab(id).map(|t| AiTabId(t.id))
     }
 
-    /// True for the local-provider variants (`claude-local`). The integrity
-    /// check uses this as the canonical `use_local_provider` value for each
-    /// reserved id. OpenCode picks its own provider, so it is never "local".
+    /// This tab's declaration. Infallible by construction — the only way to
+    /// hold an `AiTabId` is [`Self::from_id`], which looked it up.
+    fn spec(self) -> &'static crate::harness::registry::BuiltinTab {
+        crate::harness::registry::builtin_tab(self.0)
+            .expect("an AiTabId is a registry lookup that succeeded")
+    }
+
+    /// True for the local-provider variants (`claude-local` today). The
+    /// integrity check uses this as the canonical `use_local_provider` value for
+    /// each reserved id.
+    ///
+    /// V40 Phase I: declared by the harness on its
+    /// [`crate::harness::registry::BuiltinTab`] row, not a `matches!` here. A
+    /// harness that ships a local-provider variant says so; core does not
+    /// recognise one by the shape of its id.
     pub fn uses_local_provider(self) -> bool {
-        matches!(self, Self::ClaudeLocal)
+        self.spec().local_provider
     }
 
     /// Canonical tab-bar position: claude (0) → claude-local → opencode,
@@ -1553,10 +1553,44 @@ impl AiTabId {
     }
 }
 
+/// **Tests only** — the [`AiTabId`] for a reserved tab id.
+///
+/// Naming a harness in a fixture is a recorded input, not a dependency on one
+/// (the identity scan drops test regions for exactly this reason). What this
+/// buys over an inline `unwrap` is that the panic names the id, instead of a
+/// bare `None` twenty lines into a settings fixture.
+#[cfg(test)]
+pub(crate) fn ai_tab_id(id: &str) -> AiTabId {
+    AiTabId::from_id(id).unwrap_or_else(|| panic!("`{id}` is not a registered reserved tab id"))
+}
+
+impl Serialize for AiTabId {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for AiTabId {
+    /// **Refuses an id no descriptor claims**, exactly as the enum's derived
+    /// impl refused an unknown variant. That refusal is load-bearing: a
+    /// `Vec<AiTabId>` that silently accepted junk would let a hand-edited
+    /// settings file name a tab nothing can materialise, and the integrity check
+    /// would then hold an id it cannot seed.
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        AiTabId::from_id(&s).ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "unknown AI tab id `{s}`; expected one of {:?}",
+                crate::harness::registry::canonical_tab_ids()
+            ))
+        })
+    }
+}
+
 /// The reserved AI tab ids in **canonical tab-bar order**, flattened out of the
 /// registry (`claude` → `claude-local` → `opencode` today).
 ///
-/// V40 Phase A: this used to be a literal `[AiTabId::Claude, ..]` array written
+/// V40 Phase A: this used to be a literal `[ai_tab_id("claude"), ..]` array written
 /// out in three places (`persistence::restore_enabled_ai_builtins`,
 /// `ipc::tab_lifecycle`, and `AiTabId::canonical_order`), which is three places
 /// a new harness's tab could be forgotten and only one of them would have said
@@ -1564,21 +1598,17 @@ impl AiTabId {
 /// `tab_ids` order — so a harness owns where its tabs sit relative to its own,
 /// and the registry owns where harnesses sit relative to each other.
 ///
-/// V40 review M-3: the `filter_map` **drops** a registered tab id that has no
-/// `AiTabId` variant, which is the one way a third harness could reach a shipped
-/// build with no canonical position and no way for the user to enable it. That
-/// cannot happen silently any more — 10(b) refuses the descriptor — and the
-/// assertion below is the runtime half, so a debug build says which id went
-/// missing rather than rendering a tab bar one entry short.
+/// V40 review M-3 noted that the old `filter_map` here **dropped** a registered
+/// tab id that had no `AiTabId` variant — the one way a third harness could
+/// reach a shipped build with no canonical position and no way for the user to
+/// enable it. Phase I removed the possibility rather than the symptom: an
+/// [`AiTabId`] IS a registered tab id, so this is a total map and there is
+/// nothing left to drop or to assert about.
 pub fn canonical_ai_tab_order() -> Vec<AiTabId> {
-    let declared = crate::harness::registry::canonical_tab_ids();
-    let out: Vec<AiTabId> = declared.iter().filter_map(|id| AiTabId::from_id(id)).collect();
-    debug_assert_eq!(
-        out.len(),
-        declared.len(),
-        "a registered reserved tab id has no `AiTabId` variant: {declared:?}"
-    );
-    out
+    crate::harness::registry::canonical_tab_ids()
+        .into_iter()
+        .map(AiTabId)
+        .collect()
 }
 
 impl Settings {
@@ -4519,29 +4549,52 @@ impl Default for ShellNotificationConfig {
 //   3. `Settings::default()` to seed a fresh-install file before the first
 //      save.
 
-pub fn default_claude_tab() -> TabConfig {
+/// **The seeded config for ONE reserved AI tab, built from its declaration**
+/// (V40 Phase I, issue #107 item 1).
+///
+/// This used to be three near-identical hand-written constructors plus a
+/// `default_ai_tab` `match` over the three `AiTabId` variants — so a fourth
+/// reserved tab needed a fourth constructor, and a third harness's tab had no
+/// arm to be seeded from at all. The four things that actually differed between
+/// them are the [`crate::harness::registry::BuiltinTab`] row's fields; every
+/// other field below was already identical for all three, and the output for
+/// `claude` / `claude-local` / `opencode` is byte-identical to what the three
+/// constructors produced (pinned by `the_seeded_builtins_are_unchanged`).
+///
+/// The notification prose is derived from the tab's `name` — "<name> is idle" —
+/// which is exactly the pattern all three followed ("Claude is idle", "Claude
+/// (local) is idle", "OpenCode is idle").
+fn ai_tab_from_spec(spec: &'static crate::harness::registry::BuiltinTab) -> TabConfig {
+    let name = spec.name;
     TabConfig::AiTool(AiToolTabConfig {
-        id: CLAUDE_TAB_ID.to_string(),
+        id: spec.id.to_string(),
         builtin: true,
-        name: "Claude".to_string(),
-        command: "claude".to_string(),
+        name: name.to_string(),
+        command: spec.command.to_string(),
         args: Vec::new(),
         cwd: None,
         env: HashMap::new(),
+        // Every shipped AI harness accepts an instructions channel of some kind
+        // (Claude's `--append-system-prompt`, OpenCode's
+        // `OPENCODE_CONFIG_CONTENT`), so the TTS-markup convention applies and a
+        // freshly seeded tab can speak. A harness that cannot take one leaves
+        // the toggle on and injects nothing, which is inert rather than wrong.
         tts_injection: TtsInjection { enabled: true },
         notifications: AiNotificationConfig {
-            idle: NotificationSlot::enabled("Claude is idle"),
-            awaiting_permission: NotificationSlot::enabled("Claude is awaiting permission"),
-            question: NotificationSlot::enabled("Claude has a question"),
-            error: NotificationSlot::enabled("Claude encountered an error"),
+            idle: NotificationSlot::enabled(format!("{name} is idle")),
+            awaiting_permission: NotificationSlot::enabled(format!(
+                "{name} is awaiting permission"
+            )),
+            question: NotificationSlot::enabled(format!("{name} has a question")),
+            error: NotificationSlot::enabled(format!("{name} encountered an error")),
         },
         // Pre-dismissed so the overlay code can use a single per-tab
         // predicate. Aider used to fire a first-launch banner (V1.1)
-        // but Claude tabs never did.
+        // but no AI builtin has since.
         first_launch_notice_dismissed: true,
         theme_override: None,
         background_override: None,
-        use_local_provider: false,
+        use_local_provider: spec.local_provider,
         // V39 Phase A: a fresh tab accepts the keyboard. The read-only lock
         // is a deliberate user action, never a default.
         read_only: false,
@@ -4559,39 +4612,21 @@ pub fn default_claude_tab() -> TabConfig {
     })
 }
 
+/// The seeded `claude` tab.
+///
+/// Kept as a named function because the **frozen** schema migrations construct
+/// it by name (`settings::migration`'s v1 → v2 step embeds its JSON), and a
+/// frozen step must keep saying what it always said. New code asks
+/// [`default_ai_tab`] with the id it already holds.
+pub fn default_claude_tab() -> TabConfig {
+    default_ai_tab_by_id(CLAUDE_TAB_ID).expect("`claude` is a registered reserved tab")
+}
+
 /// V1.4-07: second Claude tab, preconfigured to talk to a local LLM
 /// via the global `claude_local` provider settings. Replaces the
 /// pre-V1.4-07 Aider builtin tab.
 pub fn default_claude_local_tab() -> TabConfig {
-    TabConfig::AiTool(AiToolTabConfig {
-        id: CLAUDE_LOCAL_TAB_ID.to_string(),
-        builtin: true,
-        name: "Claude (local)".to_string(),
-        command: "claude".to_string(),
-        args: Vec::new(),
-        cwd: None,
-        env: HashMap::new(),
-        tts_injection: TtsInjection { enabled: true },
-        notifications: AiNotificationConfig {
-            idle: NotificationSlot::enabled("Claude (local) is idle"),
-            awaiting_permission: NotificationSlot::enabled("Claude (local) is awaiting permission"),
-            question: NotificationSlot::enabled("Claude (local) has a question"),
-            error: NotificationSlot::enabled("Claude (local) encountered an error"),
-        },
-        first_launch_notice_dismissed: true,
-        theme_override: None,
-        background_override: None,
-        use_local_provider: true,
-        // V39 Phase A: a fresh tab accepts the keyboard. The read-only lock
-        // is a deliberate user action, never a default.
-        read_only: false,
-        // V39 Phase B: a fresh tab is nobody's delegation target. Both roles
-        // are opt-in, per tab, from that tab's own popover.
-        delegation_role: DelegationRole::None,
-        delegation_backend: DelegationBackend::default(),
-        // V39: see `default_claude_tab`.
-        injection_overrides: crate::settings::injection::TabInjectionOverrides::all_off(),
-    })
+    default_ai_tab_by_id(CLAUDE_LOCAL_TAB_ID).expect("`claude-local` is a registered reserved tab")
 }
 
 /// V19: OpenCode AI-tool tab using whatever provider OpenCode's own config
@@ -4600,43 +4635,7 @@ pub fn default_claude_local_tab() -> TabConfig {
 /// instructions file (injected via `OPENCODE_CONFIG_CONTENT`), so it honors
 /// the TTS-markup convention and the tab can speak.
 pub fn default_opencode_tab() -> TabConfig {
-    TabConfig::AiTool(AiToolTabConfig {
-        id: OPENCODE_TAB_ID.to_string(),
-        builtin: true,
-        name: "OpenCode".to_string(),
-        command: "opencode".to_string(),
-        args: Vec::new(),
-        cwd: None,
-        env: HashMap::new(),
-        // V19: unlike Aider, OpenCode accepts an instructions file (injected
-        // via OPENCODE_CONFIG_CONTENT), so the TTS-markup convention applies
-        // and the tab can speak. Seeded with the same runtime prompt as Claude.
-        tts_injection: TtsInjection { enabled: true },
-        notifications: AiNotificationConfig {
-            idle: NotificationSlot::enabled("OpenCode is idle"),
-            awaiting_permission: NotificationSlot::enabled("OpenCode is awaiting permission"),
-            question: NotificationSlot::enabled("OpenCode has a question"),
-            error: NotificationSlot::enabled("OpenCode encountered an error"),
-        },
-        first_launch_notice_dismissed: true,
-        theme_override: None,
-        background_override: None,
-        use_local_provider: false,
-        // V39 Phase A: a fresh tab accepts the keyboard. The read-only lock
-        // is a deliberate user action, never a default.
-        read_only: false,
-        // V39 Phase B: a fresh tab is nobody's delegation target. Both roles
-        // are opt-in, per tab, from that tab's own popover.
-        delegation_role: DelegationRole::None,
-        delegation_backend: DelegationBackend::default(),
-        // V39: a newly created AI tab starts with every tab-scoped injection
-        // control explicitly OFF. L1 and every L2 ship on; the per-tab row is
-        // the switch the user reaches for, from this tab's shield badge. NOT
-        // `Default::default()` — that is all-`Inherit`, which is what an
-        // ABSENT cell in an existing settings file must keep meaning (schema
-        // step 34 → 35).
-        injection_overrides: crate::settings::injection::TabInjectionOverrides::all_off(),
-    })
+    default_ai_tab_by_id(OPENCODE_TAB_ID).expect("`opencode` is a registered reserved tab")
 }
 
 /// **TEST-ONLY**: one of the builtin AI tabs with its L3 injection row reset to
@@ -4692,11 +4691,16 @@ pub(crate) fn facade_tab(id: &str, backend_name: &str) -> TabConfig {
 }
 
 pub fn default_ai_tab(id: AiTabId) -> TabConfig {
-    match id {
-        AiTabId::Claude => default_claude_tab(),
-        AiTabId::ClaudeLocal => default_claude_local_tab(),
-        AiTabId::OpenCode => default_opencode_tab(),
-    }
+    ai_tab_from_spec(id.spec())
+}
+
+/// The same, from a raw id — `None` for a string no descriptor claims.
+///
+/// The IPC "reset this tab to defaults" command and the three named
+/// constructors above go through here; a caller that already holds an
+/// [`AiTabId`] uses [`default_ai_tab`], which cannot fail.
+pub fn default_ai_tab_by_id(id: &str) -> Option<TabConfig> {
+    crate::harness::registry::builtin_tab(id).map(ai_tab_from_spec)
 }
 
 /// V9-01: the reserved, non-closable Code Graph monitor tab. A Shell-kind
@@ -6927,81 +6931,113 @@ mod tests {
 
     #[test]
     fn ai_tab_id_serde_wire_format_matches_tab_ids() {
-        // The serde wire string for each AiTabId MUST equal its tab-id constant
-        // (and the frontend literal + the migration output). A mismatch
-        // quarantines settings on load. Round-trip both directions.
-        for (variant, id) in [
-            (AiTabId::Claude, "claude"),
-            (AiTabId::ClaudeLocal, "claude-local"),
-            (AiTabId::OpenCode, "opencode"),
-        ] {
-            assert_eq!(
-                serde_json::to_value(variant).unwrap(),
-                json!(id),
-                "serialize {id}"
-            );
+        // The serde wire string for each AiTabId MUST equal its tab id (and the
+        // frontend literal + the migration output). A mismatch quarantines
+        // settings on load. Round-trip both directions, over the WHOLE registry
+        // rather than three hand-spelled rows: a fourth reserved tab is covered
+        // the day it is declared.
+        let ids = crate::harness::registry::canonical_tab_ids();
+        assert!(
+            ids.len() >= 3,
+            "the registry's tab list collapsed to {ids:?} — this test would pass by iterating              nothing"
+        );
+        for id in &ids {
+            let tab = AiTabId::from_id(id).expect("a canonical tab id resolves");
+            assert_eq!(serde_json::to_value(tab).unwrap(), json!(id), "serialize {id}");
             assert_eq!(
                 serde_json::from_value::<AiTabId>(json!(id)).unwrap(),
-                variant,
+                tab,
                 "deserialize {id}"
             );
-            assert_eq!(variant.as_str(), id, "as_str {id}");
+            assert_eq!(tab.as_str(), *id, "as_str {id}");
         }
-        // Every variant is covered above, so the serde wire format cannot gain
-        // an unpinned spelling.
-        assert_eq!(AiTabId::ALL.len(), 3);
+        // The three spellings this build ships, pinned by hand as well: the loop
+        // above would still pass if every id in the registry were renamed at
+        // once, and these three strings are in every user's settings file
+        // (locked decisions 3 and 29).
+        assert_eq!(ids[..3], ["claude", "claude-local", "opencode"]);
     }
 
-    /// **The tab enum and the registry are one list** (V40 review finding M-3).
+    /// **An id no descriptor claims is refused, not silently accepted** (V40
+    /// Phase I).
     ///
-    /// `AiTabId` is still closed while the harness set is data, so the two can
-    /// part company in either direction and neither failure is loud:
-    ///
-    /// * a descriptor tab id with no variant is dropped by
-    ///   `canonical_ai_tab_order()`, cannot be held by `enabled_ai_tabs`, has no
-    ///   `default_ai_tab` arm to seed it and falls through `TabId::from_str` to
-    ///   `Shell` while `TabId::kind()` calls it `AiTool`. That direction is
-    ///   caught by 10(b) (`every_registry_entry_is_fully_wired`), which names
-    ///   the id and the three places to add it;
-    /// * a VARIANT with no descriptor is a tab id the tab bar orders and the
-    ///   integrity check can restore, backed by no harness at all. That
-    ///   direction is this test.
-    ///
-    /// The variant count is read off the declaration so `ALL` cannot silently
-    /// stop being every variant. Newline-agnostic: CI checks this tree out with
-    /// CRLF.
+    /// The old `AiTabId` was a serde enum, so an unknown string failed the
+    /// whole `Settings` parse and the file was quarantined. The newtype's
+    /// hand-written `Deserialize` has to keep doing that: a `Vec<AiTabId>` that
+    /// accepted junk would let a hand-edited `enabled_ai_tabs` name a tab
+    /// `restore_enabled_ai_builtins` cannot seed, which is a boot with a tab
+    /// missing and nothing said.
     #[test]
-    fn the_ai_tab_enum_and_the_registry_are_the_same_list() {
-        let from_enum: Vec<&str> = AiTabId::ALL.iter().map(|t| t.as_str()).collect();
-        assert_eq!(
-            from_enum,
-            crate::harness::registry::canonical_tab_ids(),
-            "`AiTabId::ALL` and the registry's canonical tab ids must be the same list, in the              same order — a variant with no descriptor is a tab the bar orders and nothing backs"
+    fn an_unregistered_ai_tab_id_is_refused_on_the_wire() {
+        assert!(serde_json::from_value::<AiTabId>(json!("aider")).is_err());
+        assert!(serde_json::from_value::<AiTabId>(json!("")).is_err());
+        assert!(serde_json::from_value::<AiTabId>(json!("ai-1234")).is_err());
+        assert!(AiTabId::from_id("shell-default-1").is_none());
+        // …and the whole-settings consequence, which is the one users feel.
+        let mut v = serde_json::to_value(Settings::default()).unwrap();
+        v["enabled_ai_tabs"] = json!(["claude", "aider"]);
+        assert!(
+            serde_json::from_value::<Settings>(v).is_err(),
+            "an unknown reserved tab id must fail the parse, exactly as the enum did"
         );
+    }
 
-        let src = include_str!("schema.rs");
-        let start = src
-            .find("pub enum AiTabId {")
-            .expect("`AiTabId` is gone — re-point this test");
-        let decl = &src[start..];
-        let decl = &decl[..decl.find("
-}").expect("the declaration closes")];
-        let variants = decl
-            .lines()
-            .filter(|l| {
-                let t = l.trim();
-                !t.is_empty()
-                    && !t.starts_with("//")
-                    && !t.starts_with('#')
-                    && !t.starts_with("pub enum")
-                    && t.ends_with(',')
-            })
-            .count();
-        assert_eq!(
-            variants,
-            AiTabId::ALL.len(),
-            "`AiTabId::ALL` is not every variant — add the new one to it, and give it a              `HarnessDescriptor` tab id, a `TabId::from_str` arm and a `default_ai_tab` arm"
+    /// **The three shipped built-ins are seeded byte-identically** (V40 Phase
+    /// I).
+    ///
+    /// `default_ai_tab` is one generic constructor over the descriptor's
+    /// `BuiltinTab` row now, where it used to be three hand-written functions.
+    /// The seeded config is what lands in a fresh install's `settings.json` and
+    /// what the frozen v1 → v2 migration embeds, so "generic" has to mean
+    /// "identical", not "close enough".
+    #[test]
+    fn the_seeded_builtins_are_unchanged() {
+        let expect = |id: &str, name: &str, command: &str, local: bool| {
+            let TabConfig::AiTool(c) = default_ai_tab(ai_tab_id(id)) else {
+                panic!("{id} is not an AI-tool tab");
+            };
+            assert_eq!(c.id, id);
+            assert_eq!(c.name, name);
+            assert_eq!(c.command, command);
+            assert_eq!(c.use_local_provider, local);
+            assert!(c.builtin);
+            assert!(c.tts_injection.enabled);
+            assert!(c.first_launch_notice_dismissed);
+            assert!(c.args.is_empty() && c.cwd.is_none() && c.env.is_empty());
+            assert_eq!(c.notifications.idle.text, format!("{name} is idle"));
+            assert_eq!(
+                c.notifications.awaiting_permission.text,
+                format!("{name} is awaiting permission")
+            );
+            assert_eq!(c.notifications.question.text, format!("{name} has a question"));
+            assert_eq!(
+                c.notifications.error.text,
+                format!("{name} encountered an error")
+            );
+        };
+        expect("claude", "Claude", "claude", false);
+        expect("claude-local", "Claude (local)", "claude", true);
+        expect("opencode", "OpenCode", "opencode", false);
+        // The named constructors the frozen migrations call still answer the
+        // same thing as the generic one.
+        // `TabConfig` has no `PartialEq`; its JSON is the shape that matters
+        // anyway, since that is what lands on disk.
+        let same = |a: TabConfig, b: TabConfig| {
+            assert_eq!(
+                serde_json::to_value(&a).unwrap(),
+                serde_json::to_value(&b).unwrap()
+            );
+        };
+        same(default_claude_tab(), default_ai_tab(ai_tab_id("claude")));
+        same(
+            default_claude_local_tab(),
+            default_ai_tab(ai_tab_id("claude-local")),
         );
+        same(default_opencode_tab(), default_ai_tab(ai_tab_id("opencode")));
+        // `uses_local_provider` is the descriptor's field, not a `matches!`.
+        assert!(ai_tab_id("claude-local").uses_local_provider());
+        assert!(!ai_tab_id("claude").uses_local_provider());
+        assert!(!ai_tab_id("opencode").uses_local_provider());
     }
 
     #[test]

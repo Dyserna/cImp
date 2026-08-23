@@ -14698,14 +14698,14 @@ mod tests {
     /// tab. The consumer of a tab is its COMMAND (`tabs::tab_consumer`), so
     /// these are built from the real defaults rather than by stamping a field.
     fn settings_with_consumer_tabs(tabs_in: &[(&str, &str)]) -> crate::settings::Settings {
-        use crate::settings::{default_ai_tab, default_graph_monitor_tab, AiTabId, TabConfig};
+        use crate::settings::{default_ai_tab, default_graph_monitor_tab, TabConfig};
         let mut tabs = vec![default_graph_monitor_tab()];
         for (consumer, id) in tabs_in {
             let mut t = crate::settings::ai_tab_inheriting_injection(default_ai_tab(
                 if *consumer == "claude" {
-                    AiTabId::Claude
+                    crate::settings::ai_tab_id("claude")
                 } else {
-                    AiTabId::OpenCode
+                    crate::settings::ai_tab_id("opencode")
                 },
             ));
             if let TabConfig::AiTool(c) = &mut t {

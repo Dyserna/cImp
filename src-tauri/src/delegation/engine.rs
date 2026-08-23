@@ -1522,8 +1522,8 @@ mod tests {
             );
         }
         assert_eq!(
-            screen_name(&TabId::Claude),
-            format!("delegation__{}", TabId::Claude.as_str())
+            screen_name(&TabId::from_str("claude")),
+            format!("delegation__{}", TabId::from_str("claude").as_str())
         );
     }
 

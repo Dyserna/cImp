@@ -588,37 +588,37 @@ fn every_registry_entry_is_fully_wired() {
         // 3. Identity: a binary to recognise it by, at least one reserved tab id,
         //    a consumer token, and a label a human reads.
         assert!(!d.binaries.is_empty(), "{dir}: no binary — nothing can classify its tabs");
-        assert!(!d.tab_ids.is_empty(), "{dir}: no reserved tab id");
+        assert!(!d.tabs.is_empty(), "{dir}: no reserved tab id");
 
-        // 3a. **Every declared tab id must be REPRESENTABLE by the tab
-        //     machinery** (V40 review finding M-3).
+        // 3a. **Every declared tab id IS representable by the tab machinery**
+        //     (V40 review finding M-3, closed in Phase I).
         //
-        //     `AiTabId`, `TabId` and `default_ai_tab` are still closed enums
-        //     keyed to the two shipped harnesses, and nothing joined them to the
-        //     registry. A third descriptor compiled, passed every other test —
-        //     and then `canonical_ai_tab_order()` dropped its tab (no canonical
-        //     position), `enabled_ai_tabs: Vec<AiTabId>` could not hold it (the
-        //     user could not enable it and `restore_enabled_ai_builtins` never
-        //     restored it), `default_ai_tab` had no arm to seed it from, and
+        //     `AiTabId`, `TabId` and `default_ai_tab` used to be closed enums
+        //     keyed to the two shipped harnesses, with nothing joining them to
+        //     the registry: a third descriptor compiled, passed every other test
+        //     — and then `canonical_ai_tab_order()` dropped its tab (no
+        //     canonical position), `enabled_ai_tabs: Vec<AiTabId>` could not
+        //     hold it, `default_ai_tab` had no arm to seed it from, and
         //     `TabId::from_str` answered `Shell(..)` while `TabId::kind()` —
-        //     which asks the registry — called the same id `AiTool`: a `Shell`
-        //     variant claiming AI kind.
+        //     which asks the registry — called the same id `AiTool`.
         //
-        //     None of that failed loudly, which is the class this milestone
-        //     exists to delete. Until the enums are registry-driven, THIS is the
-        //     join: adding a descriptor without its variants fails here, naming
-        //     the id and the three places it has to be added.
-        for tab_id in d.tab_ids {
+        //     Phase A made that a loud failure here; Phase I made it
+        //     unrepresentable — all three resolve the id through
+        //     `registry::builtin_tab` now. These assertions stay as the SHIPPED
+        //     half: `an_unshipped_descriptor_round_trips_through_the_tab_machinery`
+        //     proves a descriptor no build ships works with no enum edit, and
+        //     this proves the two that DO ship still do.
+        for tab_id in d.tab_ids() {
             assert!(
                 crate::settings::AiTabId::from_id(tab_id).is_some(),
-                "{dir}: reserved tab id `{tab_id}` has no `AiTabId` variant — it would have no                  canonical tab-bar position, `enabled_ai_tabs` could not hold it, and the user                  could never enable it. Add the variant (with its `#[serde(rename)]` if the                  kebab-case default does not spell the tab id) and its `default_ai_tab` arm."
+                "{dir}: reserved tab id `{tab_id}` does not resolve to an `AiTabId` — it would                  have no canonical tab-bar position, `enabled_ai_tabs` could not hold it, and                  the user could never enable it."
             );
             assert!(
-                !matches!(
+                matches!(
                     crate::state::TabId::from_str(tab_id),
-                    crate::state::TabId::Shell(_)
+                    crate::state::TabId::Harness(_)
                 ),
-                "{dir}: reserved tab id `{tab_id}` falls through `TabId::from_str` to `Shell`                  while `TabId::kind()` reports `AiTool` for it — a Shell variant claiming AI                  kind. Add its arm to `TabId::from_str`/`as_str`."
+                "{dir}: reserved tab id `{tab_id}` does not round-trip through `TabId::from_str`                  to `TabId::Harness` — an id `TabId::kind()` reports as `AiTool` while its                  identity says otherwise."
             );
             assert!(
                 matches!(
@@ -631,9 +631,9 @@ fn every_registry_entry_is_fully_wired() {
             );
         }
         // …and the join in the other direction: the canonical order the tab bar
-        // and the integrity repair read must carry EVERY registered tab id, not
-        // the subset that happens to have a variant. `canonical_ai_tab_order`
-        // `filter_map`s, so a dropped id is invisible at runtime.
+        // and the integrity repair read carries EVERY registered tab id. Total
+        // by construction now, and asserted anyway — the cost is one comparison
+        // and what it would catch is a `filter` creeping back in.
         assert_eq!(
             crate::settings::canonical_ai_tab_order().len(),
             crate::harness::registry::canonical_tab_ids().len(),
@@ -811,6 +811,105 @@ fn every_registry_entry_is_fully_wired() {
          cannot see is the thing that panel exists to end"
     );
 }
+
+/// **A harness this build has never heard of goes all the way through the tab
+/// machinery, with no enum edit** (V40 Phase I, issue #107 item 1).
+///
+/// This is the assertion locked decision 1 always wanted and never had.
+/// `every_registry_entry_is_fully_wired` proves the two SHIPPED harnesses are
+/// wired — which is exactly the evidence a build with three hard-coded arms
+/// would also produce. Review finding M-3 was that the tab machinery *was* three
+/// hard-coded arms: `AiTabId`, `TabId::from_str` and `default_ai_tab` were
+/// closed enums, so a third descriptor compiled and then its tab silently had no
+/// canonical position, could not be enabled, could not be seeded, and came back
+/// from `from_str` as a `Shell` that `kind()` called `AiTool`.
+///
+/// So the fixture is a descriptor nothing in the tree has ever seen
+/// ([`registry::EXTRA_TEST_HARNESS`], id `zeta`, one tab, a plugin that declares
+/// nothing), installed for the length of this closure on this thread only, and
+/// driven through the REAL production functions — not through parameterised
+/// copies of them, which would prove only that the copies work.
+///
+/// If any of these ever needs an arm added for `zeta`, this test fails and the
+/// residual is back.
+#[test]
+fn an_unshipped_descriptor_round_trips_through_the_tab_machinery() {
+    use crate::harness::registry;
+    use crate::settings::{
+        canonical_ai_tab_order, default_ai_tab, AiTabId, Settings, TabConfig,
+    };
+    use crate::state::TabId;
+
+    // Outside the scope it does not exist — which is what makes everything
+    // below evidence rather than a fixture leaking into the registry.
+    assert!(AiTabId::from_id("zeta").is_none());
+    assert!(!registry::canonical_tab_ids().contains(&"zeta"));
+
+    registry::with_extra_harness(&registry::EXTRA_TEST_HARNESS, || {
+        // 1. Identity.
+        let h = crate::harness::HarnessId::from_tab_id("zeta").expect("the tab names a harness");
+        assert_eq!(h.id(), Some("zeta"));
+        assert_eq!(h.label(), "Zeta");
+        assert_eq!(crate::harness::HarnessId::from_command("zeta.exe"), Some(h));
+        assert_eq!(crate::harness::HarnessId::from_consumer("zeta"), Some(h));
+
+        // 2. `TabId` — a `Harness` variant, AI kind, non-closable, and the wire
+        //    form is the bare id.
+        let tab = TabId::from_str("zeta");
+        assert_eq!(tab, TabId::Harness("zeta"));
+        assert_eq!(tab.kind(), crate::state::TabKind::AiTool);
+        assert!(tab.is_builtin());
+        assert_eq!(serde_json::to_string(&tab).unwrap(), "\"zeta\"");
+        assert_eq!(
+            serde_json::from_str::<TabId>("\"zeta\"").unwrap(),
+            tab,
+            "a reserved id must not come back as `Shell`"
+        );
+
+        // 3. `AiTabId` and the canonical order — it is LAST, because the
+        //    shipped harnesses are declared before it.
+        let zeta = AiTabId::from_id("zeta").expect("the registry claims it");
+        let order = canonical_ai_tab_order();
+        assert_eq!(order.last().copied(), Some(zeta));
+        assert_eq!(zeta.canonical_order(), order.len() - 1);
+        assert!(!zeta.uses_local_provider());
+
+        // 4. `enabled_ai_tabs` can hold it, on the wire in both directions.
+        assert_eq!(serde_json::to_value(zeta).unwrap(), serde_json::json!("zeta"));
+        let mut s = Settings::default();
+        s.enabled_ai_tabs = vec![zeta];
+        let round: Settings = serde_json::from_value(serde_json::to_value(&s).unwrap())
+            .expect("a settings file naming this tab parses");
+        assert_eq!(round.enabled_ai_tabs, vec![zeta]);
+
+        // 5. It can be SEEDED — the arm `default_ai_tab` used to lack.
+        let TabConfig::AiTool(cfg) = default_ai_tab(zeta) else {
+            panic!("default_ai_tab did not seed an AI-kind tab");
+        };
+        assert_eq!((cfg.id.as_str(), cfg.name.as_str(), cfg.command.as_str()), ("zeta", "Zeta", "zeta"));
+        assert_eq!(cfg.notifications.idle.text, "Zeta is idle");
+        assert!(cfg.builtin);
+
+        // (The integrity-repair half lives beside the repair, in
+        //  `settings::persistence`: `integrity_check` is private to that
+        //  module, and a test that reached around the boundary to drive it
+        //  would be asserting about a copy.)
+
+        // 7. The window's roster carries it — `harness_list` is data, not a
+        //    hand-written mirror of the two shipped rows.
+        let list = crate::harness::info::harness_list();
+        let row = list.iter().find(|r| r.id == "zeta").expect("harness_list carries it");
+        assert_eq!(row.label, "Zeta");
+        assert_eq!(row.tab_ids, vec!["zeta"]);
+        assert_eq!(row.consumer, "zeta");
+    });
+
+    // Scoped: the fixture is gone the moment the closure returns, so nothing
+    // else in this binary can see it.
+    assert!(AiTabId::from_id("zeta").is_none());
+    assert!(crate::harness::info::harness_list().iter().all(|r| r.id != "zeta"));
+}
+
 
 /// The L4 capabilities. A harness module reaching for one of these has put
 /// capability logic in the wrong layer (design § 2: L4 speaks only cImp domain
@@ -1013,20 +1112,14 @@ const IDENTITY_ALLOWLIST: &[(&str, &str)] = &[
          `Settings::harness` and the plugins' `ext`.",
     ),
     // ── state: a persisted tab id is a persisted tab id ────────────────────
-    (
-        "state/manager.rs",
-        "PERSISTED WIRE FORMS (locked decision 29). `TabId::{as_str, from_str}` and its \
-         `Serialize`/`Deserialize` carry `\"claude\"` / `\"claude-local\"` / `\"opencode\"` \
-         because those strings are in every settings file and every frontend payload; typing \
-         them as `HarnessId` would mis-read a pre-split row. Phase A removed the per-harness \
-         BRANCHES (`kind`, `is_builtin` are registry lookups now); the variants stay for the \
-         encodings. Phase D took the OTHER residue this row used to name: the signal \
-         vocabulary is `StateSignal::HarnessOutput*` / `SubagentsActiveChanged` now, \
-         served over CHP as well as emitted in-process, and the sub-agent stall \
-         backstop asks the tab's harness for its timing instead of holding one \
-         product's constant (locked decisions 18 and 30). What is left here really is \
-         only the persisted strings.",
-    ),
+    //
+    // `state/manager.rs` left this list in V40 Phase I. Its reason was
+    // `TabId::{Claude, ClaudeLocal, OpenCode}` and the `as_str`/`from_str` arms
+    // that spelled their persisted strings; there is one `TabId::Harness(&str)`
+    // variant now, carrying the registry's own id, and `from_str` resolves a
+    // reserved id through `registry::builtin_tab` instead of matching three
+    // literals. The wire form is unchanged (locked decision 29) — the file just
+    // no longer has to know which strings it is.
     // ── the MCP consumer vocabulary ────────────────────────────────────────
     // ── the loopback wire ──────────────────────────────────────────────────
     //
@@ -1079,7 +1172,7 @@ fn identity_needles() -> BTreeSet<String> {
     for d in crate::harness::registry::HARNESSES {
         out.insert(d.id.to_string());
         out.insert(d.consumer.to_string());
-        out.extend(d.tab_ids.iter().map(|s| s.to_string()));
+        out.extend(d.tab_ids().map(|s| s.to_string()));
         out.extend(d.binaries.iter().map(|s| s.to_string()));
     }
     out

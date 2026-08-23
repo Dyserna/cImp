@@ -2332,7 +2332,7 @@ mod tests {
         let defaults = Settings::default();
         let settings = SettingsHandle::new(defaults.clone(), defaults, std::env::temp_dir());
         let ctx = OobContext {
-            tab: TabId::Claude,
+            tab: TabId::from_str("claude"),
             tts: tts_tx,
             state_signals: sig_tx,
             settings,

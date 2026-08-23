@@ -5338,20 +5338,20 @@ mod tests {
     /// Runs on every platform and reads the REAL default tab list, so a future
     /// default whose command is platform-conditional (or a fourth harness added
     /// without a grant table) fails here rather than in the field.
+    ///
+    /// V40 Phase I: the list is `canonical_ai_tab_order()` rather than three
+    /// hand-spelled ids guarded by an exhaustive `match` whose only job was to
+    /// stop compiling when a fourth was added. The registry view covers a fourth
+    /// reserved tab the day it is DECLARED, which is a stronger guarantee than a
+    /// compile error someone has to be routed through.
     #[test]
     fn every_default_ai_tab_carries_a_harness_on_every_platform() {
-        use crate::settings::{default_ai_tab, AiTabId};
+        use crate::settings::{canonical_ai_tab_order, default_ai_tab};
         // `Settings::default().tabs` is EMPTY — the reserved builtins are
         // materialized by the integrity check from this factory, so the factory
         // is what "the shipped defaults" means here.
         let mut seen = 0usize;
-        for id in [AiTabId::Claude, AiTabId::ClaudeLocal, AiTabId::OpenCode] {
-            // Exhaustive on purpose: a FOURTH reserved AI builtin stops this
-            // test compiling until someone decides which harness it is and
-            // whether `sandbox::tabs` has a grant table for it.
-            match id {
-                AiTabId::Claude | AiTabId::ClaudeLocal | AiTabId::OpenCode => {}
-            }
+        for id in canonical_ai_tab_order() {
             let TabConfig::AiTool(cfg) = default_ai_tab(id) else {
                 panic!("{} is not an AI-tool tab", id.as_str());
             };

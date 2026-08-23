@@ -232,13 +232,18 @@ pub fn spawn_tts_worker(
                         // gate at all).
                         // Benign fallback on a poisoned lock rather than
                         // `.expect()`: a panic here would permanently kill the
-                        // TTS worker for the rest of the session. `TabId::Claude`
-                        // is the v2 default and matches how the audio thread
-                        // (`current_active`) handles the same poisoned lock.
+                        // TTS worker for the rest of the session. V40 Phase I:
+                        // the fallback is `TabId::first_harness_default()` — the
+                        // registry's guess — not the literal `TabId::from_str("claude")` the
+                        // enum used to offer, which is the same "when in doubt,
+                        // Claude" locked decision 2 removed everywhere else. It
+                        // matches how the audio thread (`current_active`) and
+                        // the notification manager handle the same poisoned
+                        // lock.
                         let active_tab = active
                             .read()
                             .map(|g| g.clone())
-                            .unwrap_or(crate::state::TabId::Claude);
+                            .unwrap_or_else(|_| crate::state::TabId::first_harness_default());
                         let speak_background = settings.current().behavior.speak_background_tabs;
                         if tab != active_tab && !speak_background {
                             debug!(?tab, ?active_tab, "tts: dropping segment for inactive tab");
@@ -400,7 +405,13 @@ async fn load_engine(
         }
         Err(e) => {
             warn!(error = %e, "tts engine init failed; TTS disabled");
-            let tab = active.read().map(|g| g.clone()).unwrap_or(TabId::Claude);
+            // Same poisoned-lock fallback as above: the registry's first
+            // built-in tab, so the error is reported against a tab this build
+            // actually ships.
+            let tab = active
+                .read()
+                .map(|g| g.clone())
+                .unwrap_or_else(|_| TabId::first_harness_default());
             let _ = state_signals.try_send(StateSignal::TtsError { tab });
             None
         }

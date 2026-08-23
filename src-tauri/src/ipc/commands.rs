@@ -4655,7 +4655,7 @@ mod tests {
         assert_eq!(
             read_only_refusal(
                 &ReadOnlySource::Driven {
-                    by: TabId::OpenCode
+                    by: TabId::from_str("opencode")
                 },
                 "hello",
                 Some("api-work"),
@@ -4696,7 +4696,7 @@ mod tests {
     #[test]
     fn mouse_wheel_passes_the_lock_under_either_source() {
         let driven = ReadOnlySource::Driven {
-            by: TabId::OpenCode,
+            by: TabId::from_str("opencode"),
         };
         for wheel in [
             "\x1b[<64;10;5M",              // wheel up (SGR)

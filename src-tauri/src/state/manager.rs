@@ -394,31 +394,34 @@ impl TabActivity {
     }
 }
 
-/// Identifier for one of the multi-tab subprocesses cimp owns. Four
-/// reserved AI variants cover the V14 builtins (subscription / local
-/// pairs for Claude Code and Aider); `Shell(id)` carries the
-/// user-managed tab IDs introduced in v3 (M1 had a hardcoded "shell-1";
-/// M2/M3 generalize). The runtime kind discriminator is [`TabKind`],
-/// not this — `TabId` is purely an opaque identity used as HashMap key
-/// and IPC payload.
+/// Identifier for one of the multi-tab subprocesses cimp owns. `Harness(id)`
+/// covers every reserved AI built-in a registered harness declares;
+/// `Shell(id)` carries the user-managed tab IDs introduced in v3 (M1 had a
+/// hardcoded "shell-1"; M2/M3 generalize). The runtime kind discriminator is
+/// [`TabKind`], not this — `TabId` is purely an opaque identity used as HashMap
+/// key and IPC payload.
 ///
-/// Wire format: a single string. Reserved IDs serialize as `"claude"` /
-/// `"claude-local"` / `"aider"` / `"aider-local"`; `Ai(s)` and `Shell(s)`
-/// serialize as the inner string verbatim. Round-tripping a string that
-/// starts with `"ai-"` yields an `Ai` variant; any other unrecognized
-/// string yields a `Shell` variant.
+/// Wire format: a single string. Every variant serializes as the id string it
+/// carries, verbatim. Round-tripping a reserved built-in tab id yields a
+/// `Harness` variant, a string starting with `"ai-"` yields an `Ai` variant, and
+/// any other unrecognized string yields a `Shell` variant.
 #[derive(Clone, Hash, Eq, PartialEq, Debug)]
 pub enum TabId {
-    Claude,
-    /// V1.4-07: Claude Code talking to a local LLM via the
-    /// `claude_local` provider settings. Replaces the pre-V1.4-07 `Aider`
-    /// variant; the v1.7 → v1.8 migration rewrites the aider tab to
-    /// this id.
-    ClaudeLocal,
-    /// V19: the single OpenCode AI-tool tab — OpenCode picks its own
-    /// provider/model, so (unlike Claude) there is no local variant. Replaces
-    /// both the V14 `Aider` and `AiderLocal` variants.
-    OpenCode,
+    /// One of the **reserved built-in tabs a registered harness declares** —
+    /// `claude`, `claude-local`, `opencode` today.
+    ///
+    /// V40 Phase I (issue #107 item 1): was three variants, one per shipped
+    /// tab. Review finding M-3 was that a third descriptor's tab had no arm
+    /// here, so it fell through to [`Self::Shell`] while [`Self::kind`] —
+    /// which already asked the registry — answered `AiTool` for the same id: a
+    /// `Shell` variant claiming AI kind, with nothing to say so.
+    ///
+    /// The payload is the registry's own `&'static str` (see
+    /// [`crate::harness::registry::BuiltinTab`]), so this variant cannot name
+    /// an id no harness declares: [`Self::from_str`] resolves it through the
+    /// registry and an unclaimed string takes one of the arms below. The wire
+    /// form is unchanged — `"claude"` is still `"claude"` (locked decision 29).
+    Harness(&'static str),
     /// A user-spawned *duplicate* of one of the AI builtins (the `+` on
     /// a Claude/OpenCode tab). Carries a `"ai-<uuid>"` id and is a closable,
     /// non-builtin AI-kind tab. Its launch behavior (env synthesis,
@@ -473,20 +476,20 @@ impl TabId {
     ///
     /// It is still a guess; what changed is that it is the REGISTRY's guess and
     /// moves with the registry, so a build that ships a different first harness
-    /// does not silently fall back to one it does not ship.
+    /// does not silently fall back to one it does not ship. A build that ships
+    /// NO harness has no AI tab to name, and answers the default shell id — the
+    /// only tab such a build has.
     pub fn first_harness_default() -> TabId {
         crate::harness::registry::HARNESSES
             .first()
-            .and_then(|d| d.tab_ids.first())
-            .map(|id| TabId::from_str(id))
-            .unwrap_or(TabId::Claude)
+            .and_then(|d| d.tabs.first())
+            .map(|t| TabId::Harness(t.id))
+            .unwrap_or_else(|| TabId::Shell(crate::settings::SHELL_DEFAULT_TAB_ID.to_string()))
     }
 
     pub fn as_str(&self) -> &str {
         match self {
-            TabId::Claude => "claude",
-            TabId::ClaudeLocal => "claude-local",
-            TabId::OpenCode => "opencode",
+            TabId::Harness(s) => s,
             TabId::GraphMonitor => "graph-monitor",
             TabId::Workbench => "workbench-1",
             TabId::ToolActivity => "tool-activity",
@@ -498,10 +501,16 @@ impl TabId {
     }
 
     pub fn from_str(s: &str) -> Self {
+        // V40 Phase I: the reserved AI ids are the REGISTRY's, resolved before
+        // core's own reserved strings. A harness tab id is checked first so the
+        // `&'static str` this variant needs comes from the descriptor rather
+        // than from an allocation — and so this arm and `Self::kind` (which has
+        // asked the registry since Phase A) can never disagree about which ids
+        // are AI tabs.
+        if let Some(t) = crate::harness::registry::builtin_tab(s) {
+            return TabId::Harness(t.id);
+        }
         match s {
-            "claude" => TabId::Claude,
-            "claude-local" => TabId::ClaudeLocal,
-            "opencode" => TabId::OpenCode,
             "graph-monitor" => TabId::GraphMonitor,
             "workbench-1" => TabId::Workbench,
             "tool-activity" => TabId::ToolActivity,
@@ -549,7 +558,11 @@ impl TabId {
             return TabKind::AiTool;
         }
         match self {
-            TabId::Claude | TabId::ClaudeLocal | TabId::OpenCode | TabId::Ai(_) => TabKind::AiTool,
+            // Unreachable in practice — the registry lookup above answers for
+            // every `Harness(_)` — but a `Harness` variant is an AI tab by
+            // construction, so the arm states that rather than falling into
+            // `Shell` if the two ever diverged.
+            TabId::Harness(_) | TabId::Ai(_) => TabKind::AiTool,
             // The reserved dashboards reuse Shell-kind for processing/state
             // purposes (they never run a PTY, so this is inert), keeping them
             // off the per-kind match explosion. Their read-only behavior is
@@ -1875,7 +1888,7 @@ mod tests {
     use StateSignal::*;
 
     fn tab() -> TabId {
-        TabId::Claude
+        TabId::from_str("claude")
     }
 
     fn t(current: AvatarState, signal: StateSignal) -> AvatarState {
@@ -2167,9 +2180,9 @@ mod tests {
     #[test]
     fn tab_id_serde_round_trips() {
         for id in [
-            TabId::Claude,
-            TabId::ClaudeLocal,
-            TabId::OpenCode,
+            TabId::from_str("claude"),
+            TabId::from_str("claude-local"),
+            TabId::from_str("opencode"),
             TabId::Ai("ai-1234".to_string()),
             TabId::Shell("shell-1".to_string()),
             TabId::Shell("user-bash".to_string()),
@@ -2259,7 +2272,11 @@ mod tests {
             TabId::from_str("ai-abc123"),
             TabId::Ai("ai-abc123".to_string())
         );
-        assert_eq!(TabId::from_str("opencode"), TabId::OpenCode);
+        assert_eq!(
+            TabId::from_str("opencode"),
+            TabId::Harness("opencode"),
+            "a reserved built-in id resolves to `Harness`, not `Ai` or `Shell`"
+        );
         assert_eq!(
             TabId::from_str("shell-xyz"),
             TabId::Shell("shell-xyz".to_string())
@@ -2273,21 +2290,21 @@ mod tests {
         assert!(!dup.is_builtin());
         // Only the reserved AI tabs are builtins. All Shell tabs — including
         // the retired `shell-broot` id and on-demand tool tabs — are closable.
-        assert!(TabId::Claude.is_builtin());
-        assert!(TabId::OpenCode.is_builtin());
+        assert!(TabId::from_str("claude").is_builtin());
+        assert!(TabId::from_str("opencode").is_builtin());
         assert!(!TabId::Shell("shell-broot".into()).is_builtin());
         assert!(!TabId::Shell("shell-1".into()).is_builtin());
     }
 
     #[test]
     fn tab_id_wire_format_preserved() {
-        assert_eq!(serde_json::to_string(&TabId::Claude).unwrap(), "\"claude\"");
+        assert_eq!(serde_json::to_string(&TabId::from_str("claude")).unwrap(), "\"claude\"");
         assert_eq!(
-            serde_json::to_string(&TabId::ClaudeLocal).unwrap(),
+            serde_json::to_string(&TabId::from_str("claude-local")).unwrap(),
             "\"claude-local\""
         );
         assert_eq!(
-            serde_json::to_string(&TabId::OpenCode).unwrap(),
+            serde_json::to_string(&TabId::from_str("opencode")).unwrap(),
             "\"opencode\""
         );
         assert_eq!(
@@ -2298,9 +2315,9 @@ mod tests {
 
     #[test]
     fn tab_id_kind_mapping() {
-        assert_eq!(TabId::Claude.kind(), TabKind::AiTool);
-        assert_eq!(TabId::ClaudeLocal.kind(), TabKind::AiTool);
-        assert_eq!(TabId::OpenCode.kind(), TabKind::AiTool);
+        assert_eq!(TabId::from_str("claude").kind(), TabKind::AiTool);
+        assert_eq!(TabId::from_str("claude-local").kind(), TabKind::AiTool);
+        assert_eq!(TabId::from_str("opencode").kind(), TabKind::AiTool);
         assert_eq!(TabId::Ai("ai-1".into()).kind(), TabKind::AiTool);
         assert_eq!(TabId::Shell("anything".into()).kind(), TabKind::Shell);
     }
@@ -2326,7 +2343,7 @@ mod tests {
     // ---- V39 Phase A: per-tab read-only state -------------------------------
 
     fn other() -> TabId {
-        TabId::OpenCode
+        TabId::from_str("opencode")
     }
 
     #[test]

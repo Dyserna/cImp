@@ -658,14 +658,14 @@ mod tests {
     #[test]
     fn dedup_keeps_only_latest_per_single_tab() {
         let queue = vec![
-            q(TabId::Claude, NotificationEvent::Idle, "first", 0),
+            q(TabId::from_str("claude"), NotificationEvent::Idle, "first", 0),
             q(
-                TabId::Claude,
+                TabId::from_str("claude"),
                 NotificationEvent::AwaitingPermission,
                 "second",
                 10,
             ),
-            q(TabId::Claude, NotificationEvent::Error, "third", 20),
+            q(TabId::from_str("claude"), NotificationEvent::Error, "third", 20),
         ];
         let out = dedup_per_tab(&queue);
         assert_eq!(out.len(), 1);
@@ -675,28 +675,28 @@ mod tests {
     #[test]
     fn dedup_preserves_first_appearing_tab_order() {
         let queue = vec![
-            q(TabId::ClaudeLocal, NotificationEvent::Idle, "local-old", 0),
-            q(TabId::Claude, NotificationEvent::Idle, "claude-old", 5),
+            q(TabId::from_str("claude-local"), NotificationEvent::Idle, "local-old", 0),
+            q(TabId::from_str("claude"), NotificationEvent::Idle, "claude-old", 5),
             q(
-                TabId::ClaudeLocal,
+                TabId::from_str("claude-local"),
                 NotificationEvent::Error,
                 "local-new",
                 10,
             ),
-            q(TabId::Claude, NotificationEvent::Error, "claude-new", 15),
+            q(TabId::from_str("claude"), NotificationEvent::Error, "claude-new", 15),
         ];
         let out = dedup_per_tab(&queue);
         assert_eq!(out.len(), 2);
         // ClaudeLocal first because it appeared first in the queue.
-        assert_eq!(out[0].tab, TabId::ClaudeLocal);
+        assert_eq!(out[0].tab, TabId::from_str("claude-local"));
         assert_eq!(out[0].text, "local-new");
-        assert_eq!(out[1].tab, TabId::Claude);
+        assert_eq!(out[1].tab, TabId::from_str("claude"));
         assert_eq!(out[1].text, "claude-new");
     }
 
     #[test]
     fn dedup_passes_single_through_unchanged() {
-        let queue = vec![q(TabId::Claude, NotificationEvent::Idle, "only", 0)];
+        let queue = vec![q(TabId::from_str("claude"), NotificationEvent::Idle, "only", 0)];
         let out = dedup_per_tab(&queue);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].text, "only");

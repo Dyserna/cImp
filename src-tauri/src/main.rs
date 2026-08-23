@@ -19,6 +19,7 @@ mod notifications;
 mod offload;
 mod plugins;
 mod preview;
+mod pricing;
 mod process_guard;
 mod processing;
 mod procutil;
@@ -33,13 +34,11 @@ mod shell;
 mod spawn_gate;
 mod spawn_ledger;
 mod state;
-mod statusline;
 mod stt;
 mod sysmon;
 mod tabs;
 mod theming;
 mod tts;
-mod usage;
 mod workbench;
 
 use std::collections::{HashMap, HashSet};
@@ -60,18 +59,19 @@ use crate::ipc::commands::{
     compose_templates, compose_templates_global_get, compose_templates_global_set,
     compose_templates_project_get, consume_settings_deep_link, contamination_events, content_clear,
     content_open_folder, detection_check_now, detection_open_rules_folder, detection_revert,
-    detection_status, get_claude_usage, get_system_stats, graph_architecture,
+    detection_status, get_system_stats, graph_architecture,
     graph_context_preview, graph_cycles, graph_dead_exports, graph_fact_add, graph_fact_update,
     graph_facts, graph_history,
     graph_ignore_pick, graph_impact, graph_language_census, graph_memory, graph_memory_clear,
     graph_note_review, graph_note_set_pinned, graph_path, graph_rebuild, graph_rebuild_embeddings,
     graph_session_usage, graph_set_language_enabled, graph_set_watch_paused, graph_status,
     graph_tab_session, graph_test_embedder, graph_usage, graph_usage_advice, graph_viz_ego, graph_viz_file_status,
-    graph_viz_snapshot, harness_mark_verified, harness_run_checks, harness_versions_get, injection_status,
+    advisor_rules, graph_viz_snapshot, harness_instructions, harness_mark_verified, harness_usage, harness_list, harness_run_checks,
+    harness_versions_get, injection_status,
     latch_override, latch_status,
     list_tabs, list_voices,
     llm_pricing_get, llm_pricing_set, offload_backend_restart, offload_backend_start,
-    offload_backend_stop, offload_derive_opencode_provider, offload_enable_readonly_commands,
+    offload_backend_stop, offload_derive_local_provider, offload_enable_readonly_commands,
     offload_reload_mcp, offload_server_log, offload_server_metrics, offload_server_restart,
     offload_server_start, offload_server_stop, offload_service_status, offload_status,
     offload_statuses, offload_test, open_settings_window, open_settings_window_to_section,
@@ -115,18 +115,32 @@ use crate::stt::SttHandle;
 use crate::tabs::{TabRegistry, TabRegistryHandle};
 use crate::tts::{spawn_tts_worker, ActiveTab, AiTtsSuppressed, SpeakSession, TtsRequest};
 
-/// Usage text for `cimp --help`. Lists the drop-in `claude` forwarding
-/// contract and the service flags so an agent probing the CLI learns the
-/// surface instead of launching a GUI window per probe.
+/// Usage text for `cimp --help`. Lists the drop-in forwarding contract and the
+/// service flags so an agent probing the CLI learns the surface instead of
+/// launching a GUI window per probe.
+///
+/// **V40 Phase E (locked decision 26): the forwarding sentence is composed from
+/// the registry**, not written here. Exactly one harness declares
+/// `accepts_passthrough_argv`, and that is the harness the args actually reach —
+/// so the promise a user reads and the tab they land in cannot disagree, and a
+/// build whose passthrough harness changed does not ship a help text about the
+/// old one.
 fn help_text() -> String {
+    let (label, binary) = crate::harness::registry::passthrough_harness()
+        .and_then(|h| h.descriptor())
+        .map(|d| (d.label, d.binaries.first().copied().unwrap_or(d.id)))
+        .unwrap_or(("the AI", "the harness"));
+    let usage = format!(
+        "  cimp [ARGS...]          launch the GUI in the current directory; unrecognized\n\
+                          args are forwarded verbatim to the {label} tab\n\
+                          (drop-in `{binary}` replacement, e.g. `cimp --resume <id>`)"
+    );
     format!(
         "\
 cimp {} — code Imp: a TTS/avatar terminal for AI coding agents
 
 USAGE:
-  cimp [CLAUDE_ARGS...]   launch the GUI in the current directory; unrecognized
-                          args are forwarded verbatim to the Claude tab
-                          (drop-in `claude` replacement, e.g. `cimp --resume <id>`)
+{usage}
 
 INFO:
   -h, --help              print this help and exit
@@ -134,8 +148,8 @@ INFO:
 
 MAINTENANCE:
   --harness-canary [--json]
-                          probe the INSTALLED Claude Code / OpenCode CLIs against
-                          cImp's harness capability registry and print one line per
+                          probe the INSTALLED harness CLIs against cImp's harness
+                          capability registry and print one line per
                           capability. Needs no running cImp. Exits non-zero ONLY on
                           real drift — an absent CLI or an upstream improvement
                           reports `unknown` / `transition` and exits 0.
@@ -149,7 +163,7 @@ MAINTENANCE:
                           exits non-zero only if it could write nothing at all.
 
 SERVICE FLAGS (spawned by agent harnesses over stdio; not for interactive use):
-  --statusline                           Claude Code status-line renderer
+  --statusline                           a harness status-line renderer
   --offload-mcp [--consumer <name>] [--tab <id>] [--channel-push]
                                          stdio MCP server (offload + graph + proxied servers)
   --code-audit-mcp [--consumer <name>] [--tab <id>]
@@ -184,6 +198,59 @@ fn attach_parent_console() {
 #[cfg(not(windows))]
 fn attach_parent_console() {}
 
+/// Resolve `--consumer <name>` against the registry (V40 locked decision 2).
+///
+/// The **default stays `"claude"`** on the command line: a shim or a hand-run
+/// child from before the flag existed omits it, and refusing those would break
+/// backward compatibility for no gain — see
+/// [`crate::harness::DEFAULT_HARNESS`], which carries the full rationale. What
+/// changed is that the value is now *resolved*: a token nobody declared fails
+/// the proxy start with the registered list in the message, instead of silently
+/// serving Claude's tool set to a child that asked for something else.
+fn resolve_consumer(args: &[String], in_app_ok: bool) -> Result<&'static str, String> {
+    let named = args
+        .iter()
+        .position(|a| a == "--consumer")
+        .and_then(|i| args.get(i + 1))
+        .map(|s| s.trim());
+    let Some(named) = named.filter(|s| !s.is_empty()) else {
+        return Ok(crate::harness::DEFAULT_HARNESS
+            .id()
+            .expect("DEFAULT_HARNESS names a registered harness"));
+    };
+    let known = crate::harness::registry::harness_ids().join(", ");
+    // `offload` is cImp's OWN in-app consumer, not a harness: it is a registered
+    // token in the MCP host's vocabulary and has no `harness/<id>/` directory,
+    // so it is accepted here beside the registry's ids rather than smuggled into
+    // the registry.
+    //
+    // `in_app_ok` is FALSE for `--code-audit-mcp` (V40 review L-4): that child
+    // posts `/audit/run`, whose `audit_consumer` is narrowed to the registry's
+    // ids and refuses `offload` on every scan. Accepting it here started the
+    // child cleanly and 400'd every scan afterwards — a refusal is better said
+    // once, at the boundary that can name what IS accepted.
+    if named.eq_ignore_ascii_case("offload") {
+        return if in_app_ok {
+            Ok("offload")
+        } else {
+            Err(format!(
+                "cimp: --consumer \"offload\" is cImp's own in-app consumer and this subcommand                  serves only harnesses. Registered: {known}. Every scan would be refused at                  `/audit/run`, so the child refuses to start instead."
+            ))
+        };
+    }
+    match crate::harness::HarnessId::from_consumer(named) {
+        Some(h) => Ok(h.id().expect("from_consumer never answers ANY")),
+        None => Err(format!(
+            "cimp: --consumer {named:?} names no registered harness. Registered: {known}{}. A              consumer token decides which MCP servers this child may reach, so an unrecognised              one is refused rather than defaulted.",
+            if in_app_ok {
+                " (plus `offload`, cImp's own in-app consumer)"
+            } else {
+                ""
+            }
+        )),
+    }
+}
+
 fn main() {
     // `--help`/`--version` guard: agents reflexively probe unknown CLIs with
     // `cimp --help`, and before this guard every such invocation fell through
@@ -191,8 +258,9 @@ fn main() {
     // Claude Code running `cimp --help`, `cimp help`, `cimp code-audit --help`
     // in a project where the audit MCP server wasn't advertised). Handled
     // first and GUI-free like the service shims below. Everything else still
-    // falls through: `cimp` is a drop-in `claude` replacement and forwards
-    // unrecognized args to the Claude tab.
+    // falls through: `cimp` is a drop-in replacement for whichever harness
+    // declares `accepts_passthrough_argv`, and forwards unrecognized args to
+    // that harness's tabs (V40 locked decision 26).
     {
         let early: Vec<String> = std::env::args().skip(1).collect();
         let wants_help = early.iter().any(|a| a == "--help" || a == "-h")
@@ -238,15 +306,21 @@ fn main() {
         }
     }
 
-    // Status-line subcommand: Claude Code invokes `cimp --statusline`,
-    // pipes the session JSON to our stdin, and reads the rendered context
-    // bar from our stdout. Handle it before any Tauri/audio/settings init
-    // so it's instant and never spins up the GUI. Works under the release
-    // `windows` subsystem too — inherited stdio pipes stay usable; only
-    // console allocation is suppressed.
-    if std::env::args().skip(1).any(|a| a == "--statusline") {
-        statusline::run();
-        return;
+    // Plugin-registered subcommands (V40 Phase D, locked decision 19). Claude
+    // Code invokes `cimp --statusline`, pipes the session JSON to our stdin and
+    // reads the rendered context bar from our stdout — a contract that belongs
+    // to that harness, so the flag, the handler and the shell quoting around it
+    // all live in `harness/claude/statusline.rs` and this loop asks rather than
+    // matches. Handled before any Tauri/audio/settings init so a subcommand is
+    // instant and never spins up the GUI; works under the release `windows`
+    // subsystem too — inherited stdio pipes stay usable, only console
+    // allocation is suppressed.
+    {
+        let argv: Vec<String> = std::env::args().skip(1).collect();
+        if let Some(sub) = harness::registry::subcommand_for(&argv) {
+            (sub.run)();
+            return;
+        }
     }
 
     // ── V35 Phase J: the hook shims are GONE, and these are TOMBSTONES ───────
@@ -321,12 +395,13 @@ fn main() {
     // launch path's `extra_args`.
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--offload-mcp") {
-        let consumer = args
-            .iter()
-            .position(|a| a == "--consumer")
-            .and_then(|i| args.get(i + 1))
-            .map(String::as_str)
-            .unwrap_or("claude");
+        let consumer = match resolve_consumer(&args, true) {
+            Ok(c) => c,
+            Err(msg) => {
+                eprintln!("{msg}");
+                std::process::exit(2);
+            }
+        };
         // V28: `--tab <tab-id>` names the cImp tab this per-tab child serves, so
         // the app can resolve the tab's CURRENT session for the `context_*`
         // memory tools. Absent (hand-run child, or one spawned before the
@@ -358,12 +433,13 @@ fn main() {
     // the same optional `--consumer <name>` (default `claude`); the app's
     // loopback re-checks that consumer's expose toggle on every run.
     if args.iter().any(|a| a == "--code-audit-mcp") {
-        let consumer = args
-            .iter()
-            .position(|a| a == "--consumer")
-            .and_then(|i| args.get(i + 1))
-            .map(String::as_str)
-            .unwrap_or("claude");
+        let consumer = match resolve_consumer(&args, false) {
+            Ok(c) => c,
+            Err(msg) => {
+                eprintln!("{msg}");
+                std::process::exit(2);
+            }
+        };
         // V32 C-1b: `--tab <id>` names the cImp tab this child serves, so
         // `/audit/run` can gate the scan on that tab's taint latch. Until the
         // 2026-08-07 review this child deliberately carried no identity and the
@@ -546,7 +622,9 @@ fn main() {
             tab_metas
                 .first()
                 .map(|m| m.id.clone())
-                .unwrap_or(TabId::Claude)
+                // V40 Phase E (locked decision 26): the registry's own default,
+                // not a named harness — see `TabId::first_harness_default`.
+                .unwrap_or_else(TabId::first_harness_default)
         });
     drop(snap);
     let tts_active: ActiveTab = Arc::new(RwLock::new(initial_active.clone()));
@@ -554,7 +632,7 @@ fn main() {
     // `tts_speak_selection`/`tts_stop` commands and the TTS worker.
     let speak_session: SpeakSession = Arc::new(AtomicU64::new(0));
     // Shared "suppress AI-tag TTS" flag. Set by Esc (`tts_stop`), cleared by
-    // the state manager on the next `ClaudeOutputStarted`.
+    // the state manager on the next `HarnessOutputStarted`.
     let ai_tts_suppressed: AiTtsSuppressed = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // V6-01 STT handle. The capture + transcription threads are spawned in
@@ -1046,7 +1124,7 @@ fn main() {
             stt_cancel,
             stt_list_models,
             stt_list_input_devices,
-            get_claude_usage,
+            harness_usage,
             get_system_stats,
             settings_get,
             settings_update,
@@ -1110,7 +1188,7 @@ fn main() {
             offload_backend_stop,
             offload_backend_restart,
             offload_test,
-            offload_derive_opencode_provider,
+            offload_derive_local_provider,
             offload_enable_readonly_commands,
             offload_service_status,
             offload_reload_mcp,
@@ -1166,6 +1244,9 @@ fn main() {
             advisor_dismiss,
             advisor_mark_applied,
             harness_versions_get,
+            harness_list,
+            advisor_rules,
+            harness_instructions,
             harness_mark_verified,
             harness_run_checks,
             workbench_status,
@@ -1524,6 +1605,67 @@ fn spawn_settings_broadcast(app: AppHandle, settings: SettingsHandle, read_only:
             }
         }
     });
+}
+
+#[cfg(test)]
+mod consumer_flag_tests {
+    use super::*;
+
+    fn argv(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// **`--consumer` resolves against the registry, and `offload` only where
+    /// it can actually be served** (locked decision 2; V40 review L-4).
+    ///
+    /// The L-4 half: `--code-audit-mcp` posts `/audit/run`, whose
+    /// `audit_consumer` is narrowed to the registry's ids and refuses
+    /// `offload`. Accepting it here started the child cleanly and 400'd every
+    /// scan afterwards — a refusal said once, at the boundary that can name
+    /// what IS accepted, instead of on every scan with no way to see why.
+    #[test]
+    fn resolve_consumer_accepts_the_registry_and_gates_the_in_app_token() {
+        // Absent ⇒ the wire-compatibility default, on both subcommands.
+        for in_app_ok in [true, false] {
+            assert_eq!(
+                resolve_consumer(&argv(&["--offload-mcp"]), in_app_ok).unwrap(),
+                crate::harness::DEFAULT_HARNESS.id().unwrap()
+            );
+        }
+        // Every registered consumer resolves to its own id.
+        for d in crate::harness::registry::HARNESSES {
+            for in_app_ok in [true, false] {
+                assert_eq!(
+                    resolve_consumer(&argv(&["--consumer", d.consumer]), in_app_ok).unwrap(),
+                    d.id,
+                    "{}", d.consumer
+                );
+            }
+        }
+        // `offload` is served by the MCP child and refused by the audit child.
+        assert_eq!(
+            resolve_consumer(&argv(&["--consumer", "offload"]), true).unwrap(),
+            "offload"
+        );
+        let err = resolve_consumer(&argv(&["--consumer", "offload"]), false).unwrap_err();
+        assert!(err.contains("only harnesses"), "{err}");
+        for d in crate::harness::registry::HARNESSES {
+            assert!(err.contains(d.id), "the refusal must name what IS accepted: {err}");
+        }
+        // A token nobody declared fails the start either way, with the list.
+        for in_app_ok in [true, false] {
+            let err = resolve_consumer(&argv(&["--consumer", "codex"]), in_app_ok).unwrap_err();
+            assert!(err.contains("codex"), "{err}");
+            for d in crate::harness::registry::HARNESSES {
+                assert!(err.contains(d.id), "{err}");
+            }
+            assert_eq!(
+                err.contains("in-app consumer"),
+                in_app_ok,
+                "the audit child must not advertise a token it would refuse: {err}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

@@ -57,7 +57,6 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::harness::contract::Harness;
 use crate::harness::probe::{self, harness_name, Driven};
 
 // ── bounds ──────────────────────────────────────────────────────────────────
@@ -190,7 +189,7 @@ pub fn captures_root() -> Option<PathBuf> {
 /// `LOCALAPPDATA` and not `APPDATA` on purpose — the roaming profile is
 /// replicated between machines by domain policy, and a corpus derived from one
 /// machine's sessions has no business travelling. Env vars rather than a new
-/// `dirs` dependency, matching `oob::claude::home_dir`'s existing convention;
+/// `dirs` dependency, matching `harness::claude::read::home_dir`'s existing convention;
 /// this also has to work from the `--harness-capture` early dispatch, where
 /// there is no Tauri `AppHandle` to ask.
 fn app_data_root() -> Option<PathBuf> {
@@ -397,7 +396,7 @@ fn manifest(driven: &Driven, mode: Mode, present: &[String]) -> String {
 /// Derived from the epoch through `chrono::DateTime::from_timestamp` and
 /// truncated out of the RFC 3339 form — the crate is built with
 /// `default-features = false`, so `Utc::now()` (the `clock` feature) is not
-/// available and this is the same route `usage::mod` already takes.
+/// available and this is the same route `harness::claude::usage` already takes.
 fn today() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -478,9 +477,10 @@ pub fn run(args: &[String]) -> i32 {
     };
 
     let mut records: Vec<(Driven, Result<Written, String>)> = Vec::new();
-    // OpenCode first, for the same reason `probe::run` drives it first: one
-    // `opencode serve` child answers both its probes.
-    for harness in [Harness::OpenCode, Harness::Claude] {
+    // The registry's drive order — a harness whose probes share one expensive
+    // child goes first, for the same reason `probe::run` has it first (one
+    // `opencode serve` child answers all of that harness's probes).
+    for harness in probe::drive_order() {
         let driven = probe::drive(harness);
         let failures = driven.results.iter().filter(|r| r.outcome.is_fail()).count();
         let written = write_into(&root, &driven, Mode::of(failures));
@@ -591,6 +591,17 @@ pub(crate) const CAPTURED: &[&str] = &[
 
 #[cfg(test)]
 mod tests {
+    use crate::harness::contract::Harness;
+
+    /// The two shipped harnesses, resolved through the registry — test code may
+    /// name a harness, it just may not construct one out of thin air.
+    fn claude() -> Harness {
+        Harness::from_id("claude").expect("claude is registered")
+    }
+    #[allow(dead_code)]
+    fn opencode() -> Harness {
+        Harness::from_id("opencode").expect("opencode is registered")
+    }
     use super::*;
     use crate::harness::contract;
     use crate::harness::probe::{Outcome, ProbeResult};
@@ -670,7 +681,7 @@ mod tests {
         let help = format!("Options:\n  --settings <file>\n# config: {password}\n  --session-id");
 
         let d = driven(
-            Harness::Claude,
+            claude(),
             "2.1.232",
             vec![
                 Observed::new("claude.transcript.usage", "jsonl", payload),
@@ -726,7 +737,7 @@ mod tests {
     fn the_manifest_names_provenance_and_every_file_present() {
         let root = tmp("manifest");
         let first = driven(
-            Harness::OpenCode,
+            opencode(),
             "1.18.13",
             vec![Observed::new("opencode.tool_registry", "json", "[\"bash\"]")],
             false,
@@ -736,7 +747,7 @@ mod tests {
         // A second capture of the same version that observed something else:
         // the file from the first must still be listed.
         let second = driven(
-            Harness::OpenCode,
+            opencode(),
             "1.18.13",
             vec![Observed::new("opencode.route.noauth", "txt", "200")],
             false,
@@ -770,7 +781,7 @@ mod tests {
     fn a_failing_run_cannot_overwrite_the_known_good_capture() {
         let root = tmp("failing");
         let good = driven(
-            Harness::OpenCode,
+            opencode(),
             "1.18.13",
             vec![Observed::new(
                 "opencode.tool_registry",
@@ -788,7 +799,7 @@ mod tests {
 
         // The same version, now drifting.
         let bad = driven(
-            Harness::OpenCode,
+            opencode(),
             "1.18.13",
             vec![Observed::new(
                 "opencode.tool_registry",
@@ -840,7 +851,7 @@ mod tests {
         let obs = || vec![Observed::new("opencode.tool_registry", "json", "[\"bash\"]")];
 
         for n in 0..KEEP_VERSIONS + 4 {
-            let d = driven(Harness::OpenCode, &format!("1.0.{n}"), obs(), false);
+            let d = driven(opencode(), &format!("1.0.{n}"), obs(), false);
             write_into(&root, &d, Mode::KnownGood).expect("written");
             // mtime granularity on Windows is coarse enough that same-tick
             // directories sort arbitrarily; the sweep only needs a strict
@@ -848,7 +859,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(12));
         }
         for n in 0..KEEP_FAILING + 3 {
-            let d = driven(Harness::OpenCode, &format!("2.0.{n}"), obs(), true);
+            let d = driven(opencode(), &format!("2.0.{n}"), obs(), true);
             write_into(&root, &d, Mode::Failing).expect("written");
             std::thread::sleep(std::time::Duration::from_millis(12));
         }
@@ -886,7 +897,7 @@ mod tests {
     fn an_unversioned_run_writes_nothing() {
         let root = tmp("noversion");
         let d = driven(
-            Harness::Claude,
+            claude(),
             "   ",
             vec![Observed::new("claude.flag.session_id", "txt", "--session-id")],
             false,

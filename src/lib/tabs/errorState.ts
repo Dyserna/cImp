@@ -6,8 +6,9 @@ import { writable } from 'svelte/store';
 import type { TabId } from './types';
 
 export interface TabError {
-  // One-line user-facing summary, e.g. "Claude failed to start." or
-  // "Claude exited unexpectedly."
+  // One-line user-facing summary, e.g. "<harness> failed to start." or
+  // "<harness> exited unexpectedly." — the name comes from the registry
+  // (`tabLabel`), so it is whatever this tab's harness is called.
   headline: string;
   // Raw error text from the backend or PTY exit payload.
   raw: string;

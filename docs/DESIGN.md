@@ -6,7 +6,7 @@ This document captures the current architecture and design decisions of cImp. It
 
 Where granular history matters (which decision changed when, what a particular milestone introduced), see the per-milestone `MILESTONE-V[N]-[N].md` files. Where deferred work is tracked, see `FUTURE-FEATURES.md`. This doc describes how cImp is, not how it evolved.
 
-The audience is Claude Code working on implementation across sessions, plus any human reviewer.
+The audience is an AI coding agent working on implementation across sessions, plus any human reviewer.
 
 ---
 
@@ -14,24 +14,31 @@ The audience is Claude Code working on implementation across sessions, plus any 
 
 ### What we are building
 
-A cross-platform desktop application (Windows and Linux) that wraps Claude Code (in two configurations — subscription / API and a local-LLM variant) and arbitrary user-configured shell sessions in a single multi-tab, multi-pane interface with text-to-speech output and an animated avatar overlay. The user retains the full interactive experience of every embedded subprocess — this is not a chat client that calls the Claude API; it is a wrapper around the actual `claude` binary (and any shell the user configures) running in real PTYs, with all of their tools, slash commands, file editing, and TUI behavior preserved.
+A cross-platform desktop application (Windows and Linux) that hosts one or more **registered AI coding harnesses** — command-line agents cImp neither owns nor ships — alongside arbitrary user-configured shell sessions, in a single multi-tab, multi-pane interface with text-to-speech output and an animated avatar overlay. The user retains the full interactive experience of every embedded subprocess — this is not a chat client that calls a model API; it is a wrapper around the harnesses' real binaries (and any shell the user configures) running in real PTYs, with all of their tools, slash commands, file editing, and TUI behavior preserved.
+
+Which harnesses exist is **data, not code paths**. `src-tauri/src/harness/registry.rs` holds one `HarnessDescriptor` per harness — its id, label, the binaries whose file stem identifies it, its reserved built-in tab ids, its MCP consumer token, and the features core mounts extra UI for — and `src-tauri/src/harness/plugin.rs` declares the `HarnessPlugin` trait that carries the code half. Two ship registered today:
+
+- **Claude Code** (`claude`), in two configurations — subscription / API, and a local-LLM variant that is the same binary with provider env injected at spawn.
+- **OpenCode** (`opencode`), which picks its own provider and model, so it has no local variant.
+
+A third harness is a registry row plus one `harness/<id>/` directory; core never branches on *which* harness it is looking at, it asks the registry. See `../src-tauri/src/harness/README.md` for the layering, and the per-harness READMEs (`../src-tauri/src/harness/claude/README.md`, `../src-tauri/src/harness/opencode/README.md`) for what each one's plugin actually depends on.
 
 Capabilities beyond the underlying tools:
 
 1. **Text-to-speech** for conversational portions of AI-tool output, using a local Kokoro TTS engine running in-process. Tools opt their conversational text into TTS by wrapping it in `[[TTS]]...[[/TTS]]` tags; technical content (code, command output) stays silent.
 2. **Animated avatar overlay** with state-driven visuals, a shared transition animation between any state change, and a live audio waveform reactive to TTS playback. Floats over the terminal as a configurable, semi-transparent overlay.
 3. **Spell-checking compose overlay** — a slide-up bottom sheet for composing longer messages, complementing the native input.
-4. **Multi-tab terminal** with two Claude Code tabs (subscription and local-LLM, the latter via env-var injection at spawn time) and as many user-defined Shell tabs as the user wants. Each tab runs an independent PTY; tabs persist across launches.
+4. **Multi-tab terminal** with one reserved built-in tab per registered harness configuration (today `claude`, `claude-local` — the same binary with local-provider env injected at spawn — and `opencode`) and as many user-defined Shell tabs as the user wants. Each tab runs an independent PTY; tabs persist across launches.
 5. **Multi-pane layout** — tabs can be split horizontally or vertically, dragged between panes, torn into new splits. The full layout tree persists across launches, and named layout presets can be saved and restored.
-6. **Permission-prompt detection** for Claude Code, with a per-tab `AwaitingPermission` flag and notification.
+6. **Permission-prompt detection** for AI tabs, with a per-tab `AwaitingPermission` flag and notification. The matcher is harness-neutral; the prompt grammar it matches on is declared by each harness's plugin.
 7. **Notification system** that announces tab state changes when the user is focused elsewhere.
 8. **Bottom status bar** with mute / announcements / volume controls and a Layouts menu.
 9. **Offline speech-to-text (dictation)** — the inverse of the TTS path: a `cpal` microphone capture feeds a bundled, fully offline Whisper model (whisper.cpp via `whisper-rs`) and the transcript lands in the compose overlay for review. Triggered by a bottom-bar record button (toggle or hold) or a push-to-talk shortcut. No cloud, no API key.
 
 ### What we are NOT building
 
-- A standalone chat application using the Anthropic API directly
-- A replacement for Claude Code's TUI
+- A standalone chat application calling a model API directly
+- A replacement for any harness's own TUI
 - A coding assistant with custom tool integration
 - A multi-user or remote-accessible service
 - A general-purpose terminal emulator (the architecture supports it, but the project stays focused on the AI-tools + shells use case)
@@ -143,7 +150,7 @@ Per-tab responsibilities:
 - Handle PTY resize when the terminal area changes size
 - Detect subprocess exit and route to the state manager (Error for AI-tool tabs, Closed sub-state for Shell tabs — see below)
 
-The wrapper acts as a drop-in replacement for `claude` for the Claude tab specifically: any CLI arguments passed to `cimp` are captured at startup (`std::env::args().skip(1)`) and forwarded to the spawned `claude`. CLI args from settings (per-tab `args`) are applied first, then invocation args from the cImp command line, so persistent flags and one-shot flags compose.
+The wrapper acts as a drop-in replacement for **at most one** harness's CLI — the one whose plugin declares `accepts_passthrough_argv()`, looked up through `registry::passthrough_harness()` (Claude Code today). Any CLI arguments passed to `cimp` are captured at startup (`std::env::args().skip(1)`) and forwarded to that harness's tabs only; forwarding one CLI's flags into another harness is how a tab fails to launch, so two declared takers resolve to `None` rather than a guess. CLI args from settings (per-tab `args`) are applied first, then invocation args from the cImp command line, so persistent flags and one-shot flags compose.
 
 Implementation:
 
@@ -167,29 +174,29 @@ Kind-gated behavior:
 | Behavior                               | AiTool                                  | Shell                                                                 |
 |----------------------------------------|-----------------------------------------|-----------------------------------------------------------------------|
 | TTS markup detection / extraction      | yes                                     | bypassed entirely in processing layer                                 |
-| Permission prompt detection            | yes (both Claude tabs run the same patterns) | no                                                               |
+| Permission prompt detection            | yes (every registered harness's pattern rows are loaded; tabs of the same harness share them) | no                                              |
 | Avatar states reachable                | Idle / Listening / Thinking / Speaking / Error | Idle / Error only                                              |
 | Notifications: idle                    | yes                                     | no (would fire constantly for an interactive shell)                   |
-| Notifications: awaiting_permission     | yes (Claude)                            | no                                                                    |
+| Notifications: awaiting_permission     | yes                                     | no                                                                    |
 | Notifications: error                   | yes                                     | yes                                                                   |
 | Notifications: exited                  | no                                      | yes (with `{code}` placeholder interpolated)                          |
 | Compose overlay submission             | yes                                     | yes                                                                   |
 | Subprocess restart on exit             | no (manual via settings)                | yes (Closed sub-state with Enter-to-restart message)                  |
 
-The `claude_still_generating` helper flag (used to disambiguate Speaking → Thinking vs Speaking → Idle) is meaningful only for AI tabs.
+Whether an AI tab is still generating (used to disambiguate Speaking → Thinking vs Speaking → Idle) is carried by the neutral `HarnessOutputStarted` / `HarnessOutputStopped` state signals, which each harness's reader raises from its own turn-boundary evidence. Meaningful only for AI tabs.
 
 ### Tab Lifecycle
 
-Two AI builtin tab IDs are protected by the integrity check; their presence is governed by the top-level `claude_tabs_enabled` setting (`Cloud` | `Local` | `Both`, default `Cloud`):
+**The reserved AI tab ids are the registry's, not a literal.** Each `HarnessDescriptor` declares its own `tab_ids` in canonical order, and `registry::canonical_tab_ids()` flattens them across harnesses in declaration order — `claude` → `claude-local` → `opencode` today. That one list drives the integrity check's restore order, the tab-lifecycle inserter's position, and `AiTabId::canonical_order()`; a reserved id no descriptor claims sorts last rather than colliding with slot 0. Which of them actually materialize is the `enabled_ai_tabs` list (a `Vec<AiTabId>`, default `[claude]` on a fresh install):
 
-- `claude` — Claude Code with subscription/API auth. Restored at position 0 by the integrity check when `claude_tabs_enabled.includes_cloud()` and the tab is missing; removed when the setting excludes cloud and the tab is present.
-- `claude-local` — second Claude Code tab preconfigured to talk to a local LLM via env-var injection (V1.4-07; replaces the v1.7-and-earlier `aider` reserved id). Restored / removed analogously based on `claude_tabs_enabled.includes_local()`.
+- Each id in `enabled_ai_tabs` that is missing from `tabs[]` is restored at its canonical position by the integrity check; each reserved AI tab present in `tabs[]` but not in `enabled_ai_tabs` is dropped.
+- `claude-local` is the second reserved tab of the *same* harness — the same binary, preconfigured to talk to a local LLM via env-var injection (V1.4-07; replaces the v1.7-and-earlier `aider` reserved id). Harnesses that pick their own provider (OpenCode) declare one tab id, not two.
 - `shell-default-1` — the first Shell tab on a fresh install, with a sensible default shell per platform. Despite the reserved-looking id, it is **not** a builtin: `default_shell_1_tab(...)` returns it with `builtin: false`, and the integrity check does not re-seed it. Once the user closes it, it stays closed. Older settings files that persisted `builtin: true` on this id are demoted to `false` on load.
 
 Backend Tauri commands expose tab CRUD:
 
 - `create_shell_tab(name, command, args, cwd, env, notifications) -> TabId` — validates inputs, spawns the PTY, registers the new TabState, persists settings, broadcasts `tab-created`
-- `close_tab(tab_id)` — rejects AI builtins (`claude`, `claude-local`); otherwise kills the subprocess, drops processing tasks, removes the TabState, persists, broadcasts `tab-closed`. `shell-default-1` is closable like any other shell.
+- `close_tab(tab_id)` — rejects any reserved AI tab id (`HarnessId::from_tab_id` answers a harness); otherwise kills the subprocess, drops processing tasks, removes the TabState, persists, broadcasts `tab-closed`. `shell-default-1` is closable like any other shell.
 - `rename_tab(tab_id, new_name)` — updates name, persists, broadcasts
 - `reconfigure_shell_tab(tab_id, ...)` — updates persisted config without respawning; the change applies on the next restart of that shell
 - `restart_shell_tab(tab_id)` — kills the running subprocess (if any) and respawns with current config
@@ -217,7 +224,7 @@ Responsibilities (AI tabs):
 4. Extract TTS-tagged content and segment it into sentence-bounded chunks for the TTS pipeline
 5. Manage flush timing using the hybrid trigger model
 6. Handle in-place rewrites by tracking logical document state
-7. Detect Claude Code's permission prompts and emit `PermissionPromptDetected` / `PermissionPromptResolved` signals
+7. Detect in-tab prompt patterns (tool-use approvals, multi-choice questions, busy chrome) and emit `PermissionPromptDetected` / `PermissionPromptResolved` signals
 
 Shell tabs get a slimmer pipeline: the vte parser still runs (so xterm.js receives correctly-rendered bytes and screen state stays current) and the hybrid flush keeps rendering pacing consistent, but TTS extraction, the two-view split, sentence segmentation, and permission detection are stubbed out. This is a construction-time gate, not a per-byte conditional.
 
@@ -243,13 +250,24 @@ Subprocess TUIs rewrite lines (input boxes, spinners, status updates). The vte p
 
 Once a complete `[[TTS]]...[[/TTS]]` block is extracted, content is segmented into sentences before being pushed to the TTS queue. Boundaries: `.`, `?`, `!`, `\n\n`, with simple disambiguation for common false positives (decimal numbers, "Dr.", "e.g.", "etc."). Each sentence becomes one TTS request, giving Kokoro complete sentences for natural prosody while enabling streaming playback (sentence N+1 synthesizes while sentence N plays). Fragments without sentence-ending punctuation go through as-is.
 
-#### Permission prompt detection (Claude Code)
+#### Prompt detection
 
-The processing layer scans recently-rendered regions for known Claude Code permission patterns (e.g., the "Esc to cancel · Tab to amend" footer that anchors the choice UI). On detection, emits `PermissionPromptDetected { tab }`. Resolution is input-driven: when a permission prompt is active and the user provides input to the PTY, the flag is cleared (`PermissionPromptResolved`). If Claude reprompts, the next detection re-sets it.
+**The engine is here; the grammar is not.** `processing/permission.rs` is a harness-neutral matcher: it substring-matches the rendered (ANSI-stripped) tail of a tab's output against a list of pattern rows, where each row lists substrings that must ALL be present (`all_of`), substrings that must ALL be absent (`none_of`), and a `kind` that decides which signal fires on the absent→present (and present→absent) edge:
 
-The patterns are exact-string matches. Brittleness against upstream changes is a known limitation; patterns live in a single well-commented module so updates are localized. The `RUST_LOG=perm_capture=debug` knob exposes detection events for re-characterization when Claude Code's UI changes.
+- `permission` — tool-use / file-edit / bash approvals. Emits `PermissionPromptDetected { tab }`, sets `awaiting_permission`. Resolution is input-driven: while a permission prompt is active, any user input to the PTY clears the flag (`PermissionPromptResolved`); a re-prompt re-sets it on the next detection.
+- `question` — multi-option "pick one" prompts. Sets `awaiting_question` and fires the `question` notification template.
+- `working` — the harness's busy chrome. Drives the avatar's Thinking↔Idle activity from content rather than from a byte-silence timer, so a thinking pause no longer collapses the avatar to Idle mid-work.
 
-Both AI tabs (subscription Claude and Claude (local)) run the same Claude Code permission patterns since they're the same binary.
+Veto (`none_of`) terms are evaluated only from the start of the row's own earliest `all_of` marker onward, not over the whole tail — the tail is a scrollback window, so stale menu chrome scrolled *above* a live approval prompt must not suppress it.
+
+What a row matches *on* is a transcription of somebody else's terminal chrome, and every word of it is a dependency on a product cImp neither pins nor ships. So the rows are **declared by the harness that owns them** (`HarnessPlugin::permission_patterns`, `harness/<id>/prompts.rs`), and the shipped `patterns.json` seed is the neutral concatenation over the registry. Core never spells a marker. The per-harness state differs and the docs should not pretend otherwise:
+
+- **Claude Code** ships enabled rows, matched by *grammar* rather than by literal default chrome — the chord labels in the footer are user-remappable and its segments are conditional, so the old exact `Esc to cancel · Tab to amend` marker is retired production data, not what the detector looks for. See `../src-tauri/src/harness/claude/README.md`.
+- **OpenCode** ships its rows **disabled**, with a capture recipe attached: its `--mini` permission and working chrome has never been captured live, and a wrong guess enabled by default would mis-fire the avatar and the permission notification on every OpenCode tab. See `../src-tauri/src/harness/opencode/README.md`.
+
+Brittleness against upstream changes is inherent and tracked as a capability row (`perm.tui_scrape`) in `harness/contract.rs` rather than assumed away. `RUST_LOG=perm_capture=debug` dumps the rendered tail the detector matches against, which is how a row gets re-characterized after an upstream UI change. Users can edit `patterns.json` directly; a deleted or corrupt file falls back to the registry-composed defaults.
+
+Both reserved Claude tabs (subscription and local) run the same rows — they are the same harness, hence the same binary and the same chrome.
 
 ### TTS Engine
 
@@ -286,13 +304,13 @@ pub struct TabState {
     avatar_state: AvatarState,         // Idle | Listening | Thinking | Speaking | Error
     awaiting_permission: bool,         // independent flag — can stack with any avatar state
     done_while_away: bool,             // UI flag (see below)
-    claude_still_generating: bool,     // AI tabs only
+    harness_output_active: bool,       // AI tabs only
     closed: bool,                      // Shell tabs only
     closed_exit_code: Option<i32>,     // Shell tabs only
 }
 ```
 
-State signals (`StateSignal`), tagged with the tab they originated from: `UserInput`, `UserInputStopped`, `ClaudeOutputStarted`, `ClaudeOutputStopped`, `TtsPlaybackStarted`, `TtsPlaybackStopped`, `PermissionPromptDetected`, `PermissionPromptResolved`, `SubprocessExited`, `AudioError`, `TtsError`, `ErrorAcknowledged`, `ComposeContentChanged`, `TabActivated`.
+State signals (`StateSignal`), tagged with the tab they originated from: `UserKeystroke`, `UserSubmit`, `HarnessOutputStarted`, `HarnessOutputStopped`, `TtsPlaybackStarted`, `TtsPlaybackStopped`, `PermissionPromptDetected`, `PermissionPromptResolved`, `SubprocessExited`, `AudioError`, `TtsError`, `ErrorAcknowledged`, `ComposeContentChanged`, `TabActivated`.
 
 State events broadcast (`StateEvent`): `StateChanged`, `AwaitingPermissionChanged`, `DoneWhileAwayChanged`, `ActiveTabChanged`, `TabCreated`, `TabClosed`, `TabRenamed`, `TabClosedStateChanged`, `NotificationFired`.
 
@@ -347,7 +365,7 @@ Notifications go through a dedicated queue, separate from per-tab TTS:
 
 #### Edge-case rules
 
-- **Idle is suppressed while `awaiting_permission` is set on the same tab.** When Claude stops printing to ask permission, the avatar drops to Idle (output-stopped) at roughly the same instant the permission detector fires. Without this rule the user hears both. The check runs at enqueue time against the manager's most-recent-known `awaiting_permission` flag; the Idle notification is dropped silently when that flag is true.
+- **Idle is suppressed while `awaiting_permission` is set on the same tab.** When a harness stops printing to ask permission, the avatar drops to Idle (output-stopped) at roughly the same instant the permission detector fires. Without this rule the user hears both. The check runs at enqueue time against the manager's most-recent-known `awaiting_permission` flag; the Idle notification is dropped silently when that flag is true.
 - **Drain is debounced ~200 ms after the first enqueue when audio is idle.** Closely-spaced related events (an Idle and an AwaitingPermission landing microseconds apart for the same logical edge) get a chance to coalesce in the queue before drain. If new events arrive during the window, the existing deadline stands — they ride the same drain. Audio idle-edges drain immediately on the next pulse; the debounce only applies to the cold-start case.
 
 #### Configuration
@@ -585,24 +603,24 @@ Detection runs as a cascade so a sufficiently old file passes through every step
 
 After migration and typed deserialization, an integrity pass repairs hand-edited files:
 
-1. **AI builtins forced to `builtin: true`.** The two AI tabs (`claude`, `claude-local`) cannot be demoted by a hand-edit.
+1. **Reserved AI tabs forced to `builtin: true`.** Any tab whose id a `HarnessDescriptor` claims cannot be demoted by a hand-edit.
 2. **`shell-default-1` demoted to `builtin: false`.** Older settings files that persisted `builtin: true` on this id are corrected — closability is uniform across all shell tabs.
-3. **`use_local_provider` coerced on AI builtins.** `false` for `claude`, `true` for `claude-local`, so a hand-edit can't silently flip the subscription tab into local-LLM mode.
-4. **AI builtins reconciled with `claude_tabs_enabled`.** `Cloud` → `claude` only, `Local` → `claude-local` only, `Both` → both. Missing tabs are restored at canonical positions (`claude` at index 0; `claude-local` immediately after `claude` if present, else index 0); disabled-but-present tabs are removed from the array. `shell-default-1` is intentionally untouched here — it's a regular closable shell.
+3. **`use_local_provider` coerced on reserved AI tabs.** Each reserved id has one canonical value (`AiTabId::uses_local_provider()` — true only for the local-provider variant `claude-local`), so a hand-edit can't silently flip a subscription tab into local-LLM mode. A harness that picks its own provider is never "local".
+4. **Reserved AI tabs reconciled with `enabled_ai_tabs`.** Ids listed but missing from `tabs[]` are restored at their canonical registry position; reserved AI tabs present but not listed are removed from the array. `shell-default-1` is intentionally untouched here — it's a regular closable shell.
 5. **Layout sanity.** Tab refs in panes that don't exist in `settings.tabs` are dropped; an invalid `focused_pane_id` is reset to leftmost leaf.
 
 The frontend's `validateAndRepairLayout` runs after this on hydration and handles deeper concerns (orphan placement, empty-pane collapse).
 
 ### Offload: local task delegation (V8-01) + backend pool (V8-02) + warm pool & MCP host (V8-03)
 
-Offload lets the main cloud Claude (Opus) session hand a self-contained, token-heavy subtask to a **subordinate local/remote model** and receive only the synthesized result — Opus stays in charge, but the intermediate search/read/summarize tokens never enter its window. It is exposed to Claude as a single `offload_task` MCP tool, injected session-scoped into cImp-launched Claude tabs via `--mcp-config` (never writing `~/.claude`).
+Offload lets the frontier session in an AI tab hand a self-contained, token-heavy subtask to a **subordinate local/remote model** and receive only the synthesized result — the frontier model stays in charge, but the intermediate search/read/summarize tokens never enter its window. It is exposed as a single `offload_task` MCP tool, advertised session-scoped to cImp-launched AI tabs through whatever mechanism that harness's plugin declares for delivering an MCP server (never writing into the harness's own global config).
 
-cImp bridges two MCP roles: toward Claude it is an MCP **server** (the hidden `cimp --offload-mcp` subcommand); toward any user tool servers it is an MCP **host/client**. The `llama-server` itself never speaks MCP — cImp runs the agent loop (`offload/agent.rs`), translating between the model's OpenAI-style `tool_calls` and each tool's executor.
+cImp bridges two MCP roles: toward the AI tab it is an MCP **server** (the hidden `cimp --offload-mcp` subcommand, launched with that harness's registered `--consumer` token); toward any user tool servers it is an MCP **host/client**. The `llama-server` itself never speaks MCP — cImp runs the agent loop (`offload/agent.rs`), translating between the model's OpenAI-style `tool_calls` and each tool's executor. A consumer token nobody registered is **refused**, not defaulted: the proxy start fails with the registered list rather than silently serving another harness's tool set.
 
-**Where the loop lives (V8-03).** The agent loop, the backend pool, the router, and the MCP host all run in the **long-lived cImp app** (`offload/service.rs::OffloadService`), not in the per-session child. Only the app sees every in-flight offload across all Claude tabs, so it owns a **global concurrency gate** and feeds the router honest `in_flight` (which is why V8-02's spill/fail-over finally works), keeps **warm** MCP-host connections across calls, and renders the capability description from **live** health. The `--offload-mcp` child shrinks to a **proxy with a self-contained fallback**: when the app is up it forwards to an authenticated loopback endpoint; when the app is down (headless cron, mid-restart) it runs the V8-02 path itself (native-only, no warm host). Both paths share the pure router and the agent loop, so they can't drift.
+**Where the loop lives (V8-03).** The agent loop, the backend pool, the router, and the MCP host all run in the **long-lived cImp app** (`offload/service.rs::OffloadService`), not in the per-session child. Only the app sees every in-flight offload across all AI tabs, so it owns a **global concurrency gate** and feeds the router honest `in_flight` (which is why V8-02's spill/fail-over finally works), keeps **warm** MCP-host connections across calls, and renders the capability description from **live** health. The `--offload-mcp` child shrinks to a **proxy with a self-contained fallback**: when the app is up it forwards to an authenticated loopback endpoint; when the app is down (headless cron, mid-restart) it runs the V8-02 path itself (native-only, no warm host). Both paths share the pure router and the agent loop, so they can't drift.
 
 ```
-  Claude tab (Opus) ──offload_task──▶ cimp --offload-mcp  (thin proxy per session)
+  AI tab (frontier) ──offload_task──▶ cimp --offload-mcp  (thin proxy per session)
                                          │  POST /run · GET /describe · GET /events
                                          │  (127.0.0.1, ephemeral port + bearer token,
                                          │   discovery file next to the exe)
@@ -619,7 +637,7 @@ cImp bridges two MCP roles: toward Claude it is an MCP **server** (the hidden `c
         │  Remote Cloud (URL + auth + consent)          │
         └───────────────────────────────────────────────┘
                                          │
-                              ONE synthesized string ─▶ Opus
+                    ONE synthesized string ─▶ the AI tab
 
   app down ▶ the child runs the same router + loop itself (native tools only)
 ```
@@ -631,7 +649,7 @@ Key types (all behind the `Backend` seam so the pool is additive over V8-01's si
 - **`offload/mcp_host.rs::McpHost`** — the warm MCP **client** pool: per server it runs `initialize`+`tools/list`, **namespaces** tools (`ddg__search`), drops write/destructive tools (**read-class only**), confines a `filesystem` server to the allowed roots, multiplexes stdio JSON-RPC by id, tracks per-server health, and pulses a change event when a server connects/drops. Tools merge into the chat `tools` array (then filtered by the backend's `ToolScope`).
 - **`offload/server.rs::LlamaServer`** — the Local backend: cImp owns the process (Start/Stop/Reset, autostart), parses the command for host/port/`-np`/`--jinja`/`--kv-unified`, and discovers `n_ctx` from `/props` (unified KV reports the shared window, so it is divided by `-np` to stay a per-slot number).
 - **`offload/remote.rs::RemoteBackend`** — a Remote backend (LAN or cloud): a `base_url` (+ optional auth) cImp only health-checks and connects to; `n_ctx` from `/props` or a configured `declared_context`. No process, no tab.
-- **`offload/router.rs::select`** — the per-task router: a pure function over `BackendView` snapshots that filters by **tool need** (the privacy hard filter — a local-data task never reaches a cloud backend), then **required context**, then **tier/complexity** and Claude's `tier` hint, then **availability** (spill on busy, fail over on down). One enabled backend → no-op.
+- **`offload/router.rs::select`** — the per-task router: a pure function over `BackendView` snapshots that filters by **tool need** (the privacy hard filter — a local-data task never reaches a cloud backend), then **required context**, then **tier/complexity** and the caller's `tier` hint, then **availability** (spill on busy, fail over on down). One enabled backend → no-op.
 - **Per-backend `ToolScope`** — the allow-list over the global tool pool. Local/LAN default to all tools; **cloud defaults to web/docs only**, denying `read_file`/`code_search`/`run_command`/`filesystem`/`git`. Enforced twice: the router won't route a local-data task to cloud, and the agent loop filters the `tools` array *and* refuses a disallowed call.
 - **`offload/supervisor.rs::OffloadSupervisor`** — app-owned lifecycle for the Local backends (keyed by name) plus health-probe of Remote backends for the Settings status rows.
 
@@ -641,7 +659,9 @@ Cloud backends are gated behind an explicit data-egress consent toggle and badge
 
 ## Settings Schema
 
-The on-disk JSON shape, current as of v1.9. The example below shows the fully-resolved global file; the per-folder overlay (`.cimp/config.json`) is a partial subset of the same shape.
+The on-disk JSON shape (`schema_version` 36). The example below is an abridged view of the fully-resolved global file — it shows the groups that matter architecturally, not every field; the per-folder overlay (`.cimp/config.json`) is a partial subset of the same shape.
+
+Two groups are harness-shaped and neither names a harness in code. `harness` is a **map keyed by registry id**, one block per harness, so adding a harness needs no settings migration: core's own per-harness fields (`expose_commands`, `expose_code_audit`, `last_seen`, `last_verified`, `input_profile_status`, `auto_verify`) plus `ext`, an opaque object whose schema, defaults and validation belong to that harness's plugin (`HarnessPlugin::settings_schema`) — core stores it, type-checks the declared keys at the parse boundary, folds the spawn-baked ones into the spawn signature, and never names a key. `enabled_ai_tabs` is a list of reserved AI tab ids drawn from the same registry.
 
 ```json
 {
@@ -699,12 +719,31 @@ The on-disk JSON shape, current as of v1.9. The example below shows the fully-re
       "restore_on_launch": true
     }
   },
-  "claude_local": {
-    "base_url": "http://localhost:4000",
-    "auth_token": "sk-dummy",
-    "model_alias": ""
+  "harness": {
+    "claude": {
+      "expose_commands": true,
+      "expose_code_audit": true,
+      "last_seen": "",
+      "last_verified": "",
+      "input_profile_status": "unverified",
+      "auto_verify": null,
+      "ext": {
+        "local.base_url": "http://localhost:4000",
+        "local.auth_token": "sk-dummy",
+        "local.model_alias": ""
+      }
+    },
+    "opencode": {
+      "expose_commands": true,
+      "expose_code_audit": true,
+      "last_seen": "",
+      "last_verified": "",
+      "input_profile_status": "unverified",
+      "auto_verify": null,
+      "ext": {}
+    }
   },
-  "claude_tabs_enabled": "cloud",
+  "enabled_ai_tabs": ["claude"],
   "behavior": {
     "interrupt_on_input": true,
     "auto_speak": true,
@@ -742,7 +781,7 @@ The on-disk JSON shape, current as of v1.9. The example below shows the fully-re
       "args": [],
       "cwd": null,
       "env": {},
-      "tts_injection": { "enabled": true, "instructions": "..." },
+      "tts_injection": { "enabled": true },
       "notifications": {
         "idle": "Claude is idle",
         "awaiting_permission": "Claude is awaiting permission",
@@ -756,19 +795,19 @@ The on-disk JSON shape, current as of v1.9. The example below shows the fully-re
     },
     {
       "kind": "ai_tool",
-      "id": "claude-local",
+      "id": "opencode",
       "builtin": true,
-      "name": "Claude (local)",
-      "command": "claude",
+      "name": "OpenCode",
+      "command": "opencode",
       "args": [],
       "cwd": null,
       "env": {},
-      "tts_injection": { "enabled": true, "instructions": "..." },
+      "tts_injection": { "enabled": true },
       "notifications": { "...": "..." },
       "first_launch_notice_dismissed": true,
       "theme_override": { "name": "Solarized Dark", "custom": null },
       "background_override": "disabled",
-      "use_local_provider": true
+      "use_local_provider": false
     },
     {
       "kind": "shell",
@@ -796,7 +835,7 @@ The on-disk JSON shape, current as of v1.9. The example below shows the fully-re
       "direction": "horizontal",
       "ratio": 0.5,
       "first":  { "type": "pane", "id": "pane-...", "tab_ids": ["claude"], "active_tab_id": "claude" },
-      "second": { "type": "pane", "id": "pane-...", "tab_ids": ["claude-local", "shell-default-1"], "active_tab_id": "claude-local" }
+      "second": { "type": "pane", "id": "pane-...", "tab_ids": ["opencode", "shell-default-1"], "active_tab_id": "opencode" }
     },
     "focused_pane_id": "pane-..."
   },
@@ -813,10 +852,11 @@ The on-disk JSON shape, current as of v1.9. The example below shows the fully-re
 Notes:
 
 - Every Rust struct uses `#[serde(default)]` so a settings file written by a future or past version still loads — missing fields get defaults, unknown fields are ignored.
-- `tts_injection.enabled` controls whether cImp injects system-prompt content for an AI tab via `--append-system-prompt`. On by default for both AI builtins (subscription Claude and Claude (local)); local models vary in how reliably they honor the markup convention, so the local-tab version is best-effort.
-- `use_local_provider` (V1.4-07) gates env synthesis from the global `claude_local` settings group. When `true`, the launch-time spawn merges `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` (and `ANTHROPIC_MODEL` if the alias is non-empty) into the process env, with per-tab `env` entries always winning over synthesized values.
-- `claude_tabs_enabled` (V1.9) drives the integrity-check reconciliation of the AI builtins: `Cloud` keeps only `claude`, `Local` keeps only `claude-local`, `Both` keeps both. Default is `Cloud`. Changing the value at runtime closes / re-opens the affected tabs (kills the PTY and drops scrollback when removing; re-creates with defaults when adding).
-- AI builtins (`claude`, `claude-local`) cannot be deleted by hand-edits — the integrity check restores them at canonical positions when `claude_tabs_enabled` says they should exist, and corrects `use_local_provider` if a hand-edit flipped it. The `shell-default-1` id is *not* a builtin: it ships as the first shell tab on a fresh install but is fully closable, and the integrity check does not re-seed it. User-created Shell tab ids are uuid-based and never collide with reserved ids.
+- The `harness` block is **machine scope**, like `harness_versions` and `sandbox`: it mixes state written out of band (the version the transcript tap observed, the auto-verify record) with configuration about the harness *install on this machine*. None of that is a property of the project you happen to have open, so `harness` is in `OVERLAY_BANNED_KEYS` and a Settings save writes it through to the physical global file. Its keys are `String`, not a typed id, so a `harness.<something>` block written by a newer build survives a load/save round trip on a build that has never heard of it; every accessor takes a `HarnessId`.
+- `tts_injection.enabled` controls whether cImp injects system-prompt content for an AI tab. **The delivery mechanism is the harness's, not cImp's** — Claude Code takes `--append-system-prompt`, OpenCode takes a generated instructions file; the plugin declares which. On by default for every reserved AI tab. Local models vary in how reliably they honor the markup convention, so the local-provider variant is best-effort.
+- `use_local_provider` (V1.4-07) gates env synthesis for a tab whose harness declares a local-provider variable set. When `true`, the launch-time spawn merges that harness's declared variables — for Claude Code `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` (and `ANTHROPIC_MODEL` if the alias is non-empty), filled from its `ext` keys — into the process env, with per-tab `env` entries always winning over synthesized values. A harness that picks its own provider declares no such set and is never "local".
+- `enabled_ai_tabs` drives the integrity-check reconciliation of the reserved AI tabs; default `["claude"]` on a fresh install. Changing it at runtime closes / re-opens the affected tabs (kills the PTY and drops scrollback when removing; re-creates from the registry defaults when adding).
+- Reserved AI tabs cannot be deleted by hand-edits — the integrity check restores them at canonical registry positions when `enabled_ai_tabs` says they should exist, and corrects `use_local_provider` if a hand-edit flipped it. The `shell-default-1` id is *not* a builtin: it ships as the first shell tab on a fresh install but is fully closable, and the integrity check does not re-seed it. User-created Shell tab ids are uuid-based and never collide with reserved ids.
 - `behavior.follow_avatar` (default off) auto-mutes when the avatar is hidden; `behavior.announce_focused_tab` (default off) lets announcements fire even for the focused tab.
 - `notifications.question` (per AI tab) is spoken when an AskUserQuestion-style multi-option prompt fires. Empty string disables.
 - `session.active_tab_id` is a legacy field. It still exists in the struct and is updated by the runtime on tab activation, but the v1.2 → v1.3 migration drops it from the file (the layout's per-pane `active_tab_id` plus `focused_pane_id` are the source of truth for active-tab state). Cleanup of the runtime write path is deferred.
@@ -975,7 +1015,7 @@ src/lib/
 
 ### Logging
 
-`tracing` and `tracing-subscriber`. INFO for major state transitions, DEBUG for component-level events, TRACE for high-volume things. Avoid logging in hot paths at INFO or higher. Logging output respects `RUST_LOG`; `RUST_LOG=perm_capture=debug` exposes permission-detection events for re-characterization when Claude Code's UI changes.
+`tracing` and `tracing-subscriber`. INFO for major state transitions, DEBUG for component-level events, TRACE for high-volume things. Avoid logging in hot paths at INFO or higher. Logging output respects `RUST_LOG`; `RUST_LOG=perm_capture=debug` exposes permission-detection events for re-characterization when a harness's UI changes.
 
 ### Testing
 
@@ -1031,8 +1071,10 @@ The avatar overlay, waveform visualizer, and xterm.js terminal interior are expl
 - **Compose overlay / compose sheet** — the bottom-sheet textarea with browser spell-check
 - **Amplitude tap** — the mechanism by which the audio playback path exposes recent sample data for the visualizer
 - **Tab** — an independently-spawned subprocess with its own PTY, processing layer, and avatar state
-- **Tab kind** — discriminator between `AiTool` (subscription Claude / Claude (local); full feature set) and `Shell` (configurable shell; reduced feature set)
-- **Builtin tab** — `claude` and `claude-local` only. The integrity check restores them per the `claude_tabs_enabled` setting and refuses to close them at runtime. `shell-default-1` is *not* a builtin despite its reserved-looking id — it ships only on fresh installs and is closable like any user shell.
+- **Harness** — a registered AI coding CLI cImp hosts but does not own: one `HarnessDescriptor` row in `harness/registry.rs` plus one `harness/<id>/` plugin directory. Claude Code and OpenCode ship registered.
+- **Harness plugin** — the code half of a harness (`HarnessPlugin`, `harness/<id>/`): everything cImp knows about that CLI — its prompt grammar, its config artifacts, its readers, its affordance strings. The only per-harness artifact in the tree.
+- **Tab kind** — discriminator between `AiTool` (a tab running a registered harness; full feature set) and `Shell` (configurable shell; reduced feature set)
+- **Builtin tab** — a tab whose id a `HarnessDescriptor` claims in its `tab_ids` (`claude`, `claude-local`, `opencode` today). The integrity check restores the ones listed in `enabled_ai_tabs` at their canonical registry positions and refuses to close them at runtime. `shell-default-1` is *not* a builtin despite its reserved-looking id — it ships only on fresh installs and is closable like any user shell.
 - **User tab** — a Shell tab (whether the seeded `shell-default-1` or one created later via the `+` button or `Ctrl+T`). Can be closed, renamed, reconfigured.
 - **Closed sub-state** — a Shell-tab UI state when the subprocess has exited; shows a restart message; pressing Enter respawns
 - **Tab status indicator** — visual element on the tab bar showing status (working, awaiting permission, error, done while away)
@@ -1059,6 +1101,7 @@ The avatar overlay, waveform visualizer, and xterm.js terminal interior are expl
 - **Per-milestone implementation detail**: `MILESTONE-V[N]-[N].md` files. The milestone series numbering is independent of the git tag — each milestone preamble documents which release it shipped under (e.g. V1.4-01..04 → `v1.3.2`, V1.4-07 → `v1.3.3`). Cumulative releases are tagged on the `v0.x.y` line (most recent: `v0.4.0`).
 - **Deferred and future work**: `FUTURE-FEATURES.md` — both external dependencies and "we could build this but chose not to" items, with triggers for when to pick them up.
 - **Maintenance and operations**: `MAINTENANCE.md` — dependency upgrade notes, model files, runtime-prompt management.
+- **Harness surface**: `../src-tauri/src/harness/README.md` — the layering (capabilities → session bus → CHP → plugin → harness), what each file is for, and how to add a harness. Per-harness mechanism detail lives in `../src-tauri/src/harness/claude/README.md` and `../src-tauri/src/harness/opencode/README.md`; every dependency cImp has on a harness is a row in `harness/contract.rs`.
 - **Packaging**: `PACKAGING.md` — release-build and distribution notes.
 
 ---

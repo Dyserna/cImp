@@ -1,8 +1,17 @@
-//! Claude Code subscription usage tracker.
+//! **Claude Code's usage source** — the status-line push, the two-slot push
+//! file, and the [`UsageSource`] impl core reads it through.
+//!
+//! V40 Phase D (locked decision 19). This was `crate::usage`, an L4 capability
+//! module whose first line described it as "Claude Code subscription usage
+//! tracker": Anthropic's two subscription windows as *field names*, Claude
+//! Code's `context_window` block mirrored field for field, and a push file
+//! named after the harness. None of it is true of harnesses in general, so all
+//! of it lives here now and core sees only the neutral readings at the bottom
+//! of this file.
 //!
 //! The bottom-bar widget shows the same session (5h) / weekly (7d) quota the
 //! `/usage` slash command shows. The data arrives via the **status line
-//! push**: Claude Code (≥ 2.1.80) includes a `rate_limits` object in the JSON
+//! push**: Claude Code (>= 2.1.80) includes a `rate_limits` object in the JSON
 //! it pipes to the `statusLine` command —
 //!
 //! ```json
@@ -11,19 +20,23 @@
 //!     "seven_day": { "used_percentage": 41.2, "resets_at": 1738857600 } } }
 //! ```
 //!
-//! (`used_percentage` is 0–100; `resets_at` is Unix epoch seconds.) Our
-//! `cimp --statusline` renderer (see `crate::statusline`) extracts that
+//! (`used_percentage` is 0-100; `resets_at` is Unix epoch seconds.) Our
+//! `cimp --statusline` renderer (see [`super::statusline`]) extracts that
 //! object on every invocation and persists it to `<exe-dir>/claude-usage-push.json`
 //! via [`store_pushed_usage`]; the widget's poll reads it back through
-//! [`pushed_usage`]. The injected overlay also sets `statusLine.refreshInterval`
-//! so pushes keep flowing while a Claude tab sits idle.
+//! [`ClaudeUsage`]'s [`UsageSource::read`]. The injected overlay also sets
+//! `statusLine.refreshInterval` so pushes keep flowing while a Claude tab sits
+//! idle.
 //!
-//! This replaces polling the undocumented `api.anthropic.com/api/oauth/usage`
-//! endpoint, which allows only a tiny request burst before answering 429 with
-//! a multi-minute `Retry-After` — the widget spent most of its life dimmed on
-//! cached data. The push costs zero extra requests (Claude Code already has
-//! the numbers from its API responses) and uses a documented schema. The old
-//! poller is kept, disabled, in [`endpoint_poll`].
+//! This replaced polling an undocumented account-usage endpoint, which allowed
+//! only a tiny request burst before answering 429 with a multi-minute
+//! `Retry-After` — the widget spent most of its life dimmed on cached data.
+//! The push costs zero extra requests (Claude Code already has the numbers
+//! from its API responses) and uses a documented schema. **The disabled poller
+//! that used to sit at the bottom of this file is deleted** (V40 Phase D): it
+//! was compiled dead code carrying a vendor OAuth URL and a reader for the
+//! harness's on-disk credentials file, and "kept in case a future feature
+//! needs it" is not a consumer.
 //!
 //! NC-3: the same payload also carries a `context_window` block (used
 //! percentage, tokens in the window, and the turn's cache read/creation split)
@@ -53,12 +66,26 @@
 //!     over an idle tab that keeps re-pushing the same numbers;
 //!   - each slot carries its own write instant, so the UI dims per section by
 //!     that section's own age instead of one global timestamp.
+//!
+//! # The on-disk shape is frozen, the shape core sees is not
+//!
+//! [`UsageSnapshot`], [`UsageWindow`] and [`ContextSnapshot`] keep Claude's
+//! field names because they ARE the push file, which a previously installed
+//! build wrote and this one must still read. What crosses into core is
+//! [`crate::harness::plugin::UsageReading`] — a declared window list, a token
+//! map whose absent categories are absent, and nothing named after a
+//! subscription plan.
 
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use tracing::debug;
+
+use crate::harness::plugin::{
+    ContextReading, QuotaWindow, QuotaWindowSpec, TokenKindSpec, TokenKinds, TurnOrigin,
+    TurnUsageShape, UsageReading, UsageSource,
+};
 
 /// One quota window: how much of the limit is used and when it resets.
 /// `utilization` is 0–100; `resets_at` is an ISO-8601 timestamp (with tz) or
@@ -113,7 +140,7 @@ impl UsageSnapshot {
 /// `context_window` block plus the session metadata beside it (NC-3).
 ///
 /// Everything is `Option` on purpose — the block is walked leniently out of a
-/// raw `serde_json::Value` (see `crate::statusline`), so a reshaped or partial
+/// raw `serde_json::Value` (see [`super::statusline`]), so a reshaped or partial
 /// upstream payload yields fewer fields rather than a failed parse, and the UI
 /// can tell "0 tokens" apart from "not reported".
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -182,20 +209,18 @@ impl ContextSnapshot {
     }
 }
 
-/// Outcome of a usage read, serialized to the frontend. `rate_limited` /
-/// `retry_after_secs` are legacy fields from the endpoint-poll era (see
-/// [`endpoint_poll`]); the push path never sets them, but the shape is kept so
-/// the frontend contract is unchanged. `Default` is the unavailable state
-/// (widget hides).
-#[derive(Serialize, Clone, Debug, Default)]
-pub struct UsageResult {
+/// Outcome of a push-file read. `Default` is the unavailable state (widget
+/// hides).
+///
+/// V40 Phase D dropped its two `rate_limited` / `retry_after_secs` fields with
+/// the poller that set them: they were serialized to the frontend as
+/// permanently `false` / `null`, and a field that can only carry one value is
+/// a contract nobody can read anything out of.
+#[derive(Clone, Debug, Default)]
+pub struct PushedReading {
     /// The snapshot to render. `None` when no push data exists (no Claude tab
     /// has produced one yet, or the last one is too old to be meaningful).
     pub snapshot: Option<UsageSnapshot>,
-    /// Legacy: true when the endpoint poller hit a 429. Always false now.
-    pub rate_limited: bool,
-    /// Legacy: parsed `Retry-After` from a 429. Always `None` now.
-    pub retry_after_secs: Option<u64>,
     /// True when *every* part of `snapshot` that carries data is aging —
     /// nothing in the widget is fresh. Kept as the whole-widget signal (the
     /// tooltip); per-section dimming uses the two flags below, because the
@@ -565,25 +590,25 @@ fn context_signature(ctx: &ContextSnapshot, activity: Option<&str>) -> String {
 /// Read the current usage for the widget: the freshest status-line push,
 /// aged into fresh / stale / absent. Pure local file read — never touches
 /// the network.
-pub fn pushed_usage() -> UsageResult {
+fn pushed_usage() -> PushedReading {
     let raw = match push_path().and_then(|p| std::fs::read_to_string(p).ok()) {
         Some(r) => r,
         None => {
             debug!("usage: no push file; widget hides");
-            return UsageResult::default();
+            return PushedReading::default();
         }
     };
     interpret_push(&raw, now_ms())
 }
 
-/// Age a raw push-file payload into a `UsageResult`. Split from
+/// Age a raw push-file payload into a `PushedReading`. Split from
 /// [`pushed_usage`] so staleness is unit-testable with an injected clock.
-fn interpret_push(raw: &str, now_ms: u64) -> UsageResult {
+fn interpret_push(raw: &str, now_ms: u64) -> PushedReading {
     let pushed: PushedUsage = match serde_json::from_str(raw) {
         Ok(p) => p,
         Err(e) => {
             debug!(error = %e, "usage: push file unparseable; treating as absent");
-            return UsageResult::default();
+            return PushedReading::default();
         }
     };
     // A write instant in the future (clock adjustment) counts as fresh.
@@ -611,7 +636,7 @@ fn interpret_push(raw: &str, now_ms: u64) -> UsageResult {
             context_age_secs = context_age.as_secs(),
             "usage: no live push data; widget hides"
         );
-        return UsageResult::default();
+        return PushedReading::default();
     }
     let has_quota = snapshot.has_rate_limits();
     let has_context = snapshot
@@ -620,10 +645,8 @@ fn interpret_push(raw: &str, now_ms: u64) -> UsageResult {
         .is_some_and(ContextSnapshot::is_substantive);
     let quota_stale = has_quota && quota_age > STALE_AFTER;
     let context_stale = has_context && context_age > STALE_AFTER;
-    UsageResult {
+    PushedReading {
         snapshot: Some(snapshot),
-        rate_limited: false,
-        retry_after_secs: None,
         // Whole-widget flag: only when nothing on screen is fresh.
         stale: (!has_quota || quota_stale) && (!has_context || context_stale),
         quota_stale,
@@ -645,247 +668,304 @@ pub(crate) fn epoch_secs_to_iso(n: i64) -> Option<String> {
     Some(chrono::DateTime::from_timestamp(secs, 0)?.to_rfc3339())
 }
 
-// ---- legacy endpoint poller (DISABLED 2026-08-04) ------------------------
-//
-// The original data source: polling the undocumented
-// `GET https://api.anthropic.com/api/oauth/usage` endpoint with the OAuth
-// bearer token from `~/.claude/.credentials.json`, plus a last-good on-disk
-// cache (`<exe-dir>/usage-cache.json`) served — flagged stale — through the
-// endpoint's aggressive 429 rate-limiting. Replaced by the status-line push
-// above and no longer called from anywhere; kept compiling (not bit-rotting)
-// in case a future feature needs an on-demand pull of account data again.
-// To resurrect: call `endpoint_poll::fetch_usage()` from
-// `ipc::commands::get_claude_usage` and restore the frontend's 429 backoff
-// (see UsageMeter.svelte history around v0.49.x).
-#[allow(dead_code)]
-mod endpoint_poll {
-    use std::path::PathBuf;
-    use std::sync::{Mutex, OnceLock};
-    use std::time::Duration;
 
-    use serde::Deserialize;
-    use tracing::{debug, warn};
+// ── the neutral seam (locked decision 19) ──────────────────────────────────
 
-    use super::{UsageResult, UsageSnapshot, UsageWindow};
+/// Claude Code's subscription quota windows, in display order.
+///
+/// The ids are the push payload's own keys, so the reading joins to the
+/// declaration without a translation table; the three display strings are what
+/// the bottom-bar widget renders, and they live here rather than in the widget
+/// because "current session (5h)" is a fact about Anthropic's plan.
+const WINDOWS: &[QuotaWindowSpec] = &[
+    QuotaWindowSpec {
+        id: "five_hour",
+        label: "current session",
+        short: "(5h)",
+        description: "Rolling 5-hour session quota",
+    },
+    QuotaWindowSpec {
+        id: "seven_day",
+        label: "weekly session",
+        short: "(7d)",
+        description: "Rolling 7-day weekly quota",
+    },
+];
 
-    const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
-    const OAUTH_BETA: &str = "oauth-2025-04-20";
-    const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// The billing categories Claude Code reports a turn's tokens under.
+///
+/// Four, because this vendor prices cache reads and cache writes separately. A
+/// harness that bills one flat input number declares one row and every
+/// consumer of a reading sees one entry — never four with three zeros.
+const TOKEN_KINDS: &[TokenKindSpec] = &[
+    TokenKindSpec { id: "input", label: "Input" },
+    TokenKindSpec { id: "cache_write", label: "Cache write" },
+    TokenKindSpec { id: "cache_read", label: "Cache read" },
+    TokenKindSpec { id: "output", label: "Output" },
+];
 
-    /// Reusable HTTP client for the usage poll. Built once and shared so we
-    /// don't spin up a fresh connection pool / TLS config on every poll tick.
-    /// The bearer token is supplied per-request, so the client itself is
-    /// stateless and safe to reuse.
-    fn usage_client() -> &'static reqwest::Client {
-        static USAGE_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-        USAGE_CLIENT.get_or_init(|| {
-            reqwest::Client::builder()
-                .timeout(REQUEST_TIMEOUT)
-                .build()
-                .unwrap_or_else(|e| {
-                    warn!(error = %e, "usage: failed to build HTTP client; using default");
-                    reqwest::Client::new()
-                })
+/// **The one spelling of Claude's main-transcript lane.** Written verbatim into
+/// `usage_stat.origin` by the transcript tap and read back verbatim by the
+/// Usage donut — the value is frozen by the rows already on disk.
+pub const ORIGIN_SESSION: &str = "session";
+
+/// **The one spelling of Claude's sidechain lane** — a turn recorded in
+/// `<sid>/subagents/*.jsonl`, or an inline `isSidechain:true` line in the parent
+/// transcript. Same frozen-by-disk posture as [`ORIGIN_SESSION`].
+pub const ORIGIN_AGENT: &str = "agent";
+
+/// The two lanes a Claude turn can be attributed to. Both ids are persisted in
+/// `usage_stat.origin`, and both are spelled ONCE ([`ORIGIN_SESSION`] /
+/// [`ORIGIN_AGENT`]) so the tap, the declaration and the stored column cannot
+/// drift apart.
+const ORIGINS: &[TurnOrigin] = &[
+    TurnOrigin { id: ORIGIN_SESSION, label: "main session", subagent: false },
+    TurnOrigin { id: ORIGIN_AGENT, label: "sub-agents", subagent: true },
+];
+
+/// **The shape of a recorded Claude turn** — its four billing categories and
+/// its two lanes, handed to core by
+/// [`HarnessPlugin::turn_usage_shape`](crate::harness::plugin::HarnessPlugin::turn_usage_shape).
+///
+/// Declared beside the quota source rather than on it (V40 Phase G): what a
+/// stored `usage_stat` row looks like is a different question from what the
+/// status-line push reports, and only the first one has an answer for every
+/// harness that records turns.
+pub static TURN_SHAPE: TurnUsageShape = TurnUsageShape {
+    token_kinds: TOKEN_KINDS,
+    origins: ORIGINS,
+};
+
+/// Claude Code's pseudo-model, stamped on messages it fabricates locally
+/// (errors, interrupts). Nobody was billed for a `<synthetic>` turn, so it must
+/// not appear in "which model ran this session" — a filter that used to be two
+/// string literals inside `graph/index.rs`.
+const MODEL_SENTINELS: &[&str] = &["<synthetic>"];
+
+/// The [`UsageSource`] the descriptor hands core.
+pub struct ClaudeUsage;
+
+/// The one instance.
+pub static USAGE: ClaudeUsage = ClaudeUsage;
+
+impl UsageSource for ClaudeUsage {
+    fn windows(&self) -> &'static [QuotaWindowSpec] {
+        WINDOWS
+    }
+
+    fn model_sentinels(&self) -> &'static [&'static str] {
+        MODEL_SENTINELS
+    }
+
+    fn read(&self) -> Option<UsageReading> {
+        pushed_usage().into_reading()
+    }
+}
+
+impl PushedReading {
+    /// This push-file reading as the neutral one core speaks.
+    ///
+    /// `None` when there is nothing to render at all — which is a different
+    /// answer from `usage_source() == None` ("this harness has no usage
+    /// source"), and the distinction is what stops a silent tab and a harness
+    /// without quota from looking the same.
+    fn into_reading(self) -> Option<UsageReading> {
+        let snap = self.snapshot?;
+        Some(UsageReading {
+            windows: quota_windows(&snap),
+            // Substantive-only at the neutral boundary as well as at the push
+            // one: a context block that survived the merge but has no numbers
+            // left to draw is absence with extra steps.
+            context: snap
+                .context
+                .as_ref()
+                .map(context_reading)
+                .filter(ContextReading::is_substantive),
+            stale: self.stale,
+            quota_stale: self.quota_stale,
+            context_stale: self.context_stale,
         })
     }
+}
 
-    /// Raw shape of the endpoint response — only the two fields we consume.
-    /// `#[serde(default)]` so missing windows deserialize to `None` rather
-    /// than failing the whole parse if the endpoint shape shifts.
-    #[derive(Deserialize, Default)]
-    struct UsageResponse {
-        #[serde(default)]
-        five_hour: Option<UsageWindow>,
-        #[serde(default)]
-        seven_day: Option<UsageWindow>,
-    }
-
-    // The endpoint allows a small burst, then 429s with a multi-minute
-    // `Retry-After`. Without a fallback the widget shows bare placeholders
-    // whenever a poll is throttled — so the last successful snapshot is kept
-    // in memory and on disk (`<exe-dir>/usage-cache.json`) and served,
-    // flagged stale, on any non-200 that isn't a clean logged-out.
-
-    /// `<exe-dir>/usage-cache.json` — the poller's last-good persistence.
-    fn cache_path() -> Option<PathBuf> {
-        let exe = std::env::current_exe().ok()?;
-        Some(exe.parent()?.join("usage-cache.json"))
-    }
-
-    /// Process-wide last-good snapshot, lazily hydrated from disk.
-    fn cache_slot() -> &'static Mutex<Option<UsageSnapshot>> {
-        static CACHE: OnceLock<Mutex<Option<UsageSnapshot>>> = OnceLock::new();
-        CACHE.get_or_init(|| Mutex::new(load_cache_from_disk()))
-    }
-
-    fn load_cache_from_disk() -> Option<UsageSnapshot> {
-        let path = cache_path()?;
-        let raw = std::fs::read_to_string(&path).ok()?;
-        serde_json::from_str(&raw).ok()
-    }
-
-    fn cached_snapshot() -> Option<UsageSnapshot> {
-        cache_slot()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-    }
-
-    fn store_snapshot(snapshot: &UsageSnapshot) {
-        *cache_slot().lock().unwrap_or_else(|e| e.into_inner()) = Some(snapshot.clone());
-        if let (Some(path), Ok(json)) = (cache_path(), serde_json::to_string(snapshot)) {
-            if let Err(e) = std::fs::write(&path, json) {
-                debug!(error = %e, "usage: failed to persist last-good snapshot");
-            }
-        }
-    }
-
-    /// Build the "serve the cached snapshot, flagged stale" result for a 429
-    /// / transient failure. When there's no cache yet (cold start),
-    /// `snapshot` is `None` and `stale` is false.
-    fn stale_result(rate_limited: bool, retry_after_secs: Option<u64>) -> UsageResult {
-        let snapshot = cached_snapshot();
-        let stale = snapshot.is_some();
-        UsageResult {
-            snapshot,
-            rate_limited,
-            retry_after_secs,
-            stale,
-            // This path never carried context data, so only the quota half can
-            // be aging — mirror `stale` there and leave context untouched.
-            quota_stale: stale,
-            context_stale: false,
-        }
-    }
-
-    /// Credentials file path: `<home>/.claude/.credentials.json`. Resolves
-    /// the home dir from `USERPROFILE` on Windows (falling back to
-    /// `HOMEDRIVE`+`HOMEPATH`), `HOME` elsewhere.
-    fn credentials_path() -> Option<PathBuf> {
-        let home = if cfg!(windows) {
-            std::env::var_os("USERPROFILE").or_else(|| {
-                match (std::env::var_os("HOMEDRIVE"), std::env::var_os("HOMEPATH")) {
-                    (Some(drive), Some(path)) => {
-                        let mut h = drive;
-                        h.push(path);
-                        Some(h)
-                    }
-                    _ => None,
-                }
+/// The declared windows that actually have a reading, in declared order.
+///
+/// A window with no reading is **omitted**, not emitted at 0: "absent is not
+/// zero" is the widget's governing rule, and the only way to keep it at the
+/// widget is to keep it here.
+fn quota_windows(snap: &UsageSnapshot) -> Vec<QuotaWindow> {
+    WINDOWS
+        .iter()
+        .filter_map(|spec| {
+            let w = match spec.id {
+                "five_hour" => snap.five_hour.as_ref(),
+                "seven_day" => snap.seven_day.as_ref(),
+                // Unreachable while WINDOWS and UsageSnapshot are edited
+                // together; a new declared window with no field behind it
+                // reports nothing rather than zero.
+                _ => None,
+            }?;
+            Some(QuotaWindow {
+                id: spec.id.to_string(),
+                label: spec.label.to_string(),
+                short: spec.short.to_string(),
+                description: spec.description.to_string(),
+                used: w.utilization,
+                resets_at: w.resets_at.clone(),
             })
-        } else {
-            std::env::var_os("HOME")
-        }?;
-        Some(
-            PathBuf::from(home)
-                .join(".claude")
-                .join(".credentials.json"),
-        )
+        })
+        .collect()
+}
+
+/// The push's `context_window` block as a neutral reading.
+///
+/// The four per-turn counters become entries in `tokens` keyed by
+/// [`TOKEN_KINDS`] ids, and a counter the payload did not carry produces **no
+/// entry** — the whole point of the map over four `Option` fields is that a
+/// consumer cannot read an absent category as a zero one.
+fn context_reading(ctx: &ContextSnapshot) -> ContextReading {
+    let mut tokens = TokenKinds::default();
+    for (id, v) in [
+        ("input", ctx.input_tokens),
+        ("cache_write", ctx.cache_creation_tokens),
+        ("cache_read", ctx.cache_read_tokens),
+        ("output", ctx.output_tokens),
+    ] {
+        if let Some(v) = v {
+            tokens.set(id, v);
+        }
     }
-
-    /// Read the OAuth access token from the credentials file. The token is
-    /// refreshed by Claude Code itself, so it is re-read on every fetch
-    /// rather than cached. `None` on any failure (file missing, not logged
-    /// in, malformed JSON).
-    fn read_access_token() -> Option<String> {
-        let path = credentials_path()?;
-        let raw = std::fs::read_to_string(&path).ok()?;
-        let parsed: serde_json::Value = serde_json::from_str(&raw).ok()?;
-        parsed
-            .get("claudeAiOauth")
-            .and_then(|o| o.get("accessToken"))
-            .and_then(|t| t.as_str())
-            .map(|s| s.to_string())
+    let mut meta = std::collections::BTreeMap::new();
+    for (k, v) in [
+        ("session_name", ctx.session_name.clone()),
+        ("agent_name", ctx.agent_name.clone()),
+        ("effort", ctx.effort.clone()),
+        ("thinking", ctx.thinking.clone()),
+        ("fast_mode", ctx.fast_mode.map(|b| b.to_string())),
+    ] {
+        if let Some(v) = v.filter(|s| !s.is_empty()) {
+            meta.insert(k.to_string(), v);
+        }
     }
-
-    /// Fetch the current usage from the OAuth endpoint. Returns:
-    ///   - `snapshot: Some` on a successful 200.
-    ///   - `rate_limited: true` (+ optional `retry_after_secs`) on a 429 —
-    ///     the caller keeps the widget visible and waits the cooldown.
-    ///   - the default "unavailable" state on no-token / network error /
-    ///     other non-2xx / parse failure.
-    pub async fn fetch_usage() -> UsageResult {
-        let token = match read_access_token() {
-            Some(t) => t,
-            None => {
-                debug!("usage: no Claude OAuth token; skipping fetch");
-                return UsageResult::default();
-            }
-        };
-
-        let client = usage_client();
-
-        let resp = match client
-            .get(USAGE_URL)
-            .bearer_auth(&token)
-            .header("anthropic-beta", OAUTH_BETA)
-            .send()
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                // Transient network/transport error — keep the last-good.
-                debug!(error = %e, "usage: request failed");
-                return stale_result(false, None);
-            }
-        };
-
-        let status = resp.status();
-        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            // Honor Retry-After (delta-seconds form) when present; the
-            // HTTP-date form parses as None and the caller falls back to its
-            // own cooldown.
-            let retry_after_secs = resp
-                .headers()
-                .get(reqwest::header::RETRY_AFTER)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.trim().parse::<u64>().ok());
-            debug!(?retry_after_secs, "usage: 429 rate limited");
-            return stale_result(true, retry_after_secs);
-        }
-
-        if !status.is_success() {
-            // 401 = stale token (Claude Code refreshes it), anything else =
-            // endpoint hiccup — both transient, so keep the last-good.
-            debug!(%status, "usage: non-success response");
-            return stale_result(false, None);
-        }
-
-        match resp.json::<UsageResponse>().await {
-            Ok(parsed) => {
-                debug!(
-                    five_hour = parsed.five_hour.as_ref().map(|w| w.utilization),
-                    seven_day = parsed.seven_day.as_ref().map(|w| w.utilization),
-                    "usage: fetched"
-                );
-                let snapshot = UsageSnapshot {
-                    five_hour: parsed.five_hour,
-                    seven_day: parsed.seven_day,
-                    // The endpoint only ever served quota windows; context
-                    // data exists on the status-line path alone.
-                    context: None,
-                };
-                store_snapshot(&snapshot);
-                UsageResult {
-                    snapshot: Some(snapshot),
-                    rate_limited: false,
-                    retry_after_secs: None,
-                    stale: false,
-                    quota_stale: false,
-                    context_stale: false,
-                }
-            }
-            Err(e) => {
-                warn!(error = %e, "usage: response parse failed");
-                stale_result(false, None)
-            }
-        }
+    ContextReading {
+        used_percentage: ctx.used_percentage,
+        remaining_percentage: ctx.remaining_percentage,
+        total_input_tokens: ctx.total_input_tokens,
+        context_window_size: ctx.context_window_size,
+        tokens,
+        meta,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The declared windows and the fixture render identically to the
+    /// pre-V40 widget** — the numbers AND the labels.
+    ///
+    /// This is the regression the whole of locked decision 19 has to survive:
+    /// `five_hour` / `seven_day` stopped being field names on a core struct and
+    /// became declared rows, so the risk is a row that renders in the wrong
+    /// order, under the wrong label, or with a percentage read off the wrong
+    /// window. The fixture is the exact push-file shape a shipped build wrote.
+    #[test]
+    fn the_reading_carries_the_same_numbers_and_labels_the_widget_drew_before() {
+        let now = 1_000_000_000u64;
+        let raw = format!(
+            r#"{{"written_at_ms":{now},"five_hour":{{"utilization":23.5,"resets_at":"2026-08-04T12:00:00+00:00"}},"seven_day":{{"utilization":41.2,"resets_at":null}}}}"#
+        );
+        let reading = interpret_push(&raw, now)
+            .into_reading()
+            .expect("a fresh push has a reading");
+
+        assert_eq!(reading.windows.len(), 2, "both windows report");
+        let five = &reading.windows[0];
+        assert_eq!(five.id, "five_hour");
+        assert_eq!(five.label, "current session");
+        assert_eq!(five.short, "(5h)");
+        assert_eq!(five.description, "Rolling 5-hour session quota");
+        assert_eq!(five.used, 23.5);
+        assert_eq!(five.resets_at.as_deref(), Some("2026-08-04T12:00:00+00:00"));
+
+        let seven = &reading.windows[1];
+        assert_eq!(seven.id, "seven_day");
+        assert_eq!(seven.label, "weekly session");
+        assert_eq!(seven.short, "(7d)");
+        assert_eq!(seven.description, "Rolling 7-day weekly quota");
+        assert_eq!(seven.used, 41.2);
+        assert_eq!(seven.resets_at, None);
+
+        assert!(!reading.stale);
+        assert!(!reading.quota_stale);
+    }
+
+    /// A window the push does not carry is **absent from the list**, not
+    /// present at zero — the rule the widget's hollow "not reported" track
+    /// depends on, now enforced one layer earlier.
+    #[test]
+    fn an_unreported_window_is_absent_rather_than_zero() {
+        let now = 1_000_000_000u64;
+        let raw = format!(
+            r#"{{"written_at_ms":{now},"five_hour":{{"utilization":0.0,"resets_at":null}}}}"#
+        );
+        let reading = interpret_push(&raw, now).into_reading().expect("present");
+        assert_eq!(reading.windows.len(), 1);
+        assert_eq!(reading.windows[0].id, "five_hour");
+        assert_eq!(
+            reading.windows[0].used, 0.0,
+            "a REPORTED zero is still reported — only absence is absent"
+        );
+    }
+
+    /// The context block's per-turn counters land under the DECLARED token
+    /// category ids, and a counter the payload did not carry produces **no
+    /// entry** — which is the whole reason `tokens` is a map and not four
+    /// `Option` fields.
+    #[test]
+    fn token_categories_are_declared_and_absent_means_absent() {
+        let ctx = ContextSnapshot {
+            used_percentage: Some(12.5),
+            cache_read_tokens: Some(700),
+            input_tokens: Some(10),
+            // No cache_creation_tokens, no output_tokens.
+            ..Default::default()
+        };
+        let reading = context_reading(&ctx);
+        assert_eq!(reading.tokens.get("cache_read"), Some(700));
+        assert_eq!(reading.tokens.get("input"), Some(10));
+        assert_eq!(reading.tokens.get("cache_write"), None);
+        assert_eq!(reading.tokens.get("output"), None);
+        assert_eq!(reading.used_percentage, Some(12.5));
+
+        // Every key it can emit is one the source DECLARES, or a UI has a
+        // number with no label for it.
+        let declared: Vec<&str> = TURN_SHAPE.token_kinds.iter().map(|k| k.id).collect();
+        for key in reading.tokens.ids() {
+            assert!(declared.contains(&key), "undeclared category `{key}`");
+        }
+    }
+
+    /// The persisted `usage_stat.origin` wire strings are exactly what this
+    /// harness declares as its turn origins, and the tap writes those same
+    /// constants.
+    ///
+    /// The column is written by the reader and read back by the Usage donut, so
+    /// a declared origin that no row can carry (or a stored value nothing
+    /// declares) is a lane with no label at one end or no data at the other.
+    /// V40 Phase G: there is no `UsageOrigin` enum to round-trip through any
+    /// more — the id IS the column — so what this pins instead is that the two
+    /// ids are still exactly the two strings already on disk in every user's
+    /// graph, and that the fan-out flag names the sidechain lane.
+    #[test]
+    fn every_declared_origin_round_trips_the_persisted_column() {
+        let declared: Vec<&str> = TURN_SHAPE.origins.iter().map(|o| o.id).collect();
+        assert_eq!(declared, vec!["session", "agent"]);
+        assert_eq!(ORIGIN_SESSION, "session");
+        assert_eq!(ORIGIN_AGENT, "agent");
+        assert_eq!(TURN_SHAPE.main_origin(), Some(ORIGIN_SESSION));
+        assert_eq!(TURN_SHAPE.subagent_origin(), Some(ORIGIN_AGENT));
+    }
 
     fn push_json(written_at_ms: u64) -> String {
         format!(
@@ -901,7 +981,6 @@ mod tests {
         assert_eq!(snap.five_hour.unwrap().utilization, 23.5);
         assert_eq!(snap.seven_day.unwrap().utilization, 41.2);
         assert!(!r.stale);
-        assert!(!r.rate_limited);
     }
 
     #[test]

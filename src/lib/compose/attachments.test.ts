@@ -75,26 +75,38 @@ describe('clipboardHasImage', () => {
 });
 
 describe('appendAttachments', () => {
+  // V40 Phase E: the instruction is the harness's, supplied by the caller from
+  // `harness_instructions`. The text below is what the backend inventory holds
+  // for the `attachment` slot today.
+  const INSTRUCTION = 'Read the attached image file(s).';
+
   test('returns content unchanged when there are no attachments', () => {
-    expect(appendAttachments('hello world', [])).toBe('hello world');
-    expect(appendAttachments('', [])).toBe('');
+    expect(appendAttachments('hello world', [], INSTRUCTION)).toBe('hello world');
+    expect(appendAttachments('', [], INSTRUCTION)).toBe('');
   });
 
   test('appends one [image] line per attachment plus a trailing instruction', () => {
-    const out = appendAttachments('check this out', ['/tmp/cimp-attach/s1/0.png']);
+    const out = appendAttachments('check this out', ['/tmp/cimp-attach/s1/0.png'], INSTRUCTION);
     expect(out).toBe(
       'check this out\n[image] /tmp/cimp-attach/s1/0.png\nRead the attached image file(s).',
     );
   });
 
   test('multiple attachments each get their own line, instruction appears once', () => {
-    const out = appendAttachments('msg', ['/a/0.png', '/a/1.png']);
+    const out = appendAttachments('msg', ['/a/0.png', '/a/1.png'], INSTRUCTION);
     expect(out).toBe('msg\n[image] /a/0.png\n[image] /a/1.png\nRead the attached image file(s).');
   });
 
   test('an image-only submit (empty text draft) still produces a non-empty message', () => {
-    const out = appendAttachments('', ['/a/0.png']);
+    const out = appendAttachments('', ['/a/0.png'], INSTRUCTION);
     expect(out).toBe('\n[image] /a/0.png\nRead the attached image file(s).');
     expect(out.length).toBeGreaterThan(0);
+  });
+
+  test('an unavailable instruction drops the line, never the attachments', () => {
+    // The backend could not be asked (IPC failure) or a harness declares no
+    // attachment text: the paths must still reach the tab.
+    const out = appendAttachments('msg', ['/a/0.png'], '');
+    expect(out).toBe('msg\n[image] /a/0.png');
   });
 });

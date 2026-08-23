@@ -25,6 +25,7 @@
   import { settings } from './settings/store';
   import type { Settings } from './settings/types';
   import { graphReveal, clearGraphReveal } from './graphReveal';
+  import { findHarness, harnesses, harnessLabels } from './harness';
 
   // Mirrors WorkbenchView/CodeIntelligenceView: an optional project root:
   // neither currently receives one from `Pane.svelte` (both default to the
@@ -45,6 +46,11 @@
   const EDGE_CONTAINS = '#5fd38d';
   const EDGE_OTHER = '#9aa3b2';
   const PULSE_CLOUD = '#7fd4ff';
+  /// Who the cloud swatch stands for, named from the registry rather than from
+  /// a hand-kept pair — the legend lists the harnesses this build actually has.
+  const cloudHarnessLabels = $derived(
+    harnessLabels($harnesses.filter((h) => h.affordances.tier === 'cloud')),
+  );
   const PULSE_LOCAL = '#ffb454';
   const PULSE_ADVISOR = '#d2a8ff';
   const ACCENT_COLOR = '#bb55ff';
@@ -1340,7 +1346,12 @@
   function applyActivity(call: GraphCall): void {
     const matched = matchNodes(call.target);
     if (matched.length === 0) return;
-    const isCloud = call.source === 'claude' || call.source === 'opencode';
+    // V40 Phase F (locked decision 27): a call's source is in the cloud bucket
+    // when the registry says the harness that made it runs there — `tier`, not
+    // a list of the harnesses this build happens to ship. A source no harness
+    // declares (an offload backend, an internal service) falls through to the
+    // buckets below, which is what it did before.
+    const isCloud = findHarness($harnesses, call.source)?.affordances.tier === 'cloud';
     // read_advisor/auto_check are backend-internal services, not offload
     // worker traffic — they get their own pulse bucket.
     const isAdvisor = call.source === 'read_advisor' || call.source === 'auto_check';
@@ -1901,7 +1912,7 @@
               <div class="legend-section">
                 <h4>Live activity pulse</h4>
                 {#if sawCloudPulse}
-                  <div class="legend-row"><span class="swatch" style="background:{PULSE_CLOUD}"></span>cloud agent (Claude / OpenCode)</div>
+                  <div class="legend-row"><span class="swatch" style="background:{PULSE_CLOUD}"></span>cloud agent ({cloudHarnessLabels})</div>
                 {/if}
                 {#if sawLocalPulse}
                   <div class="legend-row"><span class="swatch" style="background:{PULSE_LOCAL}"></span>local offload worker</div>

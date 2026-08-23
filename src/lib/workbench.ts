@@ -142,7 +142,7 @@ export interface Checkpoint {
   ts_unix: number;
   label: string;
   trigger: CheckpointTrigger;
-  /// The harness NAME ('claude' / 'opencode') — shared by every tab of that
+  /// The harness NAME (a registry id) — shared by every tab of that
   /// kind, which is why `tab` below exists.
   agent: string | null;
   files_changed: number;
@@ -156,8 +156,7 @@ export interface Checkpoint {
   /// `session`.
   tab: string | null;
   /// V33 (contract C8): which tool call this checkpoint was taken in front of,
-  /// as `harness:tool_name` — `claude:Bash`, `offload:run_command`,
-  /// `opencode:edit`.
+  /// as `harness:tool_name` — `<harness-id>:<its tool>`, `offload:run_command`.
   ///
   /// Optional AND nullable, deliberately, and they mean different things at the
   /// same point in a rollout: `undefined` = a backend that predates the field

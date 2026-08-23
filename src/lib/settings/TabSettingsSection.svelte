@@ -16,14 +16,17 @@
   import { resolveBundledTheme, defaultPalette } from '../themes';
   import { paletteRegistry } from '../themes/registry';
   import { settings as settingsStore } from './store';
+  import { harnessRow } from './types';
+  import { findHarnessByTabId, harnesses } from '../harness';
 
   // Renders the per-AI-tab settings form: command (read-only), CLI args,
   // a TTS speak toggle, notification texts, and a Restart Tab button. The
   // parent owns baseline tracking and computes `restartRequired`; this
   // component just shows the indicator and routes the restart click back up.
-  // V19: `tabId` drives per-id conditionals — the local-provider helper
-  // text differs (Claude synthesizes ANTHROPIC_* env; OpenCode synthesizes a
-  // provider block inside OPENCODE_CONFIG_CONTENT).
+  // V40 Phase F: what differs per harness — whether there is a local-provider
+  // control at all, which env vars it synthesizes, what the Command field
+  // defaults to — is the registry's declared affordances (locked decision 27),
+  // not an `if (tabId === …)` here.
   // V20: the TTS toggle is a plain per-tab speak gate (the `[[TTS]]` markup
   // convention is retired — prose is spoken from each tool's out-of-band
   // transcript/event stream), so there is no longer an instructions field.
@@ -45,10 +48,40 @@
     onrestart: () => void;
   } = $props();
 
-  // OpenCode manages its own provider/model (global config, switchable
-  // in-session), so the "use local provider" toggle does not apply to it —
-  // it's hidden for the OpenCode tab. The flag still drives Claude (local).
-  let isOpencode = $derived(tabId === 'opencode');
+  /// This tab's harness, or `null` for a tab whose harness the registry does
+  /// not know (and for the frame before `harness_list` answers).
+  const harness = $derived(findHarnessByTabId($harnesses, tabId));
+  const affordances = $derived(harness?.affordances ?? null);
+  /// The env vars a local-provider tab of this harness synthesizes, in render
+  /// order. `null` means this harness has NO local-provider control — it
+  /// manages its own providers — and the checkbox is hidden with the harness's
+  /// own explanation in its place.
+  const localProvider = $derived(affordances?.localProvider ?? null);
+
+  /// The preview rows for the local-provider env, filled from the harness's own
+  /// `ext` values so the user sees what THIS tab will actually launch with.
+  ///
+  /// A var with no `extKey` is the credential and prints masked; one marked
+  /// `onlyWhenSet` is omitted while its key is empty, because an empty value
+  /// means the variable is not set at all and printing `NAME=` would describe a
+  /// spawn that does not happen.
+  function envPreview(): string[] {
+    const id = harness?.id;
+    if (!localProvider || !id) return [];
+    const ext = harnessRow($settingsStore, id).ext ?? {};
+    const out: string[] = [];
+    for (const v of localProvider) {
+      if (v.extKey === null) {
+        out.push(`${v.name}=…`);
+        continue;
+      }
+      const value = ext[v.extKey];
+      const text = typeof value === 'string' ? value : '';
+      if (v.onlyWhenSet && text === '') continue;
+      out.push(`${v.name}=${text}`);
+    }
+    return out;
+  }
 
   function update<K extends keyof AiToolTabConfig>(key: K, value: AiToolTabConfig[K]) {
     settings = { ...settings, [key]: value };
@@ -167,11 +200,12 @@
           update('command', (e.currentTarget as HTMLInputElement).value)}
       />
       <small class="hint">
-        The binary spawned for this tab. Defaults to <code>claude</code>;
-        edit if your <code>claude</code> binary lives somewhere PATH
-        doesn't reach (e.g. an absolute path like
-        <code>C:\tools\claude.exe</code>). Restart this tab after
-        changing.
+        The binary spawned for this tab{#if affordances?.defaultCommand}. Defaults
+          to <code>{affordances.defaultCommand}</code>; edit if your
+          <code>{affordances.defaultCommand}</code> binary lives somewhere PATH
+          doesn't reach{#if affordances.commandExample} (e.g. an absolute path
+            like <code>{affordances.commandExample}</code>){/if}{/if}. Restart
+        this tab after changing.
       </small>
     </label>
 
@@ -220,14 +254,13 @@
       />
       <small class="hint">
         Extra environment variables for this tab's subprocess. They
-        override any values cImp synthesizes (e.g. the
-        <code>ANTHROPIC_*</code> set from "Use local LLM provider").
-        Values are stored cleartext in settings.json. Restart this tab
-        after changing.
+        override any values cImp synthesizes (the set this harness declares for
+        "Use local LLM provider", below). Values are stored cleartext in
+        settings.json. Restart this tab after changing.
       </small>
     </label>
 
-    {#if !isOpencode}
+    {#if localProvider}
       <label class="checkbox">
         <input
           type="checkbox"
@@ -248,20 +281,13 @@
       {#if settings.use_local_provider}
         <p class="hint hint-effective-env">
           On launch this tab synthesizes
-          <code>ANTHROPIC_BASE_URL={$settingsStore.claude_local.base_url}</code>,
-          <code>ANTHROPIC_AUTH_TOKEN=…</code>{$settingsStore.claude_local.model_alias
-            ? `, ANTHROPIC_MODEL=${$settingsStore.claude_local.model_alias}`
-            : ''}
-          from the global <em>Local LLM provider — Claude</em> settings.
+          {#each envPreview() as row, i}{#if i > 0}, {/if}<code>{row}</code>{/each}
+          from the harness's own settings (Tabs → {harness?.label ?? ''}).
           Per-tab env entries below override these.
         </p>
       {/if}
-    {:else}
-      <p class="hint hint-effective-env">
-        OpenCode manages its own providers and credentials (global config,
-        switchable in-session). Configure providers in OpenCode itself; cimp
-        injects only its MCP tools and the TTS/offload/graph guidance.
-      </p>
+    {:else if affordances?.localProviderNote}
+      <p class="hint hint-effective-env">{affordances.localProviderNote}</p>
     {/if}
   </div>
 

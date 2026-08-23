@@ -1,0 +1,7 @@
+Should I delete the temp files?
+
+> 1. Yes
+  2. No
+  3. Type something.
+
+Enter to select · ↑/↓ to navigate · Esc to cancel

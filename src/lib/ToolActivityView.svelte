@@ -27,7 +27,7 @@
   import { graphReveal } from './graphReveal';
   import { loadViewSection, saveViewSection } from './viewSection';
 
-  // Reference list of the graph_* MCP tools the code graph exposes to Claude
+  // Reference list of the graph_* MCP tools the code graph exposes to AI tabs
   // (and the offload worker) while the graph is enabled. Mirrors the
   // descriptions in `src-tauri/src/graph/mcp.rs::tool_specs`; kept here as
   // static docs (moved from CodeIntelligenceView).
@@ -56,7 +56,7 @@
   ];
 
   // Reference list of the tools the offload feature provides. `offload_task`
-  // is the MCP tool Claude calls to delegate; read_file / code_search /
+  // is the MCP tool an AI tab calls to delegate; read_file / code_search /
   // run_command are the native tools the local worker uses to complete the
   // task (toggle them in Settings → Offload task tools → Tools). Static docs (moved from
   // OffloadServerView).
@@ -151,7 +151,7 @@
     <ToolsReference
       title="Graph tools"
       tools={GRAPH_TOOLS}
-      note="MCP tools exposed to Claude (and the offload worker) while the graph is enabled. Ask in natural language — Claude picks the tool."
+      note="MCP tools exposed to AI tabs (and the offload worker) while the graph is enabled. Ask in natural language — the agent picks the tool."
     />
   {:else if section === 'graph-index'}
     <!-- The graph indexer dashboard (status cards + rebuild/pause actions),
@@ -161,7 +161,7 @@
     <ToolsReference
       title="Offload tools"
       tools={OFFLOAD_TOOLS}
-      note="offload_task is the tool Claude calls to delegate; the rest are the tools the local worker uses to complete the task."
+      note="offload_task is the tool an AI tab calls to delegate; the rest are the tools the local worker uses to complete the task."
     />
   {:else if section === 'offload-server'}
     <!-- The live backend dashboard (event-driven, remount-cheap), in normal

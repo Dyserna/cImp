@@ -1,0 +1,8 @@
+   New-Item -ItemType File -Path "delete.me"
+
+ Do you want to proceed?
+ > 1. Yes
+  2. Yes, and don't ask again
+   3. No
+
+ Esc to cancel · Tab to amend · ctrl+e to explain

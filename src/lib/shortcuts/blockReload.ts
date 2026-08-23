@@ -2,7 +2,7 @@
 // Ctrl+Shift+R, Ctrl+F5, and the macOS Cmd+R variants).
 //
 // A user-triggered reload tears the whole webview down and back up: every
-// tab's PTY is killed and respawned, scrollback is lost, and the Claude tab
+// tab's PTY is killed and respawned, scrollback is lost, and the AI tab
 // in particular can get wedged on an error popup while the session restarts
 // underneath it. There is no situation where we want that, so we disable it
 // outright rather than expose it as a setting.

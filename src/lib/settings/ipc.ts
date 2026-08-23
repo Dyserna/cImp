@@ -70,7 +70,7 @@ export async function setActiveTab(tab: TabId): Promise<void> {
 
 /// The global LLM price table ($ per MTok per provider/model), read straight
 /// from the physical global `settings.json` (missing file/key → the backend's
-/// seeded Anthropic/Copilot defaults). Used by the Code Intelligence tab's
+/// seeded vendor/Copilot defaults). Used by the Code Intelligence tab's
 /// session-cost popup and the Settings → LLM pricing editor.
 export async function llmPricingGet(): Promise<LlmPricingModel[]> {
   return invoke('llm_pricing_get');

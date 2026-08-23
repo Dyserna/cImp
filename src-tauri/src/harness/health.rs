@@ -40,7 +40,7 @@
 //! milestone's own deploy trap.
 
 use crate::harness::chp::{self, StalePlugin};
-use crate::harness::contract::{self, Capability, Degradation, Gate, Harness, Seam, CAPABILITIES};
+use crate::harness::contract::{self, Capability, Degradation, Gate, Harness, Seam};
 use crate::harness::probe::{harness_name, tier_name};
 use crate::harness::verify::{self, RunSummary};
 use crate::settings::{AutoVerify, Settings};
@@ -50,18 +50,37 @@ use crate::settings::{AutoVerify, Settings};
 /// `Capability::harness` values: a harness with zero rows must still get a
 /// header saying so.
 ///
-/// **V39 Phase B added the third, and it is not a product.** [`Harness::Any`]
+/// **V39 Phase B added the third, and it is not a product.** [`Harness::ANY`]
 /// marks a row whose contract is stated about a *tab* rather than about a
 /// vendor — `delegation.worker` is the first — so it has no version, no
 /// installed CLI and no auto-verify record, and every one of those fields
 /// renders empty for it by construction. It gets a panel anyway because it
 /// carries a **gate**: a capability the user can be blocked by and cannot see
 /// is exactly the thing this panel exists to end.
-const PANELS: &[(Harness, &str)] = &[
-    (Harness::Claude, "Claude Code"),
-    (Harness::OpenCode, "OpenCode"),
-    (Harness::Any, "Cross-harness"),
-];
+/// The neutral panel, and the reason it is a SECOND SOURCE rather than a
+/// pseudo-descriptor with empty binaries (amendment 0-e).
+///
+/// A descriptor with no binary, no plugin and no directory would satisfy every
+/// registry lookup by lying; the neutral rows are not a harness, they are the
+/// absence of one. Two explicit sources, joined here, is the honest shape — and
+/// `every_registry_entry_is_fully_wired` asserts both halves so neither can be
+/// dropped.
+const NEUTRAL_PANEL: (Harness, &str) = (Harness::ANY, "Cross-harness");
+
+/// The panels the view shows, in display order.
+///
+/// The registry's descriptors — so a harness with zero capability rows still
+/// gets a header saying so — **plus** [`NEUTRAL_PANEL`]. Plain iteration over
+/// the registry would silently drop the `Harness::ANY` rows and hide a gate the
+/// user can be blocked by, which is exactly what this panel exists to end.
+pub(in crate::harness) fn panel_labels() -> Vec<(Harness, &'static str)> {
+    let mut out: Vec<(Harness, &'static str)> = crate::harness::registry::HARNESSES
+        .iter()
+        .map(|d| (d.harness(), d.label))
+        .collect();
+    out.push(NEUTRAL_PANEL);
+    out
+}
 
 // ── outcome vocabulary ──────────────────────────────────────────────────────
 
@@ -344,28 +363,27 @@ fn run_view(run: &RunSummary) -> RunView {
 /// **The** Harness health query — everything the Settings panel renders,
 /// grouped by harness and ordered riskiest-tier-first inside each group.
 ///
-/// `settings` must already carry a FRESH `harness_versions` (the caller layers
-/// the physical-global read in, exactly as `harness_versions_get` does for the
-/// gates): the versions and the auto-verify record are written out-of-band by
-/// the tap and the verify worker, so a snapshot from app start would show a
-/// panel that is stale in precisely the situation the panel exists for.
+/// `settings` must already carry a FRESH `harness` map and `harness_versions`
+/// (the caller layers the physical-global read in, exactly as
+/// `harness_versions_get` does for the gates): the versions and the
+/// auto-verify record are written out-of-band by the tap and the verify worker,
+/// so a snapshot from app start would show a panel that is stale in precisely
+/// the situation the panel exists for.
 pub fn health(settings: &Settings) -> Vec<HarnessHealth> {
     let gates = contract::gates(settings);
-    let hv = &settings.harness_versions;
-    PANELS
-        .iter()
-        .map(|&(harness, label)| {
+    panel_labels()
+        .into_iter()
+        .map(|(harness, label)| {
             let run = verify::last_run(harness);
-            // Claude is the only harness with a persisted record: Phase F runs
-            // on `claude_last_seen` changing, and there is deliberately no
-            // second stored field (that would be the Settings schema bump this
-            // phase is not allowed — and does not need).
-            let record = match harness {
-                Harness::Claude => hv.claude_auto_verify.as_ref(),
-                _ => None,
-            };
+            // V40 Phase B: every harness has a row, so this is a map read and
+            // not a plugin call any more. Before it, `auto_verify_record` was a
+            // trait method whose only job was to know that Claude's record
+            // lived in a field called `claude_auto_verify` and that no other
+            // harness had one at all.
+            let row = settings.harness_settings(harness);
+            let record = row.auto_verify.as_ref();
             let mut rows: Vec<&'static Capability> =
-                CAPABILITIES.iter().filter(|c| c.harness == harness).collect();
+                contract::capabilities().filter(|c| c.harness == harness).collect();
             rows.sort_by_key(|c| risk_rank(c.tier));
             let capabilities = rows
                 .into_iter()
@@ -389,11 +407,7 @@ pub fn health(settings: &Settings) -> Vec<HarnessHealth> {
                     last_verify: last_verify(c, run.as_ref(), record),
                 })
                 .collect();
-            let last_seen = match harness {
-                Harness::Claude => hv.claude_last_seen.clone(),
-                Harness::OpenCode => hv.opencode_last_seen.clone(),
-                Harness::Any => String::new(),
-            };
+            let last_seen = row.last_seen.trim().to_string();
             HarnessHealth {
                 harness: harness_name(harness),
                 label,
@@ -404,10 +418,7 @@ pub fn health(settings: &Settings) -> Vec<HarnessHealth> {
                 // line and its stale-plugin list are one reading of one value.
                 stale_plugins: chp::stale_for(harness_name(harness), &last_seen),
                 last_seen,
-                last_verified: match harness {
-                    Harness::Claude => Some(hv.claude_last_verified.clone()),
-                    _ => None,
-                },
+                last_verified: Some(row.last_verified.clone()),
                 auto_verify: record.cloned(),
                 last_run: run.as_ref().map(run_view),
                 capabilities,
@@ -424,10 +435,10 @@ mod tests {
 
     fn settings_with(record: Option<AutoVerify>) -> Settings {
         let mut s = Settings::default();
-        s.harness_versions.claude_last_seen = "2.2.0".to_string();
-        s.harness_versions.claude_last_verified = "2.1.0".to_string();
-        s.harness_versions.opencode_last_seen = "1.19.0".to_string();
-        s.harness_versions.claude_auto_verify = record;
+        s.harness_row("claude").last_seen = "2.2.0".to_string();
+        s.harness_row("claude").last_verified = "2.1.0".to_string();
+        s.harness_row("opencode").last_seen = "1.19.0".to_string();
+        s.harness_row("claude").auto_verify = record;
         s
     }
 
@@ -451,7 +462,7 @@ mod tests {
             .collect();
         let unique: BTreeSet<&str> = shown.iter().copied().collect();
         assert_eq!(shown.len(), unique.len(), "a capability is rendered twice");
-        let registry: BTreeSet<&str> = CAPABILITIES.iter().map(|c| c.id).collect();
+        let registry: BTreeSet<&str> = contract::capabilities().map(|c| c.id).collect();
         assert_eq!(
             unique, registry,
             "the Harness health panel and the registry disagree about which capabilities exist"
@@ -663,9 +674,15 @@ mod tests {
         let claude = health.iter().find(|p| p.harness == "claude").unwrap();
         assert_eq!(claude.auto_verify.as_ref().unwrap().at_ms, 4242);
         assert_eq!(claude.last_verified.as_deref(), Some("2.1.0"));
-        // OpenCode has no verified column and no record — `None`, not `""`.
+        // **V40 Phase B: OpenCode HAS a verified column now** — every harness
+        // does, because the record is a `harness[<id>]` row rather than two
+        // Claude-named fields. It is EMPTY here, which is the honest answer
+        // ("never verified"), and it is a different state from the `None` this
+        // used to assert: `None` meant "this harness cannot record one at all",
+        // which was a fact about the schema, not about OpenCode.
         let oc = health.iter().find(|p| p.harness == "opencode").unwrap();
-        assert!(oc.last_verified.is_none() && oc.auto_verify.is_none());
+        assert_eq!(oc.last_verified.as_deref(), Some(""));
+        assert!(oc.auto_verify.is_none(), "no run has been recorded for it");
         assert_eq!(oc.last_seen, "1.19.0");
     }
 

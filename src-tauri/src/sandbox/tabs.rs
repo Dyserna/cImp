@@ -55,31 +55,28 @@ use std::path::{Path, PathBuf};
 
 use super::{GrantAccess, GrantHints, GrantRow, SandboxCfg};
 
-/// Which AI harness a tab runs. Chosen by `tabs::config::build_ai_tool_spec`
-/// (the one place that already knows), carried on `PtyLaunchSpec`, and used here
-/// for exactly one thing: picking the grant table.
+/// Which AI harness a tab runs — the registry's [`HarnessId`].
 ///
-/// Deliberately not `Other`: a tab whose command matches neither harness gets
-/// `None` on the spec and is not sandboxed at all, because a grant table nobody
-/// wrote is not a boundary — it is a tool that fails to start for reasons the
-/// user cannot see.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Harness {
-    /// `claude` / `claude-local` — Claude Code.
-    Claude,
-    /// `opencode`.
-    OpenCode,
-}
-
-impl Harness {
-    /// The label used in row text.
-    pub fn label(&self) -> &'static str {
-        match self {
-            Harness::Claude => "Claude Code",
-            Harness::OpenCode => "OpenCode",
-        }
-    }
-}
+/// Chosen by `tabs::config::build_ai_tool_spec` (the one place that already
+/// knows), carried on `PtyLaunchSpec`, and used here for exactly one thing:
+/// asking that harness's plugin for its grant table.
+///
+/// **V40 Phase A deleted the local enum.** It was the second `Harness` type in
+/// the tree and it had the same two variants as the first, which is one variant
+/// per harness in two places — the shape this milestone exists to end. A tab
+/// whose command matches no registered harness still gets `None` on the spec and
+/// is not sandboxed at all, because a grant table nobody wrote is not a
+/// boundary; it is a tool that fails to start for reasons the user cannot see.
+///
+/// **[`crate::harness::HarnessId::ANY`] is NOT a sandbox harness** (V40 review
+/// L-5). The old local enum made it unrepresentable; `HarnessId` does not, and
+/// `ANY` has no descriptor, so it would sandbox a tab with the neutral rows and
+/// **no harness state grants at all** — precisely the "fails to start for
+/// reasons the user cannot see" outcome the paragraph above exists to avoid.
+/// Unreachable today (`from_command` never answers `ANY`), and
+/// [`grant_rows_with`] debug-asserts it rather than leaving the next caller to
+/// rediscover it.
+pub use crate::harness::HarnessId as Harness;
 
 /// The runtime sandbox config for a TAB spawn.
 ///
@@ -242,6 +239,14 @@ fn grant_rows_with(
     env: &dyn Fn(&str) -> Option<OsString>,
     exe: Option<&Path>,
 ) -> Vec<GrantRow> {
+    // See the `Harness` alias: `ANY` is a type-valid value with no descriptor,
+    // so it would confine a tab with cImp's neutral rows and none of the harness
+    // state its program needs (V40 review L-5). A `PtyLaunchSpec` carrying it is
+    // a bug in the caller, not a configuration.
+    debug_assert!(
+        harness.id().is_some(),
+        "`HarnessId::ANY` reached the tab sandbox: it has no grant table, so the tab would be          confined with no harness state and fail to start for reasons the user cannot see"
+    );
     // cImp's own three first: they are anchored on the executable, not on the
     // home directory, so a machine that reports no home still gets a working
     // proxy child.
@@ -285,90 +290,12 @@ fn grant_rows_with(
         },
     ]);
 
-    match harness {
-        Harness::Claude => {
-            // `CLAUDE_CONFIG_DIR` relocates the state directory; honoring it
-            // costs one lookup and its absence would silently confine a tab
-            // away from the state it actually uses.
-            let claude_dir = env("CLAUDE_CONFIG_DIR")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| home.join(".claude"));
-            rows.extend([
-                GrantRow {
-                    path: claude_dir,
-                    access: GrantAccess::Full,
-                    is_file: false,
-                    reason: "Claude Code's own state — projects, history, sessions, shell \
-                             snapshots. Written on every turn; the CLI does not start without it",
-                    required: false,
-                },
-                GrantRow {
-                    path: home.join(".claude.json"),
-                    access: GrantAccess::Full,
-                    is_file: true,
-                    reason: "Claude Code's top-level config, rewritten in place on most \
-                             sessions. A FILE grant, so the home directory around it stays dark",
-                    required: false,
-                },
-                GrantRow {
-                    path: home.join(".claude.json.backup"),
-                    access: GrantAccess::Full,
-                    is_file: true,
-                    reason: "the backup Claude Code rotates beside its config; same width, same \
-                             file-only scope",
-                    required: false,
-                },
-                GrantRow {
-                    // `.local/bin/claude.exe` is a launcher — the install dir
-                    // grant `prepare` derives from the program path covers only
-                    // `bin`, and the JS payload lives in a sibling tree.
-                    path: xdg("XDG_DATA_HOME", &[".local", "share"]).join("claude"),
-                    access: GrantAccess::ReadExecute,
-                    is_file: false,
-                    reason: "the installed CLI payload (versions/<n>/…), which the launcher in \
-                             ~/.local/bin executes. READ-ONLY on purpose: a sandboxed agent that \
-                             can rewrite its own program image can persist across the boundary, \
-                             so in-tab auto-update is refused rather than allowed",
-                    required: false,
-                },
-                GrantRow {
-                    path: xdg("XDG_STATE_HOME", &[".local", "state"]).join("claude"),
-                    access: GrantAccess::Full,
-                    is_file: false,
-                    reason: "the CLI's lock/state directory (~/.local/state/claude)",
-                    required: false,
-                },
-            ]);
-        }
-        Harness::OpenCode => {
-            rows.extend([
-                GrantRow {
-                    path: xdg("XDG_CONFIG_HOME", &[".config"]).join("opencode"),
-                    access: GrantAccess::Full,
-                    is_file: false,
-                    reason: "OpenCode's config tree — opencode.json(c), themes, and the \
-                             `node_modules` it installs plugin dependencies into at startup, \
-                             which is why this is read+WRITE",
-                    required: false,
-                },
-                GrantRow {
-                    path: xdg("XDG_DATA_HOME", &[".local", "share"]).join("opencode"),
-                    access: GrantAccess::Full,
-                    is_file: false,
-                    reason: "OpenCode's data directory — auth.json, the session SQLite database \
-                             (+ its -wal/-shm), logs, snapshots. Written continuously",
-                    required: false,
-                },
-                GrantRow {
-                    path: xdg("XDG_STATE_HOME", &[".local", "state"]).join("opencode"),
-                    access: GrantAccess::Full,
-                    is_file: false,
-                    reason: "OpenCode's state directory (~/.local/state/opencode)",
-                    required: false,
-                },
-            ]);
-        }
-    }
+    // Where THIS harness keeps its own state, declared by its own plugin
+    // (V40 locked decision 4). Read an implementation as a security review, not
+    // as configuration: every row widens what a compromised agent can read.
+    rows.extend(harness.plugin().map(|p| {
+        p.sandbox_grants(&crate::harness::plugin::GrantCtx { home: &home, env })
+    }).unwrap_or_default());
     rows
 }
 
@@ -589,6 +516,20 @@ pub async fn plan_tab(
 
 #[cfg(test)]
 mod tests {
+
+    /// The two shipped harnesses, resolved through the registry — the tests may
+    /// name a harness, they just may not construct one.
+    fn claude() -> Harness {
+        Harness::from_id("claude").expect("claude is registered")
+    }
+    fn opencode() -> Harness {
+        Harness::from_id("opencode").expect("opencode is registered")
+    }
+    /// Every registered harness, for the tests that assert a property of all of
+    /// them rather than of a named one.
+    fn every_harness() -> Vec<Harness> {
+        crate::harness::registry::all().collect()
+    }
     use super::*;
     use std::collections::HashMap;
 
@@ -635,7 +576,7 @@ mod tests {
     /// notices in a diff full of doc comments.
     #[test]
     fn the_claude_grant_table_is_what_it_claims() {
-        let rows = rows(Harness::Claude, &[("USERPROFILE", HOME)]);
+        let rows = rows(claude(), &[("USERPROFILE", HOME)]);
         let by_path: Vec<(String, GrantAccess, bool)> = rows
             .iter()
             .map(|r| {
@@ -697,7 +638,7 @@ mod tests {
     /// The OpenCode table, same treatment.
     #[test]
     fn the_opencode_grant_table_is_what_it_claims() {
-        let rows = rows(Harness::OpenCode, &[("USERPROFILE", HOME)]);
+        let rows = rows(opencode(), &[("USERPROFILE", HOME)]);
         let by_path: Vec<(String, GrantAccess)> = rows
             .iter()
             .map(|r| (r.path.to_string_lossy().replace('/', "\\"), r.access))
@@ -731,7 +672,7 @@ mod tests {
     /// mean the boundary no longer says what the Settings screen says it says.
     #[test]
     fn no_grant_row_reaches_credentials_or_the_home_directory() {
-        for harness in [Harness::Claude, Harness::OpenCode] {
+        for harness in every_harness() {
             for p in paths(&rows(harness, &[("USERPROFILE", HOME)])) {
                 let lower = p.to_ascii_lowercase();
                 assert!(
@@ -770,7 +711,7 @@ mod tests {
     /// placeholder — the property that makes this table a review artifact.
     #[test]
     fn every_grant_row_states_why() {
-        for harness in [Harness::Claude, Harness::OpenCode] {
+        for harness in every_harness() {
             for row in rows(harness, &[("USERPROFILE", HOME)]) {
                 assert!(
                     row.reason.len() > 20,
@@ -789,7 +730,7 @@ mod tests {
     #[test]
     fn relocation_env_vars_move_the_grants() {
         let rows = rows(
-            Harness::OpenCode,
+            opencode(),
             &[
                 ("USERPROFILE", HOME),
                 ("XDG_CONFIG_HOME", r"D:\cfg"),
@@ -811,7 +752,7 @@ mod tests {
 
     fn rows_claude_with_config_dir() -> Vec<GrantRow> {
         rows(
-            Harness::Claude,
+            claude(),
             &[("USERPROFILE", HOME), ("CLAUDE_CONFIG_DIR", r"E:\claude-state")],
         )
     }
@@ -825,12 +766,12 @@ mod tests {
     /// executable there is nothing left to guess from, and the table is empty.
     #[test]
     fn a_missing_home_yields_no_home_anchored_rows() {
-        for harness in [Harness::Claude, Harness::OpenCode] {
+        for harness in every_harness() {
             assert_eq!(paths(&rows(harness, &[])), cimp_paths());
         }
         let e = env_of(&[]);
-        assert!(grant_rows_with(Harness::Claude, &e, None).is_empty());
-        assert!(grant_rows_with(Harness::OpenCode, &e, None).is_empty());
+        assert!(grant_rows_with(claude(), &e, None).is_empty());
+        assert!(grant_rows_with(opencode(), &e, None).is_empty());
     }
 
     /// **The proxy child's three, and nothing wider.** V37 Phase F made
@@ -845,7 +786,7 @@ mod tests {
     /// would quietly hand a compromised agent all of it.
     #[test]
     fn the_proxy_child_gets_the_binary_and_its_discovery_and_nothing_wider() {
-        for harness in [Harness::Claude, Harness::OpenCode] {
+        for harness in every_harness() {
             let rows = rows(harness, &[("USERPROFILE", HOME)]);
             let head: Vec<(String, GrantAccess, bool)> = rows
                 .iter()
@@ -916,7 +857,7 @@ mod tests {
     /// over an absent `~/.config/git` would refuse to sandbox a healthy tab.
     #[test]
     fn every_row_is_optional_so_a_fresh_machine_still_sandboxes() {
-        for harness in [Harness::Claude, Harness::OpenCode] {
+        for harness in every_harness() {
             for row in rows(harness, &[("USERPROFILE", HOME)]) {
                 assert!(!row.required, "{} must be optional", row.path.display());
             }
@@ -1039,7 +980,7 @@ mod tests {
 
     #[test]
     fn harness_labels_are_distinct() {
-        assert_ne!(Harness::Claude.label(), Harness::OpenCode.label());
+        assert_ne!(claude().label(), opencode().label());
     }
 
     // ── the setting itself: persistence and the TS mirror ──

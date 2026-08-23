@@ -24,6 +24,7 @@
   import { closeTab as closeTabIpc } from './lib/ipc';
   import { showToast } from './lib/toast';
   import { startLatchPolling } from './lib/latch';
+  import { harnessLabel } from './lib/harness';
   import { initDelegation } from './lib/delegationState';
   import {
     seedPerTabEntries,
@@ -219,14 +220,16 @@
       // the backend simply never emits until the user records.
       initStt();
       // Settings edits that are baked into an AI tab at spawn (MCP server
-      // exposure, hooks, guidance, statusline, local-provider env, the
-      // OpenCode provider) only take effect at tab spawn — surface the
-      // backend's edge hint as a toast so the user knows to restart the tab
-      // (Settings → Tabs → Restart) instead of wondering why nothing changed.
+      // exposure, hooks, guidance, the status line, local-provider config) only
+      // take effect at tab spawn — surface the backend's edge hint as a toast so
+      // the user knows to restart the tab (Settings → Tabs → Restart) instead of
+      // wondering why nothing changed.
+      //
+      // V40 Phase F: the payload carries harness ids and the registry names
+      // them, so a harness this build learned about over IPC is named properly
+      // instead of falling through to its bare id (locked decision 7).
       void listen<string[]>('ai-tab-restart-hint', (e) => {
-        const names = (e.payload ?? [])
-          .map((c) => (c === 'claude' ? 'Claude' : c === 'opencode' ? 'OpenCode' : c))
-          .join(' and ');
+        const names = (e.payload ?? []).map((c) => harnessLabel(c)).join(' and ');
         if (!names) return;
         showToast(
           `Some of the saved changes take effect after restarting the ${names} tab${
@@ -413,8 +416,8 @@
       // focused-pane active tab to the backend on its own first
       // emission). Without this guard, when the two values disagree
       // — common after V4-04 migration where session.active_tab_id
-      // is dropped and the backend falls back to Claude while the
-      // hydrated layout has e.g. Claude (local) active — the two
+      // is dropped and the backend falls back to its default tab while the
+      // hydrated layout has a different builtin active — the two
       // subscriptions ping-pong correcting each other across async
       // backend round-trips, flapping the active tab dozens of
       // times on launch.

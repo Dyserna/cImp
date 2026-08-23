@@ -14,6 +14,7 @@ const {
   isVideoSrc,
   spriteSetName,
   spriteManifestUrl,
+  SPRITE_SETS,
 } = await import('./avatarConfig');
 
 const NO_IMAGES: AvatarImages = {
@@ -87,7 +88,9 @@ describe('isVideoSrc', () => {
 
 describe('spriteSetName', () => {
   it('falls back to the default set for unknown names', () => {
-    expect(spriteSetName('claudeSprites')).toBe('claudeSprites');
+    // The second bundled set, named once in `avatarConfig.ts` (locked decision 29
+    // rules a mascot a brand ASSET, not harness identity).
+    expect(spriteSetName(SPRITE_SETS[1].id)).toBe(SPRITE_SETS[1].id);
     expect(spriteSetName('typo-set')).toBe('impSprites');
     expect(spriteManifestUrl('typo-set')).toBe('/sprites/impSprites/manifest.json');
   });

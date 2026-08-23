@@ -1,0 +1,185 @@
+[
+  {
+    "id": "claude",
+    "label": "Claude Code",
+    "tab_ids": [
+      "claude",
+      "claude-local"
+    ],
+    "binaries": [
+      "claude"
+    ],
+    "features": [
+      "session_usage",
+      "context_bar",
+      "usage_push"
+    ],
+    "consumer": "claude",
+    "affordances": {
+      "newSessionCommand": "/clear",
+      "toolListRefresh": "picks it up on its next turn",
+      "webTools": [
+        "WebFetch",
+        "WebSearch"
+      ],
+      "stateDirs": [
+        "~/.claude"
+      ],
+      "installHint": "Make sure Claude Code is installed and on your PATH. Installation instructions:",
+      "docsUrl": "https://docs.anthropic.com/en/docs/claude-code/setup",
+      "attachmentFormat": "[image] {path}",
+      "localProvider": [
+        {
+          "name": "ANTHROPIC_BASE_URL",
+          "extKey": "local.base_url",
+          "onlyWhenSet": false
+        },
+        {
+          "name": "ANTHROPIC_AUTH_TOKEN",
+          "extKey": null,
+          "onlyWhenSet": false
+        },
+        {
+          "name": "ANTHROPIC_MODEL",
+          "extKey": "local.model_alias",
+          "onlyWhenSet": true
+        }
+      ],
+      "localProviderNote": null,
+      "localProviderConfigNote": null,
+      "localProviderConfigBlockKey": null,
+      "localProviderConfigAutoKey": null,
+      "statuslineRows": 2,
+      "attributionTemplate": "[delegated by {label} · tab \"{tab}\" · via cImp]",
+      "injectMechanism": "a UserPromptSubmit hook",
+      "defaultCommand": "claude",
+      "commandExample": "C:\\tools\\claude.exe",
+      "accent": "var(--text-info, #58a6ff)",
+      "tier": "cloud"
+    },
+    "fields": [
+      {
+        "key": "statusline",
+        "kind": "bool",
+        "options": [],
+        "label": "Context status line",
+        "hint": "Inject a session-scoped `--settings` overlay pointing Claude Code's status line at cImp's own themed context-usage bar. Merges with your own Claude Code settings; your global ~/.claude config is left untouched.",
+        "default": true,
+        "spawn_baked": true,
+        "secret": false
+      },
+      {
+        "key": "local.base_url",
+        "kind": "text",
+        "options": [],
+        "label": "Local provider — base URL",
+        "hint": "Used only by tabs with `use_local_provider` on: synthesized into ANTHROPIC_BASE_URL at spawn. Typically a LiteLLM proxy bridging to Ollama or LM Studio.",
+        "default": "http://localhost:4000",
+        "spawn_baked": true,
+        "secret": false
+      },
+      {
+        "key": "local.auth_token",
+        "kind": "text",
+        "options": [],
+        "label": "Local provider — auth token",
+        "hint": "Synthesized into ANTHROPIC_AUTH_TOKEN. Stored cleartext in settings.json — local proxies typically accept dummy tokens.",
+        "default": "sk-dummy",
+        "spawn_baked": true,
+        "secret": true
+      },
+      {
+        "key": "local.model_alias",
+        "kind": "text",
+        "options": [],
+        "label": "Local provider — model alias",
+        "hint": "Optional. Synthesized into ANTHROPIC_MODEL, which some proxies honour; empty leaves the model to the --model flag.",
+        "default": "",
+        "spawn_baked": true,
+        "secret": false
+      }
+    ],
+    "scoped_features": []
+  },
+  {
+    "id": "opencode",
+    "label": "OpenCode",
+    "tab_ids": [
+      "opencode"
+    ],
+    "binaries": [
+      "opencode"
+    ],
+    "features": [
+      "file_artifact",
+      "local_provider_config"
+    ],
+    "consumer": "opencode",
+    "affordances": {
+      "newSessionCommand": "/clear",
+      "toolListRefresh": "refreshes its tool list in the same session",
+      "webTools": [
+        "webfetch",
+        "websearch"
+      ],
+      "stateDirs": [
+        "~/.config/opencode",
+        "~/.local/share/opencode",
+        "~/.local/state/opencode"
+      ],
+      "installHint": "OpenCode is not installed. Install it from",
+      "docsUrl": "https://opencode.ai/docs",
+      "attachmentFormat": "[image] {path}",
+      "localProvider": null,
+      "localProviderNote": "OpenCode manages its own providers and credentials (global config, switchable in-session). Configure providers in OpenCode itself; cimp injects only its MCP tools and the TTS/offload/graph guidance.",
+      "localProviderConfigNote": "Registers this server as OpenCode's local-llama provider (base URL + model read                  from the command above) and selects it as the default model, so a freshly opened                  OpenCode tab is ready to work. Overrides any existing local-llama. Auto-sync                  re-derives it from the primary local backend at launch and on save, but only                  while the offload server is enabled. OpenCode reads the provider from its launch                  config — restart the OpenCode tab to apply a change.",
+      "localProviderConfigBlockKey": "provider",
+      "localProviderConfigAutoKey": "provider_auto",
+      "statuslineRows": 0,
+      "attributionTemplate": "[delegated by {label} · tab \"{tab}\" · via cImp]",
+      "injectMechanism": "a generated .opencode/plugin",
+      "defaultCommand": "opencode",
+      "commandExample": null,
+      "accent": "var(--accent-purple, #d2a8ff)",
+      "tier": "cloud"
+    },
+    "fields": [
+      {
+        "key": "native_gate",
+        "kind": "bool",
+        "options": [],
+        "label": "Native-tool gating",
+        "hint": "Let the generated OpenCode plugin DENY the harness's own native tools against the tab's taint latch, rather than only beaconing on them. App-wide ceiling; each tab opts in from its shield badge.",
+        "default": true,
+        "spawn_baked": true,
+        "secret": false
+      },
+      {
+        "key": "provider_auto",
+        "kind": "bool",
+        "options": [],
+        "label": "Keep the local-llama provider in sync",
+        "hint": "Re-derive the injected provider block from the primary Local backend's command at each launch and on save, so editing the command takes effect without re-clicking Add to OpenCode.",
+        "default": false,
+        "spawn_baked": true,
+        "secret": false
+      },
+      {
+        "key": "provider",
+        "kind": "json",
+        "options": [],
+        "label": "Derived local-llama provider",
+        "hint": "Written by cImp, not typed: the provider block injected into OPENCODE_CONFIG_CONTENT.",
+        "default": null,
+        "spawn_baked": true,
+        "secret": false
+      }
+    ],
+    "scoped_features": [
+      {
+        "feature": "opencode_native_gate",
+        "extKey": "native_gate"
+      }
+    ]
+  }
+]

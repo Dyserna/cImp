@@ -127,8 +127,9 @@ pool + router + global gate + MCP host (`offload/service.rs`), and the
 `cimp --offload-mcp` child is a thin proxy to it. Only the app sees all
 in-flight offloads, so cross-backend spill/fail-over works there. The child
 still carries the **self-contained fallback** (the V8-02 path) for when the app
-is down — keep it first-class (headless `claude -p` / cron paths depend on it),
-and keep the shared `router`/`agent` code shared so the two paths can't drift.
+is down — keep it first-class (headless one-shot and cron invocations of a
+harness CLI depend on it), and keep the shared `router`/`agent` code shared so
+the two paths can't drift.
 The child probes the loopback endpoint per request and **falls back** to that
 self-contained path on any transport failure (stale discovery file from a
 hard-killed app, app mid-restart, app not running). *(This is the single
@@ -163,7 +164,7 @@ explanation of the fallback child; `MAINTENANCE.md` § Offload (V8) points here.
   loopback.
 
 **MCP host (`offload/mcp_host.rs`).** Warm client pool over `offload.mcp_servers`
-(same shape as Claude's `mcpServers`). Per server: `initialize`+`tools/list`,
+(the conventional `mcpServers` object shape). Per server: `initialize`+`tools/list`,
 namespacing `<server>__<tool>`, a **read-class filter** (leading-verb heuristic on
 the first two name segments — see `is_read_class`/`WRITE_VERBS`, unit-tested), and
 `filesystem` confinement (the configured `allowed_roots` are appended as the
@@ -241,26 +242,37 @@ transcript tap (`harness/claude/read.rs::record_tool_events`, beside `update_age
 session id = the `<id>.jsonl` stem), wired through `OobContext.mem` from
 `pty/manager.rs`. OpenCode's OOB SSE stream has no tool events, so its memory
 comes from the injection plugin's `tool.execute.after` hook POSTing to
-`/memory/event`. `graph::classify_tool` maps tool names → `(kind, arg)` for both.
+`/memory/event`. Each harness's plugin declares the mapping (the `memory_kind`
+column of `harness/<id>/tools.rs`), and core reads it through
+`harness::native::memory_kind` with the request's SOURCE — so `Edit` and `edit`
+are answered from their own vocabularies and an unidentifiable source records
+nothing (V40 Phase A, locked decision 16; it used to be one
+`graph::classify_tool` `match` over both).
 
 **Memory-tool session scoping — per-agent, then per-tab (V28).** The
 `context_recall` / `context_note` / `context_notes` MCP tools have no session
 argument (no harness passes session identity into an MCP server's tool-call
 context), so they resolve a session from `graph.db`. The first layer scopes to
-the *calling agent*: the MCP child's `--consumer` (claude/opencode) flows
+the *calling agent*: the MCP child's `--consumer` — a **registered** harness's
+consumer token, resolved through `HarnessId::from_consumer` — flows
 `offload/mcp.rs::proxy_graph` → `/graph_run` (`GraphRunBody.consumer`) →
 `run_graph_tool` → `dispatch_recorded` `source` → `mem_agent(source)` →
 `GraphIndex::mem_current_session_for(Some(agent))` (and the app-down fallback
-`handle_call(params, consumer)` does the same). `source` is also the activity
-ring's badge, so OpenCode's graph/context calls read as `opencode`, not `claude`
-(frontend `GraphCall.source` union + `.hsrc.opencode`).
+`handle_call(params, consumer)` does the same). A token nobody registered
+resolves to `graph::mcp::UNKNOWN_SOURCE` and filters to no sessions; it is never
+served a default harness's scope (V40 Phase A, locked decision 2). `source` is
+also the activity ring's badge, so each harness's graph/context calls read as
+its own registry id — the frontend types that field as a bare `string` since
+V40 Phase F (a call from a harness this build has not heard of must render, not
+fail to type-check) and colours it from the harness's declared `accent`.
 
 **V28 (issue #13) closes the per-agent layer's gap** — two tabs of the *same*
 agent sharing (and stealing) one memory scope. Identity rides the **spawn argv**,
 since the `cimp --offload-mcp` child is per-tab and cImp composes its whole
-command line: `tabs/config.rs` bakes `--tab <tab-id>` into both harness configs
-(Claude's `--mcp-config` server entry, OpenCode's
-`OPENCODE_CONFIG_CONTENT.mcp.cimp-offload`). The child forwards it as
+command line: each harness's plugin bakes `--tab <tab-id>` into whatever MCP
+server entry it writes at spawn (`HarnessPlugin::pre_args` / `compose_env` /
+`write_artifacts`; the per-harness mechanism is in that plugin's README). The
+child forwards it as
 `GraphRunBody.tab` on `/graph_run` — and, since V32 Phase B, as
 `McpCallBody.tab` on `/mcp/call` too: external servers still hold no cImp memory
 scope, but the proxy's taint latch is keyed by the same tab identity on both
@@ -278,68 +290,80 @@ for lack of identity, so there is no restart hint owed — and because the tab i
 is not Settings-derived and cannot change while a tab runs, it needs no
 `spawn_inject_sig` entry.
 
-**Per-tab identity is pinned at spawn (V34, 2026-08-09).** cImp generates a UUID
-for each Claude tab and passes it as `--session-id`, so the tap follows exactly
-`<root>/<uuid>.jsonl` instead of racing for the newest file, and the tab's
-binding is provable no matter how many tabs share a project. Generated in
-`tabs::config::resolve_oob_source` beside the `OobSpec` that carries it, so the
-argv flag and the file the tap follows cannot drift; and `graph_tab_session`
-exposes tab → session so the Code Intelligence Overview can follow the focused
-tab rather than the most-recently-active session.
+**Per-tab identity is pinned at spawn where the harness's CLI allows it (V34,
+2026-08-09).** A harness whose CLI can be told which conversation to run under
+declares the flags that select one (`HarnessPlugin::session_selector_flags`,
+V40 locked decision 26) — that is how cImp tells *the user pinned a session*
+from *cImp may pin one*. Where it may, the plugin generates a UUID at spawn and
+passes it, so the fallback reader follows exactly that session's artifact
+instead of racing for the newest one and the tab's binding is provable no matter
+how many tabs share a project. The id is generated beside the `OobSpec` that
+carries it (`HarnessPlugin::resolve_oob`), so the argv flag and the artifact the
+tap follows cannot drift; `graph_tab_session` exposes tab → session so the Code
+Intelligence Overview can follow the focused tab rather than the
+most-recently-active session. An empty `session_selector_flags` is a first-class
+answer: *this harness selects its session some other way*, and no pin is
+attempted.
 
-**The pin is a claim, verified against the transcript's existence**
-(`harness/claude/read.rs::pin_step`) — passing the flag does not mean the tab runs under
-it, which was observed in the field on tabs carrying no `--resume`/`--continue`.
-Until `<root>/<pinned>.jsonl` exists, the tab publishes no identity and behaves
-exactly as described next; the tap keeps watching and upgrades if the file
-appears. A tab whose own args already select a conversation (see
-`args_select_session`) is never pinned at all, and a `/clear` rolls a verified
-tab's session over and returns it to the same fallback.
+**A pin is a claim, verified against the artifact's existence.** Passing the
+flag does not mean the tab runs under it — that was observed in the field.
+Until the pinned artifact exists the tab publishes no identity and behaves
+exactly as described next; the tap keeps watching and upgrades if it appears. A
+tab whose own args already select a conversation is never pinned at all, and a
+new-session command rolls a verified tab's session over and returns it to the
+same fallback. The per-harness mechanics — the flag names, the artifact path,
+the verification step — are in that plugin's README § *Memory scoping*.
 
 **The unpinned case is not isolatable, and degrades to unscoped rather than
-guessing (H1, 2026-08-05 review).** Without a pin Claude's tap has no
-per-process discriminator: it tails the newest `*.jsonl` under
-`~/.claude/projects/<slug(cwd)>`, a root derived from the project dir alone. Two
-such Claude tabs on the SAME project dir therefore follow whichever session
-wrote last, so neither tab's registry entry proves anything. Each running Claude tap
-declares its root (`GraphService::mark_live_tab_root`, refreshed per poll tick,
-RAII-cleared on tab exit), and the single predicate
-`graph::service::tab_binding_is_ambiguous` — running tabs only, never merely
-configured ones, and never a PINNED one — makes the registry withhold both
-answers while ≥2 tabs share a root: `live_session_for_tab` → `None` (⇒ fail-open
-to the pre-V28 recency lookup, never a tool error) and `live_claude_sessions`
-drops the pair, so NC-2's permission resolver refuses instead of flipping a
-badge/TTS on the wrong tab. The pin exemption is deliberately one-sided: it
-clears the pinned tab only, since an unpinned neighbour is still the one
-guessing and may still grab the pinned tab's transcript.
-Claude tabs on different dirs, and OpenCode tabs anywhere, are unaffected. The
-spawn dir feeding both the transcript root and the hook's cwd fallback has one
-definition (`tabs::config::ai_working_dir`).
+guessing (H1, 2026-08-05 review).** Without a pin, a fallback reader whose
+artifact root is derived from the project directory alone has no per-process
+discriminator — it follows whichever session under that root wrote last. Two
+such tabs of the same harness on the SAME project dir therefore prove nothing
+about which session is theirs. Each running tap declares its root
+(`GraphService::mark_live_tab_root`, refreshed per poll tick, RAII-cleared on
+tab exit), and the single predicate `graph::service::tab_binding_is_ambiguous`
+— running tabs only, never merely configured ones, and never a PINNED one —
+makes the registry withhold both answers while ≥2 tabs share a root:
+`live_session_for_tab` → `None` (⇒ fail-open to the pre-V28 recency lookup,
+never a tool error) and `live_sessions_for(harness)` drops the pair, so NC-2's
+permission resolver refuses instead of flipping a badge/TTS on the wrong tab.
+The pin exemption is deliberately one-sided: it clears the pinned tab only,
+since an unpinned neighbour is still the one guessing and may still grab the
+pinned tab's artifact. Tabs on different dirs are unaffected, and so is a
+harness whose reader is *told* a session id rather than deriving a directory to
+watch. The spawn dir feeding both the artifact root and the ingress cwd fallback
+has one definition (`tabs::config::ai_working_dir`).
 
-Both harnesses stamp the registry per tab: Claude from its transcript drain tick
-(`harness/claude/read.rs:208`), OpenCode from its `/event` SSE tap
-(`harness/opencode/read.rs::Tracker::track_live_session`) — every session-scoped SSE event
-carries `properties.sessionID` (verified against the spike-0a capture in
-`docs/spikes/v20/ev.ndjson`). The loopback `/memory/event` path keeps its
-*separate* session-keyed entries (the Usage "live now" badge reads them);
-tab-keyed and session-keyed entries coexist because tab lookups are exact-match.
-Sub-agent sessions ride the same OpenCode stream and are excluded via
-`session.created`'s `info.parentID`, so a tab always resolves to its current
-**main** session — sub-agent tool calls arrive through the same per-tab child and
-therefore share the tab's scope by design. The offload worker (`offload`
-consumer) has no tab and keeps its project-wide, agent-`None` scope.
+Every harness stamps the registry per tab from its own reader, and **which key
+space that stamp lands in is declared, not inferred** (`HarnessPlugin::
+session_key_space`, V40 Phase D, locked decision 20): `SessionKey::Tab` for a
+harness whose live session is keyed by the cImp tab id, `SessionKey::Session` —
+the default, and the fail-closed one — for a harness that hands cImp its own
+session id. An id from an undeclared harness therefore lands in the session
+space, where it cannot name a cImp tab, which is the C-2 hazard the declaration
+removes: `LiveKey` carries the space, so a session id and a tab id are not the
+same key even when they are the same string. The loopback `/memory/event` path
+keeps its *separate* session-keyed entries (the Usage "live now" badge reads
+them), and OpenCode's ids are accepted into the session space **even when they
+collide with a tab id** — tab-keyed and session-keyed entries coexist because
+the key space is part of the key. Sub-agent sessions are excluded by each reader
+from its own stream, so a tab always resolves to its current **main** session;
+sub-agent tool calls arrive through the same per-tab child and therefore share
+the tab's scope by design. The offload worker (`offload` consumer) has no tab
+and keeps its project-wide, agent-`None` scope.
 
 **Context injection** (opt-in, `graph.context_injection`). `graph/context.rs`
 ranks files (symbol/reference/doc hits + session working set) and budget-packs
-outline digests — synchronous, no per-prompt embedding. Claude injects via a
-`UserPromptSubmit` hook added to the `--settings` overlay (a `type: "http"`
-entry since V35 Phase J — see the hook table below); OpenCode via a generated
-dependency-free plugin
-(`harness/opencode/plugin.rs::write_opencode_plugin`, rendering
-`harness/opencode/templates/plugin.js` → `<project>/.opencode/plugin/cimp-inject-<tab>.js`,
-baking in the loopback port+token per launch; `.opencode/` is added to
-`.git/info/exclude`). **Never launch OpenCode with `--pure`** — it disables all
-external plugins.
+outline digests — synchronous, no per-prompt embedding. The block reaches a
+model over **that harness's own extension mechanism**: the plugin writes
+whatever artifact its harness loads and composes whatever flags or environment
+carry it (`HarnessPlugin::write_artifacts` / `pre_args` / `compose_env`), and it
+declares what that mechanism is called as an affordance the window renders
+(`HarnessAffordances::inject_mechanism`). Core never names either. Every such
+artifact is **spawn-baked**, so a Settings change that alters it moves that
+harness's `spawn_sig` and raises the restart hint; the file names, the launch
+flags that would disable the mechanism, and the ignore-file bookkeeping live in
+that plugin's README.
 
 **New local loopback routes** (`offload/loopback.rs`), same authenticated-
 localhost trust model as `/graph_run`: `POST /context/retrieve` (gated on
@@ -365,98 +389,96 @@ relation** — it's an in-memory `HashMap<session_id, InjectState>` on
 no schema entry; a restart just re-injects fresh on the next turn, which is
 the intended fail-safe.
 
-**Claude hooks are `type: "http"` (V35 Phase J).** They used to be five shim
-binaries (`cimp --context-hook` and friends) whose whole job was to carry a
-payload from stdin to the loopback and a reply back to stdout. Claude Code
-2.1.63's http hooks let the harness POST that payload itself and parse the 2xx
-JSON reply exactly as it parses a command hook's stdout, so the shims were
-deleted and their payload mechanics moved into `harness/claude/hook.rs` on the
-receiving end:
+**Harness ingress is a plugin seam (V40 Phase C, locked decisions 15 and 22).**
+Core's loopback router holds **no harness path literal**. A harness that reaches
+cImp over its own ingress registers those routes from its plugin —
+`HarnessPlugin::routes()` returns a `&'static [Route]` of `(method, path,
+handler)` — and `offload/loopback.rs` matches every CHP-neutral arm **first**,
+then falls through to `harness::ingress::route(method, path)`; a path nobody
+serves is a `404` either way. The handler answers a `HookReply` (a status and a
+body) that core **serializes without reading**, because "this harness answers
+hook-output JSON and that one answers `{"ok":true}`" is not something core may
+know (`harness/plugin.rs::HookReply`). Four tests hold the seam:
+`ingress::tests::no_two_plugins_claim_one_route` (a wire boundary may not depend
+on registry order), `no_plugin_route_shadows_a_core_route` (core's `match` wins,
+so a shadowing handler would simply never run),
+`every_declared_timeout_outlasts_the_budget` and
+`every_inverted_wire_default_names_a_route_that_exists`.
 
-| Hook event | Route | Feeds |
-|---|---|---|
-| `UserPromptSubmit` | `POST /claude/hook/user_prompt_submit` | `/context/retrieve`'s core (V10) |
-| `PreCompact` | `POST /claude/hook/pre_compact` | `/context/compaction`'s core (V11 Phase D) |
-| `PreToolUse` (matchers `Read`, `Bash`) | `POST /claude/hook/pre_tool_use` | `/context/should_read`'s core (V11 Phase E) |
-| `PostToolUse` (matcher `Edit\|Write\|MultiEdit`) | `POST /claude/hook/post_tool_use` | `/context/post_edit`'s core (V12 Phase F) |
-| `Notification` + `PermissionDenied` (both `matcher: ""`) | `POST /claude/hook/notification` | `/permission/event`'s core (NC-2) |
-| `SessionStart` | `POST /claude/hook/session_start` | CHP hello (V35 Phase J) |
-| `PostToolUseFailure` (`matcher: ""`) | `POST /claude/hook/post_tool_use_failure` | `/session/tool_result`'s core, errored (2026-08-17) |
-| `PreToolUse` (matcher `WebFetch\|WebSearch`) | `POST /claude/hook/pre_tool_use_taint` | `/latch/beacon`'s core (V32 Phase F; http since 2026-08-17) |
-| `PreToolUse` (matcher `Edit\|Write\|MultiEdit\|Bash`) | `POST /claude/hook/pre_tool_use_checkpoint` | `/workbench/tool_checkpoint`'s core (V33 Phase F; http since 2026-08-17) |
+*Which* of a harness's own events map onto which of its routes — the matcher
+strings, the payload fields, the reply envelope, the version floor — is that
+harness's business and lives in its plugin directory. For Claude Code the table
+is [`src-tauri/src/harness/claude/README.md` § *Hook routing*](../src-tauri/src/harness/claude/README.md#hook-routing);
+the wire contract every route rides on is [`docs/CHP.md`](CHP.md).
 
-The **legacy `/context/*` routes stay**: a tab open across the upgrade is still
-running an overlay full of command hooks, and the retired dispatch flags survive
-in `main.rs` as tombstones that drain stdin and exit 0 so an old overlay is inert
-rather than launching a second cImp GUI. Both transports meet at one shared core
-per capability.
+The **legacy `/context/*` routes stay**, and they are the harness-neutral CHP
+bodies: a tab open across an upgrade is still running the artifact an older
+build wrote, so both transports of each capability meet at **one shared core**
+— which is what keeps them from drifting into two behaviours. cImp's own retired
+dispatch flags survive in `main.rs` as tombstones that drain stdin and exit 0,
+so an old artifact is inert rather than launching a second cImp GUI.
 
-**No Claude hook is a command any more.** The last two shim binaries —
-`cimp --taint-beacon` and `cimp --checkpoint-beacon` — became `type: "http"`
-entries on 2026-08-17 (`POST /claude/hook/pre_tool_use_taint`,
-`POST /claude/hook/pre_tool_use_checkpoint`), which moved their registry rows from
-Tier D to Tier B: both had been built around *undocumented* behaviours of a
-command hook (a silent exit-0 hook never perturbs the call, including on timeout;
-the tool does not begin until the hook process exits), and the http contract states
-both in writing. In particular a `PreToolUse` http hook blocks the tool call until
-the response, so the checkpoint handler simply takes the snapshot before it
-answers — the ordering is enforced rather than inferred. A third entry landed with
-them: `PostToolUseFailure`, because `PostToolUse` fires only on success and failed
-tool results were otherwise lost on every tab that serves `session.tool_result`.
+**Every ingress route fails open, and the app's budget is derived rather than
+hand-set.** A harness declares how long its out-of-process caller waits before
+abandoning cImp's reply (`HarnessPlugin::hook_reply_timeout`; `None` = "this
+harness never waits", and it does not participate). Core takes
+`min(every declared timeout) − harness::ingress::HOOK_REPLY_MARGIN` as the time
+it may spend before answering — `ingress::hook_reply_budget()`, 1800 ms with the
+two shipped plugins, pinned by
+`the_derived_budget_is_the_1800_ms_the_shipped_plugins_imply`. The ordering is
+the whole mechanism: the harness starts the tool the instant its own timer
+fires, so cImp's answer has to land first or the app is staging into a call it
+believes it gated. A refused connection, a timeout and any non-2xx are
+non-blocking on every one of these routes.
 
-All of them fail open. For an http hook that is the harness's own contract: a
-timeout, a refused connection and any non-2xx are non-blocking, and a 2xx JSON
-body with no directive is a no-op — so every handler answers `200 {}` when it
-has nothing to say. Every emitted entry carries an explicit `timeout: 1`, the
-deleted shims' 600 ms budget rounded up — with one documented exception, the
-pre-mutation checkpoint's 5 s, a ceiling over the app's own 1800 ms snapshot
-budget — pinned by a test rather than inherited
-from the harness's 600 s / 30 s defaults. The full wire contract, including the
-`X-CIMP-*` identity headers, is `docs/CHP.md` § 4.5.
+**Every ingress request carries its cImp tab** (#48, finding M-7). A harness's
+own hook payload names its session and its working directory and nothing that
+identifies a cImp tab, so the identity travels **outside the body**:
+`HarnessPlugin::identity_of_request(route, req)` answers the `(chp, agent, tab)`
+triple for the routes its harness owns, and `None` — the default — means *read
+the CHP envelope*, which is what core does for every ordinary caller. The four
+`/context/*` routes need a tab to resolve the V32 taint-latch scope against, and
+three of them (`compaction`, `should_read`, `post_edit`) gate on it: under an
+EXTERNAL latch `post_edit` will not run the project's configured checks and
+`should_read` will not return source text, each answering with its own fail-safe
+rather than an error. A caller that sends no tab resolves no scope and is
+admitted — the same locked fail-open every tool-serving loopback route takes.
+Which of its hooks a harness emits at all is that harness's own gating, computed
+from the same Settings its `spawn_sig` covers, so a toggle the user flips raises
+the restart hint.
 
-**Every hook carries its cImp tab** (#48, finding M-7) — `--tab <id>` in argv for
-the two surviving beacon shims, `X-CIMP-Tab` in the emitted headers for the six
-http hooks. A Claude hook payload names `session_id` and `cwd` and nothing that
-identifies a cImp tab, and the four `/context/*` routes need a tab to resolve the
-V32 taint latch scope against. Three of those routes (`compaction`,
-`should_read`, `post_edit`) gate on it: under an EXTERNAL latch `post_edit` will
-not run the project's configured checks and `should_read` will not return source
-text, each answering with its own fail-safe rather than an error. A caller that
-sends no tab resolves no scope and is admitted — the same locked fail-open every
-tool-serving loopback route takes.
-`tabs/config.rs` adds the `PreCompact` hook to the Claude settings overlay
-whenever `context_injection && compaction_context`, and the `PreToolUse` hook
-whenever `context_injection && read_advisor` (independent toggles — a project
-can run compaction survival without the read advisor).
+**Permission detection is push-primary, scrape-fallback (NC-2).** A harness's
+notification ingress has no toggle and no schema entry of its own; it is emitted
+whenever `Settings::loopback_needed()` holds — i.e. whenever the loopback it
+POSTs into actually runs (offload / graph / Code Audit MCP). That gate is
+load-bearing (H2, 2026-08-05 review): without it a default install did work per
+notification whose POST had nowhere to land, so the *primary* signal was dead
+and silent. The gate is structural as well as deliberate — an artifact bakes its
+URL at spawn, so with no loopback there is nothing to emit — and the consequence
+is unchanged: **a feature-less install runs scrape-only permission detection.**
+The injection carries a `spawn_inject_sig` entry so enabling one of those
+features raises the restart hint.
 
-**Permission detection is hook-primary, regex-fallback (NC-2).** The
-`Notification` / `PermissionDenied` pair has no toggle and no schema entry of
-its own; it is injected whenever `Settings::loopback_needed()` holds — i.e.
-whenever the loopback it POSTs into actually runs (offload / graph / Code
-Audit MCP). That gate is load-bearing (H2, 2026-08-05 review): without it a
-default install spawned a `cimp --notify-hook` process per Claude notification
-whose POST had nowhere to land, so the *primary* signal was dead and silent.
-Since V35 Phase J the gate is structural as well as deliberate: an http hook
-bakes its URL at spawn, so with no loopback there is nothing to emit. The
-consequence is unchanged — **a feature-less install runs regex-only permission
-detection** — and the injection carries a `spawn_inject_sig` entry
-(`notify_hooks`) so enabling one of those features raises the restart hint.
-The route forwards the payload to `/permission/event`'s core, which
-classifies it (`notification_type == "permission_prompt"` ⇒ detected; the other
-documented types, `idle_prompt` included, are ignored *without* consulting the
-prose; an absent **or unrecognized** type falls through to permission-flavoured
-prose matching, so payload-shape drift degrades to "read the message" rather
-than to silence — M12; `PermissionDenied` ⇒ resolved), maps it to a tab
-(`session_id` → `transcript_path` → unique `cwd`, else DROP — never a guess),
-and emits the same `PermissionPromptDetected` / `PermissionPromptResolved`
-signals the TUI-regex detector (`processing::permission`) emits. Both producers
-feed the one idempotent `awaiting_permission` flag, so the hook simply usually
-wins the race; the regex path is untouched and still covers a dropped or
-missed event. A hook-driven *resolve* additionally force-clears that tab's
-regex latch (`ProcessorControl::ClearPermissionLatch` → `PermissionDetector::
-force_clear`) and re-scans, because the detector is edge-triggered: an
-auto-denial landing while a real approval prompt is still on screen would
-otherwise clear the badge with nothing able to re-raise it (M11).
+**What reaches core is an EDGE, not a payload** (V40 Phase C, locked decision
+21). Which of a harness's notification types or TUI footers means *a prompt is
+on screen* is that harness's own grammar: the classification lives in
+`harness/<id>/`, along with the rows the neutral detector engine
+(`processing::permission::PermissionDetector`) matches on — those are a
+transcription of somebody else's terminal chrome and belong beside the harness
+they were transcribed from (`HarnessPlugin::permission_patterns`,
+`patterns_doc_note`, `legacy_permission_patterns`). Core receives
+`PermissionEdge::{Detected, Resolved}` and a tab, which is the same pair the
+scrape detector produces — which is why a pushed edge and a scraped edge
+collapse to one signal at the state manager instead of being two features. The
+tab mapping is the harness's too, and it never guesses: a candidate that cannot
+be resolved uniquely is DROPPED. Both producers feed the one idempotent
+`awaiting_permission` flag, so the push simply usually wins the race and the
+scrape path still covers a dropped or missed event. A pushed *resolve*
+additionally force-clears that tab's scrape latch
+(`ProcessorControl::ClearPermissionLatch` → `PermissionDetector::force_clear`)
+and re-scans, because the detector is edge-triggered: an auto-denial landing
+while a real approval prompt is still on screen would otherwise clear the badge
+with nothing able to re-raise it (M11).
 
 **Compaction route's side effects are unconditional.** `GraphService::
 compaction_context` (`graph/service.rs`) always clears the session's
@@ -466,14 +488,19 @@ two effects are what keep Phase C (dedup) and Phase E (read advisor) correct
 across a compaction regardless of whether the block itself is gated on. Only
 the returned working-set/notes text is gated.
 
-**Two hook output contracts are unverified against the pinned Claude Code
-build** — `TODO(spike)` D0 (`compact_hook.rs`) and E1 (`read_hook.rs`). Both
-are tracked, with their pass/fail recipes and where the outcome is recorded, in
-`MAINTENANCE.md` § Open spikes & unverified contracts. Design posture in both
-cases: the server-side effects are correct regardless of whether Claude reads
-the emitted field, so the feature degrades safely — worst case the block never
-reaches the model, and for E1 the milestone spec says to cancel the feature
-rather than ship a bare refusal (`read_advisor` defaults off).
+**Two ingress output contracts are unverified against the pinned harness
+build** — the `TODO(spike)` rows D0 (does a compaction block reach the model?)
+and E1 (does a read refusal's reason reach it?). Both are `Dep::Behavior`: no
+payload reveals the answer, so they stay manual spikes with a recorded outcome
+rather than probes, and each harness declares its own row as permanently
+unprobed with the reason (`HarnessPlugin::declared_unprobed`). They are tracked,
+with their pass/fail recipes and where the outcome is recorded, in
+`MAINTENANCE.md` § Open spikes & unverified contracts, and the per-harness
+detail is in that plugin's README § *Open spikes & unverified contracts*. Design
+posture in both cases: the server-side effects are correct regardless of whether
+the harness reads the emitted field, so the feature degrades safely — worst case
+the block never reaches the model, and for E1 the milestone spec says to cancel
+the feature rather than ship a bare refusal (`read_advisor` defaults off).
 
 **Read advisor staleness check uses content hash, not mtime.** `should_read`
 (`graph/service.rs`) compares the current file's FNV hash against the indexed
@@ -588,21 +615,21 @@ key/value store backing the analyses-auto trigger's last-seen counts). An
 older `graph.db` opens against these with zero migration step — they simply
 don't exist until the first write.
 
-**A fourth Claude hook shim joins the V11 three, sharing the same POST
-helper.** `postedit_hook.rs`'s `cimp --postedit-hook` (`PostToolUse`, matcher
-`Edit|Write|MultiEdit` → `POST /context/post_edit`) reuses `context_hook.rs`'s
-`post_loopback(path, body)` exactly like `compact_hook.rs` and `read_hook.rs`
-do — same Bearer auth, `Content-Length`, ~600 ms timeout, fail-open-on-any-error
-posture. `tabs/config.rs` adds the hook to the Claude settings overlay
-whenever `context_injection && auto_check`, independent of the other three
-context-hook toggles.
+**A fourth ingress capability joins the V11 three, on the same seam.** The
+auto-check tap is `POST /context/post_edit`'s core, reached either by the
+harness-neutral CHP body or by a harness's own post-edit ingress route — the two
+transports meet at one core, as every other capability's do. Its emission is
+gated on `context_injection && auto_check`, independent of the other three
+context toggles, and which hook a harness wires it to is that harness's own
+declaration (`HarnessPlugin::routes()`, `chp_event_for_route()`); the mapping is
+in that plugin's README § *Hook routing*.
 
-**`TODO(spike F0)` — a third unverified hook output contract, same posture as
-V11's D0/E1.** Which JSON field of a `PostToolUse` hook's stdout actually
-reaches the model as additional context is unconfirmed against the pinned
-Claude Code build (`postedit_hook.rs`'s module doc). We emit the documented
-`hookSpecificOutput.additionalContext` shape, mirroring `UserPromptSubmit`/
-`PreCompact`. Degrades safely either way: the server-side effects (debounce
+**`TODO(spike F0)` — a third unverified output contract, same posture as
+V11's D0/E1.** Which field of a post-edit hook's reply actually reaches the
+model as additional context is unconfirmed against the pinned harness build; the
+emitted shape and the spike's status are the plugin's, recorded in its README
+§ *Open spikes & unverified contracts*. Degrades safely either way: the
+server-side effects (debounce
 clock, baseline update, parked-block bookkeeping) run regardless of whether
 Claude reads the field, and a parked block still drains via the next
 `/context/retrieve` call (`GraphService::drain_auto_check`) — worst case the
@@ -742,76 +769,175 @@ section is `src-tauri/src/harness/README.md`; the design is
 `DESIGN-harness-plugin-architecture.md` (§ 4 for the tree, § 4.1 for the tests
 below, § 6 for this cost table).
 
-**Everything cImp knows about a harness lives in one directory**, and three
+**Everything cImp knows about a harness lives in one directory**, and four
 tests in `harness/layering.rs` keep it that way:
 
-- `no_harness_literals_outside_harness` — a string a harness owns
+- `no_harness_literals_outside_harness` — a string a harness OWNS
   (`hookSpecificOutput`, `message.part.delta`, the TUI permission footer) may not
   appear in production code outside `harness/`. The needle list is *derived from
   the capability registry's* `depends_on`, so declaring a new dependency
   automatically widens what the scan refuses to see elsewhere. Exceptions are an
-  explicit, commented allowlist in that file — seven files today, each with the
-  phase that retires it, and each re-checked by
+  explicit, commented `LITERAL_ALLOWLIST` — **one file today** (`graph/index.rs`,
+  a word collision rather than a dependency) — re-checked by
   `every_literal_allowlist_entry_is_still_earning_it` so an entry cannot outlive
   the literal it was written for. The scan reads each file with its
   `#[cfg(test)]` items removed, line-ending-blind and brace-matched via
-  `crate::rustsrc` — it used to hand-roll that boundary, and got both halves
-  wrong (see `executable_text`'s docs).
+  `crate::rustsrc`, and two further tests guard the guard
+  (`the_literal_scan_reads_the_same_code_on_every_platform`,
+  `executable_text_ignores_line_endings_and_cuts_at_every_test_item`).
+- `no_harness_identity_outside_registry` (V40 Phase A, locked decision 10(a)) —
+  a harness's own NAME. Every descriptor id, reserved tab id, binary stem and
+  consumer token is a needle, derived from the registry, and none of them may
+  appear in production code outside `harness/`. Core may *hold* a `HarnessId`
+  and pass it to the registry; it may not spell one and it may not branch on
+  one. Exceptions are `IDENTITY_ALLOWLIST` — **two files today**
+  (`settings/schema.rs`, `state/manager.rs`), both for persisted wire forms —
+  re-checked by `every_identity_allowlist_entry_is_still_earning_it`. The
+  frontend has its own half: `src/lib/harnessIdentity.test.ts` runs the same
+  scan over `src/`, with its own allowlist and its own both-directions check.
 - `harness_modules_do_not_import_capabilities` — the dependency direction is
-  L1 → L2 only. A module under `harness/` may not reach into `graph::`, `tts::`,
-  `usage::` or `workbench::`; the Tier-C fallback readers that still do are a
-  declared, **shrinking** list (`UPWARD_EXEMPT`), and the test also fails when an
-  exemption stops being needed, so the list cannot rot into padding.
-- `every_harness_dir_declares_its_capabilities` — a `harness/<id>/` with no rows
-  in the registry and no CHP hello is a harness nobody can reason about.
+  L1 → L2 only. A module under `harness/` may not reach into `crate::graph`,
+  `crate::tts`, `crate::workbench` or `crate::delegation`
+  (`layering::CAPABILITY_MODULES`; `crate::usage` left that list in V40 Phase D,
+  because the whole usage data path moved *below* the seam into
+  `harness/claude/usage.rs` behind `usage_source()`). The fallback readers that
+  still import upward are a declared list (`UPWARD_EXEMPT`, **six entries**),
+  each with its reason, and the test asserts in **both** directions — an
+  exemption that stops being needed fails the build, so the list cannot rot into
+  padding.
+- `every_registry_entry_is_fully_wired` (V40 Phase A, locked decision 10(b); it
+  absorbed `every_harness_dir_declares_its_capabilities`) — one
+  `HarnessDescriptor` row is a promise about a dozen places, and this is what
+  makes forgetting one of them a red build. It checks the directory set in
+  **both** directions (a `harness/<id>/` directory the registry does not declare
+  fails as loudly as a descriptor with no directory; `_`-prefixed directories
+  such as `_retired/` are data a retired harness left behind, not a harness),
+  then per descriptor: capability rows exist, a CHP hello is declared
+  (`chp::EV_HELLO` appears in the directory), identity is complete (binary, tab
+  id, consumer, label), exactly **one** `<id>.input.profile` capability row
+  exists and the plugin really answers an `input_profile()`, `spawn_sig` is not
+  null, every declared setting is unique/labelled/well-typed and every
+  `scoped_features()` row names a `Bool` field the schema declares, the sandbox
+  grant table is non-empty, a *Harness health* panel row appears (plus the
+  neutral `Harness::ANY` one), `MAINTENANCE.md` names every capability id, and a
+  harness declaring `FileArtifact` has `fixtures/harness/<id>/goldens/`.
 
-The steps:
+**The steps, and the test that fails until you do each one:**
 
-1. **`harness/<id>/mod.rs`**, plus `pub mod <id>;` in `harness/mod.rs` and a row
-   in `layering.rs`'s `HARNESS_DIRS` (the third test fails until you add it).
-2. **Emit the harness's own extension artifact** — whatever mechanism it
-   provides. The three that exist are the template:
-   `claude/overlay.rs` (a `--settings` JSON overlay + `--mcp-config`),
-   `opencode/plugin.rs` (a dependency-free ES module) and `opencode/config.rs`
-   (one `OPENCODE_CONFIG_CONTENT` env var).
+1. **`harness/<id>/mod.rs`** with an `impl HarnessPlugin`, plus `pub mod <id>;`
+   in `harness/mod.rs` and **one `HarnessDescriptor` row** in
+   `harness/registry.rs` (id, label, binaries, reserved tab ids, consumer token,
+   `expects_chp`, `env_strip`, `features`, `plugin`). It is deliberately **not**
+   a new enum variant: `HarnessId` is an opaque newtype, so there is no
+   `HarnessId::Claude` for a `match` in core to grow an arm for.
+   → `every_registry_entry_is_fully_wired`, `ids_are_unique_and_non_empty`,
+   `every_reserved_tab_id_resolves_to_exactly_one_harness`.
+2. **`settings_schema()`** — your own `ext` fields, stored under
+   `Settings.harness[<id>].ext` and never named by core. An empty table is an
+   ordinary answer (empty Settings section, no ext keys, no work anywhere).
+   → `every_registry_entry_is_fully_wired` (duplicate key, missing label,
+   default the declared kind rejects), and
+   `info::tests::the_committed_registry_fixture_matches_the_registry` for the
+   frontend mirror.
+3. **`routes()`** if the harness pushes over its own ingress rather than posting
+   plain CHP bodies, plus `identity_of_request()` if its identity rides outside
+   the body, `chp_event_for_route()`, `drift_vocabulary()` and
+   `hook_reply_timeout()`.
+   → `ingress::tests::no_two_plugins_claim_one_route`,
+   `no_plugin_route_shadows_a_core_route`,
+   `every_inverted_wire_default_names_a_route_that_exists`,
+   `the_drift_vocabulary_is_declared_and_deduplicated`,
+   `every_declared_timeout_outlasts_the_budget`.
+4. **`native_tools()`** — the tools this harness serves ITSELF, with `class`,
+   `mutates_fs` and `memory_kind` per row, plus `memory_arg_keys()` for the
+   argument spellings its payloads use. **Empty fails closed and loudly**: every
+   call would be treated as mutating and none recorded as a memory event.
+   → `native::tests::every_registered_harness_declares_its_natives`,
+   `an_unidentified_source_fails_closed`,
+   `each_harness_answers_in_its_own_vocabulary`. Add the matching section to
+   `HARNESS-NATIVE-TOOLS.md`.
+5. **`input.rs` + `input_profile()`** if this harness may be a delegation
+   worker, **and** the `<id>.input.profile` capability row that states what the
+   profile depends on, **and** that row's `declared_unprobed()` reason. All
+   three or none: a profile with no row is a Tier-D behaviour nothing records
+   and nobody can mark verified, and the `delegation.worker` gate reads the
+   recorded spike outcome **per harness** (`contract::gate_for`), so a harness
+   with no profile answers `None` and is simply not a valid worker.
+   → `every_registry_entry_is_fully_wired` (exactly one row, and a row implies a
+   profile), `contract::tests::the_delegation_gate_resolves_the_workers_own_row`,
+   `the_delegation_worker_gate_fails_closed_on_anything_unrecognized`.
+6. **`instructions()`** — every string cImp puts in front of this harness's
+   model, rendered in its vocabulary, and **`tool_for_role()`** for the one thing
+   a neutral sentence cannot avoid naming (`GRAPH_GUIDANCE` says "prefer
+   `graph_outline` → `graph_snippet` over a full *Read*", and OpenCode's
+   rendering says `read` / `bash` because that is what OpenCode serves).
+   → `instructions::tests::every_harness_declares_every_slot`,
+   `nothing_ships_with_an_unfilled_placeholder`,
+   `the_graph_nudge_speaks_each_harnesss_own_vocabulary`,
+   `registry::tests::every_declared_tool_role_names_a_native_tool`.
+7. **`preflight()`** — whether a tab of this harness may be enabled right now,
+   with the install hint the UI appends to a refusal. Claude's "not gated, it is
+   the app's own front end" is a declared `Ok`, so *not gated* is on the record
+   rather than an exemption a third harness inherits by accident.
+8. **`spawn_sites()`** — your rows in the external-process spawn ledger, because
+   its tripwire scans the whole tree and consumes core's rows and every plugin's
+   together. → `spawn_ledger::tests::the_spawn_ledger_is_exhaustive`.
+9. **`config_writer()`** if cImp can write this harness's local-provider
+   configuration, and the descriptor's matching `LocalProviderConfig` feature.
+   → `info::tests::a_declared_config_writer_exists` (both directions),
+   `local_provider_vars_name_declared_ext_keys`.
+10. **The descriptor's `features` and the plugin's `affordances()`** — what core
+    mounts beyond the neutral path, and every user-facing string the window used
+    to hard-code (label, default command, accent, state dirs, install hint,
+    attachment format, attribution template, inject mechanism, status-line rows).
+    A harness that declares nothing renders with cImp's own wording and no
+    accent: a visible absence, never another product's copy under this one's
+    name. → `a_declared_usage_push_has_a_source`,
+    `accents_are_distinct_where_declared`,
+    `every_harness_declares_what_the_window_prints`, and the vitest suite
+    *registry parity (locked decision 11)* in `src/lib/harness.test.ts`.
+11. **A CHP hello** — `serves` / `cannot`, built from the *same* booleans that
+    decided what the artifact actually wired, so the declaration cannot claim
+    something the artifact does not do. Event ids come from `chp::EV_*`.
+12. **`canaries()` + fixtures** under
+    `src-tauri/fixtures/harness/<id>/<version>/` — the L1 assertions that a
+    recorded payload still produces *substantive* output, run every `cargo test`
+    and inside the shipped binary whenever this harness's version changes. Write
+    the negative twin: a positive canary that never ran passes just as green as
+    one that did. → `canary::tests::canaries_and_the_matrix_agree`,
+    `embedded_canaries_are_exactly_the_declared_ones`,
+    `every_fixture_version_dir_has_a_manifest`.
+13. **`probe()`** (plus `probes_share_one_child()` and `declared_unprobed()`) —
+    the L2 half, driven against the installed CLI. `harness/probe.rs` stays core:
+    it owns the runner, the report shape and `IMPLEMENTED`, the **declared report
+    order**. → `contract::tests::probes_and_the_matrix_agree`,
+    `every_silent_degradation_has_a_canary_or_a_probe_or_a_waiver`.
+14. **Goldens if the artifact is a file** — declare `HarnessFeature::FileArtifact`
+    and commit `src-tauri/fixtures/harness/<id>/goldens/`, so a change to what the
+    harness loads is a reviewable byte diff.
+15. **Capability rows** in `harness/contract.rs` (or, for rows whose contract is
+    a sentence about this product, `HarnessPlugin::capabilities()`), with
+    `wired_in` naming your files — **and a drift row in `MAINTENANCE.md` in the
+    same commit**. → `wired_in_paths_exist`,
+    `contract::tests::matrix_matches_maintenance_doc`.
+16. **A fallback reader** (`<id>/read.rs`) *only* if the harness cannot push;
+    declare `activity_source()`, `usage_source()` and `session_key_space()` to
+    match. Tier C stays possible, contained and declared rather than ambient. It
+    will need L4 types, so add it to `UPWARD_EXEMPT` with the reason and the
+    condition that retires it.
 
-   **If the artifact is text, it is a file, not a `format!()` string** (V35
-   Phase M, design § 5.1). `opencode/templates/plugin.js` is a real `.js` file
-   with `{{cimp.*}}` slots, `include_str!`ed and rendered by `harness/render.rs`;
-   `plugin.rs` keeps only the *key set* (`OPENCODE_PLUGIN_KEYS`) and the values
-   behind it. Two rules come with that: every substitution value is a whole
-   serde-produced literal (`render::json_lit`), so a tool name or refusal added
-   later can never malform the emitted file; and every `{{key}}` must be in the
-   declared set — three tests fail the build otherwise, rather than a typo
-   emitting a plugin with a missing gate constant. The emitted artifact is
-   goldened byte for byte (`src-tauri/fixtures/plugin-goldens/`), so an upstream
-   rename lands as a readable diff in JavaScript and in its goldens, in one
-   commit. **If the artifact is structured (JSON, TOML), build it structurally**
-   — `claude/overlay.rs` composes `serde_json::Value`, which is strictly safer
-   than a text template and deliberately was *not* converted.
+Everything **outside** `harness/<id>/` is neutral and consumes the plugin through
+the interface. Two claims this section used to make were false and are replaced
+by the tests that now enforce the truth:
 
-   All are computed in Rust at tab
-   spawn and are **spawn-baked**: the artifact outlives the binary that wrote it,
-   so every body it posts carries `chp::CHP_VERSION` (which is what turns a stale
-   artifact from a mysterious functional failure into a line in the *Harness
-   health* panel), and any Settings-derived value baked into it needs a
-   `tabs::config::spawn_inject_sig` entry so the user gets the restart hint.
-3. **Declare a hello** — `serves` / `cannot`, built from the *same* booleans that
-   decided what was emitted, so the declaration cannot claim something the
-   artifact does not do. Event ids come from `chp::EV_*`. A capability missing
-   from `serves` reads as *unavailable, with a reason*, never as *nobody wrote it
-   down*.
-4. **Add capability rows** to `harness/contract.rs` for anything not already
-   covered, with `wired_in` naming your files — `wired_in_paths_exist` and the
-   `MAINTENANCE.md` parity test both hold you to it. A row whose degradation is
-   `Silent` must carry a canary, a probe or an explicit waiver.
-5. **A fallback reader** (`<id>/read.rs`) *only* if the harness cannot push. Tier
-   C stays possible; it is now contained and declared rather than ambient. It
-   will need L4 types, so add it to `UPWARD_EXEMPT` with the reason.
+| Old claim | What is actually true |
+|---|---|
+| "no new enum variant outside `harness/`" | Still true, and now **checked**: `HarnessId` is an opaque newtype with no per-product constants, and `no_harness_identity_outside_registry` fails the build if core spells a harness name at all. |
+| ~~"no new `match` arm in `tabs/config.rs`"~~ | The *file* is no longer exempt from the identity scan — its last per-harness residual left in V40 Phase C — so a new arm there would fail `no_harness_identity_outside_registry`, not merely be discouraged. |
+| ~~"no frontend mirror"~~ | **False.** There IS a frontend mirror and it is pinned: `harness_list` serves the roster over IPC, `info::tests::the_committed_registry_fixture_matches_the_registry` writes `src-tauri/fixtures/harness/registry.json` and fails when the committed file differs, and vitest asserts the TypeScript unions in `src/lib/harness.ts` cover it (*registry parity (locked decision 11)*). A descriptor field, a feature or a harness added in Rust without its TS mirror is a red `npm test` rather than a runtime `undefined`. |
+| ~~"a bespoke gate constant"~~ | Still true: `contract::gate_for(id, settings, harness)` is the one query, and `no_gate_blocks_outside_the_declared_list` / `every_gated_capability_can_actually_block` hold both directions. |
 
-What you should **not** need, and which the pre-K tree did require: a new enum
-variant outside `harness/`, new match arms in `tabs/config.rs`, a bespoke gate
-constant, a frontend mirror. If a step forces one, the seam is in the wrong
+If a step forces something outside `harness/<id>/`, the seam is in the wrong
 place — raise it rather than adding it.
 
 Two standing constraints. **cImp does not load harness plugins it did not
@@ -1057,10 +1183,10 @@ an older `settings.json` round-trips through it with nothing to migrate.
 
 **Usage/X-ray is the fifth hook-free area in Code Intelligence.** Of the tab's
 six sections (Index / Activity / Memory / Context / Analyses / Usage), only
-**Context** needs a Claude hook (the four shims tabulated in the V11 section
-above: `UserPromptSubmit`, `PreCompact`, `PreToolUse`, `PostToolUse`) — Index,
-Activity, Memory, Analyses, and now **Usage** all ride existing plumbing with
-no hook of their own. The usage tap extends the OOB Claude-transcript reader
+**Context** needs a harness-side hook at all (the ingress seam described in the
+V11 section above) — Index, Activity, Memory, Analyses, and now **Usage** all
+ride existing plumbing with no hook of their own. The usage tap extends the OOB
+Claude-transcript reader
 that already exists for TTS and memory (`harness/claude/read.rs::record_usage`, called
 from the same `drain_new_lines` loop as `record_tool_events`): `parse_usage_line`
 pulls `message.usage.{input_tokens,output_tokens,cache_read_input_tokens,
@@ -1106,11 +1232,16 @@ already land, `offload/loopback.rs::handle_memory_event` (`POST
 /memory/event`), which estimates chars from a tool call's *input* args (the
 same blind spot the memory tap already had — tool output isn't visible
 there either) and records a `ToolResult` usage event from that estimate.
-`GraphIndex::usage_all_sessions` derives `est_only` structurally
-(`session.agent != "claude"`), not from a separately tracked flag, so it can
-never drift out of sync with which agent actually produced a session. Revisit
-if a future OpenCode release adds real token fields to `message.updated`;
-`opencode.rs`'s doc comment names the exact field path to re-check.
+`est_only` is derived **structurally and harness-neutrally**, not from a
+tracked flag and no longer from the session's agent: a session shows the badge
+exactly when it has no recorded `turn` usage row at all
+(`GraphIndex::usage_session_has_turn`, read by both `usage_all_sessions` and
+`usage_session_row` so the two paths cannot answer differently). A harness that
+starts reporting real per-turn tokens therefore stops being `est_only` by
+producing them, with no per-product condition to update. Revisit if a future
+OpenCode release adds token fields to `message.updated`;
+`harness/opencode/read.rs`'s doc comment names the exact field path to
+re-check.
 
 **`TODO(spike E0)` — WebView2 child-webview capture compiles clean but has
 never run against a live instance.** The Preview tab's capture path

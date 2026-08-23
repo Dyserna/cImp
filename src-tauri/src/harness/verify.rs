@@ -1,5 +1,5 @@
 //! V35 Phase F — **auto-verify on version change**: run the canaries, advance
-//! `claude_last_verified` by itself, and only speak when something actually
+//! `harness[<id>].last_verified` by itself, and only speak when something actually
 //! broke.
 //!
 //! # The problem this closes
@@ -13,14 +13,14 @@
 //!
 //! # What happens now
 //!
-//! 1. The OOB tap records a changed `claude_last_seen` (unchanged from V16).
-//! 2. [`on_claude_version_changed`] wakes a single background thread.
+//! 1. The OOB tap records a changed `harness[<id>].last_seen` (unchanged from V16).
+//! 2. [`on_version_changed`] wakes a single background thread.
 //! 3. **L1** — the four embedded fixture canaries
 //!    ([`crate::harness::canary::run_embedded`]) run in-process, in
 //!    milliseconds, with no CLI needed.
 //! 4. **L2** — [`crate::harness::probe::run_for`] drives the *installed* CLI
 //!    for the same harness.
-//! 5. **Zero `Fail` ⇒ `claude_last_verified` advances on its own** and no
+//! 5. **Zero `Fail` ⇒ `harness[<id>].last_verified` advances on its own** and no
 //!    Advisor card appears at all. Otherwise the version stays put and each
 //!    failing capability is recorded so the Advisor can raise a
 //!    `drift.capability.v1` notice naming it, its evidence, and the `wired_in`
@@ -101,7 +101,7 @@ const OVERALL_CAP: Duration = Duration::from_secs(90);
 /// How many times the worker re-checks for a newer version before giving up.
 ///
 /// A trigger arriving while a run is in flight is DROPPED (single-flight), so
-/// the worker re-reads `claude_last_seen` after each run instead — otherwise an
+/// the worker re-reads `harness[<id>].last_seen` after each run instead — otherwise an
 /// update landing mid-probe would be verified only at the next app start. A
 /// round only happens for a version this worker has not already answered for,
 /// so it terminates on its own; the cap bounds the pathological case of a CLI
@@ -203,7 +203,7 @@ fn verify_until(harness: Harness, deadline: Instant) -> Report {
     // regressing. Runs first for that reason: if the fixtures no longer parse
     // substantively the probes cannot tell us anything the canaries have not
     // already said, and it costs milliseconds to know.
-    for id in crate::harness::canary::EMBEDDED {
+    for id in crate::harness::canary::embedded() {
         let Some(cap) = contract::get(id) else {
             // Unreachable in a built binary — `canary::tests::
             // embedded_canaries_are_exactly_the_declared_ones` pins the join —
@@ -295,9 +295,10 @@ pub struct RunSummary {
     pub answers: Vec<Answer>,
 }
 
-/// At most one entry per harness — a short list rather than a map because
-/// [`Harness`] is a two-value enum in practice and a linear scan of two is not
-/// worth a hash. Poisoning is swallowed on both sides: a panicking writer must
+/// At most one entry per harness — a short list rather than a map because the
+/// registry is a handful of entries and a linear scan of a handful is not worth
+/// a hash. (It said "a two-value enum" until V40 review L-10; [`Harness`] is
+/// `HarnessId` now and its arity is the registry's.) Poisoning is swallowed on both sides: a panicking writer must
 /// degrade the panel to "no run recorded", never take the Settings window down
 /// with it.
 static LAST_RUNS: Mutex<Vec<RunSummary>> = Mutex::new(Vec::new());
@@ -338,7 +339,7 @@ pub fn in_flight() -> bool {
 // ── the triggers ────────────────────────────────────────────────────────────
 
 /// Set while a verify worker is alive. A second trigger is DROPPED rather than
-/// queued — the worker re-reads `claude_last_seen` after each round, so
+/// queued — the worker re-reads `harness[<id>].last_seen` after each round, so
 /// dropping loses nothing except a duplicate run.
 static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
@@ -353,14 +354,20 @@ impl Drop for InFlight {
     }
 }
 
-/// Trigger (a): the version writer just recorded a **changed**
-/// `claude_last_seen`. Called from `settings::note_harness_version`, which is
-/// the one place that write happens.
+/// Trigger (a): the version writer just recorded a **changed** `last_seen` for
+/// `harness`. Called from `settings::note_harness_version`, which is the one
+/// place that write happens.
+///
+/// V40 Phase B: it takes the harness. It used to be `on_claude_version_changed`
+/// and only Claude's half of the `*_last_seen` field pair called it, so
+/// OpenCode updating recorded a string and verified nothing — a whole harness
+/// outside the mechanism, with no error and no card.
 ///
 /// Non-blocking by construction — the caller (the OOB transcript tap, mid
 /// session) must never wait on a probe.
-pub fn on_claude_version_changed() {
-    spawn_worker("claude version change");
+pub fn on_version_changed(harness: Harness) {
+    tracing::debug!(?harness, "harness version changed; waking auto-verify");
+    spawn_worker("harness version change");
 }
 
 /// Trigger (b): once at app startup, when the seen and verified versions do not
@@ -381,13 +388,87 @@ pub fn on_claude_version_changed() {
 /// The cost is one background run per launch while a failure stands, which is
 /// exactly the situation where re-checking is worth its seconds.
 pub fn spawn_startup_check() {
-    let hv = crate::settings::read_global_harness_versions();
-    if hv.claude_last_seen.trim().is_empty()
-        || hv.claude_last_seen.trim() == hv.claude_last_verified.trim()
-    {
+    if pending_harness().is_none() {
         return;
     }
     spawn_worker("startup (seen != verified)");
+}
+
+/// The first registered harness with an unverified observation — a non-empty
+/// `last_seen` that differs from `last_verified`.
+///
+/// V40 Phase B: two string comparisons per harness against the mtime-cached
+/// read, in registry order, replacing the two comparisons against Claude's
+/// field pair. `None` in the overwhelmingly common already-verified case, which
+/// is what keeps the startup check free.
+fn pending_harness() -> Option<(Harness, String)> {
+    pending_harness_excluding(&[])
+}
+
+/// [`pending_harness`], skipping the (harness, version) pairs this worker has
+/// already answered for.
+fn pending_harness_excluding(ran: &[(Harness, String)]) -> Option<(Harness, String)> {
+    // V40 review M-2 (parity lens): a harness whose reserved tabs are all
+    // DISABLED is not probed. `verify` runs the harness's own CLI —
+    // `opencode serve` binds a port, `claude --help` starts a process — and the
+    // 35 -> 36 migration hands every harness a `last_seen` (carried over from
+    // `harness_versions.<id>_last_seen`) with an EMPTY `last_verified`, because
+    // auto-verify only ever recorded one harness before V40. So the first
+    // post-upgrade launch spawned a child for a harness the user may have
+    // turned off months ago, with nothing on screen to explain it.
+    let enabled = crate::settings::read_global_enabled_ai_tabs();
+    let rows: Vec<(Harness, String, String)> = crate::harness::registry::all()
+        .filter(|harness| harness_has_enabled_tab(*harness, &enabled))
+        .map(|harness| {
+            let row = crate::settings::read_global_harness_settings(harness);
+            (
+                harness,
+                row.last_seen.trim().to_string(),
+                row.last_verified.trim().to_string(),
+            )
+        })
+        .collect();
+    next_pending(&rows, ran)
+}
+
+/// Whether any of `harness`'s reserved tab ids is in the enabled list.
+///
+/// An EMPTY list means the settings file has not been read (no global file
+/// yet — a fresh install before the first save), not "the user disabled
+/// everything": the integrity check refuses an empty `enabled_ai_tabs` and
+/// repairs it to the first registered harness's first tab. Treated as "do not
+/// probe", which is the conservative direction for spawning a child process.
+fn harness_has_enabled_tab(harness: Harness, enabled: &[crate::settings::AiTabId]) -> bool {
+    harness
+        .descriptor()
+        .is_some_and(|d| d.tab_ids.iter().any(|t| enabled.iter().any(|e| e.as_str() == *t)))
+}
+
+/// The selection itself, over `(harness, last_seen, last_verified)` rows —
+/// pure, so the starvation this fixes is testable without a settings file.
+///
+/// **V40 review finding M-1.** The worker held the memo and answered it with
+/// `return`: with the first harness FAILING (a failure leaves
+/// `seen != verified`, which is deliberate — see `spawn_startup_check`) and the
+/// second pending, round 0 ran the first, round 1 asked again, got the first
+/// back, hit the memo and returned. The second harness was never verified at
+/// all, for as long as the first kept failing — the exact case the memo's own
+/// comment said it existed to handle. The memo belongs in the LOOKUP: a pair
+/// already answered is skipped, not a reason to stop.
+fn next_pending(
+    rows: &[(Harness, String, String)],
+    ran: &[(Harness, String)],
+) -> Option<(Harness, String)> {
+    for (harness, seen, verified) in rows {
+        if seen.is_empty() || seen == verified {
+            continue;
+        }
+        if ran.iter().any(|(h, v)| h == harness && v == seen) {
+            continue;
+        }
+        return Some((*harness, seen.clone()));
+    }
+    None
 }
 
 /// Trigger (c), V35 Phase G: the Settings → Harness health panel's **Run
@@ -429,50 +510,39 @@ pub fn run_now(harness: Harness) -> bool {
 
 /// One **Run checks now** click.
 ///
-/// The Claude arm goes through [`run_once`] — the same write path Phase F's
-/// automatic run uses, so a manual run records the same `claude_auto_verify`
-/// and advances `claude_last_verified` under the same all-pass rule. A second
-/// spelling of that write is how the button and the worker would come to
-/// disagree about what "verified" means.
+/// Goes through [`run_once`] — the same write path Phase F's automatic run
+/// uses, so a manual run records the same `auto_verify` and advances the same
+/// `last_verified` under the same all-pass rule. A second spelling of that
+/// write is how the button and the worker would come to disagree about what
+/// "verified" means.
+///
+/// **V40 Phase B: every registered harness takes that path.** There used to be
+/// a `persists` branch here, asked of the plugin, because only Claude had the
+/// two fields to hold a record — so clicking *Run checks now* on the OpenCode
+/// row produced an in-memory summary that vanished on restart, advanced
+/// nothing, and left the panel saying "never verified" straight afterwards.
+/// With `harness[<id>]` every harness has the row and the branch is gone.
 fn manual_run(harness: Harness) {
-    let hv = crate::settings::read_global_harness_versions();
-    match harness {
-        Harness::Claude => {
-            let seen = hv.claude_last_seen.trim().to_string();
-            if seen.is_empty() {
-                // Nothing to stamp a record against: cImp has never observed
-                // this CLI write a transcript. Run the checks anyway — the
-                // per-capability answers are what the panel shows — but write
-                // NO record. An `AutoVerify` stamped with an empty version
-                // would compare equal to every other empty version, and the
-                // all-pass advance would overwrite a real `claude_last_verified`
-                // with "".
-                let report = verify(Harness::Claude);
-                tracing::info!(tally = ?report.tally(), "manual harness verify ran with no known version; not recorded");
-                remember(&report, "");
-                return;
-            }
-            run_once(&seen);
-        }
-        other => {
-            // No persisted record exists for any other harness (see
-            // [`RunSummary`]), so the in-memory summary IS the result.
-            let version = match other {
-                Harness::OpenCode => hv.opencode_last_seen.trim().to_string(),
-                _ => String::new(),
-            };
-            let report = verify(other);
-            let (pass, fail, unknown, transition) = report.tally();
-            tracing::info!(
-                harness = ?other,
-                version = %version,
-                pass, fail, unknown, transition,
-                capped = report.capped,
-                "manual harness verify finished"
-            );
-            remember(&report, &version);
-        }
+    let version = crate::settings::read_global_harness_settings(harness)
+        .last_seen
+        .trim()
+        .to_string();
+    if version.is_empty() {
+        // Nothing to stamp a record against: cImp has never observed this CLI
+        // run. Run the checks anyway — the per-capability answers are what the
+        // panel shows — but write NO record. An `AutoVerify` stamped with an
+        // empty version would compare equal to every other empty version, and
+        // the all-pass advance would overwrite a real `last_verified` with "".
+        let report = verify(harness);
+        tracing::info!(
+            harness = %harness,
+            tally = ?report.tally(),
+            "manual harness verify ran with no known version; not recorded"
+        );
+        remember(&report, "");
+        return;
     }
+    run_once(harness, &version);
 }
 
 fn spawn_worker(why: &'static str) {
@@ -499,30 +569,40 @@ fn spawn_worker(why: &'static str) {
 /// One worker's life: verify the currently-seen version, then re-check in case
 /// the tap saw a newer one while we were probing.
 fn worker(why: &'static str) {
-    // The version this worker has already answered for. A run that FAILED
-    // leaves `seen != verified`, so without this the loop below would re-run
-    // the same version until `MAX_ROUNDS` — burning three probe runs to learn
-    // the same thing three times.
-    let mut ran: Option<String> = None;
+    // The (harness, version) pairs this worker has already answered for. A run
+    // that FAILED leaves `seen != verified`, so without this the loop below
+    // would re-run the same version until `MAX_ROUNDS` — burning three probe
+    // runs to learn the same thing three times.
+    //
+    // V40 Phase B keyed it by harness as well as version: `pending_harness`
+    // walks the registry, so with Claude failing and OpenCode pending, a
+    // version-only memo would have made the loop answer Claude, skip OpenCode
+    // as "already ran", and never verify it.
+    let mut ran: Vec<(Harness, String)> = Vec::new();
     for round in 0..MAX_ROUNDS {
-        let hv = crate::settings::read_global_harness_versions();
-        let seen = hv.claude_last_seen.trim().to_string();
-        if seen.is_empty() || seen == hv.claude_last_verified.trim() {
+        // V40 review M-1: the memo is applied by the LOOKUP, so an already-
+        // answered (and still failing) harness is SKIPPED rather than ending
+        // the worker — which is what used to starve every harness after the
+        // first failing one.
+        let Some((harness, seen)) = pending_harness_excluding(&ran) else {
             return;
-        }
-        if ran.as_deref() == Some(seen.as_str()) {
-            return;
-        }
-        tracing::info!(trigger = why, round, version = %seen, "harness auto-verify starting");
-        run_once(&seen);
-        ran = Some(seen);
+        };
+        tracing::info!(
+            trigger = why,
+            round,
+            ?harness,
+            version = %seen,
+            "harness auto-verify starting"
+        );
+        run_once(harness, &seen);
+        ran.push((harness, seen));
     }
 }
 
-/// Verify `version` and write the outcome — the ONE place `claude_last_verified`
-/// advances without a click.
-fn run_once(version: &str) {
-    let report = verify(Harness::Claude);
+/// Verify `version` for `harness` and write the outcome — the ONE place
+/// `harness[<id>].last_verified` advances without a click.
+fn run_once(harness: Harness, version: &str) {
+    let report = verify(harness);
     let record = report.record(version, crate::activity::now_ms());
     let advance = report.advances();
     let (pass, fail, unknown, transition) = report.tally();
@@ -541,14 +621,14 @@ fn run_once(version: &str) {
     // file write lands or neither does.
     let version = version.to_string();
     let stamp = version.clone();
-    let res = crate::settings::mutate_global_harness_versions(move |hv| {
-        hv.claude_auto_verify = Some(record.clone());
+    let res = crate::settings::mutate_global_harness(harness, move |row| {
+        row.auto_verify = Some(record.clone());
         // Re-read inside the write: the tap may have seen a NEWER version while
-        // the probes ran. Stamping `claude_last_verified` with a version we did
-        // not verify would be a lie — and the worker's next round picks the new
-        // one up.
-        if advance && hv.claude_last_seen.trim() == stamp {
-            hv.claude_last_verified = stamp.clone();
+        // the probes ran. Stamping `last_verified` with a version we did not
+        // verify would be a lie — and the worker's next round picks the new one
+        // up.
+        if advance && row.last_seen.trim() == stamp {
+            row.last_verified = stamp.clone();
         }
     });
 
@@ -558,7 +638,7 @@ fn run_once(version: &str) {
             version = %version,
             pass, fail, unknown, transition,
             capped = report.capped,
-            "harness auto-verify passed; claude_last_verified advanced with no user action"
+            "harness auto-verify passed; last_verified advanced with no user action"
         ),
         Ok(_) => tracing::warn!(
             harness = ?report.harness,
@@ -617,6 +697,16 @@ pub fn notifiable_failures<'a>(
 
 #[cfg(test)]
 mod tests {
+
+    /// The two shipped harnesses, resolved through the registry — test code may
+    /// name a harness, it just may not construct one out of thin air.
+    fn claude() -> Harness {
+        Harness::from_id("claude").expect("claude is registered")
+    }
+    #[allow(dead_code)]
+    fn opencode() -> Harness {
+        Harness::from_id("opencode").expect("opencode is registered")
+    }
     use super::*;
 
     fn answer(id: &'static str, outcome: Outcome) -> Answer {
@@ -629,7 +719,7 @@ mod tests {
 
     fn report(answers: Vec<Answer>) -> Report {
         Report {
-            harness: Harness::Claude,
+            harness: claude(),
             answers,
             capped: false,
         }
@@ -811,7 +901,7 @@ mod tests {
     /// blocks.
     #[test]
     fn an_l1_only_run_drives_this_harnesss_canaries_and_advances() {
-        let report = verify_until(Harness::Claude, Instant::now() - Duration::from_secs(1));
+        let report = verify_until(claude(), Instant::now() - Duration::from_secs(1));
         assert!(report.capped, "the L2 half must have been skipped");
         assert_eq!(
             report.answers.len(),
@@ -824,7 +914,7 @@ mod tests {
         for a in &report.answers {
             assert_eq!(a.evidence, EVIDENCE_CANARY);
             let cap = contract::get(a.id).expect("every answer names a registry row");
-            assert_eq!(cap.harness, Harness::Claude, "wrong harness for {}", a.id);
+            assert_eq!(cap.harness, claude(), "wrong harness for {}", a.id);
             assert_eq!(
                 a.outcome.label(),
                 "pass",
@@ -842,9 +932,9 @@ mod tests {
     /// one CLI must not report the other's readers.
     #[test]
     fn a_run_is_scoped_to_one_harness() {
-        let claude = verify_until(Harness::Claude, Instant::now() - Duration::from_secs(1));
+        let claude = verify_until(claude(), Instant::now() - Duration::from_secs(1));
         assert!(!claude.answers.iter().any(|a| a.id.starts_with("opencode.")));
-        let opencode = verify_until(Harness::OpenCode, Instant::now() - Duration::from_secs(1));
+        let opencode = verify_until(opencode(), Instant::now() - Duration::from_secs(1));
         assert_eq!(
             opencode.answers.iter().map(|a| a.id).collect::<Vec<_>>(),
             vec!["opencode.sse.events"]
@@ -856,19 +946,19 @@ mod tests {
     /// tell "passed" from "could not be checked" for a row the stored record
     /// does not name.
     ///
-    /// Keyed on [`Harness::Any`] deliberately. [`LAST_RUNS`] is process-wide
+    /// Keyed on [`Harness::ANY`] deliberately. [`LAST_RUNS`] is process-wide
     /// and `harness::health` asks it about Claude and OpenCode, so writing a
     /// real harness here would leak into that module's fixtures depending on
     /// test order — the neutral marker is invisible to it.
     #[test]
     fn a_remembered_run_is_readable_and_replaced_per_harness() {
         assert!(
-            last_run(Harness::Any).is_none(),
+            last_run(Harness::ANY).is_none(),
             "nothing is ever recorded for the neutral harness outside this test"
         );
 
         let first = Report {
-            harness: Harness::Any,
+            harness: Harness::ANY,
             answers: vec![answer(
                 "a",
                 Outcome::Pass {
@@ -878,14 +968,14 @@ mod tests {
             capped: true,
         };
         remember(&first, "1.0.0");
-        let got = last_run(Harness::Any).expect("the run was recorded");
+        let got = last_run(Harness::ANY).expect("the run was recorded");
         assert_eq!(got.version, "1.0.0");
         assert!(got.capped, "the budget flag survives");
         assert!(got.at_ms > 0, "a run is stamped so the panel can age it");
         assert_eq!(got.answers.len(), 1);
 
         let second = Report {
-            harness: Harness::Any,
+            harness: Harness::ANY,
             answers: vec![
                 answer(
                     "b",
@@ -903,7 +993,7 @@ mod tests {
             capped: false,
         };
         remember(&second, "2.0.0");
-        let got = last_run(Harness::Any).expect("the run was recorded");
+        let got = last_run(Harness::ANY).expect("the run was recorded");
         assert_eq!(got.version, "2.0.0", "the newer run replaces the older one");
         assert!(!got.capped);
         assert_eq!(
@@ -915,6 +1005,100 @@ mod tests {
         // from a pass.
         assert_eq!(got.answers[0].outcome.label(), "unknown");
         assert_eq!(got.answers[1].outcome.label(), "fail");
+    }
+
+    /// **A failing harness must not starve the ones behind it** (V40 review
+    /// finding M-1).
+    ///
+    /// A failed run deliberately leaves `seen != verified` (see
+    /// `spawn_startup_check`), so the first harness stays pending forever. The
+    /// worker held its already-answered memo and answered a hit with `return`,
+    /// which meant: round 0 verifies harness A, round 1 asks again, gets A
+    /// back, hits the memo, and the worker STOPS — harness B is never verified,
+    /// for as long as A keeps failing. Its own comment said the memo existed to
+    /// stop exactly that.
+    #[test]
+    fn a_failing_harness_does_not_starve_the_next_one() {
+        let ids: Vec<Harness> = crate::harness::registry::all().collect();
+        assert!(ids.len() >= 2, "this test needs two registered harnesses");
+        let (a, b) = (ids[0], ids[1]);
+        // Both pending: A observed 1.0 with nothing verified, B observed 2.0.
+        let rows = vec![
+            (a, "1.0".to_string(), String::new()),
+            (b, "2.0".to_string(), String::new()),
+        ];
+
+        // Round 0 answers A.
+        let first = next_pending(&rows, &[]).expect("A is pending");
+        assert_eq!(first, (a, "1.0".to_string()));
+
+        // A FAILS, so the rows are unchanged. Round 1 must answer B.
+        let ran = vec![first.clone()];
+        let second = next_pending(&rows, &ran).expect("B is still pending");
+        assert_eq!(second, (b, "2.0".to_string()));
+
+        // Both answered ⇒ nothing left, and the worker ends.
+        let ran = vec![first, second];
+        assert_eq!(next_pending(&rows, &ran), None);
+    }
+
+    /// **A harness whose tabs are all disabled is not probed** (V40 review
+    /// finding M-2, parity lens).
+    ///
+    /// `verify` runs the harness's OWN CLI — one of them binds a port — and the
+    /// 35 -> 36 migration gives every harness a `last_seen` carried over from
+    /// `harness_versions.<id>_last_seen` with an EMPTY `last_verified`, because
+    /// auto-verify only ever recorded one harness before V40. So the first
+    /// post-upgrade launch spawned a child for a harness the user may have
+    /// turned off months ago, with nothing on screen to explain it.
+    #[test]
+    fn a_harness_with_no_enabled_tab_is_not_probed() {
+        let ids: Vec<Harness> = crate::harness::registry::all().collect();
+        assert!(ids.len() >= 2, "this test needs two registered harnesses");
+        let (a, b) = (ids[0], ids[1]);
+        let tab_of = |h: Harness| {
+            crate::settings::AiTabId::from_id(
+                h.descriptor().expect("registered").tab_ids[0],
+            )
+            .expect("10(b) requires every reserved tab id to have a variant")
+        };
+
+        assert!(harness_has_enabled_tab(a, &[tab_of(a)]));
+        assert!(!harness_has_enabled_tab(b, &[tab_of(a)]));
+        // An empty list is "settings not read yet", and the conservative answer
+        // to "should cImp spawn a child process" is no.
+        assert!(!harness_has_enabled_tab(a, &[]));
+        // Every reserved tab of a harness counts, not only the first.
+        for h in [a, b] {
+            for t in h.descriptor().expect("registered").tab_ids {
+                let one = crate::settings::AiTabId::from_id(t).expect("has a variant");
+                assert!(harness_has_enabled_tab(h, &[one]), "{h}: {t}");
+            }
+        }
+    }
+
+    /// The ordinary cases the selection also has to get right: an empty
+    /// `last_seen` is "never observed", not "pending", and an equal pair is
+    /// verified.
+    #[test]
+    fn next_pending_skips_unobserved_and_verified_rows() {
+        let ids: Vec<Harness> = crate::harness::registry::all().collect();
+        let (a, b) = (ids[0], ids[1]);
+        assert_eq!(
+            next_pending(
+                &[
+                    (a, String::new(), String::new()),
+                    (b, "2.0".to_string(), "2.0".to_string()),
+                ],
+                &[]
+            ),
+            None
+        );
+        // …and a re-observed version after a pass is pending again.
+        assert_eq!(
+            next_pending(&[(b, "2.1".to_string(), "2.0".to_string())], &[]),
+            Some((b, "2.1".to_string()))
+        );
     }
 
     /// Single-flight: the second trigger while one is in flight is dropped, and

@@ -23,8 +23,7 @@ use crate::harness::claude::hook as claude_hook;
 use crate::settings::injection::NativeWebMode as NativeWebVisibility;
 use crate::settings::{AiToolTabConfig, Settings};
 use crate::tabs::config::{
-    advertises_audit_to_claude, command_is, compose_capability_guidance, native_web_for,
-    read_advisor_gate_blocked, CHANNEL_PUSH_FLAG, CHANNEL_REGISTRATION_FLAG,
+    compose_capability_guidance, native_web_for, CHANNEL_PUSH_FLAG, CHANNEL_REGISTRATION_FLAG,
     CHANNEL_REGISTRATION_TARGET,
 };
 
@@ -139,7 +138,7 @@ fn claude_hello(settings: &Settings, flags: ClaudeHookFlags) -> claude_hook::Hel
     hello.declare(
         flags.read_advisor,
         chp::EV_CONTEXT_SHOULD_READ,
-        if read_advisor_gate_blocked(settings) {
+        if crate::harness::plugin::read_advisor_gate_blocked(settings) {
             "the read advisor is BLOCKED by the capability matrix — `claude.hook.pretooluse_deny` \
              is recorded as failed, so a deny's reason would never reach the model"
         } else {
@@ -239,7 +238,11 @@ pub(crate) fn build_pre_args(
     tab: &str,
     endpoint: Option<&crate::offload::loopback::Discovery>,
 ) -> Vec<String> {
-    if !command_is(&cfg.command, "claude") {
+    // Belt and braces: `ClaudePlugin::pre_args` is the only production caller
+    // and it is reached only for a Claude tab, but the tests drive this
+    // directly with both harnesses' configs and the guard is what makes those
+    // assertions mean something.
+    if crate::harness::HarnessId::from_command(&cfg.command) != super::plugin::id() {
         return Vec::new();
     }
     let mut args = Vec::new();
@@ -268,11 +271,11 @@ pub(crate) fn build_pre_args(
         // V32 Phase G: resolved for THIS tab, so a per-tab override reaches
         // both halves together for the same reason.
         let native_web = native_web_for(settings, "claude", tab);
-        if settings.statusline.enabled {
-            if let Some(command) = crate::statusline::launch_command() {
+        if super::settings::statusline_enabled(settings) {
+            if let Some(command) = super::statusline::launch_command() {
                 // `refreshInterval` (seconds) re-runs the command on a timer in
                 // addition to event-driven updates, so the `rate_limits` usage
-                // push (see `crate::usage`) keeps flowing — and the bottom-bar
+                // push (see [`super::usage`]) keeps flowing — and the bottom-bar
                 // widget stays fresh — while the tab sits idle. 30s beats the
                 // widget's 90s stale threshold with margin; the render itself
                 // is a local subprocess, so the cost is negligible.
@@ -331,7 +334,7 @@ pub(crate) fn build_pre_args(
             // effect on the next tab launch, not the next app restart.
             let read_hook = settings.graph.enabled
                 && settings.graph.read_advisor
-                && !read_advisor_gate_blocked(settings);
+                && !crate::harness::plugin::read_advisor_gate_blocked(settings);
             // V17 Phase B: a second matcher intercepts a whole-file shell read
             // (`cat FILE`) of an already-read file via the SAME route (which
             // dispatches on `tool_name`).
@@ -502,7 +505,7 @@ pub(crate) fn build_pre_args(
             // documented mechanism that makes `permissionDecision` expressible —
             // so the ordering the feature's whole claim rests on is upstream's
             // written contract rather than an observed behaviour. The app still
-            // bounds itself (`loopback::TOOL_CHECKPOINT_BUDGET`, 1800 ms) and
+            // bounds itself (`harness::ingress::hook_reply_budget()`, 1800 ms today) and
             // abandons an unfinished snapshot rather than writing a row that
             // might contain the change it claims to predate; the entry's
             // `timeout` is 5 s, a backstop over that (see
@@ -830,7 +833,7 @@ pub(crate) fn build_pre_args(
                 serde_json::json!({ "command": exe, "args": child_args }),
             );
         }
-        if advertises_audit_to_claude(settings) {
+        if crate::harness::plugin::audit_advertised(settings, super::plugin::me()) {
             // V32 C-1b: `--tab <id>` here for the same reason as on the offload
             // child, and NOT for the same purpose. The audit child resolves no
             // memory scope — it takes no arguments and always scans the app's
@@ -886,7 +889,7 @@ mod tests {
     ///
     /// Moved here from `checkpoint_beacon.rs` when that shim was deleted
     /// (2026-08-17); the matcher it guards lives in this file, so this is where
-    /// it belongs. The matcher and `toolclass::TABLE` are still edited
+    /// it belongs. The matcher and `tools::CLAUDE_NATIVE_TABLE` are still edited
     /// separately, and a matcher naming a tool with no `mutates_fs: true` row now
     /// costs more than it used to: the entry's handler blocks the tool call, so a
     /// mismatch means a call held for a checkpoint the core immediately declines
@@ -899,7 +902,7 @@ mod tests {
     fn every_matched_claude_tool_is_classified_as_mutating() {
         for tool in CLAUDE_MUTATING_TOOL_MATCHER.split('|') {
             assert!(
-                crate::offload::toolclass::mutates_fs(tool),
+                crate::harness::claude::tools::claude_native_mutates_fs(tool),
                 "`{tool}` is in the PreToolUse matcher but has no `mutates_fs: true` row — \
                  every matched call would be held for a checkpoint the core refuses"
             );

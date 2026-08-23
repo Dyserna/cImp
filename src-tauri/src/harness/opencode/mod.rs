@@ -12,8 +12,15 @@
 //! plugin sits in the harness's own tool path. A change to [`plugin`] or
 //! [`tools`] is a change to a security control, not to a data pipe.
 
+pub mod canary;
 pub mod config;
+pub mod harness_plugin;
 pub mod input;
 pub mod plugin;
+pub mod probe;
+pub mod prompts;
 pub mod read;
+pub mod settings;
 pub mod tools;
+
+pub use harness_plugin::PLUGIN;

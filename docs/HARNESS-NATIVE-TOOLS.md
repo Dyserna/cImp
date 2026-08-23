@@ -14,16 +14,22 @@ Scope of that re-audit, so the next reader knows what was and was not re-checked
 
 * **Re-checked against code** — every claim about tool classes, what an engaged
   latch removes, which routes enforce it, and whether the natives are gated.
-  The authority is `offload/toolclass.rs::TABLE` plus the five places that read
+  The authority is `offload/toolclass.rs::TABLE` (cImp's ROUTED tools; since
+  V40 Phase A the harness natives live in `harness/<id>/tools.rs` and are read
+  through `harness::native`) plus the five places that read
   it: the worker (`filter_defs` + `Latch::refusal`) and `loopback.rs`'s four
   gated routes `/run`, `/graph_run`, `/mcp/call` and `/audit/run` (all via
   `Latch::proxy_gate`). Corrections are marked **(2026-08-09)** inline. Seven
   claims were false — the three the review named, plus four more found by
   reading the rest of the file.
-* **NOT re-checked** — §2 and §3, the harness-native tool *surfaces*. No
+* **NOT re-checked** — §2 and §3's *upstream inventories*. No
   `claude --version` / `/experimental/tool/ids` probe was re-run, so those two
   sections still carry their 2026-08-07 basis and may have drifted with a
   harness release. §4's live MCP-endpoint probes were likewise not repeated.
+* **Pinned to the code (V40 Phase G)** — §§ 2.2 and 3.2 reproduce each plugin's
+  `HarnessPlugin::native_tools()` row for row. Those two tables are the ones a
+  reader may rely on; the inventories around them are upstream's lists and are
+  deliberately different.
 
 ## Why this document exists
 
@@ -61,8 +67,11 @@ Reproduce, do not trust:
 
 ## 2. Claude Code native tool surface (2.1.223)
 
-The complete built-in set. Names are the exact strings used in permission
-rules, hook matchers and subagent tool lists.
+**Upstream inventory, not cImp's table.** This is the complete built-in set as
+*Claude Code* publishes it — the exact strings used in permission rules, hook
+matchers and subagent tool lists. What cImp's plugin **declares** about these
+names is a strict subset, and it is § 2.2; the two are different lists on
+purpose and only § 2.2 is machine-checked against the code.
 
 | Tool | What it provides | Class |
 |---|---|---|
@@ -97,8 +106,11 @@ rules, hook matchers and subagent tool lists.
 | `RemoteTrigger` | Create/run Routines on claude.ai (`/schedule`) | **outbound** |
 
 **Web-capable, in the sense `native_web_visibility` means it:** `WebFetch` and
-`WebSearch` only. These are the two names in
-`CLAUDE_WEB_DENY_RULES` / `CLAUDE_WEB_TOOL_MATCHER` (`tabs/config.rs`).
+`WebSearch` only. These are the two names in `CLAUDE_WEB_DENY_RULES` /
+`CLAUDE_WEB_TOOL_MATCHER` (`harness/claude/overlay.rs`), and the two rows this
+harness declares as `ToolClass::External` in § 2.2. They are also what it
+publishes as its `web_tools` affordance, so the window can name them without
+knowing which harness it is talking about.
 
 **Web-capable in the sense an attacker means it — and NOT covered by any mode:**
 `Bash`/`PowerShell`/`Monitor` (a one-line `curl` is a complete exfil channel),
@@ -107,6 +119,61 @@ bytes to a remote endpoint without touching `WebFetch`. Decision 14's
 "honest limits" paragraph names the shell case; the upload family is the same
 shape and is called out here so nobody reads `deny` as "no egress". Egress
 containment is V33's problem, not V32's.
+
+### 2.2 What cImp's plugin declares — `HarnessPlugin::native_tools()`
+
+**This table is `harness/claude/tools.rs::CLAUDE_NATIVE_TABLE`, row for row and
+in table order.** It is the *only* Claude tool table in this document that is
+pinned to the code; § 2's inventory above is upstream's list and is deliberately
+larger. Core never reads the constant directly — every consumer goes through
+`harness::native::{mutates_fs, memory_kind, class, memory_arg}` with the
+**request's source**, so a name is only ever answered from the vocabulary of the
+harness that sent it, and a source cImp cannot identify is answered from none.
+
+| Tool | `class` | `mutates_fs` | `memory_kind` |
+|---|---|---|---|
+| `Read` | — | `false` | `read` (path arg) |
+| `NotebookRead` | — | `false` | `read` (path arg) |
+| `Edit` | `LocalCapability` | `true` | `edit` (path arg) |
+| `Write` | `LocalCapability` | `true` | `edit` (path arg) |
+| `MultiEdit` | `LocalCapability` | `true` | `edit` (path arg) |
+| `Bash` | `LocalCapability` | `true` | `query` (command arg) |
+| `NotebookEdit` | — | `false` | `edit` (path arg) |
+| `Grep` | — | `false` | `query` (pattern arg) |
+| `Glob` | — | `false` | `query` (pattern arg) |
+| `WebFetch` | `External` | `false` | — |
+| `WebSearch` | `External` | `false` | — |
+
+Argument spellings, from `memory_arg_keys()` and in precedence order: path =
+`file_path`, `notebook_path`; pattern = `pattern`, `path`; command = `command`.
+(`path` is deliberately absent from the path list — no documented Claude tool
+input uses it.)
+
+Three readings the table needs:
+
+* **`class: —` is not "unclassified".** It means cImp makes no gating claim
+  about that name. `Read` is here for its memory kind, not because anything
+  gates it. Contrast § 3.2, where `class: Some(..)` **is** the gate's membership
+  test.
+* **`NotebookEdit` is `mutates_fs: false`, recorded as-is rather than endorsed.**
+  It writes a `.ipynb`, so on the merits it belongs with the four mutating rows —
+  but it has never had a `mutates_fs` row and it is not in the `PreToolUse`
+  matcher, so no call of it has ever reached the checkpoint route. V40 Phase A
+  was a verbatim move and did not change it; widening the matcher and this flag
+  **together** is the edit that would.
+* **The mutating set is exactly the matcher.** `Edit`, `Write`, `MultiEdit`,
+  `Bash` — the four names in `CLAUDE_MUTATING_TOOL_MATCHER`, pinned in that
+  direction by
+  `overlay::tests::every_matched_claude_tool_is_classified_as_mutating`: a
+  matched name with no `mutates_fs: true` row would hold every one of its calls
+  waiting for a checkpoint core then declines to take.
+* **Undeclared ⇒ fails closed, but only for an identified harness's *caller*.**
+  `harness::native::mutates_fs(None, ..)` — an unidentified source — answers
+  `true` for every name, and `memory_kind` answers `None`. Within a harness, a
+  name with no row answers `true` for `mutates_fs` as well. Ids deliberately
+  absent: `Task` / `TodoWrite` (orchestration and bookkeeping), and every
+  `mcp__*` id, which is a **proxied** name cImp classifies in its own vocabulary
+  through `offload::toolclass`.
 
 ### `WebFetch` behavior that matters for the gap analysis
 
@@ -151,6 +218,9 @@ containment is V33's problem, not V32's.
 ---
 
 ## 3. OpenCode native tool surface (1.18.13)
+
+**Upstream inventory, not cImp's table** — same split as § 2. What cImp's plugin
+declares is § 3.2, and only that one is pinned to the code.
 
 Registry ids, from `GET /experimental/tool/ids` (14):
 
@@ -200,6 +270,60 @@ page**, not an answer — no extraction model, though the description notes
 already says: *"if another tool is present that offers better web fetching
 capabilities … prefer using that tool instead of this one"* — which makes a
 proxied `ddg__fetch_content` a natural first choice even in `sensor` mode.
+
+### 3.2 What cImp's plugin declares — `HarnessPlugin::native_tools()`
+
+**This table is `harness/opencode/tools.rs::OPENCODE_NATIVE_TABLE`, row for row
+and in table order** — the pinned twin of § 2.2. Here, unlike Claude's table,
+`class: Some(..)` **is** the gate's membership test: `opencode_native_names
+(class)` and `opencode_native_mutating_names()` are baked into the generated
+plugin's `Set` literals, so the JavaScript that refuses and the table reviewed
+here cannot drift.
+
+| Tool | `class` | `mutates_fs` | `memory_kind` |
+|---|---|---|---|
+| `bash` | `LocalCapability` | `true` | `query` (command arg) |
+| `read` | `LocalCapability` | `false` | `read` (path arg) |
+| `glob` | `LocalCapability` | `false` | `query` (pattern arg) |
+| `grep` | `LocalCapability` | `false` | `query` (pattern arg) |
+| `edit` | `LocalCapability` | `true` | `edit` (path arg) |
+| `write` | `LocalCapability` | `true` | `edit` (path arg) |
+| `patch` | `LocalCapability` | `true` | `edit` (path arg) |
+| `apply_patch` | `LocalCapability` | `true` | — |
+| `execute` | `LocalCapability` | `true` | — |
+| `lsp` | `LocalCapability` | `false` | — |
+| `webfetch` | `External` | `false` | — |
+| `websearch` | `External` | `false` | — |
+| `list` | — | `false` | `query` (pattern arg) |
+
+Argument spellings, from `memory_arg_keys()` and in precedence order: path =
+`filePath`, `path`; pattern = `pattern`, `path`, `query`; command = `command`.
+
+* **`patch` and `list` are served by no current build.** `apply_patch`
+  superseded `patch`, and `list` went with `todoread`; both are kept because
+  gating (or recording) a name the harness does not serve costs nothing and
+  closes it in advance. `list` carries `class: —`, so it is a memory row only
+  and adds nothing to the gate.
+* **`execute` and `lsp` are experiment-gated upstream** (`OPENCODE_EXPERIMENTAL
+  _CODE_MODE`, `OPENCODE_EXPERIMENTAL_LSP_TOOL`), so `GET /experimental/tool/ids`
+  never lists them and the live probe cannot classify them for us. They are
+  classified here from the source, with the sharper version of the same
+  argument: a user who switches an experiment on must not thereby open an
+  **ungated** execution surface, and the gate is allowlist-only, so the
+  alternative is not "gated later" — it is "never gated".
+* **`OPENCODE_NATIVE_REVIEWED_UNGATED`** is the other half of the record: ids
+  the registry route *does* serve and this table deliberately does **not** gate
+  (`task`, `skill`, `todowrite`, `question`, `invalid`, `plan_exit`), each with
+  its reason. It exists so the live probe can tell *an id nobody has looked at*
+  (unclassified ⇒ a failure, because the table is allowlist-only so it ships
+  ungated) from *an id a human consciously left ungated* (a recorded decision,
+  which must not turn the probe permanently red). Adding a row there IS a
+  security decision and belongs in review, exactly like adding one to the table.
+
+**Two vocabularies, never crossed.** `edit` is unknown in Claude's table and
+`Edit` is unknown in this one, asserted by
+`claude::tools::tests::claudes_ids_are_not_opencodes`: a crossed lookup would
+disable one whole harness's seam while every test of the other stayed green.
 
 ---
 
@@ -379,22 +503,37 @@ file/shell tools "remain completely ungated in every mode" and that gating them
 was unscheduled Phase E. Phase H shipped the OpenCode half (`f5fb221`), so the
 two harnesses now differ and the difference is the whole point of this section:
 
-**Claude:** `Read`/`Write`/`Edit`/`Bash`/`Glob`/`Grep`/`LSP`/`Monitor` are
-**ungated in every mode**, unchanged. E1 (Claude-side `PreToolUse` gating) has
-still not had its latency spike and is still deferred by locked decision 17.
-Phase F's sensor hook is matched on web tools only, so it levies no per-call tax
-on `Read`/`Grep`/`Bash` and does not need E1.
+**Claude:** its local natives — the `LocalCapability` and unclassed rows of
+§ 2.2, plus every id in § 2 that has no row at all — are **ungated in every
+mode**, unchanged. That is a property of the plugin, not of core: the *class*
+column exists for this harness too (`harness::native::class`) and is declared
+but unconsumed, kept so that a future hook which does gate a native tool reads
+its class from the same reviewed place rather than inventing one. E1 (a
+Claude-side `PreToolUse` gate) has still not had its latency spike and is still
+deferred by locked decision 17. The sensor beacon is matched on web tools only,
+so it levies no per-call tax on the local natives and does not need E1.
 
-**OpenCode:** the eight ids in `toolclass.rs::OPENCODE_NATIVE_TABLE` —
-`bash`, `read`, `glob`, `grep`, `edit`, `write`, `patch`, `apply_patch` — are
+**OpenCode:** the **ten** `LocalCapability` ids in § 3.2 — `bash`, `read`,
+`glob`, `grep`, `edit`, `write`, `patch`, `apply_patch`, `execute`, `lsp` — are
 gated as LOCAL-CAPABILITY, and `webfetch`/`websearch` as EXTERNAL, by the
 generated plugin's `tool.execute.before` handler against this tab's latch
-(`POST /latch/state`). Checkable properties:
+(`POST /latch/state`). (`execute` and `lsp` joined the table on 2026-08-17 with
+the experiment-gated ids; `list` is a memory-only row and is **not** gated.)
+Checkable properties:
 
-* **Default OFF.** `Feature::OpencodeNativeGate::default_enabled() == false` —
-  the only V32 control that is; "off" is exactly the pre-V32 behaviour. It is a
-  per-feature (L2) + per-tab (L3) switch in the Phase G hierarchy, and it is
-  **spawn-baked**, so turning it on needs a tab restart.
+* **Default OFF as a per-tab posture.** The control is
+  `Feature::HarnessNativeGate` — renamed from `OpencodeNativeGate` in V40
+  Phase B, keeping the wire key `opencode_native_gate` because that string is in
+  every settings file. It is **harness-scoped**, not app-wide: the harness whose
+  plugin implements the gate declares it through
+  `HarnessPlugin::scoped_features()`, naming the `ext` key on its own settings
+  row that holds the app-wide value, and `every_registry_entry_is_fully_wired`
+  fails the build if that key is not a `Bool` the harness's `settings_schema()`
+  declares. Core derives *is this feature scoped at all?* from that list across
+  the registry, so a feature nobody declares stays app-wide and a feature two
+  harnesses declare reaches both. It is a per-feature (L2) + per-tab (L3) switch
+  in the Phase G hierarchy, **spawn-baked**, so a change needs a tab restart —
+  and each tab opts in from its shield badge.
 * **Allowlist-only, deliberately.** A name absent from that table is UNGATED —
   the `unknown ⇒ EXTERNAL` invariant that governs `TABLE` is wrong for a
   harness registry and would refuse `todowrite`. `task` (sub-agent spawn) is
@@ -405,6 +544,12 @@ generated plugin's `tool.execute.before` handler against this tab's latch
   gating** — block `write`, it uses `bash` — which is why the gate is
   whole-surface; and `OPENCODE_PURE`, an ungated `opencode` binary, user-typed
   `!shell` and the PTY route all walk around it.
+* **A name absent from the table is UNGATED, and an unidentified source is
+  not.** The two defaults point in opposite directions on purpose: within a
+  harness's published, closed set, unknown ⇒ ungated (§ 3.2); across harnesses,
+  `harness::native::mutates_fs(None, ..)` answers `true` for everything, because
+  "not in that harness's table, therefore safe" is exactly the inference that
+  used to answer a third harness's `edit` out of Claude's rows.
 * OS-level containment of the local natives is still **V33**, not V32.
 
 The practical reading is unchanged: the latch protects against a compromised
@@ -416,28 +561,70 @@ default. `deny` narrows the model's easiest route; it does not build a wall.
 
 ## 7. Recommended configurations
 
+**`native_web_visibility` is a CORE setting, and the mode is the whole of it.**
+It lives at `offload.native_web_visibility` as a tri-mode (`off` | `sensor` |
+`deny`) and is resolved per tab through `settings::injection::native_web_mode`
+under `Feature::NativeWeb` — the feature has **no L2 boolean of its own**,
+deliberately, because the mode's `off` already *is* its disabled state and
+storing both would make a contradictory state representable. (One consequence
+worth knowing: an L3 `On` over an app-wide `off` re-enables the feature at its
+default posture, `sensor` — "on" has to mean something, and `deny` would take a
+tool away from one tab because the user disabled the feature everywhere else.)
+
+**What the mode means is core's; how it is enforced is the harness's.** Core
+resolves a mode for a tab and hands it to that tab's plugin at spawn; the plugin
+turns it into whatever its harness understands and declares which of its own
+tool names count as web (`HarnessAffordances::web_tools`, and the
+`ToolClass::External` rows in §§ 2.2 / 3.2). Nothing in core names a permission
+key, a hook matcher or a config path. Every mode is **spawn-baked**: the value
+rides that harness's `spawn_sig`, so a change raises the restart hint, and a
+running tab keeps the posture it launched with.
+
+The three modes, in core's terms:
+
+| Mode | What core asks the plugin for | Enforcement site |
+|---|---|---|
+| `sensor` (default) | *observe every native web call* | in-harness pre-tool signal → `POST /latch/beacon`; never denies |
+| `deny` | *refuse the harness's own web tools* | the harness's own permission mechanism, at spawn |
+| `off` | *nothing* | none — pre-V32 posture |
+
 ### 7.1 Default — `native_web_visibility: sensor`
 
-Keep the natives; cImp watches. A `PreToolUse` hook matched **only** on
-`WebFetch|WebSearch` (Claude, via the `--settings` overlay) and a
-`tool.execute.before` handler in the existing OpenCode plugin POST a beacon to
-the loopback, which engages that tab's EXTERNAL latch and raises the taint
-badge. Hooks never deny; a hook or loopback failure fails **open** and silently
-— sensor mode must never break a tab.
+Keep the natives; cImp watches. The plugin arms a pre-tool signal on **its
+harness's own web tool names** which POSTs a beacon to the loopback; the beacon
+engages that tab's EXTERNAL latch and raises the taint badge. The signal never
+denies, and a signal or loopback failure fails **open** and silently — sensor
+mode must never break a tab.
 
-Use when: the MCP endpoints are not guaranteed up, or the workflow leans on
-`WebFetch`'s in-context summarization. The cost is that native web use is
-*observed*, not *contained*: the page content still lands in the session
+*Per-harness recipe:* Claude arms a `PreToolUse` hook matched **only** on
+`WebFetch|WebSearch` in its `--settings` overlay; OpenCode arms a
+`tool.execute.before` handler in its generated plugin. Both reach the same
+`/latch/beacon` core, and either transport of it behaves identically because
+there is only one core.
+
+Use when: the MCP endpoints are not guaranteed up, or the workflow leans on the
+harness's in-context summarization of a fetch. The cost is that native web use
+is *observed*, not *contained*: the page content still lands in the session
 unenveloped and unscreened. The latch it engages then constrains what the
 session can do with proxied tools afterwards, which is the point.
 
 ### 7.2 Hardened — `native_web_visibility: deny`
 
-Claude gets `permissions.deny: ["WebFetch", "WebSearch"]` in the `--settings`
-overlay; OpenCode gets `permission.webfetch = "deny"` / `permission.websearch =
-"deny"` in the pinned block inside `OPENCODE_CONFIG_CONTENT`. All modes are
-**spawn-baked** — a change needs an AI-tab restart, and `spawn_inject_sig`
-raises the hint.
+Core's statement is *this tab may not reach the network through its harness's
+own tools*; each plugin writes that into the artifact its harness reads, at
+spawn. A harness that has **no** such mechanism cannot express `deny` at all,
+and that is a visible absence rather than a silent downgrade — nothing in core
+substitutes another harness's key.
+
+*Per-harness recipes:* Claude gets `permissions.deny: ["WebFetch", "WebSearch"]`
+in the `--settings` overlay (`CLAUDE_WEB_DENY_RULES` in
+`harness/claude/overlay.rs` — bare tool names, no `allow`/`ask` counterpart).
+OpenCode gets `permission.webfetch = "deny"` / `permission.websearch = "deny"`
+in the pinned block inside `OPENCODE_CONFIG_CONTENT`
+(`harness/opencode/config.rs`), which flips **those two keys and only those
+two**: `bash` and `edit` keep their pinned values in every mode, because
+shell-level egress is V33's problem (a documented honest limit) and taking
+`edit` away would gut the tab.
 
 **Pre-flight — verify each before flipping, in this order:**
 
@@ -456,11 +643,11 @@ raises the hint.
 5. OpenCode only: **nothing to check here in `deny`, corrected 2026-08-09.**
    This step used to say "the plugin is written out … confirm the decoupled
    build is the one running", which is a `sensor`-mode step written into the
-   `deny` checklist. `tabs/config.rs::opencode_plugin_wanted` writes the plugin
-   for `graph.enabled` **or** `native_web_for(..) == Sensor` **or** the Phase H
-   gate — `deny` is deliberately not a disjunct, because the pinned
-   `permission.webfetch/websearch = "deny"` block does that work at spawn and
-   needs no plugin. So under `deny` a tab with the graph off and the Phase H
+   `deny` checklist. `harness/opencode/plugin.rs::opencode_plugin_wanted` writes
+   the plugin for `graph.enabled` **or** `native_web_for(..) == Sensor` **or**
+   the harness native gate — `deny` is deliberately not a disjunct, because the
+   pinned `permission.webfetch/websearch = "deny"` block does that work at spawn
+   and needs no plugin. So under `deny` a tab with the graph off and the Phase H
    gate off correctly has **no plugin file at all**, and its absence is not a
    fault. What Phase F actually decoupled is the *other* direction (turning the
    graph off must not delete a plugin carrying a security handler); that

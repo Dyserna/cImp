@@ -43,14 +43,15 @@ use crate::error::{AppError, AppResult};
 use crate::settings::migration;
 use crate::settings::schema::{
     default_ai_tab, default_events_tab, default_graph_monitor_tab,
-    default_shell_1_tab, default_tool_activity_tab, default_workbench_tab, pricing_rows_since,
+    default_shell_1_tab, default_tool_activity_tab, default_workbench_tab,
     starter_prompt_templates, AiTabId, HarnessVersions, LayoutNodePersisted, LlmPricingModel,
     McpCategory, McpServerConfig, PromptTemplate, RemoteBackendTemplate, ServerCommandTemplate,
     Settings, TabConfig,
-    CLAUDE_LOCAL_TAB_ID, CLAUDE_TAB_ID, CODE_AUDIT_TAB_ID, CODE_QUALITY_TAB_ID, EVENTS_TAB_ID,
-    GRAPH_MONITOR_TAB_ID, GRAPH_VIEW_TAB_ID, OFFLOAD_SERVER_TAB_ID, OPENCODE_TAB_ID,
-    PRICING_GENERATION, SHELL_DEFAULT_TAB_ID, TOOL_ACTIVITY_TAB_ID, WORKBENCH_TAB_ID,
+    CODE_AUDIT_TAB_ID, CODE_QUALITY_TAB_ID, EVENTS_TAB_ID, GRAPH_MONITOR_TAB_ID,
+    GRAPH_VIEW_TAB_ID, OFFLOAD_SERVER_TAB_ID,
+    SHELL_DEFAULT_TAB_ID, TOOL_ACTIVITY_TAB_ID, WORKBENCH_TAB_ID,
 };
+use crate::pricing::{pricing_rows_since, PRICING_GENERATION};
 use crate::settings::write_atomic;
 use crate::shell::ShellSpec;
 
@@ -195,9 +196,17 @@ pub fn load(default_shell: &ShellSpec, launch_cwd: &Path) -> LoadOutcome {
         // key ban, this one SAYS SO. A hand-edited config that sets a binary
         // path per repo is a reasonable thing to try and a silent no-op is how
         // that becomes "cImp ignores my config" an hour later.
+        let mut dropped = strip_overlay_tool_plugins(&mut v);
+        // V40 review M-2: the same structured strip for the per-harness map,
+        // whose scope is per FIELD (see `OVERLAY_BANNED_HARNESS_FIELDS`). Named
+        // in the SAME Events row for the same reason the tool-plugins strip is
+        // named: a hand-edited config that sets one of these per repo is a
+        // reasonable thing to try, and a silent no-op is how that becomes "cImp
+        // ignores my config" an hour later.
+        dropped.extend(strip_overlay_harness(&mut v));
         crate::plugins::events::record_overlay_strip(
             &overlay_path.display().to_string(),
-            &strip_overlay_tool_plugins(&mut v),
+            &dropped,
         );
         v
     });
@@ -250,6 +259,13 @@ pub fn load(default_shell: &ShellSpec, launch_cwd: &Path) -> LoadOutcome {
         }
     };
 
+    // The merged view goes through the same parse boundary (V40 review M-1):
+    // `load_global` normalised the baseline, but a project overlay's
+    // `harness.<id>.ext` values are merged in AFTER that and are just as
+    // hand-editable. Not folded into `repaired` — a normalisation of the merged
+    // value is not a repair of the GLOBAL file, and `load_global` has already
+    // healed that one on disk.
+    settings.normalize_harness_settings();
     let repaired = integrity_check(&mut settings);
 
     // Re-point bundled avatar videos at the loaded theme. Existing installs
@@ -325,6 +341,10 @@ pub fn load_readonly(launch_cwd: &Path) -> Settings {
         // this very file. No Events row — a lightweight subprocess has no lane
         // to speak into, and the app's own `load` already reported it.
         let _ = strip_overlay_tool_plugins(&mut overlay);
+        // V40 review M-2, and NOT optional here either: `expose_commands`
+        // decides whether `run_command` is advertised, and this reader IS the
+        // child that asks.
+        let _ = strip_overlay_harness(&mut overlay);
         // V37 registry, same reason and the SAME asymmetry made explicit: `load`
         // promotes an overlay's servers/categories into the global baseline and
         // then enforces the global arrays over the merged view, so an overlay
@@ -335,7 +355,13 @@ pub fn load_readonly(launch_cwd: &Path) -> Settings {
         let _ = strip_overlay_mcp_registry(&mut overlay);
         deep_merge(&mut merged, overlay);
     }
-    serde_json::from_value(merged).unwrap_or_default()
+    let mut settings: Settings = serde_json::from_value(merged).unwrap_or_default();
+    // V40 review M-1: the same parse boundary, and NOT optional here — the
+    // children this serves read declared `ext` values (`harness_ext_bool` and
+    // friends) to decide what they advertise. No write-back: this reader's whole
+    // contract is that it has no side effects.
+    settings.normalize_harness_settings();
+    settings
 }
 
 /// V14 Phase A: global scope of the prompt-template library, read directly
@@ -388,10 +414,22 @@ fn read_settings_or_default(path: &Path) -> Settings {
     if !path.exists() {
         return Settings::default();
     }
-    fs::read_to_string(path)
+    let mut s: Settings = fs::read_to_string(path)
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    // **THE parse boundary for the harness map** (V40 Phase B, locked decision
+    // 6). Every typed read of a settings file in this module goes through here
+    // — the load path, the out-of-band readers, the read-modify-write helpers —
+    // so a declared `ext` key whose stored value its kind rejects is replaced by
+    // the declared default exactly once, wherever the file was read from.
+    //
+    // Deliberately NOT in `integrity_check`: that runs only on load-from-disk,
+    // and `mutate_global_harness` would then read a hand-edited
+    // `"statusline": "yes"`, write it straight back, and hand the launch path a
+    // string every reader answers `false` for.
+    s.normalize_harness_settings();
+    s
 }
 
 fn write_prompt_templates_to(path: &Path, templates: Vec<PromptTemplate>) -> AppResult<()> {
@@ -411,20 +449,20 @@ fn write_prompt_templates_to(path: &Path, templates: Vec<PromptTemplate>) -> App
 /// that carries the key — even as `[]` — keeps exactly what it has.
 pub fn read_global_llm_pricing() -> Vec<LlmPricingModel> {
     let Ok(path) = global_path() else {
-        return crate::settings::default_llm_pricing();
+        return crate::pricing::default_llm_pricing();
     };
     read_llm_pricing_from(&path)
 }
 
 fn read_llm_pricing_from(path: &Path) -> Vec<LlmPricingModel> {
     if !path.exists() {
-        return crate::settings::default_llm_pricing();
+        return crate::pricing::default_llm_pricing();
     }
     fs::read_to_string(path)
         .ok()
         .and_then(|t| serde_json::from_str::<Settings>(&t).ok())
         .map(|s| s.llm_pricing)
-        .unwrap_or_else(crate::settings::default_llm_pricing)
+        .unwrap_or_else(crate::pricing::default_llm_pricing)
 }
 
 /// Write the LLM price table straight to the physical global file, bypassing
@@ -449,7 +487,9 @@ fn write_llm_pricing_to(path: &Path, pricing: Vec<LlmPricingModel>) -> AppResult
 /// shows up through the mtime), otherwise a metadata stat is the entire
 /// cost. In-process writers ([`mutate_global_harness_versions`]) refresh the
 /// cache directly so a same-timestamp write can't serve a stale value.
-static HV_CACHE: std::sync::Mutex<Option<(std::time::SystemTime, HarnessVersions)>> =
+type HarnessMap = std::collections::BTreeMap<String, crate::settings::HarnessSettings>;
+
+static HV_CACHE: std::sync::Mutex<Option<(std::time::SystemTime, HarnessVersions, HarnessMap)>> =
     std::sync::Mutex::new(None);
 
 /// V16 Feature 1: harness version + contract state, read straight from the
@@ -465,78 +505,173 @@ pub fn read_global_harness_versions() -> HarnessVersions {
         return HarnessVersions::default();
     };
     if let Ok(cache) = HV_CACHE.lock() {
-        if let Some((cached_at, hv)) = cache.as_ref() {
+        if let Some((cached_at, hv, _)) = cache.as_ref() {
             if *cached_at == mtime {
                 return hv.clone();
             }
         }
     }
-    let hv = read_settings_or_default(&path).harness_versions;
+    let s = read_settings_or_default(&path);
+    let hv = s.harness_versions;
     if let Ok(mut cache) = HV_CACHE.lock() {
-        *cache = Some((mtime, hv.clone()));
+        *cache = Some((mtime, hv.clone(), s.harness));
     }
     hv
 }
 
-/// Mutate the global `harness_versions` state in place (read-modify-write on
-/// the physical global file, every other field preserved — mirror of
-/// [`write_global_prompt_templates`]). Returns the post-mutation state.
-/// No-ops (no disk write) when the mutation leaves the state unchanged, so
-/// background callers polling a version can call this freely.
-pub fn mutate_global_harness_versions(
-    mutate: impl FnOnce(&mut HarnessVersions),
-) -> AppResult<HarnessVersions> {
+/// V40 Phase B: the per-harness settings map, read straight from the physical
+/// global file — the same out-of-band discipline (and the same cache) as
+/// [`read_global_harness_versions`], and for the same reason: `harness` carries
+/// the version the transcript tap observed and the auto-verify record, both
+/// written by background threads that must never land in a project overlay
+/// diff.
+pub fn read_global_harness_map() -> HarnessMap {
+    let Ok(path) = global_path() else {
+        return crate::settings::default_harness_settings();
+    };
+    let Ok(mtime) = fs::metadata(&path).and_then(|m| m.modified()) else {
+        return crate::settings::default_harness_settings();
+    };
+    if let Ok(cache) = HV_CACHE.lock() {
+        if let Some((cached_at, _, map)) = cache.as_ref() {
+            if *cached_at == mtime {
+                return map.clone();
+            }
+        }
+    }
+    let s = read_settings_or_default(&path);
+    let map = s.harness.clone();
+    if let Ok(mut cache) = HV_CACHE.lock() {
+        *cache = Some((mtime, s.harness_versions, map.clone()));
+    }
+    map
+}
+
+/// The reserved AI tab ids the user has enabled, read straight from the
+/// physical global file (V40 review finding M-2, parity lens).
+///
+/// The out-of-band consumer is the auto-verify worker, which runs on a plain
+/// thread with no `SettingsHandle` and decides whether to spawn a harness's own
+/// CLI to probe it. Deliberately the GLOBAL value rather than a project-merged
+/// one: this answers "does this machine use that harness at all", and a
+/// background probe is not worth reading a project overlay to decide.
+///
+/// Uncached — it is asked at most a handful of times per launch, and the
+/// `HV_CACHE` above is keyed to the two harness structures.
+pub fn read_global_enabled_ai_tabs() -> Vec<crate::settings::AiTabId> {
+    let Ok(path) = global_path() else {
+        return Vec::new();
+    };
+    if !path.exists() {
+        return Vec::new();
+    }
+    read_settings_or_default(&path).enabled_ai_tabs
+}
+
+/// One harness's row out of [`read_global_harness_map`], defaults included.
+///
+/// The read every out-of-band consumer wants: `Settings::harness_settings`
+/// resolves declared defaults for an absent key, and a raw map lookup would
+/// answer `None` where the accessor answers the default.
+pub fn read_global_harness_settings(
+    harness: crate::harness::HarnessId,
+) -> crate::settings::HarnessSettings {
+    let mut probe = crate::settings::Settings::default();
+    probe.harness = read_global_harness_map();
+    probe.harness_settings(harness).clone()
+}
+
+/// Mutate ONE harness's row in the physical global file, out of band.
+///
+/// The `mutate_global_harness_versions` pattern, and it exists for the same
+/// two reasons: these fields are stripped from a project overlay by
+/// [`strip_overlay_harness`] so a Settings save can never carry them, and the
+/// writers here (the version tap, the auto-verify worker, *Mark verified*) run
+/// on background threads where a full `save_settings` would race the user's own
+/// edits. No-op when the mutation
+/// changes nothing, so a change-guarded caller can poll freely.
+pub fn mutate_global_harness(
+    harness: crate::harness::HarnessId,
+    mutate: impl FnOnce(&mut crate::settings::HarnessSettings),
+) -> AppResult<crate::settings::HarnessSettings> {
+    let Some(id) = harness.id() else {
+        return Err(AppError::Settings(
+            "harness settings write for an id no registry claims".to_string(),
+        ));
+    };
     let path = global_path()?;
     let mut settings = read_settings_or_default(&path);
-    let before = settings.harness_versions.clone();
-    mutate(&mut settings.harness_versions);
-    if settings.harness_versions == before {
+    let row = settings
+        .harness
+        .entry(id.to_string())
+        .or_insert_with(|| crate::settings::HarnessSettings::defaults_for(harness));
+    let before = row.clone();
+    mutate(row);
+    if *row == before {
         return Ok(before);
     }
-    let after = settings.harness_versions.clone();
+    let after = row.clone();
+    let map = settings.harness.clone();
+    let hv = settings.harness_versions.clone();
     save_to(&path, &settings)?;
-    // Refresh the read cache under the post-write mtime — never leave it
-    // holding the pre-write value for a same-timestamp write.
     if let Ok(mtime) = fs::metadata(&path).and_then(|m| m.modified()) {
         if let Ok(mut cache) = HV_CACHE.lock() {
-            *cache = Some((mtime, after.clone()));
+            *cache = Some((mtime, hv, map));
         }
     }
     Ok(after)
 }
 
+// `mutate_global_harness_versions` is gone with the five fields it wrote (V40
+// Phase B). Every one of them — the two versions, the verified stamp, the
+// auto-verify record, the input-profile spike — is a `harness[<id>]` row now,
+// written through [`mutate_global_harness`]. What is LEFT on `HarnessVersions`
+// (`e1_status`, `d0_status`) has never had a writer in the app: both are
+// recorded by hand after a manual spike, which is what their docs say, so a
+// writer nothing called was a function pretending there was a path.
+
 /// Record a harness version observation (V16 Feature 1's tripwire input).
-/// `harness` is `"claude"` (from the OOB transcript tap) or `"opencode"`
-/// (from `opencode --version` at tab spawn). Change-guarded — safe to call
-/// once per session/spawn without file churn.
+/// `harness` is a registry id — Claude's comes from the OOB transcript tap,
+/// OpenCode's from `opencode --version` at tab spawn. Change-guarded — safe to
+/// call once per session/spawn without file churn.
 ///
-/// V35 Phase F: a **changed** `claude_last_seen` is also the first of the two
-/// auto-verify triggers (the other is the startup check). It fires from here
-/// rather than from the tap because this is the one place the observation is
-/// actually recorded — a caller-side trigger would miss the hand-edit and
-/// spawn-time paths, and would fire on the no-op re-observations this function
-/// exists to swallow. The call is non-blocking (it spawns a detached worker) so
-/// the tap is never delayed by a probe.
+/// V35 Phase F: a **changed** version is also the first of the two auto-verify
+/// triggers (the other is the startup check). It fires from here rather than
+/// from the tap because this is the one place the observation is actually
+/// recorded — a caller-side trigger would miss the hand-edit and spawn-time
+/// paths, and would fire on the no-op re-observations this function exists to
+/// swallow. The call is non-blocking (it spawns a detached worker) so the tap
+/// is never delayed by a probe.
+///
+/// **V40 Phase B: one write, whatever the harness.** Phase A had already made
+/// the DISPATCH registry-driven; what remained was a two-arm `match id` over
+/// `claude_last_seen` / `opencode_last_seen` — a field pair with only one
+/// half wired to the auto-verify trigger, so OpenCode's version moving recorded
+/// a string and did nothing else. Both halves are `harness[<id>].last_seen`
+/// now, and the trigger fires for whichever harness changed.
 pub fn note_harness_version(harness: &str, version: &str) {
     let version = version.trim();
     if version.is_empty() {
         return;
     }
-    let mut claude_changed = false;
-    let res = mutate_global_harness_versions(|hv| match harness {
-        "claude" => {
-            claude_changed = hv.claude_last_seen != version;
-            hv.claude_last_seen = version.to_string();
-        }
-        "opencode" => hv.opencode_last_seen = version.to_string(),
-        _ => {}
+    // A version note for a harness nobody registered is dropped, loudly enough
+    // to find in a log rather than landing on a `_ => {}` that reads like an
+    // intentional no-op.
+    let Some(id) = crate::harness::HarnessId::from_id(harness) else {
+        tracing::debug!(harness, "version note for an unregistered harness; dropped");
+        return;
+    };
+    let mut changed = false;
+    let res = mutate_global_harness(id, |row| {
+        changed = row.last_seen != version;
+        row.last_seen = version.to_string();
     });
     if let Err(e) = res {
         tracing::warn!("failed to record {harness} version {version}: {e}");
         return;
     }
-    if claude_changed {
-        crate::harness::verify::on_claude_version_changed();
+    if changed {
+        crate::harness::verify::on_version_changed(id);
     }
 }
 
@@ -650,15 +785,25 @@ fn load_global(default_shell: &ShellSpec) -> Settings {
     // price table lives, so the top-up has to run here rather than against the
     // merged per-project `Settings`.
     let priced = top_up_llm_pricing_if_needed(&mut typed);
+    // **THE parse boundary for the harness map, on the LOAD path** (V40 review
+    // finding M-1). `read_settings_or_default`'s doc claimed every typed read in
+    // this module went through it; this one did not, so a hand-edited
+    // `"statusline": "yes"` reached the launch path as a string the accessors
+    // answer with the DECLARED DEFAULT (`true`) while the Settings window's
+    // `value === true` rendered it OFF — the UI saying one thing and the spawn
+    // doing the other, which is precisely the divergence `SettingKind::accepts`
+    // exists to prevent. Folded into the write-back below so the repair is
+    // durable rather than re-derived (and re-warned) on every launch.
+    let normalized = typed.normalize_harness_settings();
 
-    if migrated || seeded || priced {
+    if migrated || seeded || priced || normalized {
         // Persist the migrated/seeded shape back to disk so future launches
         // don't re-migrate or re-seed. Atomic write inside save_to keeps
         // this safe under crash.
         if let Err(e) = save_to(&path, &typed) {
             tracing::warn!(error = %e, path = %path.display(), "settings: post-migration/seed global save failed");
         } else {
-            tracing::info!(path = %path.display(), migrated, seeded, "settings: global migrated/seeded and rewritten");
+            tracing::info!(path = %path.display(), migrated, seeded, normalized, "settings: global migrated/seeded and rewritten");
         }
     } else {
         tracing::info!(path = %path.display(), "settings: global loaded");
@@ -756,6 +901,17 @@ fn read_overlay(path: &Path, quarantine: bool) -> Option<Value> {
 /// is sufficient alone: banning the key still leaves a compromised *global*
 /// file able to name `~/.ssh`, and screening paths still leaves
 /// `sandbox.enabled` flippable.
+// V40 Phase B added `harness` to this list and the review (finding M-2) took it
+// back out. `harness` **cannot** be banned wholesale, for the same reason
+// `tool_plugins` cannot: its scope is per FIELD, not per container. Five of the
+// settings that moved into it were per-project on develop
+// (`statusline.enabled`, `claude_local.*`, `code_audit.expose_<id>`,
+// `offload.opencode_provider{,_auto}`,
+// `offload.injection.opencode_native_gate_enabled`), and banning the container
+// silently narrowed all five to machine scope — a scope change hiding inside a
+// refactor, with the first post-upgrade save erasing the project's values and
+// no trace anywhere. The machine-scope half gets [`strip_overlay_harness`]
+// instead, which names what it drops.
 const OVERLAY_BANNED_KEYS: &[&str] = &["llm_pricing", "harness_versions", "sandbox"];
 
 fn strip_overlay_banned(v: &mut Value) {
@@ -1167,6 +1323,93 @@ fn strip_overlay_tool_plugins(v: &mut Value) -> Vec<String> {
     dropped
 }
 
+/// The fields of a `harness.<id>` row that a project overlay may **not** carry
+/// (V40 review finding M-2).
+///
+/// Two different reasons, both machine scope:
+///
+/// * `last_seen` / `last_verified` / `auto_verify` are written OUT OF BAND by
+///   the transcript tap and the auto-verify worker (`mutate_global_harness`), so
+///   a Settings save carrying a window-open snapshot of them would stomp a newer
+///   observation — the `prompt_templates` stale-snapshot defect in a different
+///   field. `input_profile_status` is the recorded outcome of a manual spike
+///   against the CLI *installed on this machine*, in the same family.
+/// * `expose_commands` decides whether `run_command` is advertised to a
+///   harness — a capability grant, and it was already machine scope before V40
+///   (as `tool_plugins.expose_commands_<id>`, stripped by
+///   [`strip_overlay_tool_plugins`]). A project config file lives inside the
+///   sandbox boundary a confined tool can write to; a boundary a confined
+///   process can widen is not a boundary.
+///
+/// Everything else in the row — `expose_code_audit` and the plugin `ext`
+/// block — is per-project, exactly as its pre-V40 spelling was
+/// (`code_audit.expose_<id>`, `statusline.enabled`, `claude_local.*`,
+/// `offload.opencode_provider{,_auto}`,
+/// `offload.injection.opencode_native_gate_enabled`).
+const OVERLAY_BANNED_HARNESS_FIELDS: &[&str] = &[
+    "last_seen",
+    "last_verified",
+    "auto_verify",
+    "input_profile_status",
+    "expose_commands",
+];
+
+/// Remove the machine-scope fields of every `harness.<id>` row from an overlay
+/// value, returning the dotted names of what was dropped (empty ⇒ the overlay
+/// was already clean).
+///
+/// A deny-list, not an allow-list, and deliberately so — the opposite of
+/// [`strip_overlay_tool_plugins`]. The default answer for a `harness` row is
+/// "the project may set this": each harness plugin declares its own `ext` keys,
+/// so an allow-list here would be a second copy of every plugin's settings
+/// schema, and a newly declared field would silently stop being project-settable
+/// until someone remembered to add it. The five fields that are NOT the
+/// project's are enumerable and stable; see [`OVERLAY_BANNED_HARNESS_FIELDS`].
+///
+/// **Shape is part of it**, the one thing shared with the tool-plugins strip: a
+/// non-object `harness`, or a non-object row inside it, is removed and reported
+/// rather than walked past — `deep_merge` scalar-overwrites, and a scalar
+/// dropped onto a row would delete the whole subtree under it on the way to a
+/// lenient reader that then falls back to defaults.
+fn strip_overlay_harness(v: &mut Value) -> Vec<String> {
+    let mut dropped: Vec<String> = Vec::new();
+    let Some(root) = v.as_object_mut() else {
+        return dropped;
+    };
+    if root.get("harness").is_none() {
+        return dropped;
+    }
+    if remove_if_not_a_map(root, "harness") {
+        dropped.push("harness".to_string());
+        return dropped;
+    }
+    let Some(rows) = root.get_mut("harness").and_then(Value::as_object_mut) else {
+        return dropped;
+    };
+    for key in non_map_keys(rows) {
+        rows.remove(&key);
+        dropped.push(format!("harness.{key}"));
+    }
+    for (id, row) in rows.iter_mut() {
+        // Every survivor of `non_map_keys` is an object.
+        let Some(obj) = row.as_object_mut() else {
+            continue;
+        };
+        for field in OVERLAY_BANNED_HARNESS_FIELDS {
+            if obj.remove(*field).is_some() {
+                dropped.push(format!("harness.{id}.{field}"));
+            }
+        }
+    }
+    // Rows (and a container) reduced to `{}` contribute nothing to a merge and
+    // only noise to a diff; drop the husks.
+    rows.retain(|_, row| !row.as_object().is_some_and(serde_json::Map::is_empty));
+    if rows.is_empty() {
+        root.remove("harness");
+    }
+    dropped
+}
+
 /// The keys of `obj` whose value is not a JSON object — the shape half of the
 /// allow-list, collected up front for the same borrow reason as
 /// [`keys_other_than`].
@@ -1211,6 +1454,50 @@ fn keys_other_than(obj: &serde_json::Map<String, Value>, keep: &[&str]) -> Vec<S
 /// "machine scope" means for a plugin the user has only just configured — but
 /// nothing is ever removed here: a plugin whose file is temporarily missing must
 /// keep its state (see [`crate::settings::ToolPluginsSettings`]).
+/// Write the MACHINE-SCOPE half of the live per-harness map through to the
+/// physical global file — the same fields [`strip_overlay_harness`] keeps out of
+/// a project overlay, and for the same reasons. This is the only place they can
+/// land, so the two lists have to agree; `the_two_halves_of_harness_scope_agree`
+/// asserts they do.
+///
+/// Of the five, three are **excluded here too**: `last_seen`, `last_verified`
+/// and `auto_verify` are written out of band, and the Settings window holds a
+/// snapshot taken when it opened. Copying the snapshot's copy of those would be
+/// a Settings save silently reverting a version observation — the
+/// `prompt_templates` stale-snapshot defect (V14 review, HIGH/data loss) in a
+/// different field. They have their own writer, [`mutate_global_harness`].
+///
+/// `expose_code_audit` and the plugin `ext` block are NOT copied: they are the
+/// project's (V40 review M-2), so they ride [`save`]'s overlay diff exactly as
+/// their pre-V40 spellings did. Rows for harnesses this build does not know are
+/// left exactly as the disk has them.
+fn sync_harness_into(disk_global: &mut Settings, current: &Settings) -> bool {
+    let mut changed = false;
+    for (id, live) in &current.harness {
+        let Some(harness) = crate::harness::HarnessId::from_id(id) else {
+            // An unregistered id in the live map came from the disk file in the
+            // first place (nothing else can create one) and is already there.
+            continue;
+        };
+        let disk = disk_global
+            .harness
+            .entry(id.clone())
+            .or_insert_with(|| {
+                changed = true;
+                crate::settings::HarnessSettings::defaults_for(harness)
+            });
+        if disk.expose_commands != live.expose_commands {
+            disk.expose_commands = live.expose_commands;
+            changed = true;
+        }
+        if disk.input_profile_status != live.input_profile_status {
+            disk.input_profile_status = live.input_profile_status.clone();
+            changed = true;
+        }
+    }
+    changed
+}
+
 fn sync_tool_plugin_state_into(disk_global: &mut Settings, current: &Settings) -> bool {
     let mut changed = false;
     let cur = &current.tool_plugins;
@@ -1222,19 +1509,11 @@ fn sync_tool_plugin_state_into(disk_global: &mut Settings, current: &Settings) -
         disk_global.tool_plugins.project_paths = cur.project_paths.clone();
         changed = true;
     }
-    // V38 F-3: the two `command`-kind exposure switches. Machine scope like the
-    // enables above, so this is the ONLY place a UI toggle of them can land —
-    // the overlay strip (an allow-list) drops them from a project diff, and
-    // without this line the checkbox would flip in memory and be gone on the
-    // next launch.
-    if disk_global.tool_plugins.expose_commands_claude != cur.expose_commands_claude {
-        disk_global.tool_plugins.expose_commands_claude = cur.expose_commands_claude;
-        changed = true;
-    }
-    if disk_global.tool_plugins.expose_commands_opencode != cur.expose_commands_opencode {
-        disk_global.tool_plugins.expose_commands_opencode = cur.expose_commands_opencode;
-        changed = true;
-    }
+    // V38 F-3's two `command`-kind exposure switches used to be synced here.
+    // They are `harness[<id>].expose_commands` since V40 Phase B and ride
+    // `sync_harness_into` — still machine scope, still the only place a UI
+    // toggle of them can land, and now one loop over the registry instead of
+    // two named fields.
     for (plugin_key, live) in &cur.plugins {
         let disk = disk_global
             .tool_plugins
@@ -1489,7 +1768,16 @@ pub fn save(settings: &Settings, launch_cwd: &Path, global: &Settings) -> AppRes
             // `variables`/`parameters`, so this is the only place the rest can
             // land — see the block comment above `strip_overlay_tool_plugins`.
             let plugins_changed = sync_tool_plugin_state_into(&mut disk, settings);
-            if templates_changed || registry_changed || sandbox_changed || plugins_changed {
+            // V40 Phase B: the machine-scope half of the per-harness map.
+            // Stripped from overlays (`strip_overlay_harness`), so the global
+            // file is the ONLY place those fields can land.
+            let harness_changed = sync_harness_into(&mut disk, settings);
+            if templates_changed
+                || registry_changed
+                || sandbox_changed
+                || plugins_changed
+                || harness_changed
+            {
                 if let Err(e) = save_to(&gpath, &disk) {
                     tracing::warn!(error = %e, "settings: machine-scope global write-through failed");
                 }
@@ -1512,6 +1800,12 @@ pub fn save(settings: &Settings, launch_cwd: &Path, global: &Settings) -> AppRes
     // about; the load path is where a warning belongs.
     let _ = strip_overlay_tool_plugins(&mut current);
     let _ = strip_overlay_tool_plugins(&mut baseline);
+    // V40 review M-2: both sides, identically — what remains under `harness` on
+    // either side is only the project-settable half, so the diff can express a
+    // project's `ext` overrides and nothing else. `sync_harness_into` above is
+    // the only place the machine-scope half can land.
+    let _ = strip_overlay_harness(&mut current);
+    let _ = strip_overlay_harness(&mut baseline);
     strip_mcp_registry(&mut current);
     strip_mcp_registry(&mut baseline);
 
@@ -1840,7 +2134,7 @@ fn restore_enabled_ai_builtins(settings: &mut Settings) -> bool {
     // Iterate in canonical order (claude → claude-local → opencode) so
     // successive insertions land in the right relative
     // slot regardless of the user's `enabled_ai_tabs` ordering.
-    let order = [AiTabId::Claude, AiTabId::ClaudeLocal, AiTabId::OpenCode];
+    let order = crate::settings::canonical_ai_tab_order();
     let mut changed = false;
     for &id in &order {
         if !settings.enabled_ai_tabs.contains(&id) {
@@ -2071,11 +2365,17 @@ pub fn reconcile_reserved_tabs(settings: &mut Settings) -> bool {
     changed
 }
 
-/// All three reserved AI tab ids. Used by the integrity check's "is this
-/// id one of our reserved AI builtins?" loops; a single source of truth
-/// keeps the `ai_builtins` membership check, the `use_local_provider`
-/// expectation table, and the drop-disabled-tab pass in sync.
-const AI_BUILTIN_IDS: [&str; 3] = [CLAUDE_TAB_ID, CLAUDE_LOCAL_TAB_ID, OPENCODE_TAB_ID];
+/// Every reserved AI tab id — **a view over the registry**, not a list.
+///
+/// Used by the integrity check's "is this id one of our reserved AI builtins?"
+/// loops. V40 Phase B replaced `const AI_BUILTIN_IDS: [&str; 3]`: the fixed
+/// arity was the defect, not the literals. A harness registering a tab id
+/// would have left it outside the membership check — so its tab would never be
+/// forced `builtin: true`, never be restored at its canonical position, and
+/// never be dropped when disabled, all silently.
+fn ai_builtin_ids() -> Vec<&'static str> {
+    crate::harness::registry::canonical_tab_ids()
+}
 
 /// Reconcile the `tabs` array with `enabled_ai_tabs`. Every enabled AI
 /// id is forced present and marked `builtin: true`; every reserved AI
@@ -2097,17 +2397,31 @@ const AI_BUILTIN_IDS: [&str; 3] = [CLAUDE_TAB_ID, CLAUDE_LOCAL_TAB_ID, OPENCODE_
 pub fn integrity_check(settings: &mut Settings) -> bool {
     let mut changed = false;
 
-    // 0. Empty enabled_ai_tabs is invalid — repair to [claude].
+    // 0. Empty enabled_ai_tabs is invalid — repair to the FIRST REGISTERED
+    //    harness's first built-in tab. V40 Phase B replaced a literal
+    //    `[AiTabId::Claude]`, which made ONE harness load-bearing for the app
+    //    booting at all; Phase E replaced `DEFAULT_HARNESS` with the registry's
+    //    own order, because that constant is a wire-compatibility promise about
+    //    identity-less loopback bodies (locked decision 22) and not an answer to
+    //    "which tab should this install boot with".
     if settings.enabled_ai_tabs.is_empty() {
-        settings.enabled_ai_tabs = vec![AiTabId::Claude];
+        let fallback = crate::harness::registry::HARNESSES
+            .first()
+            .and_then(|d| d.tab_ids.first())
+            .and_then(|id| AiTabId::from_id(id))
+            .unwrap_or(AiTabId::Claude);
+        settings.enabled_ai_tabs = vec![fallback];
         changed = true;
-        tracing::warn!("integrity: enabled_ai_tabs was empty; reset to [claude]");
+        tracing::warn!(
+            tab = fallback.as_str(),
+            "integrity: enabled_ai_tabs was empty; reset to the default harness's tab"
+        );
     }
 
     // 1. Force builtin: true on every reserved AI id if it exists with
     //    builtin: false. Defends against hand-edits trying to flip the flag.
     for tab in settings.tabs.iter_mut() {
-        if AI_BUILTIN_IDS.contains(&tab.id()) && !tab.builtin() {
+        if ai_builtin_ids().contains(&tab.id()) && !tab.builtin() {
             tab.set_builtin(true);
             changed = true;
             tracing::warn!(
@@ -2296,6 +2610,7 @@ fn leftmost_pane_id(node: &LayoutNodePersisted) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::schema::{CLAUDE_LOCAL_TAB_ID, CLAUDE_TAB_ID, OPENCODE_TAB_ID};
     use std::path::PathBuf;
 
     fn fake_default_shell() -> ShellSpec {
@@ -3653,6 +3968,276 @@ mod tests {
         assert_eq!(clean, serde_json::json!({ "ui": { "theme": "tui" } }));
     }
 
+    /// **Every reader of a settings file runs the harness parse boundary**
+    /// (V40 review finding M-1).
+    ///
+    /// `read_settings_or_default`'s doc comment claimed it already — "the load
+    /// path, the out-of-band readers, the read-modify-write helpers" — and the
+    /// load path was the one that did not. `load_global` parsed straight to
+    /// `Settings`, `load` parsed the merged value, and `load_readonly` (the
+    /// `cimp --offload-mcp` child) did the same. A hand-edited
+    /// `harness.claude.ext.statusline = "yes"` therefore reached the launch path
+    /// as a string the accessors answer with the DECLARED DEFAULT while the
+    /// Settings window rendered the checkbox OFF: the UI saying one thing and
+    /// the spawn doing the other, which is the divergence `SettingKind::accepts`
+    /// exists to prevent.
+    ///
+    /// Structural because there is no way to reach `load_global` from a unit
+    /// test without writing next to the test binary; the normaliser's own
+    /// behaviour is covered in `settings::schema`. Newline-agnostic: CI checks
+    /// this tree out with CRLF.
+    #[test]
+    fn every_settings_reader_runs_the_harness_parse_boundary() {
+        let src = include_str!("persistence.rs");
+        for sig in [
+            "fn load_global(",
+            "pub fn load(",
+            "pub fn load_readonly(",
+            "fn read_settings_or_default(",
+        ] {
+            let start = src
+                .find(sig)
+                .unwrap_or_else(|| panic!("`{sig}` is gone — re-point this test"));
+            let body = &src[start..];
+            let body = &body[..body.find("\n}").unwrap_or(body.len())];
+            assert!(
+                body.contains("normalize_harness_settings"),
+                "`{sig}` must run the harness parse boundary: a declared `ext` key whose stored \
+                 value its kind rejects has to be repaired wherever the file was read from, or \
+                 the Settings window and the spawn path answer differently"
+            );
+        }
+    }
+
+    /// The behavioural half: a PROJECT overlay's `ext` values go through the
+    /// boundary too, because they are merged in after `load_global` healed the
+    /// baseline. Mirrors `load`'s own steps (serialize global -> strip -> merge
+    /// -> typed parse -> normalize).
+    #[test]
+    fn a_project_overlay_ext_value_its_kind_rejects_is_reset_to_the_declared_default() {
+        let claude = crate::harness::DEFAULT_HARNESS
+            .id()
+            .expect("DEFAULT_HARNESS is registered");
+        let mut global = Settings::default();
+        global.normalize_harness_settings();
+        // A declared bool key, to prove the boundary reaches the merged value.
+        let declared = crate::harness::DEFAULT_HARNESS
+            .descriptor()
+            .expect("a registered id has a descriptor")
+            .plugin
+            .settings_schema()
+            .iter()
+            .find(|f| matches!(f.kind, crate::harness::plugin::SettingKind::Bool))
+            .map(|f| f.key)
+            .expect("the default harness declares at least one bool setting");
+
+        let mut merged = serde_json::to_value(&global).unwrap();
+        let mut overlay = serde_json::json!({
+            "harness": { claude: { "ext": {
+                declared: "yes",
+                "a.key.from.a.newer.build": { "keep": true }
+            } } }
+        });
+        strip_overlay_banned(&mut overlay);
+        let _ = strip_overlay_harness(&mut overlay);
+        deep_merge(&mut merged, overlay);
+
+        let mut settings: Settings = serde_json::from_value(merged).unwrap();
+        assert_eq!(
+            settings.harness[claude].ext.get(declared).and_then(Value::as_str),
+            Some("yes"),
+            "precondition: the un-normalised merge really does carry the bad value"
+        );
+        assert!(settings.normalize_harness_settings());
+        assert_eq!(
+            settings.harness[claude].ext.get(declared),
+            global.harness[claude].ext.get(declared),
+            "a value the declared kind rejects is reset to the declared default"
+        );
+        // An UNDECLARED key still rides through untouched — a key a newer cImp
+        // declares must survive a downgrade.
+        assert_eq!(
+            settings.harness[claude].ext.get("a.key.from.a.newer.build"),
+            Some(&serde_json::json!({ "keep": true }))
+        );
+    }
+
+    /// V40 review M-2: `harness` splits INSIDE the block too, and V40 Phase B
+    /// banned the whole container.
+    ///
+    /// Five settings that were per-project on develop moved into it —
+    /// `statusline.enabled`, `claude_local.*`, `code_audit.expose_<id>`,
+    /// `offload.opencode_provider{,_auto}` and
+    /// `offload.injection.opencode_native_gate_enabled`. The ban narrowed all
+    /// five to machine scope silently: a project's values became unknown keys at
+    /// the first post-upgrade launch and the first post-upgrade save deleted
+    /// them, with no Events row and no warning. This pins the split as it now
+    /// is: the row's out-of-band fields and the `run_command` capability grant
+    /// are the machine's; `expose_code_audit` and the plugin `ext` block are the
+    /// project's.
+    #[test]
+    fn a_project_overlay_carries_the_harness_ext_and_not_the_machine_half() {
+        let mut hostile: Value = serde_json::json!({
+            "harness": {
+                "claude": {
+                    "expose_commands": true,
+                    "expose_code_audit": false,
+                    "last_seen": "9.9.9",
+                    "last_verified": "9.9.9",
+                    "auto_verify": { "at": "2026-01-01T00:00:00Z" },
+                    "input_profile_status": "pass",
+                    "ext": { "statusline": false, "local.base_url": "http://myproxy:9000" }
+                },
+                "opencode": { "last_seen": "1.2.3" },
+                "scalar": 7
+            },
+            "checks_allow_remote_worker": true
+        });
+        let dropped = strip_overlay_harness(&mut hostile);
+
+        assert_eq!(
+            hostile,
+            serde_json::json!({
+                "harness": { "claude": {
+                    "expose_code_audit": false,
+                    "ext": { "statusline": false, "local.base_url": "http://myproxy:9000" }
+                } },
+                "checks_allow_remote_worker": true
+            }),
+            "only the project-scope half of a harness row may survive"
+        );
+        for expected in [
+            "harness.scalar",
+            "harness.claude.expose_commands",
+            "harness.claude.last_seen",
+            "harness.claude.last_verified",
+            "harness.claude.auto_verify",
+            "harness.claude.input_profile_status",
+            "harness.opencode.last_seen",
+        ] {
+            assert!(
+                dropped.contains(&expected.to_string()),
+                "`{expected}` was dropped but not reported: {dropped:?}"
+            );
+        }
+
+        // A clean overlay says nothing at all — no row, no noise.
+        let mut clean: Value = serde_json::json!({ "ui": { "theme": "tui" } });
+        assert!(strip_overlay_harness(&mut clean).is_empty());
+        assert_eq!(clean, serde_json::json!({ "ui": { "theme": "tui" } }));
+    }
+
+    /// The other half of M-2, end to end: a project's `harness.<id>.ext` value
+    /// reaches the merged settings, WINS over the machine baseline, and is still
+    /// there after a save — which is what "per-project, exactly as on develop"
+    /// has to mean for `statusline.enabled` and `claude_local.*`.
+    #[test]
+    fn a_project_overlay_harness_ext_value_wins_and_survives_a_save() {
+        let _shell = fake_default_shell();
+        let mut global = Settings::default();
+        integrity_check(&mut global);
+        let claude = crate::harness::DEFAULT_HARNESS
+            .id()
+            .expect("DEFAULT_HARNESS is registered");
+
+        let dir = std::env::temp_dir().join(format!("cimp_v40_m2_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+
+        let mut customized = global.clone();
+        {
+            let row = customized
+                .harness
+                .entry(claude.to_string())
+                .or_insert_with(|| {
+                    crate::settings::HarnessSettings::defaults_for(
+                        crate::harness::DEFAULT_HARNESS,
+                    )
+                });
+            row.ext.insert("statusline".to_string(), Value::Bool(false));
+            row.ext.insert(
+                "local.base_url".to_string(),
+                Value::String("http://myproxy:9000".into()),
+            );
+            // Machine scope: must NOT reach the overlay.
+            row.expose_commands = !row.expose_commands;
+            row.input_profile_status = "pass".to_string();
+            row.last_seen = "9.9.9".to_string();
+        }
+        save(&customized, &dir, &global).unwrap();
+
+        let text = fs::read_to_string(custom_path(&dir)).unwrap();
+        let overlay: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            overlay,
+            serde_json::json!({ "harness": { claude: { "ext": {
+                "statusline": false,
+                "local.base_url": "http://myproxy:9000"
+            } } } }),
+            "overlay: {text}"
+        );
+
+        // Merge it back the way `load` does, and the project's values win.
+        let mut merged = serde_json::to_value(&global).unwrap();
+        let mut ov = read_overlay(&custom_path(&dir), false).expect("the overlay parses");
+        strip_overlay_banned(&mut ov);
+        let _ = strip_overlay_harness(&mut ov);
+        deep_merge(&mut merged, ov);
+        let reloaded: Settings = serde_json::from_value(merged).unwrap();
+        let row = &reloaded.harness[claude];
+        assert_eq!(row.ext.get("statusline"), Some(&Value::Bool(false)));
+        assert_eq!(
+            row.ext.get("local.base_url").and_then(Value::as_str),
+            Some("http://myproxy:9000")
+        );
+        // …and the machine half came from the baseline, not the project.
+        assert_eq!(row.expose_commands, global.harness[claude].expose_commands);
+        assert_eq!(row.last_seen, global.harness[claude].last_seen);
+
+        // Saving the reloaded state again is idempotent: the same overlay.
+        save(&reloaded, &dir, &global).unwrap();
+        let again = fs::read_to_string(custom_path(&dir)).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&again).unwrap(),
+            overlay,
+            "a second save must not lose the project's `ext` values"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The strip and the write-through are two halves of ONE scope decision, in
+    /// two functions, and a field that fell out of both would be unsavable —
+    /// edited in the Settings window, kept out of the overlay, never written to
+    /// the global file. Every field `sync_harness_into` copies must therefore be
+    /// one the overlay strip removes, and nothing project-scoped may ride it.
+    #[test]
+    fn the_two_halves_of_harness_scope_agree() {
+        let src = include_str!("persistence.rs");
+        let start = src
+            .find("fn sync_harness_into(")
+            .expect("`sync_harness_into` is gone — re-point this test");
+        let body = &src[start..];
+        let body = &body[..body.find("\n}").unwrap_or(body.len())];
+        for field in OVERLAY_BANNED_HARNESS_FIELDS {
+            let written = body.contains(&format!("disk.{field} ="));
+            // The out-of-band three have their own writer (`mutate_global_harness`).
+            let out_of_band = ["last_seen", "last_verified", "auto_verify"].contains(field);
+            assert!(
+                written || out_of_band,
+                "`{field}` is stripped from overlays and not written through, so a Settings \
+                 edit of it would have nowhere to land. Either give it a write-through or take \
+                 it out of `OVERLAY_BANNED_HARNESS_FIELDS`."
+            );
+        }
+        for field in ["expose_code_audit", "ext"] {
+            assert!(
+                !body.contains(&format!("disk.{field} =")),
+                "`{field}` is the project's (V40 review M-2) and must ride the overlay diff, \
+                 not the machine-scope write-through"
+            );
+        }
+    }
+
     /// **The two settings readers must strip the overlay the same way**
     /// (V38 Phase D).
     ///
@@ -3686,13 +4271,18 @@ mod tests {
                 "pub fn load(",
                 &[
                     "strip_overlay_tool_plugins",
+                    "strip_overlay_harness",
                     "promote_overlay_mcp_registry",
                     "enforce_global_mcp_registry",
                 ],
             ),
             (
                 "pub fn load_readonly(",
-                &["strip_overlay_tool_plugins", "strip_overlay_mcp_registry"],
+                &[
+                    "strip_overlay_tool_plugins",
+                    "strip_overlay_harness",
+                    "strip_overlay_mcp_registry",
+                ],
             ),
         ];
         for (sig, needles) in required {
@@ -4360,7 +4950,7 @@ mod tests {
 
         // A missing file reads as the seeded defaults, never empty.
         let seeded = read_llm_pricing_from(&path);
-        assert_eq!(seeded, crate::settings::default_llm_pricing());
+        assert_eq!(seeded, crate::pricing::default_llm_pricing());
         assert!(!seeded.is_empty());
 
         let pricing = vec![LlmPricingModel {

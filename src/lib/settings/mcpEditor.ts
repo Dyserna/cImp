@@ -208,9 +208,11 @@ export function newServer(servers: McpServerConfig[]): McpServerConfig {
     args: [],
     env: {},
     url: '',
-    claude_access: false,
+    // V40 Phase B: an empty map, not a pair of `false`s. A new server reaches
+    // no harness until the user ticks one, and the map is keyed by registry id
+    // so a harness added later needs nothing here.
+    access: {},
     offload_access: true,
-    opencode_access: false,
     auth_token: '',
     origin: 'external',
     enabled: true,

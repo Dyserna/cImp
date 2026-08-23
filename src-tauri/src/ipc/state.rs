@@ -30,7 +30,7 @@ pub struct AppState {
     pub speak_session: SpeakSession,
     /// Set by `tts_stop` (Esc) to drop the rest of the current AI-output
     /// burst's tagged TTS; cleared by the state manager on the next
-    /// `ClaudeOutputStarted`. See [`crate::tts::AiTtsSuppressed`].
+    /// `HarnessOutputStarted`. See [`crate::tts::AiTtsSuppressed`].
     pub ai_tts_suppressed: AiTtsSuppressed,
     /// Tag contents the user typed/pasted. Shared across tabs because the
     /// processing layer's filter is content-based (not timing- or tab-

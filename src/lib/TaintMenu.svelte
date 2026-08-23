@@ -90,6 +90,17 @@
   } from './latch';
   import { openSettingsWindowToSection, requestTabRestart } from './settings/ipc';
   import { latchAlsoHoldsMemory } from './timeline';
+  import { findHarness, harnesses } from './harness';
+
+  /// The in-session command that starts a fresh conversation in a tab of
+  /// `harness`, or `null` when it declares none.
+  ///
+  /// V40 Phase F (locked decision 27): this copy used to spell one harness's
+  /// slash-command as if every harness had it. A harness that declares none now
+  /// gets the honest half of the sentence ("restart the tab") instead.
+  function newSessionCommand(harness: string): string | null {
+    return findHarness($harnesses, harness)?.affordances.newSessionCommand ?? null;
+  }
 
   let {
     x,
@@ -142,7 +153,7 @@
   ///
   /// Tracked per popover session rather than read from a backend signal, and
   /// deliberately: the backend's `ai-tab-restart-hint` is emitted per CONSUMER
-  /// ("claude" / "opencode"), which cannot name which tab the user is standing
+  /// (a registry harness id), which cannot name which tab the user is standing
   /// on, and `App.svelte` already renders it as a toast for the app-wide case.
   /// What this set knows is narrower and exactly right for this button — cells
   /// *this tab* just had moved, by *this* popover.
@@ -326,9 +337,10 @@
            is the trigger has no way to guess it. -->
       <div class="state">
         A checkpoint was restored. The flag stays until this tab starts a new
-        session — run <code>/clear</code> here, or restart the tab, and it lifts
-        on its own. Restoring files cannot remove injected text from the
-        conversation, which is why it was kept.
+        session — {#if newSessionCommand(row.consumer)}run
+          <code>{newSessionCommand(row.consumer)}</code> here, or restart the tab{:else}restart
+          the tab{/if}, and it lifts on its own. Restoring files cannot remove
+        injected text from the conversation, which is why it was kept.
       </div>
     {/if}
   {/if}

@@ -4,6 +4,8 @@
 
 import type { LayoutNode } from '../layout/types';
 import type { AiTabId } from '../tabs/types';
+import { harnessList, scopedFeatureOwner } from '../harness';
+import { DEFAULT_PALETTE_NAME } from '../themes';
 
 export type AvatarPosition = 'top-right' | 'top-left' | 'bottom-right' | 'bottom-left';
 
@@ -196,15 +198,94 @@ export interface SystemStatsSettings {
   show_network: boolean;
 }
 
-/// Context-window status line for cImp-launched Claude Code tabs.
-/// When enabled, the backend injects a session-scoped `--settings`
-/// overlay pointing Claude Code's `statusLine` at `cimp --statusline`,
-/// which renders a themed context-usage bar. Global (not per-tab) and
-/// scoped to cImp sessions only — the user's ~/.claude config is
-/// untouched. Mirrors `StatuslineSettings` in the backend schema.
-export interface StatuslineSettings {
-  /// Overall on/off for the context bar.
+/// V40 Phase B: `StatuslineSettings` is gone. The context-bar switch is one of
+/// a harness's declared `ext` rows (`harness[<id>].ext[…]`), which
+/// the Settings window renders from `harness_settings_schema` like every other
+/// per-harness setting — see [`HarnessSettings`].
+
+/// **One harness's settings** — the value type of `Settings.harness`
+/// (V40 locked decision 5, schema 36).
+///
+/// Every field here was half of a field PAIR before Phase B
+/// (the per-harness `expose_commands_*` pair, `code_audit.expose_*`,
+/// `harness_versions.*_last_seen`), and the ones with no second half were worse:
+/// `last_verified` and `auto_verify` existed for one harness only, so half the drift
+/// machinery did not exist for the second harness cImp ships.
+///
+/// An ABSENT key is not a gap — it reads the backend's declared defaults — so
+/// nothing here may be treated as required. Read through
+/// [`harnessRow`] rather than indexing, so a harness the file has never carried
+/// answers like one that has.
+export interface HarnessSettings {
+  /// Advertise the `run_command` MCP tool to this harness's tabs.
+  expose_commands: boolean;
+  /// Advertise the `cimp-code-audit` MCP server to this harness's tabs. ANDed
+  /// with `code_audit.enabled`.
+  expose_code_audit: boolean;
+  /// Latest version of this harness cImp has observed. Written out of band by
+  /// the version tap — **never from the Settings window**.
+  last_seen: string;
+  /// The version this harness's contract checks were last confirmed against.
+  /// Out of band, like `last_seen`.
+  last_verified: string;
+  /// This harness's recorded input-profile spike outcome:
+  /// `'unverified' | 'pass' | 'fail'`. A `'fail'` blocks delegation **to this
+  /// harness only** since V40 Phase B; it used to be one scalar for all of them.
+  input_profile_status: string;
+  /// This harness's last automatic verification run, or absent. Out of band.
+  auto_verify?: AutoVerify | null;
+  /// The harness's OWN settings, declared by its backend plugin
+  /// (`harness_settings_schema`). Opaque here on purpose: the window renders it
+  /// from the declaration and this file names no key.
+  ext: Record<string, unknown>;
+}
+
+/// One harness's per-server MCP grant — the value type of
+/// `McpServerConfig.access`.
+export interface McpAccess {
+  /// Expose this server's tools to that harness.
   enabled: boolean;
+}
+
+/// One harness's row out of `Settings.harness`, or the safe absent answer.
+///
+/// The map may legitimately not carry a harness (a fresh install that has never
+/// saved, a harness this build learned about after the file was written), and
+/// the backend resolves declared defaults for exactly that case. The window
+/// must not render `undefined` into a checkbox, so this supplies the same
+/// answers the backend would.
+export function harnessRow(
+  settings: Pick<Settings, 'harness'>,
+  id: string,
+): HarnessSettings {
+  return (
+    settings.harness?.[id] ?? {
+      expose_commands: true,
+      expose_code_audit: true,
+      last_seen: '',
+      last_verified: '',
+      input_profile_status: 'unverified',
+      auto_verify: null,
+      ext: {},
+    }
+  );
+}
+
+/// Write one `ext` value on a harness's row, creating the row if absent.
+///
+/// Returns the same object it was handed, so a Svelte `$settings` update reads
+/// as one expression. The window calls this from the generic form; nothing else
+/// should touch `ext`.
+export function setHarnessExt(
+  settings: Settings,
+  id: string,
+  key: string,
+  value: unknown,
+): Settings {
+  const row = { ...harnessRow(settings, id) };
+  row.ext = { ...row.ext, [key]: value };
+  settings.harness = { ...(settings.harness ?? {}), [id]: row };
+  return settings;
 }
 
 export interface ComposeSettings {
@@ -301,9 +382,9 @@ export interface AiToolTabConfig {
   /// only); a full settings object replaces the global wholesale.
   background_override: BackgroundOverrideWire | null;
   /// V1.4-07: when true, the launch flow synthesizes
-  /// `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` (and `ANTHROPIC_MODEL`
-  /// if `claude_local.model_alias` is non-empty) from the global
-  /// `claude_local` settings group. Per-tab `env` entries override
+  /// the harness's declared local-provider env vars, filled from its own
+  /// `ext` rows (see `harness_list`'s `localProvider` affordance). Per-tab
+  /// `env` entries override
   /// synthesized values.
   use_local_provider: boolean;
   /// V32 Phase G (locked decision 16): this tab's **L3** row — a tri-state per
@@ -366,6 +447,20 @@ export interface DelegationBackend {
 /// Nothing overrides the global master upward.
 export type InjectionOverride = 'inherit' | 'on' | 'off';
 
+/// **The harness native-tool gate's frozen wire key.**
+///
+/// Spelled ONCE, here, because it is a persisted form: it is a
+/// `TabInjectionOverrides` field in every settings file on disk and a `/status`
+/// row name, so renaming it is a migration. The backend calls the feature
+/// `HarnessNativeGate`; this string is the era it shipped in.
+///
+/// V40 Phase F: this file is on the frontend identity allowlist for exactly
+/// this constant and the reason above — the same rule Rust's
+/// `IDENTITY_ALLOWLIST` applies to `settings/schema.rs`. Nothing reads it as an
+/// identity: which harness owns the feature is `harness_list`'s
+/// `scoped_features`.
+export const HARNESS_NATIVE_GATE_KEY = 'opencode_native_gate';
+
 /// V32 Phase G: the per-TAB override row (mirror of Rust
 /// `TabInjectionOverrides`).
 export interface TabInjectionOverrides {
@@ -380,9 +475,15 @@ export interface TabInjectionOverrides {
   /// The managed-tool steering paragraph — injected beside the hygiene one, so
   /// it carries the same per-tab row.
   tool_steering: InjectionOverride;
-  /// V32 Phase H: the OpenCode native-tool gate. Its app-wide default was
+  /// V32 Phase H: the harness native-tool gate. Its app-wide default was
   /// `off` until V39; the opt-in now lives in this row like every other cell.
-  opencode_native_gate: InjectionOverride;
+  ///
+  /// The KEY is a frozen persisted wire form — it is a field in every settings
+  /// file — which is why it still spells the harness that first had the gate
+  /// while the backend variant is `HarnessNativeGate`. Nothing reads it as an
+  /// identity: which harness owns the feature comes from `harness_list`'s
+  /// `scoped_features` (V40 Phase F).
+  [HARNESS_NATIVE_GATE_KEY]: InjectionOverride;
 }
 
 /// Every per-tab override cell, in the order the backend's `Feature::ALL`
@@ -403,7 +504,7 @@ export const TAB_INJECTION_FEATURES = [
   'native_web',
   'consumer_hygiene',
   'tool_steering',
-  'opencode_native_gate',
+  HARNESS_NATIVE_GATE_KEY,
 ] as const satisfies readonly (keyof TabInjectionOverrides)[];
 
 /// V39: the row a NEWLY CREATED AI tab carries — every cell explicitly `'off'`.
@@ -458,11 +559,12 @@ export interface InjectionSettings {
   /// `run_command` MCP tools over the harness's own shell. Spawn-baked, same
   /// guidance channel as the hygiene paragraph.
   tool_steering_enabled: boolean;
-  /// V32 Phase H (locked decision 17): the OpenCode plugin denying the harness's
-  /// OWN native tools against the tab's taint latch. **The one L2 flag that
-  /// defaults `false`** — whole-surface denial of `bash`/`read`/`edit` is an
-  /// opt-in posture, so it is not counted as "reduced protection" when off.
-  opencode_native_gate_enabled: boolean;
+  /// V32 Phase H's harness native-tool gate is NOT here. Its mechanism lives
+  /// inside one harness's generated plugin, so V40 Phase B made the feature
+  /// harness-scoped and put its app-wide L2 in that plugin's `ext` — core holds
+  /// no flag for a control that can only ever reach one harness. Which harness,
+  /// and which `ext` key, is `harness_list`'s `scoped_features` (V40 Phase F).
+  /// The per-tab L3 cell is unchanged, and so is its wire key.
   /// App-wide, no per-scope row — TTS and toasts are global surfaces.
   terminal_escape_hygiene_enabled: boolean;
   worker: WorkerInjectionOverrides;
@@ -500,7 +602,7 @@ export const SPAWN_BAKED_INJECTION_FEATURES = [
   'native_web',
   'consumer_hygiene',
   'tool_steering',
-  'opencode_native_gate',
+  HARNESS_NATIVE_GATE_KEY,
 ] as const satisfies readonly (keyof TabInjectionOverrides)[];
 
 /// One of the spawn-baked feature keys.
@@ -514,23 +616,68 @@ export type SpawnBakedInjectionFeature = (typeof SPAWN_BAKED_INJECTION_FEATURES)
 /// `native_web`'s cell is the tri-mode STRING, not a boolean: `sensor` and `deny`
 /// both resolve the feature "on" but launch a tab very differently, so a boolean
 /// would lose a mode change. Same reconciliation Rust's `spawn_sig` makes.
+///
+/// V40 Phase B widened the reader from `OffloadSettings` to the whole
+/// `Settings`: a harness-scoped feature's L2 is a row on `harness[<id>].ext`,
+/// not a field in the offload block. [`HARNESS_NATIVE_GATE_KEY`] is that
+/// feature's frozen wire key; V40 Phase F made the harness it belongs to a
+/// registry lookup.
+/// What a spawn-baked cell answers when the roster cannot decide it — the
+/// window between mount and `harness_list`, and a build where no harness scopes
+/// the feature.
+///
+/// A STRING, so it can never be confused with the `true`/`false` a real answer
+/// takes, and stable, so two shapes computed while pending compare equal. The
+/// Settings window additionally captures its restart baseline after the roster
+/// lands (V40 review F-1), so this should not reach a comparison at all — it is
+/// what makes the failure visible if it ever does.
+export const ROSTER_PENDING = '(roster pending)';
+
 const SPAWN_BAKED_L2: Record<
   SpawnBakedInjectionFeature,
-  (o: OffloadSettings) => string | boolean
+  (s: Settings) => string | boolean
 > = {
-  spotlighting: (o) => o.injection.spotlighting_enabled,
-  native_web: (o) => o.native_web_visibility,
-  consumer_hygiene: (o) => o.injection.consumer_hygiene_enabled,
-  tool_steering: (o) => o.injection.tool_steering_enabled,
-  opencode_native_gate: (o) => o.injection.opencode_native_gate_enabled,
+  spotlighting: (s) => s.offload.injection.spotlighting_enabled,
+  native_web: (s) => s.offload.native_web_visibility,
+  consumer_hygiene: (s) => s.offload.injection.consumer_hygiene_enabled,
+  tool_steering: (s) => s.offload.injection.tool_steering_enabled,
+  // V40 Phase F: WHICH harness holds this feature's app-wide cell is the
+  // registry's answer (`harness_list`'s `scoped_features`), not a name written
+  // here.
+  //
+  // **A roster that has not answered yet is NOT a value** (V40 review finding
+  // F-1). This used to return the literal `true`, which is a guess that reads
+  // as a real answer: a user who had turned the gate OFF opened Settings, the
+  // restart baseline was captured in the window before `harness_list` resolved
+  // (`[…, true]`), the first edit re-ran the derived against the real value
+  // (`[…, false]`), and the section's "AI tabs launch differently — restart
+  // them" hint fired with no user change behind it. The literal was also wrong
+  // in the other direction for any future feature whose declared default is
+  // `false`. [`ROSTER_PENDING`] cannot be mistaken for either, and the declared
+  // default is read off the owner's field rather than assumed.
+  [HARNESS_NATIVE_GATE_KEY]: (s) => {
+    const list = harnessList();
+    if (list.length === 0) return ROSTER_PENDING;
+    const owner = scopedFeatureOwner(list, HARNESS_NATIVE_GATE_KEY);
+    // No harness scopes the feature: nothing bakes it into a launch, so there
+    // is no app-wide cell to compare. Its own sentinel, not a boolean that
+    // would flip the moment a harness declaring it appeared.
+    if (!owner) return ROSTER_PENDING;
+    const stored = harnessRow(s, owner.harness.id).ext[owner.extKey];
+    if (stored === undefined) {
+      const declared = owner.harness.fields.find((f) => f.key === owner.extKey);
+      return declared ? declared.default !== false : true;
+    }
+    return stored !== false;
+  },
 };
 
 /// The app-wide L2 cell of every spawn-baked feature, in
 /// [`SPAWN_BAKED_INJECTION_FEATURES`] order. The Settings window folds this into
 /// its section-level restart hint; the L1 master rides alongside it there,
 /// because it is not a feature and reaches every launch there is.
-export function spawnBakedInjectionL2(o: OffloadSettings): (string | boolean)[] {
-  return SPAWN_BAKED_INJECTION_FEATURES.map((f) => SPAWN_BAKED_L2[f](o));
+export function spawnBakedInjectionL2(s: Settings): (string | boolean)[] {
+  return SPAWN_BAKED_INJECTION_FEATURES.map((f) => SPAWN_BAKED_L2[f](s));
 }
 
 /// One tab's L3 override for every spawn-baked feature, in
@@ -612,7 +759,7 @@ export interface UiSettings {
   /// the backend binary and always available; its accent comes from
   /// `tui_accent` below. Any other value refers to an on-disk theme under
   /// `<exe-dir>/themes/` (`"nippon-dark"` / `"nippon-light"` ship today).
-  /// New installs default to `"tui"` (paired with the OpenCode Grey
+  /// New installs default to `"tui"` (paired with the default
   /// terminal palette); the avatar still defaults to the animated
   /// `impSprites` mascot independently. Distinct from `terminal.theme`,
   /// which governs the xterm.js terminal palette inside each tab.
@@ -829,11 +976,10 @@ export interface Settings {
   behavior: BehaviorSettings;
   usage: UsageSettings;
   system_stats: SystemStatsSettings;
-  /// Claude Code context-window status line bar (global, cImp-scoped).
-  statusline: StatuslineSettings;
   compose: ComposeSettings;
   shortcuts: ShortcutSettings;
-  /// Ordered tab configs. Reserved ids (claude, claude-local, shell-default-1)
+  /// Ordered tab configs. Reserved ids (each harness's `tab_ids`, plus
+  /// `shell-default-1`)
   /// are guaranteed to be present after the backend's startup integrity check.
   tabs: TabConfig[];
   processing: ProcessingSettings;
@@ -850,16 +996,12 @@ export interface Settings {
   /// Terminal-pane settings (V1.4-01+): xterm.js palette today, plus
   /// the V1.4-02 background sub-group when that ships.
   terminal: TerminalSettings;
-  /// V1.4-07: local-LLM provider config for AI tabs whose
-  /// `use_local_provider` flag is `true`. Stored cleartext on disk —
-  /// local proxies typically accept dummy tokens, so this is acceptable.
-  claude_local: ClaudeLocalSettings;
   /// Optional explicit executable paths for the bundled quick-launch tools
   /// (rustnet / broot); empty fields resolve normally (ebin → PATH).
   external_tools: ExternalToolsSettings;
   /// V8-01: local task-offload config. cImp runs a user-supplied
   /// `llama-server` and exposes an `offload_task` MCP tool into
-  /// cImp-launched Claude tabs. Off by default.
+  /// cImp-launched AI tabs. Off by default.
   offload: OffloadSettings;
   /// V9-01: per-project code knowledge graph config. Off by default.
   graph: GraphSettings;
@@ -908,7 +1050,7 @@ export interface Settings {
   /// tabs in response. The list is required to be non-empty; the UI
   /// disables the last-checked checkbox to enforce that, and the IPC
   /// rejects an empty value as defense-in-depth. Default is
-  /// `["claude"]` (subscription Claude only) on a fresh install.
+  /// The registry's first reserved tab, on a fresh install.
   enabled_ai_tabs: AiTabId[];
   /// File-logger configuration. The backend writes daily rolling log
   /// files into `<portable-root>/logs/`; this field drives the live filter.
@@ -954,6 +1096,18 @@ export interface Settings {
   /// like `llm_pricing` (global-only; preserved against stale snapshots by
   /// `apply_incoming_settings`); kept here for schema fidelity.
   harness_versions: HarnessVersions;
+  /// V40 Phase B (schema 36): **per-harness settings**, keyed by registry id.
+  ///
+  /// Machine scope, like `harness_versions` and `sandbox`: banned from the
+  /// project overlay and written through to the physical global file, because
+  /// half of it is written out of band (the observed version, the auto-verify
+  /// record) and the other half configures the harness INSTALL on this machine.
+  ///
+  /// A `Record<string, …>`, not a union of known ids: a row for a harness this
+  /// build has never heard of round-trips untouched, which is what keeps a
+  /// downgrade from wiping the settings of a harness the user just upgraded
+  /// for. Read through [`harnessRow`], never by indexing.
+  harness: Record<string, HarnessSettings>;
   /// V23 Phase A: Code Audit (aggregated security scanning) config. Off by
   /// default; `enabled` gates the reserved Code Audit dashboard tab and the
   /// bottom-bar entry point.
@@ -966,12 +1120,12 @@ export interface Settings {
 /// One provider/model price row: USD per million tokens for the four billing
 /// categories a session's `UsageTotals` reports. Mirror of Rust
 /// `settings::LlmPricingModel`. Fresh installs are seeded backend-side with
-/// current Anthropic API + GitHub Copilot prices (`default_llm_pricing`).
+/// current vendor API + GitHub Copilot prices (`default_llm_pricing`).
 export interface LlmPricingModel {
   provider: string;
   model: string;
   /// V16 Feature 8: transcript model-id prefix this row auto-matches (e.g.
-  /// `"claude-opus-4-8"`). Longest matching prefix wins; empty = manual-pick
+  /// a vendor's model-id prefix). Longest matching prefix wins; empty = manual-pick
   /// only. See `usageMath.ts`'s `matchPricing`.
   model_prefix: string;
   /// $/MTok for uncached input tokens (`in_tok`).
@@ -984,14 +1138,15 @@ export interface LlmPricingModel {
   output: number;
 }
 
-/// V16 Feature 1: per-install harness version + contract-verification state.
-/// Mirror of Rust `settings::HarnessVersions`. Out-of-band like
-/// `llm_pricing`: written by the transcript tap / tab spawn /
-/// `harness_mark_verified`, straight to the physical global `settings.json`.
+/// V16 Feature 0: the two recorded contract-SPIKE outcomes. Mirror of Rust
+/// `settings::HarnessVersions`, out-of-band like `llm_pricing`.
+///
+/// **V40 Phase B emptied the version half.** The five per-harness version
+/// `input_profile_status` were per-harness state spelled as harness-named
+/// scalars — three of which existed for one harness only — are
+/// [`HarnessSettings`] rows now. Both survivors are hand-recorded after a
+/// manual spike and neither is written from the frontend.
 export interface HarnessVersions {
-  claude_last_seen: string;
-  claude_last_verified: string;
-  opencode_last_seen: string;
   /// E1 spike outcome (`"unverified" | "pass" | "fail"`). Raw INPUT to a gate,
   /// never interpreted here: read `CapabilityGate.blocked` for
   /// `CAP_PRETOOLUSE_DENY` instead. V35 Phase E deleted the
@@ -1001,22 +1156,6 @@ export interface HarnessVersions {
   e1_status: string;
   /// D0 spike outcome (informational — the feature degrades to a no-op).
   d0_status: string;
-  /// V39 Phase B: input-profile spike outcome (`"unverified" | "pass" |
-  /// "fail"`) — does a harness TUI here accept a pasted multi-line request as
-  /// ONE turn? Raw INPUT to a gate, never interpreted here: read
-  /// `CapabilityGate.blocked` for `CAP_DELEGATION_WORKER` instead.
-  input_profile_status: string;
-  /// V35 Phase F: the last automatic verification run for Claude Code — the
-  /// embedded L1 canaries plus the L2 live probes, run in the background when
-  /// `claude_last_seen` changes. Absent until the first run completes, which is
-  /// a different state from "ran and passed" (it is what keeps the version
-  /// tripwire speaking as the cannot-verify fallback).
-  ///
-  /// Optional here on purpose: it is serialized only when a run has been
-  /// recorded, and no UI reads it yet — the *Harness health* panel (Phase G) is
-  /// what renders it. Never written from the frontend: `harness_versions` is
-  /// out-of-band on both sides.
-  claude_auto_verify?: AutoVerify | null;
 }
 
 /// V35 Phase F: one recorded auto-verify run. Mirror of Rust
@@ -1066,6 +1205,11 @@ export interface HarnessStatus {
   /// A verify run is in flight, so "Run checks now" is a no-op and the panel
   /// keeps polling until it clears.
   verify_in_flight: boolean;
+  /// V40 Phase F: the gated capability ids, keyed by the neutral CONTROL each
+  /// one gates (mirror of Rust `contract::GATED_CONTROLS`). The window looks a
+  /// control's id up here instead of holding one — see
+  /// [`CONTROL_READ_ADVISOR`].
+  gated_controls: Record<string, string>;
 }
 
 /// V35 Phase G: what cImp does when a capability is known-broken. Mirror of
@@ -1144,7 +1288,8 @@ export interface CapabilityHealth {
 
 /// V35 Phase G: the tally of a run made in this process. Mirror of Rust
 /// `harness::health::RunView`. In-memory only — it is the visible consequence
-/// of "Run checks now", and the only place an OpenCode run is reported at all.
+/// of "Run checks now", and the only place a run is reported for a harness
+/// with no persisted record.
 export interface RunView {
   at_ms: number;
   version: string;
@@ -1185,11 +1330,11 @@ export interface StalePlugin {
 /// V35 Phase G: one harness's header plus its rows. Mirror of Rust
 /// `harness::health::HarnessHealth`.
 export interface HarnessHealth {
-  /// `'claude' | 'opencode'` — passed straight back to `harness_run_checks`.
+  /// A registry harness id — passed straight back to `harness_run_checks`.
   harness: string;
   label: string;
   last_seen: string;
-  /// Absent for a harness with no verified column at all (OpenCode) —
+  /// Absent for a harness with no verified column at all —
   /// deliberately not `''`, which would read as "verified against nothing".
   last_verified?: string | null;
   /// The persisted Phase F record, when this harness has one.
@@ -1208,16 +1353,22 @@ export interface HarnessHealth {
 /// the Rust build if the panel stops knowing the distinction.
 export const OUTCOME_NO_FAILURE = 'no_failure';
 
-/// The capability id the read advisor's `PreToolUse` deny is gated on — the
-/// join key shared verbatim with Rust's `contract::CAP_PRETOOLUSE_DENY` and
-/// with the registry row's own `id`. Pinned by
-/// `harness::contract::tests::the_gated_capability_ids_reach_the_frontend`,
-/// which fails the Rust build if this string is missing from this file.
-export const CAP_PRETOOLUSE_DENY = 'claude.hook.pretooluse_deny';
+/// The CONTROL name the redundant-read advisor's gate is published under
+/// (`HarnessStatus.gated_controls`).
+///
+/// **V40 Phase F (locked decision 27).** This used to be
+/// `CAP_PRETOOLUSE_DENY` — the capability id itself, a harness-namespaced hook
+/// name spelled in TypeScript so the window could join on it. The id now
+/// travels in the payload keyed by this neutral name, and
+/// `harness::contract::tests::the_gated_capability_ids_reach_the_frontend`
+/// fails the Rust build if a harness-namespaced gated id reappears in this
+/// file.
+export const CONTROL_READ_ADVISOR = 'read_advisor';
 
 /// V39 Phase B: the capability id cross-harness delegation is gated on — the
 /// registry's first harness-NEUTRAL row (`Harness::Any`). Shared verbatim with
-/// Rust's `contract::CAP_DELEGATION_WORKER` and pinned by the same test. A
+/// Rust's `contract::CAP_DELEGATION_WORKER` and pinned by the same test, which
+/// permits THIS one to be spelled here precisely because it names no vendor. A
 /// blocked verdict means no tab can be driven and no `delegate_task_*` tool is
 /// advertised; the reason string says which spike recorded what.
 export const CAP_DELEGATION_WORKER = 'delegation.worker';
@@ -1232,6 +1383,38 @@ export function capabilityBlocked(
   id: string,
 ): CapabilityGate | null {
   return status?.capability_gates.find((g) => g.id === id && g.blocked) ?? null;
+}
+
+/// The verdict for the capability a neutral CONTROL name gates, resolved
+/// through `HarnessStatus.gated_controls`.
+///
+/// **A control the payload does not carry fails CLOSED** (V40 review finding
+/// M-4). The window used to do `gated_controls?.[CONTROL] ?? ''` and hand the
+/// empty string to [`capabilityBlocked`], which answers "not blocked" — so a
+/// control renamed in Rust, or dropped from `GATED_CONTROLS`, silently
+/// UN-GATED the toggle it protects. That toggle installs a `PreToolUse` hook on
+/// a contract the E1 spike may have recorded as broken; the whole point of the
+/// gate is that it is the one thing standing between a `fail` and a hook that
+/// denies the model's reads.
+///
+/// `null` while the payload has not arrived at all — that is "not yet", not "no
+/// gate", and it is the pre-Phase-E behaviour (`snapshot` is null then too).
+export function controlBlocked(
+  status: HarnessStatus | null | undefined,
+  control: string,
+): CapabilityGate | null {
+  if (!status) return null;
+  const id = status.gated_controls?.[control];
+  if (!id) {
+    return {
+      id: control,
+      blocked: true,
+      reason:
+        'this build cannot find the gate for this control (the harness registry did not ' +
+        'publish it), so it stays off rather than running ungated',
+    } as CapabilityGate;
+  }
+  return capabilityBlocked(status, id);
 }
 
 /// V14 Phase D2: one dismissed advisor proposal. Mirror of Rust
@@ -1554,7 +1737,7 @@ export interface SandboxSettings {
   /// Master switch for the OS sandbox layer. Off by default until the grant
   /// ladder has soaked on real machines.
   enabled: boolean;
-  /// V33 Phase B: also sandbox the AI-tool tabs (Claude / OpenCode). Effective
+  /// V33 Phase B: also sandbox the AI-tool tabs. Effective
   /// only when `enabled` is also true; plain Shell tabs are never included.
   tabs: boolean;
   /// Give sandboxed children network access. Off by default; on, it reaches
@@ -1602,16 +1785,11 @@ export interface WorkbenchSettings {
   checkpoint_min_gap_s: number;
 }
 
-/// V1.4-07: local-LLM provider configuration. `base_url` and
-/// `auth_token` become `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` on
-/// any AI tab with `use_local_provider: true`. `model_alias`, when
-/// non-empty, becomes `ANTHROPIC_MODEL` (also passed through some
-/// proxies as a model-mapping key).
-export interface ClaudeLocalSettings {
-  base_url: string;
-  auth_token: string;
-  model_alias: string;
-}
+/// V40 Phase B: the per-harness local-provider group is gone. Its fields are a
+/// harness's
+/// declared `ext` rows (`local.base_url` / `local.auth_token` /
+/// `local.model_alias`), rendered by the generic per-harness form and redacted
+/// in backend logs by the declaration's `secret` column.
 
 /// Optional explicit executable paths for the bundled quick-launch tools
 /// (rustnet / broot). A non-empty value overrides the normal `ebin/` → PATH
@@ -1643,14 +1821,9 @@ export interface CodeAuditSettings {
   /// button turns it back on. Security tools and user plugins are never
   /// touched; the flags it writes live in `tool_plugins`.
   quality_auto_select: boolean;
-  /// V26: advertise the `cimp-code-audit` MCP server (security_audit /
-  /// quality_audit) to Claude Code tabs. ANDed with `enabled` at the injection
-  /// site; default true. (Backend field mirror — the settings-UI checkboxes
-  /// land in a later stage.)
-  expose_claude: boolean;
-  /// V26: advertise `cimp-code-audit` to OpenCode tabs. OpenCode caches
-  /// tools/list at connect, so toggling needs a tab restart. Default true.
-  expose_opencode: boolean;
+  // V26's per-harness `expose_*` pair is
+  // `harness[<id>].expose_code_audit` since V40 Phase B — one field per
+  // harness, iterated, rather than one field pair per question.
   /// V26: advertise the code-audit native tools to the offload worker. Default
   /// true. A scan always runs in-process, so a remote worker only ever gets the
   /// free-text report.
@@ -1677,15 +1850,8 @@ export interface ToolPluginsSettings {
   plugins: Record<string, PluginState>;
   project_paths: Record<string, Record<string, string>>;
   global_paths: Record<string, string>;
-  /// V38 F-3: advertise the `run_command` MCP tool — the registry's runnable
-  /// `command`-kind entries under one tool with a `tool` enum — to Claude Code
-  /// tabs. Default true; the real gate is whether any command tool is enabled
-  /// AND has a path, so a fresh install advertises nothing.
-  expose_commands_claude: boolean;
-  /// V38 F-3: the same for OpenCode tabs. OpenCode caches `tools/list` at
-  /// connect, so a flip here (or a newly configured command tool) shows up only
-  /// after a tab restart.
-  expose_commands_opencode: boolean;
+  // V38 F-3's per-harness `expose_commands_*` pair is
+  // `harness[<id>].expose_commands` since V40 Phase B.
 }
 
 /// One plugin's user state (mirror of Rust `PluginState`). Disabling the plugin
@@ -1746,14 +1912,16 @@ export interface McpServerConfig {
   args: string[];
   env: Record<string, string>;
   url: string;
-  /// Expose this server's tools to Claude Code (proxied through the
-  /// `cimp-offload` child). Off by default — a deliberate opt-in.
-  claude_access: boolean;
+  /// **Per-harness exposure**, keyed by registry id (V40 Phase B, schema 36).
+  /// Replaces the per-harness `*_access` pair. An absent key is
+  /// NOT exposed, which is both the default for a new server and the only safe
+  /// answer to a grant question nobody has decided; a key for a harness this
+  /// build does not know round-trips untouched.
+  access: Record<string, McpAccess>;
   /// Expose this server's tools to the offload worker (the legacy `enabled`).
+  /// Not in `access`: the worker is cImp's own in-process consumer, not a
+  /// harness, so a map keyed by harness id has no honest slot for it.
   offload_access: boolean;
-  /// V19: expose this server's tools to OpenCode (proxied through the
-  /// `--consumer opencode` child). Off by default.
-  opencode_access: boolean;
   /// V33 (contract C7): bearer token for an **HTTP** server (`url`). Attached
   /// as an `Authorization` header on every request/notification the warm MCP
   /// host sends; ignored by stdio servers, which carry their secrets in `env`.
@@ -2008,19 +2176,17 @@ export interface OffloadSettings {
   /// (the better answer wins). Inert unless a second quality-tier backend
   /// exists, so zero-config setups are unaffected.
   escalate_partial: boolean;
-  /// V21: the OpenCode `local-llama` custom provider, derived from a Local
-  /// backend's server command via the Offload "Add to OpenCode" button (or
-  /// auto-sync). When set, the OpenCode tab gets a `provider.local-llama` block
-  /// + this as its default model. `null` = never registered.
-  opencode_provider: OpencodeLocalProvider | null;
-  /// V21: when true AND the local offload server is enabled, keep
-  /// `opencode_provider` in sync with the primary Local backend's command
-  /// (re-derived at launch + on save when it changed). Disabled server ⇒
-  /// no-op.
-  opencode_provider_auto: boolean;
-  /// V30 Phase A: register the `cimp-offload` MCP child as a Claude Code
+  // V21's derived-provider pair is
+  // `harness[<id>].ext['provider']` / `['provider_auto']` since V40
+  // Phase B (locked decision 6): a derived block and a sync switch that only
+  // one harness has ever read, declared by that harness's plugin and stored
+  // opaquely by core. `LocalProviderBlock` below is still the block's shape
+  // — `offload_derive_local_provider` returns it and the Offload section's
+  // *Add to <harness>* button writes it through `setHarnessExt`.
+  /// V30 Phase A: register the `cimp-offload` MCP child as a push-capable
   /// *channel*, so it can push out-of-band notices (offload/audit/graph
-  /// completion) straight into a live Claude tab. Claude-only, spawn-baked
+  /// completion) straight into a live AI tab. Needs a harness that declares
+  /// session push; spawn-baked
   /// (flips raise the AI-tab restart hint), default off — the registration
   /// flag is a research preview and pushes are fire-and-forget.
   session_push: boolean;
@@ -2057,8 +2223,8 @@ export interface OffloadSettings {
   /// Artifact URLs must live under whichever manifest URL is in force, so an
   /// override relocates the whole bundle.
   detection_update_manifest_url: string;
-  /// V32 Phase F: how cImp treats the harness's OWN web tools (Claude
-  /// WebFetch/WebSearch, OpenCode webfetch/websearch) — `"off"` | `"sensor"` |
+  /// V32 Phase F: how cImp treats the harness's OWN web tools (each declares
+  /// its own names — see `harness_list`'s `webTools`) — `"off"` | `"sensor"` |
   /// `"deny"`. Default `sensor` (report-only beacons that engage the tab's
   /// EXTERNAL latch). Spawn-baked: a change needs an AI-tab restart.
   ///
@@ -2071,12 +2237,13 @@ export interface OffloadSettings {
   injection: InjectionSettings;
 }
 
-/// V21: a derived OpenCode custom-provider entry (always id `local-llama`)
-/// pointing at the local `llama-server` (mirror of Rust `OpencodeLocalProvider`).
-export interface OpencodeLocalProvider {
+/// V21: a derived custom-provider entry a harness's config writer produces
+/// (always id `local-llama`)
+/// pointing at the local `llama-server` (mirror of Rust `LocalProviderBlock`).
+export interface LocalProviderBlock {
   /// OpenAI-compatible base URL, ending in `/v1`.
   base_url: string;
-  /// Model id OpenCode requests + selects as default (`local-llama/<model>`).
+  /// Model id the harness requests + selects as default (`local-llama/<model>`).
   model: string;
   /// Optional `--api-key` from the command; usually empty.
   api_key: string;
@@ -2084,16 +2251,13 @@ export interface OpencodeLocalProvider {
   source_command: string;
 }
 
-/// Reserved tab ids — mirror of `crate::settings::*_TAB_ID` constants.
-/// User-created shell tabs use uuid-based ids that never collide with these.
-export const CLAUDE_TAB_ID = 'claude';
-/// V1.4-07: second Claude tab preconfigured for a local LLM provider.
-export const CLAUDE_LOCAL_TAB_ID = 'claude-local';
-/// V19: the single OpenCode AI-tool tab. OpenCode picks its own provider/model
-/// (global config + credentials, switchable in-session), so there is no
-/// cloud/local pair. Replaces BOTH V14 aider ids (the v18 → v19 migration
-/// collapses them into this one).
-export const OPENCODE_TAB_ID = 'opencode';
+/// The reserved id of the default Shell tab — mirror of
+/// `crate::settings::SHELL_DEFAULT_TAB_ID`. User-created shell tabs use
+/// uuid-based ids that never collide with it.
+///
+/// V40 Phase F: the reserved AI tab ids that used to sit beside it are gone.
+/// They are the registry's (`harness_list`'s `tab_ids`), and mirroring them
+/// here was the frontend declaring the roster — see `src/lib/harness.ts`.
 export const SHELL_DEFAULT_TAB_ID = 'shell-default-1';
 
 /// Look up a tab entry by id. Returns undefined for unknown ids; callers
@@ -2201,7 +2365,6 @@ export function defaultSettings(): Settings {
       show_gpu_temp: true,
       show_network: true,
     },
-    statusline: { enabled: true },
     compose: { min_height_px: 80, max_height_px: 300 },
     shortcuts: {
       open_compose: 'Alt+Enter',
@@ -2230,79 +2393,19 @@ export function defaultSettings(): Settings {
       push_to_talk: 'Ctrl+Shift',
       speak_selection: 'Ctrl+Alt+S',
     },
-    tabs: [
-      {
-        kind: 'ai_tool',
-        id: CLAUDE_TAB_ID,
-        builtin: true,
-        name: 'Claude',
-        command: 'claude',
-        args: [],
-        cwd: null,
-        env: {},
-        tts_injection: { enabled: true },
-        notifications: {
-          idle: { enabled: true, text: 'Claude is idle' },
-          awaiting_permission: {
-            enabled: true,
-            text: 'Claude is awaiting permission',
-          },
-          question: { enabled: true, text: 'Claude has a question' },
-          error: { enabled: true, text: 'Claude encountered an error' },
-        },
-        first_launch_notice_dismissed: true,
-        theme_override: null,
-        background_override: null,
-        use_local_provider: false,
-        // V39: a new tab ships every tab-scoped injection control OFF —
-        // mirror of Rust `schema::default_claude_tab`.
-        injection_overrides: allOffInjectionOverrides(),
-        // V39 Phase A: a fresh tab accepts the keyboard; the lock is a
-        // deliberate user action, never a default.
-        read_only: false,
-        // V39 Phase B: a tab becomes reachable by another harness only by an
-        // explicit user action on that tab.
-        delegation_role: 'none',
-        delegation_backend: { name: null, tier: 'quality', declared_context: null },
-      },
-      {
-        kind: 'ai_tool',
-        id: CLAUDE_LOCAL_TAB_ID,
-        builtin: true,
-        name: 'Claude (local)',
-        command: 'claude',
-        args: [],
-        cwd: null,
-        env: {},
-        tts_injection: { enabled: true },
-        notifications: {
-          idle: { enabled: true, text: 'Claude (local) is idle' },
-          awaiting_permission: {
-            enabled: true,
-            text: 'Claude (local) is awaiting permission',
-          },
-          question: { enabled: true, text: 'Claude (local) has a question' },
-          error: {
-            enabled: true,
-            text: 'Claude (local) encountered an error',
-          },
-        },
-        first_launch_notice_dismissed: true,
-        theme_override: null,
-        background_override: null,
-        use_local_provider: true,
-        // V39: a new tab ships every tab-scoped injection control OFF —
-        // mirror of Rust `schema::default_claude_tab`.
-        injection_overrides: allOffInjectionOverrides(),
-        // V39 Phase A: a fresh tab accepts the keyboard; the lock is a
-        // deliberate user action, never a default.
-        read_only: false,
-        // V39 Phase B: a tab becomes reachable by another harness only by an
-        // explicit user action on that tab.
-        delegation_role: 'none',
-        delegation_backend: { name: null, tier: 'quality', declared_context: null },
-      },
-    ],
+    // V40 Phase F (locked decision 7): EMPTY, deliberately.
+    //
+    // These defaults are the placeholder the store holds for the few
+    // milliseconds before `initSettings()` replaces them with the backend's
+    // real snapshot. Seeding a reserved AI tab per shipped harness here — with
+    // its id, its command and four notification strings naming a product —
+    // was the frontend declaring the roster a second time, and a third harness
+    // would have had a settings file the window could not describe.
+    //
+    // Nothing renders from this: every tab surface reads the backend's answer,
+    // and an empty list for one frame is the same state a fresh install has
+    // before its first save.
+    tabs: [],
     processing: { stability_timeout_ms: 200, max_hold_ms: 500 },
     session: { active_tab_id: null },
     layout: null,
@@ -2321,11 +2424,12 @@ export function defaultSettings(): Settings {
       latched_color: '#fabd2f',
       contaminated_color: '#fb4934',
     },
-    // Default terminal palette is paired with the default UI theme
-    // (tui → OpenCode Grey); the pairing comes from each theme's
-    // `palette` metadata, applied by SettingsApp on theme switch.
+    // The default terminal palette is paired with the default UI theme; the
+    // pairing comes from each theme's `palette` metadata, applied by
+    // SettingsApp on theme switch. The NAME is persisted, so it is spelled once
+    // beside the palettes themselves.
     terminal: {
-      theme: { name: 'OpenCode Grey', custom: null },
+      theme: { name: DEFAULT_PALETTE_NAME, custom: null },
       background: {
         image: null,
         color: null,
@@ -2342,11 +2446,6 @@ export function defaultSettings(): Settings {
         persist: true,
         restore_on_launch: true,
       },
-    },
-    claude_local: {
-      base_url: 'http://localhost:4000',
-      auth_token: 'sk-dummy',
-      model_alias: '',
     },
     external_tools: {
       rustnet: '',
@@ -2410,8 +2509,6 @@ export function defaultSettings(): Settings {
       global_concurrency: null,
       max_queue_depth: null,
       escalate_partial: true,
-      opencode_provider: null,
-      opencode_provider_auto: false,
       session_push: false,
       external_fetch_max_calls: 40,
       external_fetch_max_bytes: 4 * 1024 * 1024,
@@ -2436,8 +2533,6 @@ export function defaultSettings(): Settings {
         memory_quarantine_enabled: true,
         consumer_hygiene_enabled: true,
         tool_steering_enabled: true,
-        // V32 Phase H: the deliberate exception — ships OFF (locked decision 17).
-        opencode_native_gate_enabled: false,
         terminal_escape_hygiene_enabled: true,
         worker: {
           taint_latch: 'inherit',
@@ -2546,7 +2641,10 @@ export function defaultSettings(): Settings {
     // F-12: denied by default — a remote worker does not get to run this
     // project's commands until the user says so.
     checks_allow_remote_worker: false,
-    enabled_ai_tabs: ['claude'],
+    // V40 Phase F: empty, for the same reason `tabs` above is — the real value
+    // arrives with the backend snapshot, and a guessed reserved id here would
+    // be the frontend deciding which harness ships enabled.
+    enabled_ai_tabs: [],
     logging: {
       level: 'info',
       retention: 'weekly',
@@ -2563,18 +2661,18 @@ export function defaultSettings(): Settings {
     // field is out-of-band in `settings_update`, like `prompt_templates`).
     llm_pricing: [],
     harness_versions: {
-      claude_last_seen: '',
-      claude_last_verified: '',
-      opencode_last_seen: '',
       e1_status: 'unverified',
       d0_status: 'unverified',
-      input_profile_status: 'unverified',
     },
+    // V40 Phase B: empty on purpose. The backend materializes a row per
+    // registered harness at its declared defaults, and `harnessRow` answers
+    // those same defaults for a key that is not there — so a pre-init fallback
+    // that guessed a roster would be the one place the frontend re-declared
+    // the registry.
+    harness: {},
     code_audit: {
       enabled: false,
       quality_auto_select: true,
-      expose_claude: true,
-      expose_opencode: true,
       expose_offload: true,
       timeout_secs: 600,
     },
@@ -2584,8 +2682,6 @@ export function defaultSettings(): Settings {
       plugins: {},
       project_paths: {},
       global_paths: {},
-      expose_commands_claude: true,
-      expose_commands_opencode: true,
     },
   };
 }

@@ -521,13 +521,13 @@ mod tests {
     fn the_scanned_file_set_is_exactly_the_spawn_ledgers() {
         let files = source_files();
         let scanned: BTreeSet<String> = spawning_files(&files).into_keys().collect();
-        let ledgered: BTreeSet<String> = crate::spawn_ledger::LEDGER
+        let ledgered: BTreeSet<String> = crate::spawn_ledger::ledger()
             .iter()
             .map(|s| s.file.to_string())
             .collect();
         assert_eq!(
             scanned, ledgered,
-            "the spawn gate's scan and `spawn_ledger::LEDGER` disagree about which files spawn a \
+            "the spawn gate's scan and `spawn_ledger::ledger` disagree about which files spawn a \
              process. Whichever is behind, both have to move: the ledger classifies the seam, \
              this scan proves it goes through the gate."
         );

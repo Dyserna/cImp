@@ -4,7 +4,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
@@ -245,8 +245,8 @@ pub struct TabActivityFlags {
     /// questions). Tracked separately because the two can stand at once and
     /// each clears on its own edge.
     pub awaiting_question: bool,
-    /// Output is streaming right now (`ClaudeOutputStarted` …
-    /// `ClaudeOutputStopped`) — i.e. a turn is in flight. Preflight refuses to
+    /// Output is streaming right now (`HarnessOutputStarted` …
+    /// `HarnessOutputStopped`) — i.e. a turn is in flight. Preflight refuses to
     /// type into a tab mid-burst: the request would land in the middle of
     /// someone else's turn.
     pub output_running: bool,
@@ -306,8 +306,8 @@ impl TabActivity {
             }
             StateSignal::QuestionPromptDetected { tab } => (tab, |f| f.awaiting_question = true),
             StateSignal::QuestionPromptResolved { tab } => (tab, |f| f.awaiting_question = false),
-            StateSignal::ClaudeOutputStarted { tab } => (tab, |f| f.output_running = true),
-            StateSignal::ClaudeOutputStopped { tab } => (tab, |f| f.output_running = false),
+            StateSignal::HarnessOutputStarted { tab } => (tab, |f| f.output_running = true),
+            StateSignal::HarnessOutputStopped { tab } => (tab, |f| f.output_running = false),
             // V39 review R-5: an exit from a start this row has moved past is
             // NOT this process's exit. Handled here rather than by the generic
             // arm below because it is the one signal whose meaning depends on
@@ -460,6 +460,28 @@ pub enum TabId {
 }
 
 impl TabId {
+    /// **The fallback identity for a reader that must answer with SOME tab** —
+    /// the first registered harness's first built-in tab (V40 Phase E, locked
+    /// decision 26).
+    ///
+    /// Three hot paths need one: the boot active-tab resolution when settings
+    /// name no surviving tab, and the two poisoned-lock reads of the shared
+    /// active-tab cell (`audio::playback`, `notifications::manager`), where a
+    /// `panic!` would permanently kill the audio or notification task. All three
+    /// used to say `TabId::Claude` — "when in doubt, Claude", six times over,
+    /// which is what locked decision 2 removed everywhere else.
+    ///
+    /// It is still a guess; what changed is that it is the REGISTRY's guess and
+    /// moves with the registry, so a build that ships a different first harness
+    /// does not silently fall back to one it does not ship.
+    pub fn first_harness_default() -> TabId {
+        crate::harness::registry::HARNESSES
+            .first()
+            .and_then(|d| d.tab_ids.first())
+            .map(|id| TabId::from_str(id))
+            .unwrap_or(TabId::Claude)
+    }
+
     pub fn as_str(&self) -> &str {
         match self {
             TabId::Claude => "claude",
@@ -517,6 +539,15 @@ impl TabId {
     /// don't carry `TabKind` explicitly (PTY processor, launch-spec
     /// builder) branch without threading a separate metadata table.
     pub fn kind(&self) -> TabKind {
+        // V40 Phase A: "is this a reserved AI tab id" is the registry's
+        // question, not a variant list — a harness added later brings its tab
+        // ids with it, and this stops being a place to remember. `Ai(_)` is the
+        // spawned duplicate, which is an AI tab by construction.
+        if matches!(self, TabId::Ai(_))
+            || crate::harness::HarnessId::from_tab_id(self.as_str()).is_some()
+        {
+            return TabKind::AiTool;
+        }
         match self {
             TabId::Claude | TabId::ClaudeLocal | TabId::OpenCode | TabId::Ai(_) => TabKind::AiTool,
             // The reserved dashboards reuse Shell-kind for processing/state
@@ -561,7 +592,7 @@ impl TabId {
     /// close `×`; the spawn `+` is additionally gated on AI-tool kind).
     /// `tabs::registry`'s `is_builtin_id` delegates here.
     pub fn is_builtin(&self) -> bool {
-        matches!(self, TabId::Claude | TabId::ClaudeLocal | TabId::OpenCode)
+        crate::harness::HarnessId::from_tab_id(self.as_str()).is_some()
             || self.is_reserved_dashboard()
     }
 }
@@ -647,19 +678,60 @@ impl ErrorInfo {
 /// Same rule as v1, applied per-tab.
 const EMPTY_INPUT_IDLE: Duration = Duration::from_secs(5);
 
-/// Backstop for a wedged `agents_active`. The transcript is the authoritative
-/// signal — a `Task` id clears when its `tool_result` lands — but that result
-/// can be missing (the user pressed Esc to interrupt the agent), unparseable, or
-/// its `AgentsActiveChanged` edge dropped under channel backpressure, leaving the
-/// avatar stuck in Thinking forever. This forces it back to Idle when a tab has
-/// sat in Thinking with agents nominally active but the parent producing NO
-/// output for this long. Safe against a genuinely in-flight turn: Claude Code's
-/// footer (spinner + elapsed counter, which carries the `esc to interrupt`
-/// marker) repaints ~once/second while any turn is live, so `claude_output_active`
-/// stays true throughout real work and resets this timer every tick — only a
-/// truly stopped parent leaves it continuously false. Longer than the PTY's
-/// `CLAUDE_WORKING_STALE` (6 s) so the marker path always concludes first.
-const AGENTS_STALL_TIMEOUT: Duration = Duration::from_secs(8);
+/// Backstop for a wedged `subagents_active`, **sized by the harness whose
+/// sub-agents they are** (V40 Phase D, locked decision 18).
+///
+/// The reader is the authoritative signal — a sub-agent id clears when its
+/// result lands — but that result can be missing (the user interrupted), be
+/// unparseable, or have its `SubagentsActiveChanged` edge dropped under channel
+/// backpressure, leaving the avatar stuck in Thinking forever. This forces it
+/// back to Idle when a tab has sat in Thinking with sub-agents nominally active
+/// and the parent producing NO output for the harness's declared
+/// `subagents_stall`. Safe against a genuinely in-flight turn: a busy footer
+/// repaints while a turn is live, so `harness_output_active` stays true
+/// throughout real work and resets this timer every tick — only a truly stopped
+/// parent leaves it continuously false.
+///
+/// **The fallback is the longest declared value, not a constant.** A tab whose
+/// harness cannot be resolved (settings unreadable, a tab id nothing claims)
+/// must wait at least as long as any real harness would, because the failure
+/// mode of waiting too long is a late Idle, and the failure mode of releasing
+/// too early is clipping live work.
+fn subagents_stall_timeout(tab: &TabId, app: &AppHandle) -> Duration {
+    tab_activity_tuning(tab, app)
+        .map(|t| t.subagents_stall)
+        .unwrap_or_else(longest_declared_stall)
+}
+
+/// The tuning declared by the harness running in `tab`, or `None` when the tab
+/// names no registered harness.
+fn tab_activity_tuning(
+    tab: &TabId,
+    app: &AppHandle,
+) -> Option<crate::harness::plugin::ActivityTuning> {
+    let settings = app.try_state::<crate::ipc::AppState>()?.settings.current();
+    let harness = crate::tabs::tab_harness_by_id(&settings, tab.as_str())?;
+    match harness.plugin()?.activity_source() {
+        crate::harness::plugin::ActivitySource::TuiMarkers(t) => Some(t),
+        // An out-of-band harness declares no TUI timings; the backstop still
+        // has to have a value, so it takes the conservative one below.
+        crate::harness::plugin::ActivitySource::OutOfBand => None,
+    }
+}
+
+/// The longest `subagents_stall` any registered harness declares, or 8 s when
+/// none declares one — the pre-V40 constant, kept as the floor so a build with
+/// no TUI-marker harness behaves exactly as this code always did.
+fn longest_declared_stall() -> Duration {
+    crate::harness::registry::all()
+        .filter_map(|h| h.plugin())
+        .filter_map(|p| match p.activity_source() {
+            crate::harness::plugin::ActivitySource::TuiMarkers(t) => Some(t.subagents_stall),
+            crate::harness::plugin::ActivitySource::OutOfBand => None,
+        })
+        .max()
+        .unwrap_or(Duration::from_secs(8))
+}
 
 /// Tick rate for the auto-leave-Listening sweep across all tabs.
 const TICK: Duration = Duration::from_millis(500);
@@ -689,10 +761,10 @@ pub enum StateSignal {
     UserSubmit {
         tab: TabId,
     },
-    ClaudeOutputStarted {
+    HarnessOutputStarted {
         tab: TabId,
     },
-    ClaudeOutputStopped {
+    HarnessOutputStopped {
         tab: TabId,
     },
     /// Out-of-band (transcript): the count of in-flight `Task` sub-agents for
@@ -700,8 +772,8 @@ pub enum StateSignal {
     /// one or more agents and none had been running; `active: false` when the
     /// last outstanding agent's result lands. Holds the avatar in Thinking
     /// while agents run so a marker blink between agent batches can't settle it
-    /// to Idle. Emitted by `oob::claude`, which tails the transcript JSONL.
-    AgentsActiveChanged {
+    /// to Idle. Emitted by `harness::claude::read`, which tails the transcript JSONL.
+    SubagentsActiveChanged {
         tab: TabId,
         active: bool,
     },
@@ -832,9 +904,9 @@ impl StateSignal {
         match self {
             Self::UserKeystroke { tab }
             | Self::UserSubmit { tab }
-            | Self::ClaudeOutputStarted { tab }
-            | Self::ClaudeOutputStopped { tab }
-            | Self::AgentsActiveChanged { tab, .. }
+            | Self::HarnessOutputStarted { tab }
+            | Self::HarnessOutputStopped { tab }
+            | Self::SubagentsActiveChanged { tab, .. }
             | Self::TtsPlaybackStarted { tab }
             | Self::TtsPlaybackStopped { tab }
             | Self::TtsSelectionProgress { tab, .. }
@@ -984,23 +1056,23 @@ struct TabState {
     /// Enter routes to the Configure dialog instead of restart. Cleared
     /// on `ShellRestarted`.
     closed_message: Option<String>,
-    /// Set true between `ClaudeOutputStarted` and `ClaudeOutputStopped`.
+    /// Set true between `HarnessOutputStarted` and `HarnessOutputStopped`.
     /// Lets `Speaking → TtsPlaybackStopped` fall back to Thinking instead
     /// of Idle when Claude is still emitting output (the TTS tag was a
     /// commentary tag, not a final answer). Always false for Shell tabs.
-    claude_output_active: bool,
+    harness_output_active: bool,
     /// True while one or more `Task` sub-agents are in flight, per the
-    /// transcript (`AgentsActiveChanged`). Like `claude_output_active` it
+    /// transcript (`SubagentsActiveChanged`). Like `harness_output_active` it
     /// blocks the settle to Idle — while agents run the parent's `esc to
     /// interrupt` footer blinks, and neither the marker nor a byte pause means
     /// the turn is done. Always false for Shell tabs.
-    agents_active: bool,
-    /// When the `AGENTS_STALL_TIMEOUT` backstop first observed this tab wedged
-    /// (Thinking + `agents_active` + parent output quiet). `None` whenever that
+    subagents_active: bool,
+    /// When the sub-agent stall backstop first observed this tab wedged
+    /// (Thinking + `subagents_active` + parent output quiet). `None` whenever that
     /// condition doesn't hold; the tick sweep sets it on entry and forces Idle
     /// once it has held long enough. Guards against a `Task` whose result never
     /// arrives (Esc-interrupt, dropped edge) pinning the avatar in Thinking.
-    agents_stall_since: Option<Instant>,
+    subagents_stall_since: Option<Instant>,
 }
 
 impl TabState {
@@ -1018,9 +1090,9 @@ impl TabState {
             closed: false,
             closed_exit_code: None,
             closed_message: None,
-            claude_output_active: false,
-            agents_active: false,
-            agents_stall_since: None,
+            harness_output_active: false,
+            subagents_active: false,
+            subagents_stall_since: None,
         }
     }
 }
@@ -1234,7 +1306,7 @@ async fn run(
                 // is global (one voice), but it was armed against the tab the
                 // user Esc-silenced while looking at it. Clearing on ANY tab's
                 // output would let a background tab's output un-silence that tab.
-                if let StateSignal::ClaudeOutputStarted { tab } = &signal {
+                if let StateSignal::HarnessOutputStarted { tab } = &signal {
                     if *tab == active {
                         ai_tts_suppressed.store(false, std::sync::atomic::Ordering::SeqCst);
                     }
@@ -1410,30 +1482,30 @@ async fn run(
                             ts.last_keystroke_at = Some(Instant::now());
                         }
                     }
-                    StateSignal::ClaudeOutputStarted { .. } => {
-                        ts.claude_output_active = true;
+                    StateSignal::HarnessOutputStarted { .. } => {
+                        ts.harness_output_active = true;
                     }
-                    StateSignal::ClaudeOutputStopped { .. } => {
-                        ts.claude_output_active = false;
+                    StateSignal::HarnessOutputStopped { .. } => {
+                        ts.harness_output_active = false;
                     }
-                    StateSignal::AgentsActiveChanged { active, .. } => {
-                        ts.agents_active = *active;
+                    StateSignal::SubagentsActiveChanged { active, .. } => {
+                        ts.subagents_active = *active;
                     }
                     // Reset the output-active flag on any error edge / its
-                    // acknowledgment. A ClaudeOutputStarted with no matching
+                    // acknowledgment. A HarnessOutputStarted with no matching
                     // Stopped (the subprocess crashed or exited mid-output —
                     // the normal exit path) would otherwise leave the flag
                     // stuck true, so a later normal speech cycle resolves to
                     // Thinking instead of Idle (avatar sticks; no idle
                     // announcement). Runs before `transition()` below. Clear
-                    // `agents_active` too — a crash mid-agent-run would
+                    // `subagents_active` too — a crash mid-agent-run would
                     // otherwise leave the avatar wedged in Thinking forever.
                     StateSignal::SubprocessExited { .. }
                     | StateSignal::AudioError { .. }
                     | StateSignal::TtsError { .. }
                     | StateSignal::ErrorAcknowledged { .. } => {
-                        ts.claude_output_active = false;
-                        ts.agents_active = false;
+                        ts.harness_output_active = false;
+                        ts.subagents_active = false;
                     }
                     _ => {}
                 }
@@ -1472,8 +1544,8 @@ async fn run(
                         &signal,
                         ts.has_unsent_input,
                         ts.composing,
-                        ts.claude_output_active,
-                        ts.agents_active,
+                        ts.harness_output_active,
+                        ts.subagents_active,
                     )
                 };
                 if next != prev_state {
@@ -1513,20 +1585,21 @@ async fn run(
                 };
                 for (tab, ts) in tabs.iter_mut() {
                     // Agents-stall backstop. Recover a tab wedged in Thinking by
-                    // an `agents_active` that never cleared (Task result missing
+                    // an `subagents_active` that never cleared (Task result missing
                     // after an Esc-interrupt, unparseable, or its edge dropped).
                     // Only arms while the parent is producing NO output — a live
-                    // turn keeps `claude_output_active` true via the ~1 Hz footer
-                    // repaint, so this can't clip real work. See AGENTS_STALL_TIMEOUT.
+                    // turn keeps `harness_output_active` true via the ~1 Hz footer
+                    // repaint, so this can't clip real work. See
+                    // `subagents_stall_timeout`.
                     if ts.avatar_state == AvatarState::Thinking
-                        && ts.agents_active
-                        && !ts.claude_output_active
+                        && ts.subagents_active
+                        && !ts.harness_output_active
                     {
-                        let since = *ts.agents_stall_since.get_or_insert_with(Instant::now);
-                        if since.elapsed() >= AGENTS_STALL_TIMEOUT {
+                        let since = *ts.subagents_stall_since.get_or_insert_with(Instant::now);
+                        if since.elapsed() >= subagents_stall_timeout(tab, &app) {
                             info!(?tab, from = ?ts.avatar_state, to = ?AvatarState::Idle, signal = "AgentsStallTimeout", "avatar state");
-                            ts.agents_active = false;
-                            ts.agents_stall_since = None;
+                            ts.subagents_active = false;
+                            ts.subagents_stall_since = None;
                             ts.avatar_state = AvatarState::Idle;
                             emit_state(&app, &state_events, tab.clone(), ts.avatar_state);
                             if *tab != active && !ts.done_while_away {
@@ -1537,7 +1610,7 @@ async fn run(
                             continue;
                         }
                     } else {
-                        ts.agents_stall_since = None;
+                        ts.subagents_stall_since = None;
                     }
 
                     if ts.avatar_state != AvatarState::Listening { continue; }
@@ -1558,7 +1631,7 @@ async fn run(
                     // Forced back to Idle by inactivity — clear any lingering
                     // output-active flag so it can't drive a later speech cycle
                     // to Thinking.
-                    ts.claude_output_active = false;
+                    ts.harness_output_active = false;
                     emit_state(&app, &state_events, tab.clone(), ts.avatar_state);
                     if *tab != active && !ts.done_while_away {
                         ts.done_while_away = true;
@@ -1594,15 +1667,15 @@ fn transition(
     signal: &StateSignal,
     has_unsent_input: bool,
     composing: bool,
-    claude_output_active: bool,
-    agents_active: bool,
+    harness_output_active: bool,
+    subagents_active: bool,
 ) -> AvatarState {
     use AvatarState::*;
     use StateSignal::*;
 
     // Claude is still working — the marker/byte stream OR an in-flight
     // sub-agent. Either one blocks the settle to Idle.
-    let still_working = claude_output_active || agents_active;
+    let still_working = harness_output_active || subagents_active;
 
     if matches!(
         signal,
@@ -1640,8 +1713,8 @@ fn transition(
         (Thinking, TtsPlaybackStarted { .. }) => Speaking,
         // Output stopped, but hold Thinking while sub-agents are still running
         // — their results haven't landed, so the turn isn't done.
-        (Thinking, ClaudeOutputStopped { .. }) => {
-            if agents_active {
+        (Thinking, HarnessOutputStopped { .. }) => {
+            if subagents_active {
                 Thinking
             } else {
                 Idle
@@ -1649,8 +1722,8 @@ fn transition(
         }
         // The last agent finished (or a crash cleared the flag). Settle to Idle
         // only if Claude isn't also mid-output; otherwise stay Thinking and let
-        // the eventual ClaudeOutputStopped release it.
-        (Thinking, AgentsActiveChanged { .. }) => {
+        // the eventual HarnessOutputStopped release it.
+        (Thinking, SubagentsActiveChanged { .. }) => {
             if still_working {
                 Thinking
             } else {
@@ -1667,11 +1740,11 @@ fn transition(
         (Idle, TtsPlaybackStarted { .. }) => Speaking,
         // Claude began producing output without a fresh submit (resumed
         // session, slash command, hook-driven turn). The marker-driven
-        // ClaudeOutputStarted is reliable enough to surface Thinking.
-        (Idle, ClaudeOutputStarted { .. }) => Thinking,
+        // HarnessOutputStarted is reliable enough to surface Thinking.
+        (Idle, HarnessOutputStarted { .. }) => Thinking,
         // Agents launched while somehow Idle (out-of-band signal beat the
         // marker) — surface Thinking so the run doesn't look finished.
-        (Idle, AgentsActiveChanged { active, .. }) if *active => Thinking,
+        (Idle, SubagentsActiveChanged { active, .. }) if *active => Thinking,
         (Idle, _) => Idle,
     }
 }
@@ -1857,14 +1930,14 @@ mod tests {
 
     #[test]
     fn thinking_claude_done_returns_idle() {
-        assert_eq!(t(Thinking, ClaudeOutputStopped { tab: tab() }), Idle);
+        assert_eq!(t(Thinking, HarnessOutputStopped { tab: tab() }), Idle);
     }
 
     #[test]
     fn idle_claude_output_starts_thinking() {
-        // Marker-driven ClaudeOutputStarted surfaces Thinking even without a
+        // Marker-driven HarnessOutputStarted surfaces Thinking even without a
         // fresh UserSubmit (resumed session, slash command, hook turn).
-        assert_eq!(t(Idle, ClaudeOutputStarted { tab: tab() }), Thinking);
+        assert_eq!(t(Idle, HarnessOutputStarted { tab: tab() }), Thinking);
     }
 
     #[test]
@@ -1992,8 +2065,8 @@ mod tests {
                 &TtsPlaybackStopped { tab: tab() },
                 true,  // has_unsent_input
                 false, // composing
-                true,  // claude_output_active
-                false, // agents_active
+                true,  // harness_output_active
+                false, // subagents_active
             ),
             Listening
         );
@@ -2001,25 +2074,25 @@ mod tests {
 
     #[test]
     fn thinking_output_stopped_holds_while_agents_run() {
-        // The parent's `esc to interrupt` footer blinked out (ClaudeOutputStopped)
+        // The parent's `esc to interrupt` footer blinked out (HarnessOutputStopped)
         // while sub-agents are still in flight — hold Thinking, don't settle to
         // Idle (this is the flicker + repeated-"idle" bug).
         assert_eq!(
-            t_with_agents(Thinking, ClaudeOutputStopped { tab: tab() }),
+            t_with_agents(Thinking, HarnessOutputStopped { tab: tab() }),
             Thinking
         );
         // With no agents running the same signal settles to Idle as before.
-        assert_eq!(t(Thinking, ClaudeOutputStopped { tab: tab() }), Idle);
+        assert_eq!(t(Thinking, HarnessOutputStopped { tab: tab() }), Idle);
     }
 
     #[test]
     fn agents_finishing_settles_to_idle_when_output_quiet() {
-        // Last agent's result landed (agents_active already flipped false in the
+        // Last agent's result landed (subagents_active already flipped false in the
         // caller) and Claude isn't mid-output — settle to Idle.
         assert_eq!(
             t(
                 Thinking,
-                AgentsActiveChanged {
+                SubagentsActiveChanged {
                     tab: tab(),
                     active: false
                 }
@@ -2031,11 +2104,11 @@ mod tests {
     #[test]
     fn agents_finishing_holds_thinking_while_output_active() {
         // Agents done but Claude is streaming its final answer — stay Thinking
-        // and let the eventual ClaudeOutputStopped release to Idle.
+        // and let the eventual HarnessOutputStopped release to Idle.
         assert_eq!(
             t_with_output(
                 Thinking,
-                AgentsActiveChanged {
+                SubagentsActiveChanged {
                     tab: tab(),
                     active: false
                 }
@@ -2050,7 +2123,7 @@ mod tests {
         assert_eq!(
             t(
                 Idle,
-                AgentsActiveChanged {
+                SubagentsActiveChanged {
                     tab: tab(),
                     active: true
                 }

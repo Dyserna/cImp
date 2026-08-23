@@ -575,9 +575,14 @@ static CONSUMER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 /// `build_opencode_config`) have sent `--tab` since V32 C-1b.
 static TAB: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
-/// The configured consumer name, lowercased; `"claude"` when unset.
+/// The configured consumer name, lowercased; [`DEFAULT_HARNESS`] when unset —
+/// a child spawned before the flag existed, see that constant's doc comment.
+///
+/// [`DEFAULT_HARNESS`]: crate::harness::DEFAULT_HARNESS
 fn consumer() -> &'static str {
-    CONSUMER.get().map(String::as_str).unwrap_or("claude")
+    CONSUMER.get().map(String::as_str).unwrap_or_else(|| crate::harness::DEFAULT_HARNESS
+        .id()
+        .expect("DEFAULT_HARNESS names a registered harness"))
 }
 
 /// This child's tab id, or `None` when it was spawned without one.

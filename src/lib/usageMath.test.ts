@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'vitest';
 import {
+
   turnTotal,
   maxTurnTotal,
   barHeightPct,
@@ -28,6 +29,7 @@ import {
   FREE_RATES,
   originKindTotals,
   kindsTotal,
+  laneLabel,
   donutArcs,
   arcPath,
   fmtPct,
@@ -35,10 +37,34 @@ import {
   type CostOverride,
 } from './usageMath';
 
+import { FIRST_HARNESS } from './harness.fixture';
+
+// V40 Phase F: every harness id below comes from the committed registry fixture
+// (`harness.fixture.ts`), so this suite names no product and re-points itself
+// when the registry changes.
+const H1 = FIRST_HARNESS.id;
+
+// V40 Phase G: a turn's tokens are a DECLARED-CATEGORY map now. `turn()` takes
+// the same four names the suite has always used and emits them under the four
+// pricing ids (`input` / `cache_read` / `cache_write` / `output`), so every
+// existing expectation below still asserts the same arithmetic on the same
+// numbers — which is the point: this refactor must not move a single rendered
+// figure.
+function kinds(
+  over: Partial<{ in_tok: number; cache_read: number; cache_make: number; out_tok: number }> = {},
+): Record<string, number> {
+  return {
+    input: over.in_tok ?? 0,
+    cache_read: over.cache_read ?? 0,
+    cache_write: over.cache_make ?? 0,
+    output: over.out_tok ?? 0,
+  };
+}
+
 function turn(
   over: Partial<{ in_tok: number; cache_read: number; cache_make: number; out_tok: number; tool_chars: number }>,
 ) {
-  return { in_tok: 0, cache_read: 0, cache_make: 0, out_tok: 0, tool_chars: 0, ...over };
+  return { tokens: kinds(over), tool_chars: over.tool_chars ?? 0 };
 }
 
 describe('turnTotal', () => {
@@ -88,14 +114,26 @@ describe('barHeightPct', () => {
 });
 
 describe('cacheHitRatio', () => {
-  test('matches the backend formula: cache_read / (cache_read + in_tok)', () => {
-    expect(cacheHitRatio(75, 25)).toBe(0.75);
-    expect(cacheHitRatio(0, 100)).toBe(0);
-    expect(cacheHitRatio(100, 0)).toBe(1);
+  test('matches the backend formula: cache_read / (cache_read + input)', () => {
+    expect(cacheHitRatio(kinds({ cache_read: 75, in_tok: 25 }))).toBe(0.75);
+    expect(cacheHitRatio(kinds({ cache_read: 0, in_tok: 100 }))).toBe(0);
+    expect(cacheHitRatio(kinds({ cache_read: 100, in_tok: 0 }))).toBe(1);
   });
 
-  test('no denominator (nothing recorded yet) is 0, not NaN', () => {
-    expect(cacheHitRatio(0, 0)).toBe(0);
+  test('no denominator (nothing recorded yet) is null, not 0 and not NaN', () => {
+    expect(cacheHitRatio(kinds())).toBeNull();
+  });
+
+  test('a harness that declares neither category has no ratio at all', () => {
+    // V40 Phase G: absence is not zero. A harness billing one flat token
+    // number reports no `cache_read` and no `input`, and "0% cache hit" would
+    // be a claim it never made.
+    expect(cacheHitRatio({ output: 500 })).toBeNull();
+  });
+
+  test('a partially declared shape still divides by what it has', () => {
+    expect(cacheHitRatio({ input: 100 })).toBe(0);
+    expect(cacheHitRatio({ cache_read: 100 })).toBe(1);
   });
 });
 
@@ -152,9 +190,9 @@ describe('costUsd', () => {
 describe('sessionCost', () => {
   const rates = { input: 5, cache_write: 6.25, cache_read: 0.5, output: 25 };
 
-  test('maps each UsageTotals category to its rate and sums the total', () => {
+  test('maps each declared category to its rate and sums the total', () => {
     const c = sessionCost(
-      { in_tok: 1_000_000, cache_make: 2_000_000, cache_read: 4_000_000, out_tok: 100_000 },
+      kinds({ in_tok: 1_000_000, cache_make: 2_000_000, cache_read: 4_000_000, out_tok: 100_000 }),
       rates,
     );
     expect(c.input).toBe(5);
@@ -165,25 +203,37 @@ describe('sessionCost', () => {
   });
 
   test('an all-zero session costs zero', () => {
-    const c = sessionCost({ in_tok: 0, cache_make: 0, cache_read: 0, out_tok: 0 }, rates);
-    expect(c.total).toBe(0);
+    expect(sessionCost(kinds(), rates).total).toBe(0);
+  });
+
+  test('an ABSENT category costs nothing rather than throwing or NaN-ing', () => {
+    // V40 Phase G: a harness that does not bill cache tokens reports no
+    // `cache_read` / `cache_write` key at all. You cannot be charged for
+    // tokens nobody reported, so absence prices at $0 — the one place reading
+    // absence as zero is honest.
+    const c = sessionCost({ input: 1_000_000, output: 100_000 }, rates);
+    expect(c.input).toBe(5);
+    expect(c.output).toBe(2.5);
+    expect(c.cache_read).toBe(0);
+    expect(c.cache_write).toBe(0);
+    expect(c.total).toBe(7.5);
   });
 });
 
 describe('matchPricing (V16 Feature 8)', () => {
   const rates = { input: 5, cache_write: 10, cache_read: 0.5, output: 25 };
   const rows = [
-    { model_prefix: 'claude-opus-4', name: 'family', ...rates },
-    { model_prefix: 'claude-opus-4-8', name: 'exact', ...rates },
+    { model_prefix: 'vendor-opus-4', name: 'family', ...rates },
+    { model_prefix: 'vendor-opus-4-8', name: 'exact', ...rates },
     { model_prefix: '', name: 'manual-only', ...rates },
   ];
 
   test('longest matching prefix wins', () => {
-    expect(matchPricing('claude-opus-4-8', rows)?.name).toBe('exact');
+    expect(matchPricing('vendor-opus-4-8', rows)?.name).toBe('exact');
     // A dated snapshot still hits the longest prefix.
-    expect(matchPricing('claude-opus-4-8-20260115', rows)?.name).toBe('exact');
+    expect(matchPricing('vendor-opus-4-8-20260115', rows)?.name).toBe('exact');
     // A sibling model falls back to the shorter family prefix.
-    expect(matchPricing('claude-opus-4-7', rows)?.name).toBe('family');
+    expect(matchPricing('vendor-opus-4-7', rows)?.name).toBe('family');
   });
 
   test('empty prefixes never auto-match; unknown models match nothing', () => {
@@ -199,7 +249,7 @@ describe('turnCost (V16 Feature 8)', () => {
 
   test('prices each segment at its own rate; tool chars bill at input rate on chars/4', () => {
     const c = turnCost(
-      { in_tok: 1_000_000, cache_read: 1_000_000, cache_make: 1_000_000, out_tok: 1_000_000, tool_chars: 4_000_000 },
+      turn({ in_tok: 1_000_000, cache_read: 1_000_000, cache_make: 1_000_000, out_tok: 1_000_000, tool_chars: 4_000_000 }),
       rates,
     );
     expect(c.input).toBe(5);
@@ -211,14 +261,12 @@ describe('turnCost (V16 Feature 8)', () => {
   });
 
   test('an all-zero turn costs zero', () => {
-    expect(
-      turnCost({ in_tok: 0, cache_read: 0, cache_make: 0, out_tok: 0, tool_chars: 0 }, rates).total,
-    ).toBe(0);
+    expect(turnCost(turn({}), rates).total).toBe(0);
   });
 });
 
 describe('laneSegments (V24 Phase C)', () => {
-  const o = (...origins: ('session' | 'agent')[]) => origins.map((origin) => ({ origin }));
+  const o = (...origins: string[]) => origins.map((origin) => ({ origin }));
 
   test('merges contiguous same-origin runs into segments', () => {
     // S S A A A S  ->  S×2, A×3, S×1
@@ -239,6 +287,17 @@ describe('laneSegments (V24 Phase C)', () => {
   test('labels: session -> S, agent -> A', () => {
     const segs = laneSegments(o('agent', 'session'));
     expect(segs.map((s) => s.label)).toEqual(['A', 'S']);
+  });
+
+  test('a THIRD declared lane gets its own badge instead of borrowing S', () => {
+    // V40 Phase G: the badge is the first character of the declared id, so a
+    // harness with a lane the two shipped ones do not have is representable.
+    // Pre-G the label was `origin === 'agent' ? 'A' : 'S'`, which silently
+    // rendered every unknown lane as the main session's letter.
+    expect(laneSegments(o('review', 'session')).map((s) => s.label)).toEqual(['R', 'S']);
+    expect(laneLabel('session')).toBe('S');
+    expect(laneLabel('agent')).toBe('A');
+    expect(laneLabel('')).toBe('?');
   });
 
   test('alternating origins yield one segment per turn', () => {
@@ -273,9 +332,20 @@ describe('laneLabelVisible (V24 Phase C)', () => {
 });
 
 describe('agentBarClass (V24 Phase C)', () => {
-  test('agent turns get the "agent" class, session turns none', () => {
-    expect(agentBarClass('agent')).toBe('agent');
-    expect(agentBarClass('session')).toBe('');
+  test('a DECLARED sub-agent lane gets the "agent" class, the main lane none', () => {
+    expect(agentBarClass('agent', ['agent'])).toBe('agent');
+    expect(agentBarClass('session', ['agent'])).toBe('');
+  });
+
+  test('no declaration yet ⇒ no bar is marked (never marked by guess)', () => {
+    // V40 Phase G: which lane is the fan-out one is the harness's statement
+    // (`origins[].subagent`), not the word "agent". Before the declaration
+    // arrives the chart is un-annotated rather than annotated wrongly.
+    expect(agentBarClass('agent', [])).toBe('');
+  });
+
+  test('another harness can name its fan-out lane something else', () => {
+    expect(agentBarClass('worker', ['worker'])).toBe('agent');
   });
 });
 
@@ -306,12 +376,12 @@ describe('isEmptyDetailRow (V24 Phase C — vanished-session guard)', () => {
     expect(isEmptyDetailRow({ agent: '', started_ms: 0 })).toBe(true);
   });
   test('a real row is never treated as empty', () => {
-    expect(isEmptyDetailRow({ agent: 'claude', started_ms: 1_700_000_000_000 })).toBe(false);
+    expect(isEmptyDetailRow({ agent: H1, started_ms: 1_700_000_000_000 })).toBe(false);
   });
   test('only-one-field-set is not the sentinel (needs BOTH blank agent and zero ts)', () => {
     // A live session started exactly at epoch 0 would still carry an agent;
     // an agent-less row with a real timestamp shouldn't be a real session.
-    expect(isEmptyDetailRow({ agent: 'claude', started_ms: 0 })).toBe(false);
+    expect(isEmptyDetailRow({ agent: H1, started_ms: 0 })).toBe(false);
     expect(isEmptyDetailRow({ agent: '', started_ms: 1 })).toBe(false);
   });
 });
@@ -364,15 +434,15 @@ describe('Cost card pricing (V24 Phase D)', () => {
   // Identified rows (provider + model give each a stable key) — the shape the
   // stable-identity resolver keys overrides against.
   const rows = [
-    { provider: 'anthropic', model: 'opus-4-family', model_prefix: 'claude-opus-4', ...rates },
-    { provider: 'anthropic', model: 'opus-4-8', model_prefix: 'claude-opus-4-8', ...rates },
-    { provider: 'anthropic', model: 'manual-only', model_prefix: '', ...rates },
+    { provider: 'vendor', model: 'opus-4-family', model_prefix: 'vendor-opus-4', ...rates },
+    { provider: 'vendor', model: 'opus-4-8', model_prefix: 'vendor-opus-4-8', ...rates },
+    { provider: 'vendor', model: 'manual-only', model_prefix: '', ...rates },
   ];
 
   describe('matchPricingIndex', () => {
     test('returns the index of the longest-prefix match', () => {
-      expect(matchPricingIndex('claude-opus-4-8-20260115', rows)).toBe(1); // exact
-      expect(matchPricingIndex('claude-opus-4-7', rows)).toBe(0); // family
+      expect(matchPricingIndex('vendor-opus-4-8-20260115', rows)).toBe(1); // exact
+      expect(matchPricingIndex('vendor-opus-4-7', rows)).toBe(0); // family
     });
     test('-1 when nothing matches (unknown model, empty/blank prefixes only)', () => {
       expect(matchPricingIndex('gpt-5.5', rows)).toBe(-1);
@@ -383,8 +453,8 @@ describe('Cost card pricing (V24 Phase D)', () => {
 
   describe('matchPricing (row form ≡ index form)', () => {
     test('returns the same row matchPricingIndex points at', () => {
-      expect(matchPricing('claude-opus-4-8-20260115', rows)).toBe(rows[1]);
-      expect(matchPricing('claude-opus-4-7', rows)).toBe(rows[0]);
+      expect(matchPricing('vendor-opus-4-8-20260115', rows)).toBe(rows[1]);
+      expect(matchPricing('vendor-opus-4-7', rows)).toBe(rows[0]);
     });
     test('null when the index form returns -1', () => {
       expect(matchPricing('gpt-5.5', rows)).toBeNull();
@@ -394,7 +464,7 @@ describe('Cost card pricing (V24 Phase D)', () => {
 
   describe('pricingRowKey (stable identity)', () => {
     test('is provider + " " + model', () => {
-      expect(pricingRowKey(rows[1])).toBe('anthropic opus-4-8');
+      expect(pricingRowKey(rows[1])).toBe('vendor opus-4-8');
     });
   });
 
@@ -402,8 +472,8 @@ describe('Cost card pricing (V24 Phase D)', () => {
     const CUSTOM = rows.length;
     const FREE = rows.length + 1;
     test('no override → auto-match by longest prefix', () => {
-      expect(costSelIdx('claude-opus-4-8-x', undefined, rows)).toBe(1);
-      expect(costSelIdx('claude-opus-4-7', undefined, rows)).toBe(0);
+      expect(costSelIdx('vendor-opus-4-8-x', undefined, rows)).toBe(1);
+      expect(costSelIdx('vendor-opus-4-7', undefined, rows)).toBe(0);
     });
     test('no override + no match → Custom sentinel (never a made-up cost)', () => {
       expect(costSelIdx('gpt-5.5', undefined, rows)).toBe(CUSTOM);
@@ -411,30 +481,30 @@ describe('Cost card pricing (V24 Phase D)', () => {
     });
     test('a row override resolves to that row\'s CURRENT index', () => {
       const ov: CostOverride = { kind: 'row', key: pricingRowKey(rows[0]) };
-      expect(costSelIdx('claude-opus-4-8-x', ov, rows)).toBe(0); // wins over auto-match
+      expect(costSelIdx('vendor-opus-4-8-x', ov, rows)).toBe(0); // wins over auto-match
     });
     test('a row override survives table REORDER (keyed, not positional)', () => {
       const ov: CostOverride = { kind: 'row', key: pricingRowKey(rows[1]) };
       const reordered = [rows[2], rows[1], rows[0]];
-      expect(costSelIdx('claude-opus-4-8-x', ov, reordered)).toBe(1); // still the opus-4-8 row
+      expect(costSelIdx('vendor-opus-4-8-x', ov, reordered)).toBe(1); // still the opus-4-8 row
     });
     test('a VANISHED row key falls back to auto-match, not silently Free', () => {
       const ov: CostOverride = { kind: 'row', key: 'anthropic gone' };
       // auto-match still finds opus-4-8 for this model:
-      expect(costSelIdx('claude-opus-4-8-x', ov, rows)).toBe(1);
+      expect(costSelIdx('vendor-opus-4-8-x', ov, rows)).toBe(1);
       // and Custom when the model itself no longer matches anything:
       expect(costSelIdx('gpt-5.5', ov, rows)).toBe(CUSTOM);
     });
     test('custom / free overrides map to their sentinels', () => {
-      expect(costSelIdx('claude-opus-4-8-x', { kind: 'custom' }, rows)).toBe(CUSTOM);
-      expect(costSelIdx('claude-opus-4-8-x', { kind: 'free' }, rows)).toBe(FREE);
+      expect(costSelIdx('vendor-opus-4-8-x', { kind: 'custom' }, rows)).toBe(CUSTOM);
+      expect(costSelIdx('vendor-opus-4-8-x', { kind: 'free' }, rows)).toBe(FREE);
     });
   });
 
   describe('costRowState (selIdx + rates + matchedRow)', () => {
     const custom: PriceRates = { input: 1, cache_write: 2, cache_read: 3, output: 4 };
     test('auto-matched row: rates are that row, matchedRow set', () => {
-      const st = costRowState('claude-opus-4-8-x', undefined, rows, custom);
+      const st = costRowState('vendor-opus-4-8-x', undefined, rows, custom);
       expect(st.selIdx).toBe(1);
       expect(st.rates).toBe(rows[1]);
       expect(st.matchedRow).toBe(rows[1]);
@@ -446,13 +516,13 @@ describe('Cost card pricing (V24 Phase D)', () => {
       expect(st.matchedRow).toBeNull();
     });
     test('free override: all-zero rates regardless of the model', () => {
-      const st = costRowState('claude-opus-4-8-x', { kind: 'free' }, rows, custom);
+      const st = costRowState('vendor-opus-4-8-x', { kind: 'free' }, rows, custom);
       expect(st.rates).toEqual(FREE_RATES);
       // matchedRow still reflects the auto-match (for the provider label):
       expect(st.matchedRow).toBe(rows[1]);
     });
     test('vanished row key: rates fall back to the auto-matched row', () => {
-      const st = costRowState('claude-opus-4-8-x', { kind: 'row', key: 'gone gone' }, rows, custom);
+      const st = costRowState('vendor-opus-4-8-x', { kind: 'row', key: 'gone gone' }, rows, custom);
       expect(st.rates).toBe(rows[1]);
     });
   });
@@ -495,7 +565,7 @@ describe('Cost card pricing (V24 Phase D)', () => {
     });
     test('Free rates price any session at $0', () => {
       const c = sessionCost(
-        { in_tok: 5_000_000, cache_make: 5_000_000, cache_read: 5_000_000, out_tok: 5_000_000 },
+        kinds({ in_tok: 5_000_000, cache_make: 5_000_000, cache_read: 5_000_000, out_tok: 5_000_000 }),
         resolveRates(rows.length + 1, rows, custom),
       );
       expect(c.total).toBe(0);
@@ -507,8 +577,8 @@ describe('Cost card pricing (V24 Phase D)', () => {
     const opus: PriceRates = { input: 15, cache_write: 18.75, cache_read: 1.5, output: 75 };
     const fable: PriceRates = { input: 1, cache_write: 1.25, cache_read: 0.1, output: 5 };
     const perModel = [
-      { model: 'claude-opus-4-8', totals: { in_tok: 1_000_000, out_tok: 1_000_000, cache_read: 0, cache_make: 0 } },
-      { model: 'claude-fable-2', totals: { in_tok: 2_000_000, out_tok: 0, cache_read: 0, cache_make: 0 } },
+      { model: 'vendor-opus-4-8', totals: kinds({ in_tok: 1_000_000, out_tok: 1_000_000 }) },
+      { model: 'vendor-fable-2', totals: kinds({ in_tok: 2_000_000 }) },
     ];
 
     test('sums each model row at its own rates', () => {
@@ -529,14 +599,48 @@ describe('Cost card pricing (V24 Phase D)', () => {
     });
   });
 
-  describe('originShareLine (S/A share formatting)', () => {
-    test('formats both origins with fmtTok', () => {
-      expect(originShareLine({ session_tok: 12_300, agent_tok: 4_100 })).toBe(
-        'session 12k · agents 4.1k tok',
+  describe('originShareLine (lane share formatting)', () => {
+    const TWO = [
+      { id: 'session', label: 'main session' },
+      { id: 'agent', label: 'sub-agents' },
+    ];
+
+    test('formats every declared lane with fmtTok, under the names it is given', () => {
+      expect(originShareLine({ session: 12_300, agent: 4_100 }, TWO)).toBe(
+        'main session 12k · sub-agents 4.1k tok',
       );
     });
-    test('a session with no agent fan-out still shows both sides', () => {
-      expect(originShareLine({ session_tok: 500, agent_tok: 0 })).toBe('session 500 · agents 0 tok');
+
+    test('lanes with no declared name fall back to their ids, never to a guess', () => {
+      // V40 Phase F: the wording is the harness's declared origins; a build
+      // whose registry has not answered renders the bare lane ids rather than
+      // one harness's phrasing under another's numbers.
+      expect(
+        originShareLine({ session: 12_300, agent: 4_100 }, [{ id: 'session' }, { id: 'agent' }]),
+      ).toBe('session 12k · agent 4.1k tok');
+    });
+
+    test('a session with no fan-out still shows every declared lane', () => {
+      expect(
+        originShareLine({ session: 500 }, [
+          { id: 'session', label: 'main' },
+          { id: 'agent', label: 'subs' },
+        ]),
+      ).toBe('main 500 · subs 0 tok');
+    });
+
+    test('ONE lane, and THREE lanes, both print — the pre-G shape could do neither', () => {
+      // `OriginSplit { session_tok, agent_tok }` was a closed pair: a harness
+      // with no fan-out rendered a fabricated "sub-agents 0", and a harness
+      // with a third lane had nowhere to put it.
+      expect(originShareLine({ solo: 900 }, [{ id: 'solo', label: 'turns' }])).toBe('turns 900 tok');
+      expect(
+        originShareLine({ a: 1, b: 2, c: 3 }, [{ id: 'a' }, { id: 'b' }, { id: 'c' }]),
+      ).toBe('a 1 · b 2 · c 3 tok');
+    });
+
+    test('no declared lanes ⇒ no line at all, rather than an empty "tok"', () => {
+      expect(originShareLine({ session: 500 }, [])).toBe('');
     });
   });
 });
@@ -559,30 +663,217 @@ describe('fmtUsd', () => {
 
 describe('originKindTotals', () => {
   const t = (
-    origin: 'session' | 'agent',
+    origin: string,
     over: Partial<{ in_tok: number; cache_read: number; cache_make: number; out_tok: number }> = {},
-  ) => ({ in_tok: 0, cache_read: 0, cache_make: 0, out_tok: 0, ...over, origin });
+  ) => ({ tokens: kinds(over), origin });
 
-  test('splits kind sums by origin', () => {
+  test('splits category sums by lane', () => {
     const out = originKindTotals([
       t('session', { in_tok: 10, cache_read: 100, cache_make: 5, out_tok: 20 }),
       t('agent', { in_tok: 1, cache_read: 50, out_tok: 2 }),
       t('session', { in_tok: 3, out_tok: 4 }),
     ]);
-    expect(out.session).toEqual({ in_tok: 13, out_tok: 24, cache_read: 100, cache_make: 5 });
-    expect(out.agent).toEqual({ in_tok: 1, out_tok: 2, cache_read: 50, cache_make: 0 });
+    expect(out.session).toEqual({ input: 13, output: 24, cache_read: 100, cache_write: 5 });
+    expect(out.agent).toEqual({ input: 1, output: 2, cache_read: 50, cache_write: 0 });
   });
 
-  test('empty turn series yields all-zero origins', () => {
-    const out = originKindTotals([]);
+  test('a declared lane with no turns keeps an (empty) entry so its legend row survives', () => {
+    const out = originKindTotals([], ['session', 'agent']);
     expect(kindsTotal(out.session)).toBe(0);
     expect(kindsTotal(out.agent)).toBe(0);
+    // Empty, not four zeros: nothing was reported for it.
+    expect(out.session).toEqual({});
+  });
+
+  test('a lane present only in the DATA is still counted', () => {
+    // The declaration is a poll away; a stored row must never be dropped
+    // because it has not landed yet.
+    const out = originKindTotals([t('review', { in_tok: 7 })], ['session']);
+    expect(kindsTotal(out.review)).toBe(7);
+    expect(Object.keys(out).sort()).toEqual(['review', 'session']);
   });
 });
 
 describe('kindsTotal', () => {
-  test('sums the four exact kinds (no tool estimate)', () => {
-    expect(kindsTotal({ in_tok: 1, out_tok: 2, cache_read: 3, cache_make: 4 })).toBe(10);
+  test('sums every reported category (no tool estimate)', () => {
+    expect(kindsTotal({ input: 1, output: 2, cache_read: 3, cache_write: 4 })).toBe(10);
+  });
+
+  test('a harness reporting one flat number totals that number', () => {
+    expect(kindsTotal({ tokens: 42 })).toBe(42);
+    expect(kindsTotal({})).toBe(0);
+  });
+});
+
+// ── V40 Phase G: the declared-shape refactor moves NO rendered number ───────
+//
+// The whole risk of turning four fixed token fields into a declared-category
+// map, and two fixed lanes into declared ids, is that a figure the dashboard
+// prints today quietly changes. This block is the fixture proof it does not:
+// one realistic two-lane, two-model, four-category session, fed through the
+// NEW math, asserted against the numbers the OLD shape produced — computed
+// here by hand from the same inputs, not by calling the new code twice.
+
+describe('V40 Phase G parity: a two-lane four-category session renders unchanged', () => {
+  // A `SessionUsageDetail`-shaped payload for a harness declaring the four
+  // pricing categories and the two lanes (`session` false / `agent` true) —
+  // i.e. exactly what the backend now answers for a session of the first
+  // registered harness.
+  const LANES = [
+    { id: 'session', label: 'main session', subagent: false },
+    { id: 'agent', label: 'sub-agents', subagent: true },
+  ];
+  const SUBAGENT_LANES = LANES.filter((l) => l.subagent).map((l) => l.id);
+
+  // Six turns: four main-session, two sidechain, two models.
+  const turns = [
+    { origin: 'session', tokens: kinds({ in_tok: 1200, cache_read: 18_000, cache_make: 900, out_tok: 350 }), tool_chars: 4000 },
+    { origin: 'session', tokens: kinds({ in_tok: 800, cache_read: 22_000, cache_make: 0, out_tok: 610 }), tool_chars: 0 },
+    { origin: 'agent', tokens: kinds({ in_tok: 300, cache_read: 5_000, cache_make: 120, out_tok: 90 }), tool_chars: 250 },
+    { origin: 'agent', tokens: kinds({ in_tok: 150, cache_read: 4_400, cache_make: 0, out_tok: 45 }), tool_chars: 0 },
+    { origin: 'session', tokens: kinds({ in_tok: 640, cache_read: 26_500, cache_make: 1_500, out_tok: 1_020 }), tool_chars: 12_000 },
+    { origin: 'session', tokens: kinds({ in_tok: 90, cache_read: 30_100, cache_make: 0, out_tok: 75 }), tool_chars: 0 },
+  ];
+
+  // The whole-session totals the Sessions row shows.
+  const totals = kinds({ in_tok: 3180, cache_read: 106_000, cache_make: 2_520, out_tok: 2_190 });
+
+  test('lane totals and their donut shares are the pre-G numbers', () => {
+    const byLane = originKindTotals(turns, LANES.map((l) => l.id));
+    // Hand-summed from the six turns above.
+    expect(kindsTotal(byLane.session)).toBe(
+      1200 + 18_000 + 900 + 350 + (800 + 22_000 + 0 + 610) + (640 + 26_500 + 1_500 + 1_020) + (90 + 30_100 + 0 + 75),
+    );
+    expect(kindsTotal(byLane.session)).toBe(103_785);
+    expect(kindsTotal(byLane.agent)).toBe(300 + 5_000 + 120 + 90 + (150 + 4_400 + 0 + 45));
+    expect(kindsTotal(byLane.agent)).toBe(10_105);
+
+    // The outer ring: two arcs, in declared order, with the same shares the
+    // closed `{ session_tok, agent_tok }` pair produced.
+    const arcs = donutArcs(
+      LANES.map((l) => ({ key: l.id, value: kindsTotal(byLane[l.id]) })),
+      2 / 54,
+    );
+    expect(arcs.map((a) => a.key)).toEqual(['session', 'agent']);
+    expect(arcs[0].value).toBe(103_785);
+    expect(arcs[1].value).toBe(10_105);
+    const grand = 103_785 + 10_105;
+    expect(arcs[0].share).toBeCloseTo(103_785 / grand, 12);
+    expect(arcs[1].share).toBeCloseTo(10_105 / grand, 12);
+    expect(fmtPct(arcs[0].share)).toBe('91%');
+    expect(fmtPct(arcs[1].share)).toBe('9%');
+    expect(fmtTok(grand)).toBe('114k');
+  });
+
+  test('the inner ring keeps its per-lane category split, in the same order', () => {
+    const byLane = originKindTotals(turns, LANES.map((l) => l.id));
+    const KIND_ORDER = ['input', 'cache_read', 'cache_write', 'output'];
+    const inner = donutArcs(
+      LANES.flatMap((l) =>
+        KIND_ORDER.map((k) => ({ key: `${l.id}:${k}`, value: byLane[l.id][k] ?? 0 })),
+      ),
+      2 / 35,
+    );
+    // `donutArcs` drops zero-valued segments, so this is the same set of arcs
+    // the four-field shape produced for the same numbers.
+    expect(inner.map((a) => a.key)).toEqual([
+      'session:input',
+      'session:cache_read',
+      'session:cache_write',
+      'session:output',
+      'agent:input',
+      'agent:cache_read',
+      'agent:cache_write',
+      'agent:output',
+    ]);
+    expect(inner.map((a) => a.value)).toEqual([
+      2730, 96_600, 2_400, 2_055, 450, 9_400, 120, 135,
+    ]);
+    // Nested rings stay aligned: each lane's inner arcs span its outer arc.
+    const outer = donutArcs(
+      LANES.map((l) => ({ key: l.id, value: kindsTotal(byLane[l.id]) })),
+      2 / 54,
+    );
+    expect(inner[3].a1).toBeLessThanOrEqual(outer[1].a0 + 1e-9);
+    expect(inner[4].a0).toBeGreaterThanOrEqual(outer[0].a1 - 1e-9);
+  });
+
+  test('the S/A lane strip segments and badges are unchanged', () => {
+    expect(laneSegments(turns)).toEqual([
+      { origin: 'session', label: 'S', count: 2 },
+      { origin: 'agent', label: 'A', count: 2 },
+      { origin: 'session', label: 'S', count: 2 },
+    ]);
+    expect(turns.map((t) => agentBarClass(t.origin, SUBAGENT_LANES))).toEqual([
+      '', '', 'agent', 'agent', '', '',
+    ]);
+  });
+
+  test('bar heights and the chart denominator are unchanged', () => {
+    // turnTotal = every category + round(tool_chars / 4), exactly as before.
+    expect(turns.map(turnTotal)).toEqual([
+      1200 + 18_000 + 900 + 350 + 1000,
+      800 + 22_000 + 610,
+      300 + 5_000 + 120 + 90 + 63,
+      150 + 4_400 + 45,
+      640 + 26_500 + 1_500 + 1_020 + 3_000,
+      90 + 30_100 + 75,
+    ]);
+    expect(maxTurnTotal(turns)).toBe(32_660);
+    expect(barHeightPct(turnTotal(turns[0]), maxTurnTotal(turns))).toBeCloseTo(
+      (21_450 / 32_660) * 100,
+      12,
+    );
+  });
+
+  test('the Sessions row: totals, cache-hit and cost are the same figures', () => {
+    const rates: PriceRates = { input: 15, cache_write: 18.75, cache_read: 1.5, output: 75 };
+    // The four cells the row prints.
+    expect(fmtTok(totals.input)).toBe('3.2k');
+    expect(fmtTok(totals.cache_write)).toBe('2.5k');
+    expect(fmtTok(totals.cache_read)).toBe('106k');
+    expect(fmtTok(totals.output)).toBe('2.2k');
+    // cache_read / (cache_read + input) — the pre-G formula, same inputs.
+    expect(cacheHitRatio(totals)).toBeCloseTo(106_000 / (106_000 + 3_180), 12);
+    expect(Math.round((cacheHitRatio(totals) ?? 0) * 100)).toBe(97);
+    // Cost: the direct key lookup bills each category at the rate the
+    // hand-written `in_tok → input, cache_make → cache_write` mapping used to.
+    const c = sessionCost(totals, rates);
+    expect(c.input).toBeCloseTo((3_180 / 1e6) * 15, 12);
+    expect(c.cache_write).toBeCloseTo((2_520 / 1e6) * 18.75, 12);
+    expect(c.cache_read).toBeCloseTo((106_000 / 1e6) * 1.5, 12);
+    expect(c.output).toBeCloseTo((2_190 / 1e6) * 75, 12);
+    expect(c.total).toBeCloseTo(0.0477 + 0.04725 + 0.159 + 0.16425, 9);
+    expect(fmtUsd(c.total)).toBe('$0.4182');
+  });
+
+  test('the Cost card: per-model rows, their lane-share lines and the grand total', () => {
+    const opus: PriceRates = { input: 15, cache_write: 18.75, cache_read: 1.5, output: 75 };
+    const haiku: PriceRates = { input: 1, cache_write: 1.25, cache_read: 0.1, output: 5 };
+    // What `usage_session_model_totals` now answers: `totals` a declared-
+    // category map, `origins` a per-lane id map.
+    const perModel = [
+      {
+        model: 'vendor-opus-4-8',
+        totals: kinds({ in_tok: 2_730, cache_read: 96_600, cache_make: 2_400, out_tok: 2_055 }),
+        origins: { session: 103_785 } as Record<string, number>,
+      },
+      {
+        model: 'vendor-haiku-4-5',
+        totals: kinds({ in_tok: 450, cache_read: 9_400, cache_make: 120, out_tok: 135 }),
+        origins: { agent: 10_105 } as Record<string, number>,
+      },
+    ];
+    expect(originShareLine(perModel[0].origins, LANES)).toBe(
+      'main session 104k · sub-agents 0 tok',
+    );
+    expect(originShareLine(perModel[1].origins, LANES)).toBe('main session 0 · sub-agents 10k tok');
+    const grand = costGrandTotal(perModel, (i) => (i === 0 ? opus : haiku));
+    expect(grand).toBeCloseTo(
+      sessionCost(perModel[0].totals, opus).total + sessionCost(perModel[1].totals, haiku).total,
+      12,
+    );
+    expect(fmtUsd(grand)).toBe('$0.3872');
   });
 });
 

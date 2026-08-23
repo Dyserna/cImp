@@ -591,8 +591,8 @@ function container(settings: Settings): Settings['tool_plugins'] {
     global_paths: {},
     // Same defaults as the backend's `ToolPluginsSettings::default()` — this
     // branch only fires for a snapshot that predates the container entirely.
-    expose_commands_claude: true,
-    expose_commands_opencode: true,
+    // The two `expose_commands_*` switches left with V40 Phase B; they are
+    // `harness[<id>].expose_commands` and `harnessRow` supplies their default.
   });
 }
 

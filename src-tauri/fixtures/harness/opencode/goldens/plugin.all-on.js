@@ -56,16 +56,16 @@ const CIMP_TOKEN = "deadbeef00";
 // It is ADDITIVE and TOLERATED-ABSENT in both directions: an app that predates
 // CHP ignores the field, and an app that postdates it treats a body without one
 // as pre-CHP. Nothing is ever refused over a version.
-const CIMP_CHP = 1;
-const CIMP_INJECT_ENABLED = false;
-const CIMP_AUTO_CHECK_ENABLED = false;
+const CIMP_CHP = 2;
+const CIMP_INJECT_ENABLED = true;
+const CIMP_AUTO_CHECK_ENABLED = true;
 const CIMP_EDIT_TOOLS = new Set(["edit", "write", "patch"]);
 // V32 Phase F (locked decision 14): report-only visibility of OpenCode's OWN
 // web tools, which never route through cImp and are therefore invisible to the
 // proxy's taint latch. `false` in `off`/`deny` mode — in `deny` the pinned
 // `agent.build.permission` block refuses them outright, so there is nothing to
 // observe.
-const CIMP_BEACON_ENABLED = false;
+const CIMP_BEACON_ENABLED = true;
 const CIMP_WEB_TOOLS = new Set(["webfetch","websearch"]);
 // ── V33 Phase F: the pre-mutation CHECKPOINT ────────────────────────────────
 //
@@ -85,7 +85,7 @@ const CIMP_WEB_TOOLS = new Set(["webfetch","websearch"]);
 // the feature, and unlike the Claude hook this one can wait safely) but every
 // failure is swallowed — a lost checkpoint costs one call its rewind point, a
 // thrown error would refuse the user's own edit.
-const CIMP_CHECKPOINT_ENABLED = false;
+const CIMP_CHECKPOINT_ENABLED = true;
 const CIMP_MUTATING_TOOLS = new Set(["bash","edit","write","patch","apply_patch","execute"]);
 // The cImp TAB this FILE was generated for, baked at spawn. The tab id is the
 // key the whole latch registry uses, and the hook input carries no tab or cwd
@@ -154,7 +154,7 @@ const CIMP_TAB_MATCH =
 // `bash` is pinned `allow`, so a contaminated tab could spawn a second
 // `opencode` that inherits CIMP_TAB_ID, publish a fresh session id under this
 // tab's identity, and get its web tools back. The bit is what survives that.
-const CIMP_NATIVE_GATE_ENABLED = false;
+const CIMP_NATIVE_GATE_ENABLED = true;
 const CIMP_NATIVE_LOCAL_TOOLS = new Set(["bash","read","glob","grep","edit","write","patch","apply_patch","execute","lsp"]);
 const CIMP_REFUSAL_NATIVE_LOCAL = "REFUSED (security boundary): this session has already used an external tool (web fetch/search or an MCP-server tool), so this harness's own local tools — file reads, edits, patches, file search and shell commands — are unavailable for the remainder of this session. This cannot be unlocked, re-asked for, or worked around; it is enforced outside the model, and spawning a sub-agent or a nested shell reaches the same boundary. Continue with the tools you still have, or answer with what you have gathered.";
 const CIMP_REFUSAL_NATIVE_WEB = "REFUSED (security boundary): this session has already used a local-capability tool (file read, edit, file search or shell command), so this harness's own web tools — fetch and search — are unavailable for the remainder of this session. This cannot be unlocked, re-asked for, or worked around; it is enforced outside the model, and spawning a sub-agent reaches the same boundary. Continue with the tools you still have, or answer with what you have gathered.";
@@ -325,8 +325,8 @@ try {
         // to a plugin at module scope, and baking in the number cImp last saw
         // would be cImp attesting to itself rather than the harness declaring
         // anything. `docs/CHP.md` § 6.2.
-        serves: ["hello","prompt","memory.event"],
-        cannot: [{"id":"context.post_edit","why":"auto-check is off for this tab (needs the graph, `graph.auto_check`, and at least one configured check)"},{"id":"taint.beacon","why":"native web visibility is not `sensor` for this tab — in `deny` the pinned permission block refuses those tools outright, so there is nothing to observe"},{"id":"tool.gate","why":"the native-tool gate is off for this tab"},{"id":"checkpoint.pre_mutation","why":"Workbench checkpoints are off"},{"id":"assistant_text","why":"OpenCode's plugin API delivers assistant text per completed PART (`experimental.text.complete`) or as the same SSE payload shapes the reader already consumes (`event`), so pushing it would either change the segmenter's unit or move no tier — the `/event` SSE reader stays this harness's declared fallback (`opencode.sse.events`)"},{"id":"session.tool_result","why":"reachable (`tool.execute.after`'s output parameter carries the result text) but unconsumed: OpenCode usage is estimate-only from tool-call input args, so wiring it would add a capability rather than migrate one"}],
+        serves: ["hello","prompt","memory.event","context.post_edit","taint.beacon","tool.gate","checkpoint.pre_mutation"],
+        cannot: [{"id":"assistant_text","why":"OpenCode's plugin API delivers assistant text per completed PART (`experimental.text.complete`) or as the same SSE payload shapes the reader already consumes (`event`), so pushing it would either change the segmenter's unit or move no tier — the `/event` SSE reader stays this harness's declared fallback (`opencode.sse.events`)"},{"id":"session.tool_result","why":"reachable (`tool.execute.after`'s output parameter carries the result text) but unconsumed: OpenCode usage is estimate-only from tool-call input args, so wiring it would add a capability rather than migrate one"}],
       }),
       signal: AbortSignal.timeout(2000),
     });

@@ -1,4 +1,19 @@
-import { describe, it, expect } from 'vitest';
+import { beforeEach, describe, it, expect } from 'vitest';
+import {
+  FIRST_HARNESS,
+  SECOND_HARNESS,
+  fixtureAiTabs,
+  installFixtureHarnesses,
+} from '../harness.fixture';
+
+// V40 Phase F: the chip names harnesses from the registry, so the store is
+// filled from the committed fixture and no id below is a product name.
+beforeEach(installFixtureHarnesses);
+
+/// The tab being driven, its variant, and the harness doing the driving.
+const DRIVEN = FIRST_HARNESS.tab_ids[0];
+const DRIVEN_2 = FIRST_HARNESS.tab_ids[1];
+const DRIVER = SECOND_HARNESS.id;
 import { delegationChipState } from './delegationChip';
 import type { InFlightView } from '../delegation';
 import { defaultSettings, type Settings } from '../settings/types';
@@ -12,9 +27,9 @@ import { defaultSettings, type Settings } from '../settings/types';
 
 function flight(over: Partial<InFlightView> = {}): InFlightView {
   return {
-    driver: 'opencode',
+    driver: DRIVER,
     driver_name: 'api-work',
-    driver_agent: 'opencode',
+    driver_agent: DRIVER,
     mode: 'explicit',
     started_ms: 1_000,
     awaiting_prompt: false,
@@ -26,7 +41,7 @@ function inFlight(...ids: string[]): Record<string, InFlightView> {
   return Object.fromEntries(ids.map((id) => [id, flight()]));
 }
 
-const SETTINGS: Settings = defaultSettings();
+const SETTINGS: Settings = { ...defaultSettings(), tabs: fixtureAiTabs() };
 
 describe('delegationChipState', () => {
   it('is hidden while nothing is being driven', () => {
@@ -34,12 +49,12 @@ describe('delegationChipState', () => {
   });
 
   it('appears and counts as soon as one flight starts', () => {
-    expect(delegationChipState(inFlight('claude'), SETTINGS)).toMatchObject({
+    expect(delegationChipState(inFlight(DRIVEN), SETTINGS)).toMatchObject({
       visible: true,
       count: 1,
       label: 'DLG 1',
     });
-    expect(delegationChipState(inFlight('claude', 'claude-local'), SETTINGS)).toMatchObject({
+    expect(delegationChipState(inFlight(DRIVEN, DRIVEN_2), SETTINGS)).toMatchObject({
       visible: true,
       count: 2,
       label: 'DLG 2',
@@ -47,28 +62,28 @@ describe('delegationChipState', () => {
   });
 
   it('names both ends — the tab being driven and the harness driving it', () => {
-    const { title } = delegationChipState(inFlight('claude'), SETTINGS);
+    const { title } = delegationChipState(inFlight(DRIVEN), SETTINGS);
     // The tab's DISPLAY name, not its id: an id is not what the user called it.
-    expect(title).toContain('Claude');
-    expect(title).toContain('OpenCode');
+    expect(title).toContain(DRIVEN);
+    expect(title).toContain(SECOND_HARNESS.label);
     expect(title).toContain('api-work');
     expect(title).toContain('⇄');
   });
 
   it('gets the plural right — a chip that says "1 tabs" reads as a bug', () => {
-    expect(delegationChipState(inFlight('claude'), SETTINGS).title).toContain('1 tab is being');
-    expect(delegationChipState(inFlight('claude', 'claude-local'), SETTINGS).title).toContain(
+    expect(delegationChipState(inFlight(DRIVEN), SETTINGS).title).toContain('1 tab is being');
+    expect(delegationChipState(inFlight(DRIVEN, DRIVEN_2), SETTINGS).title).toContain(
       '2 tabs are being',
     );
   });
 
   it('says when a flight is stalled on a prompt only the user can answer', () => {
-    const stalled = { claude: flight({ awaiting_prompt: true }) };
+    const stalled = { [DRIVEN]: flight({ awaiting_prompt: true }) };
     expect(delegationChipState(stalled, SETTINGS).title).toContain(
       '1 of them is waiting for your permission',
     );
     // …and stays quiet when none is, rather than reporting a zero.
-    expect(delegationChipState(inFlight('claude'), SETTINGS).title).not.toContain(
+    expect(delegationChipState(inFlight(DRIVEN), SETTINGS).title).not.toContain(
       'waiting for your permission',
     );
   });

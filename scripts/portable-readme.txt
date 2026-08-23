@@ -22,9 +22,17 @@ Quick start
 Prerequisites
 -------------
 
-  * Claude Code: cImp spawns the `claude` binary as a subprocess. Install
-    Claude Code separately and make sure `claude` is on your PATH. From a
-    new terminal, `claude --version` should print a version.
+  * A supported harness CLI: cImp does not ship an AI agent — it spawns
+    the harness binary as a subprocess, so install at least one
+    separately and make sure it is on your PATH (or drop its .exe into
+    the `ebin\` folder). The two supported today:
+
+      Claude Code   binary `claude`   https://docs.anthropic.com/en/docs/claude-code/setup
+      OpenCode      binary `opencode` https://opencode.ai/docs
+
+    From a new terminal, `claude --version` (or `opencode --version`)
+    should print a version. A fresh install enables the Claude tab only;
+    turn the others on under Settings -> Tabs -> AI tabs enabled.
 
   * WebView2 runtime: preinstalled on updated Windows 10/11. If cImp
     fails to launch with a missing-WebView2 error, install the Evergreen
@@ -107,9 +115,10 @@ Leave it blank to resolve normally.
 Customizing prompt detection
 ----------------------------
 
-cImp watches the terminal for prompts it should react to — Claude Code
-tool-use approvals and AskUserQuestion-style questions. The substrings
-it matches live in:
+cImp watches the terminal for prompts it should react to — tool-use
+approvals and "pick one" questions. The substrings it matches are the
+harness's own terminal wording, one set per supported harness, and they
+all live in:
 
   bin\patterns.json
 
@@ -119,7 +128,12 @@ present in the on-screen text for the pattern to match, plus a `kind`
 `disabled: true` to keep an entry without using it. Edit the file and
 restart cImp to apply changes.
 
-If a Claude Code update changes the prompt wording and detection stops
+Note: the OpenCode entries ship `disabled` on purpose — its prompt
+wording has not been captured yet, and a wrong guess would fire the
+badge and the announcement on every OpenCode tab. Use the recipe below
+to capture the real text, then flip `disabled` to false.
+
+If a harness update changes the prompt wording and detection stops
 firing, capture the live text by launching with
 
     set RUST_LOG=perm_capture=debug
@@ -191,15 +205,16 @@ Uninstall
 Troubleshooting
 ---------------
 
-  * "claude not found" -> install Claude Code and ensure `claude` is on
-    PATH; restart the terminal after installing.
+  * "claude not found" / "opencode not found" -> install that harness
+    and ensure its binary is on PATH (or drop it in `ebin\`); restart
+    the terminal after installing.
   * TTS silent, log shows "Kokoro model files not found" -> someone
     deleted models\kokoro-v1.0.onnx. Re-extract the zip or download the
     model from the HuggingFace link above.
   * Tab errors mention "permission detection" -> check
-    docs/MAINTENANCE.md in the source repo; the regex used to detect the
-    Claude permission prompt occasionally needs an update after a Claude
-    Code release.
+    docs/MAINTENANCE.md in the source repo; the patterns used to detect
+    a harness's permission prompt occasionally need an update after that
+    harness releases a new version.
 
 Source code, issue tracker, full documentation:
   https://github.com/Dyserna/cImp

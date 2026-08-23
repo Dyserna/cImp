@@ -56,7 +56,7 @@ export function openRestoreCheckpointDialog(id: string, root?: string): void {
 }
 
 /// V13 Phase D D3: opened from a builtin AI tab's context menu — "New
-/// <Claude|OpenCode> tab in worktree…". `template` is the AI tab whose
+/// <harness> tab in worktree…". `template` is the AI tab whose
 /// config the new tab clones; `paneId` is where the frontend routes the new
 /// tab once spawned (mirrors the plain "+" duplicate's `requestTabIntoPane`).
 export function openNewWorktreeTabDialog(template: TabId, paneId: PaneId): void {

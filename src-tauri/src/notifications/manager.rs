@@ -16,7 +16,7 @@ use tracing::{debug, info, warn};
 
 /// Drain debounce: when a notification is enqueued and audio is currently
 /// idle, wait this long before draining. Lets closely-spaced related events
-/// (e.g. ClaudeOutputStopped → Idle followed shortly by a permission
+/// (e.g. HarnessOutputStopped → Idle followed shortly by a permission
 /// detection on the same tab) land in the queue together so dedup can
 /// collapse them to the most informative one.
 const DRAIN_DEBOUNCE: Duration = Duration::from_millis(200);
@@ -130,11 +130,18 @@ struct NotificationManager {
     /// the tab entering `Listening`, which is only reachable via a user
     /// keystroke or compose input. The spoken `Idle` notification is gated on
     /// membership here: until a tab is armed, any settle into Idle is just
-    /// startup chrome (Claude's welcome banner cycles a freshly-spawned tab
+    /// startup chrome (a harness's welcome banner cycles a freshly-spawned tab
     /// `Idle → Thinking → Idle` as it prints) and must stay silent. This is
     /// the user-input analogue of the `last_avatar` "no idle before any real
     /// activity" guard, which only rejects the re-emitted *initial* Idle and
     /// not this real banner-driven transition.
+    ///
+    /// **V40 Phase E (locked decision 26): the guard is keyed on
+    /// `HarnessPlugin::emits_startup_chrome`.** Whether a fresh tab paints a
+    /// banner that looks like a finished turn is a fact about the harness, not
+    /// about notifications; a harness that declares `false` gets its first Idle
+    /// announced. The default is `true`, so an unclassified tab keeps the
+    /// pre-V40 behaviour.
     interacted: HashSet<TabId>,
 }
 
@@ -266,9 +273,10 @@ impl NotificationManager {
                         // Pre-interaction settle (e.g. the startup welcome
                         // banner cycling Idle → Thinking → Idle as it prints):
                         // the user has never driven this tab to Listening, so
-                        // this is not a "Claude finished your task" event.
-                        // Stay silent until the tab has been interacted with.
-                        if !self.interacted.contains(&tab) {
+                        // this is not a "the harness finished your task" event.
+                        // Stay silent until the tab has been interacted with —
+                        // for a harness that says it paints such chrome.
+                        if self.emits_startup_chrome(&tab) && !self.interacted.contains(&tab) {
                             debug!(
                                 ?tab,
                                 "notifications: suppressing Idle (no user interaction yet)"
@@ -392,6 +400,20 @@ impl NotificationManager {
         }
     }
 
+    /// Whether `tab`'s harness paints startup chrome that can look like a
+    /// finished turn — the predicate the pre-interaction Idle guard runs on
+    /// (V40 Phase E, locked decision 26).
+    ///
+    /// A tab that runs no registered harness answers `true`: the trait default,
+    /// reached the same way, and the fail-safe direction (a suppressed
+    /// announcement nobody asked for costs less than a spurious one on every
+    /// spawn).
+    fn emits_startup_chrome(&self, tab: &TabId) -> bool {
+        crate::tabs::tab_harness_by_id(&self.settings.current(), tab.as_str())
+            .and_then(|h| h.plugin())
+            .is_none_or(|p| p.emits_startup_chrome())
+    }
+
     /// True if `tab` should be skipped because it's the currently-focused
     /// tab and the user hasn't opted into hearing announcements for the
     /// focused tab. Re-reads settings each call so toggling the checkbox
@@ -402,13 +424,13 @@ impl NotificationManager {
         }
         // Benign fallback on a poisoned lock rather than `.expect()`: a panic
         // here would permanently kill the notification task and silence all
-        // cross-tab announcements. `TabId::Claude` is the v2 default, matching
-        // how the rest of the codebase reads this shared lock.
+        // cross-tab announcements. The registry's default tab (V40 Phase E),
+        // matching how the rest of the codebase reads this shared lock.
         let active_tab = self
             .active
             .read()
             .map(|g| g.clone())
-            .unwrap_or(TabId::Claude);
+            .unwrap_or_else(|_| TabId::first_harness_default());
         *tab == active_tab
     }
 

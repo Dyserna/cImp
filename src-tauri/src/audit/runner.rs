@@ -446,9 +446,10 @@ impl AuditState {
         self.inner.lock().unwrap().root.clone()
     }
 
-    /// Whether the per-consumer expose toggle for `consumer` is on —
-    /// `"opencode"` / `"offload"` map to their own flags; anything else
-    /// (including the child's default, `"claude"`) maps to `expose_claude`.
+    /// Whether the per-consumer expose toggle for `consumer` is on — a
+    /// registered harness's token resolves to its own
+    /// `harness[<id>].expose_code_audit` row, `"offload"` to
+    /// `code_audit.expose_offload`, and anything else to **false**.
     ///
     /// The loopback `/audit/run` route re-checks this on every run so that
     /// unchecking an expose toggle takes effect for already-running tabs —
@@ -457,12 +458,24 @@ impl AuditState {
     /// outlives that gate. The master `enabled` switch is enforced by
     /// [`begin_scan`](Self::begin_scan), not here.
     pub fn consumer_exposed(&self, consumer: &str) -> bool {
-        let ca = self.settings.current().code_audit;
-        match consumer {
-            "opencode" => ca.expose_opencode,
-            "offload" => ca.expose_offload,
-            _ => ca.expose_claude,
+        let settings = self.settings.current();
+        // V40 Phase A (locked decision 2): an UNRECOGNISED consumer is not
+        // exposed. It used to fall through to `expose_claude`, so a caller
+        // asserting any token at all was gated by a checkbox belonging to a
+        // harness it is not — the fail-OPEN direction on a question about
+        // reaching a scanner.
+        //
+        // V40 Phase B finished the job (locked decisions 5 and 25): the
+        // `expose_claude` / `expose_opencode` half of the field TRIO is
+        // `Settings::harness[<id>].expose_code_audit`, resolved through the
+        // registry, so a third harness's checkbox is read the day it registers
+        // instead of falling into the `_` arm. `expose_offload` keeps a field
+        // of its own — the offload worker is cImp's own in-process consumer,
+        // not a harness.
+        if let Some(harness) = crate::harness::HarnessId::from_consumer(consumer) {
+            return settings.harness_settings(harness).expose_code_audit;
         }
+        consumer == "offload" && settings.code_audit.expose_offload
     }
 
     /// Emit the current state as a (findings-capped) `audit-status` event.

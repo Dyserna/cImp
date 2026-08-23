@@ -47,6 +47,7 @@ vi.mock('@tauri-apps/api/core', () => ({
 }));
 
 import {
+
   fuzzyMatch,
   filterTemplates,
   hasPlaceholder,
@@ -55,6 +56,13 @@ import {
   substituteTemplate,
   type ResolvedTemplate,
 } from './templates';
+
+import { FIRST_HARNESS } from '../harness.fixture';
+
+// V40 Phase F: every harness id below comes from the committed registry fixture
+// (`harness.fixture.ts`), so this suite names no product and re-points itself
+// when the registry changes.
+const H1 = FIRST_HARNESS.id;
 
 describe('fuzzyMatch (subsequence)', () => {
   test('empty query matches everything', () => {
@@ -216,13 +224,13 @@ describe('substituteTemplate (integration of the two variable sources)', () => {
   });
 
   test('pulls {selection} from the focused pane terminal and {clipboard} from the plugin', async () => {
-    focusedTabId.set('claude');
+    focusedTabId.set(H1);
     getTerminalMock.mockReturnValue({ getSelection: () => 'const x = 1;' });
     clipboardReadText.mockResolvedValue('clipboard text');
 
     const out = await substituteTemplate('Review: {selection}\nContext: {clipboard}\nFile: {file}');
     expect(out).toBe('Review: const x = 1;\nContext: clipboard text\nFile: {file}');
-    expect(getTerminalMock).toHaveBeenCalledWith('claude');
+    expect(getTerminalMock).toHaveBeenCalledWith(H1);
   });
 
   test('empty selection when there is no focused pane', async () => {
@@ -235,7 +243,7 @@ describe('substituteTemplate (integration of the two variable sources)', () => {
   });
 
   test('empty selection when the focused terminal has none selected', async () => {
-    focusedTabId.set('claude');
+    focusedTabId.set(H1);
     getTerminalMock.mockReturnValue({ getSelection: () => '' });
     clipboardReadText.mockResolvedValue('');
 

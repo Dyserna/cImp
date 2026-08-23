@@ -13,6 +13,7 @@ use std::marker::PhantomData;
 use serde::{Deserialize, Serialize};
 
 use super::index::GraphIndex;
+use crate::harness::plugin::TokenKinds;
 use crate::offload::outbound::Screen;
 use crate::offload::toolclass::WriteTaint;
 
@@ -458,40 +459,13 @@ fn strip_list_marker(line: &str) -> &str {
 /// ~800 turns), and pruning here silently under-counts the session's spend.
 pub const MAX_USAGE_PER_SESSION: i64 = 6000;
 
-/// V24 Phase A: whether a recorded turn came from the main session transcript
-/// (`Session`) or a sub-agent transcript (`Agent`) — the tap knows which
-/// (sub-agent lines arrive via `<sid>/subagents/*.jsonl` or as inline
-/// `isSidechain:true` lines), and this preserves that fact so the Usage chart
-/// can show where agent fan-out spend went. Serialized as the wire strings
-/// `"session"` / `"agent"` (the `usage_stat.origin` column and the `TurnUsage`
-/// IPC mirror in `graph.ts`). Forward-only: pre-V24 rows migrate as `Session`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum UsageOrigin {
-    Session,
-    Agent,
-}
-
-impl UsageOrigin {
-    /// The wire string stored in `usage_stat.origin` and read back on load.
-    /// Kept in lockstep with the `Serialize` `rename_all = "lowercase"` above
-    /// (both feed the same `"session"`/`"agent"` contract).
-    pub fn as_str(self) -> &'static str {
-        match self {
-            UsageOrigin::Session => "session",
-            UsageOrigin::Agent => "agent",
-        }
-    }
-
-    /// Parse the stored column back. Anything unexpected — including a legacy
-    /// row that the migration defaulted to `"session"` — reads as `Session`.
-    pub fn from_wire(s: &str) -> Self {
-        match s {
-            "agent" => UsageOrigin::Agent,
-            _ => UsageOrigin::Session,
-        }
-    }
-}
+// V24 Phase A recorded WHICH LANE a turn belonged to; V40 Phase G (locked
+// decision 19) made the lane a **declared string** instead of a two-variant
+// core enum. There is no `UsageOrigin` any more: a lane id is whatever the
+// harness declared (`TurnOrigin.id`), written verbatim into `usage_stat.origin`
+// and read back verbatim — no `from_wire` defaulting, because core has no
+// business deciding that an id it does not recognise "is really the main
+// session". A harness with one lane, or three, needs no change here.
 
 /// One usage/cost event fed to [`super::service::GraphService::record_usage`].
 /// Timestamped internally (same posture as `record_mem_event`'s `ts_ms`
@@ -504,14 +478,24 @@ pub enum UsageEvent {
     Turn {
         msg_id: String,
         model: Option<String>,
+        /// The four token counts are **the `usage_stat` column encoding**, not
+        /// a harness's declared categories: this is the WRITE boundary, and the
+        /// relation on disk (in every existing user's `graph.db`) has exactly
+        /// these four `Int` columns plus `origin`. Generalising the persisted
+        /// row would be a graph migration for no gain; the declared-shape
+        /// [`TokenKinds`] is assembled at the READ boundary instead
+        /// (`GraphIndex::usage_*`). A producer with no number for a column
+        /// passes 0 — which the read boundary only emits if the session's
+        /// harness declared that category.
         in_tok: u32,
         out_tok: u32,
         cache_read: u32,
         cache_make: u32,
-        /// Session (parent transcript) vs. Agent (sub-agent transcript / an
-        /// inline `isSidechain:true` line). Set at the tap; `ToolResult` rows
+        /// The declared lane this turn belongs to — the harness's own
+        /// [`TurnOrigin.id`](crate::harness::plugin::TurnOrigin). Stored
+        /// verbatim in `usage_stat.origin`, set at the tap; `ToolResult` rows
         /// carry no origin (they're sized in chars, not attributed per turn).
-        origin: UsageOrigin,
+        origin: String,
     },
     /// One resolved tool call's result size, in characters (estimated tokens
     /// = chars / 4 is a UI-layer concern, not stored here). `tool` is `None`
@@ -519,14 +503,36 @@ pub enum UsageEvent {
     ToolResult { tool: Option<String>, chars: u32 },
 }
 
-/// Summed token totals across a session's "turn" rows ("tool_result" rows
-/// carry chars, not tokens, so they don't contribute).
-#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
-pub struct UsageTotals {
+/// The four stored `usage_stat` token columns, summed.
+///
+/// **Not a payload type** — nothing serialises it. It is the read boundary's
+/// working aggregate, because two derivations genuinely need all four numbers
+/// side by side whatever the harness declared: `cache_hit_ratio`
+/// (`cache_read / (cache_read + in_tok)`) and the per-model / per-lane
+/// ordering. What the frontend receives is a [`TokenKinds`] built from this by
+/// [`super::index::GraphIndex`] — see that module for the column to
+/// pricing-category mapping and the absence rule.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ColumnTotals {
     pub in_tok: u64,
     pub out_tok: u64,
     pub cache_read: u64,
     pub cache_make: u64,
+}
+
+impl ColumnTotals {
+    /// Every column summed — one lane's / one model's total spend.
+    pub fn total(self) -> u64 {
+        self.in_tok + self.out_tok + self.cache_read + self.cache_make
+    }
+
+    /// Fold another row's four columns in.
+    pub fn add(&mut self, other: ColumnTotals) {
+        self.in_tok += other.in_tok;
+        self.out_tok += other.out_tok;
+        self.cache_read += other.cache_read;
+        self.cache_make += other.cache_make;
+    }
 }
 
 /// One turn's token breakdown, plus the (estimated) tool-result characters
@@ -537,15 +543,16 @@ pub struct UsageTotals {
 pub struct TurnUsage {
     pub msg_id: String,
     pub model: Option<String>,
-    pub in_tok: u64,
-    pub out_tok: u64,
-    pub cache_read: u64,
-    pub cache_make: u64,
+    /// This turn's tokens by DECLARED category id (V40 Phase G). The four
+    /// hard-coded `in_tok`/`out_tok`/`cache_read`/`cache_make` fields were one
+    /// vendor's billing model sitting in core's payload; a category the
+    /// session's harness does not declare is now **absent**, not zero.
+    pub tokens: TokenKinds,
     pub tool_chars: u64,
     pub ts_ms: i64,
-    /// Whether this turn was the main session or a sub-agent (V24 Phase A).
-    /// Pre-V24 rows read `Session` (migrated default).
-    pub origin: UsageOrigin,
+    /// The declared lane this turn was attributed to — the harness's own
+    /// `TurnOrigin.id`, read back verbatim from `usage_stat.origin`.
+    pub origin: String,
 }
 
 /// One session's row for the project-wide usage totals table.
@@ -553,15 +560,17 @@ pub struct TurnUsage {
 pub struct SessionUsageRow {
     pub session_id: String,
     pub agent: String,
-    pub totals: UsageTotals,
+    /// The session's summed tokens by declared category id — see
+    /// [`TurnUsage::tokens`].
+    pub totals: TokenKinds,
     /// Total estimated tool-result chars for the session (sum of
     /// `usage_per_tool`'s values).
     pub tool_chars: u64,
     /// `cache_read / (cache_read + in_tok)`; `0.0` when there's no
     /// denominator (no turns recorded yet).
     pub cache_hit_ratio: f64,
-    /// True when this session recorded no real Turn tokens at all (all four
-    /// token totals are zero) — the table's "est" badge. V24 Phase E: derived
+    /// True when this session recorded no real Turn tokens at all (every
+    /// token column zero) — the table's "est" badge. V24 Phase E: derived
     /// from the totals, not the agent name, so a token-less pre-V24 OpenCode
     /// session keeps the badge while any session with real tokens loses it.
     pub est_only: bool,
@@ -603,30 +612,28 @@ pub struct ToolUsage {
 pub struct SessionUsage {
     pub session_id: String,
     pub turns: Vec<TurnUsage>,
-    pub totals: UsageTotals,
+    pub totals: TokenKinds,
     pub top_tools: Vec<ToolUsage>,
 }
 
-/// V24 Phase B: total tokens (all four categories summed) attributed to each
-/// [`UsageOrigin`] within one model's spend in a session — how much was the
-/// main session vs. sub-agent fan-out. Feeds the Cost card's per-model S/A
-/// share line.
-#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
-pub struct OriginSplit {
-    pub session_tok: u64,
-    pub agent_tok: u64,
-}
-
 /// V24 Phase B: one model's contribution to a session — its summed token
-/// totals plus the session/agent origin split. Ordered by total tokens
-/// descending in [`SessionUsageDetail::per_model`], so a mixed-model session
-/// (e.g. a Fable main + Opus sub-agents) is priced per model instead of at one
-/// blended rate.
+/// totals plus the per-lane split. Ordered by total tokens descending in
+/// [`SessionUsageDetail::per_model`], so a mixed-model session (e.g. a Fable
+/// main + Opus sub-agents) is priced per model instead of at one blended rate.
+///
+/// V40 Phase G: `origins` was `OriginSplit { session_tok, agent_tok }`, a
+/// CLOSED two-lane struct — a harness with one lane rendered a fabricated
+/// second lane at 0, and one with three had nowhere to put the third. It is a
+/// map keyed by the harness's declared `TurnOrigin.id` now, holding total
+/// tokens (every column summed) attributed to that lane.
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct ModelUsage {
     pub model: String,
-    pub totals: UsageTotals,
-    pub origins: OriginSplit,
+    /// This model's summed tokens by declared category id.
+    pub totals: TokenKinds,
+    /// Total tokens per declared lane id. A lane this model recorded no turn
+    /// in has **no entry** — not an entry at 0.
+    pub origins: std::collections::BTreeMap<String, u64>,
 }
 
 /// V24 Phase B: full drill-in detail for ONE session (the `graph_session_usage`
@@ -653,7 +660,7 @@ impl SessionUsageDetail {
             row: SessionUsageRow {
                 session_id: session_id.to_string(),
                 agent: String::new(),
-                totals: UsageTotals::default(),
+                totals: TokenKinds::default(),
                 tool_chars: 0,
                 cache_hit_ratio: 0.0,
                 est_only: true,
@@ -741,36 +748,26 @@ pub struct UsageSnapshot {
     pub store_error: Option<String>,
 }
 
-/// Map an agent tool name/id to a memory event `kind` + the argument key that
-/// carries the path/target. Shared by the Claude transcript tap and the
-/// OpenCode plugin's `/memory/event` ingress so both classify identically.
-/// Returns `None` for tools that shouldn't be recorded (Task, TodoWrite, our
-/// own graph/offload tools — already captured by the activity ring).
-pub fn classify_tool(tool: &str) -> Option<(&'static str, MemArg)> {
-    match tool {
-        // Reads.
-        "Read" | "NotebookRead" | "read" => Some(("read", MemArg::Path)),
-        // Edits / writes.
-        "Edit" | "Write" | "MultiEdit" | "NotebookEdit" | "edit" | "write" | "patch" => {
-            Some(("edit", MemArg::Path))
-        }
-        // Structural / content queries.
-        "Grep" | "Glob" | "grep" | "glob" | "list" => Some(("query", MemArg::Pattern)),
-        "Bash" | "bash" => Some(("query", MemArg::Command)),
-        _ => None,
-    }
-}
-
-/// Which argument of a classified tool carries the recorded target.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MemArg {
-    /// `file_path` — a concrete file (recorded as `path`).
-    Path,
-    /// `pattern`/`path` of a search (recorded as `path`, best-effort).
-    Pattern,
-    /// `command` of a shell call (recorded into `detail`, no path).
-    Command,
-}
+// V40 Phase A, locked decision 16 — `classify_tool` and `MemArg` used to live
+// here.
+//
+// `classify_tool` was ONE `match` over BOTH harnesses' tool ids: `Edit` next to
+// `edit`, `MultiEdit` next to `patch`. The V35 Phase K layering scan recorded
+// it as a FINDING rather than an exemption ("it should ask `toolclass` /
+// `harness::opencode::tools` instead — but the two vocabularies answer
+// differently for `edit` vs `Edit`, so rerouting it is a behaviour decision").
+// That is the decision decision 16 took: the classification is per harness, it
+// is declared by the plugin beside that harness's `mutates_fs` and `class`
+// columns, and core reads it through
+// [`crate::harness::native::memory_kind`] using the request's source — which
+// answers `None`, rather than another harness's kind, for a source it cannot
+// identify.
+//
+// `MemArg` moved with it, to `harness/plugin.rs`: L1 declares the memory shape
+// of its own tools and may not import an L4 capability, so the type a plugin
+// declares cannot live in `graph`. Nothing in `graph` reads it — the two
+// consumers are the readers on either side of the seam — so it is not
+// re-exported here either.
 
 #[cfg(test)]
 mod tests {
@@ -944,20 +941,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn classify_maps_kinds_and_ignores_meta_tools() {
-        assert_eq!(classify_tool("Read"), Some(("read", MemArg::Path)));
-        assert_eq!(classify_tool("Edit"), Some(("edit", MemArg::Path)));
-        assert_eq!(classify_tool("Write"), Some(("edit", MemArg::Path)));
-        assert_eq!(classify_tool("Grep"), Some(("query", MemArg::Pattern)));
-        assert_eq!(classify_tool("Bash"), Some(("query", MemArg::Command)));
-        // OpenCode lowercase ids.
-        assert_eq!(classify_tool("edit"), Some(("edit", MemArg::Path)));
-        // Not recorded: sub-agents, todos, and our own graph/offload tools.
-        assert_eq!(classify_tool("Task"), None);
-        assert_eq!(classify_tool("TodoWrite"), None);
-        assert_eq!(classify_tool("mcp__cimp-offload__graph_find_symbol"), None);
-    }
 
     // ── V12 Phase E: distiller output validation ──────────────────────────
 
@@ -1058,50 +1041,51 @@ mod tests {
         assert_eq!(parse_distilled_facts("- a\n- b\n- c\n- d"), None);
     }
 
-    // ── V24 Phase A: origin wire-string tripwire ──────────────────────────
-    // The `usage_stat.origin` column, the `UsageOrigin` serde form, and the TS
-    // `TurnUsage.origin: 'session' | 'agent'` mirror (`src/lib/graph.ts`) must
-    // all agree on these exact strings. Pin them so a rename can't silently
-    // desync the wire.
-    #[test]
-    fn usage_origin_wire_strings_are_stable() {
-        // Exhaustive match: adding a variant forces this test to be revisited.
-        fn _exhaustive(o: UsageOrigin) {
-            match o {
-                UsageOrigin::Session | UsageOrigin::Agent => {}
-            }
-        }
-        // serde (the `Turn` payload / `TurnUsage` IPC) and `as_str` (the stored
-        // column) must produce the same strings.
-        assert_eq!(
-            serde_json::to_value(UsageOrigin::Session).unwrap(),
-            serde_json::json!("session")
-        );
-        assert_eq!(
-            serde_json::to_value(UsageOrigin::Agent).unwrap(),
-            serde_json::json!("agent")
-        );
-        assert_eq!(UsageOrigin::Session.as_str(), "session");
-        assert_eq!(UsageOrigin::Agent.as_str(), "agent");
-        // Column round-trip; anything unexpected (incl. a migrated legacy row)
-        // reads as `Session`.
-        assert_eq!(UsageOrigin::from_wire("session"), UsageOrigin::Session);
-        assert_eq!(UsageOrigin::from_wire("agent"), UsageOrigin::Agent);
-        assert_eq!(UsageOrigin::from_wire("whatever"), UsageOrigin::Session);
+    // -- V40 Phase G: the turn payload is declared-shape --------------------
 
-        // `TurnUsage` serializes the origin under the `origin` key.
+    /// **A lane id nobody declares round-trips as ITSELF**, and the tokens map
+    /// carries only the categories it was given.
+    ///
+    /// The pre-V40-G payload could not express either half: `origin` was a
+    /// two-variant enum whose `from_wire` mapped every unrecognised string to
+    /// `Session`, so a third harness's lane silently became the main session's
+    /// spend; and the four token fields meant a category nobody reported still
+    /// serialized as 0. The `origin` key on the wire stays a plain lowercase
+    /// string, so the TS mirror (`src/lib/graph.ts`) is unchanged in FORM —
+    /// only its type widened from `session | agent` to `string`.
+    #[test]
+    fn a_turn_carries_its_declared_lane_and_only_the_categories_it_was_given() {
+        let mut tokens = TokenKinds::default();
+        tokens.set("input", 1);
         let tu = TurnUsage {
             msg_id: "m".into(),
             model: None,
-            in_tok: 1,
-            out_tok: 0,
-            cache_read: 0,
-            cache_make: 0,
+            tokens,
             tool_chars: 0,
             ts_ms: 0,
-            origin: UsageOrigin::Agent,
+            origin: "third_lane".into(),
         };
         let v = serde_json::to_value(&tu).unwrap();
-        assert_eq!(v.get("origin").unwrap(), &serde_json::json!("agent"));
+        assert_eq!(v.get("origin").unwrap(), &serde_json::json!("third_lane"));
+        assert_eq!(
+            v.get("tokens").unwrap(),
+            &serde_json::json!({ "input": 1 }),
+            "an unset category leaked into the payload as a zero"
+        );
+        assert_eq!(tu.tokens.get("output"), None);
+    }
+
+    /// The two lanes already on disk are still the two lanes the shipped
+    /// harness declares — the ids are frozen by every user's `usage_stat`.
+    #[test]
+    fn usage_origin_wire_strings_are_stable() {
+        assert_eq!(crate::harness::claude::usage::ORIGIN_SESSION, "session");
+        assert_eq!(crate::harness::claude::usage::ORIGIN_AGENT, "agent");
+        let shape = crate::harness::HarnessId::from_id("claude")
+            .and_then(|h| h.plugin())
+            .and_then(|p| p.turn_usage_shape())
+            .expect("claude declares a turn shape");
+        let ids: Vec<&str> = shape.origins.iter().map(|o| o.id).collect();
+        assert_eq!(ids, vec!["session", "agent"]);
     }
 }

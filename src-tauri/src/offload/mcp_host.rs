@@ -187,7 +187,8 @@ pub struct DisabledServer {
     pub name: String,
     /// Which level turned it off, for the refusal wording.
     pub verdict: EnableVerdict,
-    /// Expose to Claude Code — copied from the config row.
+    /// Per-harness exposure, copied from the config row's `access` map in
+    /// registry order.
     ///
     /// V37 Phase B (seam finding F2): the C4 refusal is a statement that the
     /// server EXISTS, and it must only be made to a consumer that could have
@@ -195,11 +196,9 @@ pub struct DisabledServer {
     /// never saw these tools and never would have, so it keeps the pre-V37
     /// unknown-tool wording — otherwise the refusal becomes an existence
     /// oracle for servers the caller was never granted.
-    pub claude_access: bool,
-    /// Expose to the offload worker — see [`Self::claude_access`].
+    pub harness_access: crate::harness::PerHarness<bool>,
+    /// Expose to the offload worker — see [`Self::harness_access`].
     pub offload_access: bool,
-    /// Expose to OpenCode — see [`Self::claude_access`].
-    pub opencode_access: bool,
 }
 
 /// V37 contract C5 — a hash of the tool surface **each consumer can currently
@@ -234,8 +233,10 @@ pub struct DisabledServer {
 /// (reconcile appends), and a reordered pool is not a moved surface.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct McpSurfaceFingerprint {
-    claude: u64,
-    opencode: u64,
+    /// One digest per registered harness, in registry order (locked decision
+    /// 25). A named field pair meant a third harness's surface could move with
+    /// no pulse at all — C5 propagation silently not happening for it.
+    harness: crate::harness::PerHarness<u64>,
     offload: u64,
 }
 
@@ -247,10 +248,10 @@ impl McpSurfaceFingerprint {
     /// [`surface_digest`] does (a test pins exactly that).
     pub fn empty() -> Self {
         let none: Vec<(String, ToolDef)> = Vec::new();
+        let empty = surface_digest(&none);
         McpSurfaceFingerprint {
-            claude: surface_digest(&none),
-            opencode: surface_digest(&none),
-            offload: surface_digest(&none),
+            harness: crate::harness::PerHarness::filled(empty),
+            offload: empty,
         }
     }
 }
@@ -996,9 +997,17 @@ enum Conn {
 /// `ToolScope` on top of `offload_access`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Consumer {
-    Claude,
+    /// A registered harness, proxied through its per-session
+    /// `cimp-offload --consumer <id>` child.
+    ///
+    /// **V40 Phase B collapsed the `Claude` / `Opencode` variants into this
+    /// one** (locked decision 25). Two variants for two harnesses meant every
+    /// join between this enum and the registry — `for_harness`, `harness`,
+    /// `label`, `source`, the grant `match` — was a hand-kept two-arm table,
+    /// and a third harness would have needed a third arm in each of them or
+    /// fallen into a `_` arm answering out of Claude's flags.
+    Harness(crate::harness::HarnessId),
     Offload,
-    Opencode,
     /// V38 Phase F — cImp's own audit fan-out, calling a **tier-2 provider**
     /// tool's server on behalf of a `security_audit` / `quality_audit` run.
     ///
@@ -1019,21 +1028,97 @@ pub enum Consumer {
 }
 
 impl Consumer {
-    /// Parse the `--consumer` discriminator the per-session child is launched
-    /// with. Unknown / absent ⇒ Claude (the original, default consumer).
-    pub fn parse(s: &str) -> Self {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "opencode" => Consumer::Opencode,
-            "offload" => Consumer::Offload,
-            _ => Consumer::Claude,
+    /// **The grant a request from one of cImp's OWN in-app consumers is judged
+    /// under, on a surface that only serves harness children** (V40 locked
+    /// decision 25).
+    ///
+    /// `Consumer::Offload` and `Consumer::Audit` cannot legitimately reach the
+    /// per-session MCP proxy — the offload worker and the audit fan-out call the
+    /// host in-process — so a query naming one is either a stray value or a
+    /// caller mistake. Both are folded onto a HARNESS's grants rather than onto
+    /// the `offload_access` flag, because that flag means "cImp's own in-app
+    /// consumers may reach this server" and honouring it here would let a stray
+    /// value WIDEN what a proxied child is served.
+    ///
+    /// **This is a security default and it stays in core**, named, with this
+    /// paragraph, and pinned by
+    /// `tests::the_conservative_grant_never_answers_an_in_app_consumer`. It is
+    /// not a harness fact: nothing about Claude Code decides it, and the harness
+    /// it happens to resolve to is `DEFAULT_HARNESS` only because that is the
+    /// documented stand-in for a consumer cImp cannot name (locked decision 22).
+    pub fn conservative_grant() -> Consumer {
+        Consumer::Harness(crate::harness::DEFAULT_HARNESS)
+    }
+
+    /// Fold an in-app consumer onto [`Self::conservative_grant`] — **the one
+    /// place that fold happens**, so a route that resolves a grant and a route
+    /// that resolves an identity can never disagree about which harness one
+    /// request is being judged as.
+    ///
+    /// # Why this is a method and not three copies of a `match`
+    ///
+    /// V40 review finding H-1: `handle_mcp_call` derived the taint-latch key
+    /// from the RAW query token (`?consumer=offload` ⇒ activity source
+    /// `"offload"` ⇒ no configured tab ⇒ no latch scope ⇒ the documented
+    /// fail-open) while `OffloadService::mcp_call` folded the same request onto
+    /// **Claude's** granted server set. One request, two identities: Claude's
+    /// servers with Claude's latch disabled, and the EXTERNAL budget uncharged.
+    /// Develop had no such spelling because `source_for_consumer` answered
+    /// `"claude"` for every token it did not recognise.
+    ///
+    /// Folding at the route means the latch key is `source()` of the *folded*
+    /// consumer, so `conservative_grant()` can never hand out a harness's server
+    /// set without that harness's latch applying to the same call.
+    pub(crate) fn proxied(self) -> Consumer {
+        match self {
+            Consumer::Harness(h) => Consumer::Harness(h),
+            // See the variant docs: neither reaches this proxy legitimately —
+            // the offload worker and the audit fan-out call the host
+            // in-process.
+            Consumer::Offload | Consumer::Audit => Consumer::conservative_grant(),
         }
     }
 
+    /// Parse the `--consumer` discriminator the per-session child is launched
+    /// with.
+    ///
+    /// **V40 Phase A made this fallible** (locked decision 2). It used to answer
+    /// `Claude` for anything it did not recognise, so a child asserting any
+    /// token at all was served Claude's granted server set — a grant question
+    /// answered fail-OPEN by a typo. An ABSENT value is a different question
+    /// with a different answer: the caller resolves it to
+    /// [`crate::harness::DEFAULT_HARNESS`], which is a documented
+    /// wire-compatibility promise rather than a guess.
+    pub fn parse(s: &str) -> Option<Self> {
+        let token = s.trim().to_ascii_lowercase();
+        if token == "offload" {
+            return Some(Consumer::Offload);
+        }
+        crate::harness::HarnessId::from_consumer(&token).map(Consumer::Harness)
+    }
+
+    /// The consumer variant a registered harness proxies through, if this host
+    /// has one. `None` for a harness the host does not serve — which advertises
+    /// nothing rather than borrowing another harness's grants.
+    ///
+    /// Since V40 Phase B this is a wrap, not a join: every REGISTERED harness
+    /// has a consumer, and the hand-kept two-arm table that used to answer it
+    /// is gone. `None` still means "not a registered harness", which is what
+    /// keeps the fail-closed answer at the call site.
+    pub(crate) fn for_harness(id: crate::harness::HarnessId) -> Option<Consumer> {
+        id.descriptor().map(|_| Consumer::Harness(id))
+    }
+
+    // `Consumer::harness()` is gone: with `Consumer::Harness(HarnessId)` the
+    // unwrap is `match`-free at every call site, and the one caller that had it
+    // (`OffloadService::mcp_tool_descriptors`) now matches the variant
+    // directly. It existed to hide a two-arm literal table, and the table is
+    // what V40 Phase B removed.
+
     fn label(self) -> &'static str {
         match self {
-            Consumer::Claude => "Claude Code",
+            Consumer::Harness(h) => h.label(),
             Consumer::Offload => "the offload worker",
-            Consumer::Opencode => "OpenCode",
             Consumer::Audit => "the Code Audit fan-out",
         }
     }
@@ -1047,22 +1132,34 @@ impl Consumer {
     /// its override row disagree.
     pub(crate) fn source(self) -> &'static str {
         match self {
-            Consumer::Claude => "claude",
+            Consumer::Harness(h) => h.token(),
             Consumer::Offload => "offload",
-            Consumer::Opencode => "opencode",
             // The same word `record_audit_run` stamps on the `audit` lane, so a
             // reader following one scan across two lanes sees one name for it.
             Consumer::Audit => "audit",
         }
     }
 
+    /// The `--consumer` token this consumer is spelled with on the wire — the
+    /// vocabulary [`Self::parse`], `HarnessId::from_consumer` and
+    /// `graph::mcp::commands_exposed_to` all read.
+    ///
+    /// Distinct from [`Self::source`], which is the ACTIVITY vocabulary: a
+    /// descriptor's `consumer` and its `id` are separate fields, and a harness
+    /// is free to spell them differently. Used by `loopback::proxy_identity`'s
+    /// callers to hand the resolved-and-folded identity downstream as a token
+    /// rather than re-forwarding the caller's raw claim.
+    pub(crate) fn token(self) -> &'static str {
+        match self {
+            Consumer::Harness(h) => h.descriptor().map(|d| d.consumer).unwrap_or_else(|| h.token()),
+            Consumer::Offload => "offload",
+            Consumer::Audit => "audit",
+        }
+    }
+
     /// Whether `server` is exposed to this consumer.
     fn wants(self, server: &McpServer) -> bool {
-        self.granted(
-            server.claude_access,
-            server.offload_access,
-            server.opencode_access,
-        )
+        self.granted(&server.harness_access, server.offload_access)
     }
 
     /// V37 F2: whether a *disabled* server would have been exposed to this
@@ -1071,20 +1168,20 @@ impl Consumer {
     /// none. Kept as a second method rather than a generic over both types so
     /// no call site can accidentally ask the question about the wrong one.
     fn wants_disabled(self, server: &DisabledServer) -> bool {
-        self.granted(
-            server.claude_access,
-            server.offload_access,
-            server.opencode_access,
-        )
+        self.granted(&server.harness_access, server.offload_access)
     }
 
-    /// The grant test itself, over the three flags in their canonical order.
-    /// One body, so `wants` and `wants_disabled` cannot drift apart.
-    fn granted(self, claude: bool, offload: bool, opencode: bool) -> bool {
+    /// The grant test itself. One body, so `wants` and `wants_disabled` cannot
+    /// drift apart.
+    ///
+    /// V40 Phase B: the per-harness half is a [`crate::harness::PerHarness`],
+    /// sized by the registry, so a harness with no slot is a compile error
+    /// rather than a `_` arm. An id with no ordinal ([`HarnessId::ANY`]) is
+    /// **not** granted — the fail-closed direction for a grant question.
+    fn granted(self, harness_access: &crate::harness::PerHarness<bool>, offload: bool) -> bool {
         match self {
-            Consumer::Claude => claude,
+            Consumer::Harness(h) => harness_access.get(h).copied().unwrap_or(false),
             Consumer::Offload => offload,
-            Consumer::Opencode => opencode,
             // Deliberately NOT a fourth flag — see the variant's docs. A user
             // who wants a server reachable by cImp itself ticks one box, and it
             // is the box that has always meant that.
@@ -1149,14 +1246,12 @@ pub struct McpServer {
     tools: StdMutex<Vec<HostTool>>,
     healthy: AtomicBool,
     error: StdMutex<Option<String>>,
-    /// Expose this server's tools to Claude Code (proxied through the child).
-    claude_access: bool,
-    /// Expose this server's tools to the offload worker. A flag change forces a
+    /// Per-harness exposure, in registry order. A flag change forces a
     /// reconnect (it's part of `config_sig`), so these are always fresh.
+    harness_access: crate::harness::PerHarness<bool>,
+    /// Expose this server's tools to the offload worker. Same freshness
+    /// guarantee.
     offload_access: bool,
-    /// V19: expose this server's tools to OpenCode (proxied through the
-    /// `--consumer opencode` child). Like the others, part of `config_sig`.
-    opencode_access: bool,
     /// V37 contract C9: where this server came from, copied off the config at
     /// connect exactly like the access flags above.
     ///
@@ -1605,9 +1700,8 @@ impl McpHost {
                     verdict,
                     // F2: carried so the refusal can be scoped to the consumers
                     // that would actually have had this server.
-                    claude_access: c.claude_access,
+                    harness_access: harness_access_of(c),
                     offload_access: c.offload_access,
-                    opencode_access: c.opencode_access,
                 })
             })
             .collect();
@@ -1619,7 +1713,7 @@ impl McpHost {
             // an empty command and surface a confusing resolve error.
             .filter(|c| {
                 // Connect if any consumer wants it; all off => fully disabled.
-                (c.claude_access || c.offload_access || c.opencode_access)
+                (harness_access_of(c).iter().any(|(_, on)| *on) || c.offload_access)
                     // V37 C3: and the registry says it exists at all.
                     && server_enabled(c, categories, activation)
                     && !c.name.trim().is_empty()
@@ -1763,9 +1857,15 @@ impl McpHost {
     /// currently see. See [`McpSurfaceFingerprint`] for why it is a different
     /// hash from [`host_config_sig`].
     pub async fn surface_fingerprint(&self) -> McpSurfaceFingerprint {
+        let mut harness = crate::harness::PerHarness::filled(0u64);
+        for h in crate::harness::registry::all() {
+            let digest = surface_digest(&self.advertised(Consumer::Harness(h)).await);
+            if let Some(slot) = harness.get_mut(h) {
+                *slot = digest;
+            }
+        }
         McpSurfaceFingerprint {
-            claude: surface_digest(&self.advertised(Consumer::Claude).await),
-            opencode: surface_digest(&self.advertised(Consumer::Opencode).await),
+            harness,
             offload: surface_digest(&self.advertised(Consumer::Offload).await),
         }
     }
@@ -1843,16 +1943,21 @@ impl McpHost {
         self.tool_defs_filtered(Consumer::Offload).await
     }
 
-    /// Claude-Code tool defs (servers with `claude_access`), proxied to Claude
-    /// through the per-session child's `tools/list`.
-    pub async fn tool_defs_for_claude(&self) -> Vec<ToolDef> {
-        self.tool_defs_filtered(Consumer::Claude).await
-    }
-
-    /// V19: OpenCode tool defs (servers with `opencode_access`), proxied to
-    /// OpenCode through the `--consumer opencode` child's `tools/list`.
-    pub async fn tool_defs_for_opencode(&self) -> Vec<ToolDef> {
-        self.tool_defs_filtered(Consumer::Opencode).await
+    /// One harness's tool defs (the servers granted to it), proxied to that
+    /// harness through its per-session child's `tools/list`.
+    ///
+    /// V40 Phase A (locked decision 25) replaced the
+    /// `tool_defs_for_claude` / `tool_defs_for_opencode` pair. Two methods that
+    /// differ only in a `Consumer` variant is one method per harness, which is
+    /// the shape a third harness would have had to add a third of.
+    pub async fn tool_defs_for(&self, harness: crate::harness::HarnessId) -> Vec<ToolDef> {
+        match Consumer::for_harness(harness) {
+            Some(c) => self.tool_defs_filtered(c).await,
+            // A harness the MCP host has no consumer variant for advertises
+            // NOTHING rather than inheriting another harness's grants — the
+            // fail-closed direction for a grant question.
+            None => Vec::new(),
+        }
     }
 
     /// Route a namespaced `<server>__<tool>` call to its owning server, but
@@ -2737,18 +2842,37 @@ fn config_sig(c: &McpServerConfig) -> String {
     // an unscreened surface for the app's lifetime — the same shape of bug the
     // `auth_token` note above records.
     format!(
-        "{}|{}|{:?}|{}|{}|{}|{:?}|{}|{}|{:?}",
+        "{}|{}|{:?}|{:?}|{}|{:?}|{}|{}|{:?}",
         c.command,
         c.url,
         c.args,
-        c.claude_access,
+        // The whole map, in registry order: a fixed pair here would have left a
+        // third harness's grant flip invisible to `warm_host`, so its already
+        // warm connection would keep serving the old surface for the app's
+        // lifetime — the shape the `auth_token` and `origin` notes record.
+        harness_access_of(c),
         c.offload_access,
-        c.opencode_access,
         env,
         token_fp(&c.auth_token),
         c.enabled,
         c.origin
     )
+}
+
+/// One config row's `access` map as a registry-sized array.
+///
+/// **The single translation point** between the persisted `BTreeMap<String,
+/// McpAccess>` (which round-trips ids this build does not know) and the
+/// `PerHarness<bool>` every grant check reads. An id with no registry slot is
+/// simply not represented here — it cannot be granted to a consumer that does
+/// not exist — and it is preserved on disk regardless, which is the whole point
+/// of the map being keyed by `String`.
+fn harness_access_of(c: &McpServerConfig) -> crate::harness::PerHarness<bool> {
+    crate::harness::PerHarness::from_fn(|h| {
+        h.id()
+            .and_then(|id| c.access.get(id))
+            .is_some_and(|a| a.enabled)
+    })
 }
 
 /// Non-cryptographic fingerprint of a token, for change detection only — never
@@ -2828,9 +2952,12 @@ fn fake_server(
         }]),
         healthy: AtomicBool::new(true),
         error: StdMutex::new(None),
-        claude_access: claude,
+        harness_access: crate::harness::PerHarness::from_fn(|h| match h.id() {
+            Some("claude") => claude,
+            Some("opencode") => opencode,
+            _ => false,
+        }),
         offload_access: offload,
-        opencode_access: opencode,
         // External, the config default — a fake server stands in for a real
         // third-party one, and a test that wanted the internal reading would be
         // asserting about a population this helper does not model.
@@ -2931,9 +3058,8 @@ async fn connect_server(
         tools: StdMutex::new(Vec::new()),
         healthy: AtomicBool::new(false),
         error: StdMutex::new(None),
-        claude_access: cfg.claude_access,
+        harness_access: harness_access_of(cfg),
         offload_access: cfg.offload_access,
-        opencode_access: cfg.opencode_access,
         origin: cfg.origin,
         probe: StdMutex::new(ProbeState::default()),
     };
@@ -3912,6 +4038,37 @@ fn confine_filesystem(cfg: &McpServerConfig, args: &mut Vec<String>, allowed_roo
 
 #[cfg(test)]
 mod tests {
+
+    /// **The conservative grant never answers one of cImp's OWN consumers**
+    /// (V40 locked decision 25).
+    ///
+    /// The rule folds `Offload` and `Audit` onto a harness's grants on the
+    /// proxy surface, and the whole point is the DIRECTION: answering
+    /// `Consumer::Offload` there would judge a stray query value against the
+    /// `offload_access` flag — "cImp's own in-app consumers may reach this
+    /// server" — and hand a proxied harness child a server the user never
+    /// exposed to it.
+    #[test]
+    fn the_conservative_grant_never_answers_an_in_app_consumer() {
+        let grant = Consumer::conservative_grant();
+        assert!(
+            matches!(grant, Consumer::Harness(_)),
+            "the fold must land on a harness's grants, not on `offload_access`: {grant:?}"
+        );
+        // …and it names a REGISTERED harness, so `granted` reads a real slot
+        // rather than falling through to `unwrap_or(false)` — which would be
+        // fail-closed, but silently, and for the wrong reason.
+        if let Consumer::Harness(h) = grant {
+            assert!(
+                h.ordinal().is_some(),
+                "{h} has no registry slot; every access lookup for it would answer false"
+            );
+        }
+        // The fold is not a widening: with every harness denied, the folded
+        // consumer is denied too.
+        let denied = crate::harness::PerHarness::filled(false);
+        assert!(!grant.granted(&denied, true), "the fold must not read `offload_access`");
+    }
     use super::*;
 
     #[tokio::test]
@@ -3923,7 +4080,7 @@ mod tests {
             Arc::new(fake_server("gamma", false, false, true, "gamma__z")), // OpenCode-only
         ]);
 
-        let claude = host.tool_defs_for_claude().await;
+        let claude = host.tool_defs_for(harness_id("claude")).await;
         assert_eq!(claude.len(), 1);
         assert_eq!(claude[0].function.name, "alpha__x");
 
@@ -3931,13 +4088,13 @@ mod tests {
         assert_eq!(offload.len(), 1);
         assert_eq!(offload[0].function.name, "beta__y");
 
-        let opencode = host.tool_defs_for_opencode().await;
+        let opencode = host.tool_defs_for(harness_id("opencode")).await;
         assert_eq!(opencode.len(), 1);
         assert_eq!(opencode[0].function.name, "gamma__z");
 
         // Claude must not be able to invoke the offload-only server's tool.
         let err = host
-            .call_for_consumer(Consumer::Claude, "beta__y", json!({}))
+            .call_for_consumer(consumer_of_test("claude"), "beta__y", json!({}))
             .await
             .unwrap_err();
         assert!(
@@ -3948,7 +4105,7 @@ mod tests {
         assert_eq!(err.remote(), None);
         // OpenCode must not reach the Claude-only server's tool.
         let err2 = host
-            .call_for_consumer(Consumer::Opencode, "alpha__x", json!({}))
+            .call_for_consumer(consumer_of_test("opencode"), "alpha__x", json!({}))
             .await
             .unwrap_err();
         assert!(
@@ -4587,9 +4744,8 @@ mod tests {
         DisabledServer {
             name: name.into(),
             verdict,
-            claude_access: true,
+            harness_access: crate::harness::per_harness_for_test(&[("claude", true), ("opencode", true)]),
             offload_access: true,
-            opencode_access: true,
         }
     }
 
@@ -4748,9 +4904,9 @@ mod tests {
             vec![disabled("beta", EnableVerdict::CategoriesOff("research".into()))];
 
         for defs in [
-            host.tool_defs_for_claude().await,
+            host.tool_defs_for(harness_id("claude")).await,
             host.tool_defs_for_offload().await,
-            host.tool_defs_for_opencode().await,
+            host.tool_defs_for(harness_id("opencode")).await,
         ] {
             assert_eq!(defs.len(), 1, "got: {defs:?}");
             assert_eq!(defs[0].function.name, "alpha__x");
@@ -4776,7 +4932,7 @@ mod tests {
         ];
 
         let err = host
-            .call_for_consumer(Consumer::Claude, "beta__y", json!({}))
+            .call_for_consumer(consumer_of_test("claude"), "beta__y", json!({}))
             .await
             .unwrap_err();
         let d = err.diagnostic();
@@ -4787,7 +4943,7 @@ mod tests {
         assert_eq!(err.remote(), None);
 
         let err = host
-            .call_for_consumer(Consumer::Opencode, "gamma__z", json!({}))
+            .call_for_consumer(consumer_of_test("opencode"), "gamma__z", json!({}))
             .await
             .unwrap_err();
         let d = err.diagnostic();
@@ -4799,7 +4955,7 @@ mod tests {
         // Disabled != unknown: a tool from no configured server at all keeps
         // the pre-V37 wording, with no claim about a toggle.
         let err = host
-            .call_for_consumer(Consumer::Claude, "nowhere__t", json!({}))
+            .call_for_consumer(consumer_of_test("claude"), "nowhere__t", json!({}))
             .await
             .unwrap_err();
         let d = err.diagnostic();
@@ -4810,7 +4966,7 @@ mod tests {
         // later, on the absent connection — the point is only that the disabled
         // refusal did not fire.)
         let err = host
-            .call_for_consumer(Consumer::Claude, "alpha__x", json!({}))
+            .call_for_consumer(consumer_of_test("claude"), "alpha__x", json!({}))
             .await
             .unwrap_err();
         assert!(!err.diagnostic().contains(REFUSAL_DISABLED));
@@ -4828,7 +4984,7 @@ mod tests {
             disabled("git", EnableVerdict::ServerOff),
             disabled("git__extra", EnableVerdict::CategoriesOff("vcs".into())),
         ];
-        let owner = |t: &'static str| host.disabled_owner(Consumer::Claude, t);
+        let owner = |t: &'static str| host.disabled_owner(consumer_of_test("claude"), t);
         assert_eq!(owner("git__extra__log").await.unwrap().0, "git__extra");
         assert_eq!(owner("git__log").await.unwrap().0, "git");
         // The separator is required: `github__x` is not `git`'s.
@@ -4871,8 +5027,8 @@ mod tests {
         // F2: the grants ride along, so the refusal can be scoped to the
         // consumers that would have had the server (`cfg` sets offload only).
         assert!(disabled[0].offload_access);
-        assert!(!disabled[0].claude_access);
-        assert!(!disabled[0].opencode_access);
+        assert!(!granted_for_test(&disabled[0].harness_access, "claude"));
+        assert!(!granted_for_test(&disabled[0].harness_access, "opencode"));
         drop(disabled);
 
         // Nothing disabled ended up in the pool.
@@ -4903,11 +5059,11 @@ mod tests {
 
         // The live owner settles it: no refusal, dispatch continues.
         assert!(host
-            .disabled_owner(Consumer::Claude, "git__extra__log")
+            .disabled_owner(consumer_of_test("claude"), "git__extra__log")
             .await
             .is_none());
         let err = host
-            .call_for_consumer(Consumer::Claude, "git__extra__log", json!({}))
+            .call_for_consumer(consumer_of_test("claude"), "git__extra__log", json!({}))
             .await
             .unwrap_err();
         assert!(
@@ -4917,7 +5073,7 @@ mod tests {
 
         // A tool with NO live owner still falls back to the prefix match.
         assert_eq!(
-            host.disabled_owner(Consumer::Claude, "git__log")
+            host.disabled_owner(consumer_of_test("claude"), "git__log")
                 .await
                 .unwrap()
                 .0,
@@ -4929,7 +5085,7 @@ mod tests {
         // whose OWN name is disabled must still refuse.
         *host.disabled.write().await = vec![disabled("git__extra", EnableVerdict::ServerOff)];
         let err = host
-            .call_for_consumer(Consumer::Claude, "git__extra__log", json!({}))
+            .call_for_consumer(consumer_of_test("claude"), "git__extra__log", json!({}))
             .await
             .unwrap_err();
         assert!(err.diagnostic().contains(REFUSAL_DISABLED), "got: {err}");
@@ -4946,18 +5102,17 @@ mod tests {
         *host.disabled.write().await = vec![DisabledServer {
             name: "beta".into(),
             verdict: EnableVerdict::ServerOff,
-            claude_access: false,
+            harness_access: crate::harness::per_harness_for_test(&[("claude", false), ("opencode", true)]),
             offload_access: false,
-            opencode_access: true,
         }];
 
         let err = host
-            .call_for_consumer(Consumer::Opencode, "beta__y", json!({}))
+            .call_for_consumer(consumer_of_test("opencode"), "beta__y", json!({}))
             .await
             .unwrap_err();
         assert!(err.diagnostic().contains(REFUSAL_DISABLED), "got: {err}");
 
-        for consumer in [Consumer::Claude, Consumer::Offload] {
+        for consumer in [consumer_of_test("claude"), Consumer::Offload] {
             let err = host
                 .call_for_consumer(consumer, "beta__y", json!({}))
                 .await
@@ -4981,7 +5136,7 @@ mod tests {
         host.shutdown().await;
         assert!(host.disabled.read().await.is_empty());
         let err = host
-            .call_for_consumer(Consumer::Claude, "beta__y", json!({}))
+            .call_for_consumer(consumer_of_test("claude"), "beta__y", json!({}))
             .await
             .unwrap_err();
         assert!(!err.diagnostic().contains(REFUSAL_DISABLED), "got: {err}");
@@ -5004,9 +5159,12 @@ mod tests {
             .await;
         let one = host.surface_fingerprint().await;
         let seed = McpSurfaceFingerprint::empty();
-        assert_ne!(one.claude, seed.claude);
+        assert_ne!(digest_for_test(&one, "claude"), digest_for_test(&seed, "claude"));
         assert_eq!(one.offload, seed.offload);
-        assert_eq!(one.opencode, seed.opencode);
+        assert_eq!(
+            digest_for_test(&one, "opencode"),
+            digest_for_test(&seed, "opencode")
+        );
 
         // Recomputing an unchanged host is stable (a pulse would be suppressed).
         assert_eq!(host.surface_fingerprint().await, one);
@@ -5204,12 +5362,12 @@ mod tests {
             .unwrap()
             .insert("git__extra".into(), "vcs".into());
 
-        let (server, category) = host.identify(Consumer::Claude, "git__extra__log").await;
+        let (server, category) = host.identify(consumer_of_test("claude"), "git__extra__log").await;
         assert_eq!(server.as_deref(), Some("git__extra"));
         assert_eq!(category.as_deref(), Some("vcs"));
 
         // Uncategorized rides with no category — absent, not empty.
-        let (server, category) = host.identify(Consumer::Claude, "solo__x").await;
+        let (server, category) = host.identify(consumer_of_test("claude"), "solo__x").await;
         assert_eq!(server.as_deref(), Some("solo"));
         assert_eq!(category, None);
 
@@ -5220,7 +5378,7 @@ mod tests {
         assert_eq!(server.as_deref(), Some("beta"));
 
         // Nothing owns it, live or disabled.
-        assert_eq!(host.identify(Consumer::Claude, "ghost__x").await, (None, None));
+        assert_eq!(host.identify(consumer_of_test("claude"), "ghost__x").await, (None, None));
     }
 
     #[test]
@@ -5307,9 +5465,8 @@ mod tests {
             tools: StdMutex::new(tools),
             healthy: AtomicBool::new(true),
             error: StdMutex::new(None),
-            claude_access: true,
+            harness_access: crate::harness::per_harness_for_test(&[("claude", true), ("opencode", true)]),
             offload_access: true,
-            opencode_access: true,
             origin: McpOrigin::External,
             probe: StdMutex::new(ProbeState::default()),
         }
@@ -5348,7 +5505,7 @@ mod tests {
             .await
             .push(Arc::new(server_with("ddg", "sig", kept)));
 
-        for consumer in [Consumer::Claude, Consumer::Opencode, Consumer::Offload] {
+        for consumer in [consumer_of_test("claude"), consumer_of_test("opencode"), Consumer::Offload] {
             let names: Vec<String> = host
                 .tool_defs_filtered(consumer)
                 .await
@@ -5561,9 +5718,8 @@ mod tests {
         host.disabled.write().await.push(DisabledServer {
             name: "ddg".into(),
             verdict: EnableVerdict::ServerOff,
-            claude_access: true,
+            harness_access: crate::harness::per_harness_for_test(&[("claude", true), ("opencode", true)]),
             offload_access: true,
-            opencode_access: true,
         });
         let resurrected = Arc::new(fake_server("ddg", true, true, true, "ddg__search"));
         assert!(!host.swap_recovered(&fresh, resurrected).await);
@@ -5582,9 +5738,8 @@ mod tests {
         let broken = McpServerConfig {
             name: "ddg".into(),
             command: "cimp-no-such-binary-ever".into(),
-            claude_access: true,
+            access: crate::settings::access_for_test(&[("claude", true), ("opencode", true)]),
             offload_access: true,
-            opencode_access: true,
             ..cfg("ddg", true)
         };
         let dead = Arc::new(server_with("ddg", &config_sig(&broken), Vec::new()));
@@ -5624,9 +5779,8 @@ mod tests {
         let live = McpServerConfig {
             name: "ddg".into(),
             command: "cimp-no-such-binary-ever".into(),
-            claude_access: true,
+            access: crate::settings::access_for_test(&[("claude", true), ("opencode", true)]),
             offload_access: true,
-            opencode_access: true,
             ..cfg("ddg", true)
         };
         let stale_sig = config_sig(&live);
@@ -5721,9 +5875,8 @@ mod tests {
         *host.disabled.write().await = vec![DisabledServer {
             name: "acme".to_string(),
             verdict: EnableVerdict::ServerOff,
-            claude_access: false,
+            harness_access: crate::harness::per_harness_for_test(&[("claude", false), ("opencode", false)]),
             offload_access: true,
-            opencode_access: false,
         }];
         let refused = host
             .call_for_consumer(Consumer::Audit, "acme__scan", json!({}))
@@ -5808,7 +5961,7 @@ mod tests {
 
         let err = host
             .call_recorded(
-                Consumer::Claude,
+                consumer_of_test("claude"),
                 None,
                 "acme__scan",
                 json!({}),
@@ -5839,9 +5992,8 @@ mod tests {
         *host.disabled.write().await = vec![DisabledServer {
             name: "acme".to_string(),
             verdict: EnableVerdict::ServerOff,
-            claude_access: false,
+            harness_access: crate::harness::per_harness_for_test(&[("claude", false), ("opencode", false)]),
             offload_access: true,
-            opencode_access: false,
         }];
 
         let refused = host
@@ -5887,7 +6039,7 @@ mod tests {
             ],
         )));
         let before = host.servers.read().await[0].clone();
-        assert_eq!(host.tool_defs_for_claude().await.len(), 2);
+        assert_eq!(host.tool_defs_for(harness_id("claude")).await.len(), 2);
 
         // Screening with detection OFF withholds nothing — a degraded or
         // disabled screener must never empty a surface (the `apply_screen`
@@ -5896,7 +6048,7 @@ mod tests {
             !host.rescreen(NO_SCREEN).await,
             "a screen that cannot run drops nothing"
         );
-        assert_eq!(host.tool_defs_for_claude().await.len(), 2);
+        assert_eq!(host.tool_defs_for(harness_id("claude")).await.len(), 2);
 
         // Now the rules change and the first tool's description starts firing.
         // Driven through `drop_flagged` — the mechanism `rescreen` applies — so
@@ -5919,7 +6071,7 @@ mod tests {
 
         // Gone from every consumer's surface…
         let names: Vec<String> = host
-            .tool_defs_for_claude()
+            .tool_defs_for(harness_id("claude"))
             .await
             .into_iter()
             .map(|d| d.function.name)
@@ -5930,7 +6082,7 @@ mod tests {
         // withheld tool is upstream of dispatch, so there is nothing left to
         // route to.
         let refused = host
-            .call_for_consumer(Consumer::Claude, "acme__poisoned", json!({}))
+            .call_for_consumer(consumer_of_test("claude"), "acme__poisoned", json!({}))
             .await
             .expect_err("a withheld tool is not callable")
             .to_string();
@@ -5939,7 +6091,7 @@ mod tests {
         // The tool beside it still routes (as far as a connection-less fake can
         // go: past ownership, into the transport).
         let reached = host
-            .call_for_consumer(Consumer::Claude, "acme__ok", json!({}))
+            .call_for_consumer(consumer_of_test("claude"), "acme__ok", json!({}))
             .await
             .expect_err("a fake server has no transport")
             .to_string();
@@ -5967,6 +6119,38 @@ mod tests {
         s.origin = McpOrigin::Internal;
         host.servers.write().await.push(Arc::new(s));
         assert!(!host.rescreen(detection::Config::default()).await);
-        assert_eq!(host.tool_defs_for_claude().await.len(), 1);
+        assert_eq!(host.tool_defs_for(harness_id("claude")).await.len(), 1);
     }
+}
+
+/// A registered harness by id — the tests may NAME a harness, they just may not
+/// construct one out of thin air. `expect` because a build whose registry does
+/// not know these two ids is one `every_registry_entry_is_fully_wired` fails.
+#[cfg(test)]
+fn harness_id(id: &str) -> crate::harness::HarnessId {
+    crate::harness::HarnessId::from_id(id).expect("a registered harness id")
+}
+
+/// A harness consumer by id — **tests only**. `Consumer::Harness(..)` replaced
+/// the `Claude` / `Opencode` variants in V40 Phase B; the tests name the
+/// harness they were always about.
+#[cfg(test)]
+fn consumer_of_test(id: &str) -> Consumer {
+    Consumer::Harness(harness_id(id))
+}
+
+/// One harness's grant out of a `PerHarness<bool>` — **tests only**.
+#[cfg(test)]
+fn granted_for_test(access: &crate::harness::PerHarness<bool>, id: &str) -> bool {
+    access.get(harness_id(id)).copied().unwrap_or(false)
+}
+
+/// One harness's surface digest — **tests only**. Keyed, never positional: the
+/// positional read is the defect locked decision 25 removed.
+#[cfg(test)]
+fn digest_for_test(fp: &McpSurfaceFingerprint, id: &str) -> u64 {
+    fp.harness
+        .get(harness_id(id))
+        .copied()
+        .expect("registered harness")
 }

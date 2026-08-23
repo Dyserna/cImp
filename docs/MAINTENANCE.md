@@ -40,8 +40,8 @@ apply / defer / watch decision before anything is changed.
    trigger — re-evaluate every entry as part of this step, and run it from
    `src-tauri/` or the baseline won't load).
 3. **Deep-dep changelogs.** For the hairy deps with their own *Dependencies to
-   track* sections (`ort`, `whisper-rs`, `cozo`/SQLite, the Claude Code /
-   OpenCode CLI contracts), read release notes for anything newer than the pin —
+   track* sections (`ort`, `whisper-rs`, `cozo`/SQLite, and each registered
+   harness's `README.md`), read release notes for anything newer than the pin —
    looking for: fixes we're waiting on, breaking API changes, and smoke tests
    the dep's section says to re-run on bump. Two hairy deps deliberately have
    no deep section: tree-sitter grammars (covered by the *Code graph grammars
@@ -52,16 +52,16 @@ apply / defer / watch decision before anything is changed.
    newer offload/embedding model releases (Qwen line), Kokoro/whisper model
    cards, the ddg/context7 MCP servers, toolchain cadence (Vulkan SDK, LLVM,
    CUDA/cuDNN) — per the *External runtime components* table.
-5. **Harness watch (Claude Code + OpenCode).** Read both changelogs since the
-   last run. Two lenses:
-   - **Behavior changes / contract drift** — anything touching the contracts in
-     *Claude Code / OpenCode CLIs — hook & plugin behavior contracts*: hook
-     events & payload shapes, MCP server spawning (esp. the open "session id
-     inside MCP tool calls" gap), `--settings` overlay, statusline JSON,
-     transcript JSONL shape (incl. subagents), permission-prompt text, the
-     OpenCode plugin API (`chat.message`, `tool.execute.*`,
-     `OPENCODE_CONFIG_CONTENT`). If anything moved, run the ~10-min check and
-     if needed the spike recipes in that section.
+5. **Harness watch — once per REGISTERED harness.** The list is
+   `harness::registry::HARNESSES`, not a fixed pair: for each
+   `src-tauri/src/harness/<id>/` directory, read that harness's changelog since
+   the last run and its own `README.md`. Two lenses:
+   - **Behavior changes / contract drift** — anything touching the contracts
+     in that harness's `README.md` § *Drift watch*: its ingress mechanism and
+     payload shapes, MCP server spawning, spawn-time config/overlay artifacts,
+     transcript or event shapes (incl. sub-agents), permission-prompt text, its
+     native tool ids, its input profile. If anything moved, run the ~10-min
+     check and if needed the spike recipes in that README.
    - **New capabilities** — new hook events, plugin/skill mechanisms, MCP
      features, CLI flags that would let an existing cImp feature be built
      better (e.g. a supported API replacing a scraped/undocumented one) or
@@ -351,8 +351,7 @@ cargo/npm — check their sources manually.
 | Prompt Guard 2 22M weights (V32 C) | The classifier layer's ONNX weights, expected under the models dir via the `models-v1` pipeline. | **OPEN DEPLOY FOLLOW-UP: not published** (HF-gated; the Llama 4 Community Licence must be accepted, the model exported to ONNX, real SHA-256s written, and a non-colliding asset name chosen). Until then the classifier is *gracefully inert* — Settings shows "weights not installed" and the signature layer carries detection alone. Placeholders + the full checklist are commented in `models/CHECKSUMS.txt`; keep the `classifier` component OUT of the published manifest until the weights land. |
 | Offload MCP servers | `ddg` + `context7` as Streamable-HTTP endpoints (`172.21.1.11:17201/17202`); plus stdio `git`/`fetch`/`fs`/`context7` | each MCP server's own repo; live-reloadable in Settings → MCP servers. |
 | WebView2 runtime | Windows system component (or installer-bundled) | OS-managed; relevant only if shipping an installer. |
-| Claude Code CLI | user-installed, self-updating; hosts the V10–V14 hook contracts (injection, PreCompact, read advisor, post-edit, statusline) | see **Claude Code / OpenCode CLIs — hook & plugin behavior contracts** below; re-check after visible CLI updates. |
-| OpenCode CLI | user-installed, self-updating; hosts the generated `.opencode/plugin` (injection + memory feed) | same section below. |
+| Registered harness CLIs (Claude Code, OpenCode) | user-installed, self-updating; each hosts its own ingress mechanism (hooks, a generated plugin) and its own spawn-time artifacts | one `README.md` per harness under `src-tauri/src/harness/<id>/`, indexed from **Registered harness CLIs — behavior contracts** below; re-check after visible CLI updates. |
 
 ---
 
@@ -539,105 +538,87 @@ cargo/npm — check their sources manually.
   can't be accepted, or a cozo dep blocking an MSRV/dependency bump
   elsewhere.** Until one fires, the rewrite buys nothing.
 
-### Claude Code / OpenCode CLIs — hook & plugin behavior contracts (V10–V14)
+### Registered harness CLIs — behavior contracts (V10–V14, V39, V40)
 
-The two agent harnesses are user-installed, auto-updating CLIs that cImp does
+The agent harnesses are user-installed, auto-updating CLIs that cImp does
 **not** pin — yet several features depend on undocumented or loosely-documented
-behavior contracts that a harness update can silently change. **Re-run this
-checklist periodically and after any noticeable Claude Code / OpenCode
-update** (both CLIs self-update aggressively; `claude --version` /
-`opencode --version`).
+behavior contracts that a harness update can silently change.
 
-What each feature depends on, and the early-warning signal that it broke:
+**Since V40 the per-harness half of this section lives with the harness.** One
+registered harness is one `src-tauri/src/harness/<id>/` directory, and its drift
+rows, version pins, hook/plugin routing, spike recipes and open contracts are
+its `README.md`:
+
+| Harness | Drift rows and spike recipes |
+|---|---|
+| Claude Code | [`src-tauri/src/harness/claude/README.md`](../src-tauri/src/harness/claude/README.md) |
+| OpenCode | [`src-tauri/src/harness/opencode/README.md`](../src-tauri/src/harness/opencode/README.md) |
+
+What stays here is what is true of harnesses in **general**: the neutral
+capability rows, and the registry itself.
 
 **Capability id(s)** are the join keys into the machine-readable registry in
-`src-tauri/src/harness/contract.rs` (V35 Phase A). The two are kept in step by
-`harness::contract::tests::matrix_matches_maintenance_doc` — every registry id
-appears in exactly one row below, so a new dependency cannot land in one place
-and not the other.
+`src-tauri/src/harness/contract.rs` (V35 Phase A). Registry and prose are kept
+in step by `harness::contract::tests::matrix_matches_maintenance_doc`, which
+since V40 Phase G reads **all three** documents and asserts that each
+capability has exactly one row in the document its owning harness owns — so a
+new dependency cannot land in one place and not the other, a row cannot name a
+retired id, and a row cannot cover two harnesses at once (the combined
+`claude.input.profile, opencode.input.profile` row was split when the test
+stopped accepting one).
 
 | Capability id(s) | Feature | Contract it depends on | Where wired | Symptom if the contract drifts |
 |---|---|---|---|---|
-| `claude.hook.user_prompt_submit` | Context injection (V10) | A `UserPromptSubmit` hook of `type: "http"` (**Claude Code ≥ 2.1.63**) POSTs the payload and parses the 2xx JSON reply as it would a command hook's stdout, so `hookSpecificOutput.additionalContext` reaches the model; `$CIMP_HOOK_TOKEN` is substituted into the `Authorization` header from `allowedEnvVars` | `harness/claude/hook.rs` (payload + output shapes), route `/claude/hook/user_prompt_submit` in `offload/loopback.rs`, overlay in `harness/claude/overlay.rs` | Effectiveness "chars injected" keeps growing but injected files are never followed (Advisor follow-rate collapses); agent re-explores constantly. On a CLI older than 2.1.63 the entry is not understood and the capability is simply absent — V35 Phase J generates no command-hook fallback |
-| `claude.hook.precompact` | Compaction survival (V11-D) | A `PreCompact` hook of `type: "http"` whose 2xx reply's `additionalContext` reaches the compaction prompt — spike **D0**; outcome recorded in `harness_versions.d0_status` (still `unverified` until run — see the V16 spike recipes below) | `harness/claude/hook.rs`, route `/claude/hook/pre_compact` in `offload/loopback.rs`, overlay in `harness/claude/overlay.rs` | Hard to observe (server-side dedup-clear stays correct regardless); post-compaction re-exploration despite the feature being on |
-| `claude.hook.pretooluse_deny` | Read advisor (V11-E) | A `PreToolUse` hook of `type: "http"` can deny only by answering 2xx with `permissionDecision: "deny"` — a non-2xx, a timeout and a refused connection are all non-blocking — and the accompanying `permissionDecisionReason` is surfaced **to the model**: spike **E1**, outcome in `harness_versions.e1_status` (`"fail"` hard-blocks the advisor: Settings toggle disabled + hook never installed) | `harness/claude/hook.rs` (`plan_request`, `deny`), route `/claude/hook/pre_tool_use` in `offload/loopback.rs`, overlay in `harness/claude/overlay.rs` | `drift.read_reason.v1` fires (~100% remind→immediate full re-read = bare refusals); `drift.read_hook_silent.v1` fires (remind counter flatlines while large unchanged files keep being re-read) |
-| `claude.hook.posttooluse` | Post-edit checks (V12) | A `PostToolUse` hook of `type: "http"` fires for `Edit`/`Write`/`MultiEdit` **on success** with the documented payload shape and accepts `additionalContext` back. Success-only is right for this row (there is nothing to check after a failed edit); the new `PostToolUseFailure` event is wired for the *sizing* row instead (see the tool-result sizing row below) | `harness/claude/hook.rs`, route `/claude/hook/post_tool_use` in `offload/loopback.rs` → `/context/post_edit`'s core, overlay in `harness/claude/overlay.rs` | Auto-check diagnostics stop appearing after edit bursts. **Phase A finding 2 CLOSED 2026-08-17:** the route now files `drift.payload.v1` under the token `post_edit_hook` when `session_id`/`cwd`/`tool_name`/`tool_input.file_path` go missing (deliberately NOT the never-shipped `postedit_hook` spelling, which stays unattributed). Still LAGGING only — a hook that stops firing entirely says nothing, and there is no witness that proves an edit should have happened |
-| `claude.hook.notification`, `perm.tui_scrape` | Permission detection (NC-2, issue #5) | PRIMARY: `Notification` + `PermissionDenied` hooks of `type: "http"` (observe-only — they answer `{}` on every path; matcher `""` = all notification types, classified app-side by type with prose fallback). Both events reach ONE route, which dispatches on `hook_event_name`. Payload shape is read BOTH flat (`notification_type`/`message`) and nested (`notification: {type, message}`) — the docs are ambiguous, see the UNVERIFIED note carried into `harness/claude/hook.rs`. FALLBACK: the TUI scanner (V2-03) matches the approval prompt's footer *grammar*, not the old literal "Esc to cancel · Tab to amend" — chord labels are user-remappable and the amend segment is conditional, so that literal was retired. `processing/permission.rs` ships two OR'd patterns: `claude_permission` (all_of `to cancel ·` — the cancel hint followed by another segment, which only happens when cancel comes first) and `claude_permission_bare` (all_of `to cancel` + `1. Yes 2.`, the numbered options as corroborating anchor), both with none_of `to select` / `to navigate` so select-menu chrome is vetoed. Both paths feed the same idempotent flag | `harness/claude/hook.rs` → route `/claude/hook/notification` in `offload/loopback.rs` → `classify_permission_event` (same core `/permission/event` calls); scanner as fallback | `drift.payload.v1` under the token `notify_hook` (required fields missing) — unchanged from the deleted shim, so a pre-upgrade tab's reports land in the same bucket; permission notifications stop firing entirely = both paths broke — recharacterize the fallback via `RUST_LOG=perm_capture=debug`, capture a real hook payload via a `cat > file` Notification hook |
-| `claude.flag.settings_overlay`, `claude.statusline.stdin`, `claude.transcript.usage` | Statusline / usage | `--settings` overlay accepted at spawn; statusline stdin JSON carries the `rate_limits` object (account quota → written to `<exe-dir>/claude-usage-push.json`, feeds the usage widget — no network poller) and the `context_window` block (`used_percentage` / `total_input_tokens` / `context_window_size` + cache split → context bar, NC-3, issue #14); transcript JSONL `usage` fields present. **Neither of these two migrated in V35 Phase L, and the reason is upstream's:** no Claude Code hook input carries token counts (the common payload set is `session_id` / `transcript_path` / `cwd` / `permission_mode` / `hook_event_name`; `PostCompact` exposes no compaction metrics either) and none carries a context window or a `rate_limits` block. The only documented token surface is the OpenTelemetry `claude_code.token.usage` metric — a different integration, not a hook. So both stay **Tier C, permanently-until-upstream-changes**; `chp::EVENTS` keeps `session.usage` and `session.context` reserved with no producer rather than deleting them | `harness/claude/statusline.rs` (extract + push), `statusline/mod.rs` (the rendered bar), the transcript tap in `harness/claude/read.rs` | Context bar / quota widget go blank or freeze (a payload with neither `rate_limits` nor `context_window` writes no push); Usage section stops populating |
-| `claude.transcript.tool_result`, `claude.transcript.identity`, `claude.transcript.subagents`, `claude.flag.session_id` | Transcript tap — shape beyond usage (V14/V17.1/V24/V34); **two of these are FALLBACKS since V35 Phase L** | The rest of the Claude transcript JSONL contract the tap reads, beside the `usage` block above. `tool_result` and the sub-agent LIFECYCLE are now pushed (see the two Phase L hook rows above) and the corresponding taps here are suppressed for a tab whose CHP hello declares them — but `identity`, `--session-id` pinning, sub-agent TOKEN accounting and the `launch_seen`/`completion_seen` drift bookkeeping are **not** arbitrated and run on every tab, because no hook payload carries any of them. User lines carry `tool_result` content blocks with `tool_use_id` / `is_error` (tool-result sizing, V14); every line carries `sessionId`, `version` (feeds the harness version tripwire), `isSidechain` and `isMeta`; sub-agent traffic appears either inline (`isSidechain: true`) or as `<session_id>/subagents/agent-*.jsonl`, launched by a `tool_use` named `Task` (1.x) or `Agent` (2.x); and `--session-id <uuid>` still pins one tab to one transcript file (V34) — without it two tabs on one project are indistinguishable. | `harness/claude/read.rs` (drain, `SubagentFile`), `tabs/config.rs` (`resolve_oob_source`, `args_select_session`) | Silent, and each differently: tool-result sizes and per-tab identity go blank rather than wrong; `drift.subagent_transcripts.v1` fires when sub-agent traffic is in neither known location; losing `version` *silences* the version tripwire instead of firing it; a rejected `--session-id` reverts to pre-V34 newest-transcript-wins binding (ambiguous, not broken). |
-| `claude.hook.stop`, `claude.transcript.assistant_text` | Assistant prose → TTS (V20; **pushed since V35 Phase L**) | PRIMARY: a `Stop` hook of `type: "http"` fires at every turn's end carrying `last_assistant_message` — the complete final assistant text, i.e. the *same unit at the same cadence* the transcript tail delivers, which is what makes the migration cadence-preserving by construction (`MessageDisplay` is deliberately unused: per-chunk deltas on the streaming hot path would change the segmenter's unit). FALLBACK: harness/claude/read.rs::assistant_texts lifts `message.content[]` blocks with `type == "text"` out of an `assistant` line, keyed by `message.id` so one message is not re-spoken every drain tick, and `thinking`/`tool_use` blocks stay distinguishable so reasoning is never read aloud. ARBITRATION: per capability, per tab — the reader's tap is suppressed exactly when that tab's CHP hello declares `assistant_text`, so the two can never both speak; a mid-session switchover (`SessionStart` fires on resume/clear) is closed by the handoff in `tts/prose.rs`, which strips from the first push whatever the reader already said of the same message | `harness/claude/hook.rs` + `harness/claude/overlay.rs` → route `/claude/hook/stop` in `offload/loopback.rs` → `tts/prose.rs::speak_prose`; fallback `harness/claude/read.rs` | Tab goes MUTE. If the hook broke, `drift.payload.v1` fires under the token `stop_hook` — either because `last_assistant_message` arrived empty, or because the hook stopped firing at all (the Phase L quiet detector, witnessed by three `prompt` pushes with no `Stop` between them). **cImp does NOT fall back to the reader when that happens** — falling back would restore the audio and hide the breakage; restart the tab to re-declare. If the FALLBACK broke instead, the fallback row's own canary + probe fire (see the transcript-tap row) |
-| `claude.hook.tool_result` | Tool-result sizing, pushed (V35 Phase L; **errored half added 2026-08-17**) | **TWO all-tools (`""`) `type: "http"` entries, one per outcome**, because `PostToolUse` fires only when a tool SUCCEEDS: `hooks.PostToolUse` carries `tool_name` + `tool_result` (string, or `{type:"text", text}` blocks) and `hooks.PostToolUseFailure` carries `tool_name` + `error`. Both are separate ROUTES from the auto-check entry: its group and the success group both fire for an `Edit`, so one shared route would run the project's checks twice and count one result twice. Both are sized through the transcript reader's own `tool_result_chars`, so that reader's fixture canary is the leading check for every path. The failure route maps to NO CHP event of its own (the capability is `session.tool_result`; a second event would let a rare failure push reset the quiet counter watching the common success entry) and shares its sibling's drift token | `harness/claude/hook.rs` + `harness/claude/overlay.rs` → routes `/claude/hook/post_tool_use_result` and `/claude/hook/post_tool_use_failure` → `UsageEvent::ToolResult` | Tool-result sizes stop being recorded (the reader stays suppressed, on purpose). `drift.payload.v1` under `tool_result_hook`, for a present-but-unsizeable `tool_result`/`error` or for the hook going quiet (witnessed by `context.post_edit` pushes). **Version-skew residual:** `PostToolUseFailure` is newer than the 2.1.63 floor, so a CLI between the two ignores that entry and failed results go uncounted with nothing firing — the quiet detector does not see it, because the success half keeps pushing |
-| `claude.hook.subagent` | Sub-agent lifecycle → avatar (V35 Phase L) | `SubagentStart` + `SubagentStop` hooks of `type: "http"` on ONE route (matcher `""` = all agent types), dispatching on `hook_event_name` and keyed by `agent_id` — an id started and not stopped is an agent running. **Lifecycle only:** no hook payload carries sub-agent token counts and none names a sub-agent transcript path, so the transcript sub-agent row (see the transcript-tap row below) keeps reading `<session_id>/subagents/agent-*.jsonl` for the spend on every tab, and its `launch_seen`/`completion_seen` bookkeeping keeps running too (suppressing it would make `drift_condition` report a false "launcher tool renamed") | `harness/claude/hook.rs` + `harness/claude/overlay.rs` → route `/claude/hook/subagent` → `StateSignal::AgentsActiveChanged` | The avatar stops showing sub-agent activity. **No quiet detector, declared:** a session may legitimately launch no sub-agents, so no other push proves one should have been reported — `drift.payload.v1` under `subagent_hook` covers the malformed-payload half only |
-| `claude.hook.taint_beacon`, `claude.hook.checkpoint_beacon` | The two `PreToolUse` beacons (V32 Phase F / V33 Phase F) — **TCB rows**, migrated Tier **D → B** on 2026-08-17 | Two `type: "http"` `PreToolUse` entries carrying `{session_id, cwd, tool_name}`: matcher `WebFetch\|WebSearch` → `/claude/hook/pre_tool_use_taint`, matcher `Edit\|Write\|MultiEdit\|Bash` → `/claude/hook/pre_tool_use_checkpoint`. **They were Tier D because each rested on an UNDOCUMENTED behaviour of `type: "command"` hooks** — that a hook writing nothing and exiting 0 is non-blocking *including on timeout*, and that the tool does not begin until the hook process exits. The http contract states both in writing (verified against 2.1.233, 2026-08-17): a non-2xx, a timeout and a refused connection are non-blocking, blocking is expressible ONLY as 2xx plus a decision field, and a `PreToolUse` hook blocks the tool call until the response — which is what makes `permissionDecision: "deny"` expressible and therefore what makes the checkpoint's ordering a documented guarantee. Both are still report-only and now structurally incapable of denying (V32 locked decision 14): their handlers emit no decision field. The checkpoint entry's `timeout` is 5 s, a ceiling over the app's own 1800 ms snapshot budget — the handler awaits the snapshot before answering. `cimp --taint-beacon` / `cimp --checkpoint-beacon` are deleted; the flags survive in `main.rs` as stdin-draining tombstones so a pre-upgrade tab's overlay cannot launch a second GUI per call. | `harness/claude/hook.rs` + overlay entries in `harness/claude/overlay.rs` → routes in `offload/loopback.rs` → `latch_beacon_core` (`/latch/beacon`'s own core) and `tool_checkpoint_core` (`/workbench/tool_checkpoint`'s) | `drift.payload.v1` under the tokens `taint_beacon` / `checkpoint_beacon` — unchanged by the migration, so a tab still running the old shim lands in the same bucket, and since V35 Phase I both resolve to these rows instead of the un-attributed channel. **No quiet detector, declared:** a turn may legitimately never `WebFetch` and never edit, so no witness proves either should have fired — and both events also have an OpenCode producer these Claude-named tokens would misattribute. Otherwise **silent**: a beacon that stops firing leaves a tab's EXTERNAL latch unengaged (the proxied half still catches anything routed through cImp), and a checkpoint that stops firing loses per-call rewind points while the prompt-level ones remain. A blown snapshot budget is *not* silent — it writes its own `workbench` / `checkpoint_missed` Activity event. **A tab open across the upgrade reports `old_plugin` and has neither beacon until it is restarted.** |
-| `opencode.plugin.load_all` | OpenCode injection + memory (V10) | `chat.message` plugin hook + `tool.execute.after`; `OPENCODE_CONFIG_CONTENT` env. **Plugin API re-verified byte-identical at 1.18.18 on 2026-08-17** — discovery, ESM loading, `OPENCODE_PURE` and every hook signature cImp uses. One thing found while looking: the published Hooks type declares `permission.ask` and nothing upstream ever fires it, so no control may be built on it (a handler there would read like a permission gate and never run once). The generated plugin talks only to cImp's own loopback, never to OpenCode's HTTP server, so it needs no server credential | generated `.opencode/plugin` | OpenCode sessions stop appearing in Memory; no injection for OpenCode tabs |
-| `opencode.tool_registry` | OpenCode native tool registry (V32 Phase H) — **allowlist drift watch** | `harness::opencode::tools::OPENCODE_NATIVE_TABLE` classifies OpenCode's OWN tool ids for the Phase H taint gate, and is deliberately **allowlist-only**: a name absent from it is UNGATED. (Unknown⇒EXTERNAL, the locked rule for cImp's routed vocabulary, is wrong for a harness registry — it would gate `todowrite` as external content.) The consequence is a maintenance obligation: a NEW OpenCode file/shell/web tool ships ungated and nothing fails loudly. **Each maintenance run (and after any visible OpenCode update): re-run `opencode serve` + `GET /experimental/tool/ids` and diff against the table; classify any new id (or record why it carries no capability).** `apply_patch` is the standing example of why — it replaces `edit`/`write` on OpenAI-provider models, so a list naming only `edit`/`write` leaves that whole mutation surface open. **Re-verified 2026-08-17** against the installed 1.18.13 and diffed against 1.18.18: the same 14 live ids, no drift. Two follow-ups from that pass, both about ids the probe structurally *cannot* see because they are registered only behind experiment env flags: (a) `execute` (`OPENCODE_EXPERIMENTAL_CODE_MODE`, runs arbitrary code ⇒ gated exactly like `bash`, mutating) and `lsp` (`OPENCODE_EXPERIMENTAL_LSP_TOOL`, reads project data ⇒ gated, non-mutating) are now in the table, and `plan_exit` (`OPENCODE_EXPERIMENTAL_PLAN_MODE`) is a recorded reviewed-ungated decision — a probe run against a default serve can say nothing about any of them, so `harness/opencode/tools.rs` carries its own test that all three stay classified; (b) **2.0 watch item:** upstream pins the id `bash` with a comment saying it will be RENAMED at opencode 2.0, so expect the probe to report `bash` as declared-but-not-served (a note) *and* the new name as UNCLASSIFIED (a failure) in the same run — classify the new id and keep `bash`. | `harness/opencode/tools.rs::OPENCODE_NATIVE_TABLE`; generated plugin rendered by `harness/opencode/plugin.rs::opencode_plugin_source` from the template `harness/opencode/templates/plugin.js` (V35 Phase M — the emitted sets are goldened under `src-tauri/fixtures/plugin-goldens/opencode/`, so a classification change shows up as a reviewable `.js` diff); inventory in `docs/HARNESS-NATIVE-TOOLS.md` §3 | Silent: the gate simply never fires for the new tool. Only the diff above detects it — which is why this row exists. |
-| `opencode.sse.events`, `opencode.route.push`, `opencode.route.noauth` | OpenCode OOB tap + push (V24/V30) — **the auth watch CLOSED on 2026-08-17 (Tier D → B)** | **The server is authenticated now, and that is the whole change.** cImp generates a fresh 32-hex password per OpenCode tab spawn, sets the documented `OPENCODE_SERVER_PASSWORD` + `OPENCODE_SERVER_USERNAME` pair on the child, and presents `Authorization: Basic base64("opencode:<password>")` on the SSE tap, the session probe and the push POST. Live-spiked 2026-08-17 on the installed 1.18.13 (diffed against 1.18.18, byte-identical upstream): unauth ⇒ 401 on every route including `GET /event`, Basic ⇒ 200/SSE. So the old double edge is gone in both directions — a release adding auth no longer breaks the tap, and the localhost exposure (`POST /session/:id/message` *without* `noReply` starts a real agent turn, reachable by any local process and plausibly by a browser via DNS rebinding) is closed for every tab cImp launches. **Three upstream footguns the implementation is shaped around:** the password is snapshotted at module load in the child, so it must be set AT SPAWN; an EMPTY password silently disables auth entirely; and a present-but-wrong `auth_token` query parameter WINS over a correct header, so cImp sends the header alone. First-party clients (the TUI, `opencode run`, the plugin's SDK client) self-authenticate from the same env, so the password does not break the tab. The SSE contract itself is re-verified unchanged at 1.18.18 with one movement: `session.idle` is **deprecated upstream and still emitted**, beside its replacement `session.status` (`properties.status.type` = `busy`/`idle`) — the reader honours both, and a second arrival for one turn-over is a no-op. **Each maintenance run:** run `cimp --harness-canary` (the probe spawns `opencode serve` WITH a password and asserts unauth ⇒ 401 *and* authenticated ⇒ accepted, both directions), and check release notes for changes to the Basic-auth scheme or to the turn-over events. | `harness/opencode/config.rs` (`new_server_password`, `server_auth_env`, `server_basic_auth`), `harness/reader.rs` (the spec field that carries the credential), `harness/opencode/read.rs` (`auth_headers`, `consume`, `forward_push`, `verify_main_session`, `Tracker::close_turn`), `tabs/config.rs` (`compose_ai_env`, `resolve_oob_source`) | Tap/push requests start failing 401/403 ⇒ the scheme moved: rewire `server_basic_auth`. Usage "live now" + V30 OpenCode fanout go dark until then (visible-off, and the probe FAILS rather than transitioning). The other direction is a security failure and is scored as one: if unauthenticated calls are served despite the password, the probe fails and names the route. If BOTH turn-over events stop being understood, an OpenCode tab goes mute mid-turn and the avatar stays in Thinking |
-| `claude.transcript.stop_reason` | Cross-harness delegation — the fallback reader's TURN boundary (V39 review HIGH-1) | An assistant transcript line carries `message.stop_reason`, and its value tells a turn that CONTINUES from one that is OVER: `tool_use` means the model paused to call a tool, anything else non-null (`end_turn`, and the rarer `max_tokens` / `stop_sequence`) means it stopped talking. One API message is written as SEVERAL transcript lines — one per content block — all repeating that message's stop reason, so the turn's final text can follow the line that declared the turn over; the reader therefore files at the end of a drain pass, not on the first `end_turn` line it sees. An UNRECOGNIZED value ends the turn, which is the fail-toward-answering direction | `harness/claude/read.rs::is_turn_end` + `TurnText`, feeding `delegation::note_assistant_text` through `OobContext::note_turn_text` | **Nothing visible in the tab.** Every line still parses, every message is still spoken, and only a driver waiting on a delegation finds out: no completion is ever filed, so the flight runs to the configured delegation timeout (ten minutes by default) and mints a `timeout` row for a turn that ended in seconds. A tab whose `Stop` hook pushes `assistant_text` is unaffected — the push core files the completion and this reader is suppressed (the `Stop`-hook row above is the named fallback). Caught by this row's own canary + live probe (fixture `transcript.stop-reason.jsonl`, drift model `_synthetic/stop-reason-renamed.jsonl`) |
-| `delegation.worker` | Cross-harness delegation — the worker gate (V39, locked decision 16). **The registry's first harness-NEUTRAL row (`Harness::Any`)** | A tab may be driven as a delegation worker: its harness serves CHP `assistant_text` for the turn's final assistant message (Claude, via the `Stop` hook) **or** has a live declared fallback reader that does (OpenCode, via the `/event` SSE tap — OpenCode declares `cannot` for `assistant_text`, so the reader is the normal path there, not a degradation), AND it declares an input profile (the two `*.input.profile` rows below). Harness-neutral by construction: the requirement is stated about a tab, not about a vendor, which is what lets a future harness become a worker by adding one directory. **Gated** — `contract::gate("delegation.worker")` reads `harness_versions.input_profile_status`, so a recorded `"fail"` turns delegation off entirely | `delegation/engine.rs` (preflight + `drive`), `harness/input.rs` (the neutral lookup), `offload/mcp.rs` (the generated `delegate_task_*` set) | **Fails closed, and that is the design.** A tab with no completion signal is refused at preflight naming the condition — the engine never types into a tab it cannot read back from, because an unreadable worker would swallow the task silently. Mid-flight loss of the signal surfaces as `timeout` with a `delegation` Events row, never as a hang. **The completion is per TURN, and each reader derives that boundary itself** (V39 review HIGH-1): the Claude tap fires on a transcript assistant line whose `message.stop_reason` is present and is not `tool_use` (an unknown value ends the turn — filing one message early beats hanging), the OpenCode tap fires on `session.idle` / `session.status:idle`. If a Claude release drops `stop_reason` from the transcript, delegation into Claude tabs degrades to `timeout`, never to a wrong answer |
-| `claude.input.profile`, `opencode.input.profile` | How a turn is TYPED into a harness TUI (V39, the push half of decision 16) | A bracketed paste (`ESC [ 200 ~` … `ESC [ 201 ~`) lands in the composer as **one literal insertion** — embedded newlines become newlines in the buffer, not submits — and a CR written after a short settle submits that buffer as **exactly one turn**. Both TUIs are known to enable bracketed paste (private mode 2004; `src/lib/terminals.ts` passes it through for both while swallowing mouse tracking). Everything past that is undocumented: the settle windows and paste bounds in `harness/<id>/input.rs` are **floors chosen from the failure they prevent, not measurements**. **Spike (input-profile), outcome in `harness_versions.input_profile_status`**, read by the worker gate above — same fail-closed reader as E1/D0 (`contract::spike_status_blocks`), so anything unrecognized blocks | `harness/claude/input.rs`, `harness/opencode/input.rs`, `harness/input.rs` (the harness-neutral lookup), consumed by `delegation/engine.rs` | **Silent if it drifts and the spike is not re-run** — a TUI that split a paste into two turns would send the worker a truncated question, which it would answer perfectly. That is why these rows fail closed on a recorded `"fail"` rather than degrading. **Each maintenance run (and after any visible Claude Code / OpenCode update): re-run V39 live-verify 1 and 2** (delegate a two-line task each way and confirm in the worker's own transcript that it arrived as ONE turn, verbatim, with no `[Pasted text]` placeholder), and record the outcome |
+| `delegation.worker` | Cross-harness delegation — the worker gate (V39, locked decision 16). **The registry's first harness-NEUTRAL row (`Harness::Any`)** | A tab may be driven as a delegation worker: its harness serves CHP `assistant_text` for the turn's final assistant message (Claude, via the `Stop` hook) **or** has a live declared fallback reader that does (OpenCode, via the `/event` SSE tap — OpenCode declares `cannot` for `assistant_text`, so the reader is the normal path there, not a degradation), AND it declares an input profile (the two `*.input.profile` rows below). Harness-neutral by construction: the requirement is stated about a tab, not about a vendor, which is what lets a future harness become a worker by adding one directory. **Gated** — `contract::gate("delegation.worker")` reads `Settings.harness[<id>].input_profile_status`, so a recorded `"fail"` turns delegation off entirely | `delegation/engine.rs` (preflight + `drive`), `harness/input.rs` (the neutral lookup), `offload/mcp.rs` (the generated `delegate_task_*` set) | **Fails closed, and that is the design.** A tab with no completion signal is refused at preflight naming the condition — the engine never types into a tab it cannot read back from, because an unreadable worker would swallow the task silently. Mid-flight loss of the signal surfaces as `timeout` with a `delegation` Events row, never as a hang. **The completion is per TURN, and each reader derives that boundary itself** (V39 review HIGH-1): the Claude tap fires on a transcript assistant line whose `message.stop_reason` is present and is not `tool_use` (an unknown value ends the turn — filing one message early beats hanging), the OpenCode tap fires on `session.idle` / `session.status:idle`. If a Claude release drops `stop_reason` from the transcript, delegation into Claude tabs degrades to `timeout`, never to a wrong answer |
 
-**How to check (~10 min):** open a Claude tab with `context_injection` (and,
-where enabled, `read_advisor`) on, run a couple of prompts against a large
-already-read file, and watch (a) the Code Intelligence → Usage Effectiveness
-counters move, (b) Activity logging `remind` events *without* an immediate
-identical full `Read` right after, (c) the status-bar context/usage line
-populating. For OpenCode, confirm a session shows up under Memory. Any drift:
-re-run the spike recipes below before trusting the feature again.
+### The harness registry itself (V40)
 
-**V16 (2026-07-12) — drift detection is now built in.** The "hardening ideas"
-recorded here earlier all shipped as V16:
+A harness is registered by one `HarnessDescriptor` in
+`src-tauri/src/harness/registry.rs`; everything above L2 consumes it through
+`HarnessPlugin` (in-tree, at spawn/config time) and CHP (on the wire, at run
+time). Two tests make that a build failure rather than a review habit, and both
+are the *watch* for this row:
 
-- **Version tripwire** — the OOB tap records the Claude CLI version from the
-  transcript (`harness_versions.claude_last_seen` in the global
-  `settings.json`); `opencode --version` is captured at tab spawn. When
-  `last_seen ≠ claude_last_verified` the Advisor card raises
-  `drift.harness_version.v1` with a **Mark verified** action — click it only
-  AFTER re-running the recipes below.
-- **Runtime canaries** — `drift.read_reason.v1` (~100% remind→re-read ⇒
-  propose disabling `read_advisor`), `drift.read_hook_silent.v1` (large
-  re-reads but zero reminds ⇒ hook not firing), `drift.injection_unseen.v1`
-  (injection follow-rate ~0%), `drift.usage_fields_gone.v1` (Claude sessions
-  without token fields). All on the Advisor card, `src-tauri/src/advisor.rs`.
-- **Shim payload validation** — the three shims POST
-  `/activity/contract_drift` when required fields go missing (still fail
-  open); surfaced as `drift.payload.v1`.
-- **Bypass detection** — the transcript tap counts shell reads of
-  just-reminded files (`read_advisor`/`bypass` Activity events, est.);
-  `drift.read_bypass.v1` proposes disabling the advisor at ≥40%.
+| What | Test | What breaks it |
+|---|---|---|
+| No harness identity outside the registry | `harness::layering::tests::no_harness_identity_outside_registry` (10a) | A `"claude"` / `"opencode"` / tab-id / binary literal, or a `match` on a `HarnessId`, appearing in a production file outside `harness/` and not on `IDENTITY_ALLOWLIST` with a reason. The frontend has the same test: `src/lib/harnessIdentity.test.ts`. |
+| Every descriptor is fully wired | `harness::layering::tests::every_registry_entry_is_fully_wired` (10b) | A descriptor whose directory, capability rows, CHP hello, `spawn_sig` slot, sandbox grant table, health-panel row, plugin `README.md` drift rows or (for a file-artifact harness) goldens directory is missing. |
+| The frontend mirrors the registry | `src/lib/harness.test.ts` against the committed `src-tauri/fixtures/harness/registry.json` (emitted by `cargo test`) | A descriptor field added in Rust with no TypeScript mirror. |
 
-**Spike recipes (Feature 0 — record outcomes in
-`harness_versions.{e1_status,d0_status}` in the global `settings.json`):**
+**Per-run watch step:** for **each** registered harness — read that harness's
+`README.md`, not a fixed two-item list. Adding a harness adds a row to this
+watch by adding a directory, which is the whole point of the registry.
 
-- **E1 (read advisor deny reason reaches the model).** With the app running
-  and `graph.enabled` + `graph.read_advisor` on, open a Claude tab in a
-  project with a large indexed file. Have the agent `Read` the file twice in
-  one session (second read unchanged). On the second read the hook denies
-  with the outline reminder. **Pass:** the model's next message references
-  the outline content (it *acts on* the reminder — e.g. answers from it, or
-  targets a specific symbol next). **Fail:** the model reports a bare
-  permission refusal and immediately retries/hits the same wall (check the
-  transcript JSONL for what the model actually received). Record
-  `"e1_status": "pass"` or `"fail"`; `"fail"` disables the Settings toggle
-  and blocks the hook install until changed back after a harness update.
-  A hand edit takes effect on the next tab launch/restart (the spawn path
-  re-reads the global file) and in a freshly opened Settings window — no
-  app restart needed. Anything other than `"unverified"`/`"pass"` (any
-  casing) is treated as a failure — the gate fails closed on typos.
-- **D0 (PreCompact additionalContext reaches the compaction prompt).** With
-  `compaction_context` on, run a session up to a `/compact` (manual is
-  fine). **Pass:** the post-compaction summary retains working-set files /
-  pinned notes fed by `/context/compaction` (compare against the block the
-  route returned — visible via `RUST_LOG=debug`). **Fail:** summary shows no
-  trace of it. Record `"d0_status"` accordingly (informational — a fail
-  degrades to a no-op, nothing misbehaves).
-- **OpenCode veto (V16 Feature 7 gate, still open).** In a scratch project,
-  add a `tool.execute.before` handler to the generated
-  `.opencode/plugin/cimp-inject.js` that throws for a known file's read and
-  observe whether (a) the read is vetoed and (b) the thrown message reaches
-  the model. Pass ⇒ implement the OpenCode read advisor per the V16 spec;
-  fail ⇒ record Claude-only as permanent-until-upstream-changes here.
+**How to check (~10 min per harness):** each plugin README opens with its own
+*How to check* paragraph and closes with its spike recipes. Run them in the
+harness's own tab; any drift, re-run that harness's recipes before trusting the
+feature again.
 
----
+**Drift detection is built in (V16).** The advisor evaluates every version-keyed
+rule **per harness** since V40 Phase C — `version_signature` is keyed by harness
+id, so each harness's notice fires and is dismissed independently, and *Mark
+verified* takes the harness from the row clicked:
+
+- **Version tripwire** — each harness's reader records the CLI version it
+  observes; when `last_seen ≠ last_verified` for that harness the Advisor card
+  raises `drift.harness_version.v1` with a **Mark verified** action — click it
+  only AFTER re-running that harness's recipes.
+- **Runtime canaries** — `drift.read_reason.v1` (~100% remind→re-read ⇒ propose
+  disabling `read_advisor`), `drift.read_hook_silent.v1` (large re-reads but
+  zero reminds ⇒ the harness's injection mechanism is not firing),
+  `drift.injection_unseen.v1` (injection follow-rate ~0%),
+  `drift.usage_fields_gone.v1` (sessions without token fields). All on the
+  Advisor card, `src-tauri/src/advisor.rs`; each rule's *fix hint* names the
+  mechanism the plugin declares, not a hard-coded one.
+- **Payload validation** — a harness's ingress routes POST
+  `/activity/contract_drift` when required fields go missing (still fail open);
+  surfaced as `drift.payload.v1`. The drift token vocabulary is the plugin's
+  (`HarnessPlugin::drift_vocabulary()`).
+- **Bypass detection** — the read tap counts shell reads of just-reminded files
+  (`read_advisor`/`bypass` Activity events, est.); `drift.read_bypass.v1`
+  proposes disabling the advisor at ≥40%. The shell tool it looks for is the
+  harness's declared one, not a literal `Bash`.
+
 
 ## Feature-area maintenance notes
 
@@ -845,50 +826,37 @@ Two independent version numbers; don't conflate them.
 "Memory-tool session scoping".*
 
 The `context_recall` / `context_note` / `context_notes` MCP tools resolve a
-session scoped to the calling agent (claude/opencode) **and** to the calling
-**tab** (V28, issue #13). The long-standing residual — two tabs of the *same*
-agent sharing one memory scope — is closed **without** the upstream feature it
-was waiting on.
+session scoped to the calling **harness** and to the calling **tab** (V28,
+issue #13). The long-standing residual — two tabs of the *same* harness sharing
+one memory scope — is closed **without** the upstream feature it was waiting on.
 
 **Why the upstream watch item is now moot.** No harness passes a session id into
-an MCP server's tool-call context (Claude Code gives hooks a `session_id` but
-gives its MCP children no arg, no env var, and no `tools/call` field). V28
-sidesteps that: the `--offload-mcp` child is per **tab** and cImp composes its
-argv, so `--tab <tab-id>` is baked at spawn and the *app* — which does know each
-tab's live session — resolves tab→session at call time from the V24 live-session
-registry. Stop watching for "session id inside MCP tool calls"; it is no longer
-load-bearing.
+an MCP server's tool-call context. V28 sidesteps that: the `--offload-mcp` child
+is per **tab** and cImp composes its argv, so `--tab <tab-id>` is baked at spawn
+and the *app* — which does know each tab's live session — resolves tab→session
+at call time from the V24 live-session registry. Stop watching for "session id
+inside MCP tool calls"; it is no longer load-bearing.
 
-**What to re-check instead** (the seam this design leaves):
+**The seam this design leaves, stated neutrally:**
 
-- **`--session-id` is a request, not a guarantee (V34, 2026-08-09).** Per-tab
-  identity for two Claude tabs on ONE project rests on cImp pinning each tab's
-  session at spawn (`claude --session-id <uuid>`) and the transcript being named
-  `<session-id>.jsonl`. **A tab does not always run under its pin** — observed
-  in the field on tabs carrying no `--resume`/`--continue` at all — so the pin
-  is verified against the transcript's existence before anything is published
-  from it, and a tab that never gets its pinned file simply runs as it did
-  pre-V34. Degraded, never broken, and never a false identity claim.
-
-  Nothing to watch for as a failure here: unpinned IS a supported state. What
-  would be a real regression is a pinned-but-unwritten tab going QUIET (no TTS,
-  no usage, no memory) — that means the verification turned back into a wait.
-  Check `--session-id` is still in `claude --help` on each harness upgrade, and
-  run the V28 live-verify recipe b3 (a one-liner over `Win32_Process`).
-- **The tab→session registry must stay fed.** Claude stamps it from the
-  transcript drain tick (`harness/claude/read.rs`), OpenCode from the `/event`
-  SSE tap (`harness/opencode/read.rs::Tracker::track_live_session`, keyed off
-  `properties.sessionID`). If either harness changes its event shape, resolution
-  silently degrades to the pre-V28 recency behavior — **no error, no log**. The
-  tell is per-tab isolation quietly stopping; verify with the two-tab recipe
-  (a `context_note` in tab A must not appear in tab B's `context_recall`).
-- **OpenCode sub-agent sessions** are excluded via `session.created`'s
-  `info.parentID`. If OpenCode stops announcing children that way, a tab can bind
-  to a sub-agent session mid-run (scope narrows; still isolated per tab, still
-  never an error).
-- **Fail-open is deliberate and total:** missing `--tab`, unknown key, TTL-stale
-  entry, blank value → `mem_current_session_for(agent)`. Never turn any of these
-  into a tool error; a memory read is not worth breaking a turn over.
+- **A harness's live-session identity lives in the key space it declares.**
+  `HarnessPlugin::session_key_space()` says whether a harness's sessions are
+  keyed by cImp **tab** id or by the harness's own **session** id, and since
+  V40 Phase D the registry holds both spaces side by side — which is why an id
+  arriving from one harness can never be confused with an id from the other,
+  and why the old collision guard between them is gone rather than merely
+  passing. Each harness's *feeder* and its failure mode are in that harness's
+  `README.md` § *Memory scoping*
+  (`src-tauri/src/harness/claude/README.md`,
+  `src-tauri/src/harness/opencode/README.md`).
+- **If a feeder stops, resolution silently degrades** to the pre-V28 recency
+  behavior — **no error, no log**. The tell is per-tab isolation quietly
+  stopping; verify with the two-tab recipe (a `context_note` in tab A must not
+  appear in tab B's `context_recall`), per harness.
+- **Fail-open is deliberate and total:** missing `--tab`, unknown key,
+  TTL-stale entry, blank value → the harness-scoped current session. Never turn
+  any of these into a tool error; a memory read is not worth breaking a turn
+  over.
 
 ### Check parsers & fixtures (V12 / V22)
 
@@ -959,28 +927,29 @@ invisible in the UI until it's added there.
 
 *Architecture: see `ARCHITECTURE.md` § Workflow & Visibility (V14).*
 
-- **OpenCode usage is estimate-only.** OpenCode's `/event` SSE
-  `message.updated.properties.info` carries only `{id, role, time}` on the
-  pinned version — no token fields — so OpenCode sessions are recorded
-  `est_only` from tool-call *input* args. **Revisit if a future OpenCode
-  release adds real token fields to `message.updated`**;
-  `harness/opencode/read.rs`'s doc comment names the exact field path to
-  re-check. (V35 Phase L read `@opencode-ai/plugin`'s own `Hooks` types and
-  found the plugin's `event` hook already receives `info.tokens` on
-  `message.updated` — which is where OpenCode usage actually comes from. What is
-  still missing is a tool-RESULT consumer: `tool.execute.after`'s *second*
-  parameter carries `{title, output, metadata}` and cImp's generated handler
-  takes only the first, so the result text is one parameter away whenever
-  OpenCode usage stops being estimate-only.)
-- **Sub-agent transcripts have moved once already and could move again.** Two
-  layouts are handled (1.x inline `isSidechain:true` lines; 2.x
-  `…/<session_id>/subagents/agent-<id>.jsonl` with the launcher tool renamed
-  `Task` → `Agent`). `SubagentState::drift_tick` raises
-  `drift.subagent_transcripts.v1` for "transcripts moved" or "launcher tool
-  renamed", but a **simultaneous rename and relocation is invisible** from that
-  vantage. If sub-agent-heavy sessions ever look suspiciously cheap with no
-  canary firing, diff a live session's transcript directory against the two
-  known layouts first.
+What a harness reports about a turn is that harness's declaration
+(`HarnessPlugin::usage_source()` for quota/context, the recorded-turn shape for
+token categories and lanes), so the per-harness limitations moved with it:
+
+- **Claude Code** — sub-agent transcript layout drift, and the `<synthetic>`
+  pseudo-model: `src-tauri/src/harness/claude/README.md` § *Usage tap*.
+- **OpenCode** — estimate-only SSE usage, and *no quota/context source at all*:
+  `src-tauri/src/harness/opencode/README.md` § *Usage tap*.
+
+What stays neutral here:
+
+- **A harness with no usage source answers ABSENCE, not zero.** `harness_usage`
+  returns "no usage source" for a harness whose plugin declares none, and the
+  meter renders that as absence — never as a harness sitting at 0%. Same rule
+  one level down: a token category a harness does not report has **no entry**
+  in the reading rather than a zero one, and a quota window it does not have
+  is not drawn. If a widget ever starts showing a flat zero where a harness
+  simply says nothing, that invariant broke.
+- **The lanes a turn can be attributed to are declared, not assumed.** The
+  "main session vs sub-agents" split is one harness's sidechain model; the
+  dashboard renders whatever lanes the harness declares, in declared order, and
+  a lane no harness declares renders as its own id rather than under another
+  harness's phrasing.
 
 ### Preview tab (V14) — known limitation
 
@@ -1106,20 +1075,12 @@ spike is run, and record the outcome where the last column says.
 
 | Spike | What it verifies | Status | Where recorded |
 |---|---|---|---|
-| **D0** (`compact_hook.rs`) | That a `PreCompact` hook's stdout `hookSpecificOutput.additionalContext` actually reaches the **compaction prompt** on the pinned Claude Code build. | **unverified** — degrades to a no-op if it fails (server-side dedup-clear + post-compaction flag are correct regardless) | `harness_versions.d0_status` in the global `settings.json`; recipe in *Claude Code / OpenCode CLIs* → Spike recipes |
-| **E1** (`read_hook.rs`) | That a `PreToolUse` deny's `permissionDecisionReason` is surfaced **to the model**, not just the user — the whole premise of the read advisor. | **unverified** — gate fails closed; a recorded `"fail"` disables the Settings toggle and blocks the hook install | `harness_versions.e1_status`; recipe in *Claude Code / OpenCode CLIs* → Spike recipes |
-| **F0** (`postedit_hook.rs`) | Which JSON field of a `PostToolUse` hook's stdout reaches the model as additional context. | **unverified** — degrades safely; a parked block still drains via the next `/context/retrieve`, and `auto_check` defaults off | `TODO(spike F0)` in `postedit_hook.rs`'s module doc (no settings field); narrative in `ARCHITECTURE.md` § V12 |
-| **OpenCode veto** (V16 Feature 7 gate) | Whether a `tool.execute.before` handler in the generated `.opencode/plugin/cimp-inject.js` can veto a read **and** get the thrown message to the model. | **open** — gates whether an OpenCode read advisor is implementable at all | Recipe in *Claude Code / OpenCode CLIs* → Spike recipes; record the outcome in that section (pass ⇒ implement per the V16 spec; fail ⇒ Claude-only, permanent-until-upstream-changes) |
+| **Per-harness contract spikes** | Every unverified contract of a REGISTERED harness -- Claude Code's D0 / E1 / F0 / `Notification` payload shape / input profile, OpenCode's veto gate / C3 / directory-wide plugin loading / input profile -- plus each harness's version tripwire. | **tracked per harness** | `src-tauri/src/harness/<id>/README.md` § *Open spikes & unverified contracts*, one table per harness, with the recipes beside it. Moved there by V40 Phase G: a spike about one harness belongs with that harness, and adding a harness adds its spikes by adding a directory. |
 | **E0** (`preview/capture.rs`) | That WebView2 `ICoreWebView2::CapturePreview` produces a pixel-correct PNG (viewport bounds, true CSS-pixel scale, paint timing), plus z-order during a tab drag and focus/keyboard isolation. | **compiles clean, never run against a live instance** | `TODO(spike E0)` comments in `preview/mod.rs` and `preview/capture.rs`; narrative in `ARCHITECTURE.md` § V14 |
-| **C3** (`harness/opencode/read.rs`) | Whether OpenCode's `/event` SSE `message.updated` carries token/usage fields. | **resolved — absent** on the pinned OpenCode; usage stays `est_only` | `harness/opencode/read.rs`'s module doc records the outcome; re-check on OpenCode releases (see *Usage & transcript taps (V14)*) |
 | **F9** (V21 offload grounding) | Grammar-constrained decoding × thinking mode on the offload worker — whether the two can be enabled together without degrading output. | **open, not run** | The V21 milestone spec (`docs/`); run before relying on grammar-constrained offload with thinking enabled |
 | **`MAL-*` claim** (V23) | That osv-scanner surfaces OpenSSF malicious-package (`MAL-*`) advisories in a **default** scan. | **high-confidence but unverified** in the original research | Step 3 of *Live-verify recipes* → Code Audit (V23) |
 | **Audit SARIF fixtures** (V23) | That the hand-built SARIF 2.1.0 fixtures match what osv-scanner / gitleaks / semgrep really emit. | **constructed, not captured** — replace from a real run during live-verify | *Feature-area maintenance notes* → Code Audit & Code Quality scanners |
-| **Harness version tripwire** | That the currently-installed Claude Code / OpenCode build still honors every contract in the drift table. | **re-armed on every version change** — `drift.harness_version.v1` fires until re-verified | `harness_versions.claude_last_seen` / `claude_last_verified`; the Advisor card's **Mark verified** action (click only after re-running the recipes) |
 | **`tts-webgpu` on non-NVIDIA** | That the shipped WebGPU TTS backend works on an AMD/Intel GPU. | **open** — no such GPU available on the dev box | *Dependencies to track* → `ort` open follow-ups |
-| **`Notification` payload shape** (`notify_hook.rs`) | Whether the Claude Code `Notification` hook payload is flat (`{notification_type, message}`) or nested (`{notification: {type, message}}`) — the reference docs render both ways. The shim reads BOTH spellings; the app-side classifier falls back to prose matching, then the TUI-regex scanner backstops the whole path. | **unverified** — degrades gracefully (never to silence), but the parser carries double-read complexity until settled | Capture recipe in `notify_hook.rs`'s module doc (register `"command": "cat > file"` as a `Notification` hook, read the captured stdin); record the outcome there and simplify the parser once settled. Runs naturally alongside the issue #5 live-verify. |
-| **V30 OpenCode push contracts** *(placeholder — pre-release)* | When V30 (MCP channels / session-push fanout) merges: the OpenCode `noReply` injection behavior (safe only on OpenCode **≥ 1.18.13** — a *minimum-version* fact, the first in this doc) and the format-2 push file with per-slot aging both become harness-drift surfaces. | **pre-release** — at V30 release time, replace this row with real drift-table rows + live-verify recipes | V30 milestone docs (`docs/MILESTONE-V30*`); the drift table in *Claude Code / OpenCode CLIs* above |
-| **V32 injection-hardening harness contracts** *(placeholder — pre-release, added 2026-08-08)* | When V32 releases, four harness behaviours it rides become drift surfaces, and only the last of them has a drift-table row today: (1) **`PreToolUse` timeout semantics are UNDOCUMENTED** — the hooks reference gives the exit-code table and the `timeout` field but never says whether a timed-out hook blocks; `taint_beacon` is built to not depend on it (80 ms dispatch, never reads the reply), and a harness change that makes a timeout blocking would turn the `sensor` beacon into a silent deny. (2) **The Claude `--settings` overlay key set** — cImp emits `hooks` + `statusLine`, plus `permissions` in native-web `deny`; an upstream key rename or a stricter schema breaks the overlay silently, and the deny-mode key set has **no** test guarding it (V32 accepted residual). (3) **OpenCode loads every file in `.opencode/plugin/`** into every session in that directory — the per-tab `cimp-inject-<tab>.js` scheme is only safe while that stays true *and* `CIMP_TAB_ID` stays process-wide; `tool.execute.before` denying via `throw` is the gate's only mechanism. (4) The **OpenCode native tool registry** allowlist, which already has its own row above. | **pre-release** — at V32 release time, replace this row with real drift-table rows in *Claude Code / OpenCode CLIs* and fold live-verifies 12–22 into *Live-verify recipes* | `docs/MILESTONE-V32-injection-hardening.md` (Phases F/H amendments, Accepted residuals, live-verification 12–22); `src-tauri/src/taint_beacon.rs` module doc |
 
 ---
 
@@ -1129,9 +1090,10 @@ The hand-run verification passes. These are **not** covered by `cargo test` /
 `npm test` — they need a real running build, a real agent tab, and in the audit
 cases real third-party binaries.
 
-Harness-contract spikes (**E1**, **D0**, **OpenCode veto**) keep their recipes
-in *Claude Code / OpenCode CLIs — hook & plugin behavior contracts* above,
-because they gate that section's drift table; everything else is here.
+Harness-contract spikes (**E1**, **D0**, **OpenCode veto**, the input-profile
+spike) keep their recipes in the owning harness's
+`src-tauri/src/harness/<id>/README.md` § *Open spikes*, because they gate that
+README's drift table; everything else is here.
 
 ### Shared setup
 
@@ -1156,7 +1118,7 @@ carry their deltas:
 
 ### Permission detection — hook-primary + TUI fallback (NC-2, issue #5)
 
-*Contract row: the drift table in *Claude Code / OpenCode CLIs* above.* Extra
+*Contract rows: `claude.hook.notification` and `perm.tui_scrape` in `src-tauri/src/harness/claude/README.md`.* Extra
 precondition: a Claude tab in a permission mode that actually prompts (no
 blanket allow-rules for the command you'll use).
 

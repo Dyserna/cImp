@@ -1,11 +1,19 @@
 <script lang="ts">
-  // Inline Claude Code usage tracker for the bottom status bar (right of
-  // Layouts). Shows the session (5h) and weekly (7d) quota windows, each as a
+  // Inline harness usage tracker for the bottom status bar (right of Layouts).
+  // Shows one row per quota window the harness declares — each as a
   // proportional bar, a rounded percentage, a live countdown to reset, and the
   // local reset clock time. Every element is individually toggleable via
-  // `settings.usage`; the whole widget hides when disabled or when no data
-  // exists (no Claude tab has pushed a quota reading yet, or the last one
-  // expired).
+  // `settings.usage`; the whole widget hides when disabled or when there is
+  // nothing to draw.
+  //
+  // V40 Phase D: the windows, their labels and their durations come from the
+  // BACKEND (`harness_usage` answers the harness's declared windows plus the
+  // readings), so this component knows no vendor's quota shape. A harness with
+  // no usage source at all answers `source: null` and the widget stays hidden —
+  // never a row at 0%.
+  //
+  // V40 Phase F: WHICH harness it polls comes from the registry too — the one
+  // that declares `usage_push` and has a running tab (see `usagePushHarness`).
   //
   // The widget ends at the reset clock: the live context/cache group that used
   // to sit to its right (NC-3) was retired, together with its `usage.show_context`
@@ -13,60 +21,63 @@
   // terminal status line still renders it — the app widget simply has no
   // consumer for that half any more, so nothing on the backend push path moved.
   //
-  // Data path: each `cimp --statusline` run inside a Claude tab persists the
-  // payload's `rate_limits` (5h/7d quota) to one push file; the backend
-  // `get_claude_usage` command reads that file — a local read, no network. We
-  // poll it on `usage.poll_interval_secs`; the countdown ticks locally between
-  // polls.
+  // Data path: a status-line run inside a harness tab persists its quota
+  // reading to one push file; the backend `harness_usage` command reads that
+  // file — a local read, no network. We poll it on `usage.poll_interval_secs`;
+  // the countdown ticks locally between polls.
   //
-  // Absence rule: every part is independently absent-able — `rate_limits`
-  // exists only for subscription auth after the first API response, and each
+  // Absence rule: every part is independently absent-able — a quota block
+  // exists only under subscription auth after the first API response, and each
   // field inside it can be missing. Missing renders as "—" / an empty
   // "unknown" track, NEVER as 0%.
   import { settings } from '../settings/store';
-  import { getClaudeUsage, type UsageResult, type UsageSnapshot } from '../ipc';
-  import { clampPct, claudePushTabActive, hasQuotaData } from './contextMeter';
+  import {
+    harnessUsage,
+    type HarnessUsage,
+    type UsageReading,
+    type UsageSourceInfo,
+  } from '../ipc';
+  import { clampPct, hasQuotaData, statuslineRowsFor, usagePushHarness } from './contextMeter';
+  import { harnesses } from '../harness';
 
   // Floor on the poll cadence so a hand-edited tiny interval can't busy-poll.
   // The read is a local file, so this is UI hygiene rather than protection of
   // a remote endpoint.
   const MIN_POLL_SECS = 15;
-  // Legacy (retired endpoint-poll path): on a 429, wait this many normal
-  // intervals before the next poll. The push path never reports a rate-limit,
-  // so this branch is inert — kept alongside the backend's disabled poller in
-  // case that data source is ever resurrected.
-  const RATE_LIMIT_BACKOFF = 5;
 
-  let snapshot = $state<UsageSnapshot | null>(null);
-  // Legacy: true when the last fetch was a 429 (endpoint-poll era). Always
-  // false under the push path.
-  let rateLimited = $state(false);
-  // True when every part of `snapshot` is an aging push — the Claude tabs that
-  // produced it closed or went quiet. The quota half keeps its own flag
-  // (`quotaStale`): the push file's two halves are written by different tabs
-  // and age separately, so the widget dims on the age of the data it actually
-  // draws, not on the roll-up (M14).
+  let reading = $state<UsageReading | null>(null);
+  // What the polled harness's source CAN report. Null means it has none at all
+  // — a different state from "has one, nothing reported yet", and the reason
+  // the widget can stay hidden for such a harness instead of drawing zeros.
+  let source = $state<UsageSourceInfo | null>(null);
+  // True when every part of the reading is aging — the tabs that produced it
+  // closed or went quiet. The quota half keeps its own flag (`quotaStale`):
+  // the push file's two halves are written by different tabs and age
+  // separately, so the widget dims on the age of the data it actually draws,
+  // not on the roll-up (M14).
   let stale = $state(false);
   let quotaStale = $state(false);
   let now = $state(Date.now());
 
   const usage = $derived($settings.usage);
   // The widget is worth polling for whenever *some* running AI tab can push a
-  // status-line reading. That is decided by the tab's command, not its id:
-  // `claude-local` and any user-created claude-command tab get the same
-  // statusline injection as the subscription tab (M15). What is *drawn* is
-  // subscription-only and gates itself — API-key auth reports no
-  // `rate_limits`, so such a tab pushes context alone and the widget stays
-  // hidden (it used to show the context group for those; that group is gone).
-  const claudePushTabEnabled = $derived(
-    claudePushTabActive($settings.tabs, $settings.enabled_ai_tabs),
+  // status-line reading. That is decided by the tab's command, not its id: a
+  // variant tab and any user-created tab running the same binary get the same
+  // status-line injection the reserved one does (M15). What is *drawn* can be
+  // narrower and gates itself — a tab authenticated by API key reports no quota
+  // block at all, so it pushes context alone and the widget stays hidden.
+  //
+  // `null` until the registry answers, which is one paint at most: guessing a
+  // harness here would poll an id this build may not have.
+  const pushHarness = $derived(
+    usagePushHarness($harnesses, $settings.tabs, $settings.enabled_ai_tabs),
   );
   // Derive the individual primitives the effects depend on, rather than the
   // whole `usage` object. Svelte only re-runs an effect when a value it reads
   // actually changes, so this keeps the poll/tick effects from re-arming (and
   // re-fetching) on unrelated settings edits — and collapses the
   // default→loaded settings swap at startup into a single fetch.
-  const enabled = $derived(usage.enabled && claudePushTabEnabled);
+  const enabled = $derived(usage.enabled && pushHarness !== null);
   // Coerce a non-finite interval to the floor: `Math.max(MIN, NaN)` is NaN →
   // setTimeout(…, NaN) coerces to 0 and busy-polls the usage endpoint.
   const pollMs = $derived(
@@ -82,10 +93,11 @@
   const MAX_BACKOFF_MS = 5 * 60_000;
 
   // Fetch once; never throws. Returns null only on a transport error (treated
-  // as "unavailable").
-  async function fetchOnce(): Promise<UsageResult | null> {
+  // as "unavailable") — which now includes an unregistered harness id, since
+  // the backend rejects one rather than answering empty.
+  async function fetchOnce(harness: string): Promise<HarnessUsage | null> {
     try {
-      return await getClaudeUsage();
+      return await harnessUsage(harness);
     } catch (e) {
       console.warn('usage fetch failed:', e);
       return null;
@@ -94,26 +106,25 @@
 
   // Poll loop over the local push file (via the backend command).
   //   - fresh push → show snapshot undimmed, poll at pollMs.
-  //   - aging push (`stale`) → show snapshot dimmed; the Claude tab that fed
-  //     it has closed or gone quiet.
+  //   - aging push (`stale`) → show snapshot dimmed; the tab that fed it has
+  //     closed or gone quiet.
   //   - no data (snapshot null) → hide; poll at the normal cadence so the
-  //     widget appears within one interval of a Claude tab's first push.
+  //     widget appears within one interval of a tab's first push.
   //   - thrown transport / IPC error → keep last-good, back off exponentially.
-  //   - the rate-limit branch below is legacy from the endpoint-poll era and
-  //     can no longer trigger; see RATE_LIMIT_BACKOFF above.
   $effect(() => {
-    if (!enabled) {
-      snapshot = null;
-      rateLimited = false;
+    if (!enabled || pushHarness === null) {
+      reading = null;
+      source = null;
       stale = false;
       quotaStale = false;
       return;
     }
+    const harness = pushHarness;
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     let failures = 0;
     const tick = async () => {
-      const result = await fetchOnce();
+      const result = await fetchOnce(harness);
       if (cancelled) return;
       let delay: number;
       if (!result) {
@@ -122,29 +133,16 @@
         delay = Math.min(pollMs * 2 ** Math.min(failures, 5), MAX_BACKOFF_MS);
       } else {
         failures = 0;
-        // Adopt any snapshot the backend returned — fresh (200) or the cached
-        // last-good it serves (flagged stale) during a rate-limit / hiccup.
-        if (result.snapshot) {
-          snapshot = result.snapshot;
-        } else if (!result.rate_limited) {
-          // Genuine 'unavailable / not logged in' with no cache — hide.
-          snapshot = null;
-        }
-        stale = result.stale;
+        source = result.source;
+        // `reading: null` is a genuine 'nothing reported / expired' — hide,
+        // rather than leave a stale reading on screen indefinitely.
+        reading = result.reading;
+        stale = result.reading?.stale ?? false;
         // Per-section, because the push file's halves come from different tabs
         // on different clocks; `stale` is only the whole-file roll-up, and the
         // context half of it has no consumer here any more.
-        quotaStale = result.quota_stale;
-        rateLimited = result.rate_limited;
-        if (result.rate_limited) {
-          // Back off to 5× the normal cadence, but never retry before the
-          // server's stated Retry-After — that guarantees recovery even when a
-          // short configured interval × 5 is still inside the cooldown.
-          const ra = (result.retry_after_secs ?? 0) * 1000;
-          delay = Math.max(pollMs * RATE_LIMIT_BACKOFF, ra);
-        } else {
-          delay = pollMs;
-        }
+        quotaStale = result.reading?.quota_stale ?? false;
+        delay = pollMs;
       }
       timer = setTimeout(tick, delay);
     };
@@ -206,42 +204,49 @@
 
   // Quota data is absent entirely under API-key auth (no `rate_limits` in the
   // push at all) — the rows are then dropped rather than drawn as a column of
-  // placeholders. The rate-limited half is legacy and can no longer trigger.
-  const showQuota = $derived(hasQuotaData(snapshot) || (rateLimited && !snapshot));
+  // placeholders.
+  const showQuota = $derived(hasQuotaData(reading));
 
   // Show the widget when the quota group has something to draw. Hidden until a
-  // Claude tab pushes its first reading, and again once the last push expires.
+  // tab pushes its first reading, and again once the last push expires.
   const visible = $derived(showQuota);
 
-  // The two quota windows in display order. `w` is null while we have no
-  // data yet (rate-limited at startup) — cells render "—" placeholders so
-  // the layout stays stable and fills in once a fetch succeeds. Name and
-  // duration are split so each column ((5h)/(7d) included) aligns across
-  // both rows.
-  const windowsList = $derived([
-    {
-      name: 'current session',
-      dur: '(5h)',
-      full: 'Rolling 5-hour session quota',
-      w: snapshot?.five_hour ?? null,
-    },
-    {
-      name: 'weekly session',
-      dur: '(7d)',
-      full: 'Rolling 7-day weekly quota',
-      w: snapshot?.seven_day ?? null,
-    },
-  ]);
+  // The declared windows, in declared order, joined to their readings. A window
+  // the harness declares but has no reading for renders as a hollow "not
+  // reported" track rather than a confident 0% — the same absence rule the
+  // backend keeps by omitting it from `reading.windows`. Label and duration are
+  // separate columns so the (5h)/(7d) suffixes align across rows.
+  const windowsList = $derived(
+    (source?.windows ?? []).map((decl) => ({
+      name: decl.label,
+      dur: decl.short,
+      full: decl.description,
+      w: reading?.windows.find((r) => r.id === decl.id) ?? null,
+    })),
+  );
+
+  // The bottom strip is as tall as the stacked usage rows it has to fit — the
+  // two rows of one harness's quota pair are where the pre-V40 hard-coded 44px
+  // came from. V40 Phase F: the count is the polled harness's DECLARED
+  // `statuslineRows` (locked decision 19), with the readings it actually serves
+  // as the floor, so a harness that declares two windows and reports three
+  // still gets a strip tall enough for all of them. Left at the stylesheet's
+  // default when neither is known: an empty strip is not a reason to reflow the
+  // whole window.
+  $effect(() => {
+    const rows = Math.max(statuslineRowsFor($harnesses, pushHarness), source?.windows.length ?? 0);
+    if (rows > 0) {
+      document.documentElement.style.setProperty('--status-bar-rows', String(rows));
+    }
+  });
 </script>
 
 {#if enabled && visible}
   <div
     class="usage-meter"
-    title={rateLimited && !snapshot
-      ? 'Claude Code usage — rate limited, retrying…'
-      : stale
-        ? 'Claude Code usage — last known (no recent report from a Claude tab)'
-        : 'Claude Code usage'}
+    title={stale
+      ? 'Harness usage — last known (no recent report from a running tab)'
+      : 'Harness usage'}
   >
     {#if showQuota}
       <!-- label column: name + duration in their own tracks so (5h)/(7d)
@@ -260,7 +265,7 @@
                  on a normal track would read as a genuine 0%. -->
             <span class="bar" class:unknown={!r.w} title={r.w ? undefined : 'not reported'}>
               {#if r.w}
-                <span class="fill" style="width: {clampPct(r.w.utilization)}%"></span>
+                <span class="fill" style="width: {clampPct(r.w.used)}%"></span>
               {/if}
             </span>
           {/each}
@@ -269,7 +274,7 @@
       {#if usage.show_percentage}
         <div class="ug" class:dim={quotaStale}>
           {#each windowsList as r}
-            <span class="pct">{r.w ? pct(r.w.utilization) + '%' : '—'}</span>
+            <span class="pct">{r.w ? pct(r.w.used) + '%' : '—'}</span>
           {/each}
         </div>
       {/if}
@@ -319,9 +324,9 @@
   }
   /* Aging numbers: dimmed so they read as "may be out of date" without
      hiding the data. Driven by the quota slot's own age rather than the push
-     file's roll-up, because the file's halves are pushed by different Claude
-     tabs and age on their own clocks — dimming on the roll-up was the old,
-     misleading behavior. */
+     file's roll-up, because the file's halves are pushed by different tabs and
+     age on their own clocks — dimming on the roll-up was the old, misleading
+     behavior. */
   .dim {
     opacity: 0.55;
   }

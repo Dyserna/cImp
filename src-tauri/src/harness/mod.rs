@@ -71,7 +71,7 @@
 //! Phase K moves the whole surface in here and locks the shape with tests
 //! ([`layering`]). Until it, "harness knowledge" was spread across nine
 //! locations, none named for it — `oob/{claude,opencode,mod}.rs`,
-//! `statusline/mod.rs`, `tabs/config.rs`, `offload/toolclass.rs` — so the
+//! `harness/claude/statusline.rs`, `tabs/config.rs`, `offload/toolclass.rs` — so the
 //! layering existed only in a design document, which is the state in which a
 //! layering rots. It is now a directory a contributor can be pointed at, with
 //! one sub-directory per harness ([`claude`], [`opencode`]) and a
@@ -90,20 +90,121 @@
 //! 4.1 (Phase K: the target tree and the layering tests) and § 5.1 (Phase M:
 //! the emitted artifact as a template file — [`render`]).
 
+pub mod _retired;
 pub mod canary;
 pub mod capture;
 pub mod chp;
 pub mod claude;
 pub mod contract;
 pub mod health;
-pub mod input;
+pub mod info;
+pub mod ingress;
+pub mod instructions;
+
 #[cfg(test)]
 mod layering;
+pub mod native;
 pub mod opencode;
+pub mod plugin;
 pub mod probe;
 pub mod reader;
+pub mod registry;
 pub mod render;
 pub mod verify;
 
-pub use input::{input_profile, InputProfile};
+pub use plugin::{HarnessPlugin, InputProfile};
 pub use reader::{spawn, OobContext, OobSpec};
+pub use registry::{HarnessId, PerHarness, DEFAULT_HARNESS, HARNESSES};
+#[cfg(test)]
+pub use registry::per_harness_for_test;
+
+/// **The harness-neutral input-profile lookup** (V39 locked decision 16, moved
+/// behind the plugin by V40 Phase A, amendment 0-a).
+///
+/// `id` is the CHP `agent` discriminator. `None` is a first-class answer, not an
+/// error: it is what makes "a harness without an `input.rs` is not a valid
+/// worker" a fail-closed property instead of a panic — and it is now also the
+/// answer for a harness nobody registered, which used to be OpenCode's.
+pub fn input_profile(id: &str) -> Option<InputProfile> {
+    HarnessId::from_id(id)?.plugin()?.input_profile()
+}
+
+/// **Whether `model` is a harness's fabricated pseudo-model** rather than a
+/// model anybody ran (V40 Phase D, locked decision 20).
+///
+/// A union over every registered harness's declared sentinels, because a usage
+/// row records the model id but not which harness's vocabulary it came from,
+/// and the two shipped harnesses record the SAME provider's model ids — the id
+/// is provider knowledge, and only the sentinel is a harness's. Iterating the
+/// registry is what stops this from being the `"<synthetic>"` literal it was in
+/// two `graph/index.rs` queries.
+///
+/// Empty ⇒ nothing is a sentinel, which is the fail-open direction on purpose:
+/// a harness that declares none must not have its real models filtered out.
+pub fn is_model_sentinel(model: &str) -> bool {
+    registry::all()
+        .filter_map(|h| h.plugin())
+        .filter_map(|p| p.usage_source())
+        .any(|s| s.model_sentinels().contains(&model))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use plugin::PasteMode;
+
+    /// The sentinel filter answers from DECLARATIONS, and answers `false` for
+    /// a real model id — the fail-open direction, since a wrongly filtered
+    /// model silently disappears from every cost readout.
+    #[test]
+    fn model_sentinels_come_from_the_plugins() {
+        assert!(
+            registry::all()
+                .filter_map(|h| h.plugin())
+                .filter_map(|p| p.usage_source())
+                .any(|s| !s.model_sentinels().is_empty()),
+            "at least one shipped harness declares a pseudo-model; if that stops being true, \
+             the two graph queries that filter on it have nothing to filter and should say so"
+        );
+        for real in ["claude-opus-4-8", "anthropic/claude-sonnet-4-5", "", "synthetic"] {
+            assert!(!is_model_sentinel(real), "{real:?} is a model, not a sentinel");
+        }
+    }
+
+    /// **Every harness the registry knows has a profile, and an unknown id has
+    /// none.** The second half is the fail-closed direction: a tab pointed at
+    /// some other CLI must not inherit another harness's paste rules.
+    #[test]
+    fn every_registry_harness_declares_a_profile_and_nothing_else_does() {
+        let ids = registry::harness_ids();
+        assert!(!ids.is_empty(), "the registry names at least one harness");
+        for id in &ids {
+            assert!(
+                input_profile(id).is_some(),
+                "harness `{id}` has registry rows but no input profile — it cannot be a \
+                 delegation worker, and the gate must be the thing that says so"
+            );
+        }
+        for unknown in ["", "aider", "Claude", "claude.exe", "opencode-2"] {
+            assert!(
+                input_profile(unknown).is_none(),
+                "`{unknown}` resolved to a profile it must not have"
+            );
+        }
+    }
+
+    /// Both shipped profiles submit with CR and paste bracketed. Pinned because
+    /// the engine's write order (paste → settle → submit) is only correct for a
+    /// profile shaped this way; a future `Raw` harness needs the engine's
+    /// ordering test re-read, not just a new constant.
+    #[test]
+    fn the_shipped_profiles_are_bracketed_and_submit_with_cr() {
+        for id in registry::harness_ids() {
+            let p = input_profile(id).expect("declared above");
+            assert_eq!(p.paste, PasteMode::Bracketed, "{id}");
+            assert_eq!(p.submit, b"\r", "{id}");
+            assert!(p.settle_ms > 0, "{id}: a zero settle is the defect this field exists for");
+            assert!(p.max_paste_bytes >= 4096, "{id}: the bound must admit a real request");
+        }
+    }
+}

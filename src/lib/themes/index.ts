@@ -129,6 +129,14 @@ let paletteOrder: string[] = Object.keys(FALLBACK_PALETTES);
 /// are always retained underneath so `Default` (the Custom merge base),
 /// `OpenCode Grey` (the default terminal palette), `GitHub Dark`, and
 /// `Tomorrow Night` survive even if the disk folder somehow omits them.
+/// The palette a fresh install's terminal uses, paired with the default UI
+/// theme. A PERSISTED name (it is written into every settings file), which is
+/// why it lives here with the palettes rather than being spelled again in the
+/// settings defaults — see the frontend identity allowlist's row for this file
+/// (locked decision 29: a palette named after a product depends on no harness,
+/// and renaming it would be a migration for no gain).
+export const DEFAULT_PALETTE_NAME = 'OpenCode Grey';
+
 export function setPalettes(palettes: { name: string; colors: ThemeColors }[]): void {
   const map: Record<string, ThemeColors> = { ...FALLBACK_PALETTES };
   for (const p of palettes) map[p.name] = p.colors;

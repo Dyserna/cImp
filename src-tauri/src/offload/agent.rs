@@ -641,19 +641,12 @@ about the task's intent — this licence covers interpretation, never facts. You
 must be a single JSON value matching the requested schema and nothing else: no prose, no \
 narration, no citation markers, and cite nothing — the JSON is the whole answer.";
 
-/// The sentence that makes a schema run a schema run, spelled once.
-///
-/// It is a *substring* of [`SCHEMA_SYSTEM_PROMPT`] rather than a piece it is
-/// built from, because that prompt is one `const` literal and splicing it would
-/// cost more than the tripwire that pins the relation
-/// (`the_facade_schema_note_is_the_worker_prompts_own_sentence`). The V39
-/// facade needs exactly this sentence, and needs it to be the SAME sentence:
-/// the facade's promise is that `offload_task`'s options mean the same thing
-/// wherever the task lands.
-const SCHEMA_FINAL_INSTRUCTION: &str = concat!(
-    "Your final message must be a single JSON value matching the requested schema and nothing ",
-    "else: no prose, no narration, no citation markers"
-);
+/// The sentence that makes a schema run a schema run — an inventory row since
+/// V40 Phase E (locked decision 24): it is typed into a WORKER TAB by the V39
+/// facade, so it is text a harness's model sees and belongs in the one list of
+/// those. Re-exported under its original name, so every reader here (and the
+/// tripwire that pins it against `SCHEMA_SYSTEM_PROMPT`) keeps its spelling.
+use crate::harness::instructions::SCHEMA_FINAL_INSTRUCTION;
 
 /// **V39 Phase C — what `offload_task`'s `schema` / `profile` become when the
 /// backend is a harness tab.**
@@ -690,16 +683,15 @@ pub fn facade_format_note(
     // the shape of the answer, and last is where a reader looks for that.
     if let Some(p) = profile {
         parts.push(
-            match p {
-                Profile::Research => concat!(
-                    "This is a research task: use web and document sources for it, and do not ",
-                    "read local files, search the code or run commands."
-                ),
-                Profile::Code => concat!(
-                    "This is a local code task: use local file, search and command tools for it, ",
-                    "and do not fetch anything from the web."
-                ),
-            }
+            // V40 Phase E: both sentences are typed into a worker tab, so they
+            // are inventory rows (locked decision 24) rather than literals here.
+            crate::harness::instructions::text(
+                None,
+                match p {
+                    Profile::Research => crate::harness::instructions::Slot::FacadeResearch,
+                    Profile::Code => crate::harness::instructions::Slot::FacadeCode,
+                },
+            )
             .to_string(),
         );
     }
@@ -4246,13 +4238,43 @@ mod tests {
     /// **#48 (finding M-2) — A-1's blind spot: a name that IS in `TABLE` and
     /// that no dispatcher serves.**
     ///
-    /// These six classify LOCAL-CAPABILITY or TRUSTED rather than EXTERNAL, so
+    /// These six classified LOCAL-CAPABILITY or TRUSTED rather than EXTERNAL, so
     /// A-1's rule never saw them: they engaged the latch and *then* met
     /// `tools::dispatch`'s "unknown native tool". `Bash` is the live one — a
     /// local code model reaches for it out of habit, and one such hallucination
     /// used to cost an undeclared task its web tools for good.
+    ///
+    /// **V40 Phase A** moved Claude's three natives out of `TABLE` into
+    /// `harness/claude/tools.rs` (locked decision 16), and **V40 review M-7 made
+    /// `classify` read that declaration back** — so they are LOCAL-CAPABILITY
+    /// again, as they were on develop, which is what the loopback proxy's latch
+    /// needs (an EXTERNAL-latched session's `Edit` must be refused).
+    ///
+    /// The property THIS test is about is unchanged through all of it, and the
+    /// rule that delivers it is [`LatchRoute::can_execute`]'s
+    /// `dispatchable(name)` half, not the class: on the worker's `Native` route
+    /// a name no dispatcher serves is a hallucination whatever it classifies as,
+    /// so it is neither refused nor allowed to move the latch. Asserted below in
+    /// both latch states, for all six.
     #[test]
     fn a_classified_name_no_dispatcher_serves_does_not_latch_the_task() {
+        // The three hook identities are still CLASSIFIED — `unrouted` is not
+        // `unclassified`, and the hook routes gate on exactly these rows (M-7).
+        for name in ["hook_post_edit", "hook_should_read", "hook_compaction"] {
+            assert_ne!(
+                toolclass::classify(name),
+                ToolClass::External,
+                "{name} must stay classified"
+            );
+        }
+        // Claude's natives are classified by their HARNESS's declaration
+        // (V40 review M-7) and dispatched by nothing here — which is the pair
+        // this test turns on: the class is what the PROXY's latch enforces, and
+        // `dispatchable` is what tells the WORKER the name is not a call at all.
+        for name in ["Bash", "Edit", "Write"] {
+            assert_eq!(toolclass::classify(name), ToolClass::LocalCapability, "{name}");
+            assert!(!toolclass::dispatchable(name), "{name}");
+        }
         for name in [
             "Bash",
             "Edit",
@@ -4261,13 +4283,6 @@ mod tests {
             "hook_should_read",
             "hook_compaction",
         ] {
-            // It is still CLASSIFIED — `unrouted` is not `unclassified`, and
-            // the hook routes gate on exactly these rows (M-7).
-            assert_ne!(
-                toolclass::classify(name),
-                ToolClass::External,
-                "{name} must stay classified"
-            );
             let mut latch = Latch::default();
             assert!(gate(&mut latch, name).is_ok(), "{name} must not be refused");
             assert_eq!(latch, Latch::Open, "{name} must not move the latch");

@@ -157,17 +157,29 @@ export async function ttsSetPaused(paused: boolean): Promise<void> {
   await invoke('tts_set_paused', { paused });
 }
 
-/// One Claude usage quota window. `utilization` is 0–100; `resets_at` is an
-/// ISO-8601 timestamp (with timezone) or null.
-export interface UsageWindow {
-  utilization: number;
+/// One quota window's current reading. `used` is 0–100; `resets_at` is an
+/// ISO-8601 timestamp (with timezone) or null. The three display strings are
+/// the *harness's* — a harness declares its windows and their labels, so a
+/// harness with three windows (or one, or none) needs no change here.
+export interface QuotaWindow {
+  id: string;
+  label: string;
+  /// The window's duration as the harness names it, e.g. '(5h)'.
+  short: string;
+  /// One sentence for the row's tooltip.
+  description: string;
+  used: number;
   resets_at: string | null;
 }
 
 /// Live context-window reading (NC-3), pulled from the same status-line push
 /// as the quota windows. Every field is independently optional: `null` means
 /// "not reported" and must render as unknown — never as 0.
-export interface ContextSnapshot {
+///
+/// V40 Phase D: the four per-turn counters became `tokens`, keyed by the token
+/// categories the harness declares. **An absent category has no entry** — the
+/// map exists precisely so a consumer cannot read "not reported" as zero.
+export interface ContextReading {
   /// Percentage of the context window in use (0–100).
   used_percentage?: number | null;
   /// Percentage still free (0–100), as reported (not derived).
@@ -176,64 +188,91 @@ export interface ContextSnapshot {
   total_input_tokens?: number | null;
   /// Window size in tokens (200k, or 1M with extended context).
   context_window_size?: number | null;
-  /// Latest turn's tokens served from the prompt cache.
-  cache_read_tokens?: number | null;
-  /// Latest turn's tokens written into the prompt cache.
-  cache_creation_tokens?: number | null;
-  /// Latest turn's uncached input tokens.
-  input_tokens?: number | null;
-  /// Latest turn's output tokens.
-  output_tokens?: number | null;
-  /// Session name, when Claude Code names the session.
-  session_name?: string | null;
-  /// Active agent/persona (`agent.name`).
-  agent_name?: string | null;
-  /// Reasoning effort as reported (free-form).
-  effort?: string | null;
-  /// Thinking setting as reported ('on'/'off' for the boolean form).
-  thinking?: string | null;
-  /// Fast-mode flag.
-  fast_mode?: boolean | null;
+  /// The latest turn's tokens, by declared category id (`input`,
+  /// `cache_write`, `cache_read`, `output` for one shipped harness). A category the
+  /// harness did not report has no entry.
+  tokens?: Record<string, number>;
+  /// Session metadata the harness reported beside the numbers (session name,
+  /// agent/persona, effort, thinking, fast mode), keyed by its own names.
+  meta?: Record<string, string>;
 }
 
-/// Session (5h) + weekly (7d) quota plus the live context reading for the
-/// bottom-bar tracker. Each part is independently absent-able.
-export interface UsageSnapshot {
-  five_hour: UsageWindow | null;
-  seven_day: UsageWindow | null;
-  /// NC-3 context reading; absent on older pushes / older Claude Code.
-  context?: ContextSnapshot | null;
-}
-
-/// Outcome of a usage read. Data is pushed by the Claude tab's status line
-/// (`cimp --statusline` persists the payload's `rate_limits`) and read back
-/// from disk — no network involved:
-///   - `snapshot` set, `stale` false → something on it is a fresh push from a
-///     live Claude tab.
-///   - `snapshot` set, `stale` true → every part is aging (tabs closed or gone
-///     quiet); render dimmed.
-///   - all empty → no push data (no Claude tab has reported yet, or the last
-///     push expired) — hide the widget.
-///   - `rate_limited` / `retry_after_secs` are legacy fields from the retired
-///     endpoint-poll path (kept in the shape; always false / null now).
-///
-/// M14: the quota and context halves are written by different Claude tabs and
-/// age on their own clocks, so each carries its own staleness flag; `stale` is
-/// the whole-widget roll-up (true only when nothing on screen is fresh).
-export interface UsageResult {
-  snapshot: UsageSnapshot | null;
-  rate_limited: boolean;
-  retry_after_secs: number | null;
+/// What a harness's usage source reports right now: the declared windows that
+/// HAVE a reading (in declared order — a window with nothing to report is
+/// omitted, never emitted at 0), plus the live context reading.
+export interface UsageReading {
+  windows: QuotaWindow[];
+  /// NC-3 context reading; absent on older pushes / older harness builds.
+  context?: ContextReading | null;
   stale: boolean;
   /// Quota half present but aging. False when there is no quota data at all.
   quota_stale: boolean;
-  /// Context half present but aging. False when there is no context data.
+  /// Context half present but aging.
   context_stale: boolean;
 }
 
-/// Fetch the current Claude Code usage. See `UsageResult` for the outcomes.
-export async function getClaudeUsage(): Promise<UsageResult> {
-  return invoke<UsageResult>('get_claude_usage');
+/// A declared id with the label a UI renders for it.
+export interface DeclaredLabel {
+  id: string;
+  label: string;
+}
+
+/// One declared quota window, without a reading.
+export interface DeclaredWindow extends DeclaredLabel {
+  short: string;
+  description: string;
+}
+
+/// One declared turn lane. `subagent` is what tells a UI which lane carries
+/// fan-out spend (the outlined bar, the `A` badge) without recognising the
+/// word `agent` — a harness's own statement rather than a literal in the view.
+export interface DeclaredOrigin extends DeclaredLabel {
+  subagent: boolean;
+}
+
+/// The declared SHAPE of a harness's QUOTA source — what it can report, as
+/// opposed to what it currently does. The bottom bar sizes itself from
+/// `windows.length` (one stacked row per window).
+///
+/// V40 Phase G: the token categories and turn lanes moved OFF this and onto
+/// `HarnessUsage` itself. They describe a RECORDED turn, not a quota reading,
+/// and a harness can do either without the other — which is exactly the case a
+/// shipped harness in the registry is in today.
+export interface UsageSourceInfo {
+  windows: DeclaredWindow[];
+}
+
+/// One harness's usage answer. **Three distinguishable states** (V40 Phase D):
+///   - `source` null → this harness has NO usage source. Render as
+///     absence; a harness that cannot report quota must never render at 0%.
+///   - `source` set, `reading` null → it has one and nothing has reported yet
+///     (no tab of that harness has pushed, or the last push expired).
+///   - both set → `reading.windows` holds the windows that have data.
+///
+/// The data is local: an AI tab's status line (a cImp subcommand the harness runs)
+/// persists the payload it is handed, and this reads that file back — no
+/// network is involved. M14: the quota and context halves are written by
+/// different tabs and age on their own clocks, so each carries its own
+/// staleness flag and `stale` is the whole-widget roll-up.
+export interface HarnessUsage {
+  source: UsageSourceInfo | null;
+  /// The billing categories this harness reports a RECORDED turn's tokens
+  /// under, in declared order. Empty when it records no turns — INDEPENDENT of
+  /// `source`, which is about quota.
+  token_kinds: DeclaredLabel[];
+  /// The lanes a recorded turn can be attributed to, in declared order — what
+  /// the Usage donut labels its rings with. Empty when it records no turns.
+  origins: DeclaredOrigin[];
+  reading: UsageReading | null;
+}
+
+/// Fetch one harness's usage. See `HarnessUsage` for the three outcomes.
+///
+/// An unregistered harness id REJECTS rather than answering empty: a widget
+/// polling for a harness that does not exist is a bug, and "nothing to show"
+/// would hide it forever.
+export async function harnessUsage(harness: string): Promise<HarnessUsage> {
+  return invoke<HarnessUsage>('harness_usage', { harness });
 }
 
 /// NVIDIA GPU stats (null when no NVIDIA GPU / NVML).
@@ -346,7 +385,7 @@ export async function createShellTab(input: CreateShellTabInput): Promise<TabId>
   return invoke<TabId>('create_shell_tab', input as unknown as Record<string, unknown>);
 }
 
-/// Spawn a duplicate of an existing AI tab (the `+` on a Claude/OpenCode
+/// Spawn a duplicate of an existing AI tab (the `+` on an AI
 /// builtin). `template` is the id of the tab to clone; the backend copies
 /// its live config, assigns a fresh `ai-<uuid>` id, and returns the new
 /// tab id. The new tab is closable (`builtin: false`) and persists across
@@ -355,7 +394,7 @@ export async function createAiTab(template: TabId): Promise<TabId> {
   return invoke<TabId>('create_ai_tab', { template });
 }
 
-/// V13 Phase D D3: "New <Claude|OpenCode> tab in worktree…" — creates a
+/// V13 Phase D D3: "New <harness> tab in worktree…" — creates a
 /// fresh cImp worktree (`.cimp/worktrees/<slug>`, branch `cimp/<slug>` cut
 /// from `HEAD`) then spawns a duplicate of `template`'s config with `cwd`
 /// pointed at it. Throws the same `TabLifecycleError` shape as

@@ -47,6 +47,7 @@
   import { isAppViewVisible, onAppViewShown } from './appViewVisibility';
   import { loadViewSet, loadViewString, saveViewSet, saveViewString } from './viewSection';
   import { settings } from './settings/store';
+  import { accentFor, harnesses } from './harness';
   import { workbenchCheckpoints, openTimelineCheckpoint, type Checkpoint } from './workbench';
 
   // ── Feed poll ─────────────────────────────────────────────────────────
@@ -515,19 +516,22 @@
   });
 
   // ── Row rendering ─────────────────────────────────────────────────────
-  // Agent sources with a dedicated accent class; anything else (offload
-  // backend names are user-chosen, screen names grow) falls back to the
+  // cImp's OWN agent sources get a dedicated accent class; anything else
+  // (offload backend names are user-chosen, screen names grow) falls back to the
   // default colour rather than leaking arbitrary strings into a class.
-  const KNOWN_SOURCES = new Set([
-    'claude',
-    'opencode',
-    'offload',
-    'read_advisor',
-    'auto_check',
-    'audit',
-  ]);
+  const KNOWN_SOURCES = new Set(['offload', 'read_advisor', 'auto_check', 'audit']);
   function srcClass(source: string): string {
     return KNOWN_SOURCES.has(source) ? ` ${source}` : '';
+  }
+
+  // A HARNESS source is coloured from the registry's declared accent instead of
+  // from a `.esrc.<id>` class (V40 Phase F, locked decision 27) — the delegation
+  // lane's `source` is a driver harness id, so the same rule colours those rows.
+  // A harness this build has never heard of declares no accent and renders in
+  // the default colour: an unknown lane is uncoloured, never miscoloured.
+  function srcStyle(source: string): string {
+    const accent = accentFor($harnesses, source);
+    return accent ? `color: ${accent}` : '';
   }
 
   // `ok` alone does not mean "the call worked" in this store, so the status
@@ -621,7 +625,7 @@
       case 'unrecognized':
         return `Unrecognized id "${attributionId(a)}" — it names no configured tab, so this row is NOT attributable to a tab`;
       case 'headless':
-        return 'No tab: a headless caller (claude -p, cron, a worker task, or cImp’s own internal work). A fact about the caller, not missing data.';
+        return 'No tab: a headless caller (a harness run non-interactively, cron, a worker task, or cImp’s own internal work). A fact about the caller, not missing data.';
       default:
         return 'Not recorded: the writer did not know which tab this was, or the row predates the attribution column. Different from "no tab".';
     }
@@ -753,7 +757,7 @@
     </div>
     {#if totalCount === 0}
       <div class="empty">
-        No events recorded yet — query the graph from a Claude tab, run an
+        No events recorded yet — query the graph from an AI tab, run an
         offload_task, or start a local offload server, and it shows up here.
       </div>
     {:else if shownRows.length === 0}
@@ -777,8 +781,10 @@
             >
               {#if visible.time}<span class="etime">{fmtTime(r.ts_ms)}</span>{/if}
               {#if visible.kind}<span class="ekind {r.kind}">{r.kind}</span>{/if}
-              {#if visible.source}<span class="esrc{srcClass(r.source)}" title={r.source}
-                  >{r.source}</span
+              {#if visible.source}<span
+                  class="esrc{srcClass(r.source)}"
+                  style={srcStyle(r.source)}
+                  title={r.source}>{r.source}</span
                 >{/if}
               <!-- V37 C7: rendered EXACTLY as Rust sent them. Never derived
                    from `tool` (a `__` split misroutes) and never looked up in
@@ -826,6 +832,7 @@
               {#if visible.kind}<span class="ekind checkpoint">checkpoint</span>{/if}
               {#if visible.source}<span
                   class="esrc{srcClass(cpSource(cp))}"
+                  style={srcStyle(cpSource(cp))}
                   title={cpSource(cp)}>{cpSource(cp)}</span
                 >{/if}
               <!-- A checkpoint is not an MCP call; the cells exist only so the
@@ -1309,12 +1316,10 @@
     opacity: 0.75;
     cursor: help;
   }
-  .esrc.claude {
-    color: var(--text-info, #58a6ff);
-  }
-  .esrc.opencode {
-    color: var(--accent-purple, #d2a8ff);
-  }
+  /* V40 Phase F: the one-rule-per-harness accents are gone — a harness's accent
+     is the token it declares, applied inline by `srcStyle`, so a new harness
+     arrives with its colour instead of needing a rule here. The rows below are
+     cImp's OWN sources, which no harness owns. */
   .esrc.offload {
     color: var(--text-success, #3fb950);
   }

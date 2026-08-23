@@ -262,7 +262,11 @@ fn ai_tab<'a>(
     tab: &TabId,
 ) -> Option<(&'static str, &'a crate::settings::AiToolTabConfig)> {
     match settings.find_tab(tab.as_str()) {
-        Some(TabConfig::AiTool(c)) => Some((crate::tabs::tab_consumer(c), c)),
+        // V40 Phase A (locked decision 2): a tab whose command names no
+        // registered harness is NOT a delegation target. It used to be
+        // classified as OpenCode and would have been typed into with OpenCode's
+        // paste rules.
+        Some(TabConfig::AiTool(c)) => crate::tabs::tab_consumer(c).map(|a| (a, c)),
         _ => None,
     }
 }
@@ -1336,7 +1340,7 @@ mod tests {
         use crate::state::{StateSignal, TabActivity, TabId};
         let mirror = TabActivity::default();
         let tab = TabId::from_str("ai-restart-probe");
-        mirror.note_signal(&StateSignal::ClaudeOutputStarted { tab: tab.clone() });
+        mirror.note_signal(&StateSignal::HarnessOutputStarted { tab: tab.clone() });
         mirror.note_signal(&StateSignal::SubprocessExited {
             tab: tab.clone(),
             code: Some(1),
@@ -1423,7 +1427,7 @@ mod tests {
     fn the_written_bytes_are_the_paste_then_the_submit() {
         const START: &[u8] = b"\x1b[200~";
         const END: &[u8] = b"\x1b[201~";
-        for id in crate::harness::contract::harness_ids() {
+        for id in crate::harness::registry::harness_ids() {
             let profile = crate::harness::input_profile(id).expect("a shipped profile");
             let typed = compose("do the thing", Some("src/lib/latch.ts"), None);
             assert_eq!(control_refusal(&typed), None);

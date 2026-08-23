@@ -39,6 +39,7 @@
   import { onAppViewShown, isAppViewVisible } from './appViewVisibility';
   import { loadViewString, saveViewString } from './viewSection';
   import { latchByTab, applyLatchOverride, type LatchRow } from './latch';
+  import { findHarness, harnesses } from './harness';
   import {
     fetchContaminationEvents,
     buildTimelineRows,
@@ -285,10 +286,21 @@
     });
   });
 
+  /// How to start a fresh session in a tab of `harness`, as a clause.
+  ///
+  /// V40 Phase F (locked decision 27): the in-session command is the harness's
+  /// declared `newSessionCommand`. Three strings across this window said "run
+  /// /clear in that tab" as if every harness had that command; a harness that
+  /// declares none now gets the honest half of the sentence instead.
+  function newSessionAdvice(harness: string): string {
+    const cmd = findHarness($harnesses, harness)?.affordances.newSessionCommand;
+    return cmd ? `run ${cmd} in that tab, or restart it` : 'restart that tab';
+  }
+
   async function armSessionClear(row: LatchRow): Promise<void> {
     try {
       await applyLatchOverride(row.tab, row.consumer, 'await_session_clear');
-      armNote = `Restored. ${row.consumer}:${row.tab} stays flagged until it starts a new session — run /clear in that tab, or restart it, and the flag lifts on its own. Restoring files cannot remove injected text from the conversation, which is why it was kept.`;
+      armNote = `Restored. ${row.consumer}:${row.tab} stays flagged until it starts a new session — ${newSessionAdvice(row.consumer)}, and the flag lifts on its own. Restoring files cannot remove injected text from the conversation, which is why it was kept.`;
       await refreshEvidence();
     } catch (e) {
       armNote = `Restored, but the contamination flag could not be armed to clear: ${errorMessage(e)} — clear it from the tab's containment badge instead.`;
@@ -365,7 +377,7 @@
     return `cImp holds no live containment state for ${scope} — the tab has made no gated call this run, so there is no flag here to act on. If it is open, its containment badge is the place to check.`;
   }
   function sessionNote(session: string): string {
-    return `Started in session ${session}. The flag belongs to the tab, not to that conversation — it survives a /clear, so a later session on this tab is covered by this same row and writes no second one.`;
+    return `Started in session ${session}. The flag belongs to the tab, not to that conversation — it survives the start of a new one, so a later session on this tab is covered by this same row and writes no second one.`;
   }
 </script>
 
@@ -428,7 +440,7 @@
                    Rendered only when present — a tool checkpoint is the rare
                    one, so an always-there "—" would add a column of dashes to
                    every row for the sake of a handful. It sits next to the
-                   agent because together they read as "claude · Bash": who,
+                   agent because together they read as "<harness> · <tool>": who,
                    then what they were about to run. -->
               {#if src}
                 <span class="source" title={src.title}>{src.text}</span>

@@ -15,8 +15,8 @@ use cozo::{DataValue, DbInstance, MultiTransaction, Num, ScriptMutability};
 use crate::error::{AppError, AppResult};
 
 use super::memory::{
-    ModelUsage, OriginSplit, ProjectFact, SessionInfo, SessionUsageRow, TurnUsage, UsageEvent,
-    UsageOrigin, UsageTotals, WorkingSetEntry, MAX_EVENTS_PER_SESSION, MAX_LIVE_PROJECT_FACTS,
+    ColumnTotals, ModelUsage, ProjectFact, SessionInfo, SessionUsageRow, TurnUsage, UsageEvent,
+    WorkingSetEntry, MAX_EVENTS_PER_SESSION, MAX_LIVE_PROJECT_FACTS,
     MAX_SESSIONS_PER_ROOT, MAX_USAGE_PER_SESSION, SESSION_RETENTION_DAYS,
 };
 use super::model::{Confidence, EdgeKind, FileGraph, Lang};
@@ -3637,6 +3637,24 @@ impl GraphIndex {
         })
     }
 
+    /// **The session's harness's declared turn shape**, or `None` when the
+    /// session's `agent` names no registered harness (or names one that
+    /// declares no shape).
+    ///
+    /// Resolved ONCE per usage query and threaded through the row loop — the
+    /// registry lookup is a linear scan over the descriptors and a per-row call
+    /// would repeat it thousands of times on a long session.
+    fn session_turn_shape(
+        &self,
+        session_id: &str,
+    ) -> AppResult<Option<&'static crate::harness::plugin::TurnUsageShape>> {
+        Ok(self
+            .session_agent(session_id)?
+            .and_then(|a| crate::harness::HarnessId::from_id(&a))
+            .and_then(|h| h.plugin())
+            .and_then(|p| p.turn_usage_shape()))
+    }
+
     /// Whether `session_id` has any recorded `turn` usage row — the V24 Phase E
     /// signal that exact token accounting exists (see the `est_only` derivation
     /// in [`Self::usage_row_for_session`]). A `:limit 1` existence probe, so it
@@ -3653,9 +3671,25 @@ impl GraphIndex {
         Ok(!rows.rows.is_empty())
     }
 
-    /// Summed token totals for `session_id` across its "turn" rows
-    /// ("tool_result" rows carry chars, not tokens, so they don't contribute).
-    pub fn usage_session_totals(&self, session_id: &str) -> AppResult<UsageTotals> {
+    /// Summed token totals for `session_id` across its "turn" rows, as the
+    /// **declared-shape** payload type ("tool_result" rows carry chars, not
+    /// tokens, so they don't contribute).
+    ///
+    /// The harness is resolved once here; see [`column_kinds`] for which
+    /// categories the answer carries.
+    pub fn usage_session_totals(
+        &self,
+        session_id: &str,
+    ) -> AppResult<crate::harness::plugin::TokenKinds> {
+        let shape = self.session_turn_shape(session_id)?;
+        Ok(column_kinds(self.usage_column_totals(session_id)?, shape))
+    }
+
+    /// The four stored token columns for `session_id`, summed — the internal
+    /// aggregate behind [`Self::usage_session_totals`] and the `cache_hit_ratio`
+    /// / `est_only` derivations in [`Self::usage_row_for_session`], which need
+    /// the raw columns whatever the harness declared.
+    fn usage_column_totals(&self, session_id: &str) -> AppResult<ColumnTotals> {
         let mut p = BTreeMap::new();
         p.insert("sid".to_string(), DataValue::Str(session_id.into()));
         // `seq` MUST stay in the projection even though it's unused below:
@@ -3672,22 +3706,20 @@ impl GraphIndex {
             p,
             ScriptMutability::Immutable,
         )?;
-        let mut t = UsageTotals::default();
+        let mut t = ColumnTotals::default();
         for r in &rows.rows {
-            t.in_tok += cell_i64(r, 1).max(0) as u64;
-            t.out_tok += cell_i64(r, 2).max(0) as u64;
-            t.cache_read += cell_i64(r, 3).max(0) as u64;
-            t.cache_make += cell_i64(r, 4).max(0) as u64;
+            t.add(row_columns(r, 1));
         }
         Ok(t)
     }
 
     /// Distinct model ids across `session_id`'s turns, descending by the
     /// total tokens (input + output + cache) attributed to each. Turns with
-    /// no model recorded are skipped, as is `"<synthetic>"` — Claude Code
-    /// stamps that pseudo-model on locally fabricated messages (errors,
-    /// interrupts) and it would pollute a "which model ran this session"
-    /// readout.
+    /// no model recorded are skipped, as are the harnesses' declared
+    /// pseudo-models — a harness stamps one on locally fabricated messages
+    /// (errors, interrupts) and it would pollute a "which model ran this
+    /// session" readout. V40 Phase D: the list comes from
+    /// [`crate::harness::is_model_sentinel`], not from a literal here.
     pub fn usage_session_models(&self, session_id: &str) -> AppResult<Vec<String>> {
         let mut p = BTreeMap::new();
         p.insert("sid".to_string(), DataValue::Str(session_id.into()));
@@ -3705,7 +3737,7 @@ impl GraphIndex {
             let Some(model) = cell_str_opt(r, 1) else {
                 continue;
             };
-            if model == "<synthetic>" {
+            if crate::harness::is_model_sentinel(&model) {
                 continue;
             }
             let toks: u64 = (2..=5).map(|i| cell_i64(r, i).max(0) as u64).sum();
@@ -3716,13 +3748,13 @@ impl GraphIndex {
         Ok(out.into_iter().map(|(m, _)| m).collect())
     }
 
-    /// V24 Phase B: per-model token totals for `session_id` with the
-    /// session/agent origin split, ordered by total tokens (in + out + both
-    /// cache categories) descending, model id breaking ties. Like
+    /// V24 Phase B: per-model token totals for `session_id` with the per-lane
+    /// split, ordered by total tokens (every column summed) descending, model
+    /// id breaking ties. Like
     /// [`Self::usage_session_models`] but keeps the sums it discards — the Cost
     /// card prices each model in a mixed-model session separately, and the
     /// `SessionUsageRow` cost badge sums per-model auto-matched rates. Same
-    /// `"<synthetic>"` exclusion and no-model skip as `usage_session_models`,
+    /// sentinel exclusion and no-model skip as `usage_session_models`,
     /// and the same `seq`-keeps-rows-distinct reasoning as
     /// [`Self::usage_session_totals`].
     pub fn usage_session_model_totals(&self, session_id: &str) -> AppResult<Vec<ModelUsage>> {
@@ -3735,50 +3767,47 @@ impl GraphIndex {
             p,
             ScriptMutability::Immutable,
         )?;
+        // Resolved ONCE for the whole query, not per row.
+        let shape = self.session_turn_shape(session_id)?;
         struct Agg {
-            totals: UsageTotals,
-            origins: OriginSplit,
+            totals: ColumnTotals,
+            /// Total tokens per STORED lane id, read back verbatim. A lane no
+            /// row carried gets no entry — the closed `OriginSplit` this
+            /// replaced always emitted both halves, so a single-lane harness
+            /// rendered a fabricated second lane at 0.
+            origins: BTreeMap<String, u64>,
         }
         let mut map: HashMap<String, Agg> = HashMap::new();
         for r in &rows.rows {
             let Some(model) = cell_str_opt(r, 1) else {
                 continue;
             };
-            if model == "<synthetic>" {
+            if crate::harness::is_model_sentinel(&model) {
                 continue;
             }
-            let in_tok = cell_i64(r, 2).max(0) as u64;
-            let out_tok = cell_i64(r, 3).max(0) as u64;
-            let cache_read = cell_i64(r, 4).max(0) as u64;
-            let cache_make = cell_i64(r, 5).max(0) as u64;
+            let cols = row_columns(r, 2);
             let e = map.entry(model).or_insert_with(|| Agg {
-                totals: UsageTotals::default(),
-                origins: OriginSplit::default(),
+                totals: ColumnTotals::default(),
+                origins: BTreeMap::new(),
             });
-            e.totals.in_tok += in_tok;
-            e.totals.out_tok += out_tok;
-            e.totals.cache_read += cache_read;
-            e.totals.cache_make += cache_make;
-            let tok = in_tok + out_tok + cache_read + cache_make;
-            match UsageOrigin::from_wire(&cell_str(r, 6)) {
-                UsageOrigin::Session => e.origins.session_tok += tok,
-                UsageOrigin::Agent => e.origins.agent_tok += tok,
-            }
+            e.totals.add(cols);
+            *e.origins.entry(cell_str(r, 6)).or_insert(0) += cols.total();
         }
-        let mut out: Vec<ModelUsage> = map
+        let mut out: Vec<(u64, ModelUsage)> = map
             .into_iter()
-            .map(|(model, a)| ModelUsage {
-                model,
-                totals: a.totals,
-                origins: a.origins,
+            .map(|(model, a)| {
+                (
+                    a.totals.total(),
+                    ModelUsage {
+                        model,
+                        totals: column_kinds(a.totals, shape),
+                        origins: a.origins,
+                    },
+                )
             })
             .collect();
-        out.sort_by(|a, b| {
-            let ta = a.totals.in_tok + a.totals.out_tok + a.totals.cache_read + a.totals.cache_make;
-            let tb = b.totals.in_tok + b.totals.out_tok + b.totals.cache_read + b.totals.cache_make;
-            tb.cmp(&ta).then(a.model.cmp(&b.model))
-        });
-        Ok(out)
+        out.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.model.cmp(&b.1.model)));
+        Ok(out.into_iter().map(|(_, m)| m).collect())
     }
 
     /// Estimated tool-result characters for `session_id`, grouped by tool
@@ -3825,6 +3854,8 @@ impl GraphIndex {
             p,
             ScriptMutability::Immutable,
         )?;
+        // Resolved ONCE for the whole series, not per turn.
+        let shape = self.session_turn_shape(session_id)?;
         let mut out = Vec::new();
         let mut pending_tool_chars: u64 = 0;
         for r in &rows.rows {
@@ -3835,13 +3866,15 @@ impl GraphIndex {
             out.push(TurnUsage {
                 msg_id: cell_str_opt(r, 3).unwrap_or_default(),
                 model: cell_str_opt(r, 2),
-                in_tok: cell_i64(r, 4).max(0) as u64,
-                out_tok: cell_i64(r, 5).max(0) as u64,
-                cache_read: cell_i64(r, 6).max(0) as u64,
-                cache_make: cell_i64(r, 7).max(0) as u64,
+                tokens: column_kinds(row_columns(r, 4), shape),
                 tool_chars: pending_tool_chars,
                 ts_ms: cell_i64(r, 10),
-                origin: UsageOrigin::from_wire(&cell_str(r, 11)),
+                // Read back VERBATIM: whatever the producing harness declared
+                // is what the lane is. There is no `from_wire` defaulting any
+                // more — mapping an unrecognised id onto "the main session"
+                // silently merged a third harness's lane into somebody else's
+                // spend.
+                origin: cell_str(r, 11),
             });
             pending_tool_chars = 0;
         }
@@ -3881,13 +3914,22 @@ impl GraphIndex {
     /// Build one session's totals row from its [`SessionInfo`] — the shared
     /// body of [`Self::usage_all_sessions`] and [`Self::usage_session_row`].
     fn usage_row_for_session(&self, s: SessionInfo) -> AppResult<SessionUsageRow> {
-        let totals = self.usage_session_totals(&s.session_id)?;
+        let cols = self.usage_column_totals(&s.session_id)?;
+        // The session row already carries its `agent`, so the shape resolves
+        // without a second `session_agent` query.
+        let shape = crate::harness::HarnessId::from_id(&s.agent)
+            .and_then(|h| h.plugin())
+            .and_then(|p| p.turn_usage_shape());
+        let totals = column_kinds(cols, shape);
         let per_tool = self.usage_per_tool(&s.session_id)?;
         let models = self.usage_session_models(&s.session_id)?;
         let tool_chars: u64 = per_tool.iter().map(|(_, c)| *c).sum();
-        let denom = totals.cache_read + totals.in_tok;
+        // Derived from the raw COLUMNS, not from the declared-shape payload: a
+        // harness that does not declare `cache_read` has no ratio to show, and
+        // reading an absent category as 0 here would print a confident "0%".
+        let denom = cols.cache_read + cols.in_tok;
         let cache_hit_ratio = if denom > 0 {
-            totals.cache_read as f64 / denom as f64
+            cols.cache_read as f64 / denom as f64
         } else {
             0.0
         };
@@ -4194,31 +4236,39 @@ impl GraphIndex {
         Ok(Some((pairs, window.len() as u64)))
     }
 
-    /// V16 Feature 2 (`drift.usage_fields_gone.v1` signals): Claude sessions
-    /// with at least one message-level `usage_stat` row, and how many of
-    /// those carry ZERO tokens across every such row (in/out/cache all 0 —
-    /// the transcript's `message.usage` shape changed under the tap while
-    /// messages kept flowing). Sessions with no usage rows at all appear in
-    /// NEITHER count: a session that never spoke isn't evidence, and
-    /// counting it in the denominator would let one idle session suppress
-    /// the canary (the advisor fires on `tokenless == claude_sessions`).
+    /// V16 Feature 2 (`drift.usage_fields_gone.v1` signals): **`agent`'s**
+    /// sessions with at least one message-level `usage_stat` row, and how many
+    /// of those carry ZERO tokens across every such row (in/out/cache all 0 —
+    /// the payload's usage shape changed under the reader while messages kept
+    /// flowing). Sessions with no usage rows at all appear in NEITHER count: a
+    /// session that never spoke isn't evidence, and counting it in the
+    /// denominator would let one idle session suppress the canary (the advisor
+    /// fires on `tokenless == sessions`).
+    ///
+    /// **V40 Phase D (locked decision 20): the agent is a query parameter.** It
+    /// was `agent == "claude"` inside the Datalog string, so the rule that
+    /// reads these counts could only ever fire for one harness and every other
+    /// harness's row was filled with zeros — a signal that looks answered and
+    /// is not (global principle 3).
     ///
     /// (Deliberately NOT `SessionUsageRow.est_only` — that flag now means "this
-    /// session recorded no real Turn tokens at all", so it's false for a Claude
-    /// session that spoke even once, whereas this counts Claude sessions whose
-    /// turns landed but carried a zeroed/dropped `usage` block.)
+    /// session recorded no real Turn tokens at all", so it's false for a
+    /// session that spoke even once, whereas this counts sessions whose turns
+    /// landed but carried a zeroed/dropped usage block.)
     ///
     /// Datalog's set semantics may collapse identical projected rows, but
     /// that can't change a zero-vs-nonzero verdict or row presence, which is
     /// all this reads.
-    pub fn claude_tokenless_sessions(&self) -> AppResult<(u64, u64)> {
+    pub fn tokenless_sessions(&self, agent: &str) -> AppResult<(u64, u64)> {
+        let mut p = BTreeMap::new();
+        p.insert("agent".to_string(), DataValue::Str(agent.into()));
         let sess = self.run(
-            "?[session_id] := *session{session_id, agent}, agent == \"claude\"",
-            BTreeMap::new(),
+            "?[session_id] := *session{session_id, agent}, agent == $agent",
+            p,
             ScriptMutability::Immutable,
         )?;
-        let claude_ids: HashSet<String> = sess.rows.iter().map(|r| cell_str(r, 0)).collect();
-        if claude_ids.is_empty() {
+        let session_ids: HashSet<String> = sess.rows.iter().map(|r| cell_str(r, 0)).collect();
+        if session_ids.is_empty() {
             return Ok((0, 0));
         }
         let rows = self.run(
@@ -4231,7 +4281,7 @@ impl GraphIndex {
         let mut token_sum: HashMap<String, u64> = HashMap::new();
         for r in &rows.rows {
             let sid = cell_str(r, 0);
-            if !claude_ids.contains(&sid) {
+            if !session_ids.contains(&sid) {
                 continue;
             }
             let toks: u64 = (1..=4).map(|i| cell_i64(r, i).max(0) as u64).sum();
@@ -5113,6 +5163,72 @@ fn cell_str(row: &[DataValue], i: usize) -> String {
 
 fn cell_i64(row: &[DataValue], i: usize) -> i64 {
     row.get(i).map(dv_i64).unwrap_or(0)
+}
+
+// ── usage_stat's four token columns → declared token categories ────────────
+//
+// **The persisted row shape does not move.** `usage_stat` is a memory relation
+// that survives an index rebuild and sits on disk in every existing user's
+// `graph.db` with exactly four `Int` token columns plus a `String` origin. V40
+// Phase G generalises the PAYLOAD, not the storage: the conversion below is the
+// whole of the read boundary, and there is deliberately no graph migration.
+//
+// The four ids these columns map onto — `input` / `output` / `cache_read` /
+// `cache_write` — are **cImp's own provider/pricing vocabulary, not a
+// harness's**. Locked decision 29 rules the price table provider knowledge, and
+// `crate::pricing`'s rate fields are spelled with these exact four names; a
+// stored column means "tokens billed in this category", so naming them in core
+// is naming core's own table. What a HARNESS declares is which of them it
+// reports — see [`crate::harness::plugin::TurnUsageShape`].
+
+/// The pricing category each stored column bills under, in column order:
+/// `in_tok`, `out_tok`, `cache_read`, `cache_make`.
+const COLUMN_KINDS: [&str; 4] = ["input", "output", "cache_read", "cache_write"];
+
+/// The four token columns of one `usage_stat` row, starting at projection
+/// index `base` (`in_tok`, `out_tok`, `cache_read`, `cache_make` — the order
+/// every usage query projects them in). Negative stored values clamp to 0.
+fn row_columns(row: &[DataValue], base: usize) -> ColumnTotals {
+    ColumnTotals {
+        in_tok: cell_i64(row, base).max(0) as u64,
+        out_tok: cell_i64(row, base + 1).max(0) as u64,
+        cache_read: cell_i64(row, base + 2).max(0) as u64,
+        cache_make: cell_i64(row, base + 3).max(0) as u64,
+    }
+}
+
+/// **Stored columns → the declared-shape payload**, applying the absence rule.
+///
+/// A category is emitted when the session's harness DECLARES it (`shape`), even
+/// at zero — a harness that bills cache reads and read none this session really
+/// did read zero, and the donut's four segments are its own statement. When the
+/// harness is unknown or declares no shape, only the columns that are actually
+/// non-zero are emitted: core has nobody's word for what the other categories
+/// mean, and inventing four keys would be the "empty is not absent" defect this
+/// type exists to prevent (global principle 5).
+///
+/// For the two shipped harnesses (both declare all four) this reproduces
+/// exactly the numbers the old four-field `UsageTotals` carried.
+fn column_kinds(
+    cols: ColumnTotals,
+    shape: Option<&'static crate::harness::plugin::TurnUsageShape>,
+) -> crate::harness::plugin::TokenKinds {
+    let mut out = crate::harness::plugin::TokenKinds::default();
+    for (id, v) in COLUMN_KINDS.into_iter().zip([
+        cols.in_tok,
+        cols.out_tok,
+        cols.cache_read,
+        cols.cache_make,
+    ]) {
+        let emit = match shape {
+            Some(s) => s.declares_kind(id),
+            None => v != 0,
+        };
+        if emit {
+            out.set(id, v);
+        }
+    }
+    out
 }
 
 fn cell_bool(row: &[DataValue], i: usize) -> bool {
@@ -6701,7 +6817,7 @@ pub struct Point { x: i32 }
                 out_tok: 0,
                 cache_read: 0,
                 cache_make: 0,
-                origin: UsageOrigin::Session,
+                origin: "session".to_string(),
             },
             100,
         )
@@ -6719,7 +6835,7 @@ pub struct Point { x: i32 }
                 out_tok: 30,
                 cache_read: 40,
                 cache_make: 5,
-                origin: UsageOrigin::Agent,
+                origin: "agent".to_string(),
             },
             110,
         )
@@ -6733,22 +6849,164 @@ pub struct Point { x: i32 }
         );
         assert_eq!(series[0].msg_id, "m1");
         assert_eq!(series[0].model.as_deref(), Some("claude-x"));
-        assert_eq!(series[0].in_tok, 120);
-        assert_eq!(series[0].out_tok, 30);
-        assert_eq!(series[0].cache_read, 40);
-        assert_eq!(series[0].cache_make, 5);
+        // The stored columns come back as the harness's DECLARED categories
+        // (V40 Phase G): `claude` declares all four, so all four are present
+        // with exactly the numbers the four `UsageTotals` fields used to hold.
+        assert_eq!(series[0].tokens.get("input"), Some(120));
+        assert_eq!(series[0].tokens.get("output"), Some(30));
+        assert_eq!(series[0].tokens.get("cache_read"), Some(40));
+        assert_eq!(series[0].tokens.get("cache_write"), Some(5));
         assert_eq!(
-            series[0].origin,
-            UsageOrigin::Agent,
+            series[0].origin, "agent",
             "upsert carries the updated origin"
         );
 
         let totals = idx.usage_session_totals("s1").unwrap();
         assert_eq!(
-            totals.in_tok, 120,
+            totals.get("input"),
+            Some(120),
             "totals reflect the upserted (last) value, not both writes summed"
         );
 
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── V40 Phase G: the declared-shape read boundary ─────────────────────
+
+    /// **The persisted row shape did not move.**
+    ///
+    /// `usage_stat` is a memory relation: it survives an index rebuild and sits
+    /// on disk in every existing user's `graph.db`. V40 Phase G generalises the
+    /// PAYLOAD at the read boundary and adds no graph migration, so this pins
+    /// the four `Int` token columns plus the `String` origin by name. A change
+    /// here is a data migration, not a refactor.
+    #[test]
+    fn the_usage_stat_row_shape_is_unchanged() {
+        let ddl = GraphIndex::usage_stat_create_ddl("usage_stat");
+        assert_eq!(
+            ddl,
+            concat!(
+                ":create usage_stat {session_id: String, seq: Int => ",
+                "kind: String, model: String?, msg_id: String?, ",
+                "in_tok: Int, out_tok: Int, cache_read: Int, cache_make: Int, ",
+                "tool: String?, chars: Int, ts_ms: Int, origin: String}"
+            ),
+            "the on-disk usage row changed shape - that is a graph migration, and V40 Phase G deliberately performs none"
+        );
+        // And the live relation really is built from that DDL.
+        let dir = std::env::temp_dir().join(format!("ckg-usage-ddl-{}", uuid::Uuid::new_v4()));
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+        for col in ["in_tok", "out_tok", "cache_read", "cache_make", "origin"] {
+            assert!(
+                idx.relation_has_column("usage_stat", col).unwrap(),
+                "the live relation lost the {col} column"
+            );
+        }
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A category the harness does not declare is ABSENT, not zero** — and an
+    /// unknown harness emits only what it actually stored.
+    ///
+    /// The absence rule at the read boundary (locked decision 19; global
+    /// principle 5). The pre-V40-G payload had four `u64` fields, so every
+    /// session reported four categories whatever its harness billed, and a
+    /// consumer could not tell "reported zero" from "never reported".
+    #[test]
+    fn an_undeclared_token_category_is_absent_from_a_stored_row() {
+        use crate::harness::plugin::{TokenKindSpec, TurnOrigin, TurnUsageShape};
+        let cols = ColumnTotals {
+            in_tok: 100,
+            out_tok: 20,
+            cache_read: 0,
+            cache_make: 7,
+        };
+
+        // A harness that bills input and output only: the two cache columns are
+        // ABSENT even though one of them holds a real 7.
+        static FLAT: TurnUsageShape = TurnUsageShape {
+            token_kinds: &[
+                TokenKindSpec { id: "input", label: "In" },
+                TokenKindSpec { id: "output", label: "Out" },
+            ],
+            origins: &[TurnOrigin { id: "turn", label: "turns", subagent: false }],
+        };
+        let k = column_kinds(cols, Some(&FLAT));
+        assert_eq!(k.get("input"), Some(100));
+        assert_eq!(k.get("output"), Some(20));
+        assert_eq!(k.get("cache_read"), None, "undeclared category must be absent");
+        assert_eq!(k.get("cache_write"), None, "undeclared category must be absent");
+
+        // A harness that declares all four gets all four — INCLUDING the zero,
+        // because a category it does bill and spent nothing in really is zero.
+        static FULL: TurnUsageShape = TurnUsageShape {
+            token_kinds: &[
+                TokenKindSpec { id: "input", label: "In" },
+                TokenKindSpec { id: "cache_write", label: "CW" },
+                TokenKindSpec { id: "cache_read", label: "CR" },
+                TokenKindSpec { id: "output", label: "Out" },
+            ],
+            origins: &[TurnOrigin { id: "turn", label: "turns", subagent: false }],
+        };
+        let k = column_kinds(cols, Some(&FULL));
+        assert_eq!(k.ids().collect::<Vec<_>>().len(), 4);
+        assert_eq!(k.get("cache_read"), Some(0), "a DECLARED category at zero is a real zero");
+
+        // No shape at all (unknown harness / one that records no turns): only
+        // the columns that are non-zero, because core has nobody's word for
+        // what the others mean.
+        let k = column_kinds(cols, None);
+        let mut ids: Vec<&str> = k.ids().collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec!["cache_write", "input", "output"]);
+        assert_eq!(k.get("cache_read"), None);
+
+        // Nothing stored and nothing declared ⇒ nothing at all, not four zeros.
+        assert!(column_kinds(ColumnTotals::default(), None).is_empty());
+    }
+
+    /// **A lane id no harness declares round-trips as itself.**
+    ///
+    /// The pre-V40-G `UsageOrigin::from_wire` mapped every unrecognised string
+    /// onto `Session`, so a third harness's lane silently merged into the main
+    /// session's spend. The column is read back verbatim now — including into
+    /// `ModelUsage.origins`, whose closed `{ session_tok, agent_tok }` pair had
+    /// no slot for it at all.
+    #[test]
+    fn an_undeclared_lane_round_trips_verbatim() {
+        let dir = std::env::temp_dir().join(format!("ckg-lane-{}", uuid::Uuid::new_v4()));
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+        for (msg, origin, in_tok) in [("m1", "session", 10u32), ("m2", "review", 5)] {
+            idx.record_usage_event(
+                "s1",
+                "claude",
+                &UsageEvent::Turn {
+                    msg_id: msg.to_string(),
+                    model: Some("model-a".to_string()),
+                    in_tok,
+                    out_tok: 0,
+                    cache_read: 0,
+                    cache_make: 0,
+                    origin: origin.to_string(),
+                },
+                100,
+            )
+            .unwrap();
+        }
+        let series = idx.usage_turn_series("s1").unwrap();
+        assert_eq!(
+            series.iter().map(|t| t.origin.as_str()).collect::<Vec<_>>(),
+            vec!["session", "review"],
+            "an unrecognised lane must not be folded into the main session"
+        );
+        let per_model = idx.usage_session_model_totals("s1").unwrap();
+        assert_eq!(per_model.len(), 1);
+        assert_eq!(per_model[0].origins.get("session").copied(), Some(10));
+        assert_eq!(per_model[0].origins.get("review").copied(), Some(5));
+        // The lane the harness declares but this model never used has NO entry.
+        assert_eq!(per_model[0].origins.get("agent"), None);
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -7191,10 +7449,14 @@ pub struct Point { x: i32 }
         let series = idx2.usage_turn_series("s1").unwrap();
         assert_eq!(series.len(), 1, "the pre-V24 turn row survives migration");
         assert_eq!(series[0].msg_id, "m1");
-        assert_eq!(series[0].in_tok, 100, "token counts are preserved");
+        assert_eq!(
+            series[0].tokens.get("input"),
+            Some(100),
+            "token counts are preserved"
+        );
         assert_eq!(
             series[0].origin,
-            UsageOrigin::Session,
+            "session",
             "old rows default to session"
         );
         // The relation now carries `origin`, so a re-open is a clean no-op.
@@ -7262,10 +7524,11 @@ pub struct Point { x: i32 }
         assert_eq!(series.len(), 1, "staged rows recovered without loss");
         assert_eq!(series[0].msg_id, "m1");
         assert_eq!(
-            series[0].in_tok, 100,
+            series[0].tokens.get("input"),
+            Some(100),
             "token counts preserved through recovery"
         );
-        assert_eq!(series[0].origin, UsageOrigin::Session);
+        assert_eq!(series[0].origin, "session");
         // The stage was consumed (renamed over `usage_stat`), leaving no leftover.
         assert!(
             !idx2
@@ -7296,7 +7559,7 @@ pub struct Point { x: i32 }
                 out_tok: 5,
                 cache_read: 0,
                 cache_make: 0,
-                origin: UsageOrigin::Session,
+                origin: "session".to_string(),
             },
             100,
         )
@@ -7333,7 +7596,7 @@ pub struct Point { x: i32 }
                 out_tok: 20,
                 cache_read: 0,
                 cache_make: 0,
-                origin: UsageOrigin::Session,
+                origin: "session".to_string(),
             },
             120,
         )
@@ -7396,7 +7659,7 @@ pub struct Point { x: i32 }
                 out_tok: 10,
                 cache_read: 50,
                 cache_make: 0,
-                origin: UsageOrigin::Session,
+                origin: "session".to_string(),
             },
             100,
         )
@@ -7413,7 +7676,7 @@ pub struct Point { x: i32 }
                 out_tok: 5,
                 cache_read: 0,
                 cache_make: 0,
-                origin: UsageOrigin::Session,
+                origin: "session".to_string(),
             },
             110,
         )
@@ -7428,7 +7691,7 @@ pub struct Point { x: i32 }
                 out_tok: 20,
                 cache_read: 0,
                 cache_make: 0,
-                origin: UsageOrigin::Session,
+                origin: "session".to_string(),
             },
             120,
         )
@@ -7443,7 +7706,7 @@ pub struct Point { x: i32 }
                 out_tok: 1,
                 cache_read: 0,
                 cache_make: 0,
-                origin: UsageOrigin::Session,
+                origin: "session".to_string(),
             },
             130,
         )
@@ -7472,7 +7735,7 @@ pub struct Point { x: i32 }
                 out_tok: 7,
                 cache_read: 0,
                 cache_make: 0,
-                origin: UsageOrigin::Session,
+                origin: "session".to_string(),
             },
             210,
         )
@@ -7501,7 +7764,7 @@ pub struct Point { x: i32 }
                 out_tok: 0,
                 cache_read: 0,
                 cache_make: 0,
-                origin: UsageOrigin::Session,
+                origin: "session".to_string(),
             },
             230,
         )
@@ -7513,7 +7776,7 @@ pub struct Point { x: i32 }
             .find(|r| r.session_id == "c1")
             .expect("c1 present");
         assert!(!claude.est_only, "claude sessions carry exact usage");
-        assert_eq!(claude.totals.in_tok, 306);
+        assert_eq!(claude.totals.get("input"), Some(306));
         // cache_read / (cache_read + in_tok) = 50 / 356.
         assert!((claude.cache_hit_ratio - (50.0 / 356.0)).abs() < 1e-9);
         assert_eq!(
@@ -7530,8 +7793,13 @@ pub struct Point { x: i32 }
             opencode.est_only,
             "a tool_result-only session has zero token totals ⇒ est-only"
         );
+        // OpenCode DECLARES all four categories (V40 Phase G: it records
+        // turns even though it reports no quota), so a session of its with no
+        // turn rows still answers `input: 0` — a declared category at zero,
+        // which is a different statement from an undeclared one being absent.
         assert_eq!(
-            opencode.totals.in_tok, 0,
+            opencode.totals.get("input"),
+            Some(0),
             "a tool_result-only session has zero token totals"
         );
         assert_eq!(opencode.tool_chars, 20);
@@ -7553,7 +7821,7 @@ pub struct Point { x: i32 }
             !oc_tokens.est_only,
             "an OpenCode session with real Turn tokens is exact"
         );
-        assert_eq!(oc_tokens.totals.in_tok, 42);
+        assert_eq!(oc_tokens.totals.get("input"), Some(42));
         // Claude with NO turn rows (tool-result chars only) → est-only (derived
         // from turn presence, not agent).
         let claude_notoks = rows
@@ -7574,7 +7842,11 @@ pub struct Point { x: i32 }
             !claude_ztok.est_only,
             "a recorded zero-token turn is exact, not est"
         );
-        assert_eq!(claude_ztok.totals.in_tok, 0, "the turn carries zero tokens");
+        assert_eq!(
+            claude_ztok.totals.get("input"),
+            Some(0),
+            "the turn carries zero tokens"
+        );
 
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);
@@ -7848,7 +8120,7 @@ pub struct Point { x: i32 }
         msg: &str,
         model: Option<&str>,
         toks: (u32, u32, u32, u32),
-        origin: UsageOrigin,
+        origin: &str,
         ts: i64,
     ) {
         idx.record_usage_event(
@@ -7861,7 +8133,7 @@ pub struct Point { x: i32 }
                 out_tok: toks.1,
                 cache_read: toks.2,
                 cache_make: toks.3,
-                origin,
+                origin: origin.to_string(),
             },
             ts,
         )
@@ -7879,7 +8151,7 @@ pub struct Point { x: i32 }
             "m1",
             Some("model-a"),
             (100, 20, 30, 0),
-            UsageOrigin::Session,
+            "session",
             100,
         );
         seed_turn(
@@ -7888,7 +8160,7 @@ pub struct Point { x: i32 }
             "m2",
             Some("model-a"),
             (10, 0, 0, 0),
-            UsageOrigin::Agent,
+            "agent",
             110,
         );
         // model-b: one Session turn (5 tok) — fewer tokens, ranks after model-a.
@@ -7898,7 +8170,7 @@ pub struct Point { x: i32 }
             "m3",
             Some("model-b"),
             (5, 0, 0, 0),
-            UsageOrigin::Session,
+            "session",
             120,
         );
         // `<synthetic>` and no-model rows are excluded (parity with
@@ -7909,7 +8181,7 @@ pub struct Point { x: i32 }
             "m4",
             Some("<synthetic>"),
             (999, 0, 0, 0),
-            UsageOrigin::Session,
+            "session",
             130,
         );
         seed_turn(
@@ -7918,7 +8190,7 @@ pub struct Point { x: i32 }
             "m5",
             None,
             (999, 0, 0, 0),
-            UsageOrigin::Session,
+            "session",
             140,
         );
 
@@ -7926,26 +8198,26 @@ pub struct Point { x: i32 }
         assert_eq!(per_model.len(), 2, "synthetic + no-model rows are excluded");
         // Ordered by total tokens desc.
         assert_eq!(per_model[0].model, "model-a");
+        assert_eq!(per_model[0].totals.get("input"), Some(110));
+        assert_eq!(per_model[0].totals.get("output"), Some(20));
+        assert_eq!(per_model[0].totals.get("cache_read"), Some(30));
+        assert_eq!(per_model[0].totals.get("cache_write"), Some(0));
         assert_eq!(
-            per_model[0].totals,
-            UsageTotals {
-                in_tok: 110,
-                out_tok: 20,
-                cache_read: 30,
-                cache_make: 0
-            }
+            per_model[0].origins.get("session").copied(),
+            Some(150),
+            "the main-lane turn's 150 tok"
         );
         assert_eq!(
-            per_model[0].origins.session_tok, 150,
-            "the Session turn's 150 tok"
-        );
-        assert_eq!(
-            per_model[0].origins.agent_tok, 10,
-            "the Agent turn's 10 tok"
+            per_model[0].origins.get("agent").copied(),
+            Some(10),
+            "the sub-agent turn's 10 tok"
         );
         assert_eq!(per_model[1].model, "model-b");
-        assert_eq!(per_model[1].origins.session_tok, 5);
-        assert_eq!(per_model[1].origins.agent_tok, 0);
+        assert_eq!(per_model[1].origins.get("session").copied(), Some(5));
+        // **Absent, not zero**: model-b recorded no sub-agent turn, and the
+        // closed `OriginSplit` this replaced would have reported `agent_tok:
+        // 0` — a lane the data never spoke about.
+        assert_eq!(per_model[1].origins.get("agent"), None);
 
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);
@@ -7963,7 +8235,7 @@ pub struct Point { x: i32 }
             "m1",
             Some("model-a"),
             (100, 20, 30, 5),
-            UsageOrigin::Session,
+            "session",
             100,
         );
         seed_turn(
@@ -7972,19 +8244,24 @@ pub struct Point { x: i32 }
             "m2",
             Some("model-b"),
             (7, 3, 1, 0),
-            UsageOrigin::Agent,
+            "agent",
             110,
         );
 
         let per_model = idx.usage_session_model_totals("s1").unwrap();
-        let mut summed = UsageTotals::default();
+        let mut summed: BTreeMap<String, u64> = BTreeMap::new();
         for m in &per_model {
-            summed.in_tok += m.totals.in_tok;
-            summed.out_tok += m.totals.out_tok;
-            summed.cache_read += m.totals.cache_read;
-            summed.cache_make += m.totals.cache_make;
+            for id in m.totals.ids() {
+                *summed.entry(id.to_string()).or_insert(0) +=
+                    m.totals.get(id).expect("id came from ids()");
+            }
         }
-        assert_eq!(summed, idx.usage_session_totals("s1").unwrap());
+        let whole = idx.usage_session_totals("s1").unwrap();
+        let whole_map: BTreeMap<String, u64> = whole
+            .ids()
+            .map(|id| (id.to_string(), whole.get(id).expect("id came from ids()")))
+            .collect();
+        assert_eq!(summed, whole_map);
 
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);
@@ -8005,7 +8282,7 @@ pub struct Point { x: i32 }
             "m1",
             Some("model-a"),
             (100, 20, 30, 0),
-            UsageOrigin::Session,
+            "session",
             100,
         );
         let row = idx

@@ -126,7 +126,11 @@ export interface GraphCall {
   ts_ms: number;
   /// Canonicalized project root the call ran against.
   root: string;
-  source: 'claude' | 'opencode' | 'offload' | 'read_advisor' | 'auto_check';
+  /// Who made the call: a registry harness id (`harness_list`), or one of
+  /// cImp's own services. A bare `string` since V40 Phase F — the harness half
+  /// of this union was the frontend re-declaring the roster, and a call from a
+  /// harness this build has not heard of must render, not fail to type-check.
+  source: string;
   tool: string;
   target: string;
   chars: number;
@@ -134,7 +138,7 @@ export interface GraphCall {
   ok: boolean;
 }
 
-/// Recent graph tool calls (cloud Claude + offload worker), newest first.
+/// Recent graph tool calls (harness sessions + offload worker), newest first.
 /// The store spans every indexed root; pass `scoped: true` (with an optional
 /// `root`, default the launch directory) to see one project's calls only.
 /// `sinceTs` trims the response to entries newer than the caller's
@@ -610,6 +614,19 @@ export interface ToolUsage {
   calls: number;
 }
 
+/// Tokens by DECLARED billing category id. Mirror of Rust
+/// `harness::plugin::TokenKinds`.
+///
+/// **V40 Phase G (locked decision 19).** This replaced four fixed fields
+/// (`in_tok` / `out_tok` / `cache_read` / `cache_make`) named after one
+/// vendor's billing. The keys are whatever the session's harness declared —
+/// today `input` / `cache_write` / `cache_read` / `output`, cImp's own pricing
+/// vocabulary, which is also `PriceRates`' field names. A category the harness
+/// does not declare is **ABSENT from the object**, not present at 0: read it
+/// with `?? 0` only where a missing category genuinely means "spent nothing",
+/// never where it means "we were never told".
+export type TokenKinds = Record<string, number>;
+
 /// One turn's token breakdown. Mirror of Rust `graph::memory::TurnUsage`
 /// (V14 Phase C/D). `tool_chars` is the estimated tool-result characters
 /// that arrived just before this turn — divide by 4 for the "est. tool"
@@ -617,25 +634,19 @@ export interface ToolUsage {
 export interface TurnUsage {
   msg_id: string;
   model: string | null;
-  in_tok: number;
-  out_tok: number;
-  cache_read: number;
-  cache_make: number;
+  tokens: TokenKinds;
   tool_chars: number;
   ts_ms: number;
-  /// V24 Phase A: whether this turn was the main session or a sub-agent.
-  /// Pre-V24 rows read 'session'. Mirror of Rust `graph::memory::UsageOrigin`.
-  origin: 'session' | 'agent';
+  /// The DECLARED lane this turn was attributed to — the harness's own
+  /// `TurnOrigin.id`, stored verbatim in `usage_stat.origin`. Was
+  /// `'session' | 'agent'`, one harness's sidechain model in core's mirror;
+  /// the labels for these ids come from `harness_usage`.
+  origin: string;
 }
 
-/// Summed token totals across a session's turns. Mirror of Rust
-/// `graph::memory::UsageTotals`.
-export interface UsageTotals {
-  in_tok: number;
-  out_tok: number;
-  cache_read: number;
-  cache_make: number;
-}
+/// Summed token totals across a session's turns — same declared-category map
+/// as `TurnUsage.tokens`.
+export type UsageTotals = TokenKinds;
 
 /// The current (most-recently-active) session's usage readout. Mirror of
 /// Rust `graph::memory::SessionUsage`.
@@ -656,7 +667,8 @@ export interface SessionUsageRow {
   cache_hit_ratio: number;
   /// True when this session recorded no real Turn tokens (all four token
   /// totals are zero) — the table's "est" badge. V24 Phase E: token-less
-  /// sessions (pre-V24 OpenCode) keep it; any session with real tokens loses it.
+  /// sessions (a harness that reported no tokens) keep it; any session with
+  /// real tokens loses it.
   est_only: boolean;
   /// Session start / last-activity timestamps (epoch ms).
   started_ms: number;
@@ -666,21 +678,18 @@ export interface SessionUsageRow {
   models: string[];
 }
 
-/// V24 Phase B: total tokens (all four categories summed) per usage origin —
-/// how much of a model's session spend was the main session vs. sub-agents.
-/// Mirror of Rust `graph::memory::OriginSplit`.
-export interface OriginSplit {
-  session_tok: number;
-  agent_tok: number;
-}
-
 /// V24 Phase B: one model's contribution to a session — summed totals plus the
-/// session/agent origin split, ordered by tokens desc in
-/// `SessionUsageDetail.per_model`. Mirror of Rust `graph::memory::ModelUsage`.
+/// per-lane split, ordered by tokens desc in `SessionUsageDetail.per_model`.
+/// Mirror of Rust `graph::memory::ModelUsage`.
+///
+/// V40 Phase G: `origins` was `OriginSplit { session_tok, agent_tok }`, a
+/// closed two-lane struct. It is a map keyed by the harness's declared lane id
+/// now, holding total tokens (every category summed) for that lane. A lane this
+/// model recorded no turn in has **no key** — not a key at 0.
 export interface ModelUsage {
   model: string;
   totals: UsageTotals;
-  origins: OriginSplit;
+  origins: Record<string, number>;
 }
 
 /// V24 Phase B: full drill-in detail for one session (any session, not just the
@@ -791,6 +800,15 @@ export interface AdvisorProposal {
   /// it is about (`harness::contract::Capability::id`) — the same join key the
   /// Settings window's gate lookup uses. `null` for every other rule.
   capability: string | null;
+  /// V40 Phase C: the harness this notice is ABOUT, for the drift rules that
+  /// evaluate per registered harness. `null` for every rule that is not about
+  /// one.
+  ///
+  /// Passed straight back to `harnessMarkVerified` — before this, the card's
+  /// "Mark verified" wrote the default harness's row whatever notice it sat
+  /// under, and the only reason that was never wrong is that only one harness
+  /// could raise the notice at all.
+  harness: string | null;
 }
 
 /// Mirror of Rust `ipc::commands::AdvisorSnapshot`. `collecting` distinguishes
@@ -823,9 +841,35 @@ export function advisorMarkApplied(ruleId: string, root?: string): Promise<void>
   return invoke<void>('advisor_mark_applied', { ruleId, root: root ?? null });
 }
 
-/// V16 Feature 1: stamp the currently-seen Claude Code version as verified
+/// V16 Feature 1: stamp the currently-seen version of `harness` as verified
 /// (the Advisor card's "Mark verified" — the user just re-ran the
 /// MAINTENANCE.md contract checks).
-export function harnessMarkVerified(): Promise<void> {
-  return invoke<void>('harness_mark_verified');
+///
+/// **The harness is REQUIRED** (V40 Phase F, locked decision 23). Phase C added
+/// the argument with a wire-compat default; the caller passes the id the button
+/// actually sits under now, so a card raised for one harness can never stamp
+/// another's row. The backend still accepts the absent form for older callers;
+/// there are none left in this window.
+export function harnessMarkVerified(harness: string): Promise<void> {
+  return invoke<void>('harness_mark_verified', { harness });
+}
+
+/// One rule's row in the Advisor's rule reference. Mirror of Rust
+/// `advisor::RuleReference`.
+export interface RuleReference {
+  id: string;
+  thresholds: string;
+}
+
+/// Mirror of Rust `ipc::commands::AdvisorRules`.
+export interface AdvisorRules {
+  rules: RuleReference[];
+  footer: string;
+}
+
+/// **The advisor's rule reference, from the backend** (V40 Phase F, locked
+/// decision 23). The panel used to restate every threshold — and one harness's
+/// mechanisms — in a hard-coded tooltip.
+export function advisorRules(): Promise<AdvisorRules> {
+  return invoke<AdvisorRules>('advisor_rules');
 }

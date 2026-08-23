@@ -117,9 +117,15 @@
   /// This tab's harness, for the Role labels. Read from the same settings
   /// mirror the backend's own rule reads, so the two cannot disagree about
   /// which tabs are in one Manual group.
+  ///
+  /// V40 Phase F: `''` covers both "not an AI tab" and "runs a harness this
+  /// build does not know" — `tabHarness` answers `null` for the latter now
+  /// rather than naming a harness it is not (locked decision 2). The Manual row
+  /// then reads "another harness", which is honest, instead of offering the tab
+  /// as somebody else's delegation target.
   const harness = $derived.by(() => {
     const cfg = $settings.tabs.find((t) => t.kind === 'ai_tool' && t.id === tab);
-    return cfg && cfg.kind === 'ai_tool' ? tabHarness(cfg) : '';
+    return (cfg && cfg.kind === 'ai_tool' ? tabHarness(cfg) : null) ?? '';
   });
 
   /// The backend name the requesting harness would actually see. Blank falls
@@ -271,15 +277,22 @@
       </label>
     </li>
     <li>
-      <label class:disabled={driven || busy}>
+      <!-- V40 review L-12: a tab whose command matches no registered harness
+           has no `delegate_task_*` tool to be the target OF, so the row is
+           disabled rather than offering a click the backend refuses. -->
+      <label class:disabled={driven || busy || !harness}>
         <input
           type="radio"
           name="delegation-role-{tab}"
           checked={role === 'manual'}
-          disabled={driven || busy}
+          disabled={driven || busy || !harness}
           onchange={() => void setRole('manual')}
         />
-        <span class="name">Manual — the {harnessLabel(harness)} delegation target</span>
+        <span class="name"
+          >{harness
+            ? `Manual — the ${harnessLabel(harness)} delegation target`
+            : 'Manual — unavailable: this tab runs no harness cImp knows'}</span
+        >
       </label>
     </li>
     <li>
@@ -306,7 +319,7 @@
       Manual for {harnessLabel(harness)} is on “{manualHolder.name}”. Choosing it
       here moves it — that tab drops to None.
     </small>
-  {:else if role === 'manual'}
+  {:else if role === 'manual' && harness}
     <small class="hint">
       <code>delegate_task_{harness}</code> drives this tab. Other tabs see the tool
       on their next turn; nothing restarts.

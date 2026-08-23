@@ -78,6 +78,7 @@ import { perTabClosedState } from './avatarState';
 import { openConfigureTabDialog } from './dialog/store';
 import { clearTabError, setTabError } from './tabs/errorState';
 import { isShellTab, isAppRenderedTab, type TabId } from './tabs/types';
+import { isReservedAiTab, tabLabel } from './harness';
 import {
   courtesyRefusal,
   readOnlyAdvice,
@@ -265,11 +266,20 @@ async function ensureModuleListeners(): Promise<void> {
   }
 }
 
+/// The name the in-tab error card calls this tab — the harness's label for a
+/// reserved built-in AI tab, "Shell" for everything else.
+///
+/// V40 Phase F (locked decision 7): a lookup in the registry rather than a
+/// branch per shipped tab id, so a harness added after this build gets its own
+/// name in "X failed to start." instead of being called a shell.
+///
+/// V40 review L-13: a RESERVED AI tab id whose label is not known yet is called
+/// by its id, not "Shell". `tabLabel` answers `''` until `harness_list` lands,
+/// and a spawn failure is the tightest race there is — it happens at startup —
+/// so "**Shell** failed to start." was landing in a reserved AI tab's error
+/// card.
 function displayNameFor(t: TabId): string {
-  if (t === 'claude') return 'Claude Code';
-  if (t === 'claude-local') return 'Claude Code (local)';
-  if (t === 'opencode') return 'OpenCode';
-  return 'Shell';
+  return isReservedAiTab(t) ? tabLabel(t) || t : 'Shell';
 }
 
 /// True when the entry's host has real layout — attached to a slot
@@ -310,7 +320,7 @@ const MOUSE_TRACKING_MODES = new Set([1000, 1001, 1002, 1003, 1005, 1006, 1015, 
  * like it does in a shell, with a **hold-Alt bypass** to hand the mouse to the
  * app when the user actually wants it.
  *
- * Both Claude and OpenCode enable mouse tracking (DECSET 1000/1002/1003/1006)
+ * Both shipped harnesses enable mouse tracking (DECSET 1000/1002/1003/1006)
  * in their fullscreen TUI, which routes drags/clicks to the app — breaking
  * copy-on-select, right-click paste, and select-to-speak (no local selection
  * ever forms, so `getSelection()` is empty → "no text selected"). We intercept
@@ -398,7 +408,7 @@ function installAiMouseControl(
   // V20: forward the mouse WHEEL to the app even though we suppress the app's
   // mouse-tracking modes (to keep click/drag selection local). Without this,
   // xterm — alt buffer, mouse tracking off — translates the wheel into
-  // cursor-arrow keys (ESC O A / ESC O B), which Claude/OpenCode treat as input
+  // cursor-arrow keys (ESC O A / ESC O B), which the harness TUIs treat as input
   // navigation, not scrolling. We synthesize the exact wheel sequence the app's
   // chosen encoding expects (SGR 1006 or legacy X10) and write it straight to
   // the PTY, so scroll works natively while clicks/drags stay local (copy-on-
@@ -432,7 +442,7 @@ function installAiMouseControl(
 
 /**
  * V20: the terminal cell under a wheel event, 1-based. TUIs that hit-test the
- * wheel by coordinate (OpenCode routes it to the pane under the pointer;
+ * wheel by coordinate (one shipped TUI routes it to the pane under the pointer;
  * a fixed (1;1) lands on chrome that doesn't scroll) need the real cell.
  * Falls back to (1;1) when the screen element isn't measurable.
  */
@@ -449,8 +459,8 @@ function wheelCell(term: Terminal, e: WheelEvent): { col: number; row: number } 
 
 /**
  * V20: encode a single mouse-wheel notch the way a TUI expects it. Wheel-up is
- * button 64, wheel-down 65, reported at the given cell — OpenCode scrolls the
- * pane under the pointer, so the coordinate matters (Claude scrolls the
+ * button 64, wheel-down 65, reported at the given cell — one shipped TUI scrolls
+ * the pane under the pointer, so the coordinate matters (the other scrolls the
  * transcript regardless). Uses the SGR (1006) encoding when the app enabled
  * it, else the legacy X10 form (each byte offset by 32, coords capped at its
  * 223 maximum).

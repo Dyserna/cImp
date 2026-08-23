@@ -67,8 +67,44 @@
 //! **`terminalSequence` is never emitted.** It is a hook-output field that
 //! writes escape sequences into the PTY cImp renders; it is not a CHP capability
 //! and no handler here may produce one (design § 5.2, pinned by a test).
+//!
+//! # V40 Phase C: the ingress, end to end
+//!
+//! Locked decisions 15, 21 and 22. Until this phase the payload MECHANICS lived
+//! here and the dispatch did not: `offload/loopback.rs` held twelve
+//! `("POST", "/claude/hook/*")` arms, ~900 lines of `handle_claude_*` bodies
+//! reading Claude-only payload fields, the five `*_from_hook` converters, the
+//! drift-token vocabulary, the `X-CIMP-*` identity special-case inside core's
+//! CHP observer, and the whole `Notification` classification chain — plus a
+//! `claude_hook` import at 28 sites.
+//!
+//! All of it is below. Core keeps the wire (read the request, write the reply),
+//! the latch, the ledger and one core per capability, and reaches this file
+//! through [`ROUTES_TABLE`] and the neutral `HarnessPlugin` methods. What core
+//! gained is a [`HookReply`]: a status and a body it serializes without
+//! reading, because "Claude answers hook-output JSON and OpenCode answers
+//! `{ok:true}`" is not something core may know.
 
 use serde::Deserialize;
+use std::path::Path;
+
+use serde_json::Value;
+use tauri::AppHandle;
+use tracing::{debug, info, warn};
+
+use crate::error::AppResult;
+use crate::harness::plugin::{HookReply, RequestIdentity, Route, RouteFuture};
+use crate::offload::loopback::{
+    assistant_text_core, bounded_declarations, bounded_id, bounded_tool, claim_contract_drift,
+    claim_hello, compaction_block, contract_drift_row, context_retrieve_core, hello_row,
+    hook_gate_admits, hook_tab_root, is_configured_tab, latch_beacon_for, live_settings,
+    permission_tab_candidates, post_edit_diagnostics, send_permission_edge,
+    should_read_verdict, subagent_core, tool_checkpoint_core, tool_result_core,
+    ContextCompactionBody, ContextPostEditBody, ContextRetrieveBody, ContractDriftBody,
+    PermissionOutcome, PermissionTabCandidate, Request, ShouldReadBody,
+    HOOK_TOOL_COMPACTION, HOOK_TOOL_POST_EDIT, HOOK_TOOL_SHOULD_READ, MAX_HELLO_DECLARATIONS,
+};
+use crate::harness::plugin::PermissionEdge;
 
 // ── the routes ──────────────────────────────────────────────────────────────
 
@@ -158,7 +194,7 @@ pub const ROUTE_POST_TOOL_USE_FAILURE: &str = "/claude/hook/post_tool_use_failur
 /// One route for two events, dispatching on `hook_event_name`, exactly as
 /// [`ROUTE_NOTIFICATION`] serves `Notification` and `PermissionDenied`. The
 /// pair is a lifecycle: an id that started and has not stopped is an agent
-/// running, which is the only fact the avatar's `AgentsActiveChanged` edge
+/// running, which is the only fact the avatar's `SubagentsActiveChanged` edge
 /// needs.
 ///
 /// **Sub-agent TOKEN usage does not come this way**, and cannot: no hook
@@ -209,7 +245,7 @@ pub const ROUTE_PRE_TOOL_USE_TAINT: &str = "/claude/hook/pre_tool_use_taint";
 /// **The one route in this family whose handler must FINISH its work before it
 /// replies.** "The checkpoint precedes the tool call" rests on the tool not
 /// starting until the hook resolves, so the handler awaits the snapshot (bounded
-/// by `loopback::TOOL_CHECKPOINT_BUDGET`, 1800 ms) and only then answers 200.
+/// by `harness::ingress::hook_reply_budget()`, 1800 ms today) and only then answers 200.
 /// That is the shim's 2 s reply wait expressed the other way round: the app is
 /// now on the *inside* of the wait rather than being polled across a socket by a
 /// process that had to guess how long to listen.
@@ -337,12 +373,12 @@ pub const TIMEOUT_SECS: u64 = 1;
 /// Deliberately the value the deleted `--checkpoint-beacon` hook entry carried,
 /// and for the same reason: it is a ceiling over a wait that is *supposed* to
 /// happen, not a budget for a round trip. The app abandons an unfinished
-/// snapshot at `loopback::TOOL_CHECKPOINT_BUDGET` (1800 ms) and answers, so this
+/// snapshot at `harness::ingress::hook_reply_budget()` (1800 ms today) and answers, so this
 /// is a backstop for a wedged listener rather than the mechanism — the same
 /// two-timer relationship the shim had, with the outer timer now enforced by the
 /// harness instead of by a process that had to guess. A test pins the ordering
-/// (`5 s > TOOL_CHECKPOINT_BUDGET`), because the two constants live in different
-/// files and nothing else keeps them ordered.
+/// (`5 s > hook_reply_budget()`), because the ceiling and the budget live in
+/// different modules and nothing else keeps them ordered.
 ///
 /// Everything else stays at [`TIMEOUT_SECS`]: 1 s is right for a hook that must
 /// not delay a turn, and would be wrong here — a checkpoint abandoned at 1 s on
@@ -464,12 +500,6 @@ pub const DRIFT_STOP_HOOK: &str = "stop_hook";
 pub const DRIFT_TOOL_RESULT_HOOK: &str = "tool_result_hook";
 pub const DRIFT_SUBAGENT_HOOK: &str = "subagent_hook";
 
-/// The `missing` entry a quiet report carries.
-///
-/// Not a payload field name, and deliberately shaped so it cannot be mistaken
-/// for one: what is missing is not a field in a message, it is the message.
-pub const MISSING_PUSH: &str = "(no push — the hook stopped firing)";
-
 // ── the payload ─────────────────────────────────────────────────────────────
 
 /// One Claude Code hook-input payload, read leniently.
@@ -515,7 +545,7 @@ pub struct HookInput {
     /// `transcript_path`, `cwd`, `permission_mode` and `hook_event_name` are the
     /// common set — so this is read opportunistically and left empty when
     /// absent. cImp learns Claude's version from the transcript's own top-level
-    /// `version` instead (`oob::claude::cli_version_of`), and the CHP
+    /// `version` instead (`harness::claude::read::cli_version_of`), and the CHP
     /// `harness_version` staleness arm therefore still has no Claude producer.
     /// See `docs/CHP.md` § 6.2.
     #[serde(default)]
@@ -1091,6 +1121,1207 @@ pub fn http_hook_entry(
         "timeout": timeout_secs(route),
     })
 }
+
+// ── the route table core appends (locked decision 15) ───────────────────────
+
+/// Wrap one `async fn(&AppHandle, &Request) -> AppResult<HookReply>` as the
+/// boxed-future `fn` pointer a `const` [`Route`] table can hold.
+macro_rules! route {
+    ($method:literal, $path:expr, $handler:path) => {
+        Route {
+            method: $method,
+            path: $path,
+            handler: |app, req| Box::pin($handler(app, req)) as RouteFuture<'_>,
+        }
+    };
+}
+
+/// **Every route this harness serves on the loopback listener.**
+///
+/// Returned by `HarnessPlugin::routes()` and appended by core's router after
+/// every CHP-neutral arm, so nothing here can shadow `/session/hello`, `/mcp/*`
+/// or the audit and push routes. The paths are the [`ROUTE_*`](ROUTES)
+/// constants the overlay generator emits — one spelling, not two, which is what
+/// the dispatch-arm test used to have to pin against a `match` in another file.
+///
+/// `/permission/event` is here too, and that is a Phase C correction rather
+/// than a new claim: `docs/CHP.md` § 4.4 has always recorded it as
+/// "a Claude-only route today, so the discriminator is implied" — it carries
+/// neither `agent` nor `tab`, because the only thing that ever posted it was
+/// this harness's `--notify-hook` shim. A route only one harness can send
+/// belongs to that harness's plugin.
+pub const ROUTES_TABLE: &[Route] = &[
+    route!("POST", ROUTE_USER_PROMPT_SUBMIT, handle_claude_user_prompt_submit),
+    route!("POST", ROUTE_PRE_COMPACT, handle_claude_pre_compact),
+    route!("POST", ROUTE_PRE_TOOL_USE, handle_claude_pre_tool_use),
+    route!("POST", ROUTE_POST_TOOL_USE, handle_claude_post_tool_use),
+    route!("POST", ROUTE_NOTIFICATION, handle_claude_notification),
+    route!("POST", ROUTE_SESSION_START, handle_claude_session_start),
+    // V35 Phase L: this harness's ingress for the three migrated reads.
+    route!("POST", ROUTE_STOP, handle_claude_stop),
+    route!("POST", ROUTE_POST_TOOL_USE_RESULT, handle_claude_tool_result),
+    route!("POST", ROUTE_POST_TOOL_USE_FAILURE, handle_claude_tool_failure),
+    route!("POST", ROUTE_SUBAGENT, handle_claude_subagent),
+    // 2026-08-17: the two beacons, as http hooks. Each reaches the SAME core
+    // its harness-neutral twin does — `/latch/beacon`'s and
+    // `/workbench/tool_checkpoint`'s — so the two transports of each capability
+    // cannot come to behave differently.
+    route!("POST", ROUTE_PRE_TOOL_USE_TAINT, handle_claude_taint_beacon),
+    route!("POST", ROUTE_PRE_TOOL_USE_CHECKPOINT, handle_claude_checkpoint),
+    // NC-2 (issue #5): the legacy `--notify-hook` transport. A tab open across
+    // the Phase J upgrade still runs the old shim binary and still POSTs here.
+    route!("POST", ROUTE_PERMISSION_EVENT, handle_permission_event),
+];
+
+/// The legacy `--notify-hook` shim's route — outside the `/claude/hook/`
+/// family because it predates it, and kept because a pre-upgrade tab still
+/// posts to it (`docs/CHP.md` § 4.3, `permission.event`).
+pub const ROUTE_PERMISSION_EVENT: &str = "/permission/event";
+
+/// **How long this harness's out-of-process caller waits for a reply.**
+///
+/// The deleted `--checkpoint-beacon` shim read its reply with a 2 s deadline and
+/// relied on Claude not starting the tool until the process exited; its
+/// `type: "http"` successor expresses the same ceiling as the hook entry's own
+/// `timeout`. Core takes `min(this, every other plugin's) − margin` as the
+/// budget it may spend before answering — see
+/// [`crate::harness::ingress::hook_reply_budget`].
+pub const REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2000);
+
+/// Every payload-drift ledger token this harness's ingress reports under.
+///
+/// **V40 Phase C, locked decision 22.** This was `loopback::DRIFT_SHIMS`, a
+/// `const [&str; 10]` in core — one harness's shim vocabulary and the whole key
+/// space of a core ledger. It is the same ten names, unchanged and deliberately
+/// so: no shim binary sends any of them any more (the last two became http
+/// routes on 2026-08-17), but a tab open across an upgrade still runs the old
+/// binary and still POSTs these exact strings, so both paths must land in ONE
+/// bucket per capability.
+///
+/// Three of them (`stop_hook`, `subagent_hook`, `tool_result_hook`) never named
+/// a binary at all — V35 Phase L coined them so a *served* capability that goes
+/// QUIET reports under the same bucket its payload drift does.
+///
+/// Reachability is pinned by
+/// [`tests::every_declared_drift_token_is_one_a_route_can_send`].
+pub const DRIFT_TOKENS: &[&str] = &[
+    DRIFT_CHECKPOINT_BEACON,
+    DRIFT_COMPACT_HOOK,
+    DRIFT_CONTEXT_HOOK,
+    DRIFT_NOTIFY_HOOK,
+    DRIFT_POST_EDIT_HOOK,
+    DRIFT_READ_HOOK,
+    DRIFT_STOP_HOOK,
+    DRIFT_SUBAGENT_HOOK,
+    DRIFT_TAINT_BEACON,
+    DRIFT_TOOL_RESULT_HOOK,
+];
+
+/// The `(chp, agent, tab)` triple a Claude hook request carries in `X-CIMP-*`
+/// headers, or `None` for a route this harness does not own.
+///
+/// **Why headers.** A hook's body is the harness's own payload — cImp gets no
+/// field in it — so the identity rides headers baked into the emitted hook entry
+/// at spawn. Core used to special-case this by asking
+/// `hook::is_hook_route(route)`; it asks every plugin now, and this is
+/// this harness's answer (`HarnessPlugin::identity_of_request`).
+///
+/// Every value is caller-supplied and is validated/bounded at the point of use
+/// exactly as the equivalent body fields are on the CHP routes; an empty tab is
+/// returned as an empty tab, and core drops it.
+pub fn identity_of_request(route: &str, req: &Request) -> Option<RequestIdentity> {
+    if !is_hook_route(route) {
+        return None;
+    }
+    Some(RequestIdentity {
+        chp: req.cimp.chp.unwrap_or(crate::harness::chp::PRE_CHP),
+        agent: req.cimp.agent.clone().unwrap_or_default(),
+        tab: req.cimp.tab.as_deref().map(str::trim).unwrap_or("").to_string(),
+    })
+}
+
+// ── the ingress: routes, identity, payload mapping, handlers ───────────────
+//
+// **V40 Phase C, locked decisions 15 and 22.** Everything from here down
+// used to live in `offload/loopback.rs`: twelve `("POST", "/claude/hook/*")`
+// arms in core's router, ~900 lines of handler bodies reading Claude-only
+// payload fields, the five `*_from_hook` converters, the drift token
+// vocabulary, the `X-CIMP-*` identity special-case and the `Notification`
+// payload's whole classification chain. Core kept a `claude_hook` import at
+// 28 sites and a harness path literal in its dispatch `match`.
+//
+// It reaches core now through [`ROUTES_TABLE`] (`HarnessPlugin::routes`), a
+// neutral [`HookReply`] core writes without reading, and
+// `HarnessPlugin::{identity_of_request, drift_vocabulary, hook_reply_timeout}`.
+// The text below is UNCHANGED apart from the reply plumbing and the module
+// prefixes: same handlers, same order, same tests.
+//
+// ── V35 Phase J: Claude Code's own hook payloads, posted by the harness ──────
+//
+// Twelve routes under `/claude/hook/`, replacing seven shim binaries (five in
+// Phase J, the two beacons on 2026-08-17) plus five that replaced nothing. Each one
+// parses Claude's hook-input JSON, reports payload drift under the SAME shim
+// token the deleted binary used, builds the CHP body its legacy sibling
+// receives, calls the SAME internal core, and answers with Claude hook-output
+// JSON.
+//
+// **Why the legacy routes stay.** The `--settings` overlay is written at TAB
+// LAUNCH, so a tab open across the upgrade is still running command hooks that
+// POST harness-neutral bodies to `/context/*`. Those keep working, and the two
+// transports meet at one core per capability — which is the property the
+// convergence tests assert, and the reason no capability can behave differently
+// depending on how old the tab is.
+//
+// **Fail-open, in HTTP terms.** Every arm answers `200` with either a directive
+// or `no_op()`; nothing here returns a non-2xx, because a non-2xx
+// is a *non-blocking error* the harness logs, and there is nothing to log about
+// a hook that simply had nothing to say. The one route that can block says so
+// explicitly ([`handle_claude_pre_tool_use`]).
+
+/// The cImp tab a Claude hook request claims, **validated** against the user's
+/// configured Claude tabs — `None` when the claim is absent, empty or names no
+/// such tab.
+///
+/// The `X-CIMP-Tab` header is baked into the emitted hook entry at spawn, but it
+/// arrives over a listener whose bearer token any process running as this user
+/// can read, so it is exactly as caller-asserted as the `tab` body field on
+/// every CHP route and gets exactly the same narrowing (#45's rule).
+///
+/// A `None` here is not an error: it degrades to "this hook is attributed to no
+/// tab", which is precisely the pre-V33 behaviour of a shim launched without
+/// `--tab`. The gated routes then resolve no latch scope and admit the call.
+fn claude_hook_tab(settings: &crate::settings::Settings, req: &Request) -> Option<String> {
+    let tab = req.cimp.tab.as_deref().map(str::trim).unwrap_or("");
+    if tab.is_empty() || !is_configured_tab(settings, "claude", tab) {
+        return None;
+    }
+    Some(tab.to_string())
+}
+
+/// The working directory a Claude hook payload names, or the tab's own launch
+/// directory when the payload carries none.
+///
+/// **This is deliberately NOT the deleted shims' fallback.** They fell back to
+/// `current_dir()`, which was right *for a process Claude spawned* — Claude runs
+/// hook processes in the project directory. The app's cwd is its own launch
+/// directory and has nothing to do with the tab, so reproducing that fallback
+/// here would silently point a hook at the wrong project on any tab whose `cwd`
+/// is a worktree (V13 Phase D's "New tab in worktree…").
+///
+/// The tab's configured directory is resolved through [`hook_tab_root`] (i.e.
+/// [`crate::tabs::ai_tab_dir`] — the same call the spawner makes), so this is
+/// the directory cImp itself launched that tab in. `None` when neither is
+/// available, which every caller turns into its own existing "no cwd" default.
+///
+/// **#104: this deliberately still returns the payload's cwd VERBATIM, and is
+/// not where the project root is decided.** The obvious-looking fix — walk up
+/// to the project root here, once, for every Claude hook — is wrong, because
+/// this value is not only used as a root: [`plan_request`] joins a relative Bash
+/// path onto it (a walked-up root would resolve the wrong file), and
+/// [`permission_signal`] matches it against each tab's launch directory to
+/// decide which tab a permission prompt belongs to (a walked-up root collapses
+/// two tabs in one repo into one candidate). The root question is answered where
+/// a root is actually needed, by `loopback::external_project_root`.
+fn claude_hook_cwd(
+    app: &AppHandle,
+    settings: &crate::settings::Settings,
+    tab: Option<&str>,
+    raw: &str,
+) -> Option<String> {
+    let raw = raw.trim();
+    if !raw.is_empty() {
+        return Some(raw.to_string());
+    }
+    hook_tab_root(app, settings, tab).map(|d| d.to_string_lossy().into_owned())
+}
+
+/// Parse a Claude hook-input payload, or `None` when the body is not JSON.
+///
+/// A malformed payload is the one drift this route cannot *report* (there is no
+/// `session_id` to attribute it to and no fields to enumerate), so it is logged
+/// with the caller's bytes bounded and answered as a no-op — the HTTP spelling
+/// of the shims' "bail silently, never perturb the turn".
+fn parse_hook_input(route: &str, req: &Request) -> Option<HookInput> {
+    match serde_json::from_slice::<HookInput>(&req.body) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            warn!(
+                target: "offload",
+                route,
+                error = %e,
+                head = %bounded_id(&String::from_utf8_lossy(&req.body)),
+                "loopback: a Claude http hook posted a body that is not hook-input JSON — \
+                 answered as a no-op (the turn is never perturbed)"
+            );
+            None
+        }
+    }
+}
+
+/// Report a Claude hook payload that is missing required fields, through the
+/// same ledger, bound and Activity row `POST /activity/contract_drift` uses.
+///
+/// V16 Feature 3, moved off the shims and **not** re-designed: the token is the
+/// deleted binary's own name (`drift_token`), so a pre-upgrade tab's
+/// shim reports and this build's handler reports land in ONE bucket per
+/// capability and resolve to one registry row. Fired BEFORE any early return, so
+/// a payload broken enough to make the handler bail is still counted.
+fn report_hook_drift(route: &str, input: &HookInput) {
+    let Some(shim) = drift_token(route) else {
+        return;
+    };
+    let missing = missing_fields(&contract_checks(route, input));
+    if missing.is_empty() {
+        return;
+    }
+    let body = ContractDriftBody {
+        shim: shim.to_string(),
+        missing: missing.into_iter().map(str::to_string).collect(),
+        session_id: Some(input.session_id.clone()),
+    };
+    if let Some(record) = contract_drift_row(&body, claim_contract_drift) {
+        crate::activity::record_bg(record);
+    }
+}
+
+// ── the five body mappings, pure ────────────────────────────────────────────
+//
+// Each turns a Claude hook payload plus the resolved identity into **exactly
+// the CHP body the deleted shim used to POST**. Split out of the handlers so
+// that equivalence is a unit test rather than a claim: the tests compare each
+// against the literal `serde_json::json!` body the shim built, field for field.
+// Everything downstream of these is already one shared core per capability, so
+// "same body in" is what makes "same effect" a fact.
+
+/// `context_hook.rs`'s body: `{cwd, prompt, session_id, agent, tab}`.
+fn retrieve_body_from_hook(
+    input: &HookInput,
+    tab: Option<String>,
+    cwd: Option<String>,
+) -> ContextRetrieveBody {
+    ContextRetrieveBody {
+        cwd,
+        prompt: input.prompt.clone(),
+        session_id: Some(input.session_id.clone()),
+        agent: Some("claude".to_string()),
+        tab,
+    }
+}
+
+/// `compact_hook.rs`'s body: `{cwd, session_id, trigger, agent, tab}`.
+fn compaction_body_from_hook(
+    input: &HookInput,
+    tab: Option<String>,
+    cwd: Option<String>,
+) -> ContextCompactionBody {
+    ContextCompactionBody {
+        cwd,
+        session_id: Some(input.session_id.clone()),
+        trigger: Some(input.trigger.clone()),
+        agent: Some("claude".to_string()),
+        tab,
+    }
+}
+
+/// `read_hook.rs`'s body: `{cwd, session_id, file_path, offset, limit, agent,
+/// tab}` — built from the already-planned [`ReadRequest`], because
+/// the shim built it from the same plan.
+pub(crate) fn should_read_body_from_hook(
+    input: &HookInput,
+    reqst: &ReadRequest,
+    tab: Option<String>,
+    cwd: Option<String>,
+) -> ShouldReadBody {
+    ShouldReadBody {
+        cwd,
+        session_id: Some(input.session_id.clone()),
+        file_path: reqst.file_path.clone(),
+        offset: reqst.offset,
+        limit: reqst.limit,
+        agent: Some("claude".to_string()),
+        tab,
+    }
+}
+
+/// `postedit_hook.rs`'s body: `{cwd, session_id, file_path, tool_name, agent,
+/// tab}`.
+fn post_edit_body_from_hook(
+    input: &HookInput,
+    tab: Option<String>,
+    cwd: Option<String>,
+) -> ContextPostEditBody {
+    ContextPostEditBody {
+        cwd,
+        session_id: Some(input.session_id.clone()),
+        file_path: input
+            .tool_input
+            .get("file_path")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        tool_name: input.tool_name.clone(),
+        agent: Some("claude".to_string()),
+        tab,
+    }
+}
+
+/// `notify_hook.rs`'s body: `{cwd, session_id, transcript_path, event,
+/// notification_type, message, tool_name}` — and, like the shim's, it carries
+/// neither `agent` nor `tab` (`docs/CHP.md` § 4.4).
+fn permission_body_from_hook(
+    input: &HookInput,
+    cwd: Option<String>,
+) -> PermissionEventBody {
+    PermissionEventBody {
+        cwd,
+        session_id: Some(input.session_id.clone()),
+        transcript_path: Some(input.transcript_path.clone()),
+        event: input.hook_event_name.clone(),
+        notification_type: Some(input.notification_kind().to_string()),
+        message: Some(input.notification_message().to_string()),
+        tool_name: input.tool_name.clone(),
+    }
+}
+
+/// `POST /claude/hook/user_prompt_submit` — the `UserPromptSubmit` hook.
+///
+/// Fires the prompt-tap checkpoint trigger and returns the injectable digest as
+/// `hookSpecificOutput.additionalContext`, through
+/// [`context_retrieve_core`] — the same function `/context/retrieve` calls, so
+/// injection, the once-per-session project map and the parked auto-check drain
+/// are identical on both transports. Ungated for the reason `/context/retrieve`
+/// is (see its `ROUTE_CONTAINMENT` row).
+///
+/// This entry's pinned `timeout` is [`TIMEOUT_SECS`] (1 s) and the
+/// harness DISCARDS a later reply, which is why the core races its retrieval
+/// against [`RETRIEVE_BUDGET_MS`] and parks what overruns rather than composing
+/// a digest nobody will read.
+async fn handle_claude_user_prompt_submit(
+    app: &AppHandle,
+    req: &Request,
+) -> AppResult<HookReply> {
+    let route = ROUTE_USER_PROMPT_SUBMIT;
+    let Some(input) = parse_hook_input(route, req) else {
+        return Ok(HookReply::ok(no_op()));
+    };
+    report_hook_drift(route, &input);
+    if input.prompt.trim().is_empty() {
+        return Ok(HookReply::ok(no_op()));
+    }
+    let settings = live_settings(app);
+    let tab = claude_hook_tab(&settings, req);
+    let cwd = claude_hook_cwd(app, &settings, tab.as_deref(), &input.cwd);
+    let body = retrieve_body_from_hook(&input, tab, cwd);
+    let answer = context_retrieve_core(app, &body).await;
+    let text = answer.get("text").and_then(Value::as_str).unwrap_or("");
+    if text.trim().is_empty() {
+        return Ok(HookReply::ok(no_op()));
+    }
+    Ok(HookReply::ok(
+        additional_context(EVENT_USER_PROMPT_SUBMIT, text),
+    ))
+}
+
+/// `POST /claude/hook/pre_compact` — the `PreCompact` hook.
+///
+/// Gated on [`HOOK_TOOL_COMPACTION`] exactly as `/context/compaction` is, and
+/// for the same reason: demoting that one class-table row is all it should take
+/// to close BOTH transports.
+async fn handle_claude_pre_compact(
+    app: &AppHandle,
+    req: &Request,
+) -> AppResult<HookReply> {
+    let route = ROUTE_PRE_COMPACT;
+    let Some(input) = parse_hook_input(route, req) else {
+        return Ok(HookReply::ok(no_op()));
+    };
+    report_hook_drift(route, &input);
+    let settings = live_settings(app);
+    let tab = claude_hook_tab(&settings, req);
+    let cwd = claude_hook_cwd(app, &settings, tab.as_deref(), &input.cwd);
+    let body = compaction_body_from_hook(&input, tab, cwd);
+    if !hook_gate_admits(
+        app,
+        &settings,
+        HOOK_TOOL_COMPACTION,
+        body.agent.as_deref(),
+        body.tab.as_deref(),
+    ) {
+        return Ok(HookReply::ok(no_op()));
+    }
+    let block = compaction_block(app, &body);
+    if block.trim().is_empty() {
+        return Ok(HookReply::ok(no_op()));
+    }
+    Ok(HookReply::ok(
+        additional_context(EVENT_PRE_COMPACT, &block),
+    ))
+}
+
+/// `POST /claude/hook/pre_tool_use` — the read advisor, on both its matchers.
+///
+/// **The one route in this family that can block a tool call**, and it does so
+/// only by returning `permissionDecision: "deny"` with the reminder as the
+/// reason — byte-identical to what `read_hook.rs` printed, from the same
+/// [`should_read_verdict`] the legacy route calls. Every other outcome (a
+/// non-target tool, a pass, a refused gate, missing state) is
+/// [`no_op`], and the read proceeds.
+///
+/// Gated on [`HOOK_TOOL_SHOULD_READ`], whose only reachable effect is to turn a
+/// `remind` into a `pass` — see `handle_should_read`'s note.
+async fn handle_claude_pre_tool_use(
+    app: &AppHandle,
+    req: &Request,
+) -> AppResult<HookReply> {
+    let route = ROUTE_PRE_TOOL_USE;
+    let Some(input) = parse_hook_input(route, req) else {
+        return Ok(HookReply::ok(no_op()));
+    };
+    report_hook_drift(route, &input);
+    let settings = live_settings(app);
+    let tab = claude_hook_tab(&settings, req);
+    let cwd = claude_hook_cwd(app, &settings, tab.as_deref(), &input.cwd);
+    // Map the payload to a verdict request, or let the tool proceed untouched.
+    let Some(reqst) = plan_request(
+        input.tool_name.as_deref(),
+        &input.tool_input,
+        cwd.as_deref().unwrap_or(""),
+    ) else {
+        return Ok(HookReply::ok(no_op()));
+    };
+    let body = should_read_body_from_hook(&input, &reqst, tab, cwd);
+    if !hook_gate_admits(
+        app,
+        &settings,
+        HOOK_TOOL_SHOULD_READ,
+        body.agent.as_deref(),
+        body.tab.as_deref(),
+    ) {
+        return Ok(HookReply::ok(no_op()));
+    }
+    let Some(text) = should_read_verdict(app, &body) else {
+        return Ok(HookReply::ok(no_op()));
+    };
+    if text.trim().is_empty() {
+        return Ok(HookReply::ok(no_op()));
+    }
+    // The server verdict is tool-agnostic; the Bash path prepends its own
+    // "answered without running the command — " note so the deny reads sensibly
+    // for a shell read.
+    let reason = format!("{}{text}", reqst.deny_prefix);
+    Ok(HookReply::ok(deny(&reason)))
+}
+
+/// `POST /claude/hook/post_tool_use` — the auto-check diff after an edit.
+///
+/// Gated on [`HOOK_TOOL_POST_EDIT`], the route the M-7 finding is really about:
+/// it executes the project's configured check commands, in a directory V33 C4
+/// admits from an app-derived list rather than from the payload.
+async fn handle_claude_post_tool_use(
+    app: &AppHandle,
+    req: &Request,
+) -> AppResult<HookReply> {
+    let route = ROUTE_POST_TOOL_USE;
+    let Some(input) = parse_hook_input(route, req) else {
+        return Ok(HookReply::ok(no_op()));
+    };
+    report_hook_drift(route, &input);
+    // The matcher already scopes this to edit tools, but be safe — the shim
+    // made the same check for the same reason.
+    let tool_name = input.tool_name.as_deref().unwrap_or("");
+    if !matches!(tool_name, "Edit" | "Write" | "MultiEdit") {
+        return Ok(HookReply::ok(no_op()));
+    }
+    let settings = live_settings(app);
+    let tab = claude_hook_tab(&settings, req);
+    let cwd = claude_hook_cwd(app, &settings, tab.as_deref(), &input.cwd);
+    let body = post_edit_body_from_hook(&input, tab, cwd);
+    if !hook_gate_admits(
+        app,
+        &settings,
+        HOOK_TOOL_POST_EDIT,
+        body.agent.as_deref(),
+        body.tab.as_deref(),
+    ) {
+        return Ok(HookReply::ok(no_op()));
+    }
+    let text = post_edit_diagnostics(app, &settings, &body).await;
+    if text.trim().is_empty() {
+        return Ok(HookReply::ok(no_op()));
+    }
+    Ok(HookReply::ok(
+        additional_context(EVENT_POST_TOOL_USE, &text),
+    ))
+}
+
+/// `POST /claude/hook/notification` — `Notification` **and** `PermissionDenied`.
+///
+/// One route for both events, dispatching on the payload's `hook_event_name`,
+/// exactly as the one `--notify-hook` binary did. Observe-only: it answers
+/// [`no_op`] on every path, because an observe-only hook must never
+/// emit a directive — for `PermissionDenied` the harness documents even the exit
+/// code and stderr as ignored.
+async fn handle_claude_notification(
+    app: &AppHandle,
+    req: &Request,
+) -> AppResult<HookReply> {
+    let route = ROUTE_NOTIFICATION;
+    let Some(input) = parse_hook_input(route, req) else {
+        return Ok(HookReply::ok(no_op()));
+    };
+    report_hook_drift(route, &input);
+    if input.hook_event_name.is_empty() {
+        // Without the event name the classifier cannot tell an edge from an idle
+        // notification, and guessing would risk flipping `awaiting_permission`.
+        return Ok(HookReply::ok(no_op()));
+    }
+    let settings = live_settings(app);
+    // The tab is resolved only to give the `cwd` fallback something to resolve
+    // from: this body carries neither `agent` nor `tab`, exactly as the shim's
+    // did — `/permission/event` maps by session/transcript/cwd (CHP § 4.4).
+    let tab = claude_hook_tab(&settings, req);
+    let cwd = claude_hook_cwd(app, &settings, tab.as_deref(), &input.cwd);
+    let body = permission_body_from_hook(&input, cwd);
+    let _ = permission_signal(app, &body).await;
+    Ok(HookReply::ok(no_op()))
+}
+
+/// `POST /claude/hook/session_start` — **Claude's CHP hello** (design D3).
+///
+/// New in Phase J: there was no shim to replace, because until the overlay could
+/// carry headers there was nothing to introduce. It synthesizes the same
+/// `/session/hello` record the generated OpenCode plugin posts, from the three
+/// things the emitted hook entry baked in — `X-CIMP-Tab`, `X-CIMP-Chp` and
+/// `X-CIMP-Hello`'s `serves`/`cannot` pair — plus, if the payload ever carries
+/// one, the harness's own version.
+///
+/// **`harness_version` is empty today and that is a recorded fact, not an
+/// omission.** No documented hook-input field carries the CLI version, and cImp
+/// will not bake in the number it last saw and let the hook report it back —
+/// that is cImp attesting to itself, the same objection that governs OpenCode's
+/// hello (`docs/CHP.md` § 6.2). So the `harness_version` staleness arm still has
+/// no Claude producer; the `chp` arm now does, which is the arm Phase J was for.
+///
+/// Answers [`no_op`] on every path including a rejected tab: a
+/// `SessionStart` hook's output is prepended to the session's context, and cImp
+/// has nothing to say to the model here.
+async fn handle_claude_session_start(
+    app: &AppHandle,
+    req: &Request,
+) -> AppResult<HookReply> {
+    let route = ROUTE_SESSION_START;
+    let no_op = no_op();
+    let Some(input) = parse_hook_input(route, req) else {
+        return Ok(HookReply::ok(no_op.clone()));
+    };
+    let settings = live_settings(app);
+    let Some(tab) = claude_hook_tab(&settings, req) else {
+        warn!(
+            target: "offload",
+            tab = %bounded_id(req.cimp.tab.as_deref().unwrap_or("")),
+            "loopback: a Claude SessionStart hello named no configured tab — not recorded"
+        );
+        return Ok(HookReply::ok(no_op.clone()));
+    };
+    let chp = req.cimp.chp.unwrap_or(crate::harness::chp::PRE_CHP);
+    let version = bounded_id(input.harness_version());
+    let declared = req
+        .cimp
+        .hello
+        .as_deref()
+        .and_then(Hello::parse)
+        .unwrap_or_default();
+    let serves = bounded_declarations(&declared.serves);
+    let cannot: Vec<crate::harness::chp::Unable> = declared
+        .cannot
+        .iter()
+        .take(MAX_HELLO_DECLARATIONS)
+        .map(|u| crate::harness::chp::Unable {
+            id: bounded_id(&u.id),
+            why: bounded_id(&u.why),
+        })
+        .collect();
+    let changed = crate::harness::chp::note_hello(
+        "claude",
+        &tab,
+        chp,
+        &version,
+        serves.clone(),
+        cannot.clone(),
+        crate::activity::now_ms(),
+    );
+    if changed {
+        if let Some(record) =
+            hello_row("claude", &tab, chp, &version, &serves, cannot.len(), claim_hello)
+        {
+            crate::activity::record_bg(record);
+        }
+    }
+    // `source` is `startup` / `resume` / `clear` / `compact`. Not part of the
+    // record — a hello describes the ARTIFACT, and the same overlay is in force
+    // on all four — but it is the difference between "this tab just launched"
+    // and "this tab was resumed", which is the first thing a reader wants when a
+    // hello turns up mid-session.
+    debug!(
+        target: "offload",
+        %tab,
+        chp,
+        source = %bounded_id(&input.source),
+        serves = serves.len(),
+        "claude hello recorded"
+    );
+    Ok(HookReply::ok(no_op.clone()))
+}
+
+
+/// `POST /claude/hook/stop` — the `Stop` hook: the turn's complete final
+/// assistant message.
+///
+/// **The TTS migration, and its cadence guarantee.** `last_assistant_message`
+/// is one complete message at message finish, which is exactly what
+/// `harness::claude::read::assistant_texts` hands `speak` today — so the
+/// segmenter's input is unchanged by construction (locked decision 2, recipe
+/// 10). `MessageDisplay`, which would deliver per-chunk deltas on the streaming
+/// hot path, is deliberately not wired.
+///
+/// Observe-only: answers [`no_op`] on every path.
+async fn handle_claude_stop(
+    app: &AppHandle,
+    req: &Request,
+) -> AppResult<HookReply> {
+    let route = ROUTE_STOP;
+    let no_op = no_op();
+    let Some(input) = parse_hook_input(route, req) else {
+        return Ok(HookReply::ok(no_op.clone()));
+    };
+    report_hook_drift(route, &input);
+    let settings = live_settings(app);
+    if let Some(tab) = claude_hook_tab(&settings, req) {
+        assistant_text_core(app, "claude", &tab, &input.last_assistant_message).await;
+    }
+    Ok(HookReply::ok(no_op.clone()))
+}
+
+/// `POST /claude/hook/post_tool_use_result` — the all-tools `PostToolUse`
+/// entry, sized.
+///
+/// Shares `PostToolUse` with [`handle_claude_post_tool_use`] and shares NOTHING
+/// else: two matcher groups, two routes, two meanings. That separation is what
+/// keeps the auto-check from running twice on an `Edit` — see
+/// [`ROUTE_POST_TOOL_USE_RESULT`].
+async fn handle_claude_tool_result(
+    app: &AppHandle,
+    req: &Request,
+) -> AppResult<HookReply> {
+    let route = ROUTE_POST_TOOL_USE_RESULT;
+    let no_op = no_op();
+    let Some(input) = parse_hook_input(route, req) else {
+        return Ok(HookReply::ok(no_op.clone()));
+    };
+    report_hook_drift(route, &input);
+    let settings = live_settings(app);
+    if let Some(tab) = claude_hook_tab(&settings, req) {
+        let cwd = claude_hook_cwd(app, &settings, Some(tab.as_str()), &input.cwd);
+        let chars = u32::try_from(tool_result_chars(&input.tool_result))
+            .unwrap_or(u32::MAX);
+        tool_result_core(
+            app,
+            "claude",
+            &tab,
+            cwd.as_deref(),
+            &input.session_id,
+            input.tool_name.clone(),
+            chars,
+        );
+    }
+    Ok(HookReply::ok(no_op.clone()))
+}
+
+/// `POST /claude/hook/subagent` — `SubagentStart` **and** `SubagentStop`.
+///
+/// One route, dispatching on `hook_event_name`, exactly as
+/// [`handle_claude_notification`] serves its own pair. Observe-only.
+async fn handle_claude_subagent(
+    app: &AppHandle,
+    req: &Request,
+) -> AppResult<HookReply> {
+    let route = ROUTE_SUBAGENT;
+    let no_op = no_op();
+    let Some(input) = parse_hook_input(route, req) else {
+        return Ok(HookReply::ok(no_op.clone()));
+    };
+    report_hook_drift(route, &input);
+    if input.hook_event_name.is_empty() {
+        // Without the event name a start is indistinguishable from a stop, and
+        // guessing would either wedge the avatar in Thinking or release it
+        // early. `contract_checks` has already reported the absence.
+        return Ok(HookReply::ok(no_op.clone()));
+    }
+    let settings = live_settings(app);
+    if let Some(tab) = claude_hook_tab(&settings, req) {
+        let active = input.is_subagent_start();
+        subagent_core(app, "claude", &tab, &input.agent_id, active);
+        debug!(
+            target: "offload",
+            %tab,
+            agent_type = %bounded_id(&input.agent_type),
+            active,
+            "claude sub-agent lifecycle push"
+        );
+    }
+    Ok(HookReply::ok(no_op.clone()))
+}
+
+/// `POST /claude/hook/post_tool_use_failure` — the all-tools
+/// `PostToolUseFailure` entry, sized (2026-08-17).
+///
+/// **Why this route exists at all:** `PostToolUse` fires only when a tool
+/// SUCCEEDS, so before this entry a failed tool result reached cImp only through
+/// the transcript tail — which [`tool_result_core`]'s own arbitration switches
+/// OFF for a tab that serves `session.tool_result`. Every failed result's size
+/// was therefore lost on exactly the tabs the push path serves, and a failing
+/// `Bash` returns as much text as a succeeding one.
+///
+/// **The same core, the same capability, the same arbitration.** It feeds
+/// [`tool_result_core`], which asks `chp::served(.., EV_SESSION_TOOL_RESULT)` —
+/// the capability whose reader tap is suppressed. The overlay emits this entry
+/// from the same boolean as the success entry, so the pair is declared together
+/// and exactly one path counts each result.
+///
+/// **`is_error`, and what "treated as errored" means here.** The transcript
+/// reader keeps two readers over one block (`claude.transcript.tool_result`):
+/// `extract_tool_results` sizes every result *including* failures and never looks
+/// at `is_error`, while `tool_result_is_error` exists solely to keep a FAILED
+/// result from being mined for commit hashes by the session→commit provenance
+/// tap. This handler mirrors both halves — the first by construction (the same
+/// sizing function, so a failure counts exactly as the reader counted it), the
+/// second **structurally**: the push path carries a character count and never the
+/// result text, and provenance is mined only in `harness::claude::read`'s
+/// `record_commit_events`, which is not arbitrated and reads the transcript
+/// directly. There is nothing here for a failed result to leak into.
+async fn handle_claude_tool_failure(
+    app: &AppHandle,
+    req: &Request,
+) -> AppResult<HookReply> {
+    let route = ROUTE_POST_TOOL_USE_FAILURE;
+    let no_op = no_op();
+    let Some(input) = parse_hook_input(route, req) else {
+        return Ok(HookReply::ok(no_op.clone()));
+    };
+    report_hook_drift(route, &input);
+    let settings = live_settings(app);
+    if let Some(tab) = claude_hook_tab(&settings, req) {
+        let cwd = claude_hook_cwd(app, &settings, Some(tab.as_str()), &input.cwd);
+        // The ERROR text is what a failed tool returned, and it is what the
+        // transcript reader sizes for the same call — through this same
+        // function, so the two paths produce the same number.
+        let chars =
+            u32::try_from(tool_result_chars(&input.error)).unwrap_or(u32::MAX);
+        let recorded = tool_result_core(
+            app,
+            "claude",
+            &tab,
+            cwd.as_deref(),
+            &input.session_id,
+            input.tool_name.clone(),
+            chars,
+        );
+        debug!(
+            target: "offload",
+            %tab,
+            tool = %bounded_id(input.tool_name.as_deref().unwrap_or("")),
+            chars,
+            recorded,
+            "claude failed tool result pushed"
+        );
+    }
+    Ok(HookReply::ok(no_op.clone()))
+}
+
+/// `POST /claude/hook/pre_tool_use_taint` — the V32 taint beacon, as an http
+/// hook (2026-08-17; was `cimp --taint-beacon`).
+///
+/// Reaches [`latch_beacon_core`], the same core `/latch/beacon` reaches, so the
+/// engagement, the row it writes and the #45 narrowing are one implementation.
+///
+/// **Report-only, and now structurally so.** A `PreToolUse` hook denies only by
+/// answering 2xx with a `permissionDecision`; this handler answers
+/// [`no_op`] on every path including a rejected tab, so locked
+/// decision 14 ("sensor mode must never break a tab") no longer rests on the
+/// undocumented question of what a timed-out command hook does — a timeout, a
+/// refused connection and a non-2xx are all documented as non-blocking, and this
+/// route emits no decision field to be non-blocking *about*.
+async fn handle_claude_taint_beacon(
+    app: &AppHandle,
+    req: &Request,
+) -> AppResult<HookReply> {
+    let route = ROUTE_PRE_TOOL_USE_TAINT;
+    let no_op = no_op();
+    let Some(input) = parse_hook_input(route, req) else {
+        return Ok(HookReply::ok(no_op.clone()));
+    };
+    report_hook_drift(route, &input);
+    let settings = live_settings(app);
+    // The tool name is reported verbatim (bounded) so the row and the log name
+    // the tool the harness actually ran; an empty one still engages the latch —
+    // the beacon fired, and the app labels it rather than dropping the
+    // engagement, exactly as the shim did.
+    let tool = bounded_tool(input.tool_name.as_deref());
+    match latch_beacon_for(
+        app,
+        &settings,
+        "claude",
+        req.cimp.tab.as_deref(),
+        &tool,
+    ) {
+        Ok(view) => debug!(
+            target: "offload",
+            tab = %bounded_id(req.cimp.tab.as_deref().unwrap_or("")),
+            %tool,
+            latch = %view.latch,
+            "claude taint beacon"
+        ),
+        Err(tab) => warn!(
+            target: "offload",
+            tab = %tab,
+            %tool,
+            "loopback: a Claude taint beacon named no configured tab — nothing engaged"
+        ),
+    }
+    Ok(HookReply::ok(no_op.clone()))
+}
+
+/// `POST /claude/hook/pre_tool_use_checkpoint` — the V33 pre-mutation
+/// checkpoint, as an http hook (2026-08-17; was `cimp --checkpoint-beacon`).
+///
+/// Reaches [`tool_checkpoint_core`], the same core `/workbench/tool_checkpoint`
+/// reaches — including the `mutates_fs` re-check, which is the authority the
+/// spawn-time matcher is only a pre-filter for.
+///
+/// **This handler finishes its work before it answers, and that is the feature.**
+/// A `PreToolUse` http hook blocks the tool call until the response — the
+/// documented mechanism that makes `permissionDecision: "deny"` expressible —
+/// so awaiting the snapshot here is what makes "the checkpoint precedes the
+/// call" exact rather than best-effort. The deleted shim achieved the same thing
+/// from the outside, by reading its reply with a 2 s deadline and relying on
+/// Claude not starting the tool until the process exited; that ordering was
+/// **undocumented**, which is why the row was Tier D and is why this migration
+/// is the row's closing condition rather than a tidy-up.
+///
+/// The wait stays bounded by the app's own the app's derived reply budget (1800 ms today),
+/// under the entry's pinned 5 s ceiling: past the budget the snapshot is
+/// abandoned unwritten and the miss is surfaced as its own Activity event
+/// (`workbench` / `checkpoint_missed`), because a checkpoint that might contain
+/// the change it claims to predate silently misleads a restore.
+async fn handle_claude_checkpoint(
+    app: &AppHandle,
+    req: &Request,
+) -> AppResult<HookReply> {
+    let route = ROUTE_PRE_TOOL_USE_CHECKPOINT;
+    let no_op = no_op();
+    let Some(input) = parse_hook_input(route, req) else {
+        return Ok(HookReply::ok(no_op.clone()));
+    };
+    report_hook_drift(route, &input);
+    // An empty tool name is the one field this cannot proceed without: the core
+    // resolves it against the class table and a checkpoint attributed to
+    // `claude:` would be a row that names no call. The drift report above has
+    // already fired.
+    let tool = input.tool_name.as_deref().map(str::trim).unwrap_or("");
+    if tool.is_empty() {
+        return Ok(HookReply::ok(no_op.clone()));
+    }
+    let settings = live_settings(app);
+    let tab = claude_hook_tab(&settings, req);
+    let cwd = claude_hook_cwd(app, &settings, tab.as_deref(), &input.cwd);
+    let checkpointed = tool_checkpoint_core(
+        app,
+        &settings,
+        Some("claude"),
+        tool,
+        cwd.as_deref(),
+        Some(input.session_id.as_str()),
+        tab.as_deref(),
+    )
+    .await;
+    debug!(
+        target: "offload",
+        tab = %bounded_id(tab.as_deref().unwrap_or("")),
+        tool = %bounded_id(tool),
+        checkpointed,
+        "claude pre-mutation checkpoint"
+    );
+    Ok(HookReply::ok(no_op.clone()))
+}
+
+/// A `400` body, spelled once for the three Phase L routes.
+
+// ── NC-2 (issue #5): hook-driven permission detection ────────────────────────
+
+/// A `POST /permission/event` request body — the Claude `--notify-hook` shim
+/// forwarding a `Notification` or `PermissionDenied` hook payload.
+#[derive(Deserialize, Default)]
+struct PermissionEventBody {
+    /// The hook payload's `cwd` (already resolved by the shim).
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    /// `~/.claude/projects/<slug>/<session_id>.jsonl` — the second mapping key.
+    #[serde(default)]
+    transcript_path: Option<String>,
+    /// The payload's `hook_event_name` (`"Notification"` / `"PermissionDenied"`).
+    #[serde(default)]
+    event: String,
+    /// The notification's type when the payload carries one (`permission_prompt`,
+    /// `idle_prompt`, …).
+    #[serde(default)]
+    notification_type: Option<String>,
+    /// The notification's prose, used to classify when no type field arrived.
+    #[serde(default)]
+    message: Option<String>,
+    /// Present on `PermissionDenied`; logged, not branched on.
+    #[serde(default)]
+    tool_name: Option<String>,
+}
+
+/// Substrings that identify a permission notification when the payload carries
+/// no notification-type field. Claude Code's permission notification reads
+/// "Claude needs your permission to use <tool>", so both fragments are checked
+/// (either wording survives a small rephrasing). Deliberately narrower than a
+/// bare `"permission"` test, which a "permission denied" filesystem-error
+/// notification would trip.
+const PERMISSION_MESSAGE_MARKERS: [&str; 2] = ["your permission", "permission to use"];
+
+/// The notification type that means "a permission prompt is on screen" — the
+/// value Claude Code's `Notification` matcher filters on.
+const PERMISSION_NOTIFICATION_TYPE: &str = "permission_prompt";
+
+/// Notification types we KNOW about and deliberately ignore (Claude Code hooks
+/// guide, same list the `Notification` matcher accepts, minus
+/// `permission_prompt`). Recognizing them by name is what lets an
+/// *unrecognized* type fall through to the prose check without idle/auth
+/// notifications riding along — see [`classify_permission_event`].
+const IGNORED_NOTIFICATION_TYPES: [&str; 7] = [
+    "idle_prompt",
+    "auth_success",
+    "elicitation_dialog",
+    "elicitation_complete",
+    "elicitation_response",
+    "agent_needs_input",
+    "agent_completed",
+];
+
+/// NC-2: map a hook payload to a permission edge, or `None` to ignore it.
+///
+///   * `PermissionDenied` (auto-classifier blocked the call) resolves the
+///     prompt. Note the docs describe this as the auto-mode classifier's own
+///     denial, NOT necessarily the user pressing "No" — treating it as a
+///     resolution is still right (nothing is awaiting the user afterwards).
+///     M11 fix (2026-08-05 review): the eager clear is paired with a
+///     force-clear of that tab's regex latch in `handle_permission_event`, so a
+///     prompt that is genuinely still on screen is re-raised on the detector's
+///     next scan instead of staying invisible until the next keystroke.
+///   * `Notification` is classified by its TYPE when the payload carries a
+///     RECOGNIZED one (the field the matcher filters on), else by its prose.
+///
+/// **Type dispatch, in order (M12 fix, 2026-08-05 review):**
+///   1. `permission_prompt` ⇒ `Detected`.
+///   2. A type in [`IGNORED_NOTIFICATION_TYPES`] ⇒ ignored, prose NOT
+///      consulted. Deliberate: see the idle note below.
+///   3. Anything else — including an empty/absent type — falls through to the
+///      prose check. This is the drift path the shim's payload-shape note calls
+///      UNVERIFIED: a renamed type or a nested/renamed field must degrade to
+///      "we read the message instead", never to silence. Returning early on
+///      every unrecognized non-empty type inverted the contract precisely for
+///      the permission case, where "ignored" IS silence.
+///
+/// **Idle notifications are deliberately dropped** — and, per rule 2, dropped
+/// even when their prose would match. `idle_prompt` ("waiting for your input")
+/// is semantically close to the `awaiting_question` pipe, but that pipe's
+/// meaning today is "an AskUserQuestion-style menu is on screen" and the regex
+/// detector owns it; wiring idle there would flip the badge/TTS on every turn
+/// boundary. Revisit only with a separate signal.
+fn classify_permission_event(
+    event: &str,
+    notification_type: &str,
+    message: &str,
+) -> Option<PermissionEdge> {
+    match event {
+        "PermissionDenied" => Some(PermissionEdge::Resolved),
+        "Notification" => {
+            let kind = notification_type.trim();
+            if kind.eq_ignore_ascii_case(PERMISSION_NOTIFICATION_TYPE) {
+                return Some(PermissionEdge::Detected);
+            }
+            if IGNORED_NOTIFICATION_TYPES
+                .iter()
+                .any(|t| kind.eq_ignore_ascii_case(t))
+            {
+                return None;
+            }
+            // Unrecognized (or absent) type ⇒ the prose is all we have.
+            let msg = message.to_ascii_lowercase();
+            PERMISSION_MESSAGE_MARKERS
+                .iter()
+                .any(|m| msg.contains(m))
+                .then_some(PermissionEdge::Detected)
+        }
+        _ => None,
+    }
+}
+
+/// NC-2: resolve a hook payload to exactly one tab, or `None` to DROP the event.
+///
+/// Fallback order — `session_id` → `transcript_path` → unique `cwd`:
+///
+///   1. **session id.** The live-session registry maps a Claude tab id to the
+///      session its transcript tail last saw; a hook payload names that same id.
+///   2. **transcript path.** The transcript filename stem IS the session id
+///      (`<slug>/<session_id>.jsonl`), so this recovers the match when the
+///      `session_id` field itself goes missing/renamed.
+///   3. **cwd**, and only when it identifies exactly ONE Claude tab. Tabs
+///      normally all inherit the app's launch dir, so this usually resolves only
+///      for a single-Claude-tab setup (or a worktree tab with its own cwd).
+///
+/// Never guesses: an ambiguous or unmatched payload returns `None` and the event
+/// is dropped, leaving detection to the TUI-regex fallback. Guessing would flip
+/// the badge/TTS/avatar for the WRONG tab, which is worse than a missed hook.
+///
+/// H1 fix (2026-08-05 review): the `session_id` on a candidate is already
+/// ambiguity-filtered upstream — with two RUNNING Claude tabs on one project the
+/// registry withholds BOTH bindings (`graph::service::live_claude_tab_sessions`),
+/// because the taps cannot tell those tabs' transcripts apart. Passes 1 and 2
+/// then find nothing and pass 3 sees the shared cwd on ≥2 tabs, so the event is
+/// dropped rather than attributed to whichever tab wrote last.
+fn resolve_permission_tab(
+    candidates: &[PermissionTabCandidate],
+    session_id: &str,
+    transcript_path: &str,
+    cwd: &str,
+) -> Option<String> {
+    let by_session = |sid: &str| -> Option<String> {
+        if sid.is_empty() {
+            return None;
+        }
+        let mut hits = candidates
+            .iter()
+            .filter(|c| c.session_id.as_deref() == Some(sid));
+        let first = hits.next()?;
+        // A session id belongs to one tab; if two tabs somehow claim it, refuse
+        // rather than pick.
+        hits.next().is_none().then(|| first.tab.clone())
+    };
+
+    if let Some(tab) = by_session(session_id) {
+        return Some(tab);
+    }
+    if let Some(tab) = transcript_session_id(transcript_path).and_then(|s| by_session(&s)) {
+        return Some(tab);
+    }
+    let target = crate::fsutil::norm_dir_key(cwd)?;
+    let mut hits = candidates
+        .iter()
+        .filter(|c| crate::fsutil::norm_dir_key(&c.cwd.to_string_lossy()).as_deref() == Some(target.as_str()));
+    let first = hits.next()?;
+    hits.next().is_none().then(|| first.tab.clone())
+}
+
+/// The session id encoded in a Claude transcript path
+/// (`…/projects/<slug>/<session_id>.jsonl`), or `None` for an empty/odd path.
+fn transcript_session_id(transcript_path: &str) -> Option<String> {
+    let stem = Path::new(transcript_path.trim()).file_stem()?;
+    let stem = stem.to_string_lossy().into_owned();
+    (!stem.is_empty()).then_some(stem)
+}
+
+/// `POST /permission/event` (NC-2): the hook-driven half of permission
+/// detection. Maps the payload to a tab and emits the SAME `StateSignal`s the
+/// TUI-regex detector emits, so the whole downstream pipeline
+/// (`awaiting_permission` → TTS enqueue, per-tab badge, avatar) is untouched.
+/// Both producers are idempotent at the state manager, so a hook and a regex
+/// match for the same prompt collapse to one edge.
+///
+/// Always answers 200 `{ok:true}` (with a `mapped` field for diagnosis): the
+/// shim ignores the response and must never be given a reason to retry.
+async fn handle_permission_event(
+    app: &AppHandle,
+    req: &Request,
+) -> AppResult<HookReply> {
+    let body: PermissionEventBody = match serde_json::from_slice(&req.body) {
+        Ok(b) => b,
+        Err(e) => {
+            return Ok(HookReply {
+                status: 400,
+                body: serde_json::json!({ "ok": false, "error": format!("bad request body: {e}") }),
+            });
+        }
+    };
+    match permission_signal(app, &body).await {
+        PermissionOutcome::Mapped(tab) => {
+            Ok(HookReply::ok(
+                serde_json::json!({ "ok": true, "mapped": true, "tab": tab }),
+            ))
+        }
+        PermissionOutcome::Unmapped(reason) => {
+            Ok(HookReply::ok(
+                serde_json::json!({ "ok": true, "mapped": false, "reason": reason }),
+            ))
+        }
+    }
+}
+
+/// Classify a permission payload, map it to a tab and emit the state signal —
+/// the whole of `/permission/event`'s effect, shared with
+/// [`ROUTE_NOTIFICATION`] (V35 Phase J).
+///
+/// Both producers hand this the same `PermissionEventBody`: the pre-upgrade
+/// `--notify-hook` shim built one from the raw payload before posting it, and
+/// the Claude-native route builds the identical one from the payload it receives
+/// directly. One classifier, one tab-resolution, one signal.
+async fn permission_signal(app: &AppHandle, body: &PermissionEventBody) -> PermissionOutcome {
+    let session_id = body.session_id.clone().unwrap_or_default();
+    let transcript_path = body.transcript_path.clone().unwrap_or_default();
+    let cwd = body.cwd.clone().unwrap_or_default();
+    let Some(edge) = classify_permission_event(
+        &body.event,
+        body.notification_type.as_deref().unwrap_or(""),
+        body.message.as_deref().unwrap_or(""),
+    ) else {
+        debug!(
+            event = %body.event,
+            kind = body.notification_type.as_deref().unwrap_or(""),
+            "permission hook: ignored (not a permission edge)"
+        );
+        return PermissionOutcome::Unmapped("ignored");
+    };
+
+    // Core owns the candidate set and the signal; this harness owns the
+    // MATCHING rule, which is the half that reads its transcript path and its
+    // session-id conventions (V40 Phase C, locked decision 21).
+    let candidates = permission_tab_candidates(app, super::plugin::me());
+    let Some(tab) = resolve_permission_tab(&candidates, &session_id, &transcript_path, &cwd) else {
+        debug!(
+            event = %body.event,
+            session = %session_id,
+            cwd = %cwd,
+            "permission hook: no unambiguous tab \u{2014} dropped (regex fallback still covers it)"
+        );
+        return PermissionOutcome::Unmapped("no tab");
+    };
+    if !send_permission_edge(app, &tab, edge).await {
+        return PermissionOutcome::Unmapped("no tab");
+    }
+    info!(
+        event = %body.event,
+        tool = body.tool_name.as_deref().unwrap_or(""),
+        ?edge,
+        %tab,
+        "permission hook: state signal sent"
+    );
+    PermissionOutcome::Mapped(tab)
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -1749,4 +2980,559 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn permission_denied_resolves_and_unknown_events_are_ignored() {
+        assert_eq!(
+            classify_permission_event("PermissionDenied", "", ""),
+            Some(PermissionEdge::Resolved)
+        );
+        // Events we never registered (and the PermissionRequest we chose NOT to
+        // adopt) must not move the flag even if one somehow reaches the route.
+        for event in ["PermissionRequest", "PreToolUse", "", "Stop"] {
+            assert_eq!(
+                classify_permission_event(event, "permission_prompt", ""),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn notification_type_drives_classification_when_present() {
+        assert_eq!(
+            classify_permission_event("Notification", "permission_prompt", ""),
+            Some(PermissionEdge::Detected)
+        );
+        // Case/whitespace tolerance — the value is echoed from the payload.
+        assert_eq!(
+            classify_permission_event("Notification", " Permission_Prompt ", ""),
+            Some(PermissionEdge::Detected)
+        );
+        // Every other RECOGNIZED type is ignored, including idle (which is NOT
+        // wired to the question pipe — see the classifier's doc comment) …
+        for kind in IGNORED_NOTIFICATION_TYPES {
+            assert_eq!(classify_permission_event("Notification", kind, ""), None);
+        }
+        // … and a recognized type WINS over the prose fallback, so a future
+        // permission-flavoured message under a non-permission type can't leak
+        // in. Deliberate and pinned: idle notifications stay out of the
+        // permission pipe whatever their wording says.
+        assert_eq!(
+            classify_permission_event(
+                "Notification",
+                "idle_prompt",
+                "Claude needs your permission to use Bash"
+            ),
+            None
+        );
+        assert_eq!(
+            classify_permission_event(
+                "Notification",
+                "Agent_Completed",
+                "Claude needs your permission to use Bash"
+            ),
+            None,
+            "recognized types are matched case-insensitively too"
+        );
+    }
+
+    /// M12 (2026-08-05 review): an UNRECOGNIZED non-empty type must fall
+    /// through to the prose check instead of short-circuiting to "ignored".
+    /// The `Notification` payload shape is explicitly UNVERIFIED
+    /// (`notify_hook.rs` module doc), so a renamed type — or a nested field the
+    /// shim reads into `notification_type` — is the expected drift, and for the
+    /// permission case "ignored" is silence: the badge/TTS never fire and
+    /// nothing logs above debug.
+    #[test]
+    fn unrecognized_notification_type_falls_through_to_the_prose_check() {
+        // Renamed/unknown type + permission prose ⇒ still detected.
+        for kind in ["tool_permission", "permission-prompt", "something_new"] {
+            assert_eq!(
+                classify_permission_event(
+                    "Notification",
+                    kind,
+                    "Claude needs your permission to use Bash"
+                ),
+                Some(PermissionEdge::Detected),
+                "{kind}"
+            );
+        }
+        // Unknown type + unrelated prose ⇒ ignored, as before.
+        for msg in [
+            "Claude is waiting for your input",
+            "Error: permission denied while reading /etc/shadow",
+            "",
+        ] {
+            assert_eq!(
+                classify_permission_event("Notification", "something_new", msg),
+                None,
+                "{msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn notification_message_classifies_when_type_field_is_absent() {
+        assert_eq!(
+            classify_permission_event(
+                "Notification",
+                "",
+                "Claude needs your permission to use Bash"
+            ),
+            Some(PermissionEdge::Detected)
+        );
+        assert_eq!(
+            classify_permission_event("Notification", "", "Permission to use Edit is required"),
+            Some(PermissionEdge::Detected)
+        );
+        // Idle prose, and a "permission denied" error that must NOT be read as
+        // a prompt (why the marker is narrower than a bare "permission").
+        for msg in [
+            "Claude is waiting for your input",
+            "Error: permission denied while reading /etc/shadow",
+            "",
+        ] {
+            assert_eq!(
+                classify_permission_event("Notification", "", msg),
+                None,
+                "{msg}"
+            );
+        }
+    }
+
+    fn cand(tab: &str, session: Option<&str>, cwd: &str) -> PermissionTabCandidate {
+        PermissionTabCandidate {
+            tab: tab.to_string(),
+            session_id: session.map(str::to_string),
+            cwd: std::path::PathBuf::from(cwd),
+        }
+    }
+
+    #[test]
+    fn tab_mapping_prefers_session_id_then_transcript_then_unique_cwd() {
+        let tabs = [
+            cand("claude", Some("sess-a"), "C:/proj"),
+            cand("ai-2", Some("sess-b"), "C:/proj/wt"),
+            cand("claude-local", None, "C:/proj"),
+        ];
+        // 1. session id.
+        assert_eq!(
+            resolve_permission_tab(&tabs, "sess-b", "", ""),
+            Some("ai-2".to_string())
+        );
+        // 2. transcript stem, when the session field went missing.
+        assert_eq!(
+            resolve_permission_tab(
+                &tabs,
+                "",
+                "C:/Users/x/.claude/projects/slug/sess-a.jsonl",
+                ""
+            ),
+            Some("claude".to_string())
+        );
+        // 3. cwd, but only where it names exactly one tab: `C:/proj` is shared
+        // by two tabs (ambiguous ⇒ drop), the worktree dir is unique.
+        assert_eq!(resolve_permission_tab(&tabs, "", "", "C:/proj"), None);
+        assert_eq!(
+            resolve_permission_tab(&tabs, "", "", "C:/proj/wt"),
+            Some("ai-2".to_string())
+        );
+        // Separator/trailing-slash normalization (and, on Windows, case).
+        assert_eq!(
+            resolve_permission_tab(&tabs, "", "", "C:\\proj\\wt\\"),
+            Some("ai-2".to_string())
+        );
+        // Nothing matches ⇒ dropped, never guessed.
+        assert_eq!(
+            resolve_permission_tab(&tabs, "sess-zz", "", "D:/elsewhere"),
+            None
+        );
+        assert_eq!(resolve_permission_tab(&tabs, "", "", ""), None);
+        assert_eq!(resolve_permission_tab(&[], "sess-a", "", "C:/proj"), None);
+    }
+
+    #[test]
+    fn tab_mapping_refuses_a_session_claimed_by_two_tabs() {
+        let tabs = [
+            cand("claude", Some("dup"), "C:/a"),
+            cand("claude-local", Some("dup"), "C:/b"),
+        ];
+        assert_eq!(resolve_permission_tab(&tabs, "dup", "", ""), None);
+    }
+
+    /// H1 (2026-08-05 review): two RUNNING Claude tabs on one project make every
+    /// tab-keyed identity claim unprovable, so `live_sessions_for` (the sole
+    /// source of `session_id` here) hands both candidates `None` — see
+    /// `graph::service::live_claude_tab_sessions`. This pins the resulting
+    /// contract on THIS side of the seam: refuse, never guess.
+    #[test]
+    fn tab_mapping_refuses_when_the_registry_withholds_ambiguous_bindings() {
+        // Both same-root tabs, session bindings withheld at the registry.
+        let tabs = [
+            cand("claude", None, "C:/proj"),
+            cand("claude-local", None, "C:/proj"),
+        ];
+        // The hook payload names a real live session — but nothing claims it.
+        assert_eq!(resolve_permission_tab(&tabs, "sess-b", "", "C:/proj"), None);
+        assert_eq!(
+            resolve_permission_tab(
+                &tabs,
+                "",
+                "C:/Users/x/.claude/projects/slug/sess-b.jsonl",
+                "C:/proj"
+            ),
+            None
+        );
+        // ...and the cwd fallback declines too: the shared root is, by
+        // construction, shared by ≥2 tabs.
+        assert_eq!(resolve_permission_tab(&tabs, "", "", "C:/proj"), None);
+        // A single running tab per root keeps its binding and still resolves.
+        let solo = [
+            cand("claude", Some("sess-a"), "C:/proj"),
+            cand("ai-2", None, "C:/other"),
+        ];
+        assert_eq!(
+            resolve_permission_tab(&solo, "sess-a", "", ""),
+            Some("claude".to_string())
+        );
+    }
+
+    #[test]
+    fn permission_event_body_tolerates_a_minimal_payload() {
+        // Only the event name — every other field defaults, so a drifted
+        // payload still deserializes and is simply unmappable (dropped).
+        let body: PermissionEventBody =
+            serde_json::from_value(serde_json::json!({ "event": "Notification" }))
+                .expect("minimal body deserializes");
+        assert_eq!(body.event, "Notification");
+        assert!(body.session_id.is_none() && body.cwd.is_none());
+    }
+
+    /// An absolute project root **in the platform's own idiom**, for the hook
+    /// bodies below.
+    ///
+    /// The mapping under test is platform-NEUTRAL, but one branch it crosses is
+    /// not: `plan_request`'s `Bash` arm passes an absolute shell
+    /// path through untouched and joins a relative one against the payload cwd,
+    /// and `Path::is_absolute()` reads `P:\proj\big.rs` as a RELATIVE path off
+    /// Windows. A hard-coded drive-letter literal therefore flips the test onto
+    /// the join branch on Linux and fails there — CI's `tool Bash` failure.
+    /// [`crate::harness::claude::hook`]'s own fixtures are cfg'd for exactly
+    /// this reason; this is the same fact one layer up.
+    #[cfg(windows)]
+    const HOOK_ROOT: &str = "P:\\proj";
+    #[cfg(not(windows))]
+    const HOOK_ROOT: &str = "/proj";
+
+    /// **The convergence assertion.** For the same logical input, the Claude
+    /// `type: "http"` route builds *byte-identically* the CHP body the deleted
+    /// shim used to POST — which is what makes "both paths have the same
+    /// internal effect" a fact rather than a hope, since everything downstream
+    /// of the body is already one shared core per capability.
+    ///
+    /// The expected values are the deleted shims' own `serde_json::json!`
+    /// literals, transcribed. A test that built them from the new mapping would
+    /// assert nothing; these are what `context_hook.rs`, `compact_hook.rs`,
+    /// `read_hook.rs`, `postedit_hook.rs` and `notify_hook.rs` sent on
+    /// `develop` before this phase.
+    ///
+    /// The parse half is the other direction: the same literal, deserialized
+    /// through the route's own body type, must land on the same fields — so a
+    /// pre-upgrade tab's POST and this build's mapping are one body in both
+    /// senses.
+    #[test]
+    fn a_claude_http_hook_builds_the_body_its_shim_used_to_post() {
+        let tab = || Some("claude-1".to_string());
+        let cwd = || Some(HOOK_ROOT.to_string());
+        // Built with `join` so the separator is the platform's own, and reused
+        // as both the payload value and the expected value — the mapping must
+        // carry a path through byte-for-byte on either platform.
+        let big = Path::new(HOOK_ROOT)
+            .join("big.rs")
+            .to_string_lossy()
+            .into_owned();
+        let edited = Path::new(HOOK_ROOT)
+            .join("a.rs")
+            .to_string_lossy()
+            .into_owned();
+
+        // ── UserPromptSubmit / context_hook ──────────────────────────────
+        let input: HookInput = serde_json::from_value(serde_json::json!({
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "sess-a",
+            "cwd": HOOK_ROOT,
+            "prompt": "why is the build slow?",
+        }))
+        .expect("hook input");
+        let mapped = retrieve_body_from_hook(&input, tab(), cwd());
+        let shim: ContextRetrieveBody = serde_json::from_value(serde_json::json!({
+            "cwd": HOOK_ROOT,
+            "prompt": "why is the build slow?",
+            "session_id": "sess-a",
+            "agent": "claude",
+            "tab": "claude-1",
+        }))
+        .expect("the shim's body");
+        assert_eq!((mapped.cwd, mapped.prompt), (shim.cwd, shim.prompt));
+        assert_eq!(mapped.session_id, shim.session_id);
+        assert_eq!((mapped.agent, mapped.tab), (shim.agent, shim.tab));
+
+        // ── PreCompact / compact_hook ────────────────────────────────────
+        let input: HookInput = serde_json::from_value(serde_json::json!({
+            "hook_event_name": "PreCompact",
+            "session_id": "sess-a",
+            "cwd": HOOK_ROOT,
+            "trigger": "auto",
+        }))
+        .expect("hook input");
+        let mapped = compaction_body_from_hook(&input, tab(), cwd());
+        let shim: ContextCompactionBody = serde_json::from_value(serde_json::json!({
+            "cwd": HOOK_ROOT,
+            "session_id": "sess-a",
+            "trigger": "auto",
+            "agent": "claude",
+            "tab": "claude-1",
+        }))
+        .expect("the shim's body");
+        assert_eq!(mapped.cwd, shim.cwd);
+        assert_eq!(mapped.session_id, shim.session_id);
+        assert_eq!(mapped.trigger, shim.trigger);
+        assert_eq!((mapped.agent, mapped.tab), (shim.agent, shim.tab));
+
+        // ── PreToolUse / read_hook, on BOTH its matchers ─────────────────
+        for (tool_input, want_path, want_offset, want_limit, want_prefix) in [
+            (
+                serde_json::json!({ "file_path": big, "offset": 40, "limit": 80 }),
+                big.as_str(),
+                Some(40u32),
+                Some(80u32),
+                "",
+            ),
+            (
+                serde_json::json!({ "command": format!("cat {big}") }),
+                big.as_str(),
+                None,
+                None,
+                BASH_DENY_PREFIX,
+            ),
+        ] {
+            let tool = if tool_input.get("command").is_some() {
+                "Bash"
+            } else {
+                "Read"
+            };
+            let input: HookInput = serde_json::from_value(serde_json::json!({
+                "hook_event_name": "PreToolUse",
+                "session_id": "sess-a",
+                "cwd": HOOK_ROOT,
+                "tool_name": tool,
+                "tool_input": tool_input,
+            }))
+            .expect("hook input");
+            let plan = plan_request(Some(tool), &input.tool_input, HOOK_ROOT)
+                .expect("a verdict request");
+            assert_eq!(plan.deny_prefix, want_prefix);
+            let mapped = should_read_body_from_hook(&input, &plan, tab(), cwd());
+            let shim: ShouldReadBody = serde_json::from_value(serde_json::json!({
+                "cwd": HOOK_ROOT,
+                "session_id": "sess-a",
+                "file_path": want_path,
+                "offset": want_offset,
+                "limit": want_limit,
+                "agent": "claude",
+                "tab": "claude-1",
+            }))
+            .expect("the shim's body");
+            assert_eq!(mapped.cwd, shim.cwd);
+            assert_eq!(mapped.file_path, shim.file_path, "tool {tool}");
+            assert_eq!((mapped.offset, mapped.limit), (shim.offset, shim.limit));
+            assert_eq!((mapped.agent, mapped.tab), (shim.agent, shim.tab));
+        }
+
+        // ── PostToolUse / postedit_hook ──────────────────────────────────
+        let input: HookInput = serde_json::from_value(serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "session_id": "sess-a",
+            "cwd": HOOK_ROOT,
+            "tool_name": "Edit",
+            "tool_input": { "file_path": edited },
+        }))
+        .expect("hook input");
+        let mapped = post_edit_body_from_hook(&input, tab(), cwd());
+        let shim: ContextPostEditBody = serde_json::from_value(serde_json::json!({
+            "cwd": HOOK_ROOT,
+            "session_id": "sess-a",
+            "file_path": edited,
+            "tool_name": "Edit",
+            "agent": "claude",
+            "tab": "claude-1",
+        }))
+        .expect("the shim's body");
+        assert_eq!(mapped.cwd, shim.cwd);
+        assert_eq!(mapped.file_path, shim.file_path);
+        assert_eq!((mapped.agent, mapped.tab), (shim.agent, shim.tab));
+
+        // ── Notification / notify_hook, in the NESTED payload shape ──────
+        //
+        // The nested spelling is the one the shim's module doc records as
+        // UNVERIFIED upstream, so it is the shape worth pinning: both spellings
+        // must flatten to the same body.
+        let input: HookInput = serde_json::from_value(serde_json::json!({
+            "hook_event_name": "Notification",
+            "session_id": "sess-a",
+            "cwd": HOOK_ROOT,
+            "transcript_path": "C:/t/sess-a.jsonl",
+            "notification": { "type": "permission_prompt", "message": "needs your permission" },
+        }))
+        .expect("hook input");
+        let mapped = permission_body_from_hook(&input, cwd());
+        let shim: PermissionEventBody = serde_json::from_value(serde_json::json!({
+            "cwd": HOOK_ROOT,
+            "session_id": "sess-a",
+            "transcript_path": "C:/t/sess-a.jsonl",
+            "event": "Notification",
+            "notification_type": "permission_prompt",
+            "message": "needs your permission",
+            "tool_name": "",
+        }))
+        .expect("the shim's body");
+        assert_eq!(mapped.cwd, shim.cwd);
+        assert_eq!(mapped.event, shim.event);
+        assert_eq!(mapped.transcript_path, shim.transcript_path);
+        assert_eq!(mapped.notification_type, shim.notification_type);
+        assert_eq!(mapped.message, shim.message);
+        // …and it carries no identity fields at all, exactly as the shim's did.
+        let raw = serde_json::to_value(serde_json::json!({})).unwrap();
+        assert!(raw.get("agent").is_none() && raw.get("tab").is_none());
+
+        // The classifier reaches the same verdict from both bodies, which is the
+        // effect the two transports have to share.
+        assert_eq!(
+            classify_permission_event(
+                &mapped.event,
+                mapped.notification_type.as_deref().unwrap_or(""),
+                mapped.message.as_deref().unwrap_or("")
+            ),
+            Some(PermissionEdge::Detected)
+        );
+    }
+
+    // ── V40 Phase C: the ingress, after the move ────────────────────────────
+
+    /// **Every declared drift token is one a route can actually send**, and the
+    /// list is the length it says it is.
+    ///
+    /// This was `loopback::tests::the_drift_shim_list_is_spelled_the_way_the_
+    /// shims_spell_it`, which `include_str!`d THIS file from core to check that
+    /// core's `DRIFT_SHIMS` matched the module that sends them. Both halves live
+    /// here now, so the scan is of the module's own source — and the property it
+    /// proves is the one that mattered: a token nothing sends is a bucket nobody
+    /// claims, and a typo would fail silently by folding into the sentinel.
+    ///
+    /// **What this would still pass if the implementation were wrong:** a NEW
+    /// reporter using an undeclared name. That case degrades safely (it shares
+    /// the sentinel bucket, so it gets fewer rows, never more). **It happened**:
+    /// `checkpoint_beacon` shipped with V33 Phase F reporting drift under its own
+    /// name and no entry in the list, which is why the length assertion names the
+    /// failure it guards rather than just pinning a number.
+    #[test]
+    fn every_declared_drift_token_is_one_a_route_can_send() {
+        const SRC: &str = include_str!("hook.rs");
+        for token in DRIFT_TOKENS {
+            assert!(
+                SRC.contains(&format!("\"{token}\"")),
+                "{token} is declared but this module never spells it"
+            );
+        }
+        // The seven that name a converted hook resolve through the route table,
+        // so a renamed token cannot quietly split a capability's reports in two.
+        for route in ROUTES {
+            if let Some(token) = drift_token(route) {
+                assert!(
+                    DRIFT_TOKENS.contains(&token),
+                    "{route} reports drift under `{token}`, which is not declared"
+                );
+            }
+        }
+        assert_eq!(
+            DRIFT_TOKENS.len(),
+            10,
+            "a new reporter needs an entry in DRIFT_TOKENS — otherwise its reports fold into \
+             the unrecognized-shim bucket and nothing fails"
+        );
+        // The never-shipped shim spelling must stay unclaimed: `postedit_hook`
+        // is the name the deleted `--postedit-hook` binary WOULD have reported
+        // under had it ever reported, and nothing can be carrying it.
+        assert!(!DRIFT_TOKENS.contains(&"postedit_hook"));
+        // V35 Phase L: every event whose SILENCE is reportable resolves to a
+        // declared token. Without this a quiet report would be filed under the
+        // unrecognized-shim bucket, i.e. attributed to nothing.
+        for event in [
+            crate::harness::chp::EV_ASSISTANT_TEXT,
+            crate::harness::chp::EV_SESSION_TOOL_RESULT,
+            crate::harness::chp::EV_SESSION_SUBAGENT,
+        ] {
+            let token = drift_token_for_event(event)
+                .unwrap_or_else(|| panic!("{event} can go quiet but reports under no token"));
+            assert!(DRIFT_TOKENS.contains(&token));
+        }
+    }
+
+    /// **The route table and the exported constants are one list.**
+    ///
+    /// This replaces `loopback::tests::the_dispatch_arms_spell_the_routes_
+    /// claude_hook_exports`, which scanned core's `match` as TEXT because the
+    /// arms were literals in another file and "the two could part company and
+    /// every Claude hook would 404 — which, being fail-open, would look exactly
+    /// like a feature quietly switching itself off". After Phase C there is one
+    /// spelling: [`ROUTES_TABLE`] holds the same `&'static str` constants
+    /// [`ROUTES`] does, and core matches on them. What is left to check is that
+    /// the table and the enumeration cover each other.
+    #[test]
+    fn the_route_table_and_the_route_list_cover_each_other() {
+        let table: Vec<&str> = ROUTES_TABLE
+            .iter()
+            .map(|r| r.path)
+            .filter(|p| *p != ROUTE_PERMISSION_EVENT)
+            .collect();
+        assert_eq!(
+            table, ROUTES,
+            "ROUTES_TABLE and ROUTES disagree — the overlay generator emits ROUTES and the \
+             router serves ROUTES_TABLE, so a gap here is a hook that 404s while looking like \
+             a feature that switched itself off"
+        );
+        for r in ROUTES_TABLE {
+            assert_eq!(r.method, "POST", "{}: every hook ingress route is a POST", r.path);
+        }
+        // The legacy shim transport is in the table and NOT in `ROUTES`: no
+        // overlay entry points at it, because the only thing that posts there is
+        // a shim binary from before Phase J.
+        assert!(
+            ROUTES_TABLE.iter().any(|r| r.path == ROUTE_PERMISSION_EVENT),
+            "the pre-Phase-J `--notify-hook` transport is still served"
+        );
+        assert!(!ROUTES.contains(&ROUTE_PERMISSION_EVENT));
+    }
+
+    /// The `X-CIMP-*` identity is read for this harness's routes and for
+    /// nothing else — a plugin that claimed identity on a route it does not
+    /// serve would be answering for another harness's caller.
+    #[test]
+    fn identity_is_claimed_only_for_this_harnesss_routes() {
+        let req = crate::offload::loopback::request_for_test(
+            "POST",
+            ROUTE_STOP,
+            Some("claude-1"),
+            Some(3),
+        );
+        let id = identity_of_request(ROUTE_STOP, &req).expect("this harness's route");
+        assert_eq!((id.chp, id.tab.as_str()), (3, "claude-1"));
+        for foreign in ["/session/hello", "/mcp/call", "/context/retrieve", "/nope"] {
+            assert!(
+                identity_of_request(foreign, &req).is_none(),
+                "{foreign}: claimed by a plugin that does not serve it"
+            );
+        }
+    }
+
 }

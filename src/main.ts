@@ -10,6 +10,7 @@ import { getCurrentWindow } from '@tauri-apps/api/window';
 import { invoke } from '@tauri-apps/api/core';
 import './theme.css';
 import './app.css';
+import { loadHarnesses } from './lib/harness';
 
 // Set the active theme synchronously before Svelte mounts so the first
 // paint already reflects token values — avoids FOUC. The static
@@ -69,6 +70,15 @@ function applyChrome() {
     showMainWindowOnce();
   }
 }
+
+// V40 Phase F (locked decision 7): the harness roster, fetched once, as early
+// as the window can ask. Everything downstream — which tab ids are AI builtins,
+// what each harness is called, its accent, its install hint — is this answer.
+// Started here rather than from a component so the gap between mount and the
+// first registry-aware paint is as short as the IPC allows; until it lands the
+// window renders neutral rather than guessing (`harness.ts` documents the one
+// synchronous fallback).
+void loadHarnesses();
 
 // Load the verified theme/palette registry, inject theme CSS, then re-apply the
 // chrome with the real metadata now available.

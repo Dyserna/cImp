@@ -213,11 +213,14 @@ impl AudioOutput {
     }
 }
 
-/// Read the active-tab cell synchronously. Falls back to Claude on a
-/// poisoned lock — that's the v2 default and we only consult this on
-/// playback edges, so a benign default keeps the avatar pipeline alive.
+/// Read the active-tab cell synchronously. Falls back to the first registered
+/// harness's default tab on a poisoned lock (V40 Phase E) — we only consult this
+/// on playback edges, so a benign default keeps the avatar pipeline alive.
 fn current_active(active: &ActiveTab) -> TabId {
-    active.read().map(|g| g.clone()).unwrap_or(TabId::Claude)
+    active
+        .read()
+        .map(|g| g.clone())
+        .unwrap_or_else(|_| TabId::first_harness_default())
 }
 
 /// Mute folds into volume: muted means volume = 0, unmuted means the

@@ -603,7 +603,17 @@ pub async fn tab_set_delegation_role(
     let Some(TabConfig::AiTool(cfg)) = settings.find_tab(tab.as_str()) else {
         return Err(AppError::Ipc(format!("unknown AI tab `{}`", tab.as_str())));
     };
-    let agent = crate::tabs::tab_consumer(cfg);
+    let Some(agent) = crate::tabs::tab_consumer(cfg) else {
+        // V40 Phase A (locked decision 2): a tab whose command names no
+        // registered harness is not a worker at all. It used to be classified
+        // as OpenCode here, become eligible for that harness's Manual slot, and
+        // be typed into with OpenCode's paste rules.
+        return Err(AppError::Ipc(format!(
+            "tab `{}` runs no registered harness, so cImp has no way to type a turn into \
+             it - it cannot hold a delegation role",
+            tab.as_str()
+        )));
+    };
     if crate::harness::input_profile(agent).is_none() {
         return Err(AppError::Ipc(format!(
             "tab `{}` runs a harness with no input profile, so cImp could never type a turn into \
@@ -620,7 +630,7 @@ pub async fn tab_set_delegation_role(
             TabConfig::AiTool(c)
                 if c.delegation_role == DelegationRole::Manual
                     && c.id != tab.as_str()
-                    && crate::tabs::tab_consumer(c) == agent =>
+                    && crate::tabs::tab_consumer(c) == Some(agent) =>
             {
                 Some((c.id.clone(), c.name.clone()))
             }
@@ -642,7 +652,7 @@ pub async fn tab_set_delegation_role(
                 c.delegation_role = role;
             } else if role == DelegationRole::Manual
                 && c.delegation_role == DelegationRole::Manual
-                && crate::tabs::tab_consumer(c) == agent_for_mutate
+                && crate::tabs::tab_consumer(c) == Some(agent_for_mutate)
             {
                 c.delegation_role = DelegationRole::None;
             }
@@ -1014,7 +1024,7 @@ pub async fn tts_speak_selection(
 pub async fn tts_stop(state: State<'_, AppState>) -> AppResult<()> {
     state.speak_session.store(0, Ordering::SeqCst);
     // Suppress the rest of the current AI-output burst's tagged segments
-    // (those still queued or yet to arrive) until the next `ClaudeOutputStarted`
+    // (those still queued or yet to arrive) until the next `HarnessOutputStarted`
     // clears the flag. Notifications and selection reads are unaffected — they
     // ride other request variants the worker doesn't gate on this flag.
     state.ai_tts_suppressed.store(true, Ordering::SeqCst);
@@ -1087,14 +1097,133 @@ pub async fn stt_list_input_devices() -> AppResult<Vec<String>> {
     crate::stt::list_input_devices()
 }
 
-/// Read the current Claude Code usage snapshot (session 5h + weekly 7d) for
-/// the bottom-bar usage tracker: a local read of the status-line push file
-/// (see `crate::usage`) — no network. `snapshot` is `None` when no Claude tab
-/// has pushed data (or the last push expired) — the frontend hides the widget
-/// in that case. Polled by the frontend on `usage.poll_interval_secs`.
+/// **One harness's usage reading** for the bottom-bar tracker (V40 Phase D,
+/// locked decision 19). Local read, never the network.
+///
+/// This was `get_claude_usage`, a command named after a harness that answered
+/// a payload with `five_hour` / `seven_day` fields in it. It now takes the
+/// harness and answers three distinguishable states, which is the whole point:
+///
+/// * `source: None` — **this harness has no usage source at all.** OpenCode.
+///   A UI must render that as absence; rendering it as a harness at 0% would be
+///   a number nobody reported (global principle 5). It says nothing about
+///   whether the harness RECORDS turns — see `token_kinds`/`origins` below.
+/// * `source: Some(..), reading: None` — it has one, and nothing has been
+///   reported yet (no tab of that harness has pushed, or the last push aged
+///   out).
+/// * `source: Some(..), reading: Some(..)` — the declared windows that have a
+///   reading, in declared order, plus the live context block.
+///
+/// Beside those three, and **independent of them**, the answer carries the
+/// declared shape of a RECORDED turn: `token_kinds` and `origins`. V40 Phase G
+/// split the two questions, because they had different answers all along —
+/// OpenCode reports no quota and no context window (`source: None`) and still
+/// writes real per-turn token rows with a parent/child lane split. Nesting the
+/// declaration under `source` meant the Usage donut could not label an OpenCode
+/// session's lanes at all. Both lists are EMPTY for a harness that declares no
+/// turn shape.
+///
+/// An unregistered harness id is an error, not an empty reading: a widget
+/// polling for a harness that does not exist is a bug, and answering it with
+/// "nothing to show" would hide it forever.
 #[tauri::command]
-pub async fn get_claude_usage() -> AppResult<crate::usage::UsageResult> {
-    Ok(crate::usage::pushed_usage())
+pub async fn harness_usage(harness: String) -> AppResult<HarnessUsage> {
+    let id = crate::harness::HarnessId::from_id(&harness).ok_or_else(|| {
+        crate::error::AppError::Ipc(format!(
+            "unknown harness `{harness}` — registered: {}",
+            crate::harness::registry::harness_ids().join(", ")
+        ))
+    })?;
+    let plugin = id.plugin();
+    let source = plugin.and_then(|p| p.usage_source());
+    let shape = plugin.and_then(|p| p.turn_usage_shape());
+    Ok(HarnessUsage {
+        source: source.map(|s| UsageSourceInfo {
+            windows: s
+                .windows()
+                .iter()
+                .map(|w| DeclaredWindow {
+                    id: w.id,
+                    label: w.label,
+                    short: w.short,
+                    description: w.description,
+                })
+                .collect(),
+        }),
+        token_kinds: shape
+            .map(|s| {
+                s.token_kinds
+                    .iter()
+                    .map(|k| DeclaredLabel { id: k.id, label: k.label })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        origins: shape
+            .map(|s| {
+                s.origins
+                    .iter()
+                    .map(|o| DeclaredOrigin { id: o.id, label: o.label, subagent: o.subagent })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        reading: source.and_then(|s| s.read()),
+    })
+}
+
+/// The answer [`harness_usage`] gives. See its docs for the three source
+/// states and for why the turn shape sits BESIDE them, not inside them.
+#[derive(serde::Serialize)]
+pub struct HarnessUsage {
+    /// What this harness's quota source *can* report — `None` when it has none.
+    pub source: Option<UsageSourceInfo>,
+    /// The billing categories this harness reports a RECORDED turn's tokens
+    /// under, in declared order. Empty when it records no turns.
+    pub token_kinds: Vec<DeclaredLabel>,
+    /// The lanes a recorded turn can be attributed to, in declared order —
+    /// what the Usage donut labels its rings with. Empty when it records no
+    /// turns.
+    pub origins: Vec<DeclaredOrigin>,
+    /// What the quota source reports right now.
+    pub reading: Option<crate::harness::plugin::UsageReading>,
+}
+
+/// The declared shape of a QUOTA source: which windows it can report.
+///
+/// Sent alongside the reading rather than mirrored in the frontend, so a
+/// harness with three quota windows (or one, or none) needs no UI change —
+/// locked decision 19. V40 Phase G moved `token_kinds` / `origins` OUT of here:
+/// they describe a stored turn, not a quota reading, and a harness can have
+/// either without the other.
+#[derive(serde::Serialize)]
+pub struct UsageSourceInfo {
+    pub windows: Vec<DeclaredWindow>,
+}
+
+/// One declared quota window, without a reading.
+#[derive(serde::Serialize)]
+pub struct DeclaredWindow {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub short: &'static str,
+    pub description: &'static str,
+}
+
+/// A declared id with the label a UI renders for it (token categories).
+#[derive(serde::Serialize)]
+pub struct DeclaredLabel {
+    pub id: &'static str,
+    pub label: &'static str,
+}
+
+/// One declared turn lane. Carries `subagent` because that is what tells a UI
+/// which lane gets the fan-out treatment (the outlined bar, the "A" badge)
+/// without recognising the word `"agent"` — the literal locked decision 19
+/// exists to delete.
+#[derive(serde::Serialize)]
+pub struct DeclaredOrigin {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub subagent: bool,
 }
 
 /// Sample the system-monitor stats (CPU / memory / GPU / network) for the
@@ -1377,7 +1506,50 @@ fn apply_incoming_settings(cur: &mut Settings, mut incoming: Settings) {
     // this list here covers the in-memory round trip, that one the on-disk
     // diff/merge. Keep both in mind when adding an out-of-band field.)
     incoming.harness_versions = cur.harness_versions.clone();
+    // V40 Phase B: the same rule, one level down. `Settings::harness` is NOT
+    // preserved wholesale — `expose_commands`, `expose_code_audit`, the
+    // recorded spike outcome and every plugin `ext` value are what the Settings
+    // window is FOR — but the three OUT-OF-BAND fields on each row are
+    // (`sync_harness_into` excludes them from the disk write for the same
+    // reason). The window's snapshot is taken when it opens; the transcript tap
+    // or the auto-verify worker may have written a newer version since, and a
+    // save must not revert a version observation or a Mark-verified.
+    //
+    // V40 review L-1: iterate the REGISTRY, not `cur.harness`. A registered
+    // harness with no live row used to take all three straight from the
+    // incoming snapshot — and the frontend fabricates them for an absent key
+    // (`harnessRow` answers `last_seen: ''`, `auto_verify: null`), so the health
+    // panel would read "never auto-verified" until the next restart.
+    // `harness_settings` supplies the declared defaults for an absent row, which
+    // is the same answer every other reader gets.
+    for h in crate::harness::registry::all() {
+        let Some(id) = h.id() else {
+            continue;
+        };
+        let live = cur.harness_settings(h).clone();
+        let row = incoming
+            .harness
+            .entry(id.to_string())
+            .or_insert_with(|| live.clone());
+        row.last_seen = live.last_seen;
+        row.last_verified = live.last_verified;
+        row.auto_verify = live.auto_verify;
+    }
+    // A row for a harness this build does not know can only have come from the
+    // file, through `cur`; keep it whole rather than letting a window snapshot
+    // that never showed it decide its shape.
+    for (id, live) in &cur.harness {
+        if crate::harness::HarnessId::from_id(id).is_none() {
+            incoming.harness.entry(id.clone()).or_insert_with(|| live.clone());
+        }
+    }
     *cur = incoming;
+    // V40 review M-1: the declared parse boundary, on the IPC write path too.
+    // The Settings window can post an out-of-enum `SettingKind::Enum` value or a
+    // non-object `Json` block (its generic form has an `{:else}` branch), and
+    // without this the wrong-typed value would live in memory — and in the file
+    // it is saved to — until some later out-of-band read repaired it.
+    cur.normalize_harness_settings();
     // Keep the reserved feature tabs (Code Graph monitor / Workbench / ...)
     // present-iff-enabled in the persisted list.
     crate::settings::reconcile_reserved_tabs(cur);
@@ -1387,10 +1559,12 @@ fn apply_incoming_settings(cur: &mut Settings, mut incoming: Settings) {
     // it and the registry supplies the manifest default — which is what made the
     // old top-up (`reconcile_audit_tools`, appending missing built-ins to a
     // persisted array) unnecessary rather than merely moved.
-    // V21: when OpenCode local-llama auto-sync is on and the local server is
-    // enabled, re-derive the provider snapshot if the primary Local command
-    // changed (no-op otherwise), so the OpenCode tab tracks command edits.
-    cur.offload.sync_opencode_provider_on_save();
+    // V21: when a harness declares a config writer that tracks cImp's own
+    // offload command, re-derive its snapshot if the primary Local command
+    // changed (no-op otherwise). V40 Phase B moved the two settings behind the
+    // OpenCode plugin, so this calls the plugin's own sync rather than a method
+    // on `OffloadSettings` named after one harness.
+    crate::harness::opencode::settings::sync_provider_on_save(cur);
 }
 
 #[tauri::command]
@@ -1521,13 +1695,19 @@ pub async fn settings_update(
     // consumer names whose spawn injection changed.
     let now_spawn_sig = crate::tabs::spawn_inject_sig(&now);
     if now_spawn_sig != was_spawn_sig {
-        let mut consumers: Vec<&'static str> = Vec::new();
-        if now_spawn_sig[0] != was_spawn_sig[0] {
-            consumers.push("claude");
-        }
-        if now_spawn_sig[1] != was_spawn_sig[1] {
-            consumers.push("opencode");
-        }
+        // Locked decision 8: iterate the map instead of reading slots 0 and 1.
+        // A positional pair meant a harness with no slot got NO restart hint
+        // when a spawn-baked setting changed — the exact failure the mechanism
+        // exists to prevent, and one that compiled. Phase A made it a
+        // registry-sized `PerHarness`; Phase B made it the
+        // `BTreeMap<HarnessId, Value>` the decision asks for, and folded every
+        // plugin's `spawn_baked` `ext` rows into it automatically, so the flag
+        // and its hint are one declaration.
+        let consumers: Vec<&'static str> = now_spawn_sig
+            .iter()
+            .filter(|(h, v)| was_spawn_sig.get(*h) != Some(*v))
+            .filter_map(|(h, _)| h.id())
+            .collect();
         // Best-effort UI hint — never fail the save over it.
         //
         // BOTH windows (#48, F-x). This used to target `main` only, whose
@@ -1673,16 +1853,52 @@ pub async fn offload_test(
         .await
 }
 
-/// V21: derive the OpenCode `local-llama` provider from a Local backend's
-/// server command (the Settings "Add to OpenCode" button). Pure — parses and
-/// validates only; the frontend persists the returned snapshot via
-/// `settings_update`. On a missing `--port` or model flag it errors with a
-/// message naming exactly what's absent, which the button surfaces verbatim.
+/// V21: derive a harness's local-provider block from a Local backend's server
+/// command (the Settings "Add to OpenCode" button). Pure — parses and validates
+/// only; the frontend persists the returned snapshot via `settings_update`. On a
+/// missing `--port` or model flag it errors with a message naming exactly what's
+/// absent, which the button surfaces verbatim.
+///
+/// **V40 Phase E (locked decision 26).** The body used to call
+/// `offload::server::derive_opencode_provider` — core holding one harness's
+/// config writer. It asks the registry now, through
+/// [`crate::harness::plugin::ConfigWriter`].
+///
+/// `harness` is optional for wire compatibility with the pre-V40 frontend: when
+/// it is absent the registry answers, and it **refuses if more than one harness
+/// declares a writer** rather than picking the first. A silently-chosen harness
+/// here would write one product's provider block into another's settings, which
+/// is precisely the class of defect this milestone removes. The Settings section
+/// passes the id explicitly once decision 27 lands.
 #[tauri::command]
-pub async fn offload_derive_opencode_provider(
+pub async fn offload_derive_local_provider(
+    harness: Option<String>,
     server_command: String,
-) -> AppResult<crate::settings::OpencodeLocalProvider> {
-    crate::offload::server::derive_opencode_provider(&server_command)
+) -> AppResult<crate::settings::LocalProviderBlock> {
+    let writers: Vec<crate::harness::HarnessId> = match harness.as_deref().map(str::trim) {
+        Some(h) if !h.is_empty() => vec![crate::harness::HarnessId::from_id(h).ok_or_else(|| {
+            crate::error::AppError::Offload(format!("{h:?} names no registered harness"))
+        })?],
+        _ => crate::harness::registry::all()
+            .filter(|h| h.plugin().is_some_and(|p| p.config_writer().is_some()))
+            .collect(),
+    };
+    let [only] = writers[..] else {
+        return Err(crate::error::AppError::Offload(format!(
+            "which harness should this provider be written for? {} of them accept one — name it",
+            writers.len()
+        )));
+    };
+    let writer = only
+        .plugin()
+        .and_then(|p| p.config_writer())
+        .ok_or_else(|| {
+            crate::error::AppError::Offload(format!(
+                "{} is not configured through a provider block cImp writes",
+                only.label()
+            ))
+        })?;
+    writer.derive_local_provider(&server_command)
 }
 
 /// V8-03: aggregate offload-service status — the honest global in-flight
@@ -3042,6 +3258,51 @@ fn count_hideable_tool_calls(
         .count() as u64
 }
 
+/// Every registered harness's [`crate::advisor::DriftSignals`], for one advisor
+/// poll (V40 Phase C, locked decision 23).
+///
+/// The version half — `last_seen`, `last_verified`, `auto_verify` — is genuinely
+/// per harness: it comes out of `Settings::harness[<id>]`, which Phase B made a
+/// map, so a second harness gets a real `drift.version.v1` path for the first
+/// time.
+///
+/// **The SESSION half is per harness too since V40 Phase D** (locked decision
+/// 20). It used to be filled for the default harness only, with zeros for every
+/// other, because the queries behind it had one agent literal inside them —
+/// `drift.usage_fields_gone.v1` therefore never tripped its sample floor for a
+/// second harness, and a rule that cannot fire looks exactly like a rule that
+/// found nothing. `sessions` / `tokenless_sessions` now come from
+/// `GraphIndex::tokenless_sessions(agent)` run once per registered harness, and
+/// `subagent_drift` from the Activity rows each plugin declares it files
+/// (`drift_report_tools`). A harness whose reader files no drift reports gets an
+/// empty list — the truth, rather than a zero-fill that looks like one.
+fn harness_drift_signals(
+    sessions: &std::collections::BTreeMap<crate::harness::HarnessId, (u64, u64)>,
+    subagent_drift: &std::collections::BTreeMap<crate::harness::HarnessId, Vec<String>>,
+) -> crate::advisor::HarnessDriftSignals {
+    let map = crate::settings::read_global_harness_map();
+    crate::harness::registry::all()
+        .map(|id| {
+            let row = map
+                .get(id.token())
+                .cloned()
+                .unwrap_or_else(|| crate::settings::read_global_harness_settings(id));
+            let (sessions, tokenless_sessions) = sessions.get(&id).copied().unwrap_or((0, 0));
+            (
+                id,
+                crate::advisor::DriftSignals {
+                    last_seen: row.last_seen,
+                    last_verified: row.last_verified,
+                    auto_verify: row.auto_verify,
+                    sessions,
+                    tokenless_sessions,
+                    subagent_drift: subagent_drift.get(&id).cloned().unwrap_or_default(),
+                },
+            )
+        })
+        .collect()
+}
+
 /// V14 Phase D2: the budget-tuning advisor's current proposals for `root`.
 /// Assembled fresh on every call from `GraphService`'s D2.1 signal getters —
 /// cheap (bounded Datalog queries + a small in-memory scan), no caching
@@ -3095,8 +3356,7 @@ fn advisor_snapshot_blocking(
     // count `advisor_reread_rate` just scanned for — reuse its sample count
     // instead of a second identical Datalog scan.
     let remind_count = advisor_reread_samples;
-    let (large_reread_pairs, claude_sessions, claude_tokenless_sessions) =
-        graph.drift_db_signals(&root);
+    let (large_reread_pairs, sessions_by_harness) = graph.drift_db_signals(&root);
     // One clone of the activity ring serves both the bypass-rate signal and
     // the contract-drift filter.
     let activity = crate::activity::snapshot();
@@ -3110,14 +3370,28 @@ fn advisor_snapshot_blocking(
         .filter(|e| e.source == "harness" && e.tool == "contract_drift" && e.ts_ms >= since)
         .map(|e| e.target.clone())
         .collect();
-    // V17.1: sub-agent transcript-contract drift reports from the Claude OOB
-    // tap (see `oob::claude::report_subagent_drift`) — same channel
-    // discipline as the shims' contract_drift events above.
-    let subagent_drift: Vec<String> = activity
-        .iter()
-        .filter(|e| e.source == "harness" && e.tool == "subagent_drift" && e.ts_ms >= since)
-        .map(|e| e.target.clone())
-        .collect();
+    // V17.1: sub-agent transcript-contract drift reports filed by a harness's
+    // own reader — same channel discipline as the `contract_drift` events
+    // above. V40 Phase D: attributed to the harness that files them, which each
+    // plugin declares (`drift_report_tools`), because the rule that reads them
+    // runs per harness. A harness whose reader files none has an empty list —
+    // which is the truth, not a zero-fill.
+    let subagent_drift_by_harness: std::collections::BTreeMap<crate::harness::HarnessId, Vec<String>> =
+        crate::harness::registry::all()
+            .map(|h| {
+                let tools = h.plugin().map(|p| p.drift_report_tools()).unwrap_or(&[]);
+                let rows = activity
+                    .iter()
+                    .filter(|e| {
+                        e.source == "harness"
+                            && e.ts_ms >= since
+                            && tools.contains(&e.tool.as_str())
+                    })
+                    .map(|e| e.target.clone())
+                    .collect();
+                (h, rows)
+            })
+            .collect();
 
     // V17 Phase E signals: RECENT calls to any lean-hidden tool in the Activity
     // ring (zero ⇒ the lean-surface rule may fire) and the measured advertised
@@ -3201,19 +3475,19 @@ fn advisor_snapshot_blocking(
         graph: settings.graph.clone(),
         dismissed: settings.advisor_dismissed.clone(),
         applied,
-        claude_last_seen: hv.claude_last_seen,
-        claude_last_verified: hv.claude_last_verified,
-        // V35 Phase F: read from the same fresh physical-global snapshot as the
-        // two versions above — the auto-verify worker writes all three
-        // out-of-band, so a record only a second old must be visible to the
-        // very next 2s advisor poll without a restart.
-        claude_auto_verify: hv.claude_auto_verify,
+        // V40 Phase C, locked decision 23: ONE ROW PER REGISTERED HARNESS,
+        // read from the same fresh physical-global snapshot (the auto-verify
+        // worker writes the version half out of band, so a record a second old
+        // must be visible to the very next 2 s advisor poll without a restart).
+        //
+        // Phase B moved the storage into `harness[<id>]` and left a note here
+        // saying the reader still took the DEFAULT harness's row because every
+        // V16 rule was written around Claude's payload shapes. The rules are
+        // per-harness now, so this is the whole map.
+        harness: harness_drift_signals(&sessions_by_harness, &subagent_drift_by_harness),
         remind_count,
         large_reread_pairs,
-        claude_sessions,
-        claude_tokenless_sessions,
         contract_drift,
-        subagent_drift,
         bypass_rate,
         bypass_samples,
         hideable_tool_calls,
@@ -3279,6 +3553,36 @@ pub struct HarnessStatus {
     /// A verify run is happening right now, so *Run checks now* is a no-op and
     /// the panel should keep polling.
     pub verify_in_flight: bool,
+    /// V40 Phase F (locked decision 27): the gated capability ids, keyed by the
+    /// neutral CONTROL each one gates (`harness::contract::GATED_CONTROLS`).
+    ///
+    /// The window used to hold one of these ids — a harness-namespaced hook
+    /// name — as a TypeScript constant so it could join on it. It looks the id
+    /// up here now, so a gate whose capability belongs to a harness reaches the
+    /// frontend as data rather than as a second spelling.
+    pub gated_controls: std::collections::BTreeMap<&'static str, &'static str>,
+}
+
+/// **Every registered harness, as the window sees it** (V40 Phase F, locked
+/// decisions 7, 11 and 27).
+///
+/// The one command the frontend learns the roster from: ids, labels, reserved
+/// tab ids, binaries, features, consumer token, the declared `ext` fields and
+/// the affordance strings. See [`crate::harness::info`] for the shape and for
+/// the committed fixture that keeps the TypeScript mirror honest.
+///
+/// Deliberately a SEPARATE command from [`harness_versions_get`], unlike the
+/// health panel that shares it: this answer is `'static` data that cannot go
+/// stale between calls, so there is no consistency argument for folding it in,
+/// and each window fetches it once at startup rather than on every poll.
+///
+/// It subsumes Phase B's `harness_settings_schema`, exactly as that command's
+/// doc comment said it would — the declared fields are one more column of the
+/// same row, and two commands would have meant two round trips the window had
+/// to keep in step.
+#[tauri::command]
+pub async fn harness_list() -> AppResult<Vec<crate::harness::info::HarnessInfo>> {
+    Ok(crate::harness::info::harness_list())
 }
 
 /// V16 Feature 1: the harness version + contract-verification state, read
@@ -3293,6 +3597,11 @@ pub async fn harness_versions_get(state: State<'_, AppState>) -> AppResult<Harne
     let versions = crate::settings::read_global_harness_versions();
     let mut settings = state.settings.current();
     settings.harness_versions = versions.clone();
+    // V40 Phase B: the versions, the auto-verify records and the recorded spike
+    // outcomes all live in `harness` now, and all three are written out of band
+    // — so the panel has to be computed against a FRESH read of that map for
+    // exactly the reason it already was for `harness_versions`.
+    settings.harness = crate::settings::read_global_harness_map();
     Ok(HarnessStatus {
         capability_gates: crate::harness::contract::gates(&settings),
         // V35 Phase G: computed against the SAME fresh-versions settings as the
@@ -3301,6 +3610,10 @@ pub async fn harness_versions_get(state: State<'_, AppState>) -> AppResult<Harne
         harness_health: crate::harness::health::health(&settings),
         verify_in_flight: crate::harness::verify::in_flight(),
         versions,
+        gated_controls: crate::harness::contract::GATED_CONTROLS
+            .iter()
+            .copied()
+            .collect(),
     })
 }
 
@@ -3332,19 +3645,89 @@ pub async fn harness_run_checks(harness: String) -> AppResult<bool> {
 }
 
 /// V16 Feature 1: the Advisor card's "Mark verified" action — stamp the
-/// currently-seen Claude Code version as the last-verified one (the user
-/// just re-ran the MAINTENANCE.md contract checks). Also mirrors the change
-/// into the live settings so the open Settings window sees it without a
-/// restart.
+/// currently-seen version of `harness` as the last-verified one (the user just
+/// re-ran the MAINTENANCE.md contract checks). Also mirrors the change into the
+/// live settings so the open Settings window sees it without a restart.
+///
+/// **V40 Phase B: it takes a harness.** It used to write `claude_last_verified`
+/// with no argument at all, so the OpenCode row of the health panel had no
+/// action that could ever clear it. `None` is the DEFAULT harness — the
+/// documented wire-compatibility default (locked decision 22), which keeps the
+/// existing frontend call site working unchanged until Phase F passes the id
+/// the button sits under.
 #[tauri::command]
-pub async fn harness_mark_verified(state: State<'_, AppState>) -> AppResult<()> {
-    let after = crate::settings::mutate_global_harness_versions(|hv| {
-        hv.claude_last_verified = hv.claude_last_seen.clone();
+pub async fn harness_mark_verified(
+    state: State<'_, AppState>,
+    harness: Option<String>,
+) -> AppResult<()> {
+    let id = match harness.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(name) => crate::harness::HarnessId::from_id(name).ok_or_else(|| {
+            AppError::Ipc(format!("harness_mark_verified: {name:?} is not a harness"))
+        })?,
+        None => crate::harness::DEFAULT_HARNESS,
+    };
+    let after = crate::settings::mutate_global_harness(id, |row| {
+        row.last_verified = row.last_seen.clone();
     })?;
-    state
-        .settings
-        .mutate(move |cur| cur.harness_versions = after);
+    let key = id.token().to_string();
+    state.settings.mutate(move |cur| {
+        cur.harness.insert(key.clone(), after.clone());
+    });
     Ok(())
+}
+
+/// **The model-visible text one tab's harness receives**, keyed by slot (V40
+/// Phase E, locked decision 24).
+///
+/// The compose overlay is the first consumer: it appends one instruction line
+/// after the `[image] <path>` lines it types into the tab, and that line used to
+/// be a literal in `compose/attachments.ts` — a string the model reads that
+/// nothing in the backend inventory could see, and that no harness could
+/// influence. It comes over this command now.
+///
+/// `tab` is a tab id; a tab that runs no registered harness (or an unknown id)
+/// gets the NEUTRAL rendering, which is a real answer rather than a failure —
+/// the same posture `instructions::all_for` takes.
+#[tauri::command]
+pub async fn harness_instructions(
+    state: State<'_, AppState>,
+    tab: Option<String>,
+) -> AppResult<std::collections::BTreeMap<String, String>> {
+    let settings = state.settings.current();
+    let harness = tab
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .and_then(|t| crate::tabs::tab_harness_by_id(&settings, t));
+    Ok(crate::harness::instructions::all_for(harness)
+        .iter()
+        .map(|i| (i.slot.id().to_string(), i.text.to_string()))
+        .collect())
+}
+
+/// **The advisor's rule reference** (V40 Phase F, locked decision 23).
+///
+/// The Code Intelligence panel used to hold this table as a hard-coded tooltip
+/// — a restatement of thresholds `advisor.rs` owns, with one harness's
+/// mechanisms named in it for rules that fire per registered harness. It
+/// renders this instead.
+///
+/// `'static` data; the window fetches it once when the panel first opens.
+#[tauri::command]
+pub async fn advisor_rules() -> AppResult<AdvisorRules> {
+    Ok(AdvisorRules {
+        rules: crate::advisor::RULE_REFERENCE.to_vec(),
+        footer: crate::advisor::RULE_REFERENCE_FOOTER,
+    })
+}
+
+/// The answer [`advisor_rules`] gives.
+#[derive(serde::Serialize)]
+pub struct AdvisorRules {
+    /// One row per rule, in the order the reference lists them.
+    pub rules: Vec<crate::advisor::RuleReference>,
+    /// The one sentence that is about the panel rather than about a rule.
+    pub footer: &'static str,
 }
 
 /// V14 Phase D2: dismiss one advisor proposal (`rule_id` + its coarse rate
@@ -4106,6 +4489,75 @@ mod tests {
     use crate::settings::{PromptTemplate, Settings};
     use crate::state::{ReadOnlySource, TabId};
 
+    /// **"No quota source" and "records no turns" are two answers, and this
+    /// command gives both** (V40 Phase G, locked decision 19).
+    ///
+    /// The regression this pins is the one the phase exists to remove: the
+    /// declared token categories and turn lanes used to hang off `source`, so a
+    /// harness that reports no quota was also declared to record no turns — and
+    /// the Usage donut had no labels for its sessions' lanes. Live-verify 14
+    /// reads the FIRST half of this (a harness answering *no usage source*, not
+    /// a widget at 0%), so both halves are asserted together.
+    ///
+    /// Names no product: the two harnesses are picked out of the registry by
+    /// what they DECLARE, which is what locked decision 10(a) asks of core.
+    #[tokio::test]
+    async fn harness_usage_reports_a_turn_shape_independently_of_a_quota_source() {
+        let mut quota_only = 0usize;
+        let mut turns_without_quota = 0usize;
+        for id in crate::harness::registry::all() {
+            let answer = super::harness_usage(id.token().to_string())
+                .await
+                .expect("a registered harness answers");
+            let plugin = id.plugin();
+            let has_source = plugin.and_then(|p| p.usage_source()).is_some();
+            let has_shape = plugin.and_then(|p| p.turn_usage_shape()).is_some();
+            assert_eq!(
+                answer.source.is_some(),
+                has_source,
+                "{id}: the `source` half must mirror the declaration exactly"
+            );
+            assert_eq!(
+                !answer.origins.is_empty(),
+                has_shape,
+                "{id}: the lanes must arrive whenever a turn shape is declared"
+            );
+            assert_eq!(
+                !answer.token_kinds.is_empty(),
+                has_shape,
+                "{id}: the categories must arrive whenever a turn shape is declared"
+            );
+            if has_source {
+                quota_only += 1;
+                // The quota half carries WINDOWS and nothing else now.
+                assert!(!answer.source.as_ref().unwrap().windows.is_empty());
+            }
+            if has_shape && !has_source {
+                turns_without_quota += 1;
+                // Exactly the case that was unrepresentable: no quota widget at
+                // all, and still a labelled lane split for its stored rows.
+                assert!(answer.reading.is_none(), "{id}: no source can produce no reading");
+                assert!(
+                    answer.origins.iter().any(|o| o.subagent),
+                    "{id}: it rolls a child session's spend up, so it declares the lane"
+                );
+            }
+        }
+        assert!(quota_only > 0, "no harness declares a quota source at all");
+        assert!(
+            turns_without_quota > 0,
+            "no harness records turns without reporting quota — if that becomes true, this \
+             command's independence has no live example and the two fields can silently \
+             re-couple"
+        );
+    }
+
+    /// An unregistered harness id REJECTS rather than answering an empty shape.
+    #[tokio::test]
+    async fn harness_usage_rejects_an_unregistered_harness() {
+        assert!(super::harness_usage("not-a-harness".to_string()).await.is_err());
+    }
+
     /// **The facade knobs are a NARROW write** (V39 review M-10).
     ///
     /// The popover's old path sent the whole `Settings` document, which can
@@ -4592,7 +5044,11 @@ mod tests {
             ActivityKind::Graph,
             ts_ms,
             "root".to_string(),
-            "claude".to_string(),
+            // An opaque source tag: this test is about the RECENCY window, and
+            // `ActivityEntry::source` is a persisted free string (locked
+            // decision 29). Asking the registry keeps it a real one without
+            // hard-coding which harness happens to be first.
+            crate::harness::DEFAULT_HARNESS.token().to_string(),
             "graph_cycles".to_string(),
             "target".to_string(),
             0,

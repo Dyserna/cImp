@@ -296,7 +296,7 @@ pub async fn dispatch(
             // no reason to abandon itself — the executor below simply does not
             // start until it is done. The pre-tool budget exists only where a
             // caller stops waiting while the agent's tool runs anyway
-            // (`loopback::TOOL_CHECKPOINT_BUDGET`). The returned "did it settle"
+            // (`harness::ingress::hook_reply_budget()`). The returned "did it settle"
             // flag has no consumer here for the same reason: there is no miss
             // this seam can produce.
             let _ = cp

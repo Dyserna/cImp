@@ -141,11 +141,15 @@ impl Screen {
         let mut total: usize = 0;
         for row in self.rows.iter().rev() {
             let line = row.rendered();
-            // Count characters, not bytes: Claude's prompt chrome is full of
-            // multibyte glyphs (─ · ↑ ↓ em-dashes), and `String::len()` (bytes)
-            // would overcount by up to 3× per glyph, shrinking the captured tail
-            // to far fewer visible rows than `max_chars` implies and pushing a
-            // multi-row permission prompt's marker out of the window.
+            // Count characters, not bytes. `String::len()` (bytes) would
+            // overcount a multibyte glyph by up to 3x, shrinking the captured
+            // tail to far fewer visible rows than `max_chars` implies and
+            // pushing a multi-row prompt's marker out of the window. WHOSE
+            // chrome is full of such glyphs is a fact about a harness's TUI and
+            // is recorded beside the markers it protects
+            // (`harness::claude::prompts`, V40 Phase C, locked decision 21);
+            // this window stays neutral machinery, and counting characters is
+            // the right rule for any of them.
             total += line.chars().count() + 1;
             parts.push(line);
             if total >= max_chars {

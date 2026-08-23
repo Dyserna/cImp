@@ -21,9 +21,11 @@
 use std::path::Path;
 
 use crate::settings::injection::NativeWebMode as NativeWebVisibility;
-use crate::settings::{AiToolTabConfig, Settings};
+use crate::error::{AppError, AppResult};
+use crate::offload::server;
+use crate::settings::{AiToolTabConfig, LocalProviderBlock, Settings};
 use crate::tabs::config::{
-    advertises_audit_to_opencode, compose_capability_guidance, consumer_hygiene_for,
+    compose_capability_guidance, consumer_hygiene_for,
     native_web_for,
 };
 
@@ -502,7 +504,7 @@ pub(crate) fn build_opencode_config(
                 }),
             );
         }
-        if advertises_audit_to_opencode(settings) {
+        if crate::harness::plugin::audit_advertised(settings, super::harness_plugin::me()) {
             mcp.insert(
                 "cimp-code-audit".to_string(),
                 serde_json::json!({
@@ -540,7 +542,7 @@ pub(crate) fn build_opencode_config(
     // `llama-server`'s OpenAI-compatible endpoint and points `model` at it so a
     // freshly opened tab is ready to work. `None` ⇒ no `provider`/`model` keys,
     // exactly as before (default install / never registered).
-    if let Some(provider) = settings.offload.resolve_opencode_provider() {
+    if let Some(provider) = super::settings::resolve_provider(settings) {
         if !provider.base_url.is_empty() && !provider.model.is_empty() {
             let mut options = serde_json::Map::new();
             options.insert(
@@ -652,3 +654,121 @@ mod tests {
     }
 }
 
+// ── the local-provider block (V40 Phase E, locked decision 26) ──────────────
+//
+// Moved verbatim from `offload/server.rs`, where it was the last OpenCode
+// config writer in core: a function that parses the offload server's own
+// command line and emits ONE harness's provider block. The parsing helpers it
+// uses stay in `offload/server.rs` — they read cImp's own llama-server command,
+// which is not this harness's business — and are `pub(crate)` for this caller.
+
+/// The [`ConfigWriter`] the descriptor hands core, so the "Add to OpenCode"
+/// button can ask *the harness* rather than call a function named after it.
+pub static WRITER: OpencodeConfigWriter = OpencodeConfigWriter;
+
+/// See [`WRITER`]. A ZST, like the plugin itself.
+pub struct OpencodeConfigWriter;
+
+impl crate::harness::plugin::ConfigWriter for OpencodeConfigWriter {
+    fn derive_local_provider(&self, server_command: &str) -> AppResult<LocalProviderBlock> {
+        derive_provider(server_command)
+    }
+}
+
+/// Derive the OpenCode `local-llama` provider from a Local backend's
+/// `server_command`. Requires an explicit `--port` and a model identifier
+/// (`--alias`/`-a`, else the `--model`/`-m` file basename); the host defaults
+/// to `127.0.0.1`. On a missing required flag, returns a self-contained error
+/// naming exactly what's absent so the Settings button can surface it verbatim.
+pub fn derive_provider(command: &str) -> AppResult<LocalProviderBlock> {
+    let tokens = shlex::split(command)
+        .ok_or_else(|| AppError::Offload("server command has unbalanced quotes".into()))?;
+    let mut it = tokens.into_iter();
+    let _program = it
+        .next()
+        .ok_or_else(|| AppError::Offload("server command is empty".into()))?;
+    let args: Vec<String> = it.collect();
+
+    let mut host = server::DEFAULT_HOST.to_string();
+    let mut port: Option<u16> = None;
+    let mut alias: Option<String> = None;
+    let mut model_path: Option<String> = None;
+    // One definition of "where the key is", shared with `resolve_local_auth`.
+    let api_key = server::api_key_from_args(&args);
+
+    let mut i = 0;
+    while i < args.len() {
+        let (key, inline) = server::split_flag(&args[i]);
+        match key {
+            "--host" => {
+                if let Some(v) = server::flag_value(inline, &args, &mut i) {
+                    host = server::normalize_host(&v);
+                }
+            }
+            "--port" => {
+                if let Some(v) = server::flag_value(inline, &args, &mut i) {
+                    if let Ok(p) = v.parse::<u16>() {
+                        port = Some(p);
+                    }
+                }
+            }
+            "-a" | "--alias" => {
+                if let Some(v) = server::flag_value(inline, &args, &mut i) {
+                    if !v.trim().is_empty() {
+                        alias = Some(v.trim().to_string());
+                    }
+                }
+            }
+            "-m" | "--model" => {
+                if let Some(v) = server::flag_value(inline, &args, &mut i) {
+                    if !v.trim().is_empty() {
+                        model_path = Some(v);
+                    }
+                }
+            }
+            // `--api-key` is read by `api_key_from_args` above, not here — one
+            // parser, two callers. It must still be *skipped* correctly so its
+            // value cannot be mistaken for a positional model path.
+            "--api-key" | "--api_key" => {
+                let _ = server::flag_value(inline, &args, &mut i);
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    let model = alias.or_else(|| model_path.as_deref().map(model_id_from_path));
+
+    // Collect every missing required param so the error names them all at once.
+    let mut missing: Vec<&str> = Vec::new();
+    if port.is_none() {
+        missing.push("--port");
+    }
+    if model.is_none() {
+        missing.push("a model (--model/-m or --alias/-a)");
+    }
+    if !missing.is_empty() {
+        return Err(AppError::Offload(format!(
+            "can't register the OpenCode local-llama provider: the server command is missing {}.",
+            missing.join(" and ")
+        )));
+    }
+
+    Ok(LocalProviderBlock {
+        base_url: format!("http://{host}:{}/v1", port.expect("port present")),
+        model: model.expect("model present"),
+        api_key,
+        source_command: command.to_string(),
+    })
+}
+
+/// The OpenCode model id for a `--model` path: the file name with any leading
+/// directory and a trailing `.gguf` removed
+/// (`…/Qwen3.6-35B-A3B-Q4.gguf` → `Qwen3.6-35B-A3B-Q4`).
+pub(crate) fn model_id_from_path(path: &str) -> String {
+    let base = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    base.strip_suffix(".gguf")
+        .or_else(|| base.strip_suffix(".GGUF"))
+        .unwrap_or(base)
+        .to_string()
+}

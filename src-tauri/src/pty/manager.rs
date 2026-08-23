@@ -541,10 +541,21 @@ impl PtyManager {
                 },
             )
         });
-        // OpenCode's event stream authoritatively drives Thinking/Idle, so the
-        // processor must not also run its byte-burst activity fallback.
-        let oob_drives_activity =
-            matches!(spec.oob, Some(crate::harness::OobSpec::OpenCodeEvent { .. }));
+        // V40 Phase D (locked decision 18): how this tab's harness reports
+        // being busy, asked of the harness. This used to be
+        // `matches!(spec.oob, Some(OobSpec::OpenCodeEvent { .. }))` — core
+        // testing for ONE harness's transport to decide whether to run a TUI
+        // heuristic tuned to ANOTHER harness's spinner.
+        //
+        // A tab with no registered harness (a shell tab, a command nothing
+        // claims) gets `OutOfBand`, i.e. no inference at all: see
+        // `ActivitySource`'s docs for why a missing declaration must not
+        // inherit somebody else's timings.
+        let activity = spec
+            .harness
+            .and_then(|h| h.plugin())
+            .map(|p| p.activity_source())
+            .unwrap_or(crate::harness::plugin::ActivitySource::OutOfBand);
 
         tasks::spawn_reader(
             reader,
@@ -562,7 +573,7 @@ impl PtyManager {
             state_signals.clone(),
             settings,
             patterns,
-            oob_drives_activity,
+            activity,
         );
         tasks::spawn_waiter(
             tab.clone(),
@@ -1047,7 +1058,8 @@ mod tests {
             state_tx,
             settings,
             patterns,
-            false,
+            // A shell tab: nothing infers activity for it.
+            crate::harness::plugin::ActivitySource::OutOfBand,
         );
 
         // Bytes before the rebind. The processor's flush tick is 50ms;
@@ -1112,7 +1124,8 @@ mod tests {
             state_tx,
             settings,
             patterns,
-            false,
+            // A shell tab: nothing infers activity for it.
+            crate::harness::plugin::ActivitySource::OutOfBand,
         );
 
         // Three rapid rebinds. The last channel is the one whose buffer

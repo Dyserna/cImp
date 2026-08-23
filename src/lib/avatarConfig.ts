@@ -101,12 +101,28 @@ export function isVideoSrc(src: string): boolean {
 // `{ tile, animations: { "<name>": { slug, category, frames: [{file, hold_ms}] } } }`)
 // plus one frame subfolder per animation.
 
-/// Sprite sets that ship bundled under `sprites/`. Unknown values fall back to
-/// `impSprites` (the cImp default mascot) so a stale/typo'd setting never
-/// leaves the overlay blank. Add new bundled sets here (and drop the folder
-/// under `sprites/`). `claudeSprites` (Clawd) stays selectable.
-const KNOWN_SPRITE_SETS = new Set(['impSprites', 'claudeSprites']);
-const FALLBACK_SPRITE_SET = 'impSprites';
+/// Sprite sets that ship bundled under `sprites/`, with the name the Settings
+/// picker shows.
+///
+/// **The one place a bundled set is named.** V40 Phase F moved the picker's
+/// `<option>` list here so the Settings window enumerates this instead of
+/// spelling the folder names again; the id is the folder under `sprites/`, so
+/// adding a set is a row here plus the folder.
+///
+/// Locked decision 29 rules these BRAND ASSETS rather than harness identity:
+/// a mascot named after a product depends on no harness, cImp ships it as an
+/// image, and renaming it would be a settings migration for no gain. That is
+/// why this file is on the frontend identity allowlist and nothing else here
+/// needs to be.
+export const SPRITE_SETS: readonly { id: string; label: string }[] = [
+  { id: 'impSprites', label: 'cImp (pixel art)' },
+  { id: 'claudeSprites', label: 'Claude (pixel art)' },
+] as const;
+
+/// Unknown values fall back to the first bundled set so a stale or typo'd
+/// setting never leaves the overlay blank.
+const KNOWN_SPRITE_SETS = new Set(SPRITE_SETS.map((s) => s.id));
+const FALLBACK_SPRITE_SET = SPRITE_SETS[0].id;
 
 export function spriteSetName(set: string): string {
   return KNOWN_SPRITE_SETS.has(set) ? set : FALLBACK_SPRITE_SET;

@@ -562,7 +562,7 @@ function locationSuffix(row: FindingRow): string {
 }
 
 /// The clipboard markdown for the selected findings — agent-ready to paste into
-/// a Claude Code / OpenCode prompt. Uses the REAL Diag severity names
+/// an AI tab's prompt. Uses the REAL Diag severity names
 /// (error|warning|note), project-relative paths, and the true total (`M`) in
 /// the header even though only `N` rows are copied. `rows` should already be in
 /// display order (pass `selectedRows(sortedVisible, …)`).

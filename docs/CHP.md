@@ -1,23 +1,27 @@
 # CHP — the cImp Harness Protocol
 
-**Protocol version:** `chp = 1`
+**Protocol version:** `chp = 2`
 
 **Status:** declared V35 Phase I (2026-08-16), issue #66; extended additively by
 V35 Phase J (2026-08-17), issue #67 — § 4.5 — and again by V35 Phase L
 (2026-08-17), issue #69 — § 4.6, which realizes three of the six reserved
 read-path events and makes `serves` load-bearing. Extended additively once more
-on **2026-08-17 (Claude Code 2.1.233)**: the two beacon hooks moved off
-`type: "command"` and `PostToolUseFailure` was wired — three new routes in § 4.5,
-no new events. This document is the wire contract;
+on **2026-08-17**: two beacon capabilities moved from a command transport to a
+harness's own HTTP ingress, and a tool-failure entry was wired — new routes in
+§ 4.5, no new events. **V40 Phase C took `chp` to 2** and V40 Phase D wired the
+first three of its producers (§ 5). This document is the wire contract;
 `src-tauri/src/harness/chp.rs` is the code half, and `harness::chp::CHP_VERSION`
 is checked equal to the version above by
 `harness::chp::tests::the_doc_states_this_version`. The two move in one commit
 or neither.
 
-**`chp` stays at 1 through all of it.** Nothing on the wire changed shape: the
-routes in § 4.2 carry the same bodies from the same senders, and § 4.5's
-Claude-native ingress is *additive* — new routes, new meaning, per compatibility
-rule 4. What changed is who sends them.
+**`chp` went 1 → 2 for vocabulary additions only.** Nothing already on the wire
+changed shape: the routes in § 4.2 carry the same bodies, and every harness's
+own ingress (§ 4.5) is *additive* — new routes, new meaning, per compatibility
+rule 4. The one consequence is the intended one: **a tab opened before the
+upgrade reports `old_plugin` until it is restarted** (§ 6.1). That is true — its
+generator had never heard of the new events — and it is precisely the mismatch
+the field exists to make legible.
 
 Design: [DESIGN-harness-plugin-architecture.md](DESIGN-harness-plugin-architecture.md)
 (§ 2 the four layers, § 3 D1/D3/D4/D5, § 7 step 1) and
@@ -28,12 +32,11 @@ Design: [DESIGN-harness-plugin-architecture.md](DESIGN-harness-plugin-architectu
 
 ## 1. What CHP is, and what it is not
 
-CHP is **the wire both harnesses have already been speaking**, given a name and
-a version. `context_hook.rs` and the generated OpenCode plugin have posted the
-same harness-neutral body to the same loopback routes since V10; `agent` has
-been the discriminator all along. Phase I documents that reality, stamps a
-version on it, and adds one route (`/session/hello`). It changes **no
-behavior**.
+CHP is **the wire the shipped harnesses have already been speaking**, given a
+name and a version. Both harnesses' generated artifacts have posted the same
+harness-neutral body to the same loopback routes since V10; `agent` has been the
+discriminator all along. Phase I documents that reality, stamps a version on it,
+and adds one route (`/session/hello`). It changes **no behavior**.
 
 CHP is **not** a public extension point. cImp does not load harness plugins it
 did not ship (milestone locked decision 10): a new harness is a PR adding
@@ -89,8 +92,17 @@ the route's own.
 | Field | Type | Meaning |
 |---|---|---|
 | `chp` | integer | The protocol version the sender speaks. **Additive and tolerated-absent** — absent means *pre-CHP* (treated as `chp = 0`) and is never rejected. |
-| `agent` / `consumer` | string | The harness discriminator: `claude` or `opencode`. **Two spellings exist on the live wire** — see below. |
-| `tab` | string | The cImp tab id the sender was spawned for. Baked into the artifact at spawn; a hook payload never carries one. |
+| `agent` / `consumer` | string | The harness discriminator: **a registered harness id** — the `id` of a `HarnessDescriptor` in `harness/registry.rs`, resolved through `HarnessId::from_id` / `from_consumer`. Never a closed enum: a harness is added by adding a descriptor row, and this field's value space widens with it. **Two spellings exist on the live wire** — see below. |
+| `tab` | string | The cImp tab id the sender was spawned for. Baked into the artifact at spawn; a harness's own native payload never carries one (§ 4.5). |
+
+**An unregistered id is refused, not defaulted.** `HarnessId::from_id` and
+`from_consumer` answer `None` for a token no descriptor declares, and every
+consumer of that answer treats `None` as a refusal rather than as a fall-back to
+some named product: `graph::mcp::source_for_consumer` answers
+`UNKNOWN_SOURCE` (which filters to no sessions), the routes that *require*
+identity refuse, and `cimp --consumer <unknown>` fails the proxy start naming
+the registered list. The one exception is an **absent** discriminator, which is
+a different question with a different answer — see § 3.1.
 
 ### 3.1 `agent` vs `consumer` — documented, not redesigned
 
@@ -106,13 +118,30 @@ envelope reader (`chp::Envelope::agent_token`) accepts either. A future phase
 may converge them — as an additive `agent` alias with `consumer` still accepted,
 never as a swap.
 
+**An absent discriminator resolves to `harness::DEFAULT_HARNESS`**, and that is
+a compatibility statement with an expiry date rather than a default harness:
+*a body with no identity on this wire came from a build old enough that only one
+product could have sent it.* It is one named constant with that rationale
+attached (it replaced thirteen `unwrap_or` literals), and **new code does not get
+to use it** — a route that can carry an identity must require one. Two routes
+invert it, and the asymmetry is load-bearing rather than tidy: a plugin claims
+them through `HarnessPlugin::legacy_wire_default_routes()` because only one
+harness has ever posted to them at all, so reading them as the default harness
+would attribute one product's tool gate to another's tab.
+`ingress::tests::every_inverted_wire_default_names_a_route_that_exists` fails
+the build if such a claim names a route nothing serves, or resolves to a harness
+other than the claimant.
+
 ### 3.2 `tab` is the identity, and it is baked
 
-No harness hands its extension a cImp tab id. Claude Code's hook payload carries
-`session_id` and `cwd`; OpenCode's plugin input carries `directory` and a
-session id. So `--tab <id>` is baked into every shim's argv and `CIMP_TAB_ID` is
-baked into every generated plugin, at spawn. **This is what makes the artifact
-spawn-baked**, and therefore what makes `chp` necessary (§ 6).
+No harness hands its extension a cImp tab id — a harness's own payload names
+its session and its working directory, and nothing that identifies a cImp tab.
+So the tab id is **baked into the artifact at spawn**, by whatever mechanism
+that harness's plugin uses to carry values into it (argv, an environment
+variable, a substituted template slot). **This is what makes the artifact
+spawn-baked**, and therefore what makes `chp` necessary (§ 6). Where a harness's
+ingress carries the whole envelope outside the body instead, it says so itself —
+`HarnessPlugin::identity_of_request` (§ 4.5).
 
 A message with no `tab` is accepted and simply attributed to nothing — routes
 that need a scope resolve none and fail open.
@@ -128,7 +157,7 @@ per tab launch — exactly the spawn-baked moment worth stamping.
 
 ```json
 POST /session/hello
-{ "chp": 1,
+{ "chp": 2,
   "agent": "opencode",
   "tab": "opencode-1",
   "harness_version": "1.18.13",
@@ -139,7 +168,7 @@ POST /session/hello
 | Field | Required | Notes |
 |---|---|---|
 | `chp` | no | Absent ⇒ pre-CHP. |
-| `agent` | no | Defaults to `claude` when absent, as every other route does. |
+| `agent` | no | A registered harness id (§ 3). Absent ⇒ `harness::DEFAULT_HARNESS`, as on every other route — the compatibility statement of § 3.1, not a guess. |
 | `tab` | **yes in practice** | A hello with no tab, or one naming a tab the user has not configured, is refused `400` and recorded nowhere. |
 | `harness_version` | no | The harness's own version. **Omitted by OpenCode today** — OpenCode exposes no version to a plugin at module scope, and inventing one would be cImp attesting to itself. See § 6.2. |
 | `serves` | no | CHP event ids (§ 5) this artifact will actually push, with its per-tab flags applied. |
@@ -155,15 +184,15 @@ the arbitration input. `cannot` is still purely descriptive, and deliberately:
 "this artifact will not push X" and "therefore the reader must" are the same
 statement, and one of them is enough to act on.
 
-**Claude Code sends a hello since Phase J.** Its L1 was five stateless shim
-binaries plus a spawn-baked `--settings` overlay, with nowhere to put a version
-or a declaration — which is why Phase I recorded "no hello yet" rather than
-faking one. Phase J's `SessionStart` hook is the hello: it POSTs to
-`/claude/hook/session_start` (§ 4.5) and the handler synthesizes exactly the
-record above, with `agent: "claude"`, `tab` and `chp` from headers, and
-`serves`/`cannot` from the `X-CIMP-Hello` header the generator baked in.
-`harness_version` stays **absent** for OpenCode's reason (§ 6.2): no documented
-hook-input field carries the CLI version, and cImp will not attest to itself.
+**A harness whose extension mechanism cannot POST a CHP body still sends a
+hello** — through its own ingress (§ 4.5), whose handler synthesizes exactly the
+record above from the envelope the request carries out-of-band plus a
+declaration its generator baked in. Both shipped harnesses send one, and
+`every_registry_entry_is_fully_wired` refuses to let a registered harness ship
+without declaring a `chp::EV_HELLO` at all: without a hello, Phase I's
+stale-artifact detection cannot cover its tabs and a capability's absence is
+indistinguishable from nobody having written it down. `harness_version` is
+absent from both of today's hellos, for the reason § 6.2 gives.
 
 ### 4.2 The push routes that exist today
 
@@ -172,24 +201,42 @@ Documented as they **actually are** on `develop`, field for field. The
 tab}`) is real but it is the shape of `/context/retrieve` specifically; the
 other routes carry their own bodies.
 
-Since Phase J the **Claude** sender of five of these is cImp's own handler for
-the corresponding `/claude/hook/*` route (§ 4.5), not a shim binary. The body is
-unchanged: the handler builds exactly what the deleted shim POSTed, and a
-pre-upgrade tab still POSTs it over the wire from the old binary. Both are
-listed, because both are live.
+**Two producer shapes reach these routes, and the table does not distinguish
+them** because the body is identical either way:
 
-| Event | Route | Sent by | Body (beyond the envelope) |
-|---|---|---|---|
-| `prompt` | `POST /context/retrieve` | `/claude/hook/user_prompt_submit`'s handler — or, from a pre-Phase-J tab, `cimp --context-hook` (claude); plugin `chat.message` (opencode) | `cwd`, `prompt`, `session_id` |
-| `context.compaction` | `POST /context/compaction` | `/claude/hook/pre_compact`'s handler (was `cimp --precompact-hook`) | `cwd`, `session_id`, `trigger` |
-| `context.should_read` | `POST /context/should_read` | `/claude/hook/pre_tool_use`'s handler (was `cimp --read-hook`) | `cwd`, `session_id`, `file_path`, `offset`, `limit` |
-| `context.post_edit` | `POST /context/post_edit` | `/claude/hook/post_tool_use`'s handler (was `cimp --postedit-hook`) (claude), plugin `tool.execute.after` (opencode) | `cwd`, `session_id`, `file_path`, `tool_name` |
-| `memory.event` | `POST /memory/event` | plugin `tool.execute.after` and `event` (opencode only) | tool form: `cwd`, `session_id`, `tool`, `args`, `parent_session_id?` · usage form: `kind: "usage"`, `msg_id`, `model`, `in_tok`, `out_tok`, `cache_read`, `cache_make` |
-| `permission.event` | `POST /permission/event` | `/claude/hook/notification`'s handler (was `cimp --notify-hook`) | `cwd`, `session_id`, `transcript_path`, `event`, `notification_type`, `message`, `tool_name` — **carries neither `agent` nor `tab`** (see § 4.4) |
-| `taint.beacon` | `POST /latch/beacon` | `/claude/hook/pre_tool_use_taint`'s handler — or, from a pre-2026-08-17 tab, `cimp --taint-beacon` (claude); plugin `tool.execute.before` (opencode) | `tool`, `cwd`, `session_id` |
-| `tool.gate` | `POST /latch/state` | plugin `tool.execute.before` (opencode only) | — (identity only, deliberately: the answer must not depend on what the caller claims about the tool) |
-| `checkpoint.pre_mutation` | `POST /workbench/tool_checkpoint` | `/claude/hook/pre_tool_use_checkpoint`'s handler (was `cimp --checkpoint-beacon`), plugin `tool.execute.before` (opencode) | `tool`, `cwd`, `session_id` |
-| `contract.drift` | `POST /activity/contract_drift` | every converted hook raises this report **in process** (same tokens, same ledger, same row); a pre-upgrade tab's own shim binary still POSTs it over the wire | `shim`, `missing`, `session_id` — **carries no `tab`**, so its reports are attributed by shim name, not by tab |
+* a harness's **generated artifact** POSTs the CHP body directly (the case for
+  any harness whose extension mechanism can make an HTTP request); or
+* the harness POSTs its own native payload to a route **its plugin registered**
+  (§ 4.5), and that plugin's handler builds the same body and reaches the same
+  core.
+
+Which of the two a given harness uses per event is that harness's declaration
+(`HarnessPlugin::routes()` and `chp_event_for_route()`), published in its plugin
+README's *CHP — event → route table*: for Claude Code,
+[`src-tauri/src/harness/claude/README.md`](../src-tauri/src/harness/claude/README.md#chp--event--route-table).
+Both shapes are live at once — a tab open across an upgrade may still be POSTing
+from the artifact an older build wrote — which is exactly why the two must land
+on one core per capability.
+
+| Event | Route | Body (beyond the envelope) |
+|---|---|---|
+| `prompt` | `POST /context/retrieve` | `cwd`, `prompt`, `session_id` |
+| `context.compaction` | `POST /context/compaction` | `cwd`, `session_id`, `trigger` |
+| `context.should_read` | `POST /context/should_read` | `cwd`, `session_id`, `file_path`, `offset`, `limit` |
+| `context.post_edit` | `POST /context/post_edit` | `cwd`, `session_id`, `file_path`, `tool_name` |
+| `memory.event` | `POST /memory/event` | tool form: `cwd`, `session_id`, `tool`, `args`, `parent_session_id?` · usage form: `kind: "usage"`, `msg_id`, `model`, `in_tok`, `out_tok`, `cache_read`, `cache_make`. **One of the two inverted wire defaults** (§ 3.1). |
+| `permission.event` | `POST /permission/event` | `cwd`, `session_id`, `transcript_path`, `event`, `notification_type`, `message`, `tool_name` — **carries neither `agent` nor `tab`** (see § 4.4). A legacy transport, kept because a pre-upgrade tab still posts to it. |
+| `taint.beacon` | `POST /latch/beacon` | `tool`, `cwd`, `session_id` |
+| `tool.gate` | `POST /latch/state` | — (identity only, deliberately: the answer must not depend on what the caller claims about the tool). **The other inverted wire default.** |
+| `checkpoint.pre_mutation` | `POST /workbench/tool_checkpoint` | `tool`, `cwd`, `session_id` |
+| `contract.drift` | `POST /activity/contract_drift` | `shim`, `missing`, `session_id` — **carries no `tab`**, so its reports are attributed by the reporting artifact's name, not by tab. A converted ingress route raises the same report **in process**, under the same token and into the same ledger. |
+
+The ledger those `contract.drift` rows are keyed by is **declared, not a core
+constant**: `HarnessPlugin::drift_vocabulary()` supplies one `&'static str`
+bucket per capability, and `harness::ingress::drift_tokens()` is the union over
+the registry — so the key space stays bounded by construction (a caller-supplied
+string can never become a key) while the names stay the harness's, because they
+name its hooks.
 
 ### 4.4 Where the live wire departs from the design's summary
 
@@ -200,13 +247,19 @@ naming. It is **not** true of the whole surface, and Phase I documents the
 reality rather than reshaping it:
 
 - **Two discriminator spellings** (`agent` and `consumer`) — § 3.1.
-- **`/permission/event` carries neither `agent` nor `tab`.** `notify_hook.rs`
-  posts the raw Claude notification payload plus `cwd`/`session_id` and nothing
-  else, so its events are attributed by session, not by tab. It is a
-  Claude-only route today, so the discriminator is implied.
+- **`/permission/event` carries neither `agent` nor `tab`.** It is the legacy
+  notification transport: the harness's raw notification payload plus
+  `cwd`/`session_id` and nothing else, so its events are attributed by session,
+  not by tab. Exactly one harness has ever posted to it, so the discriminator is
+  implied — and *that* is a declaration, not an inference: the route's owner
+  claims it through `legacy_wire_default_routes()` where the asymmetry matters
+  (§ 3.1).
 - **`/activity/contract_drift` carries no `tab` either** — a fact
   `loopback::contract_drift_row` already records honestly (`Unattributed`), and
-  the reason its reports are attributed to a capability by *shim name*.
+  the reason its reports are attributed to a capability by the **reporting
+  artifact's declared token** rather than by tab. Those tokens are the
+  harness's, from `HarnessPlugin::drift_vocabulary()`; the ledger and its bound
+  are core's.
 - **`/latch/state` carries no payload beyond identity**, on purpose: the answer
   must not depend on anything the caller claims about the tool it is about to
   run.
@@ -218,88 +271,66 @@ attributed to a peer, so `contract.drift` and `permission.event` contribute no
 `chp` observation. Neither is a loss — every tab that posts those also posts
 `/context/retrieve`.
 
-### 4.5 `POST /claude/hook/*` — the Claude-native ingress (Phase J)
+### 4.5 Harness-native ingress — routes a plugin registers
 
-**Additive extension, `chp` unchanged.** Twelve routes that take Claude Code's
-own hook-input JSON verbatim rather than a CHP body. They are not a second body
-shape on an existing route (compatibility rule 4 forbids that) and they are not
-in the § 5 vocabulary: they are a *transport* for events that already have ids.
+**Additive extension.** A harness whose extension mechanism cannot POST a CHP
+body — because what it emits is *its own* hook-input JSON — reaches cImp on
+routes **its own plugin registers**. Those routes are not a second body shape on
+an existing route (compatibility rule 4 forbids that) and they are not in the
+§ 5 vocabulary: they are a *transport* for events that already have ids.
 
-| Claude event | Route | CHP event it feeds | Answers |
-|---|---|---|---|
-| `UserPromptSubmit` | `POST /claude/hook/user_prompt_submit` | `prompt` | `hookSpecificOutput.additionalContext`, or `{}` |
-| `PreCompact` | `POST /claude/hook/pre_compact` | `context.compaction` | `hookSpecificOutput.additionalContext`, or `{}` |
-| `PreToolUse` (`Read`, `Bash`) | `POST /claude/hook/pre_tool_use` | `context.should_read` | `permissionDecision: "deny"` + reason, or `{}` |
-| `PostToolUse` (`Edit\|Write\|MultiEdit`) | `POST /claude/hook/post_tool_use` | `context.post_edit` | `hookSpecificOutput.additionalContext`, or `{}` |
-| `Notification`, `PermissionDenied` | `POST /claude/hook/notification` | `permission.event` | always `{}` (observe-only) |
-| `SessionStart` | `POST /claude/hook/session_start` | `hello` | always `{}` |
-| `Stop` | `POST /claude/hook/stop` | `assistant_text` (§ 4.6) | always `{}` (observe-only) |
-| `PostToolUse` (matcher `""`) | `POST /claude/hook/post_tool_use_result` | `session.tool_result` (§ 4.6) | always `{}` (observe-only) |
-| `PostToolUseFailure` (matcher `""`) | `POST /claude/hook/post_tool_use_failure` | **none of its own** — it is the errored half of `session.tool_result` (see below) | always `{}` (observe-only) |
-| `SubagentStart`, `SubagentStop` | `POST /claude/hook/subagent` | `session.subagent` (§ 4.6) | always `{}` (observe-only) |
-| `PreToolUse` (`WebFetch\|WebSearch`) | `POST /claude/hook/pre_tool_use_taint` | `taint.beacon` | always `{}` (report-only) |
-| `PreToolUse` (`Edit\|Write\|MultiEdit\|Bash`) | `POST /claude/hook/pre_tool_use_checkpoint` | `checkpoint.pre_mutation` | always `{}` (report-only) — **answered only after the snapshot is taken** |
+**Core registers none of them** (V40 Phase C, locked decisions 15 and 22).
+`HarnessPlugin::routes()` returns a `&'static [Route]` of `(method, path,
+handler)`; `offload/loopback.rs` matches every CHP-neutral arm **first** and
+falls through to `harness::ingress::route(method, path)` afterwards, so a plugin
+can neither shadow `/session/hello`, `/mcp/*` or the audit and push routes, nor
+add a route core does not reach. The handler answers a `HookReply` — a status
+and a body — which **core serializes without reading**, because "this harness
+answers hook-output JSON and that one answers `{"ok":true}`" is not something
+core may know. Four tests hold it: `no_two_plugins_claim_one_route` (a wire
+boundary may not depend on registry order), `no_plugin_route_shadows_a_core_route`,
+`every_declared_timeout_outlasts_the_budget` and
+`every_inverted_wire_default_names_a_route_that_exists`.
 
-**Minimum Claude Code: 2.1.63**, when `type: "http"` hooks shipped; the contract
-is verified unchanged through **2.1.233 (2026-08-17)**. Phase J is a hard switch —
-the overlay generates no command-hook fallback — so an older CLI gets hook entries
-it does not understand and every one of these capabilities is simply absent.
+Two further declarations travel with the routes:
 
-**Two of the twelve are newer than that floor**, and each degrades differently:
+* **`chp_event_for_route(route)`** — which § 5 event one of this harness's own
+  routes feeds. It is the join the quiet detector needs in order to speak about
+  *capabilities* rather than about transports: a harness whose payload cannot
+  carry a CHP envelope still reaches the same capability core, and this is what
+  says which.
+* **`identity_of_request(route, req)`** — see § 6.2. `None` (the default) means
+  *read the CHP envelope*, which is what core does for every ordinary caller.
 
-- `PostToolUseFailure` (the event itself is newer than 2.1.63) — a CLI without it
-  ignores the entry, so *failed* tool results go uncounted while successes keep
-  flowing. Nothing reports it: an absent hook event cannot.
-- the two beacon routes are not new upstream, only new here — they were
-  `type: "command"` shims (`cimp --taint-beacon`, `cimp --checkpoint-beacon`)
-  until 2026-08-17. **The migration is a tier change, not a transport preference:**
-  each rested on an *undocumented* behaviour (a hook that writes nothing and exits
-  0 is non-blocking including on timeout; the tool does not begin until the hook
-  process exits), and the http contract states both facts in writing. In
-  particular a `PreToolUse` http hook **blocks the tool call until the response** —
-  the documented mechanism that makes `permissionDecision: "deny"` expressible —
-  which is what turns "the checkpoint precedes the call" into a guarantee cImp can
-  enforce by awaiting the snapshot before it answers. Multiple `PreToolUse` entries
-  run in parallel and all must resolve before the tool starts, so the beacons do
-  not serialize against the read advisor. A tab open across the upgrade keeps its
-  old command hooks and gets neither beacon until it is restarted; the flags
-  survive in `main.rs` as stdin-draining tombstones, because a `cimp` that no
-  longer recognized one would fall through and launch a second GUI per web call.
+**The per-harness table — which of its events maps to which route, what each
+route answers, the CLI version floor it needs and how each capability degrades
+below it — lives with the plugin, not here.** For Claude Code:
+[`src-tauri/src/harness/claude/README.md` § *CHP — event → route table*](../src-tauri/src/harness/claude/README.md#chp--event--route-table).
+`POST /permission/event` (§ 4.2) is one of these registered routes too, kept
+because a pre-upgrade tab still posts to it; it carries neither `agent` nor
+`tab`, which is the same fact § 4.4 records.
 
-**The failure half maps to no CHP event on purpose.** Two ids that can never be
-declared independently are one id: the failure entry is emitted from the same
-per-tab boolean as the success entry, feeds the same core, the same consumer, the
-same drift token and the same `served` predicate, so there is no per-tab decision
-a second event could report (the same reasoning that keeps `session.usage` off
-*both* sides of Claude's hello). What a second mapping would cost is concrete —
-the quiet detector **resets** a served capability's counter on each push of it, so
-a rare failure push would silently rearm the detector watching the common success
-entry. Staleness observation is unaffected either way: a hook route's envelope
-rides headers and is read before the event join.
+**Fail-open, in HTTP terms, on every one of them.** A timeout, a refused
+connection and any non-2xx are **non-blocking**; a 2xx JSON body with no
+directive is a no-op. Blocking is expressible *only* as 2xx plus a decision
+field, which is why the read advisor is structurally unable to refuse a read by
+failing. Every handler answers a 2xx with an empty directive when it has nothing
+to say.
 
-**Identity rides headers, because a hook's body is the harness's.** cImp gets no
-field in the payload, so the envelope of § 3 is carried alongside it:
+**The reply budget is derived, not hand-set.** A harness declares how long its
+out-of-process caller waits before abandoning cImp's reply and starting the tool
+anyway (`HarnessPlugin::hook_reply_timeout()`; `None` = "never waits", and does
+not participate). Core takes `min(every declared timeout) −
+ingress::HOOK_REPLY_MARGIN` as the time it may spend before answering
+(`ingress::hook_reply_budget()` — 1800 ms with the two shipped plugins, pinned
+by a test). The ordering is the whole mechanism: the harness starts the tool the
+instant its own timer fires, so cImp's answer has to land first or the app is
+staging into a call it believes it gated. Each emitted entry pins its own
+timeout at generation rather than inheriting the harness's defaults.
 
-| Header | Meaning |
-|---|---|
-| `Authorization: Bearer $CIMP_HOOK_TOKEN` | The launch token, substituted by the harness from its own environment. The variable **must** be named in the entry's `allowedEnvVars` or it substitutes to the empty string; cImp sets it on the Claude child at spawn (`tabs::config::compose_ai_env`) rather than baking a literal into the `--settings` argv value. |
-| `X-CIMP-Tab` | § 3.2's baked tab id. Caller-asserted and validated against the user's configured Claude tabs before anything is recorded. |
-| `X-CIMP-Agent` | Always `claude`. |
-| `X-CIMP-Chp` | § 3's `chp`, substituted from `CHP_VERSION` at generation. |
-| `X-CIMP-Hello` | `SessionStart` only: `{"serves":[…],"cannot":[{id,why}…]}`, the § 4.1 declaration, computed from the booleans that decided what this tab's overlay actually wired. |
-
-**Fail-open, in HTTP terms.** The shims' contract was "print nothing, exit 0".
-The equivalent here is the harness's own: a timeout, a refused connection and any
-non-2xx are **non-blocking**; a 2xx JSON body with no directive is a no-op.
-Blocking is expressible *only* as 2xx plus a decision field, which is why the
-read advisor is structurally unable to refuse a read by failing. Every handler
-answers `200 {}` when it has nothing to say, and every emitted entry carries an
-explicit `timeout: 1` — the deleted shims' 600 ms budget, rounded up, pinned by a
-test rather than left to the harness's 600 s / 30 s defaults.
-
-**`terminalSequence` is never emitted.** It writes escape sequences into the PTY
-cImp renders; it is not a CHP capability, and a test asserts no handler produces
-one.
+**No handler emits a terminal control directive.** Writing escape sequences into
+the PTY cImp renders is not a CHP capability, and a test asserts no handler
+produces one.
 
 Not CHP, listed so the boundary is explicit: `/run`, `/graph_run`, `/audit/run`,
 `/mcp/list`, `/mcp/call` (MCP JSON-RPC — another protocol's body),
@@ -308,12 +339,13 @@ harness), `/describe`, `/events`, `/health`, `/status`.
 
 ### 4.6 The read path, pushed (Phase L)
 
-Design D2 retires the Tier-C read path — `harness/claude/read.rs` tailing
-transcript JSONL, `harness/opencode/read.rs` consuming SSE,
-`harness/claude/statusline.rs` parsing stdin — by having the harness push the
-same facts. **Phase L realized three of the six** routes Phase I reserved. `chp`
-stays at **1**: these are new routes with new meaning (compatibility rule 4),
-not a reshaping of anything already on the wire.
+Design D2 retires the Tier-C read path — each harness's fallback reader in
+`harness/<id>/read.rs`, plus the status-line stdin reader — by having the
+harness push the same facts. **Phase L realized three of the six** routes
+Phase I reserved, and left `chp` alone: these are new routes with new meaning
+(compatibility rule 4), not a reshaping of anything already on the wire. (The
+later bump to `chp = 2` is § 5's vocabulary addition, and likewise reshapes
+nothing.)
 
 | Event | Route | Status | Replaces |
 |---|---|---|---|
@@ -341,17 +373,20 @@ a stated reason is a fact, a deletion is a blank.
 
 ```json
 POST /session/assistant_text
-{ "chp": 1, "agent": "claude", "tab": "claude-1",
+{ "chp": 2, "agent": "claude", "tab": "claude-1",
   "text": "The complete final assistant message, as prose." }
 
 POST /session/tool_result
-{ "chp": 1, "agent": "claude", "tab": "claude-1",
+{ "chp": 2, "agent": "claude", "tab": "claude-1",
   "cwd": "C:/proj", "session_id": "…", "tool": "Read", "chars": 4211 }
 
 POST /session/subagent
-{ "chp": 1, "agent": "claude", "tab": "claude-1",
+{ "chp": 2, "agent": "claude", "tab": "claude-1",
   "agent_id": "agent_01…", "active": true }
 ```
+
+(`agent` is a registered harness id — § 3 — and these bodies are the same shape
+whichever harness sends them.)
 
 `text` is **prose, never markup or control**: the sender does not segment, and
 everything below `to_speakable` — escape stripping, markdown reduction, sentence
@@ -408,42 +443,31 @@ and declares so: a session may legitimately launch no sub-agents forever.
 
 #### Who produces these today
 
-**Claude, through § 4.5's native ingress**, because a hook's body is the
-harness's and cannot carry a CHP envelope:
+**One harness produces all three, through § 4.5's own-ingress routes**, because
+its hook body is the harness's own and cannot carry a CHP envelope. Which of its
+events feeds `assistant_text`, `session.tool_result` and `session.subagent` — and
+the two structural facts that come with that mapping — is published in that
+plugin's README:
+[`src-tauri/src/harness/claude/README.md` § *CHP — event → route table*](../src-tauri/src/harness/claude/README.md#chp--event--route-table).
 
-| Claude event | Route | CHP event it feeds |
-|---|---|---|
-| `Stop` | `POST /claude/hook/stop` | `assistant_text` |
-| `PostToolUse` (matcher `""`) | `POST /claude/hook/post_tool_use_result` | `session.tool_result` |
-| `PostToolUseFailure` (matcher `""`) | `POST /claude/hook/post_tool_use_failure` | `session.tool_result`, its errored half |
-| `SubagentStart`, `SubagentStop` | `POST /claude/hook/subagent` | `session.subagent` |
+Two properties of the mapping are protocol-level rather than per-harness, and
+they generalize to any harness that wires these:
 
-The tool-result entry is a **second `PostToolUse` matcher group pointing at a
-second route**, never a widening of the auto-check entry: Claude evaluates every
-matching group, so one shared route would run the project's checks twice and
-count one result twice.
-
-**And it needs a third entry, because `PostToolUse` fires only on success**
-(2026-08-17). Without `PostToolUseFailure`, a failed tool result reached cImp only
-through the transcript tail — which arbitration switches OFF on exactly the tabs
-that serve `session.tool_result`, so a serving tab lost every failure's size, and
-a failing `Bash` returns as much text as a succeeding one. The failure entry sizes
-its `error` field through the same `tool_result_chars` the success entry sizes
-`tool_result` with, because that is the function the transcript reader sizes a
-failed result's content with too — so the two paths report the same number for the
-same failure. It is gated on the same boolean as the success entry, and that
-coupling is load-bearing rather than tidy: the reader's tap is suppressed per
-CAPABILITY, so wiring one entry without the other would either lose failures or
-double-count them.
-
-**"Errored" here means exactly what it means in the transcript reader.** That
-reader keeps two readers over one `tool_result` block: one sizes every result
-including failures and never looks at `is_error`, the other exists solely to keep
-a failed result out of the session→commit provenance tap. The push path mirrors
-the first by construction and the second **structurally** — it carries a character
-count and never the result text, and provenance is mined only by the transcript
-reader, which is not arbitrated. There is nothing on this path for a failed result
-to leak into.
+* **A success entry and a failure entry are one capability, not two.** Where a
+  harness reports successful and failed tool results through different events,
+  both must be wired from the **same** per-tab flag and both must feed
+  `session.tool_result`. Arbitration suppresses the fallback reader per
+  *capability*, so wiring one without the other either loses every failure's size
+  or double-counts the successes. The failure half deliberately maps to **no CHP
+  event of its own**: two ids that can never be declared independently are one
+  id, and a second id would let a rare failure push reset the quiet detector that
+  is watching the common one.
+* **The push carries a size, never the result text.** `chars` and not content —
+  the consumer is usage accounting, whose estimated-token proxy has always been a
+  character count, and shipping the content would put an unbounded
+  model-influenced blob on the wire for a `u32`'s worth of information. It also
+  means a failed result has nothing on this path to leak into: session→commit
+  provenance is mined only by the fallback reader, which is not arbitrated.
 
 **OpenCode produces none of them, declares so, and keeps its SSE reader.** This
 is a Phase L outcome under design D6 ("a fallback contained and declared beats a
@@ -492,6 +516,48 @@ not broken" means here, and OpenCode is the standing example (§ 4.6).
 reserved *permanently until upstream changes*, for the reason § 4.6 gives: no
 hook payload carries token counts or a context window.
 
+**Optional, live since V40 Phase D (`chp = 2`):** `harness.output_started`
+(`POST /session/output_started`), `harness.output_stopped`
+(`POST /session/output_stopped`) and `subagents.active`
+(`POST /session/subagents_active`) — the activity edges. A harness that knows
+its own turn boundaries POSTs them instead of leaving cImp to infer them from
+the terminal, and each lands on the same core signal an in-process reader emits.
+All three are gated on the tab's own hello: pushing an edge a tab never declared
+does nothing, which is what keeps a pushing tab and cImp's TUI-marker heuristic
+from driving one avatar at the same time (§ 4.6's arbitration rule, applied to
+activity).
+
+**Optional, reserved (V40 Phase C, `chp = 2`):** `permission.detected`
+(`POST /permission/detected`), `permission.resolved`
+(`POST /permission/resolved`), `turn.usage` (`POST /session/turn_usage`) and
+`drift` (`POST /activity/drift`).
+
+Each names something cImp already knows, in a vocabulary that is currently one
+harness's:
+
+| Event | What it replaces | Status |
+|---|---|---|
+| `harness.output_started` / `harness.output_stopped` | the core activity-signal vocabulary, which was named after one product (`StateSignal::ClaudeOutput*`). The TUI-marker heuristic that infers the edges for a harness that does not report them stays, as a declared `ActivitySource` (V40 locked decision 18). | **live** — renamed `StateSignal::HarnessOutput*` and served over the wire since Phase D |
+| `subagents.active` | a core signal documented as "the count of in-flight sub-agents … emitted by the transcript tail" — one harness's mechanism stated as a core fact. | **live** — renamed `SubagentsActiveChanged` and served since Phase D. Distinct from `session.subagent`, which reports one sub-agent's lifecycle and lets cImp derive the edge. |
+| `permission.detected` / `permission.resolved` | the neutral half of prompt detection. Which notification type or TUI footer means a prompt is on screen is the harness's own grammar (`harness/<id>/prompts.rs` and that harness's own ingress); what reaches core is a `PermissionEdge` and a tab. `permission.event` above is unchanged and stays — it is the legacy notification transport, one harness's payload posted verbatim. | reserved |
+| `turn.usage` | one turn's reading, carrying the neutral `QuotaWindow` / `TokenKinds` / `TurnOrigin` types. Distinct from `session.usage`, which is the whole-session roll-up. | reserved |
+| `drift` | contract drift a *reader* reports — today an Activity row core writes on the reader's behalf, keyed by the reader's declared `drift_report_tools()` name. | reserved |
+
+**The `live` column is what tells the two apart.** The vocabulary is what L3
+gates against, so it is one list rather than a live half plus a design document.
+V40 Phase D wired the three activity producers; `is_push_route` answers `true`
+for their routes and `false` for the remaining four, so a POST to one of those is
+still a 404.
+
+### Why `chp` went to 2
+
+Vocabulary additions only. Every existing event, route and body keeps its shape,
+so an artifact written by a `chp = 1` build still speaks the whole of what it
+knew — nothing is refused, and § 6.1's staleness report is the entire
+consequence: a tab open across this upgrade reads as `old_plugin` until it is
+restarted, which is true (it cannot serve an event its generator had never heard
+of) and is precisely the mismatch the field exists to make legible.
+
 The table lives in code as `harness::chp::EVENTS` and is checked against this
 document by `harness::chp::tests::the_doc_documents_every_event`, so an id
 cannot exist in one and not the other.
@@ -523,44 +589,59 @@ Nothing is refused in any of the three. The whole value is that the mismatch is
 every `chp` value that ever shipped must keep being understood, precisely
 because a stale artifact is a normal state rather than an error.
 
-**Since Phase J, an absent `chp` from Claude IS staleness.** Phase I answered
-`false` from `harness::chp::expects_chp` for Claude because it shipped no
-CHP-speaking artifact — five shim binaries with nowhere to put a version. Phase J
-made the `--settings` overlay exactly such an artifact (`X-CIMP-Chp`, § 4.5), so
-that flipped to `true` and every Claude tab is now version-checked by the same
-code.
+**Whether an absent `chp` from a given harness counts as staleness is
+declared** — `HarnessDescriptor.expects_chp`, read by `harness::chp::
+expects_chp` (V40 Phase A). It answers *does cImp generate a CHP-speaking
+artifact for this harness?*, and it used to be a hard-coded disjunction over two
+names, which meant stale-artifact detection was silently OFF for any harness not
+spelled in it: a new harness would have shipped with the mechanism disabled and
+no diff saying so. Both shipped harnesses declare `true`.
 
-The immediate consequence is intended, not a false positive: **every Claude tab
-open across the Phase J upgrade reports `old_plugin` until it is restarted.** It
-really is running an overlay full of `cimp --context-hook` command hooks that
-this build no longer generates, and *restart the tab* really is the fix. Those
-tabs keep working, inert — the retired dispatch flags survive in `main.rs` as
-tombstones that drain stdin and exit 0, so an old overlay costs a fast no-op per
-hook rather than launching a second cImp — but they get no injection, no read
-advisor, no auto-check, and permission detection falls back to the TUI regex.
-**Since 2026-08-17 that list is seven flags and includes the two beacons**, so
-such a tab also has no native-web taint sensor (the proxied half of the latch
-still catches anything routed through cImp) and no per-call rewind points (the
-prompt-level checkpoints remain). This is the V32 "needs a FRESH TAB" trap being
-*named at the moment it applies*, which is what § 6.1 exists for.
+**Every bump has the same immediate consequence, and it is intended rather than
+a false positive: a tab open across the upgrade reports `old_plugin` until it is
+restarted.** It really is running an artifact this build no longer generates,
+and *restart the tab* really is the fix. Such tabs keep working, inert — cImp's
+retired dispatch flags survive in `main.rs` as tombstones that drain stdin and
+exit 0, so an old artifact costs a fast no-op rather than launching a second
+cImp — but each capability that artifact never wired is simply absent for that
+tab, and the capabilities that have a fallback reader fall back to it. That is
+the V32 "needs a FRESH TAB" trap being *named at the moment it applies*, which
+is what § 6.1 exists for. **`chp = 2` is the standing example**: a tab generated
+by a `chp = 1` build cannot serve an event its generator had never heard of, so
+it reads as `old_plugin` and is correct to.
 
-### 6.2 Why OpenCode's hello omits `harness_version`
+### 6.2 Identity outside the envelope, and the empty `harness_version`
 
-OpenCode does not expose its own version to a plugin at module-evaluation scope,
-and cImp will not bake in a number and let the plugin report it back as though
-the harness had said it — that would be cImp attesting to itself. cImp learns
-OpenCode's version from `GET /global/health` during a probe run instead (V35
-Phase H).
+**A harness may declare its identity out-of-envelope.** Where its extension
+mechanism emits *its own* payload, there is no field in the body for the § 3
+envelope to ride in — so the `(chp, agent, tab)` triple arrives some other way,
+and the harness says so itself:
+`HarnessPlugin::identity_of_request(route, req)` answers the triple for the
+routes that harness owns and `None` for everything else. `None` is the default
+and it means *read the CHP envelope*, which is what core does for every ordinary
+caller; core holds no special case (it used to hold one — an
+`is_hook_route(route)` test inside `note_chp` — and that is exactly what V40
+Phase C's locked decision 22 deleted). The values are caller-asserted and
+validated before anything is recorded, exactly like the body fields they
+replace.
 
-**Claude's hello omits it for the same reason, and Phase J did not change that.**
-The hook-input contract has no CLI version field — the common set is
-`session_id`, `transcript_path`, `cwd`, `permission_mode`, `hook_event_name` —
-so `handle_claude_session_start` reads a top-level `version` opportunistically
-(absent in every shape documented today) and leaves `harness_version` empty when
-it finds none. cImp learns Claude's version from the transcript's own top-level
-`version` instead (`oob::claude::cli_version_of` → `harness_versions.claude_last_seen`).
+Where each harness puts them — the header names, the token substitution, the
+baked hello declaration — is in that plugin's README:
+[`src-tauri/src/harness/claude/README.md` § *CHP — hook-body identity*](../src-tauri/src/harness/claude/README.md#chp--hook-body-identity).
+
+**`harness_version` is empty in both of today's hellos, and that is a refusal
+rather than a gap.** Neither harness exposes its own version to the artifact
+cImp generates: OpenCode does not expose one to a plugin at module-evaluation
+scope, and no documented hook-input field carries a CLI version. cImp will not
+bake a number in and let the artifact report it back as though the harness had
+said it — that would be cImp attesting to itself. It learns each version by
+observation instead, per harness: OpenCode's from `GET /global/health` during a
+probe run (V35 Phase H), Claude's from its transcript's own top-level `version`
+(`harness::claude::read::cli_version_of`), each stored in that harness's own
+settings row (`Settings.harness[<id>].last_seen` — the per-harness map V40
+Phase B replaced `harness_versions.<id>_last_seen` with).
 **The `harness_version` arm of § 6.1 therefore still has no producer on either
-harness.** It is implemented and unit-tested; what Phase J supplied is the `chp`
+harness.** It is implemented and unit-tested; what has a producer is the `chp`
 arm, which is the one the deploy trap actually needs.
 
 ---

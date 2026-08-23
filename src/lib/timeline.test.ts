@@ -22,6 +22,19 @@ import type { Checkpoint } from './workbench';
 import type { LatchRow } from './latch';
 import type { TabId } from './tabs/types';
 
+import { FIRST_HARNESS, SECOND_HARNESS } from './harness.fixture';
+
+// V40 Phase F: every harness id below comes from the committed registry fixture
+// (`harness.fixture.ts`), so this suite names no product and re-points itself
+// when the registry changes.
+const H1 = FIRST_HARNESS.id;
+const H2 = SECOND_HARNESS.id;
+/// Two tabs of the first harness — the checkpoint/scope pairs these tests join
+/// on are `<harness>:<tab>`, so the tab ids are derived from it too.
+const TAB1 = `${H1}-1`;
+const TAB2 = `${H1}-2`;
+
+
 /// V33 step 5 — the Timeline's evidence surface.
 ///
 /// Every case here is written against the *invariant*, not the shape of the
@@ -44,10 +57,10 @@ function cp(over: Partial<Checkpoint> = {}): Checkpoint {
     ts_unix: 1000,
     label: 'checkpoint',
     trigger: 'prompt',
-    agent: 'claude',
+    agent: H1,
     files_changed: 2,
     session: 'sess-a',
-    tab: 'claude-1',
+    tab: TAB1,
     ...over,
   };
 }
@@ -58,9 +71,9 @@ function ev(over: Partial<ContaminationEvent> = {}): ContaminationEvent {
     ts_ms: 2_000_000,
     root: ROOT,
     cleared: false,
-    scope: 'claude:claude-1',
-    agent: 'claude',
-    tab: 'claude-1',
+    scope: `${H1}:${TAB1}`,
+    agent: H1,
+    tab: TAB1,
     session: 'sess-a',
     tool: 'ddg__fetch_content',
     host: 'evil.example',
@@ -73,8 +86,8 @@ function ev(over: Partial<ContaminationEvent> = {}): ContaminationEvent {
 
 function latch(over: Partial<LatchRow> = {}): LatchRow {
   return {
-    consumer: 'claude',
-    tab: 'claude-1' as TabId,
+    consumer: H1,
+    tab: TAB1 as TabId,
     session: 'sess-a',
     latch: 'external',
     contaminated: true,
@@ -137,19 +150,19 @@ describe('the join', () => {
   });
 
   /// The honesty requirement of the whole step. The nearest preceding checkpoint
-  /// belongs to `claude-2`; this tab (`claude-1`) also has one, but an OLDER
+  /// belongs to the SECOND tab; this tab also has one, but an OLDER
   /// one. A join that quietly filtered to same-tab checkpoints would return the
   /// older one and look correct — so the assertion is on both halves: the
   /// checkpoint chosen AND the label it is given.
   it('labels a nearest checkpoint from another tab as another tab’s', () => {
-    const link = linkCheckpoint(ev({ tab: 'claude-1' }), [
-      cp({ id: 'mine', seq: 1, ts_unix: 100, tab: 'claude-1' }),
-      cp({ id: 'theirs', seq: 2, ts_unix: 1500, tab: 'claude-2' }),
+    const link = linkCheckpoint(ev({ tab: TAB1 }), [
+      cp({ id: 'mine', seq: 1, ts_unix: 100, tab: TAB1 }),
+      cp({ id: 'theirs', seq: 2, ts_unix: 1500, tab: TAB2 }),
     ]);
     expect(link.kind).toBe('other-tab');
     expect(restoreTarget(link)?.id).toBe('theirs');
     const line = linkLine(link);
-    expect(line).toContain('claude-2');
+    expect(line).toContain(TAB2);
     expect(line).toContain("not this tab's own restore point");
   });
 
@@ -161,7 +174,7 @@ describe('the join', () => {
 
   it('calls it unattributed when the EVENT has no tab either', () => {
     const link = linkCheckpoint(ev({ tab: null, agent: null }), [
-      cp({ id: 'x', ts_unix: 1500, tab: 'claude-1' }),
+      cp({ id: 'x', ts_unix: 1500, tab: TAB1 }),
     ]);
     expect(link.kind).toBe('unattributed');
   });
@@ -270,13 +283,13 @@ describe('the cleared lifecycle', () => {
     const rows = buildTimelineRows(
       [],
       [
-        ev({ id: 1, ts_ms: 1_000_000, scope: 'claude:claude-1' }),
+        ev({ id: 1, ts_ms: 1_000_000, scope: `${H1}:${TAB1}` }),
         ev({
           id: 2,
           ts_ms: 1_500_000,
           cleared: true,
-          scope: 'claude:claude-2',
-          tab: 'claude-2',
+          scope: `${H1}:${TAB2}`,
+          tab: TAB2,
           tool: 'clear_contamination',
         }),
       ],
@@ -338,7 +351,7 @@ describe('what the view says when it cannot show everything', () => {
       error: null,
     });
     expect(orphaned.map((n) => n.kind)).toEqual(['not-retained']);
-    expect(orphaned[0].text).toContain('claude:claude-1');
+    expect(orphaned[0].text).toContain(`${H1}:${TAB1}`);
     expect(orphaned[0].text).toContain('not "they were never contaminated"');
 
     const clean = evidenceNotices({
@@ -474,10 +487,10 @@ describe('the feature-off state', () => {
     expect(quiet).toContain('containment badge');
     expect(quiet).not.toMatch(/\bno tab\b|never/);
 
-    const loud = evidenceOffNotice(['claude:claude-2', 'claude:claude-1']);
+    const loud = evidenceOffNotice([`${H1}:${TAB2}`, `${H1}:${TAB1}`]);
     expect(loud).toContain('flagged as contaminated right now');
     // Sorted, so the sentence does not reorder itself between renders.
-    expect(loud).toContain('claude:claude-1, claude:claude-2');
+    expect(loud).toContain(`${H1}:${TAB1}, ${H1}:${TAB2}`);
     expect(loud).toContain('containment badge');
   });
 });
@@ -488,9 +501,9 @@ describe('row rendering', () => {
       kind: 'contamination',
       key: 'ct:1',
       tsMs: 1,
-      scope: 'claude:claude-1',
-      agent: 'claude',
-      tab: 'claude-1',
+      scope: `${H1}:${TAB1}`,
+      agent: H1,
+      tab: TAB1,
       opened: ev(),
       cleared: null,
       link: { kind: 'none' },
@@ -555,9 +568,9 @@ describe('checkpoint source (C8 provenance)', () => {
 
   it('shows the tool name and names the harness in the explanation', () => {
     for (const [raw, tool, harness] of [
-      ['claude:Bash', 'Bash', 'claude'],
+      [`${H1}:Bash`, 'Bash', H1],
       ['offload:run_command', 'run_command', 'offload'],
-      ['opencode:edit', 'edit', 'opencode'],
+      [`${H2}:edit`, 'edit', H2],
     ] as const) {
       const s = checkpointSource(raw)!;
       expect(s.text).toBe(tool);
@@ -577,7 +590,7 @@ describe('checkpoint source (C8 provenance)', () => {
     expect(bare.title).toContain('mystery_tool');
     // A colon with nothing after it is not a tool name — fall back to the raw
     // value instead of rendering an empty badge.
-    const empty = checkpointSource('claude:')!;
-    expect(empty.text).toBe('claude:');
+    const empty = checkpointSource(`${H1}:`)!;
+    expect(empty.text).toBe(`${H1}:`);
   });
 });

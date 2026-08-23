@@ -15,7 +15,7 @@
 //! once on startup for the launch root when the feature is enabled, and again
 //! whenever the `graph_rebuild` IPC is invoked.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -34,7 +34,7 @@ use super::embed::Embedder;
 use super::index::{GraphIndex, GraphStats, LangCount, SymbolHit};
 use super::memory::{
     Effectiveness, MemorySnapshot, ModelUsage, ProjectFact, SessionUsage, SessionUsageDetail,
-    SessionUsageRow, ToolUsage, TurnUsage, UsageEvent, UsageSnapshot, UsageTotals, WorkingSetEntry,
+    SessionUsageRow, ToolUsage, TurnUsage, UsageEvent, UsageSnapshot, WorkingSetEntry,
 };
 use super::model::Lang;
 use super::parse_file;
@@ -165,7 +165,7 @@ pub struct EmbedderProbe {
 /// for the sibling, and the sibling's tap — which tails the *stalled* tab's
 /// transcript, the newest file — gains a CONFIDENT and WRONG session binding.
 /// The tap therefore refreshes both of its entries from an independent heartbeat
-/// task (`oob::claude::TapHeartbeat`) that no drain-side await can starve; this
+/// task (`harness::claude::read::TapHeartbeat`) that no drain-side await can starve; this
 /// TTL only has to outlast that heartbeat's cadence by a wide margin.
 const LIVE_SESSION_TTL_MS: i64 = 90_000;
 
@@ -183,12 +183,53 @@ const LIVE_SESSION_RECENCY_MS: i64 = 5 * 60_000;
 #[derive(Clone, Debug)]
 struct LiveSession {
     /// Which agent reported the entry (`"claude"` / `"opencode"`). Read by
-    /// [`GraphService::live_claude_sessions`] — the NC-2 permission-hook's
+    /// [`GraphService::live_sessions_for`] — the NC-2 permission-hook's
     /// session→tab mapping only trusts Claude entries, whose key IS a tab id.
     agent: String,
     session_id: String,
     last_seen_ms: i64,
 }
+
+/// **A live-session registry key: the space it lives in, and the id.**
+///
+/// V40 Phase D, locked decision 20. This map used to be keyed by a bare
+/// `String` holding *either* a cImp tab id (a harness whose session cImp's own
+/// reader binds — [`SessionKey::Tab`]) *or* a session id the harness reported
+/// over the loopback ([`SessionKey::Session`]). One map, two key spaces: a
+/// `/memory/event` naming a configured tab id landed on that tab's entry and
+/// repointed its session, which flapped the taint latch clear in a loop (C-2).
+/// It was closed by refusing any body-supplied key that named a configured tab
+/// — a check beside the write, of a list the check had to keep in step with.
+///
+/// The spaces are separate now, so the collision cannot be expressed: a
+/// `/memory/event` writes into the session space, every tab-keyed reader looks
+/// in the tab space, and no string can be in both.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct LiveKey {
+    space: crate::harness::plugin::SessionKey,
+    id: String,
+}
+
+impl LiveKey {
+    /// A key in the TAB space — cImp's own reader, keyed by the tab it runs in.
+    fn tab(id: &str) -> Self {
+        Self {
+            space: crate::harness::plugin::SessionKey::Tab,
+            id: id.to_string(),
+        }
+    }
+
+    /// A key in the SESSION space — an id the harness reported for itself.
+    fn session(id: &str) -> Self {
+        Self {
+            space: crate::harness::plugin::SessionKey::Session,
+            id: id.to_string(),
+        }
+    }
+}
+
+/// The live-session registry: [`LiveKey`] → what that key last reported.
+type LiveRegistry = HashMap<LiveKey, LiveSession>;
 
 /// H1 fix (2026-08-05 review): one RUNNING agent tab and the transcript source
 /// it binds its session identity from — for Claude, the
@@ -348,11 +389,11 @@ pub struct GraphService {
     /// intersects it with the queried root's own sessions before reporting
     /// `active_session_ids`. Claude clears its entry on tab cancel; every entry
     /// also expires by [`LIVE_SESSION_TTL_MS`].
-    live_sessions: StdMutex<HashMap<String, LiveSession>>,
+    live_sessions: StdMutex<LiveRegistry>,
     /// H1 fix: the running-tab → transcript-root map behind
     /// [`tab_binding_is_ambiguous`] — see [`LiveTabRoot`]. Written only by the
     /// per-tab out-of-band taps; read by every consumer of a tab-keyed identity
-    /// claim ([`Self::live_session_for_tab`], [`Self::live_claude_sessions`]).
+    /// claim ([`Self::live_session_for_tab`], [`Self::live_sessions_for`]).
     live_tab_roots: StdMutex<HashMap<String, LiveTabRoot>>,
     /// V30 Phase C: the session-push bus, when this process has one. `None` for
     /// tests and any standalone construction without an `OffloadService` — a
@@ -830,7 +871,7 @@ fn first_read_eligible(i: &FirstReadIn) -> bool {
 /// mark here anyway. Deduped; sorted for a stable payload. Free-standing so it's
 /// unit-testable without an `AppHandle`.
 fn compute_active_session_ids(
-    live: &HashMap<String, LiveSession>,
+    live: &LiveRegistry,
     sessions: &[SessionUsageRow],
     now: i64,
 ) -> Vec<String> {
@@ -921,7 +962,7 @@ fn tab_binding_is_ambiguous(
 /// tab B's scope. Degrading to unscoped (V28 decision 4's documented fail-open)
 /// is strictly better than a confidently wrong scope.
 fn lookup_live_session_for_tab(
-    live: &HashMap<String, LiveSession>,
+    live: &LiveRegistry,
     roots: &HashMap<String, LiveTabRoot>,
     tab: &str,
     agent: &str,
@@ -930,7 +971,7 @@ fn lookup_live_session_for_tab(
     if tab_binding_is_ambiguous(roots, tab, agent, now) {
         return None;
     }
-    live.get(tab)
+    live.get(&LiveKey::tab(tab))
         .filter(|e| e.agent == agent)
         .filter(|e| now.saturating_sub(e.last_seen_ms) <= LIVE_SESSION_TTL_MS)
         .map(|e| e.session_id.clone())
@@ -949,18 +990,27 @@ fn lookup_live_session_for_tab(
 /// before B's own tap confirms) — during that window both tabs are running on
 /// one root, so the predicate is already true.
 ///
-/// Pure half of [`GraphService::live_claude_sessions`].
-fn live_claude_tab_sessions(
-    live: &HashMap<String, LiveSession>,
+/// Pure half of [`GraphService::live_sessions_for`].
+///
+/// V40 Phase D (locked decision 20): `agent` is an argument. This was
+/// `live_claude_tab_sessions`, with `"claude"` written into both filters — so
+/// the permission-edge resolver could only ever resolve one harness's prompts,
+/// and every other harness's fell back to the cwd pass or was dropped.
+fn live_tab_sessions(
+    live: &LiveRegistry,
     roots: &HashMap<String, LiveTabRoot>,
+    agent: &str,
     now: i64,
 ) -> Vec<(String, String)> {
     live.iter()
+        // TAB space only: the answer is a `(tab_id, session_id)` pair, and a
+        // session-space entry has no tab to name.
+        .filter(|(k, _)| k.space == crate::harness::plugin::SessionKey::Tab)
         .filter(|(_, e)| {
-            e.agent == "claude" && now.saturating_sub(e.last_seen_ms) <= LIVE_SESSION_TTL_MS
+            e.agent == agent && now.saturating_sub(e.last_seen_ms) <= LIVE_SESSION_TTL_MS
         })
-        .filter(|(k, _)| !tab_binding_is_ambiguous(roots, k, "claude", now))
-        .map(|(k, e)| (k.clone(), e.session_id.clone()))
+        .filter(|(k, _)| !tab_binding_is_ambiguous(roots, &k.id, agent, now))
+        .map(|(k, e)| (k.id.clone(), e.session_id.clone()))
         .collect()
 }
 
@@ -993,7 +1043,7 @@ fn upsert_live_tab_root(
             e.root = key.clone();
             // Kept current rather than sticky: a pinned tap DROPS its pin if
             // the harness never wrote the pinned transcript (see
-            // `oob::claude`'s pin grace), and the tab must degrade back to
+            // `harness::claude::read`'s pin grace), and the tab must degrade back to
             // ambiguous with it.
             e.pinned = pinned;
         })
@@ -1015,20 +1065,24 @@ fn upsert_live_tab_root(
 /// younger [`LIVE_SESSION_RECENCY_MS`] window over recorded activity) covers any
 /// session that is still genuinely active — so eviction can never change an
 /// active-set result. Free-standing so it's unit-testable without an `AppHandle`.
-fn evict_stale_live_sessions(live: &mut HashMap<String, LiveSession>, now: i64) {
+fn evict_stale_live_sessions(live: &mut LiveRegistry, now: i64) {
     live.retain(|_, e| now.saturating_sub(e.last_seen_ms) <= LIVE_SESSION_TTL_MS);
 }
 
 /// V16 drift signals that need full-relation scans (`large_reread_pairs`
-/// walks every read event + every symbol span; `claude_tokenless_sessions`
-/// walks every usage row). The Overview's advice poll asks every 2s, but
-/// these only change when new events land — cache per root with a short TTL
-/// instead of rescanning per tick.
+/// walks every read event + every symbol span; `tokenless_sessions` walks
+/// every usage row). The Overview's advice poll asks every 2s, but these only
+/// change when new events land — cache per root with a short TTL instead of
+/// rescanning per tick.
+///
+/// V40 Phase D: the session counts are **per harness**. They were two scalars
+/// filled from a query with one agent literal in it, which is why every
+/// non-default harness's row in the advisor's signals was zero.
 struct DriftDbSignals {
     at: Instant,
     large_reread_pairs: u64,
-    claude_sessions: u64,
-    claude_tokenless: u64,
+    /// `(sessions_with_usage_rows, of_those_tokenless)` per harness.
+    sessions: BTreeMap<crate::harness::HarnessId, (u64, u64)>,
 }
 
 /// Per-root backfill liveness for the single-flight guard in [`spawn_backfill`].
@@ -1606,17 +1660,24 @@ impl GraphService {
         }
     }
 
-    /// Summed token totals for `session_id` ("turn" rows only). Empty
-    /// defaults on any store error (graph disabled, session unknown, etc.).
-    /// Best-effort like the wrappers below it, but never SILENT: every
-    /// swallowed store error in this block is traced, so a degraded store is
-    /// diagnosable from the log even where the return type can't carry it.
-    pub fn usage_session_totals(&self, root: &Path, session_id: &str) -> UsageTotals {
+    /// Summed token totals for `session_id` ("turn" rows only), by the
+    /// session's harness's declared token categories. Empty defaults on any
+    /// store error (graph disabled, session unknown, etc.) — and an EMPTY map
+    /// is the honest answer there: no category was reported, as opposed to
+    /// four categories reported at zero. Best-effort like the wrappers below
+    /// it, but never SILENT: every swallowed store error in this block is
+    /// traced, so a degraded store is diagnosable from the log even where the
+    /// return type can't carry it.
+    pub fn usage_session_totals(
+        &self,
+        root: &Path,
+        session_id: &str,
+    ) -> crate::harness::plugin::TokenKinds {
         let idx = match self.index_for(root) {
             Ok(idx) => idx,
             Err(e) => {
                 debug!(error = %e, "graph: usage_session_totals open failed");
-                return UsageTotals::default();
+                return crate::harness::plugin::TokenKinds::default();
             }
         };
         idx.usage_session_totals(session_id)
@@ -1768,7 +1829,7 @@ impl GraphService {
             .flatten()
     }
 
-    /// V24 Phase B: per-model token totals + session/agent origin split for
+    /// V24 Phase B: per-model token totals + the per-lane split for
     /// `session_id`, ordered by tokens desc. Empty on any store error.
     pub fn usage_session_model_totals(&self, root: &Path, session_id: &str) -> Vec<ModelUsage> {
         let idx = match self.index_for(root) {
@@ -1783,16 +1844,32 @@ impl GraphService {
             .unwrap_or_default()
     }
 
-    /// V24 Phase B: upsert a live-session registry entry, keyed by `key` (a
-    /// Claude tab id, or the reporting session id on the OpenCode loopback
-    /// path), stamping `last_seen_ms` to now. Called on every Claude drain tick
-    /// and every OpenCode `/memory/event` — cheap and idempotent.
-    pub fn mark_live_session(&self, key: &str, agent: &str, session_id: &str) {
+    /// V24 Phase B: upsert a live-session registry entry, stamping
+    /// `last_seen_ms` to now. Called on every reader drain tick and every
+    /// `/memory/event` — cheap and idempotent.
+    ///
+    /// **`space` is not a formality** (V40 Phase D, locked decision 20). It
+    /// says whether `key` is a cImp TAB id — which only cImp's own reader may
+    /// claim — or a SESSION id the harness reported for itself. The two live in
+    /// separate spaces, so a value that arrived over the wire can no longer
+    /// name a tab and repoint its session (C-2); the collision check that used
+    /// to guard that is gone because the collision is now unrepresentable.
+    pub fn mark_live_session(
+        &self,
+        space: crate::harness::plugin::SessionKey,
+        key: &str,
+        agent: &str,
+        session_id: &str,
+    ) {
         let now = crate::activity::now_ms() as i64;
+        let key = match space {
+            crate::harness::plugin::SessionKey::Tab => LiveKey::tab(key),
+            crate::harness::plugin::SessionKey::Session => LiveKey::session(key),
+        };
         if let Ok(mut m) = self.live_sessions.lock() {
             // Entry API so the steady-state 200ms Claude drain tick only stamps
             // `last_seen_ms` in place — no per-tick allocation of a fresh entry.
-            m.entry(key.to_string())
+            m.entry(key)
                 .and_modify(|e| {
                     e.last_seen_ms = now;
                     // The reported session/agent can rotate under a stable key
@@ -1811,10 +1888,10 @@ impl GraphService {
         }
     }
 
-    /// V24 Phase B: drop a live-session registry entry by `key` — the Claude
-    /// tap calls this on tab cancel so a closed tab stops being reported active
-    /// before its TTL lapses. OpenCode has no tab binding on the loopback path,
-    /// so its entries rely on TTL expiry alone.
+    /// V24 Phase B: drop a live-session registry entry by TAB id — a reader
+    /// calls this on tab cancel so a closed tab stops being reported active
+    /// before its TTL lapses. Session-space entries have no tab binding to
+    /// cancel and rely on TTL expiry alone.
     ///
     /// H1 fix: also drops the tab's [`LiveTabRoot`] — the two facts have exactly
     /// one lifetime (this tab's tap is running), and clearing them together is
@@ -1823,7 +1900,7 @@ impl GraphService {
     /// registered a root (every OpenCode key).
     pub fn clear_live_session(&self, key: &str) {
         if let Ok(mut m) = self.live_sessions.lock() {
-            m.remove(key);
+            m.remove(&LiveKey::tab(key));
         }
         if let Ok(mut m) = self.live_tab_roots.lock() {
             m.remove(key);
@@ -1856,19 +1933,27 @@ impl GraphService {
         }
     }
 
-    /// NC-2 (issue #5): the live-session registry entries reported by CLAUDE
-    /// tabs — `(tab_id, session_id)` per entry still inside
+    /// NC-2 (issue #5): the live-session registry entries reported by
+    /// `harness`'s tabs — `(tab_id, session_id)` per entry still inside
     /// [`LIVE_SESSION_TTL_MS`]. This is the session→tab mapping the
-    /// `/permission/event` route resolves a hook payload with: a Claude entry
-    /// is keyed by its stable TAB ID (see [`Self::mark_live_session`]) and
-    /// carries the session id the tab's transcript tail last saw, which is
-    /// exactly the `session_id` a Claude Code hook payload names.
+    /// permission-edge resolver matches a payload with: a tab-space entry is
+    /// keyed by its stable TAB ID (see [`Self::mark_live_session`]) and carries
+    /// the session id that tab's reader last saw, which is exactly the session
+    /// id a hook payload names.
+    ///
+    /// **V40 Phase D (locked decision 20): the harness is an argument.** It was
+    /// `live_claude_sessions`, filtering on the literal `"claude"`, so the
+    /// resolver could resolve exactly one harness's prompts and silently
+    /// resolved nothing for any other.
     ///
     /// Stale (TTL-lapsed) entries are filtered out rather than returned, so a
     /// closed tab whose entry hasn't been reclaimed yet can never be credited
     /// with a live session's permission prompt. H1 fix: tabs whose binding is
-    /// ambiguous are filtered out too — see [`live_claude_tab_sessions`].
-    pub fn live_claude_sessions(&self) -> Vec<(String, String)> {
+    /// ambiguous are filtered out too — see [`live_tab_sessions`].
+    pub fn live_sessions_for(&self, harness: crate::harness::HarnessId) -> Vec<(String, String)> {
+        let Some(agent) = harness.id() else {
+            return Vec::new();
+        };
         let now = crate::activity::now_ms() as i64;
         let Ok(live) = self.live_sessions.lock() else {
             return Vec::new();
@@ -1876,7 +1961,7 @@ impl GraphService {
         let Ok(roots) = self.live_tab_roots.lock() else {
             return Vec::new();
         };
-        live_claude_tab_sessions(&live, &roots, now)
+        live_tab_sessions(&live, &roots, agent, now)
     }
 
     /// V28 (issue #13): the session id the tab keyed `tab` currently reports,
@@ -1884,9 +1969,9 @@ impl GraphService {
     /// `context_*` memory tools scope to, so two same-agent tabs on one project
     /// stop sharing a memory scope.
     ///
-    /// This is the generalization of [`Self::live_claude_sessions`] (which stays
-    /// as-is — the `/permission/event` route needs the whole Claude mapping, not
-    /// one tab). `None` means "no proof": no entry under that key, an entry left
+    /// This is the per-tab twin of [`Self::live_sessions_for`] (which stays —
+    /// the permission-edge resolver needs a harness's whole mapping, not one
+    /// tab). `None` means "no proof": no entry under that key, an entry left
     /// by a different agent, or a TTL-stale one. Every caller fails OPEN on
     /// `None` — back to `mem_current_session_for(agent)` — so a missing/unknown/
     /// stale tab can never error a tool call. H1 fix: an AMBIGUOUS tab (two
@@ -1912,7 +1997,7 @@ impl GraphService {
         let now = crate::activity::now_ms() as i64;
         let live = self.live_sessions.lock().ok()?;
         let roots = self.live_tab_roots.lock().ok()?;
-        let agent = live.get(tab)?.agent.clone();
+        let agent = live.get(&LiveKey::tab(tab))?.agent.clone();
         lookup_live_session_for_tab(&live, &roots, tab, &agent, now)
     }
 
@@ -3052,14 +3137,22 @@ impl GraphService {
         // so `GraphIndex::advisor_reread_rate` can precisely check whether the
         // agent re-read this exact file afterward. Reaching a remind means the
         // agent has already read this file at least once this session
-        // (`read_seen` held its prior hash), so the session row normally exists;
-        // `"claude"` is a safe default if the lookup somehow misses.
-        let agent = idx
-            .session_agent(sid)
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| "claude".to_string());
-        let _ = idx.record_mem_event(sid, &agent, "remind", rel, None, None, ts, None);
+        // (`read_seen` held its prior hash), so the session row normally exists.
+        // V40 Phase A (locked decisions 2/20): a MISSING agent is no longer
+        // recorded as Claude's. A `mem_event` stamped with the wrong agent is
+        // worse than one that is absent - `advisor_reread_rate` reads these rows
+        // per agent, so a mis-stamped row moves a statistic about a harness that
+        // did not produce it. The remind itself is unaffected; only the
+        // provenance row is skipped, and the log line says so.
+        match idx.session_agent(sid).ok().flatten() {
+            Some(agent) => {
+                let _ = idx.record_mem_event(sid, &agent, "remind", rel, None, None, ts, None);
+            }
+            None => tracing::debug!(
+                session = %sid,
+                "no agent recorded for this session; skipping the remind provenance row rather                  than attributing it to a harness that may not have produced it"
+            ),
+        }
         // Activity: `chars` is the reminder's actual size (what we returned),
         // consistent with every other graph tool's honest response-size figure —
         // not a fabricated token estimate.
@@ -3242,24 +3335,36 @@ impl GraphService {
     /// file) pairs with ≥2 observed reads of a file at/above
     /// `read_advisor_min_lines`, the condition `should_read` reminds on
     /// (zero reminds + many large re-reads ⇒ the hook isn't firing) — plus
-    /// `GraphIndex::claude_tokenless_sessions`' two counts.
-    pub fn drift_db_signals(&self, root: &Path) -> (u64, u64, u64) {
+    /// `GraphIndex::tokenless_sessions`' two counts **per registered harness**
+    /// (locked decision 23: every rule runs per harness, so every signal it
+    /// reads has to exist per harness).
+    pub fn drift_db_signals(
+        &self,
+        root: &Path,
+    ) -> (u64, BTreeMap<crate::harness::HarnessId, (u64, u64)>) {
         const DRIFT_SIGNALS_TTL: Duration = Duration::from_secs(30);
         if let Ok(cache) = self.drift_signals.lock() {
             if let Some(s) = cache.get(root) {
                 if s.at.elapsed() < DRIFT_SIGNALS_TTL {
-                    return (s.large_reread_pairs, s.claude_sessions, s.claude_tokenless);
+                    return (s.large_reread_pairs, s.sessions.clone());
                 }
             }
         }
-        let (pairs, claude, tokenless) = match self.index_for(root) {
+        let (pairs, sessions) = match self.index_for(root) {
             Ok(idx) => {
                 let min_lines = self.settings.current().graph.read_advisor_min_lines;
                 let pairs = idx.large_reread_pairs(min_lines).unwrap_or(0);
-                let (claude, tokenless) = idx.claude_tokenless_sessions().unwrap_or((0, 0));
-                (pairs, claude, tokenless)
+                // One query per harness rather than one query plus zeros: the
+                // scan is TTL-cached and bounded by the usage relation, and a
+                // zero that means "not measured" is indistinguishable from a
+                // zero that means "measured, none" at every consumer.
+                let sessions = crate::harness::registry::all()
+                    .filter_map(|h| h.id().map(|agent| (h, agent)))
+                    .map(|(h, agent)| (h, idx.tokenless_sessions(agent).unwrap_or((0, 0))))
+                    .collect();
+                (pairs, sessions)
             }
-            Err(_) => (0, 0, 0),
+            Err(_) => (0, BTreeMap::new()),
         };
         if let Ok(mut cache) = self.drift_signals.lock() {
             cache.insert(
@@ -3267,12 +3372,11 @@ impl GraphService {
                 DriftDbSignals {
                     at: Instant::now(),
                     large_reread_pairs: pairs,
-                    claude_sessions: claude,
-                    claude_tokenless: tokenless,
+                    sessions: sessions.clone(),
                 },
             );
         }
-        (pairs, claude, tokenless)
+        (pairs, sessions)
     }
 
     /// V16 Feature 4 (`drift.read_bypass.v1` signal): share of read-advisor
@@ -6295,7 +6399,7 @@ mod tests {
         SessionUsageRow {
             session_id: id.to_string(),
             agent: "claude".to_string(),
-            totals: UsageTotals::default(),
+            totals: crate::harness::plugin::TokenKinds::default(),
             tool_chars: 0,
             cache_hit_ratio: 0.0,
             est_only: false,
@@ -6324,17 +6428,16 @@ mod tests {
         let mut reg = HashMap::new();
         // A still-ticking tab whose last activity fell out of the recency window
         // — the registry keeps it active (the point of the union).
-        reg.insert("tabA".to_string(), live("idle-but-open", now - 1_000));
+        reg.insert(LiveKey::tab("tabA"), live("idle-but-open", now - 1_000));
         // An expired registry entry does NOT keep its session active.
-        reg.insert(
-            "tabB".to_string(),
+        reg.insert(LiveKey::tab("tabB"),
             live("stale", now - LIVE_SESSION_TTL_MS - 1_000),
         );
         // A fresh entry whose session isn't in THIS root's list is ignored
         // (the registry is process-wide; the output is root-scoped).
-        reg.insert("tabC".to_string(), live("other-project", now));
+        reg.insert(LiveKey::tab("tabC"), live("other-project", now));
         // "recent" is BOTH recency-fresh and registry-fresh → appears once.
-        reg.insert("tabD".to_string(), live("recent", now));
+        reg.insert(LiveKey::tab("tabD"), live("recent", now));
 
         let active = compute_active_session_ids(&reg, &sessions, now);
         assert_eq!(
@@ -6351,14 +6454,14 @@ mod tests {
         let sessions = vec![urow("s", now - LIVE_SESSION_RECENCY_MS - 1)];
         // Exactly at the TTL edge is still live...
         let mut at_edge = HashMap::new();
-        at_edge.insert("t".to_string(), live("s", now - LIVE_SESSION_TTL_MS));
+        at_edge.insert(LiveKey::tab("t"), live("s", now - LIVE_SESSION_TTL_MS));
         assert_eq!(
             compute_active_session_ids(&at_edge, &sessions, now),
             vec!["s".to_string()]
         );
         // ...one ms past it has expired.
         let mut past = HashMap::new();
-        past.insert("t".to_string(), live("s", now - LIVE_SESSION_TTL_MS - 1));
+        past.insert(LiveKey::tab("t"), live("s", now - LIVE_SESSION_TTL_MS - 1));
         assert!(compute_active_session_ids(&past, &sessions, now).is_empty());
     }
 
@@ -6373,22 +6476,18 @@ mod tests {
         }
     }
 
-    fn v28_registry(now: i64) -> HashMap<String, LiveSession> {
+    fn v28_registry(now: i64) -> LiveRegistry {
         let mut reg = HashMap::new();
-        reg.insert(
-            "claude".to_string(),
+        reg.insert(LiveKey::tab("claude"),
             live_for("claude", "ses_a", now - 1_000),
         );
-        reg.insert(
-            "claude-local".to_string(),
+        reg.insert(LiveKey::tab("claude-local"),
             live_for("claude", "ses_b", now - 1_000),
         );
-        reg.insert(
-            "opencode".to_string(),
+        reg.insert(LiveKey::tab("opencode"),
             live_for("opencode", "ses_oc", now - 1_000),
         );
-        reg.insert(
-            "claude-stale".to_string(),
+        reg.insert(LiveKey::tab("claude-stale"),
             live_for("claude", "ses_old", now - LIVE_SESSION_TTL_MS - 1),
         );
         reg
@@ -6448,8 +6547,7 @@ mod tests {
         // Exactly at the TTL edge still counts (same boundary as the registry
         // half of `compute_active_session_ids` and the eviction sweep).
         let mut edge = HashMap::new();
-        edge.insert(
-            "claude".to_string(),
+        edge.insert(LiveKey::tab("claude"),
             live_for("claude", "ses_edge", now - LIVE_SESSION_TTL_MS),
         );
         assert_eq!(
@@ -6471,7 +6569,7 @@ mod tests {
             );
         }
         assert!(
-            lookup_live_session_for_tab(&HashMap::new(), &no_roots(), "claude", "claude", now)
+            lookup_live_session_for_tab(&LiveRegistry::new(), &no_roots(), "claude", "claude", now)
                 .is_none()
         );
     }
@@ -6517,8 +6615,8 @@ mod tests {
 
         assert!(!tab_binding_is_ambiguous(&reg, "claude", "claude", now));
         // ...and the pin is what makes its session resolvable again.
-        let live = HashMap::from([(
-            "claude".to_string(),
+        let live = LiveRegistry::from([(
+            LiveKey::tab("claude"),
             LiveSession {
                 agent: "claude".to_string(),
                 session_id: "ses_pinned".to_string(),
@@ -6588,12 +6686,10 @@ mod tests {
         assert!(tab_binding_is_ambiguous(&two, "claude-local", "claude", now));
         // 2 running tabs on DIFFERENT roots → each keeps its own identity.
         let mut split = HashMap::new();
-        split.insert(
-            "claude".to_string(),
+        split.insert("claude".to_string(),
             root_at("claude", "/home/u/.claude/projects/P--one", now),
         );
-        split.insert(
-            "claude-local".to_string(),
+        split.insert("claude-local".to_string(),
             root_at("claude", "/home/u/.claude/projects/P--two", now),
         );
         assert!(!tab_binding_is_ambiguous(&split, "claude", "claude", now));
@@ -6617,8 +6713,7 @@ mod tests {
         assert!(!tab_binding_is_ambiguous(&reg, "claude", "claude", now));
         // A CLOSED tab whose entry outlived the TTL is not a co-tenant either —
         // otherwise a leaked entry would disable scoping forever.
-        reg.insert(
-            "claude-local".to_string(),
+        reg.insert("claude-local".to_string(),
             root_at("claude", shared, now - LIVE_SESSION_TTL_MS - 1),
         );
         assert!(!tab_binding_is_ambiguous(&reg, "claude", "claude", now));
@@ -6659,13 +6754,13 @@ mod tests {
     }
 
     #[test]
-    fn live_claude_tab_sessions_drops_ambiguous_tabs_only() {
+    fn live_tab_sessions_drops_ambiguous_tabs_only() {
         let now = 10_000_000i64;
         let reg = v28_registry(now);
         // Single running tab per root: the permission resolver still gets the
         // mapping it needs (TTL-stale entries filtered as before).
         let one = roots_sharing(&["claude"], now);
-        let mut got = live_claude_tab_sessions(&reg, &one, now);
+        let mut got = live_tab_sessions(&reg, &one, "claude", now);
         got.sort();
         assert_eq!(
             got,
@@ -6680,24 +6775,21 @@ mod tests {
         // live UNIQUELY: no pair survives, so the resolver has nothing to
         // attribute with and refuses.
         let two = roots_sharing(&["claude", "claude-local"], now);
-        assert!(live_claude_tab_sessions(&reg, &two, now).is_empty());
+        assert!(live_tab_sessions(&reg, &two, "claude", now).is_empty());
         let mut window = HashMap::new();
-        window.insert(
-            "claude".to_string(),
+        window.insert(LiveKey::tab("claude"),
             live_for("claude", "ses_b", now - 10), // A's tap, B's session
         );
-        assert!(live_claude_tab_sessions(&window, &two, now).is_empty());
+        assert!(live_tab_sessions(&window, &two, "claude", now).is_empty());
         // Two tabs on DIFFERENT roots keep their pairs.
         let mut split = HashMap::new();
-        split.insert(
-            "claude".to_string(),
+        split.insert("claude".to_string(),
             root_at("claude", "/home/u/.claude/projects/P--one", now),
         );
-        split.insert(
-            "claude-local".to_string(),
+        split.insert("claude-local".to_string(),
             root_at("claude", "/home/u/.claude/projects/P--two", now),
         );
-        assert_eq!(live_claude_tab_sessions(&reg, &split, now).len(), 2);
+        assert_eq!(live_tab_sessions(&reg, &split, "claude", now).len(), 2);
     }
 
     /// H1-R5: the root is a normalized comparison key, so two tabs whose cwds
@@ -6787,6 +6879,67 @@ mod tests {
         assert!(tab_binding_is_ambiguous(&reg, "claude-local", "claude", now));
     }
 
+    /// **The C-2 collision, made unrepresentable** (V40 Phase D, locked
+    /// decision 20).
+    ///
+    /// A `/memory/event` writes into the SESSION space. Even when the id it
+    /// carries is character-for-character a configured tab id, every tab-keyed
+    /// reader — the memory-scoping lookup, the permission-edge mapping, the
+    /// "what is this tab working on" query — looks in the TAB space and cannot
+    /// see it. That is what replaced the predicate that used to refuse such a
+    /// key, and this is the assertion that the replacement actually holds.
+    #[test]
+    fn a_session_space_entry_is_invisible_to_every_tab_keyed_reader() {
+        let now = 10_000_000i64;
+        let mut reg = LiveRegistry::new();
+        // The tab's own reader: tab space, the true session.
+        reg.insert(LiveKey::tab("claude"), live_for("claude", "ses_true", now));
+        // A forged POST naming that tab id: session space.
+        reg.insert(
+            LiveKey::session("claude"),
+            live_for("opencode", "ses_forged", now),
+        );
+
+        assert_eq!(
+            lookup_live_session_for_tab(&reg, &no_roots(), "claude", "claude", now).as_deref(),
+            Some("ses_true"),
+            "the tab-keyed reader must still see its own reader's binding"
+        );
+        assert_eq!(
+            live_tab_sessions(&reg, &no_roots(), "claude", now),
+            vec![("claude".to_string(), "ses_true".to_string())],
+            "the permission-edge mapping must not pick up the session-space row"
+        );
+        assert!(
+            live_tab_sessions(&reg, &no_roots(), "opencode", now).is_empty(),
+            "…and must not report the forged row under the agent that sent it either"
+        );
+    }
+
+    /// `live_sessions_for`'s pure half answers PER HARNESS, which is the half
+    /// that used to be a `"claude"` literal — an OpenCode tab's live session was
+    /// invisible to the permission-edge resolver however fresh it was.
+    #[test]
+    fn live_tab_sessions_answers_for_each_harness() {
+        let now = 10_000_000i64;
+        let reg = v28_registry(now);
+        let claude: Vec<String> = live_tab_sessions(&reg, &no_roots(), "claude", now)
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect();
+        assert!(claude.contains(&"claude".to_string()));
+        assert!(!claude.contains(&"opencode".to_string()));
+        assert_eq!(
+            live_tab_sessions(&reg, &no_roots(), "opencode", now),
+            vec![("opencode".to_string(), "ses_oc".to_string())],
+            "an OpenCode tab's live session is now resolvable, not silently empty"
+        );
+        assert!(
+            live_tab_sessions(&reg, &no_roots(), "not-a-harness", now).is_empty(),
+            "an unknown agent resolves nothing"
+        );
+    }
+
     #[test]
     fn evict_stale_live_sessions_drops_only_ttl_stale_entries() {
         // V24 code-review: the opportunistic eviction `mark_live_session` runs
@@ -6794,19 +6947,17 @@ mod tests {
         // uses) and drops only those past it, so OpenCode keys can't accumulate.
         let now = 10_000_000i64;
         let mut reg = HashMap::new();
-        reg.insert("fresh".to_string(), live("s_fresh", now - 1_000));
-        reg.insert(
-            "edge".to_string(),
+        reg.insert(LiveKey::tab("fresh"), live("s_fresh", now - 1_000));
+        reg.insert(LiveKey::tab("edge"),
             live("s_edge", now - LIVE_SESSION_TTL_MS),
         );
-        reg.insert(
-            "stale".to_string(),
+        reg.insert(LiveKey::tab("stale"),
             live("s_stale", now - LIVE_SESSION_TTL_MS - 1),
         );
         evict_stale_live_sessions(&mut reg, now);
-        assert!(reg.contains_key("fresh"), "within TTL kept");
-        assert!(reg.contains_key("edge"), "exactly at TTL kept");
-        assert!(!reg.contains_key("stale"), "past TTL evicted");
+        assert!(reg.contains_key(&LiveKey::tab("fresh")), "within TTL kept");
+        assert!(reg.contains_key(&LiveKey::tab("edge")), "exactly at TTL kept");
+        assert!(!reg.contains_key(&LiveKey::tab("stale")), "past TTL evicted");
         assert_eq!(reg.len(), 2);
     }
 }

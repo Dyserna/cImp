@@ -39,7 +39,6 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::error::{AppError, AppResult};
-use crate::harness::claude::hook as claude_hook;
 
 use super::agent::ThinkingMode;
 use super::mcp_host::Consumer;
@@ -239,7 +238,7 @@ fn is_ancestor_or_equal(root: &Path, hint: &Path) -> bool {
 /// spawner makes — so it is a directory cImp itself chose, not one a caller
 /// asserted. `claude_hook_cwd` and [`external_project_root`] share it so the tab
 /// a hook claims resolves to the same place on both paths.
-fn hook_tab_root(
+pub(crate) fn hook_tab_root(
     app: &AppHandle,
     settings: &crate::settings::Settings,
     tab: Option<&str>,
@@ -1229,13 +1228,13 @@ where
 }
 
 /// A parsed HTTP request: method, path, headers (lowercased keys), and body.
-struct Request {
-    method: String,
-    path: String,
+pub(crate) struct Request {
+    pub(crate) method: String,
+    pub(crate) path: String,
     auth: Option<String>,
     /// V35 Phase J: the `X-CIMP-*` identity headers, when the caller sent any.
-    cimp: CimpHeaders,
-    body: Vec<u8>,
+    pub(crate) cimp: CimpHeaders,
+    pub(crate) body: Vec<u8>,
 }
 
 /// The identity a **Claude `type: "http"` hook** carries, which its body cannot.
@@ -1243,15 +1242,15 @@ struct Request {
 /// A hook's body is the harness's own payload — cImp gets no field in it — so
 /// the tab id, the harness discriminator, the CHP version and the hello
 /// declaration ride headers baked into the emitted hook entry at spawn
-/// (`harness::claude_hook`). Every value here is caller-supplied and is
+/// (`harness::claude::hook`). Every value here is caller-supplied and is
 /// validated/bounded at the point of use exactly as the equivalent body fields
 /// are on the CHP routes.
 #[derive(Debug, Default, Clone)]
-struct CimpHeaders {
-    tab: Option<String>,
-    agent: Option<String>,
-    chp: Option<u32>,
-    hello: Option<String>,
+pub(crate) struct CimpHeaders {
+    pub(crate) tab: Option<String>,
+    pub(crate) agent: Option<String>,
+    pub(crate) chp: Option<u32>,
+    pub(crate) hello: Option<String>,
 }
 
 /// Read and parse one HTTP/1.1 request from the stream (headers + an
@@ -1375,6 +1374,89 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+/// **Every path core's own router serves**, scraped from the dispatch `match`.
+///
+/// Test-only, and it exists for one assertion: a plugin route that duplicates a
+/// core path would never run, because core's arms are matched first. Read as
+/// text rather than as a list, so the answer cannot drift from the `match` the
+/// way a hand-kept enumeration would.
+#[cfg(test)]
+pub(crate) fn core_route_paths() -> std::collections::BTreeSet<&'static str> {
+    // V40 review L-2: scoped to the dispatch `match` itself, not the whole
+    // file. Scanning the file meant a line beginning `("` anywhere (a tuple in
+    // a test, say) had to be tolerated, which forced the scan to SKIP anything
+    // it could not parse — and a wrapped dispatch arm is exactly that: the path
+    // would drop out of the set, `no_plugin_route_shadows_a_core_route` would
+    // still pass on the smaller set, and a plugin could then declare a
+    // shadowing route with the test green and its handler never running.
+    // Inside the block there is nothing to tolerate, so an unreadable arm is a
+    // panic.
+    //
+    // Both delimiters are built with `concat!` so this function's own source
+    // does not contain them: a self-matching needle would cut the block at the
+    // scanner instead of at the dispatch and answer the empty set.
+    let src = include_str!("loopback.rs");
+    let block = src
+        .split_once(concat!("match (req.method.as_str(), ", "route) {"))
+        .expect("the loopback dispatch `match` is gone — re-point this scan")
+        .1;
+    let block = block
+        .split_once(concat!("_ => match crate::harness::", "ingress::route("))
+        .expect("the plugin-route fallthrough arm is gone — re-point this scan")
+        .0;
+    let mut out = std::collections::BTreeSet::new();
+    for line in block.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("(\"") else {
+            continue;
+        };
+        // A dispatch arm reads `(<method>, <path>) => handler(..)`.
+        let path = rest
+            .split_once("\", \"")
+            .and_then(|(_method, tail)| tail.split_once('"'))
+            .map(|(path, _)| path)
+            .filter(|path| path.starts_with('/'))
+            .unwrap_or_else(|| {
+                panic!(
+                    "loopback dispatch: `{line}` opens a route arm this scan cannot read (a                      wrapped arm, or a rustfmt pass). Left unread it would drop the path from                      `core_route_paths()` and let a plugin shadow it with every test green."
+                )
+            });
+        // `&'static str` from the embedded source, which is `'static`.
+        out.insert(path);
+    }
+    out
+}
+
+/// One parsed request, for the plugin-route tests that need a `Request` they
+/// cannot build from outside this module.
+#[cfg(test)]
+pub(crate) fn request_for_test(
+    method: &str,
+    path: &str,
+    tab: Option<&str>,
+    chp: Option<u32>,
+) -> Request {
+    Request {
+        method: method.to_string(),
+        path: path.to_string(),
+        auth: None,
+        cimp: CimpHeaders {
+            tab: tab.map(str::to_string),
+            agent: None,
+            chp,
+            hello: None,
+        },
+        body: Vec::new(),
+    }
+}
+
+/// The two routes whose identity-less bodies do NOT default to
+/// [`crate::harness::DEFAULT_HARNESS`], spelled once each so the lookup and the
+/// dispatch arm cannot part company.
+const MEMORY_EVENT_ROUTE: &str = "/memory/event";
+/// See [`MEMORY_EVENT_ROUTE`].
+const LATCH_STATE_ROUTE: &str = "/latch/state";
+
 /// Handle one connection: route by method+path after checking auth.
 async fn handle_conn(
     mut stream: TcpStream,
@@ -1416,50 +1498,28 @@ async fn handle_conn(
         ("POST", "/memory/event") => handle_memory_event(&mut stream, &app, &req).await,
         ("POST", "/activity/contract_drift") => handle_contract_drift(&mut stream, &req).await,
         ("POST", "/activity/discovery_skipped") => handle_discovery_skipped(&mut stream, &app, &req).await,
-        ("POST", "/permission/event") => handle_permission_event(&mut stream, &app, &req).await,
         ("POST", "/latch/beacon") => handle_latch_beacon(&mut stream, &app, &req).await,
         ("POST", "/latch/state") => handle_latch_state(&mut stream, &app, &req).await,
         ("POST", "/session/hello") => handle_session_hello(&mut stream, &app, &req).await,
         // ── V35 Phase L: the read path, as CHP pushes ────────────────────────
         //
         // The harness-neutral half of the three capabilities Phase L moves off
-        // the Tier-C readers. Claude reaches the same cores through its own
-        // `/claude/hook/*` ingress below (its hook body is Claude's, so it
-        // cannot carry a CHP envelope); these routes are what a harness whose
-        // plugin CAN build a body posts to, and what the tests drive.
+        // the Tier-C readers. A harness whose hook body cannot carry a CHP
+        // envelope reaches the same cores through its OWN routes, appended
+        // below from the registry; these are what a harness whose plugin CAN
+        // build a body posts to, and what the tests drive.
         ("POST", "/session/assistant_text") => handle_session_assistant_text(&mut stream, &app, &req).await,
         ("POST", "/session/tool_result") => handle_session_tool_result(&mut stream, &app, &req).await,
         ("POST", "/session/subagent") => handle_session_subagent(&mut stream, &app, &req).await,
-        // ── V35 Phase J: Claude Code's own hook payloads, posted by the harness ──
-        //
-        // The `type: "http"` half of the five hooks that used to be shim
-        // binaries. Same internal cores as the CHP routes above, different
-        // envelope in and out: raw Claude hook-input JSON in, Claude hook-output
-        // JSON back, and the identity in `X-CIMP-*` headers rather than in the
-        // body. Spelled as literals here — like every other arm, and unlike the
-        // `claude_hook::ROUTE_*` constants the overlay generator emits — because
-        // the route-enumeration test scans this `match` as text; a test pins the
-        // two spellings equal.
-        ("POST", "/claude/hook/user_prompt_submit") => handle_claude_user_prompt_submit(&mut stream, &app, &req).await,
-        ("POST", "/claude/hook/pre_compact") => handle_claude_pre_compact(&mut stream, &app, &req).await,
-        ("POST", "/claude/hook/pre_tool_use") => handle_claude_pre_tool_use(&mut stream, &app, &req).await,
-        ("POST", "/claude/hook/post_tool_use") => handle_claude_post_tool_use(&mut stream, &app, &req).await,
-        ("POST", "/claude/hook/notification") => handle_claude_notification(&mut stream, &app, &req).await,
-        ("POST", "/claude/hook/session_start") => handle_claude_session_start(&mut stream, &app, &req).await,
-        // ── V35 Phase L: Claude's ingress for the three migrated reads ───────
-        ("POST", "/claude/hook/stop") => handle_claude_stop(&mut stream, &app, &req).await,
-        ("POST", "/claude/hook/post_tool_use_result") => handle_claude_tool_result(&mut stream, &app, &req).await,
-        ("POST", "/claude/hook/post_tool_use_failure") => handle_claude_tool_failure(&mut stream, &app, &req).await,
-        ("POST", "/claude/hook/subagent") => handle_claude_subagent(&mut stream, &app, &req).await,
-        // ── 2026-08-17: the two beacons, as http hooks ───────────────────────
-        //
-        // The last two `type: "command"` Claude shims, migrated. Each reaches
-        // the SAME core its harness-neutral twin above does — `/latch/beacon`'s
-        // and `/workbench/tool_checkpoint`'s — so the two transports of each
-        // capability cannot come to behave differently (asserted by
-        // `both_transports_of_a_capability_call_one_core`).
-        ("POST", "/claude/hook/pre_tool_use_taint") => handle_claude_taint_beacon(&mut stream, &app, &req).await,
-        ("POST", "/claude/hook/pre_tool_use_checkpoint") => handle_claude_checkpoint(&mut stream, &app, &req).await,
+        // V40 Phase D (locked decisions 18 and 30): the neutral activity edges.
+        // Phase C declared them; these are the producers, and what makes them
+        // `live` in `chp::EVENTS`. A harness that reports its own turn
+        // boundaries posts here instead of leaving core to infer them from the
+        // terminal — which is the same fact `ActivitySource::OutOfBand`
+        // declares at L1, arriving over the wire instead.
+        ("POST", "/session/output_started") => handle_harness_output(&mut stream, &app, &req, true).await,
+        ("POST", "/session/output_stopped") => handle_harness_output(&mut stream, &app, &req, false).await,
+        ("POST", "/session/subagents_active") => handle_subagents_active(&mut stream, &app, &req).await,
         // NOTE (#45): there is deliberately no `POST /latch/override`. The
         // manual override is a capability GRANT, and the bearer token gating
         // this listener is readable by every process running as the user, so an
@@ -1487,7 +1547,24 @@ async fn handle_conn(
         ("GET", "/events") => handle_events(stream, service, &req).await,
         ("GET", "/health") => write_simple(&mut stream, 200, "text/plain", b"ok").await,
         ("GET", "/status") => handle_status(&mut stream, &app).await,
-        _ => write_simple(&mut stream, 404, "text/plain", b"not found").await,
+        // ── V40 Phase C: the plugin-owned routes (locked decisions 15, 22) ───
+        //
+        // Every registered harness's `routes()`, matched **after** every arm
+        // above — so a plugin can never shadow `/session/hello`, `/mcp/*` or
+        // the audit and push routes, whatever it declares. Core keeps no
+        // harness path literal: the twelve `/claude/hook/*` arms that used to
+        // sit in this `match` are `harness::claude::hook::ROUTES_TABLE` now,
+        // and the reply comes back as a [`crate::harness::plugin::HookReply`]
+        // core writes without reading. A harness whose ingress is an ordinary
+        // CHP plugin declares none and this lookup misses, exactly as it does
+        // for a path nobody serves.
+        _ => match crate::harness::ingress::route(req.method.as_str(), route) {
+            Some(r) => {
+                let reply = (r.handler)(&app, &req).await?;
+                write_json(&mut stream, reply.status, &reply.body).await
+            }
+            None => write_simple(&mut stream, 404, "text/plain", b"not found").await,
+        },
     }
 }
 
@@ -1577,13 +1654,21 @@ async fn handle_run(
     // funnel). `LatchRoute::Native` — this route serves cImp's own tools, never
     // a proxied server's content.
     let tool = offload_tool_name(body.tool.as_deref());
+    // V40 review H-1: the same one-resolution funnel `/mcp/call` uses. This
+    // route's gate is `LatchRoute::Native` over `offload_task`/`offload_batch`
+    // — the V32 C-1c gate whose doc paragraph above describes the `.env`
+    // exfiltration it closes — so a consumer token that resolved to no tab
+    // scope disabled exactly that gate.
+    let Some((_, run_agent)) = proxy_identity(body.consumer.as_deref()) else {
+        let r = RunResult {
+            ok: false,
+            text: None,
+            error: Some(unknown_consumer_message()),
+        };
+        return write_json(stream, 400, &r).await;
+    };
     let settings = live_settings(app);
-    let scoping = latch_scope(
-        app,
-        &settings,
-        crate::graph::source_for_consumer(body.consumer.as_deref().unwrap_or("claude")),
-        body.tab.as_deref(),
-    );
+    let scoping = latch_scope(app, &settings, run_agent, body.tab.as_deref());
     if let LatchScoping::Unknown(tab) = &scoping {
         warn!(
             target: "offload",
@@ -1624,11 +1709,7 @@ async fn handle_run(
     // stale claim, and a checkpoint is the one record that exists to be trusted
     // after an incident, so it degrades to "cannot attribute" rather than to
     // "some other tab".
-    let checkpoint_tab = match tab_identity(
-        &settings,
-        crate::graph::source_for_consumer(body.consumer.as_deref().unwrap_or("claude")),
-        body.tab.as_deref(),
-    ) {
+    let checkpoint_tab = match tab_identity(&settings, run_agent, body.tab.as_deref()) {
         TabIdentity::Configured(t) => Some(t.to_string()),
         TabIdentity::Anonymous | TabIdentity::Unknown(_) => None,
     };
@@ -1902,17 +1983,16 @@ impl LatchScope {
 /// exactly the unbounded key space #45 closed. So the floor keeps its original
 /// trigger and only the positive test is consumer-scoped, which makes this
 /// change a strict tightening of the admitted set.
-fn is_configured_tab(settings: &crate::settings::Settings, agent: &'static str, tab: &str) -> bool {
+pub(crate) fn is_configured_tab(settings: &crate::settings::Settings, agent: &'static str, tab: &str) -> bool {
     names_a_configured_ai_tab_for(settings, agent, tab) || ai_tab_ids(settings).next().is_none()
 }
 
 /// Every configured AI tab's id, in settings order — **every consumer's**.
 ///
-/// Two callers, and neither is the latch: [`names_a_configured_ai_tab`] (a
-/// collision check across the whole id space) and [`is_configured_tab`]'s
-/// availability floor (whose condition is "settings are unreadable", not
-/// "this consumer has no tabs"). Identity checks use
-/// [`ai_tab_ids_for`] instead.
+/// One caller, and it is not the latch: [`is_configured_tab`]'s availability
+/// floor, whose condition is "settings are unreadable", not "this consumer has
+/// no tabs". Identity checks use [`ai_tab_ids_for`] instead. (The second
+/// caller, the C-2 collision check, went with V40 Phase D's key spaces.)
 fn ai_tab_ids(settings: &crate::settings::Settings) -> impl Iterator<Item = &str> {
     settings.tabs.iter().filter_map(|t| match t {
         crate::settings::TabConfig::AiTool(c) => Some(c.id.as_str()),
@@ -1927,7 +2007,7 @@ fn ai_tab_ids_for<'a>(
     agent: &'static str,
 ) -> impl Iterator<Item = &'a str> {
     settings.tabs.iter().filter_map(move |t| match t {
-        crate::settings::TabConfig::AiTool(c) if crate::tabs::tab_consumer(c) == agent => {
+        crate::settings::TabConfig::AiTool(c) if crate::tabs::tab_consumer(c) == Some(agent) => {
             Some(c.id.as_str())
         }
         _ => None,
@@ -1944,24 +2024,12 @@ fn names_a_configured_ai_tab_for(
     ai_tab_ids_for(settings, agent).any(|t| t == id)
 }
 
-/// Whether `id` **exactly** names a configured AI tab of ANY consumer —
-/// [`is_configured_tab`] without its availability floor and without its
-/// consumer scope.
-///
-/// The floor is an availability floor for the *latch* (a gate that rejects
-/// every id before settings load would refuse real tool calls). It is the wrong
-/// polarity for a caller that must be REFUSED for naming a tab, where "no tabs
-/// configured yet" must mean "this string collides with nothing" — so that
-/// caller gets this predicate instead of a negated one. See
-/// [`mark_live_session_from_event`], its only consumer.
-///
-/// V33 C5 left the consumer scope off this one deliberately, for the same
-/// polarity reason: it asks "does this session id collide with a TAB id", and a
-/// collision is a collision whichever consumer owns the tab. Narrowing it to one
-/// consumer would let an OpenCode session id equal to a Claude tab id through.
-fn names_a_configured_ai_tab(settings: &crate::settings::Settings, id: &str) -> bool {
-    ai_tab_ids(settings).any(|t| t == id)
-}
+// `names_a_configured_ai_tab` lived here: "does this session id collide with a
+// configured TAB id", the C-2 guard on `/memory/event`'s registry writes. V40
+// Phase D deleted it with the collision it guarded — the live-session registry
+// has two key spaces now (locked decision 20), a body-supplied id goes into the
+// session space, and no string can be in both. See
+// `mark_live_session_from_body`.
 
 /// Which of three cases a request body's `(agent, tab)` falls into, decided
 /// **without** the `AppHandle` [`latch_scope`]'s session lookup needs.
@@ -2339,7 +2407,7 @@ struct TabLatch {
     /// happened yet?", never "should it happen?". H-2's decode proof still gates
     /// it: `observe` only ever sees session ids the live-session registry
     /// published, and that registry takes Claude ids from
-    /// `oob::claude::LiveSessionGate` (a decoded record naming the session) and
+    /// `harness::claude::read::LiveSessionGate` (a decoded record naming the session) and
     /// OpenCode ids from a `session.created` on the harness's own event stream.
     ///
     /// # Lifetime
@@ -3108,7 +3176,7 @@ struct LatchRegistry {
 /// takes them as data rather than reading settings itself, so the whole gate
 /// stays a pure decision over one lock and one snapshot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct GatePolicy {
+pub(crate) struct GatePolicy {
     /// [`Feature::TaintLatch`](crate::settings::injection::Feature::TaintLatch)
     /// — engagement, refusals and the latch shown in `/status`.
     latch: bool,
@@ -3146,7 +3214,7 @@ impl GatePolicy {
 /// fallback is `Settings::default()` — all protection ON — because a request
 /// arriving before managed state is up must not be the moment containment
 /// silently lapses.
-fn live_settings(app: &AppHandle) -> crate::settings::Settings {
+pub(crate) fn live_settings(app: &AppHandle) -> crate::settings::Settings {
     app.try_state::<crate::ipc::AppState>()
         .map(|s| s.settings.current())
         .unwrap_or_default()
@@ -4853,7 +4921,23 @@ async fn handle_graph_run(stream: &mut TcpStream, app: &AppHandle, req: &Request
             return write_json(stream, 200, &r).await;
         }
     };
-    let consumer = body.consumer.as_deref().unwrap_or("claude");
+    // V40 review H-1: ONE identity for this call. `proxy_identity` folds an
+    // in-app consumer onto `Consumer::conservative_grant` and refuses a token
+    // nobody declared — before this, `?consumer=offload` reached the
+    // `LatchRoute::Native` gate with an activity source that names no
+    // configured tab (so no latch, no attribution) and `?consumer=<garbage>`
+    // did the same with nothing refusing it. The FOLDED token goes downstream,
+    // so `run_command`'s exposure switch, the memory agent scope, the activity
+    // source and the latch all answer about the same harness.
+    let Some((resolved, consumer_source)) = proxy_identity(body.consumer.as_deref()) else {
+        let r = RunResult {
+            ok: false,
+            text: None,
+            error: Some(unknown_consumer_message()),
+        };
+        return write_json(stream, 400, &r).await;
+    };
+    let consumer = resolved.token();
     // V28: resolve the calling TAB to the session it currently reports, so the
     // `context_*` memory tools scope to this tab's own session instead of "the
     // most recent session for this agent" (two same-agent tabs used to share —
@@ -4889,12 +4973,7 @@ async fn handle_graph_run(stream: &mut TcpStream, app: &AppHandle, req: &Request
         };
         return write_json(stream, 200, &r).await;
     };
-    let scoping = latch_scope(
-        app,
-        &settings,
-        crate::graph::source_for_consumer(consumer),
-        body.tab.as_deref(),
-    );
+    let scoping = latch_scope(app, &settings, consumer_source, body.tab.as_deref());
     // #48 F-20: resolved BEFORE `into_scope()` collapses `Anonymous` and
     // `Unknown` into one `None`. That collapse is right for the latch (both fail
     // open) and wrong for the row, which has to say which of the three this call
@@ -4960,7 +5039,7 @@ async fn handle_graph_run(stream: &mut TcpStream, app: &AppHandle, req: &Request
                 spotlight_recall: crate::settings::injection::effective(
                     crate::settings::injection::Feature::Spotlighting,
                     crate::settings::injection::Scope::for_tab(
-                        crate::graph::source_for_consumer(consumer),
+                        consumer_source,
                         body.tab.as_deref(),
                     ),
                     &settings,
@@ -4999,7 +5078,7 @@ struct AuditRunBody {
     /// The agent that triggered the scan, from the child's `--consumer` flag.
     /// It selects which `expose_*` toggle the route re-enforces at run time, so
     /// it is a *capability selector*, not a label — H-8: narrowed to
-    /// [`AUDIT_CONSUMERS`] by [`audit_consumer`] before it reaches
+    /// [`audit_consumers`] by [`audit_consumer`] before it reaches
     /// [`AuditState::consumer_exposed`](crate::audit::AuditState::consumer_exposed).
     #[serde(default)]
     consumer: Option<String>,
@@ -5045,9 +5124,14 @@ struct AuditRunBody {
 /// ("`expose_offload` is deliberately absent: the offload worker runs
 /// in-process"). So `expose_offload` — which defaults **true** — was reachable
 /// over HTTP only by a caller that no legitimate component ever is.
-const AUDIT_CONSUMERS: [&str; 2] = ["claude", "opencode"];
+/// The consumers `/audit/run` serves — **the registry**, not a literal pair
+/// (V40 Phase A). A harness added without a line here used to be refused by a
+/// route it is entitled to, with a message naming two products it isn't one of.
+fn audit_consumers() -> Vec<&'static str> {
+    crate::harness::registry::harness_ids()
+}
 
-/// H-8: narrow `/audit/run`'s caller-asserted `consumer` to [`AUDIT_CONSUMERS`]
+/// H-8: narrow `/audit/run`'s caller-asserted `consumer` to [`audit_consumers`]
 /// at the parse boundary, returning the `&'static str` the rest of the route
 /// uses. Same discipline `ada4bae` gave `/run`'s `tool` label
 /// ([`offload_tool_name`]) and for a stronger reason: `tool` is only a label,
@@ -5061,16 +5145,20 @@ fn audit_consumer(raw: Option<&str>) -> Result<&'static str, String> {
     let raw = raw
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .unwrap_or("claude");
+        .unwrap_or_else(|| {
+            crate::harness::DEFAULT_HARNESS
+                .id()
+                .expect("DEFAULT_HARNESS names a registered harness")
+        });
     let lower = raw.to_ascii_lowercase();
-    AUDIT_CONSUMERS
-        .iter()
-        .copied()
+    audit_consumers()
+        .into_iter()
         .find(|c| *c == lower)
         .ok_or_else(|| {
             format!(
-                "code audit does not serve the consumer {raw:?} — this route serves the \
-                 cimp-code-audit MCP child only (claude, opencode)"
+                "code audit does not serve the consumer {raw:?} - this route serves the \
+                 cimp-code-audit MCP child only ({})",
+                audit_consumers().join(", ")
             )
         })
 }
@@ -5078,7 +5166,7 @@ fn audit_consumer(raw: Option<&str>) -> Result<&'static str, String> {
 /// H-8: `/audit/run` requires a tab identity — a request without one is
 /// **refused**, never treated as clean.
 ///
-/// Both spawn paths have sent `--tab` since V32 C-1b (see [`AUDIT_CONSUMERS`]),
+/// Both spawn paths have sent `--tab` since V32 C-1b (see [`audit_consumers`]),
 /// so the only bodies this rejects are a hand-run child, a forged request, and
 /// a *stale* child left over from a pre-C-1b build — which is why the message
 /// names the remedy (restart the tab) rather than the symptom.
@@ -5264,7 +5352,7 @@ fn audit_admit(
 /// already has this" residual does not cover. Compounding it, `consumer` was
 /// caller-asserted and unbounded while *selecting which `expose_*` toggle is
 /// checked*, including `"offload"` — which defaults **true** and which no
-/// legitimate caller sends (see [`AUDIT_CONSUMERS`]). Both halves are now
+/// legitimate caller sends (see [`audit_consumers`]). Both halves are now
 /// closed at the parse boundary by [`audit_admit`]: a body with no usable tab
 /// identity is refused with an actionable message, an unrecognized `consumer`
 /// is refused, and any surviving path on which the gate does not apply warns.
@@ -5423,23 +5511,23 @@ async fn handle_audit_run(stream: &mut TcpStream, app: &AppHandle, req: &Request
 /// A `POST /context/retrieve` request body (from the Claude UserPromptSubmit
 /// hook or the OpenCode injection plugin).
 #[derive(Deserialize)]
-struct ContextRetrieveBody {
+pub(crate) struct ContextRetrieveBody {
     /// The calling session's working directory; the project root is resolved
     /// from it (defaults to `.`).
     #[serde(default)]
-    cwd: Option<String>,
+    pub(crate) cwd: Option<String>,
     /// The user's prompt to rank context against.
-    prompt: String,
+    pub(crate) prompt: String,
     /// The agent session id (scopes the working-set boost); optional.
     #[serde(default)]
-    session_id: Option<String>,
+    pub(crate) session_id: Option<String>,
     /// V13 Phase C: which agent shim is calling — `"claude"` (set by
     /// the Claude `UserPromptSubmit` route) or `"opencode"` (the generated plugin);
     /// absent/`None` for an unrecognized caller. Recorded on the checkpoint
     /// it triggers (see [`WorkbenchService::on_prompt`](crate::workbench::WorkbenchService::on_prompt)),
     /// not otherwise used by context retrieval itself.
     #[serde(default)]
-    agent: Option<String>,
+    pub(crate) agent: Option<String>,
     /// V33: the cImp TAB this prompt belongs to — `--tab <id>` baked into the
     /// `--context-hook` command at spawn (`tabs::config`), or `CIMP_TAB_ID`
     /// from the generated OpenCode plugin. Recorded on the checkpoint this
@@ -5450,7 +5538,7 @@ struct ContextRetrieveBody {
     /// such field, and a prompt must never fail for lack of identity — the
     /// checkpoint is simply written without a tab, exactly as before.
     #[serde(default)]
-    tab: Option<String>,
+    pub(crate) tab: Option<String>,
 }
 
 /// V33: the conversation identity recorded on the prompt-tap checkpoint this
@@ -5545,7 +5633,7 @@ async fn handle_context_retrieve(
 /// *after* those destructive reads already happened:
 ///
 /// - the Claude harness discards the hook's reply outright at 1 s
-///   ([`claude_hook::TIMEOUT_SECS`]);
+///   ([`crate::harness::claude::hook::TIMEOUT_SECS`]);
 /// - the OpenCode plugin aborts its `/context/retrieve` fetch at **600 ms**
 ///   (`AbortSignal.timeout(600)` in `templates/plugin.js` — the five deleted
 ///   shims' own `context_hook::TIMEOUT` number, "a slow/cold index never
@@ -5605,7 +5693,7 @@ fn merge_files_used(parked: Vec<String>, fresh: Vec<String>) -> Vec<String> {
 
 /// The prompt tap's whole effect, shared by `/context/retrieve` (the CHP body a
 /// pre-upgrade shim or the OpenCode plugin posts) and
-/// [`claude_hook::ROUTE_USER_PROMPT_SUBMIT`] (the raw `UserPromptSubmit` payload
+/// [`crate::harness::claude::hook::ROUTE_USER_PROMPT_SUBMIT`] (the raw `UserPromptSubmit` payload
 /// the harness posts since V35 Phase J).
 ///
 /// Extracted rather than duplicated: this is the only place the checkpoint
@@ -5626,7 +5714,7 @@ fn merge_files_used(parked: Vec<String>, fresh: Vec<String>) -> Vec<String> {
 /// once-per-session greeting and the drained auto-check block are destructive
 /// reads (consumed exactly once), and both are cheap — no embed, no network —
 /// so a slow retrieval can never cost the session its project map.
-async fn context_retrieve_core(app: &AppHandle, body: &ContextRetrieveBody) -> serde_json::Value {
+pub(crate) async fn context_retrieve_core(app: &AppHandle, body: &ContextRetrieveBody) -> serde_json::Value {
     // #104: both consumers below create per-project state — the workbench's
     // `<db_subdir>/shadow.git` and the graph store — so the payload's `cwd` is
     // resolved to a real root first. `None` refuses BOTH: no checkpoint and no
@@ -5812,48 +5900,93 @@ struct ToolCheckpointBody {
 /// Not a per-call latency budget for the *user*: the throttle means most calls
 /// never reach a snapshot at all, and this bound is only reached by a
 /// `git add -A` over a work tree big enough to take seconds.
-/// `pub(crate)` so `checkpoint_beacon`'s
-/// `the_shim_waits_longer_than_the_app_takes_to_give_up` can assert the ordering
-/// against the shim's own timeout. The two constants live in different files and
-/// nothing else keeps them in the right order.
-pub(crate) const TOOL_CHECKPOINT_BUDGET: Duration = Duration::from_millis(1800);
+/// **V40 Phase C, locked decision 22 — this is no longer a number typed here.**
+/// It was `Duration::from_millis(1800)`, hand-computed from two artifacts'
+/// timers and asserted against both by a cross-file test, which meant a THIRD
+/// harness with a shorter timer would have been silently over-run. Core now
+/// derives it as `min(every plugin's declared `hook_reply_timeout`) − margin`
+/// ([`crate::harness::ingress::hook_reply_budget`]); the shipped pair still
+/// implies 1800 ms and a test pins that, so the behaviour is unchanged and the
+/// derivation is what moved.
+pub(crate) fn tool_checkpoint_budget() -> Duration {
+    crate::harness::ingress::hook_reply_budget()
+}
 
 /// V33 Phase F: does `tool` change files on disk, **in `harness`'s own tool
 /// vocabulary**?
 ///
 /// Split out of [`handle_tool_checkpoint`] so the namespace selection is
 /// exercised by a test rather than re-implemented in one — a test that owned its
-/// own copy of this `match` would stay green after the handler stopped calling
-/// it. `harness` has already been normalised through [`hook_agent`], so it is
-/// one of the two-word vocabulary and the `_` arm is Claude's.
+/// own copy of this lookup would stay green after the handler stopped calling it.
+///
+/// **V40 Phase A, locked decision 16.** This was a `match` with `"opencode"` in
+/// one arm and Claude's table in the `_` arm, which meant a THIRD harness's
+/// `edit` was not rejected but answered out of Claude's vocabulary — `false`,
+/// silently, for its whole mutation surface. It is now one registry lookup that
+/// fails CLOSED: a token naming no registered harness, and a name the registered
+/// plugin does not declare, both answer `true`. A checkpoint nobody needed is a
+/// commit into cImp's own shadow repo; a missed one is a destructive call with
+/// no way back.
 fn tool_checkpoint_is_mutating(harness: &str, tool: &str) -> bool {
-    match harness {
-        "opencode" => crate::harness::opencode::tools::opencode_native_mutates_fs(tool),
-        _ => crate::offload::toolclass::mutates_fs(tool),
+    crate::harness::native::mutates_fs(crate::harness::HarnessId::from_id(harness), tool)
+}
+
+/// The identity check `POST /workbench/tool_checkpoint` makes before anything is
+/// staged — the harness token this call is attributed to, or the refusal.
+///
+/// **V40 review finding M-6 (parity lens).** The route's own doc claims a
+/// forged POST "cannot get a destructive call waved through by naming a harness
+/// cImp does not know", and the opposite was true: an unregistered token
+/// resolves to `UNKNOWN_SOURCE`, `mutates_fs` fails CLOSED for it — which is
+/// right for a name inside a known harness's vocabulary and wrong for a source
+/// that has no vocabulary — so EVERY tool name from an unidentified caller was
+/// "mutating" and minted a snapshot attributed to `unknown:<whatever>`. Bounded
+/// by the throttle and the tree-sha dedup, but a checkpoint is the one record
+/// that exists to be trusted after an incident, and an unattributable row in it
+/// is worse than no row.
+///
+/// An ABSENT `agent` is a different question with a different answer: it is a
+/// shim from a build before the field existed, and it resolves to
+/// [`crate::harness::DEFAULT_HARNESS`] exactly as every other hook body does.
+///
+/// Split out so the decision is testable without a `TcpStream`.
+fn checkpoint_source_admits(agent: Option<&str>) -> Result<&'static str, String> {
+    let harness = hook_agent(agent);
+    if crate::harness::HarnessId::from_id(harness).is_some() {
+        return Ok(harness);
     }
+    Err(format!(
+        "`agent` names no registered harness ({}), so this call cannot be attributed to one. A          checkpoint is the record a restore is judged against; an unattributable row in it is          worse than no row.",
+        crate::harness::registry::harness_ids().join(", ")
+    ))
 }
 
 /// `POST /workbench/tool_checkpoint` (V33 Phase F): take a Workbench checkpoint
 /// **immediately before** a filesystem-mutating tool call, attributed to that
 /// exact call.
 ///
-/// # Why the tool name is re-checked here
+/// # Why identity and the tool name are both re-checked here
+///
+/// **Identity first** (V40 review M-6): a body whose `agent` names no
+/// registered harness is refused with a 400, because `mutates_fs` fails CLOSED
+/// for an unknown vocabulary — which is right for a name inside a known
+/// harness's table and wrong for a source that has no table, where it made
+/// EVERY tool name mutating. See [`checkpoint_source_admits`].
 ///
 /// Both callers pre-filter — Claude's hook is installed with an
 /// `Edit|Write|MultiEdit|Bash` matcher, the plugin consults a baked
 /// `CIMP_MUTATING_TOOLS` set — but neither is the authority. This route resolves
-/// the name against `toolclass`'s reviewed tables, per harness:
-/// [`mutates_fs`](crate::offload::toolclass::mutates_fs) for Claude's
-/// capitalized vocabulary,
-/// [`opencode_native_mutates_fs`](crate::harness::opencode::tools::opencode_native_mutates_fs)
-/// for OpenCode's. A drifted matcher, a shim from a newer build, or a forged
-/// POST from any local process therefore cannot mint a checkpoint for a tool
-/// cImp does not classify as mutating.
+/// the name against the SENDING harness's own reviewed table, through
+/// [`crate::harness::native::mutates_fs`]. A drifted matcher, a shim from a
+/// newer build, or a forged POST from any local process therefore cannot mint a
+/// checkpoint for a tool that harness declares non-mutating — and cannot get a
+/// destructive call waved through by naming a harness cImp does not know.
 ///
-/// **Crossing the two vocabularies would be silent, not loud**: `mutates_fs`
-/// answers `false` for `edit` (an unknown name in cImp's own table), so reading
-/// OpenCode's ids through it would disable the whole OpenCode seam while every
-/// test that only exercised Claude stayed green.
+/// **Crossing the two vocabularies would be silent, not loud**: `edit` and
+/// `Edit` are unknown in each other's tables, so one crossed lookup would
+/// disable a whole harness's seam while every test that only exercised the other
+/// stayed green. The registry lookup is what makes crossing them impossible to
+/// express.
 ///
 /// # Containment posture
 ///
@@ -5874,7 +6007,7 @@ fn tool_checkpoint_is_mutating(harness: &str, tool: &str) -> bool {
 /// — and the harness runs the tool the moment they do. A snapshot still staging
 /// past that point is racing the very edit it exists to precede, so this route
 /// hands [`WorkbenchService::on_tool`](crate::workbench::WorkbenchService::on_tool)
-/// a deadline of [`TOOL_CHECKPOINT_BUDGET`] and the snapshot writes **nothing**
+/// a deadline of [`tool_checkpoint_budget`] and the snapshot writes **nothing**
 /// once it is spent. The alternative — let the caller give up and let the app
 /// commit the row anyway — is the failure this amendment exists to close: a
 /// checkpoint that sometimes contains the change it claims to predate silently
@@ -5931,6 +6064,16 @@ async fn handle_tool_checkpoint(
         )
         .await;
     };
+    // V40 review M-6: identity BEFORE anything is staged. See
+    // `checkpoint_source_admits`.
+    if let Err(msg) = checkpoint_source_admits(body.agent.as_deref()) {
+        return write_json(
+            stream,
+            400,
+            &serde_json::json!({ "ok": false, "error": msg }),
+        )
+        .await;
+    }
     let checkpointed = tool_checkpoint_core(
         app,
         &live_settings(app),
@@ -5951,7 +6094,7 @@ async fn handle_tool_checkpoint(
 
 /// **The pre-tool checkpoint itself** — the core both out-of-process fire seams
 /// reach: this route's harness-neutral body (the OpenCode plugin) and
-/// [`claude_hook::ROUTE_PRE_TOOL_USE_CHECKPOINT`]'s Claude hook payload.
+/// [`crate::harness::claude::hook::ROUTE_PRE_TOOL_USE_CHECKPOINT`]'s Claude hook payload.
 ///
 /// Split out on 2026-08-17, when the Claude side stopped being a shim POSTing to
 /// the route and became a handler beside it. One core, so the two transports
@@ -5963,10 +6106,10 @@ async fn handle_tool_checkpoint(
 /// Returns `checkpointed`: the trigger settled and nothing about this call is
 /// unaccounted for — true for a checkpoint created, a dedup hit and a throttled
 /// call; false for a non-mutating name, checkpoints off, no service, or a
-/// snapshot abandoned against [`TOOL_CHECKPOINT_BUDGET`]. `settings` is passed in
+/// snapshot abandoned against [`tool_checkpoint_budget`]. `settings` is passed in
 /// rather than read here so a handler resolves identity and policy under ONE
 /// snapshot.
-async fn tool_checkpoint_core(
+pub(crate) async fn tool_checkpoint_core(
     app: &AppHandle,
     settings: &crate::settings::Settings,
     agent: Option<&str>,
@@ -6019,7 +6162,7 @@ async fn tool_checkpoint_core(
             &root,
             origin,
             &source,
-            Some(Instant::now() + TOOL_CHECKPOINT_BUDGET),
+            Some(Instant::now() + tool_checkpoint_budget()),
         )
         .await
 }
@@ -6055,12 +6198,12 @@ async fn tool_checkpoint_core(
 
 /// The class-table name `POST /context/post_edit` gates under. See its
 /// [`toolclass::TABLE`] row for why it is LOCAL-CAPABILITY.
-const HOOK_TOOL_POST_EDIT: &str = "hook_post_edit";
+pub(crate) const HOOK_TOOL_POST_EDIT: &str = "hook_post_edit";
 /// The class-table name `POST /context/should_read` gates under.
-const HOOK_TOOL_SHOULD_READ: &str = "hook_should_read";
+pub(crate) const HOOK_TOOL_SHOULD_READ: &str = "hook_should_read";
 /// The class-table name `POST /context/compaction` gates under. TRUSTED, so
 /// this gate admits every call today — see the row.
-const HOOK_TOOL_COMPACTION: &str = "hook_compaction";
+pub(crate) const HOOK_TOOL_COMPACTION: &str = "hook_compaction";
 
 /// V39 Phase B: the class-table name `POST /delegate` gates under.
 ///
@@ -6136,6 +6279,35 @@ fn delegate_admit(
 /// selects which agent's key the scope is built under and nothing else; F-4
 /// (`(consumer, tab)` is a verified pair on no route) is unchanged here, not
 /// worked around.
+/// **The hook gate, as one call a plugin can make** (V40 Phase C).
+///
+/// [`hook_admit`]'s signature names `LatchRegistry`, `LatchScoping`,
+/// `LatchScope` and `GatePolicy` — four private types, three of them closures'
+/// arguments. That is the right shape for the callers inside this file and the
+/// wrong one for a plugin route: the latch model is core's, and a harness's
+/// ingress must be able to ask "may this hook run?" without being handed the
+/// machinery that answers.
+///
+/// Same decision, same ledger, same `CallProvenance::http()`; only the surface
+/// is narrower. `false` means refused.
+pub(crate) fn hook_gate_admits(
+    app: &AppHandle,
+    settings: &crate::settings::Settings,
+    tool: &'static str,
+    agent: Option<&str>,
+    tab: Option<&str>,
+) -> bool {
+    hook_admit(
+        latches(),
+        tool,
+        hook_agent(agent),
+        tab,
+        |agent, tab| latch_scope(app, settings, agent, tab),
+        |scope| GatePolicy::resolve(settings, scope),
+    )
+    .is_ok()
+}
+
 fn hook_admit(
     reg: &LatchRegistry,
     tool: &'static str,
@@ -6167,29 +6339,66 @@ fn hook_admit(
 /// `claude`: `--precompact-hook` and `--read-hook` are installed only into
 /// Claude's settings overlay, and a `post_edit` body with no `agent` is a shim
 /// from a build before this field existed, which was a Claude shim.
+///
+/// **EMPTY counts as absent** (V40 review finding M-4). `identity_of_request`
+/// answers `req.cimp.agent.clone().unwrap_or_default()` and
+/// `chp::Envelope::agent_token` answers `.unwrap_or("")`, so an artifact from
+/// before the discriminator existed arrives here as `Some("")`, not `None`. On
+/// develop `source_for_consumer("")` was `"claude"` and the guard never
+/// mattered; since V40 it is `UNKNOWN_SOURCE`, which names no configured tab
+/// and fails every gate open. Whitespace-only counts as empty, so `" "` cannot
+/// walk past it either — but a token that has any content is passed through
+/// UNTRIMMED, because `HarnessId::from_consumer`'s no-trim is a locked decision
+/// and `" opencode "` must keep answering `unknown`.
 fn hook_agent(agent: Option<&str>) -> &'static str {
-    crate::graph::source_for_consumer(agent.unwrap_or("claude"))
+    crate::graph::source_for_consumer(
+        agent
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or(crate::harness::DEFAULT_HARNESS.token()),
+    )
+}
+
+/// The agent key an identity-less body on `route` resolves to — [`hook_agent`]
+/// for the routes whose default is the ROUTE's, not the app's.
+///
+/// One funnel for the three places that read a body-supplied discriminator and
+/// fall back to [`crate::harness::ingress::wire_default`] (`/memory/event`,
+/// `/latch/state`, and the CHP observer), so the handler and the observer on one
+/// request cannot answer differently — the disagreement V40 review M-4 found on
+/// `/memory/event`, where the handler read `opencode` and `note_chp` read
+/// `unknown` from the same bytes.
+///
+/// Empty is absent here for the same reason it is in [`hook_agent`]; an
+/// unresolvable token stays `UNKNOWN_SOURCE`, which is V40's deliberate
+/// narrowing and not what this funnel is about.
+fn wire_agent(route: &str, token: Option<&str>) -> &'static str {
+    match token.filter(|s| !s.trim().is_empty()) {
+        Some(t) => crate::graph::source_for_consumer(t),
+        None => crate::graph::source_for_consumer(
+            crate::harness::ingress::wire_default(route).token(),
+        ),
+    }
 }
 
 /// A `POST /context/compaction` request body (the Claude `PreCompact` shim).
 #[derive(Deserialize)]
-struct ContextCompactionBody {
+pub(crate) struct ContextCompactionBody {
     #[serde(default)]
-    cwd: Option<String>,
+    pub(crate) cwd: Option<String>,
     #[serde(default)]
-    session_id: Option<String>,
+    pub(crate) session_id: Option<String>,
     /// `"manual"` / `"auto"`; recorded, not currently branched on.
     #[serde(default)]
     #[allow(dead_code)]
-    trigger: Option<String>,
+    pub(crate) trigger: Option<String>,
     /// #48 (M-7): which shim is calling. See [`hook_agent`].
     #[serde(default)]
-    agent: Option<String>,
+    pub(crate) agent: Option<String>,
     /// #48 (M-7): the cImp TAB this hook serves, baked into argv at spawn.
     /// `#[serde(default)]` because a shim from an older build sends none — see
     /// the residual note above.
     #[serde(default)]
-    tab: Option<String>,
+    pub(crate) tab: Option<String>,
 }
 
 /// `POST /context/compaction` (V11 Phase D): always runs the session's
@@ -6238,14 +6447,14 @@ async fn handle_context_compaction(
 }
 
 /// The compaction carry-over block, **after** the gate — shared by
-/// `/context/compaction` and [`claude_hook::ROUTE_PRE_COMPACT`].
+/// `/context/compaction` and [`crate::harness::claude::hook::ROUTE_PRE_COMPACT`].
 ///
 /// The gate itself deliberately stays in each handler rather than moving in
 /// here: the route-enumeration test (`every_loopback_route_declares_what_it_does_
 /// about_the_latch`) checks each handler's own body for its `hook_admit(latches(),
 /// …)` call, and a gate that a route merely inherits from a helper is a gate a
 /// reviewer cannot see at the route.
-fn compaction_block(app: &AppHandle, body: &ContextCompactionBody) -> String {
+pub(crate) fn compaction_block(app: &AppHandle, body: &ContextCompactionBody) -> String {
     let Some(graph) = app.try_state::<Arc<crate::graph::GraphService>>() else {
         return String::new();
     };
@@ -6265,26 +6474,26 @@ fn compaction_block(app: &AppHandle, body: &ContextCompactionBody) -> String {
 /// A `POST /context/should_read` request body (the Claude `PreToolUse` Read
 /// advisor shim).
 #[derive(Deserialize)]
-struct ShouldReadBody {
+pub(crate) struct ShouldReadBody {
     #[serde(default)]
-    cwd: Option<String>,
+    pub(crate) cwd: Option<String>,
     #[serde(default)]
-    session_id: Option<String>,
-    file_path: String,
+    pub(crate) session_id: Option<String>,
+    pub(crate) file_path: String,
     /// 1-based read offset, when the agent asked for a windowed read.
     #[serde(default)]
-    offset: Option<u32>,
+    pub(crate) offset: Option<u32>,
     /// V17 Phase B: the `Read` line limit, when the agent asked for a slice.
     /// Forwarded so the verdict can tell a full read from a head-peek (a
     /// deliberate slice always passes — Phase C's first-read branch).
     #[serde(default)]
-    limit: Option<u32>,
+    pub(crate) limit: Option<u32>,
     /// #48 (M-7): which shim is calling. See [`hook_agent`].
     #[serde(default)]
-    agent: Option<String>,
+    pub(crate) agent: Option<String>,
     /// #48 (M-7): the cImp TAB this hook serves, baked into argv at spawn.
     #[serde(default)]
-    tab: Option<String>,
+    pub(crate) tab: Option<String>,
 }
 
 /// `POST /context/should_read` (V11 Phase E): the read-advisor verdict for a
@@ -6346,9 +6555,9 @@ async fn handle_should_read(
 
 /// The read advisor's verdict, **after** the gate — `Some(reminder)` for a
 /// `remind`, `None` for a `pass`. Shared by `/context/should_read` and
-/// [`claude_hook::ROUTE_PRE_TOOL_USE`]; see [`compaction_block`] for why the
+/// [`crate::harness::claude::hook::ROUTE_PRE_TOOL_USE`]; see [`compaction_block`] for why the
 /// gate stays at each route rather than moving in here.
-fn should_read_verdict(app: &AppHandle, body: &ShouldReadBody) -> Option<String> {
+pub(crate) fn should_read_verdict(app: &AppHandle, body: &ShouldReadBody) -> Option<String> {
     let graph = app.try_state::<Arc<crate::graph::GraphService>>()?;
     let graph = graph.inner().clone();
     // #104: the advisor OPENS (and therefore creates) the project's graph store,
@@ -6368,84 +6577,46 @@ fn should_read_verdict(app: &AppHandle, body: &ShouldReadBody) -> Option<String>
 /// A `POST /activity/contract_drift` request body (V16 Feature 3): a hook
 /// shim reporting a payload that was missing required fields.
 #[derive(Deserialize)]
-struct ContractDriftBody {
-    shim: String,
+pub(crate) struct ContractDriftBody {
+    pub(crate) shim: String,
     #[serde(default)]
-    missing: Vec<String>,
+    pub(crate) missing: Vec<String>,
     #[serde(default)]
-    session_id: Option<String>,
+    pub(crate) session_id: Option<String>,
 }
-
-/// The hook shims cImp itself installs — and, with [`DRIFT_SHIM_UNKNOWN`], the
-/// **only** keys [`CONTRACT_DRIFT_SEEN`] can hold (#48 F-37).
-///
-/// Every entry is a literal one of this crate's own reporters sends. It used to
-/// be a list of shim binaries — `context_hook::report_contract_drift`'s first
-/// argument at four call sites, plus the two beacons' hand-rolled bodies — and
-/// every one of those files is now deleted, so the names are defined in
-/// `harness::claude::hook` and sent by its routes' handlers. Spelling is pinned
-/// against that source by
-/// `tests::the_drift_shim_list_is_spelled_the_way_the_shims_spell_it`.
-///
-/// Drift here fails SAFE in both directions: an unlisted shim shares the
-/// sentinel bucket (fewer rows, never more), and a listed name no shim sends is
-/// a bucket nothing ever claims.
-///
-/// `checkpoint_beacon` was missing when V33 Phase F landed — it shipped a shim
-/// that reported drift under its own name, so its reports were folding into
-/// [`DRIFT_SHIM_UNKNOWN`] alongside genuinely forged names and sharing that
-/// bucket's doubling counter. Fail-safe, as documented, but it meant the newest
-/// shim's payload drift was the one hardest to see.
-///
-/// **2026-08-17: no shim binary sends any of these any more** — the last two
-/// (`taint_beacon`, `checkpoint_beacon`) became `type: "http"` routes whose
-/// checks run in-process, exactly as Phase J did to the other four. The names are
-/// unchanged for the reason they were unchanged then: a tab open across the
-/// upgrade still runs the old binary and still POSTs these strings over the wire,
-/// so both paths must land in ONE bucket per capability.
-const DRIFT_SHIMS: [&str; 10] = [
-    "checkpoint_beacon",
-    "compact_hook",
-    "context_hook",
-    "notify_hook",
-    // 2026-08-17: the auto-check route's token, closing V35 Phase A finding 2 —
-    // the one converted hook that reported no payload drift at all, so a matcher
-    // or field rename killed its diagnostics with nothing firing anywhere.
-    // Deliberately NOT the never-shipped `postedit_hook` spelling; see
-    // `claude_hook::DRIFT_POST_EDIT_HOOK`.
-    "post_edit_hook",
-    "read_hook",
-    // V35 Phase L's three. They name no shim binary — there never was one — but
-    // they occupy the same key space for the same reason: one ledger bucket per
-    // capability, `&'static str` so a caller-supplied string can never become a
-    // key. Both a malformed payload AND a served capability gone QUIET (locked
-    // decision 7) report under these, so a capability that broke either way
-    // lands in one bucket.
-    "stop_hook",
-    "subagent_hook",
-    "taint_beacon",
-    "tool_result_hook",
-];
 
 /// The one bucket every shim name cImp does not ship shares. Parenthesized like
 /// [`outbound::NO_TAB_IDENTITY`], so it cannot be confused with a real name.
 const DRIFT_SHIM_UNKNOWN: &str = "(unrecognized shim)";
 
-/// The ledger key for a caller-supplied `shim` string: its own entry in
-/// [`DRIFT_SHIMS`], or the one shared sentinel.
+/// The ledger key for a caller-supplied `shim` string: a token some registered
+/// harness declares, or the one shared sentinel.
 ///
 /// Returns `&'static str` and not `String` **on purpose** — that is the bound
 /// itself rather than a check that implements it. The ledger's key type makes a
 /// caller-supplied string unable to become a key at all, so the key space is
-/// `DRIFT_SHIMS.len() + 1` by construction and cannot drift back.
+/// `drift_tokens().len() + 1` by construction and cannot drift back.
 ///
 /// **Exact match, never a prefix** (after trimming): `"read_hook-forged"` is the
 /// sentinel, not `read_hook`. A prefix or truncation rule here would let an
-/// invented name claim a real shim's counter — [`bounded_id`]'s
-/// ordering rule, one route over.
+/// invented name claim a real shim's counter — [`bounded_id`]'s ordering rule,
+/// one route over.
+///
+/// **V40 Phase C, locked decision 22.** The list used to be a
+/// `const DRIFT_SHIMS: [&str; 10]` here — one harness's shim-token vocabulary,
+/// the whole key space of the drift ledger, in core. It comes from
+/// [`crate::harness::ingress::drift_tokens`] now: still `&'static str`, still
+/// bounded, but by what the plugins declare. Drift fails SAFE in both
+/// directions exactly as before — an undeclared shim shares the sentinel bucket
+/// (fewer rows, never more), and a declared name no shim sends is a bucket
+/// nothing ever claims.
+///
+/// The names themselves are unchanged, and deliberately: a tab open across an
+/// upgrade still runs the old shim binary and still POSTs these exact strings
+/// over the wire, so both paths must land in ONE bucket per capability.
 fn drift_shim_key(raw: &str) -> &'static str {
     let raw = raw.trim();
-    DRIFT_SHIMS
+    crate::harness::ingress::drift_tokens()
         .into_iter()
         .find(|shim| *shim == raw)
         .unwrap_or(DRIFT_SHIM_UNKNOWN)
@@ -6485,7 +6656,7 @@ static CONTRACT_DRIFT_SEEN: OnceLock<Mutex<HashMap<&'static str, outbound::Doubl
 
 /// Count one drift report against the process ledger. See
 /// [`CONTRACT_DRIFT_SEEN`].
-fn claim_contract_drift(shim: &'static str) -> outbound::DoublingRow {
+pub(crate) fn claim_contract_drift(shim: &'static str) -> outbound::DoublingRow {
     let ledger = CONTRACT_DRIFT_SEEN.get_or_init(Default::default);
     let mut ledger = ledger.lock().unwrap_or_else(PoisonError::into_inner);
     drift_claim_in(&mut ledger, shim)
@@ -6540,7 +6711,7 @@ fn bounded_missing(raw: &[String]) -> String {
 /// and on the session id, [`bounded_missing`] on the field list. The bounds are
 /// applied **after** [`drift_shim_key`] has classified, so a truncated name
 /// cannot claim a real shim's counter.
-fn contract_drift_row(
+pub(crate) fn contract_drift_row(
     body: &ContractDriftBody,
     claim: impl FnOnce(&'static str) -> outbound::DoublingRow,
 ) -> Option<crate::activity::ActivityRecord> {
@@ -6657,16 +6828,19 @@ async fn handle_contract_drift(stream: &mut TcpStream, req: &Request) -> AppResu
 /// hello's claim stands; the silence gets a `drift.payload.v1` row instead,
 /// under the same token that capability's payload drift uses.
 fn note_chp(app: &AppHandle, route: &str, req: &Request) {
-    let (chp, agent_token, tab) = if claude_hook::is_hook_route(route) {
-        let tab = req.cimp.tab.as_deref().map(str::trim).unwrap_or("");
-        if tab.is_empty() {
+    // **V40 Phase C, locked decision 22.** This used to read
+    // `hook::is_hook_route(route)` — core deciding, by naming one
+    // harness, where a request's identity lives. The question is now asked of
+    // the registry: a plugin whose ingress puts its identity outside the body
+    // answers for its own routes, and `None` from all of them means "read the
+    // CHP envelope", which is what every ordinary caller sends.
+    let (chp, agent_token, tab) = if let Some(id) =
+        crate::harness::ingress::identity_of_request(route, req)
+    {
+        if id.tab.is_empty() {
             return;
         }
-        (
-            req.cimp.chp.unwrap_or(crate::harness::chp::PRE_CHP),
-            req.cimp.agent.clone().unwrap_or_default(),
-            tab.to_string(),
-        )
+        (id.chp, id.agent, id.tab)
     } else {
         let Some((env, tab)) = crate::harness::chp::envelope(route, &req.body) else {
             return;
@@ -6677,7 +6851,15 @@ fn note_chp(app: &AppHandle, route: &str, req: &Request) {
             tab,
         )
     };
-    let agent = crate::graph::source_for_consumer(&agent_token);
+    // V40 review M-4: through the same funnel the HANDLERS use, and empty is
+    // absent. Both identity readers answer the empty string rather than `None`
+    // for a body with no discriminator (`identity_of_request` is
+    // `unwrap_or_default()`, `Envelope::agent_token` is `unwrap_or("")`), so a
+    // pre-upgrade artifact resolved to `UNKNOWN_SOURCE` — which fails
+    // `is_configured_tab` and silently switched OFF stale-artifact recording and
+    // the quiet-capability detector for exactly the artifacts they exist to
+    // catch.
+    let agent = wire_agent(route, Some(agent_token.as_str()));
     // The quiet pass runs FIRST and on every POST, including the ones the
     // `already_seen` shortcut below returns early from — a tab whose `chp` has
     // not changed is precisely the steady state in which a hook goes silent.
@@ -6704,12 +6886,24 @@ fn note_chp(app: &AppHandle, route: &str, req: &Request) {
 /// no `Stop` behind it three times over is the `Stop` hook having stopped
 /// firing, and nothing else.
 fn report_quiet_capabilities(route: &str, agent: &'static str, tab: &str) {
-    let Some(event) = claude_hook::chp_event(route).or_else(|| crate::harness::chp::event_for_route(route))
+    // The route→event join and the capability→token join are both the
+    // harness's (locked decision 22): the sending harness is the only thing
+    // that knows which of ITS routes feeds a capability, and which ledger
+    // bucket that capability's silence belongs in. Core keeps the detector,
+    // the ledger and the bound.
+    let harness = crate::harness::HarnessId::from_id(agent);
+    let Some(event) = harness
+        .and_then(|h| h.plugin())
+        .and_then(|p| p.chp_event_for_route(route))
+        .or_else(|| crate::harness::chp::event_for_route(route))
     else {
         return;
     };
     for capability in crate::harness::chp::note_event(agent, tab, event) {
-        let Some(shim) = claude_hook::drift_token_for_event(&capability) else {
+        let Some(shim) = harness
+            .and_then(|h| h.plugin())
+            .and_then(|p| p.drift_token_for_capability(&capability))
+        else {
             continue;
         };
         warn!(
@@ -6724,7 +6918,7 @@ fn report_quiet_capabilities(route: &str, agent: &'static str, tab: &str) {
         );
         let body = ContractDriftBody {
             shim: shim.to_string(),
-            missing: vec![claude_hook::MISSING_PUSH.to_string()],
+            missing: vec![crate::harness::ingress::MISSING_PUSH.to_string()],
             session_id: None,
         };
         if let Some(record) = contract_drift_row(&body, claim_contract_drift) {
@@ -6784,7 +6978,7 @@ struct SessionHelloUnable {
 /// shape and the same reasoning as [`MAX_DRIFT_MISSING`]. Without it, `serves`
 /// is an unbounded list of unbounded strings that reaches an in-memory registry
 /// and a Settings panel.
-const MAX_HELLO_DECLARATIONS: usize = 32;
+pub(crate) const MAX_HELLO_DECLARATIONS: usize = 32;
 
 /// The doubling ledger for hello rows, keyed on the **resolved** `agent:tab` —
 /// which is only ever reached after [`is_configured_tab`] accepted it, so the
@@ -6799,7 +6993,7 @@ const MAX_HELLO_DECLARATIONS: usize = 32;
 static HELLO_SEEN: OnceLock<Mutex<HashMap<String, outbound::Doubling>>> = OnceLock::new();
 
 /// Count one hello against the process ledger. See [`HELLO_SEEN`].
-fn claim_hello(key: &str) -> outbound::DoublingRow {
+pub(crate) fn claim_hello(key: &str) -> outbound::DoublingRow {
     let ledger = HELLO_SEEN.get_or_init(Default::default);
     let mut ledger = ledger.lock().unwrap_or_else(PoisonError::into_inner);
     claim_in(&mut ledger, key)
@@ -6808,7 +7002,7 @@ fn claim_hello(key: &str) -> outbound::DoublingRow {
 /// The caller's declaration list, bounded in both dimensions before it reaches
 /// the peer registry — the [`bounded_missing`] discipline applied to `serves`
 /// and to `cannot`.
-fn bounded_declarations(raw: &[String]) -> Vec<String> {
+pub(crate) fn bounded_declarations(raw: &[String]) -> Vec<String> {
     raw.iter()
         .take(MAX_HELLO_DECLARATIONS)
         .map(|s| bounded_id(s))
@@ -6821,7 +7015,7 @@ fn bounded_declarations(raw: &[String]) -> Vec<String> {
 /// `activity::record_bg` has no `cfg(test)` diversion, so a row written inside a
 /// handler is unobservable to the suite. Returning the record makes what a
 /// caller can put in the store assertable without touching the global store.
-fn hello_row(
+pub(crate) fn hello_row(
     agent: &'static str,
     tab: &str,
     chp: u32,
@@ -6928,7 +7122,7 @@ async fn handle_session_hello(
             return write_json(stream, 400, &r).await;
         }
     };
-    let agent = crate::graph::source_for_consumer(body.agent.as_deref().unwrap_or("claude"));
+    let agent = crate::graph::source_for_consumer(body.agent.as_deref().unwrap_or(crate::harness::DEFAULT_HARNESS.token()));
     let tab = body.tab.as_deref().map(str::trim).unwrap_or("");
     let settings = live_settings(app);
     if tab.is_empty() || !is_configured_tab(&settings, agent, tab) {
@@ -6984,547 +7178,6 @@ async fn handle_session_hello(
     .await
 }
 
-// ── V35 Phase J: Claude Code's own hook payloads, posted by the harness ──────
-//
-// Twelve routes under `/claude/hook/`, replacing seven shim binaries (five in
-// Phase J, the two beacons on 2026-08-17) plus five that replaced nothing. Each one
-// parses Claude's hook-input JSON, reports payload drift under the SAME shim
-// token the deleted binary used, builds the CHP body its legacy sibling
-// receives, calls the SAME internal core, and answers with Claude hook-output
-// JSON.
-//
-// **Why the legacy routes stay.** The `--settings` overlay is written at TAB
-// LAUNCH, so a tab open across the upgrade is still running command hooks that
-// POST harness-neutral bodies to `/context/*`. Those keep working, and the two
-// transports meet at one core per capability — which is the property the
-// convergence tests assert, and the reason no capability can behave differently
-// depending on how old the tab is.
-//
-// **Fail-open, in HTTP terms.** Every arm answers `200` with either a directive
-// or `claude_hook::no_op()`; nothing here returns a non-2xx, because a non-2xx
-// is a *non-blocking error* the harness logs, and there is nothing to log about
-// a hook that simply had nothing to say. The one route that can block says so
-// explicitly ([`handle_claude_pre_tool_use`]).
-
-/// The cImp tab a Claude hook request claims, **validated** against the user's
-/// configured Claude tabs — `None` when the claim is absent, empty or names no
-/// such tab.
-///
-/// The `X-CIMP-Tab` header is baked into the emitted hook entry at spawn, but it
-/// arrives over a listener whose bearer token any process running as this user
-/// can read, so it is exactly as caller-asserted as the `tab` body field on
-/// every CHP route and gets exactly the same narrowing (#45's rule).
-///
-/// A `None` here is not an error: it degrades to "this hook is attributed to no
-/// tab", which is precisely the pre-V33 behaviour of a shim launched without
-/// `--tab`. The gated routes then resolve no latch scope and admit the call.
-fn claude_hook_tab(settings: &crate::settings::Settings, req: &Request) -> Option<String> {
-    let tab = req.cimp.tab.as_deref().map(str::trim).unwrap_or("");
-    if tab.is_empty() || !is_configured_tab(settings, "claude", tab) {
-        return None;
-    }
-    Some(tab.to_string())
-}
-
-/// The working directory a Claude hook payload names, or the tab's own launch
-/// directory when the payload carries none.
-///
-/// **This is deliberately NOT the deleted shims' fallback.** They fell back to
-/// `current_dir()`, which was right *for a process Claude spawned* — Claude runs
-/// hook processes in the project directory. The app's cwd is its own launch
-/// directory and has nothing to do with the tab, so reproducing that fallback
-/// here would silently point a hook at the wrong project on any tab whose `cwd`
-/// is a worktree (V13 Phase D's "New tab in worktree…").
-///
-/// The tab's configured directory is resolved through [`hook_tab_root`] (i.e.
-/// [`crate::tabs::ai_tab_dir`] — the same call the spawner makes), so this is
-/// the directory cImp itself launched that tab in. `None` when neither is
-/// available, which every caller turns into its own existing "no cwd" default.
-///
-/// **#104: this deliberately still returns the payload's cwd VERBATIM, and is
-/// not where the project root is decided.** The obvious-looking fix — walk up
-/// to the project root here, once, for every Claude hook — is wrong, because
-/// this value is not only used as a root: `claude_hook::plan_request` joins a
-/// relative Bash path onto it (a walked-up root would resolve the wrong file),
-/// and `permission_signal` matches it against each tab's launch directory to
-/// decide which tab a permission prompt belongs to (a walked-up root collapses
-/// two tabs in one repo into one candidate). The root question is answered where
-/// a root is actually needed, by [`external_project_root`].
-fn claude_hook_cwd(
-    app: &AppHandle,
-    settings: &crate::settings::Settings,
-    tab: Option<&str>,
-    raw: &str,
-) -> Option<String> {
-    let raw = raw.trim();
-    if !raw.is_empty() {
-        return Some(raw.to_string());
-    }
-    hook_tab_root(app, settings, tab).map(|d| d.to_string_lossy().into_owned())
-}
-
-/// Parse a Claude hook-input payload, or `None` when the body is not JSON.
-///
-/// A malformed payload is the one drift this route cannot *report* (there is no
-/// `session_id` to attribute it to and no fields to enumerate), so it is logged
-/// with the caller's bytes bounded and answered as a no-op — the HTTP spelling
-/// of the shims' "bail silently, never perturb the turn".
-fn parse_hook_input(route: &str, req: &Request) -> Option<claude_hook::HookInput> {
-    match serde_json::from_slice::<claude_hook::HookInput>(&req.body) {
-        Ok(v) => Some(v),
-        Err(e) => {
-            warn!(
-                target: "offload",
-                route,
-                error = %e,
-                head = %bounded_id(&String::from_utf8_lossy(&req.body)),
-                "loopback: a Claude http hook posted a body that is not hook-input JSON — \
-                 answered as a no-op (the turn is never perturbed)"
-            );
-            None
-        }
-    }
-}
-
-/// Report a Claude hook payload that is missing required fields, through the
-/// same ledger, bound and Activity row `POST /activity/contract_drift` uses.
-///
-/// V16 Feature 3, moved off the shims and **not** re-designed: the token is the
-/// deleted binary's own name (`claude_hook::drift_token`), so a pre-upgrade tab's
-/// shim reports and this build's handler reports land in ONE bucket per
-/// capability and resolve to one registry row. Fired BEFORE any early return, so
-/// a payload broken enough to make the handler bail is still counted.
-fn report_hook_drift(route: &str, input: &claude_hook::HookInput) {
-    let Some(shim) = claude_hook::drift_token(route) else {
-        return;
-    };
-    let missing = claude_hook::missing_fields(&claude_hook::contract_checks(route, input));
-    if missing.is_empty() {
-        return;
-    }
-    let body = ContractDriftBody {
-        shim: shim.to_string(),
-        missing: missing.into_iter().map(str::to_string).collect(),
-        session_id: Some(input.session_id.clone()),
-    };
-    if let Some(record) = contract_drift_row(&body, claim_contract_drift) {
-        crate::activity::record_bg(record);
-    }
-}
-
-// ── the five body mappings, pure ────────────────────────────────────────────
-//
-// Each turns a Claude hook payload plus the resolved identity into **exactly
-// the CHP body the deleted shim used to POST**. Split out of the handlers so
-// that equivalence is a unit test rather than a claim: the tests compare each
-// against the literal `serde_json::json!` body the shim built, field for field.
-// Everything downstream of these is already one shared core per capability, so
-// "same body in" is what makes "same effect" a fact.
-
-/// `context_hook.rs`'s body: `{cwd, prompt, session_id, agent, tab}`.
-fn retrieve_body_from_hook(
-    input: &claude_hook::HookInput,
-    tab: Option<String>,
-    cwd: Option<String>,
-) -> ContextRetrieveBody {
-    ContextRetrieveBody {
-        cwd,
-        prompt: input.prompt.clone(),
-        session_id: Some(input.session_id.clone()),
-        agent: Some("claude".to_string()),
-        tab,
-    }
-}
-
-/// `compact_hook.rs`'s body: `{cwd, session_id, trigger, agent, tab}`.
-fn compaction_body_from_hook(
-    input: &claude_hook::HookInput,
-    tab: Option<String>,
-    cwd: Option<String>,
-) -> ContextCompactionBody {
-    ContextCompactionBody {
-        cwd,
-        session_id: Some(input.session_id.clone()),
-        trigger: Some(input.trigger.clone()),
-        agent: Some("claude".to_string()),
-        tab,
-    }
-}
-
-/// `read_hook.rs`'s body: `{cwd, session_id, file_path, offset, limit, agent,
-/// tab}` — built from the already-planned [`claude_hook::ReadRequest`], because
-/// the shim built it from the same plan.
-fn should_read_body_from_hook(
-    input: &claude_hook::HookInput,
-    reqst: &claude_hook::ReadRequest,
-    tab: Option<String>,
-    cwd: Option<String>,
-) -> ShouldReadBody {
-    ShouldReadBody {
-        cwd,
-        session_id: Some(input.session_id.clone()),
-        file_path: reqst.file_path.clone(),
-        offset: reqst.offset,
-        limit: reqst.limit,
-        agent: Some("claude".to_string()),
-        tab,
-    }
-}
-
-/// `postedit_hook.rs`'s body: `{cwd, session_id, file_path, tool_name, agent,
-/// tab}`.
-fn post_edit_body_from_hook(
-    input: &claude_hook::HookInput,
-    tab: Option<String>,
-    cwd: Option<String>,
-) -> ContextPostEditBody {
-    ContextPostEditBody {
-        cwd,
-        session_id: Some(input.session_id.clone()),
-        file_path: input
-            .tool_input
-            .get("file_path")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string(),
-        tool_name: input.tool_name.clone(),
-        agent: Some("claude".to_string()),
-        tab,
-    }
-}
-
-/// `notify_hook.rs`'s body: `{cwd, session_id, transcript_path, event,
-/// notification_type, message, tool_name}` — and, like the shim's, it carries
-/// neither `agent` nor `tab` (`docs/CHP.md` § 4.4).
-fn permission_body_from_hook(
-    input: &claude_hook::HookInput,
-    cwd: Option<String>,
-) -> PermissionEventBody {
-    PermissionEventBody {
-        cwd,
-        session_id: Some(input.session_id.clone()),
-        transcript_path: Some(input.transcript_path.clone()),
-        event: input.hook_event_name.clone(),
-        notification_type: Some(input.notification_kind().to_string()),
-        message: Some(input.notification_message().to_string()),
-        tool_name: input.tool_name.clone(),
-    }
-}
-
-/// `POST /claude/hook/user_prompt_submit` — the `UserPromptSubmit` hook.
-///
-/// Fires the prompt-tap checkpoint trigger and returns the injectable digest as
-/// `hookSpecificOutput.additionalContext`, through
-/// [`context_retrieve_core`] — the same function `/context/retrieve` calls, so
-/// injection, the once-per-session project map and the parked auto-check drain
-/// are identical on both transports. Ungated for the reason `/context/retrieve`
-/// is (see its `ROUTE_CONTAINMENT` row).
-///
-/// This entry's pinned `timeout` is [`claude_hook::TIMEOUT_SECS`] (1 s) and the
-/// harness DISCARDS a later reply, which is why the core races its retrieval
-/// against [`RETRIEVE_BUDGET_MS`] and parks what overruns rather than composing
-/// a digest nobody will read.
-async fn handle_claude_user_prompt_submit(
-    stream: &mut TcpStream,
-    app: &AppHandle,
-    req: &Request,
-) -> AppResult<()> {
-    let route = claude_hook::ROUTE_USER_PROMPT_SUBMIT;
-    let Some(input) = parse_hook_input(route, req) else {
-        return write_json(stream, 200, &claude_hook::no_op()).await;
-    };
-    report_hook_drift(route, &input);
-    if input.prompt.trim().is_empty() {
-        return write_json(stream, 200, &claude_hook::no_op()).await;
-    }
-    let settings = live_settings(app);
-    let tab = claude_hook_tab(&settings, req);
-    let cwd = claude_hook_cwd(app, &settings, tab.as_deref(), &input.cwd);
-    let body = retrieve_body_from_hook(&input, tab, cwd);
-    let answer = context_retrieve_core(app, &body).await;
-    let text = answer.get("text").and_then(Value::as_str).unwrap_or("");
-    if text.trim().is_empty() {
-        return write_json(stream, 200, &claude_hook::no_op()).await;
-    }
-    write_json(
-        stream,
-        200,
-        &claude_hook::additional_context(claude_hook::EVENT_USER_PROMPT_SUBMIT, text),
-    )
-    .await
-}
-
-/// `POST /claude/hook/pre_compact` — the `PreCompact` hook.
-///
-/// Gated on [`HOOK_TOOL_COMPACTION`] exactly as `/context/compaction` is, and
-/// for the same reason: demoting that one class-table row is all it should take
-/// to close BOTH transports.
-async fn handle_claude_pre_compact(
-    stream: &mut TcpStream,
-    app: &AppHandle,
-    req: &Request,
-) -> AppResult<()> {
-    let route = claude_hook::ROUTE_PRE_COMPACT;
-    let Some(input) = parse_hook_input(route, req) else {
-        return write_json(stream, 200, &claude_hook::no_op()).await;
-    };
-    report_hook_drift(route, &input);
-    let settings = live_settings(app);
-    let tab = claude_hook_tab(&settings, req);
-    let cwd = claude_hook_cwd(app, &settings, tab.as_deref(), &input.cwd);
-    let body = compaction_body_from_hook(&input, tab, cwd);
-    if hook_admit(
-        latches(),
-        HOOK_TOOL_COMPACTION,
-        hook_agent(body.agent.as_deref()),
-        body.tab.as_deref(),
-        |agent, tab| latch_scope(app, &settings, agent, tab),
-        |scope| GatePolicy::resolve(&settings, scope),
-    )
-    .is_err()
-    {
-        return write_json(stream, 200, &claude_hook::no_op()).await;
-    }
-    let block = compaction_block(app, &body);
-    if block.trim().is_empty() {
-        return write_json(stream, 200, &claude_hook::no_op()).await;
-    }
-    write_json(
-        stream,
-        200,
-        &claude_hook::additional_context(claude_hook::EVENT_PRE_COMPACT, &block),
-    )
-    .await
-}
-
-/// `POST /claude/hook/pre_tool_use` — the read advisor, on both its matchers.
-///
-/// **The one route in this family that can block a tool call**, and it does so
-/// only by returning `permissionDecision: "deny"` with the reminder as the
-/// reason — byte-identical to what `read_hook.rs` printed, from the same
-/// [`should_read_verdict`] the legacy route calls. Every other outcome (a
-/// non-target tool, a pass, a refused gate, missing state) is
-/// [`claude_hook::no_op`], and the read proceeds.
-///
-/// Gated on [`HOOK_TOOL_SHOULD_READ`], whose only reachable effect is to turn a
-/// `remind` into a `pass` — see `handle_should_read`'s note.
-async fn handle_claude_pre_tool_use(
-    stream: &mut TcpStream,
-    app: &AppHandle,
-    req: &Request,
-) -> AppResult<()> {
-    let route = claude_hook::ROUTE_PRE_TOOL_USE;
-    let Some(input) = parse_hook_input(route, req) else {
-        return write_json(stream, 200, &claude_hook::no_op()).await;
-    };
-    report_hook_drift(route, &input);
-    let settings = live_settings(app);
-    let tab = claude_hook_tab(&settings, req);
-    let cwd = claude_hook_cwd(app, &settings, tab.as_deref(), &input.cwd);
-    // Map the payload to a verdict request, or let the tool proceed untouched.
-    let Some(reqst) = claude_hook::plan_request(
-        input.tool_name.as_deref(),
-        &input.tool_input,
-        cwd.as_deref().unwrap_or(""),
-    ) else {
-        return write_json(stream, 200, &claude_hook::no_op()).await;
-    };
-    let body = should_read_body_from_hook(&input, &reqst, tab, cwd);
-    if hook_admit(
-        latches(),
-        HOOK_TOOL_SHOULD_READ,
-        hook_agent(body.agent.as_deref()),
-        body.tab.as_deref(),
-        |agent, tab| latch_scope(app, &settings, agent, tab),
-        |scope| GatePolicy::resolve(&settings, scope),
-    )
-    .is_err()
-    {
-        return write_json(stream, 200, &claude_hook::no_op()).await;
-    }
-    let Some(text) = should_read_verdict(app, &body) else {
-        return write_json(stream, 200, &claude_hook::no_op()).await;
-    };
-    if text.trim().is_empty() {
-        return write_json(stream, 200, &claude_hook::no_op()).await;
-    }
-    // The server verdict is tool-agnostic; the Bash path prepends its own
-    // "answered without running the command — " note so the deny reads sensibly
-    // for a shell read.
-    let reason = format!("{}{text}", reqst.deny_prefix);
-    write_json(stream, 200, &claude_hook::deny(&reason)).await
-}
-
-/// `POST /claude/hook/post_tool_use` — the auto-check diff after an edit.
-///
-/// Gated on [`HOOK_TOOL_POST_EDIT`], the route the M-7 finding is really about:
-/// it executes the project's configured check commands, in a directory V33 C4
-/// admits from an app-derived list rather than from the payload.
-async fn handle_claude_post_tool_use(
-    stream: &mut TcpStream,
-    app: &AppHandle,
-    req: &Request,
-) -> AppResult<()> {
-    let route = claude_hook::ROUTE_POST_TOOL_USE;
-    let Some(input) = parse_hook_input(route, req) else {
-        return write_json(stream, 200, &claude_hook::no_op()).await;
-    };
-    report_hook_drift(route, &input);
-    // The matcher already scopes this to edit tools, but be safe — the shim
-    // made the same check for the same reason.
-    let tool_name = input.tool_name.as_deref().unwrap_or("");
-    if !matches!(tool_name, "Edit" | "Write" | "MultiEdit") {
-        return write_json(stream, 200, &claude_hook::no_op()).await;
-    }
-    let settings = live_settings(app);
-    let tab = claude_hook_tab(&settings, req);
-    let cwd = claude_hook_cwd(app, &settings, tab.as_deref(), &input.cwd);
-    let body = post_edit_body_from_hook(&input, tab, cwd);
-    if hook_admit(
-        latches(),
-        HOOK_TOOL_POST_EDIT,
-        hook_agent(body.agent.as_deref()),
-        body.tab.as_deref(),
-        |agent, tab| latch_scope(app, &settings, agent, tab),
-        |scope| GatePolicy::resolve(&settings, scope),
-    )
-    .is_err()
-    {
-        return write_json(stream, 200, &claude_hook::no_op()).await;
-    }
-    let text = post_edit_diagnostics(app, &settings, &body).await;
-    if text.trim().is_empty() {
-        return write_json(stream, 200, &claude_hook::no_op()).await;
-    }
-    write_json(
-        stream,
-        200,
-        &claude_hook::additional_context(claude_hook::EVENT_POST_TOOL_USE, &text),
-    )
-    .await
-}
-
-/// `POST /claude/hook/notification` — `Notification` **and** `PermissionDenied`.
-///
-/// One route for both events, dispatching on the payload's `hook_event_name`,
-/// exactly as the one `--notify-hook` binary did. Observe-only: it answers
-/// [`claude_hook::no_op`] on every path, because an observe-only hook must never
-/// emit a directive — for `PermissionDenied` the harness documents even the exit
-/// code and stderr as ignored.
-async fn handle_claude_notification(
-    stream: &mut TcpStream,
-    app: &AppHandle,
-    req: &Request,
-) -> AppResult<()> {
-    let route = claude_hook::ROUTE_NOTIFICATION;
-    let Some(input) = parse_hook_input(route, req) else {
-        return write_json(stream, 200, &claude_hook::no_op()).await;
-    };
-    report_hook_drift(route, &input);
-    if input.hook_event_name.is_empty() {
-        // Without the event name the classifier cannot tell an edge from an idle
-        // notification, and guessing would risk flipping `awaiting_permission`.
-        return write_json(stream, 200, &claude_hook::no_op()).await;
-    }
-    let settings = live_settings(app);
-    // The tab is resolved only to give the `cwd` fallback something to resolve
-    // from: this body carries neither `agent` nor `tab`, exactly as the shim's
-    // did — `/permission/event` maps by session/transcript/cwd (CHP § 4.4).
-    let tab = claude_hook_tab(&settings, req);
-    let cwd = claude_hook_cwd(app, &settings, tab.as_deref(), &input.cwd);
-    let body = permission_body_from_hook(&input, cwd);
-    let _ = permission_signal(app, &body).await;
-    write_json(stream, 200, &claude_hook::no_op()).await
-}
-
-/// `POST /claude/hook/session_start` — **Claude's CHP hello** (design D3).
-///
-/// New in Phase J: there was no shim to replace, because until the overlay could
-/// carry headers there was nothing to introduce. It synthesizes the same
-/// `/session/hello` record the generated OpenCode plugin posts, from the three
-/// things the emitted hook entry baked in — `X-CIMP-Tab`, `X-CIMP-Chp` and
-/// `X-CIMP-Hello`'s `serves`/`cannot` pair — plus, if the payload ever carries
-/// one, the harness's own version.
-///
-/// **`harness_version` is empty today and that is a recorded fact, not an
-/// omission.** No documented hook-input field carries the CLI version, and cImp
-/// will not bake in the number it last saw and let the hook report it back —
-/// that is cImp attesting to itself, the same objection that governs OpenCode's
-/// hello (`docs/CHP.md` § 6.2). So the `harness_version` staleness arm still has
-/// no Claude producer; the `chp` arm now does, which is the arm Phase J was for.
-///
-/// Answers [`claude_hook::no_op`] on every path including a rejected tab: a
-/// `SessionStart` hook's output is prepended to the session's context, and cImp
-/// has nothing to say to the model here.
-async fn handle_claude_session_start(
-    stream: &mut TcpStream,
-    app: &AppHandle,
-    req: &Request,
-) -> AppResult<()> {
-    let route = claude_hook::ROUTE_SESSION_START;
-    let no_op = claude_hook::no_op();
-    let Some(input) = parse_hook_input(route, req) else {
-        return write_json(stream, 200, &no_op).await;
-    };
-    let settings = live_settings(app);
-    let Some(tab) = claude_hook_tab(&settings, req) else {
-        warn!(
-            target: "offload",
-            tab = %bounded_id(req.cimp.tab.as_deref().unwrap_or("")),
-            "loopback: a Claude SessionStart hello named no configured tab — not recorded"
-        );
-        return write_json(stream, 200, &no_op).await;
-    };
-    let chp = req.cimp.chp.unwrap_or(crate::harness::chp::PRE_CHP);
-    let version = bounded_id(input.harness_version());
-    let declared = req
-        .cimp
-        .hello
-        .as_deref()
-        .and_then(claude_hook::Hello::parse)
-        .unwrap_or_default();
-    let serves = bounded_declarations(&declared.serves);
-    let cannot: Vec<crate::harness::chp::Unable> = declared
-        .cannot
-        .iter()
-        .take(MAX_HELLO_DECLARATIONS)
-        .map(|u| crate::harness::chp::Unable {
-            id: bounded_id(&u.id),
-            why: bounded_id(&u.why),
-        })
-        .collect();
-    let changed = crate::harness::chp::note_hello(
-        "claude",
-        &tab,
-        chp,
-        &version,
-        serves.clone(),
-        cannot.clone(),
-        crate::activity::now_ms(),
-    );
-    if changed {
-        if let Some(record) =
-            hello_row("claude", &tab, chp, &version, &serves, cannot.len(), claim_hello)
-        {
-            crate::activity::record_bg(record);
-        }
-    }
-    // `source` is `startup` / `resume` / `clear` / `compact`. Not part of the
-    // record — a hello describes the ARTIFACT, and the same overlay is in force
-    // on all four — but it is the difference between "this tab just launched"
-    // and "this tab was resumed", which is the first thing a reader wants when a
-    // hello turns up mid-session.
-    debug!(
-        target: "offload",
-        %tab,
-        chp,
-        source = %bounded_id(&input.source),
-        serves = serves.len(),
-        "claude hello recorded"
-    );
-    write_json(stream, 200, &no_op).await
-}
-
 // ── V35 Phase L: the read path, pushed (design D2, issue #69) ────────────────
 //
 // Three capabilities that reached cImp by TAILING AN EMITTED ARTIFACT — Tier C,
@@ -7557,7 +7210,7 @@ async fn handle_claude_session_start(
 //   has no hook equivalent.
 // * **Sub-agent token usage.** `SubagentStop` carries
 //   `last_assistant_message`, not tokens, and there is no sub-agent transcript
-//   path in any payload — so `SubagentState::scan`'s `UsageOrigin::Agent`
+//   path in any payload — so `SubagentState::scan`'s sub-agent-lane
 //   accounting keeps reading `<session_id>/subagents/agent-*.jsonl`. What
 //   migrates is the LIFECYCLE (which drives the avatar), not the spend.
 
@@ -7621,12 +7274,155 @@ struct SessionSubagentBody {
     active: bool,
 }
 
+/// A `POST /session/output_started` or `/session/output_stopped` body — one
+/// turn boundary, reported by the harness itself.
+///
+/// Identity only: the edge is the message. Which direction it is comes from the
+/// ROUTE rather than a body field, for the same reason the two `permission.*`
+/// events are two routes — an edge whose direction is a payload value can be
+/// dropped by a lenient parser and read as its opposite.
+#[derive(Deserialize)]
+struct HarnessOutputBody {
+    #[serde(default)]
+    agent: Option<String>,
+    #[serde(default)]
+    tab: Option<String>,
+}
+
+/// A `POST /session/subagents_active` body — the sub-agent COUNT's zero
+/// boundary, as the harness sees it.
+///
+/// Distinct from `session.subagent` (`/session/subagent`), which reports one
+/// sub-agent's lifecycle and lets core derive the edge: a harness that already
+/// knows "none running / some running" posts this and core keeps no set for it.
+#[derive(Deserialize)]
+struct SubagentsActiveBody {
+    #[serde(default)]
+    agent: Option<String>,
+    #[serde(default)]
+    tab: Option<String>,
+    #[serde(default)]
+    active: bool,
+}
+
+/// `POST /session/output_{started,stopped}`: a pushed turn boundary.
+///
+/// **Gated on the tab's own hello** (`chp::served`), exactly as every other
+/// pushed core is, and here that gate is load-bearing for a reason worth
+/// stating: core may ALSO be inferring this tab's activity from its terminal
+/// (`ActivitySource::TuiMarkers`). Two producers for one avatar is the
+/// double-speak V35 Phase L's arbitration exists to prevent, so a harness that
+/// pushes these edges must declare them in its hello — at which point its
+/// plugin declares `ActivitySource::OutOfBand` and the TUI heuristic never runs
+/// for its tabs.
+async fn handle_harness_output(
+    stream: &mut TcpStream,
+    app: &AppHandle,
+    req: &Request,
+    started: bool,
+) -> AppResult<()> {
+    let ok = RunResult {
+        ok: true,
+        text: None,
+        error: None,
+    };
+    let Ok(body) = serde_json::from_slice::<HarnessOutputBody>(&req.body) else {
+        return write_json(stream, 400, &bad_request("bad request body")).await;
+    };
+    if let Some((agent, tab)) =
+        session_push_identity(app, body.agent.as_deref(), body.tab.as_deref())
+    {
+        harness_output_core(app, agent, &tab, started);
+    }
+    write_json(stream, 200, &ok).await
+}
+
+/// Apply one pushed turn boundary — the `harness.output_*` core.
+///
+/// Returns whether it acted, the same shape the other pushed cores answer with
+/// so the arbitration tests can assert an exact complement.
+pub(crate) fn harness_output_core(
+    app: &AppHandle,
+    agent: &'static str,
+    tab: &str,
+    started: bool,
+) -> bool {
+    let event = if started {
+        crate::harness::chp::EV_HARNESS_OUTPUT_STARTED
+    } else {
+        crate::harness::chp::EV_HARNESS_OUTPUT_STOPPED
+    };
+    if !crate::harness::chp::served(agent, tab, event) {
+        return false;
+    }
+    let Some(state) = app.try_state::<crate::ipc::AppState>() else {
+        return false;
+    };
+    let tab = crate::state::TabId::from_str(tab);
+    let signal = if started {
+        crate::state::StateSignal::HarnessOutputStarted { tab }
+    } else {
+        crate::state::StateSignal::HarnessOutputStopped { tab }
+    };
+    let _ = state.state_signals.try_send(signal);
+    true
+}
+
+/// `POST /session/subagents_active`: the pushed zero-boundary of a tab's
+/// sub-agent count.
+async fn handle_subagents_active(
+    stream: &mut TcpStream,
+    app: &AppHandle,
+    req: &Request,
+) -> AppResult<()> {
+    let ok = RunResult {
+        ok: true,
+        text: None,
+        error: None,
+    };
+    let Ok(body) = serde_json::from_slice::<SubagentsActiveBody>(&req.body) else {
+        return write_json(stream, 400, &bad_request("bad request body")).await;
+    };
+    if let Some((agent, tab)) =
+        session_push_identity(app, body.agent.as_deref(), body.tab.as_deref())
+    {
+        subagents_active_core(app, agent, &tab, body.active);
+    }
+    write_json(stream, 200, &ok).await
+}
+
+/// Apply one pushed sub-agent-count edge — the `subagents.active` core.
+///
+/// Emits the same `SubagentsActiveChanged` signal [`subagent_core`] derives
+/// from individual lifecycles, so the state manager sees one signal shape
+/// whichever path produced it.
+pub(crate) fn subagents_active_core(
+    app: &AppHandle,
+    agent: &'static str,
+    tab: &str,
+    active: bool,
+) -> bool {
+    if !crate::harness::chp::served(agent, tab, crate::harness::chp::EV_SUBAGENTS_ACTIVE) {
+        return false;
+    }
+    let Some(state) = app.try_state::<crate::ipc::AppState>() else {
+        return false;
+    };
+    let _ = state
+        .state_signals
+        .try_send(crate::state::StateSignal::SubagentsActiveChanged {
+            tab: crate::state::TabId::from_str(tab),
+            active,
+        });
+    true
+}
+
 /// Speak one pushed assistant message — the `assistant_text` core.
 ///
 /// Returns whether it acted, which is what the arbitration tests assert on:
 /// for one `(agent, tab, capability)` the answer here and the fallback reader's
 /// `ctx.pushed(..)` are exact complements.
-async fn assistant_text_core(app: &AppHandle, agent: &'static str, tab: &str, text: &str) -> bool {
+pub(crate) async fn assistant_text_core(app: &AppHandle, agent: &'static str, tab: &str, text: &str) -> bool {
     if !crate::harness::chp::served(agent, tab, crate::harness::chp::EV_ASSISTANT_TEXT) {
         // Not declared by THIS tab's artifact ⇒ its reader is still speaking,
         // and speaking here too is the double-speak this phase must not ship.
@@ -7675,7 +7471,7 @@ async fn assistant_text_core(app: &AppHandle, agent: &'static str, tab: &str, te
 /// same graph service, keyed the same way. Nothing downstream can tell which
 /// path produced it, which is the point: the migration is of the SOURCE, not of
 /// the data model.
-fn tool_result_core(
+pub(crate) fn tool_result_core(
     app: &AppHandle,
     agent: &'static str,
     tab: &str,
@@ -7731,10 +7527,10 @@ static PUSHED_SUBAGENTS: OnceLock<Mutex<SubagentSets>> = OnceLock::new();
 
 /// Apply one pushed sub-agent lifecycle edge — the `session.subagent` core.
 ///
-/// Emits `StateSignal::AgentsActiveChanged` on the empty↔non-empty EDGE only,
+/// Emits `StateSignal::SubagentsActiveChanged` on the empty↔non-empty EDGE only,
 /// exactly as `harness::claude::read::update_agents` does, so the state manager
 /// sees the same signal shape whichever path produced it.
-fn subagent_core(
+pub(crate) fn subagent_core(
     app: &AppHandle,
     agent: &'static str,
     tab: &str,
@@ -7770,7 +7566,7 @@ fn subagent_core(
     if let Some(state) = app.try_state::<crate::ipc::AppState>() {
         let _ = state
             .state_signals
-            .try_send(crate::state::StateSignal::AgentsActiveChanged {
+            .try_send(crate::state::StateSignal::SubagentsActiveChanged {
                 tab: crate::state::TabId::from_str(tab),
                 active: now_active,
             });
@@ -7789,7 +7585,7 @@ fn session_push_identity(
     agent: Option<&str>,
     tab: Option<&str>,
 ) -> Option<(&'static str, String)> {
-    let agent = crate::graph::source_for_consumer(agent.unwrap_or("claude"));
+    let agent = crate::graph::source_for_consumer(agent.unwrap_or(crate::harness::DEFAULT_HARNESS.token()));
     let tab = tab.map(str::trim).unwrap_or("");
     if tab.is_empty() {
         return None;
@@ -7880,294 +7676,6 @@ fn bounded_tool_name(raw: &str) -> String {
     bounded_id(raw)
 }
 
-/// `POST /claude/hook/stop` — the `Stop` hook: the turn's complete final
-/// assistant message.
-///
-/// **The TTS migration, and its cadence guarantee.** `last_assistant_message`
-/// is one complete message at message finish, which is exactly what
-/// `harness::claude::read::assistant_texts` hands `speak` today — so the
-/// segmenter's input is unchanged by construction (locked decision 2, recipe
-/// 10). `MessageDisplay`, which would deliver per-chunk deltas on the streaming
-/// hot path, is deliberately not wired.
-///
-/// Observe-only: answers [`claude_hook::no_op`] on every path.
-async fn handle_claude_stop(
-    stream: &mut TcpStream,
-    app: &AppHandle,
-    req: &Request,
-) -> AppResult<()> {
-    let route = claude_hook::ROUTE_STOP;
-    let no_op = claude_hook::no_op();
-    let Some(input) = parse_hook_input(route, req) else {
-        return write_json(stream, 200, &no_op).await;
-    };
-    report_hook_drift(route, &input);
-    let settings = live_settings(app);
-    if let Some(tab) = claude_hook_tab(&settings, req) {
-        assistant_text_core(app, "claude", &tab, &input.last_assistant_message).await;
-    }
-    write_json(stream, 200, &no_op).await
-}
-
-/// `POST /claude/hook/post_tool_use_result` — the all-tools `PostToolUse`
-/// entry, sized.
-///
-/// Shares `PostToolUse` with [`handle_claude_post_tool_use`] and shares NOTHING
-/// else: two matcher groups, two routes, two meanings. That separation is what
-/// keeps the auto-check from running twice on an `Edit` — see
-/// [`claude_hook::ROUTE_POST_TOOL_USE_RESULT`].
-async fn handle_claude_tool_result(
-    stream: &mut TcpStream,
-    app: &AppHandle,
-    req: &Request,
-) -> AppResult<()> {
-    let route = claude_hook::ROUTE_POST_TOOL_USE_RESULT;
-    let no_op = claude_hook::no_op();
-    let Some(input) = parse_hook_input(route, req) else {
-        return write_json(stream, 200, &no_op).await;
-    };
-    report_hook_drift(route, &input);
-    let settings = live_settings(app);
-    if let Some(tab) = claude_hook_tab(&settings, req) {
-        let cwd = claude_hook_cwd(app, &settings, Some(tab.as_str()), &input.cwd);
-        let chars = u32::try_from(claude_hook::tool_result_chars(&input.tool_result))
-            .unwrap_or(u32::MAX);
-        tool_result_core(
-            app,
-            "claude",
-            &tab,
-            cwd.as_deref(),
-            &input.session_id,
-            input.tool_name.clone(),
-            chars,
-        );
-    }
-    write_json(stream, 200, &no_op).await
-}
-
-/// `POST /claude/hook/subagent` — `SubagentStart` **and** `SubagentStop`.
-///
-/// One route, dispatching on `hook_event_name`, exactly as
-/// [`handle_claude_notification`] serves its own pair. Observe-only.
-async fn handle_claude_subagent(
-    stream: &mut TcpStream,
-    app: &AppHandle,
-    req: &Request,
-) -> AppResult<()> {
-    let route = claude_hook::ROUTE_SUBAGENT;
-    let no_op = claude_hook::no_op();
-    let Some(input) = parse_hook_input(route, req) else {
-        return write_json(stream, 200, &no_op).await;
-    };
-    report_hook_drift(route, &input);
-    if input.hook_event_name.is_empty() {
-        // Without the event name a start is indistinguishable from a stop, and
-        // guessing would either wedge the avatar in Thinking or release it
-        // early. `contract_checks` has already reported the absence.
-        return write_json(stream, 200, &no_op).await;
-    }
-    let settings = live_settings(app);
-    if let Some(tab) = claude_hook_tab(&settings, req) {
-        let active = input.is_subagent_start();
-        subagent_core(app, "claude", &tab, &input.agent_id, active);
-        debug!(
-            target: "offload",
-            %tab,
-            agent_type = %bounded_id(&input.agent_type),
-            active,
-            "claude sub-agent lifecycle push"
-        );
-    }
-    write_json(stream, 200, &no_op).await
-}
-
-/// `POST /claude/hook/post_tool_use_failure` — the all-tools
-/// `PostToolUseFailure` entry, sized (2026-08-17).
-///
-/// **Why this route exists at all:** `PostToolUse` fires only when a tool
-/// SUCCEEDS, so before this entry a failed tool result reached cImp only through
-/// the transcript tail — which [`tool_result_core`]'s own arbitration switches
-/// OFF for a tab that serves `session.tool_result`. Every failed result's size
-/// was therefore lost on exactly the tabs the push path serves, and a failing
-/// `Bash` returns as much text as a succeeding one.
-///
-/// **The same core, the same capability, the same arbitration.** It feeds
-/// [`tool_result_core`], which asks `chp::served(.., EV_SESSION_TOOL_RESULT)` —
-/// the capability whose reader tap is suppressed. The overlay emits this entry
-/// from the same boolean as the success entry, so the pair is declared together
-/// and exactly one path counts each result.
-///
-/// **`is_error`, and what "treated as errored" means here.** The transcript
-/// reader keeps two readers over one block (`claude.transcript.tool_result`):
-/// `extract_tool_results` sizes every result *including* failures and never looks
-/// at `is_error`, while `tool_result_is_error` exists solely to keep a FAILED
-/// result from being mined for commit hashes by the session→commit provenance
-/// tap. This handler mirrors both halves — the first by construction (the same
-/// sizing function, so a failure counts exactly as the reader counted it), the
-/// second **structurally**: the push path carries a character count and never the
-/// result text, and provenance is mined only in `harness::claude::read`'s
-/// `record_commit_events`, which is not arbitrated and reads the transcript
-/// directly. There is nothing here for a failed result to leak into.
-async fn handle_claude_tool_failure(
-    stream: &mut TcpStream,
-    app: &AppHandle,
-    req: &Request,
-) -> AppResult<()> {
-    let route = claude_hook::ROUTE_POST_TOOL_USE_FAILURE;
-    let no_op = claude_hook::no_op();
-    let Some(input) = parse_hook_input(route, req) else {
-        return write_json(stream, 200, &no_op).await;
-    };
-    report_hook_drift(route, &input);
-    let settings = live_settings(app);
-    if let Some(tab) = claude_hook_tab(&settings, req) {
-        let cwd = claude_hook_cwd(app, &settings, Some(tab.as_str()), &input.cwd);
-        // The ERROR text is what a failed tool returned, and it is what the
-        // transcript reader sizes for the same call — through this same
-        // function, so the two paths produce the same number.
-        let chars =
-            u32::try_from(claude_hook::tool_result_chars(&input.error)).unwrap_or(u32::MAX);
-        let recorded = tool_result_core(
-            app,
-            "claude",
-            &tab,
-            cwd.as_deref(),
-            &input.session_id,
-            input.tool_name.clone(),
-            chars,
-        );
-        debug!(
-            target: "offload",
-            %tab,
-            tool = %bounded_id(input.tool_name.as_deref().unwrap_or("")),
-            chars,
-            recorded,
-            "claude failed tool result pushed"
-        );
-    }
-    write_json(stream, 200, &no_op).await
-}
-
-/// `POST /claude/hook/pre_tool_use_taint` — the V32 taint beacon, as an http
-/// hook (2026-08-17; was `cimp --taint-beacon`).
-///
-/// Reaches [`latch_beacon_core`], the same core `/latch/beacon` reaches, so the
-/// engagement, the row it writes and the #45 narrowing are one implementation.
-///
-/// **Report-only, and now structurally so.** A `PreToolUse` hook denies only by
-/// answering 2xx with a `permissionDecision`; this handler answers
-/// [`claude_hook::no_op`] on every path including a rejected tab, so locked
-/// decision 14 ("sensor mode must never break a tab") no longer rests on the
-/// undocumented question of what a timed-out command hook does — a timeout, a
-/// refused connection and a non-2xx are all documented as non-blocking, and this
-/// route emits no decision field to be non-blocking *about*.
-async fn handle_claude_taint_beacon(
-    stream: &mut TcpStream,
-    app: &AppHandle,
-    req: &Request,
-) -> AppResult<()> {
-    let route = claude_hook::ROUTE_PRE_TOOL_USE_TAINT;
-    let no_op = claude_hook::no_op();
-    let Some(input) = parse_hook_input(route, req) else {
-        return write_json(stream, 200, &no_op).await;
-    };
-    report_hook_drift(route, &input);
-    let settings = live_settings(app);
-    // The tool name is reported verbatim (bounded) so the row and the log name
-    // the tool the harness actually ran; an empty one still engages the latch —
-    // the beacon fired, and the app labels it rather than dropping the
-    // engagement, exactly as the shim did.
-    let tool = bounded_tool(input.tool_name.as_deref());
-    match latch_beacon_core(
-        latches(),
-        app,
-        &settings,
-        "claude",
-        req.cimp.tab.as_deref(),
-        &tool,
-    ) {
-        Ok(view) => debug!(
-            target: "offload",
-            tab = %bounded_id(req.cimp.tab.as_deref().unwrap_or("")),
-            %tool,
-            latch = %view.latch,
-            "claude taint beacon"
-        ),
-        Err(tab) => warn!(
-            target: "offload",
-            tab = %tab,
-            %tool,
-            "loopback: a Claude taint beacon named no configured tab — nothing engaged"
-        ),
-    }
-    write_json(stream, 200, &no_op).await
-}
-
-/// `POST /claude/hook/pre_tool_use_checkpoint` — the V33 pre-mutation
-/// checkpoint, as an http hook (2026-08-17; was `cimp --checkpoint-beacon`).
-///
-/// Reaches [`tool_checkpoint_core`], the same core `/workbench/tool_checkpoint`
-/// reaches — including the `mutates_fs` re-check, which is the authority the
-/// spawn-time matcher is only a pre-filter for.
-///
-/// **This handler finishes its work before it answers, and that is the feature.**
-/// A `PreToolUse` http hook blocks the tool call until the response — the
-/// documented mechanism that makes `permissionDecision: "deny"` expressible —
-/// so awaiting the snapshot here is what makes "the checkpoint precedes the
-/// call" exact rather than best-effort. The deleted shim achieved the same thing
-/// from the outside, by reading its reply with a 2 s deadline and relying on
-/// Claude not starting the tool until the process exited; that ordering was
-/// **undocumented**, which is why the row was Tier D and is why this migration
-/// is the row's closing condition rather than a tidy-up.
-///
-/// The wait stays bounded by the app's own [`TOOL_CHECKPOINT_BUDGET`] (1800 ms),
-/// under the entry's pinned 5 s ceiling: past the budget the snapshot is
-/// abandoned unwritten and the miss is surfaced as its own Activity event
-/// (`workbench` / `checkpoint_missed`), because a checkpoint that might contain
-/// the change it claims to predate silently misleads a restore.
-async fn handle_claude_checkpoint(
-    stream: &mut TcpStream,
-    app: &AppHandle,
-    req: &Request,
-) -> AppResult<()> {
-    let route = claude_hook::ROUTE_PRE_TOOL_USE_CHECKPOINT;
-    let no_op = claude_hook::no_op();
-    let Some(input) = parse_hook_input(route, req) else {
-        return write_json(stream, 200, &no_op).await;
-    };
-    report_hook_drift(route, &input);
-    // An empty tool name is the one field this cannot proceed without: the core
-    // resolves it against the class table and a checkpoint attributed to
-    // `claude:` would be a row that names no call. The drift report above has
-    // already fired.
-    let tool = input.tool_name.as_deref().map(str::trim).unwrap_or("");
-    if tool.is_empty() {
-        return write_json(stream, 200, &no_op).await;
-    }
-    let settings = live_settings(app);
-    let tab = claude_hook_tab(&settings, req);
-    let cwd = claude_hook_cwd(app, &settings, tab.as_deref(), &input.cwd);
-    let checkpointed = tool_checkpoint_core(
-        app,
-        &settings,
-        Some("claude"),
-        tool,
-        cwd.as_deref(),
-        Some(input.session_id.as_str()),
-        tab.as_deref(),
-    )
-    .await;
-    debug!(
-        target: "offload",
-        tab = %bounded_id(tab.as_deref().unwrap_or("")),
-        tool = %bounded_id(tool),
-        checkpointed,
-        "claude pre-mutation checkpoint"
-    );
-    write_json(stream, 200, &no_op).await
-}
-
-/// A `400` body, spelled once for the three Phase L routes.
 fn bad_request(msg: &str) -> RunResult {
     RunResult {
         ok: false,
@@ -8184,7 +7692,7 @@ fn bad_request(msg: &str) -> RunResult {
 ///
 /// Modelled field-for-field on [`LatchBeaconBody`]'s two identity fields,
 /// including the `#[serde(default)] Option<String>` spelling and the
-/// `source_for_consumer(…unwrap_or("claude"))` normalisation, so one tab is
+/// `source_for_consumer(…unwrap_or(DEFAULT_HARNESS))` normalisation, so one tab is
 /// named the same way from every route. **`consumer` is a BODY field**: the
 /// query-string form exists only on `/mcp/call`, whose body is not ours — it is
 /// MCP JSON-RPC, owned by another protocol — so cImp's transport metadata cannot
@@ -8471,7 +7979,7 @@ fn record_discovery_skipped(
     let Some((skipped, clamped)) = bounded_skips(body.skipped) else {
         return;
     };
-    let agent = crate::graph::source_for_consumer(body.consumer.as_deref().unwrap_or("claude"));
+    let agent = crate::graph::source_for_consumer(body.consumer.as_deref().unwrap_or(crate::harness::DEFAULT_HARNESS.token()));
     let identity = tab_identity(settings, agent, body.tab.as_deref());
     // The scope label doubles as the flood key, which is deliberate: both want
     // "the identity this call actually resolved to", and the identity-less cases
@@ -8612,350 +8120,108 @@ fn discovery_row(origin: outbound::Origin, rep: &DiscoveryReport) -> FlagRow {
     }
 }
 
-// ── NC-2 (issue #5): hook-driven permission detection ────────────────────────
+// ── NC-2 (issue #5): the neutral half of hook-driven permission detection ────
+//
+// **V40 Phase C, locked decision 21.** What used to live here was the whole
+// chain: Claude's `Notification` payload struct, its marker strings, its
+// `IGNORED_NOTIFICATION_TYPES` list transcribed from the hooks guide, the
+// classifier that reads `hook_event_name`, and the session-id → transcript-stem
+// → cwd resolution that knows what a Claude transcript path looks like. All of
+// that is `harness/claude/hook.rs` now.
+//
+// What stays is the part that is true of prompt detection in general: the tabs
+// an edge could belong to, and the signal an edge becomes. The TUI-regex
+// detector produces the same [`PermissionEdge`] from a screen scrape, and both
+// producers are idempotent at the state manager — which is why a hook and a
+// regex match for the same prompt collapse to one edge rather than being two
+// features that must agree.
 
-/// A `POST /permission/event` request body — the Claude `--notify-hook` shim
-/// forwarding a `Notification` or `PermissionDenied` hook payload.
-#[derive(Deserialize, Default)]
-struct PermissionEventBody {
-    /// The hook payload's `cwd` (already resolved by the shim).
-    #[serde(default)]
-    cwd: Option<String>,
-    #[serde(default)]
-    session_id: Option<String>,
-    /// `~/.claude/projects/<slug>/<session_id>.jsonl` — the second mapping key.
-    #[serde(default)]
-    transcript_path: Option<String>,
-    /// The payload's `hook_event_name` (`"Notification"` / `"PermissionDenied"`).
-    #[serde(default)]
-    event: String,
-    /// The notification's type when the payload carries one (`permission_prompt`,
-    /// `idle_prompt`, …).
-    #[serde(default)]
-    notification_type: Option<String>,
-    /// The notification's prose, used to classify when no type field arrived.
-    #[serde(default)]
-    message: Option<String>,
-    /// Present on `PermissionDenied`; logged, not branched on.
-    #[serde(default)]
-    tool_name: Option<String>,
-}
-
-/// Which edge of the existing `awaiting_permission` flag a hook payload maps to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PermissionEdge {
-    /// A permission prompt is now on screen ⇒ `PermissionPromptDetected`.
-    Detected,
-    /// The pending call was denied ⇒ `PermissionPromptResolved`.
-    Resolved,
-}
-
-/// Substrings that identify a permission notification when the payload carries
-/// no notification-type field. Claude Code's permission notification reads
-/// "Claude needs your permission to use <tool>", so both fragments are checked
-/// (either wording survives a small rephrasing). Deliberately narrower than a
-/// bare `"permission"` test, which a "permission denied" filesystem-error
-/// notification would trip.
-const PERMISSION_MESSAGE_MARKERS: [&str; 2] = ["your permission", "permission to use"];
-
-/// The notification type that means "a permission prompt is on screen" — the
-/// value Claude Code's `Notification` matcher filters on.
-const PERMISSION_NOTIFICATION_TYPE: &str = "permission_prompt";
-
-/// Notification types we KNOW about and deliberately ignore (Claude Code hooks
-/// guide, same list the `Notification` matcher accepts, minus
-/// `permission_prompt`). Recognizing them by name is what lets an
-/// *unrecognized* type fall through to the prose check without idle/auth
-/// notifications riding along — see [`classify_permission_event`].
-const IGNORED_NOTIFICATION_TYPES: [&str; 7] = [
-    "idle_prompt",
-    "auth_success",
-    "elicitation_dialog",
-    "elicitation_complete",
-    "elicitation_response",
-    "agent_needs_input",
-    "agent_completed",
-];
-
-/// NC-2: map a hook payload to a permission edge, or `None` to ignore it.
-///
-///   * `PermissionDenied` (auto-classifier blocked the call) resolves the
-///     prompt. Note the docs describe this as the auto-mode classifier's own
-///     denial, NOT necessarily the user pressing "No" — treating it as a
-///     resolution is still right (nothing is awaiting the user afterwards).
-///     M11 fix (2026-08-05 review): the eager clear is paired with a
-///     force-clear of that tab's regex latch in `handle_permission_event`, so a
-///     prompt that is genuinely still on screen is re-raised on the detector's
-///     next scan instead of staying invisible until the next keystroke.
-///   * `Notification` is classified by its TYPE when the payload carries a
-///     RECOGNIZED one (the field the matcher filters on), else by its prose.
-///
-/// **Type dispatch, in order (M12 fix, 2026-08-05 review):**
-///   1. `permission_prompt` ⇒ `Detected`.
-///   2. A type in [`IGNORED_NOTIFICATION_TYPES`] ⇒ ignored, prose NOT
-///      consulted. Deliberate: see the idle note below.
-///   3. Anything else — including an empty/absent type — falls through to the
-///      prose check. This is the drift path the shim's payload-shape note calls
-///      UNVERIFIED: a renamed type or a nested/renamed field must degrade to
-///      "we read the message instead", never to silence. Returning early on
-///      every unrecognized non-empty type inverted the contract precisely for
-///      the permission case, where "ignored" IS silence.
-///
-/// **Idle notifications are deliberately dropped** — and, per rule 2, dropped
-/// even when their prose would match. `idle_prompt` ("waiting for your input")
-/// is semantically close to the `awaiting_question` pipe, but that pipe's
-/// meaning today is "an AskUserQuestion-style menu is on screen" and the regex
-/// detector owns it; wiring idle there would flip the badge/TTS on every turn
-/// boundary. Revisit only with a separate signal.
-fn classify_permission_event(
-    event: &str,
-    notification_type: &str,
-    message: &str,
-) -> Option<PermissionEdge> {
-    match event {
-        "PermissionDenied" => Some(PermissionEdge::Resolved),
-        "Notification" => {
-            let kind = notification_type.trim();
-            if kind.eq_ignore_ascii_case(PERMISSION_NOTIFICATION_TYPE) {
-                return Some(PermissionEdge::Detected);
-            }
-            if IGNORED_NOTIFICATION_TYPES
-                .iter()
-                .any(|t| kind.eq_ignore_ascii_case(t))
-            {
-                return None;
-            }
-            // Unrecognized (or absent) type ⇒ the prose is all we have.
-            let msg = message.to_ascii_lowercase();
-            PERMISSION_MESSAGE_MARKERS
-                .iter()
-                .any(|m| msg.contains(m))
-                .then_some(PermissionEdge::Detected)
-        }
-        _ => None,
-    }
-}
-
-/// One tab a permission event could belong to: its id, the Claude session id it
+/// One tab a permission edge could belong to: its id, the harness session id it
 /// is currently running (from the graph's live-session registry — `None` for a
 /// configured-but-not-running tab), and the directory it launches in.
 #[derive(Debug, Clone)]
-struct PermissionTabCandidate {
-    tab: String,
-    session_id: Option<String>,
-    cwd: PathBuf,
-}
-
-/// NC-2: resolve a hook payload to exactly one tab, or `None` to DROP the event.
-///
-/// Fallback order — `session_id` → `transcript_path` → unique `cwd`:
-///
-///   1. **session id.** The live-session registry maps a Claude tab id to the
-///      session its transcript tail last saw; a hook payload names that same id.
-///   2. **transcript path.** The transcript filename stem IS the session id
-///      (`<slug>/<session_id>.jsonl`), so this recovers the match when the
-///      `session_id` field itself goes missing/renamed.
-///   3. **cwd**, and only when it identifies exactly ONE Claude tab. Tabs
-///      normally all inherit the app's launch dir, so this usually resolves only
-///      for a single-Claude-tab setup (or a worktree tab with its own cwd).
-///
-/// Never guesses: an ambiguous or unmatched payload returns `None` and the event
-/// is dropped, leaving detection to the TUI-regex fallback. Guessing would flip
-/// the badge/TTS/avatar for the WRONG tab, which is worse than a missed hook.
-///
-/// H1 fix (2026-08-05 review): the `session_id` on a candidate is already
-/// ambiguity-filtered upstream — with two RUNNING Claude tabs on one project the
-/// registry withholds BOTH bindings (`graph::service::live_claude_tab_sessions`),
-/// because the taps cannot tell those tabs' transcripts apart. Passes 1 and 2
-/// then find nothing and pass 3 sees the shared cwd on ≥2 tabs, so the event is
-/// dropped rather than attributed to whichever tab wrote last.
-fn resolve_permission_tab(
-    candidates: &[PermissionTabCandidate],
-    session_id: &str,
-    transcript_path: &str,
-    cwd: &str,
-) -> Option<String> {
-    let by_session = |sid: &str| -> Option<String> {
-        if sid.is_empty() {
-            return None;
-        }
-        let mut hits = candidates
-            .iter()
-            .filter(|c| c.session_id.as_deref() == Some(sid));
-        let first = hits.next()?;
-        // A session id belongs to one tab; if two tabs somehow claim it, refuse
-        // rather than pick.
-        hits.next().is_none().then(|| first.tab.clone())
-    };
-
-    if let Some(tab) = by_session(session_id) {
-        return Some(tab);
-    }
-    if let Some(tab) = transcript_session_id(transcript_path).and_then(|s| by_session(&s)) {
-        return Some(tab);
-    }
-    let target = norm_dir(cwd)?;
-    let mut hits = candidates
-        .iter()
-        .filter(|c| norm_dir(&c.cwd.to_string_lossy()).as_deref() == Some(target.as_str()));
-    let first = hits.next()?;
-    hits.next().is_none().then(|| first.tab.clone())
-}
-
-/// The session id encoded in a Claude transcript path
-/// (`…/projects/<slug>/<session_id>.jsonl`), or `None` for an empty/odd path.
-fn transcript_session_id(transcript_path: &str) -> Option<String> {
-    let stem = Path::new(transcript_path.trim()).file_stem()?;
-    let stem = stem.to_string_lossy().into_owned();
-    (!stem.is_empty()).then_some(stem)
-}
-
-/// A directory string normalized for comparison: separators unified, trailing
-/// separators dropped, and — on Windows, whose paths are case-insensitive —
-/// case-folded. `None` for an empty/whitespace path.
-///
-/// H1-R5 fix: delegates to [`crate::fsutil::norm_dir_key`], which the H1
-/// ambiguity predicate's transcript-root key also goes through — the two seams
-/// compare "same project dir?" and must not drift apart.
-fn norm_dir(dir: &str) -> Option<String> {
-    crate::fsutil::norm_dir_key(dir)
-}
-
-/// `POST /permission/event` (NC-2): the hook-driven half of permission
-/// detection. Maps the payload to a tab and emits the SAME `StateSignal`s the
-/// TUI-regex detector emits, so the whole downstream pipeline
-/// (`awaiting_permission` → TTS enqueue, per-tab badge, avatar) is untouched.
-/// Both producers are idempotent at the state manager, so a hook and a regex
-/// match for the same prompt collapse to one edge.
-///
-/// Always answers 200 `{ok:true}` (with a `mapped` field for diagnosis): the
-/// shim ignores the response and must never be given a reason to retry.
-async fn handle_permission_event(
-    stream: &mut TcpStream,
-    app: &AppHandle,
-    req: &Request,
-) -> AppResult<()> {
-    let body: PermissionEventBody = match serde_json::from_slice(&req.body) {
-        Ok(b) => b,
-        Err(e) => {
-            return write_json(
-                stream,
-                400,
-                &serde_json::json!({ "ok": false, "error": format!("bad request body: {e}") }),
-            )
-            .await;
-        }
-    };
-    match permission_signal(app, &body).await {
-        PermissionOutcome::Mapped(tab) => {
-            write_json(
-                stream,
-                200,
-                &serde_json::json!({ "ok": true, "mapped": true, "tab": tab }),
-            )
-            .await
-        }
-        PermissionOutcome::Unmapped(reason) => {
-            write_json(
-                stream,
-                200,
-                &serde_json::json!({ "ok": true, "mapped": false, "reason": reason }),
-            )
-            .await
-        }
-    }
+pub(crate) struct PermissionTabCandidate {
+    pub(crate) tab: String,
+    pub(crate) session_id: Option<String>,
+    pub(crate) cwd: PathBuf,
 }
 
 /// What one permission payload did: the tab whose state signal was sent, or why
 /// nothing was sent.
 ///
-/// The route answers 200 on every arm — the two producers are observe-only and
-/// must never be given a reason to retry — so this exists to keep the *diagnosis*
-/// out of the transport, not to give a caller anything to branch on.
-enum PermissionOutcome {
+/// The route answers 200 on every arm — the producers are observe-only and must
+/// never be given a reason to retry — so this exists to keep the *diagnosis* out
+/// of the transport, not to give a caller anything to branch on.
+pub(crate) enum PermissionOutcome {
     Mapped(String),
     Unmapped(&'static str),
 }
 
-/// Classify a permission payload, map it to a tab and emit the state signal —
-/// the whole of `/permission/event`'s effect, shared with
-/// [`claude_hook::ROUTE_NOTIFICATION`] (V35 Phase J).
+/// Every tab a permission edge could be attributed to, with the session each is
+/// currently running.
 ///
-/// Both producers hand this the same `PermissionEventBody`: the pre-upgrade
-/// `--notify-hook` shim built one from the raw payload before posting it, and
-/// the Claude-native route builds the identical one from the payload it receives
-/// directly. One classifier, one tab-resolution, one signal.
-async fn permission_signal(app: &AppHandle, body: &PermissionEventBody) -> PermissionOutcome {
-    let session_id = body.session_id.clone().unwrap_or_default();
-    let transcript_path = body.transcript_path.clone().unwrap_or_default();
-    let cwd = body.cwd.clone().unwrap_or_default();
-    let Some(edge) = classify_permission_event(
-        &body.event,
-        body.notification_type.as_deref().unwrap_or(""),
-        body.message.as_deref().unwrap_or(""),
-    ) else {
-        debug!(
-            event = %body.event,
-            kind = body.notification_type.as_deref().unwrap_or(""),
-            "permission hook: ignored (not a permission edge)"
-        );
-        return PermissionOutcome::Unmapped("ignored");
+/// Snapshots what is needed from managed state and drops the guards — nothing
+/// borrowed from `AppHandle` is held across a response write. An empty answer
+/// (no `AppState`, no configured tabs) is not an error: it makes the resolution
+/// find nothing, which is the same "drop it rather than guess" outcome an
+/// ambiguous match produces.
+pub(crate) fn permission_tab_candidates(
+    app: &AppHandle,
+    harness: crate::harness::HarnessId,
+) -> Vec<PermissionTabCandidate> {
+    let Some(state) = app.try_state::<crate::ipc::AppState>() else {
+        return Vec::new();
     };
+    let sessions: Vec<(String, String)> = app
+        .try_state::<Arc<crate::graph::GraphService>>()
+        .map(|g| g.live_sessions_for(harness))
+        .unwrap_or_default();
+    crate::tabs::harness_tab_dirs(&state.settings.current(), &state.launch.cwd, harness)
+        .into_iter()
+        .map(|(tab, dir)| PermissionTabCandidate {
+            session_id: sessions
+                .iter()
+                .find(|(k, _)| *k == tab)
+                .map(|(_, s)| s.clone()),
+            tab,
+            cwd: dir,
+        })
+        .collect()
+}
 
-    // Snapshot everything we need from managed state, then drop the guards —
-    // nothing borrowed from `AppHandle` is held across the response write.
-    let resolved = app.try_state::<crate::ipc::AppState>().map(|state| {
-        let sessions: Vec<(String, String)> = app
-            .try_state::<Arc<crate::graph::GraphService>>()
-            .map(|g| g.live_claude_sessions())
-            .unwrap_or_default();
-        let candidates: Vec<PermissionTabCandidate> =
-            crate::tabs::claude_tab_dirs(&state.settings.current(), &state.launch.cwd)
-                .into_iter()
-                .map(|(tab, dir)| PermissionTabCandidate {
-                    session_id: sessions
-                        .iter()
-                        .find(|(k, _)| *k == tab)
-                        .map(|(_, s)| s.clone()),
-                    tab,
-                    cwd: dir,
-                })
-                .collect();
-        (
-            resolve_permission_tab(&candidates, &session_id, &transcript_path, &cwd),
-            state.state_signals.clone(),
-            state.tabs.clone(),
-        )
-    });
-    let Some((Some(tab), signals, registry)) = resolved else {
-        debug!(
-            event = %body.event,
-            session = %session_id,
-            cwd = %cwd,
-            "permission hook: no unambiguous tab — dropped (regex fallback still covers it)"
-        );
-        return PermissionOutcome::Unmapped("no tab");
+/// Emit one neutral permission edge for `tab`, returning whether it was sent.
+///
+/// The SAME `StateSignal`s the TUI-regex detector emits, so the whole downstream
+/// pipeline (`awaiting_permission` → TTS enqueue, per-tab badge, avatar) is
+/// untouched by which producer found the prompt.
+///
+/// Edge-triggered and best-effort, exactly like the PTY processor's `try_send`:
+/// a full channel means the state manager is saturated, and the regex detector's
+/// next scan re-raises the edge anyway.
+pub(crate) async fn send_permission_edge(
+    app: &AppHandle,
+    tab: &str,
+    edge: crate::harness::plugin::PermissionEdge,
+) -> bool {
+    use crate::harness::plugin::PermissionEdge;
+    let Some(state) = app.try_state::<crate::ipc::AppState>() else {
+        return false;
     };
-
-    let tab_id = crate::state::TabId::from_str(&tab);
+    let signals = state.state_signals.clone();
+    let registry = state.tabs.clone();
+    drop(state);
+    let tab_id = crate::state::TabId::from_str(tab);
     let signal = match edge {
-        PermissionEdge::Detected => {
-            crate::state::StateSignal::PermissionPromptDetected {
-                tab: tab_id.clone(),
-            }
-        }
-        PermissionEdge::Resolved => {
-            crate::state::StateSignal::PermissionPromptResolved {
-                tab: tab_id.clone(),
-            }
-        }
+        PermissionEdge::Detected => crate::state::StateSignal::PermissionPromptDetected {
+            tab: tab_id.clone(),
+        },
+        PermissionEdge::Resolved => crate::state::StateSignal::PermissionPromptResolved {
+            tab: tab_id.clone(),
+        },
     };
-    // Edge-triggered and best-effort, exactly like the PTY processor's
-    // `try_send`: a full channel means the state manager is saturated, and the
-    // regex detector's next scan re-raises the edge anyway.
     let _ = signals.try_send(signal);
     // M11 (2026-08-05 review): a hook-driven Resolved clears the flag eagerly —
-    // a `PermissionDenied` from the auto-classifier can land while a genuine
+    // a denial from the harness's own auto-classifier can land while a genuine
     // approval prompt is still on screen. The regex fallback cannot recover on
     // its own: `PermissionDetector::check` is edge-triggered on a latched
     // per-kind pattern name, so while that same pattern keeps matching it emits
@@ -8965,39 +8231,32 @@ async fn permission_signal(app: &AppHandle, body: &PermissionEventBody) -> Permi
     if matches!(edge, PermissionEdge::Resolved) {
         registry.lock().await.clear_permission_latch(&tab_id).await;
     }
-    info!(
-        event = %body.event,
-        tool = body.tool_name.as_deref().unwrap_or(""),
-        ?edge,
-        %tab,
-        "permission hook: state signal sent"
-    );
-    PermissionOutcome::Mapped(tab)
+    true
 }
 
 /// A `POST /context/post_edit` request body (the Claude `PostToolUse` shim, or
 /// the OpenCode plugin's `tool.execute.after` hook).
 #[derive(Deserialize)]
-struct ContextPostEditBody {
+pub(crate) struct ContextPostEditBody {
     #[serde(default)]
-    cwd: Option<String>,
+    pub(crate) cwd: Option<String>,
     #[serde(default)]
-    session_id: Option<String>,
+    pub(crate) session_id: Option<String>,
     #[serde(default)]
-    file_path: String,
+    pub(crate) file_path: String,
     /// Recorded for symmetry with the shim's payload; not currently branched
     /// on (the matcher/plugin already scope this to edit-class tools).
     #[serde(default)]
     #[allow(dead_code)]
-    tool_name: Option<String>,
+    pub(crate) tool_name: Option<String>,
     /// #48 (M-7): which shim is calling — `"claude"` (the `--postedit-hook`
     /// shim) or `"opencode"` (the generated plugin). See [`hook_agent`].
     #[serde(default)]
-    agent: Option<String>,
+    pub(crate) agent: Option<String>,
     /// #48 (M-7): the cImp TAB this hook serves — `--tab <id>` from argv on the
     /// Claude side, `CIMP_TAB_ID` on the OpenCode side.
     #[serde(default)]
-    tab: Option<String>,
+    pub(crate) tab: Option<String>,
 }
 
 /// **V33 C4** — every directory this instance will run the project's configured
@@ -9155,9 +8414,9 @@ async fn handle_post_edit(stream: &mut TcpStream, app: &AppHandle, req: &Request
 
 /// The auto-check diff for one edit, **after** the gate — including V33 C4's
 /// root admission, which is part of the work rather than part of the latch gate.
-/// Shared by `/context/post_edit` and [`claude_hook::ROUTE_POST_TOOL_USE`]; see
+/// Shared by `/context/post_edit` and [`crate::harness::claude::hook::ROUTE_POST_TOOL_USE`]; see
 /// [`compaction_block`] for why the latch gate stays at each route.
-async fn post_edit_diagnostics(
+pub(crate) async fn post_edit_diagnostics(
     app: &AppHandle,
     settings: &crate::settings::Settings,
     body: &ContextPostEditBody,
@@ -9246,17 +8505,29 @@ struct MemoryEventBody {
     cache_make: u32,
 }
 
-/// V24 Phase F: from an OpenCode usage POST body, the target session id and the
+/// V24 Phase F: from a harness's usage POST body, the target session id and the
 /// [`crate::graph::UsageEvent::Turn`] to record — or `None` when the body has no
 /// usable data (missing/empty `msg_id`, or all four token totals are zero).
 ///
 /// When `parent_session_id` is present the spend rolls up to the PARENT session
-/// with `origin: Agent` (sub-agent spend is the parent's spend — mirrors the
-/// Claude sub-agent contract); otherwise it's the reporting session with
-/// `origin: Session`. A model id that is absent/empty maps to `None` (unknown
-/// model), matching the Claude tap. Pure, so the mapping is unit-tested without
-/// a live handler.
-fn usage_event_from_body(body: &MemoryEventBody) -> Option<(String, crate::graph::UsageEvent)> {
+/// in the reporting harness's **declared sub-agent lane** (sub-agent spend is
+/// the parent's spend); otherwise it's the reporting session in its declared
+/// main lane. A model id that is absent/empty maps to `None` (unknown model),
+/// matching the Claude tap. Pure, so the mapping is unit-tested without a live
+/// handler.
+///
+/// **V40 Phase G (locked decision 19).** This used to hard-code
+/// `UsageOrigin::Agent` / `::Session` — core writing one harness's two lane
+/// names into another harness's rows. `agent` is the request's asserted harness
+/// id, and the lanes come from that harness's
+/// [`TurnUsageShape`](crate::harness::plugin::TurnUsageShape). A harness that
+/// declares NO shape records **nothing**: guessing a lane for a harness that
+/// never told cImp what its lanes are would put real tokens in a fabricated
+/// bucket, and a dropped row is recoverable where a mis-attributed one is not.
+fn usage_event_from_body(
+    body: &MemoryEventBody,
+    agent: &str,
+) -> Option<(String, crate::graph::UsageEvent)> {
     let msg_id = body.msg_id.clone().filter(|m| !m.is_empty())?;
     // The plugin only forwards COMPLETED turns, so an all-zero body is a
     // degenerate/creation emit — skip it rather than plant an empty turn row.
@@ -9266,9 +8537,12 @@ fn usage_event_from_body(body: &MemoryEventBody) -> Option<(String, crate::graph
     if body.in_tok == 0 && body.out_tok == 0 && body.cache_read == 0 && body.cache_make == 0 {
         return None;
     }
+    let shape = crate::harness::HarnessId::from_id(agent)
+        .and_then(|h| h.plugin())
+        .and_then(|p| p.turn_usage_shape())?;
     let (target, origin) = match body.parent_session_id.as_deref() {
-        Some(p) if !p.is_empty() => (p.to_string(), crate::graph::UsageOrigin::Agent),
-        _ => (body.session_id.clone(), crate::graph::UsageOrigin::Session),
+        Some(p) if !p.is_empty() => (p.to_string(), shape.subagent_origin()?),
+        _ => (body.session_id.clone(), shape.main_origin()?),
     };
     Some((
         target,
@@ -9279,7 +8553,7 @@ fn usage_event_from_body(body: &MemoryEventBody) -> Option<(String, crate::graph
             out_tok: body.out_tok,
             cache_read: body.cache_read,
             cache_make: body.cache_make,
-            origin,
+            origin: origin.to_string(),
         },
     ))
 }
@@ -9296,75 +8570,52 @@ fn tool_event_parent(body: &MemoryEventBody) -> Option<String> {
         .filter(|p| !p.is_empty())
         .map(str::to_string)
 }
-
-/// V32 Phase F, C-2 token variant (2026-08-07 review): mark `session` live from
-/// a `/memory/event` body, refusing any id that collides with a configured AI
-/// tab id.
+/// **The live-session write a `/memory/event` body asks for** (V40 Phase D,
+/// locked decision 20).
 ///
-/// # Why the guard exists
+/// The body names a SESSION, so the write lands in the session key space —
+/// where it cannot name a cImp tab. That is the whole of the C-2 fix now: it
+/// used to be `mark_live_session_from_event`, which refused any key that
+/// exactly matched a configured AI tab id, because one map held both key spaces
+/// and a POST could therefore repoint a running tab's session (flapping the
+/// taint latch clear in a loop, with the real tap's re-stamp producing a second
+/// rotation that helped the attacker). A check beside the write has to keep a
+/// list in step; separate spaces make the collision unrepresentable.
 ///
-/// `live_sessions` is ONE map with TWO key spaces: the Claude tap keys it by
-/// **tab id** (`harness/claude/read.rs`), and OpenCode's loopback path keys it by the
-/// **reporting session id**, because OpenCode has no tab binding here (V24
-/// Phase B). Nothing kept them apart. `handle_memory_event` derives all three
-/// of its keys from request-body strings, with `agent` defaulting to
-/// `"opencode"` and no validation of any kind — #45's check is on the *read*
-/// side (`latch_scope`), not here — so an authenticated POST could write
-/// `live_sessions["claude-1"] = <attacker string>` and repoint a real tab's
-/// session identity.
-///
-/// Two things then follow, and the second is the sharp one:
-/// - V28 memory scoping is corrupted: `/graph_run`'s `context_*` calls for that
-///   tab resolve to a session the tab never had.
-/// - [`TabLatch::observe`] reads that session through the same lookup, sees a
-///   *changed* id, and treats it as a new conversation — clearing the latch,
-///   the budget **and `contaminated`**, which locked decision 15 says only a
-///   genuinely new conversation may do. The real tap re-stamps the true id
-///   within its 200 ms poll, producing a SECOND rotation, so the race helps the
-///   attacker: POST in a loop and the tab flaps clean.
-///
-/// # Why rejection, and why exact-match
-///
-/// Namespacing the OpenCode key space would work equally well and is the other
-/// option the review named, but it would rewrite the keys V24's usage/permission
-/// consumers already read (`live_claude_sessions`, `compute_active_session_ids`)
-/// for a hazard that only exists at the collision. Rejecting the collision
-/// leaves every legitimate key untouched: a real OpenCode session id is a UUID,
-/// and a cImp tab id is config-derived (`claude`, `opencode-2`), so the two
-/// never legitimately meet.
-///
-/// Exact-match against the configured list, with **no** empty-list escape (see
-/// [`names_a_configured_ai_tab`]): "settings are not loaded yet" must not be a
-/// window in which every string is refused, and a string that collides with
-/// nothing is not an attack.
-///
-/// This closes the token-gated half of C-2 only. The filesystem half — a
-/// zero-byte `.jsonl` appearing in the transcript dir — is closed in
-/// `harness/claude/read.rs` by requiring observed growth before a rotated file is marked
-/// live. **Neither alone is sufficient**: they are two independent writers into
-/// the same registry.
+/// A harness whose identity is TAB-keyed ([`SessionKey::Tab`] — its session is
+/// bound by cImp's own reader) gets **no registry write from a request body at
+/// all**: its live session is not something a wire value may claim. An
+/// unregistered `agent` likewise writes nothing — fail closed.
 ///
 /// `mark` is the registry write, taken as a parameter rather than reached
-/// through a `GraphService` this crate has no `AppHandle` to build: the point of
-/// #48's `only_configured_ai_tab_ids_can_ever_key_a_latch` rewrite is that a
-/// bound asserted *beside* its enforcement point survives deleting the call, so
-/// the test drives this function and observes whether the write happened.
-fn mark_live_session_from_event(
-    mark: impl FnOnce(&str),
-    settings: &crate::settings::Settings,
+/// through a `GraphService` this crate has no `AppHandle` to build — the same
+/// reasoning #48 gave for the function this replaces: a bound asserted *beside*
+/// its enforcement point survives deleting the call, so the test drives this
+/// function and observes whether (and into which space) the write happened.
+fn mark_live_session_from_body(
+    mark: impl FnOnce(crate::harness::plugin::SessionKey, &str),
     agent: &str,
     session: &str,
 ) {
-    if names_a_configured_ai_tab(settings, session) {
-        warn!(
+    let space = crate::harness::HarnessId::from_id(agent)
+        .and_then(|h| h.plugin())
+        .map(|p| p.session_key_space());
+    match space {
+        Some(crate::harness::plugin::SessionKey::Session) => {
+            mark(crate::harness::plugin::SessionKey::Session, session);
+        }
+        Some(crate::harness::plugin::SessionKey::Tab) => debug!(
             target: "offload",
             agent,
-            key = %session,
-            "loopback: /memory/event refused — the session id collides with a configured tab id"
-        );
-        return;
+            "loopback: /memory/event named a session for a tab-keyed harness; its reader owns \
+             that binding, so nothing is written"
+        ),
+        None => warn!(
+            target: "offload",
+            agent,
+            "loopback: /memory/event from an unregistered harness; no live-session write"
+        ),
     }
-    mark(session);
 }
 
 /// `POST /memory/event`: classify an agent tool call and record it as a memory
@@ -9402,18 +8653,19 @@ async fn handle_memory_event(
     else {
         return write_json(stream, 200, &ok).await;
     };
-    let agent = body.agent.as_deref().unwrap_or("opencode");
-    // C-2 (2026-08-07 review): ONE settings read for the whole request, feeding
-    // every `mark_live_session` below through `mark_live_session_from_event` —
-    // see its docs for why a body-supplied key must not be able to name a tab.
-    let settings = live_settings(app);
+    let agent = wire_agent(MEMORY_EVENT_ROUTE, body.agent.as_deref());
+    // C-2 (2026-08-07 review) used to read settings here, once for the whole
+    // request, so the three live-session writes below could refuse a key that
+    // named a configured tab. V40 Phase D removed the read with the check: the
+    // registry has two key spaces now and `mark_live_session_from_body` decides
+    // which one a body-supplied id lands in, which needs no settings at all.
 
     // V24 Phase F: the usage arm — a completed assistant turn's real token
     // totals (OpenCode's only exact-token ingress; see the spike note atop
     // `harness/opencode/read.rs`). Distinct body shape (`kind == "usage"`, no `tool`),
     // so it short-circuits the tool-event path below.
     if body.kind.as_deref() == Some("usage") {
-        if let Some((target, event)) = usage_event_from_body(&body) {
+        if let Some((target, event)) = usage_event_from_body(&body, agent) {
             // Roll-up target = the parent when a child (sub-agent) session
             // reported, else the reporting session itself. `record_usage`
             // upserts by `msg_id`, so the plugin's duplicate final emit is
@@ -9422,12 +8674,7 @@ async fn handle_memory_event(
             // Mark the SAME id live: the target is the session row that exists
             // / gets the spend attributed (the parent when a child reports),
             // so that's the row the Sessions list should flag active.
-            mark_live_session_from_event(
-                |k| graph.mark_live_session(k, agent, k),
-                &settings,
-                agent,
-                &target,
-            );
+            mark_live_session_from_body(|space, k| graph.mark_live_session(space, k, agent, k), agent, &target);
         }
         return write_json(stream, 200, &ok).await;
     }
@@ -9446,45 +8693,37 @@ async fn handle_memory_event(
     // still reaches the parent via the usage arm above; mark the PARENT live so
     // the sub-agent's activity keeps the parent's row active.
     if let Some(parent) = tool_event_parent(&body) {
-        mark_live_session_from_event(
-            |k| graph.mark_live_session(k, agent, k),
-            &settings,
-            agent,
-            &parent,
-        );
+        mark_live_session_from_body(|space, k| graph.mark_live_session(space, k, agent, k), agent, &parent);
         return write_json(stream, 200, &ok).await;
     }
 
-    if let Some((kind, arg)) = crate::graph::classify_tool(&tool_name) {
-        let get = |k: &str| body.args.get(k).and_then(Value::as_str);
+    // V40 Phase A, locked decision 16: the memory classification is the
+    // SENDING harness's, resolved through the registry. A body whose `agent`
+    // names no registered harness records nothing — where the old single
+    // `match` would have answered it out of whichever vocabulary happened to
+    // contain the name.
+    let source = crate::harness::HarnessId::from_id(agent);
+    if let Some((kind, arg)) = crate::harness::native::memory_kind(source, &tool_name) {
+        // V40 Phase C, locked decision 16: which KEY carries the target is the
+        // sending harness's vocabulary, not core's. This was a chain of four
+        // `or_else`s mixing Claude's snake_case with OpenCode's camelCase in one
+        // lookup — see `HarnessPlugin::memory_arg_keys`.
+        let value = crate::harness::native::memory_arg(source, arg, &body.args);
         let (path, detail) = match arg {
-            crate::graph::MemArg::Path => (
-                get("file_path")
-                    .or_else(|| get("filePath"))
-                    .or_else(|| get("notebook_path"))
-                    .or_else(|| get("path"))
-                    .unwrap_or("")
-                    .to_string(),
-                None,
-            ),
-            crate::graph::MemArg::Pattern => (
-                get("pattern")
-                    .or_else(|| get("path"))
-                    .or_else(|| get("query"))
-                    .unwrap_or("")
-                    .to_string(),
-                None,
-            ),
-            crate::graph::MemArg::Command => (
+            crate::harness::plugin::MemArg::Path
+            | crate::harness::plugin::MemArg::Pattern => {
+                (value.unwrap_or_default(), None)
+            }
+            crate::harness::plugin::MemArg::Command => (
                 String::new(),
-                get("command").map(|c| c.chars().take(200).collect::<String>()),
+                value.map(|c| c.chars().take(200).collect::<String>()),
             ),
         };
         // Skip an event with no usable target: an empty path (Path/Pattern) or a
         // Command whose `command` arg was absent (detail is None) — recording it
         // would just evict useful events from the ring.
         let recordable = match arg {
-            crate::graph::MemArg::Command => detail.is_some(),
+            crate::harness::plugin::MemArg::Command => detail.is_some(),
             _ => !path.is_empty(),
         };
         if recordable {
@@ -9505,7 +8744,7 @@ async fn handle_memory_event(
     // `harness/opencode/read.rs` — its SSE stream carries no usage fields, so this
     // hook, which already fires after every tool call, is the only place
     // that can record OpenCode usage). Unlike the memory recording above,
-    // this runs for EVERY tool call, not just ones `classify_tool` maps to a
+    // this runs for EVERY tool call, not just ones the native table maps to a
     // filesystem/query target — usage wants the full picture. `chars` is
     // estimated from the tool's serialized INPUT args (its actual output
     // isn't visible to this hook). This path records only tool-result chars,
@@ -9530,12 +8769,7 @@ async fn handle_memory_event(
     // TTL (there is no cancel signal to clear it — see the C3 spike note atop
     // `harness/opencode/read.rs`). C-2: which is exactly why the key must not be allowed
     // to name a TAB — the other half of the same map.
-    mark_live_session_from_event(
-        |k| graph.mark_live_session(k, agent, k),
-        &settings,
-        agent,
-        &body.session_id,
-    );
+    mark_live_session_from_body(|space, k| graph.mark_live_session(space, k, agent, k), agent, &body.session_id);
 
     write_json(stream, 200, &ok).await
 }
@@ -9550,7 +8784,16 @@ async fn handle_mcp_list(
     service: &Arc<OffloadService>,
     req: &Request,
 ) -> AppResult<()> {
-    let tools = service.mcp_tool_descriptors(consumer_of(req)).await;
+    // An unrecognised consumer advertises NOTHING rather than inheriting
+    // another's grants (locked decision 2). An empty list, not an error: a
+    // `tools/list` that 400s would break the child's handshake, while an empty
+    // one is the honest answer to "what may this caller reach".
+    // V40 review H-1: through the same funnel `/mcp/call` resolves its grant
+    // with, so a token that is callable is exactly a token that is listed.
+    let tools = match proxy_identity(query_param(&req.path, "consumer")) {
+        Some((c, _)) => service.mcp_tool_descriptors(c).await,
+        None => Vec::new(),
+    };
     write_json(stream, 200, &serde_json::json!({ "tools": tools })).await
 }
 
@@ -9581,10 +8824,21 @@ async fn handle_mcp_call(
             return write_json(stream, 400, &r).await;
         }
     };
-    // Normalized through the same `source_for_consumer` vocabulary
-    // `/graph_run` uses, so one tab keys one latch from both routes.
-    let agent =
-        crate::graph::source_for_consumer(query_param(&req.path, "consumer").unwrap_or("claude"));
+    // V40 review H-1: the GRANT and the LATCH KEY are resolved together, here,
+    // before anything is charged or gated — `proxy_identity` folds an in-app
+    // consumer onto `Consumer::conservative_grant` and derives `agent` from the
+    // FOLDED consumer, so a request served Claude's server set is judged under
+    // Claude's latch. Refused (not degraded) for a token nobody declared:
+    // locked decision 2, and refusing here means an unattributable caller
+    // cannot spend a tab's budget either.
+    let Some((consumer, agent)) = proxy_identity(query_param(&req.path, "consumer")) else {
+        return write_json(
+            stream,
+            400,
+            &serde_json::json!({ "error": unknown_consumer_message() }),
+        )
+        .await;
+    };
     // V32 Phase G: ONE settings read here, so the tab-id check, the latch, the
     // budget, detection and the envelope all resolve under the same snapshot —
     // a mid-call settings save must not leave a result screened by one posture
@@ -9678,7 +8932,7 @@ async fn handle_mcp_call(
     let audit = TabAudit(scope.as_ref(), agent);
     let called = service
         .mcp_call(
-            consumer_of(req),
+            consumer,
             &body.name,
             body.arguments,
             cwd.as_deref(),
@@ -9768,7 +9022,7 @@ async fn handle_mcp_call(
 /// reaches for a HARNESS-NATIVE web tool — and, until 2026-08-17, by the
 /// `cimp --taint-beacon` Claude shim, which a tab open across that upgrade may
 /// still be running. Claude's current path is
-/// [`claude_hook::ROUTE_PRE_TOOL_USE_TAINT`], whose handler carries Claude's own
+/// [`crate::harness::claude::hook::ROUTE_PRE_TOOL_USE_TAINT`], whose handler carries Claude's own
 /// hook payload and reaches [`latch_beacon_core`] directly rather than through
 /// this body. Every field except `tab` is descriptive; `tab` is the only one the
 /// latch actually needs.
@@ -9850,7 +9104,7 @@ async fn handle_latch_beacon(
         }
     };
     let agent =
-        crate::graph::source_for_consumer(body.consumer.as_deref().unwrap_or("claude"));
+        crate::graph::source_for_consumer(body.consumer.as_deref().unwrap_or(crate::harness::DEFAULT_HARNESS.token()));
     // ONE settings read for the whole request: the tab-id check, `latch_scope`
     // and the policy must not resolve against three different snapshots.
     let settings = live_settings(app);
@@ -9894,7 +9148,7 @@ async fn handle_latch_beacon(
 
 /// **The taint engagement itself** — the core both fire seams reach: this
 /// route's harness-neutral body (the OpenCode plugin) and
-/// [`claude_hook::ROUTE_PRE_TOOL_USE_TAINT`]'s Claude hook payload.
+/// [`crate::harness::claude::hook::ROUTE_PRE_TOOL_USE_TAINT`]'s Claude hook payload.
 ///
 /// Split out on 2026-08-17, when the Claude side stopped being a shim POSTing to
 /// the route and became a handler beside it. One core, so the two transports
@@ -9908,6 +9162,24 @@ async fn handle_latch_beacon(
 /// harness logs, and there is nothing to log about a hook with nothing to say).
 /// Either way nothing is engaged and no registry entry is created, which is #45's
 /// bound.
+/// **The taint beacon, as one call a plugin can make** (V40 Phase C).
+///
+/// The narrow twin of [`latch_beacon_core`], for the same reason
+/// [`hook_gate_admits`] is the narrow twin of [`hook_admit`]: the registry the
+/// core takes is a private type, and a harness's ingress route must be able to
+/// engage the latch without holding the latch machinery. Same core, same row,
+/// same #45 narrowing — `Err(tab)` still means "named no configured tab, nothing
+/// engaged".
+pub(crate) fn latch_beacon_for(
+    app: &AppHandle,
+    settings: &crate::settings::Settings,
+    agent: &'static str,
+    tab: Option<&str>,
+    tool: &str,
+) -> Result<LatchView, String> {
+    latch_beacon_core(latches(), app, settings, agent, tab, tool)
+}
+
 fn latch_beacon_core(
     reg: &LatchRegistry,
     app: &AppHandle,
@@ -9990,7 +9262,7 @@ const BEACON_TOOL_MAX: usize = 64;
 ///
 /// Control-sequence hygiene is a separate concern with its own owner (Phase D,
 /// at the surfaces that render); this only bounds length.
-fn bounded_tool(raw: Option<&str>) -> String {
+pub(crate) fn bounded_tool(raw: Option<&str>) -> String {
     let raw = raw.map(str::trim).filter(|t| !t.is_empty());
     let Some(raw) = raw else {
         return "(native web tool)".to_string();
@@ -10018,7 +9290,7 @@ fn bounded_tool(raw: Option<&str>) -> String {
 /// Truncated by **chars**, not bytes, so a multi-byte id cannot be cut
 /// mid-codepoint. Control-sequence hygiene is a separate concern with its own
 /// owner (Phase D, at the surfaces that render); this only bounds length.
-fn bounded_id(raw: &str) -> String {
+pub(crate) fn bounded_id(raw: &str) -> String {
     let mut out: String = raw.chars().take(BEACON_TOOL_MAX).collect();
     if raw.chars().nth(BEACON_TOOL_MAX).is_some() {
         out.push('…');
@@ -10072,7 +9344,7 @@ fn beacon_row(origin: outbound::Origin, tool: &str, out: &BeaconOutcome) -> Flag
 ///
 /// It is the AND of two features, and the second one is the point:
 ///
-/// - [`Feature::OpencodeNativeGate`] — the Phase H switch itself (default off).
+/// - [`Feature::HarnessNativeGate`] — the Phase H switch itself (default off).
 /// - [`Feature::TaintLatch`] — because this gate enforces *the latch's*
 ///   boundary on tools cImp does not route. With the latch feature off the
 ///   registry stops engaging (see [`GatePolicy`]), so the latch label the plugin
@@ -10091,7 +9363,7 @@ fn native_gate_verdict(
     s: crate::settings::injection::Scope<'_>,
 ) -> bool {
     use crate::settings::injection::{effective, Feature};
-    effective(Feature::OpencodeNativeGate, s, settings)
+    effective(Feature::HarnessNativeGate, s, settings)
         && effective(Feature::TaintLatch, s, settings)
 }
 
@@ -10144,7 +9416,7 @@ async fn handle_latch_state(
             return write_json(stream, 400, &r).await;
         }
     };
-    let agent = crate::graph::source_for_consumer(body.consumer.as_deref().unwrap_or("opencode"));
+    let agent = wire_agent(LATCH_STATE_ROUTE, body.consumer.as_deref());
     let settings = live_settings(app);
     let scoping = latch_scope(app, &settings, agent, body.tab.as_deref());
     // #48: the verdict comes from the resolved injection scope, which is
@@ -10280,8 +9552,8 @@ pub fn injection_status(settings: &crate::settings::Settings) -> serde_json::Val
 ///
 /// Deliberately no percent-decoding: every value on these routes is composed by
 /// cImp itself (consumer names, tab ids — `[a-z0-9-]`), never by a user or a
-/// browser. Matches the pre-V30 behaviour of [`consumer_of`], which this now
-/// backs.
+/// browser. Matches the pre-V30 behaviour of [`consumer_from_token`], which
+/// this now backs.
 fn query_param<'a>(path: &'a str, key: &str) -> Option<&'a str> {
     let (_, query) = path.split_once('?')?;
     query.split('&').find_map(|kv| {
@@ -10290,10 +9562,54 @@ fn query_param<'a>(path: &'a str, key: &str) -> Option<&'a str> {
     })
 }
 
-/// Parse the `?consumer=<name>` query value off a request path into a
-/// [`Consumer`]. Absent / unknown ⇒ Claude (the original default).
-fn consumer_of(req: &Request) -> Consumer {
-    Consumer::parse(query_param(&req.path, "consumer").unwrap_or("claude"))
+/// Parse a `consumer` discriminator into a [`Consumer`], from wherever the
+/// route carries it — the `?consumer=` query string on `/mcp/*`, the request
+/// BODY on `/run` and `/graph_run`.
+///
+/// **Absent** ⇒ [`crate::harness::DEFAULT_HARNESS`]: the pre-V30 child sends no
+/// query at all, and that child was Claude's. **Unknown** ⇒ `None`, and every
+/// route that asks advertises nothing and refuses — these are grant-bearing
+/// questions, and until V40 Phase A a typo'd token was answered with Claude's
+/// granted server set.
+fn consumer_from_token(token: Option<&str>) -> Option<Consumer> {
+    Consumer::parse(token.unwrap_or_else(|| {
+        crate::harness::DEFAULT_HARNESS
+            .id()
+            .expect("DEFAULT_HARNESS names a registered harness")
+    }))
+}
+
+/// **The single identity resolution for a grant-bearing loopback route** (V40
+/// review finding H-1).
+///
+/// Answers the resolved-and-folded [`Consumer`] the call is judged under AND
+/// the `source_for_consumer` token its taint latch, its EXTERNAL budget, its
+/// injection scope and its activity attribution key off — from ONE resolution,
+/// so the two can never name different harnesses.
+///
+/// `None` for a token no registered harness and no in-app consumer claims: a
+/// grant question, refused rather than degraded. Before this funnel,
+/// `?consumer=offload` resolved to Claude's granted server set (via
+/// [`Consumer::conservative_grant`]) while its latch key resolved to the
+/// activity source `"offload"`, which names no configured tab — so the latch,
+/// the budget and the attribution all fell through their documented fail-open
+/// while the *grant* stayed Claude's. `?consumer=<garbage>` did the same on
+/// `/run` and `/graph_run`, where nothing refused it at all.
+fn proxy_identity(token: Option<&str>) -> Option<(Consumer, &'static str)> {
+    let consumer = consumer_from_token(token)?.proxied();
+    Some((consumer, crate::graph::source_for_consumer(consumer.source())))
+}
+
+/// The refusal a grant-bearing route answers a token nobody declared with
+/// (locked decision 2). One text, so `/mcp/call`, `/run` and `/graph_run` all
+/// name the same registered list.
+fn unknown_consumer_message() -> String {
+    format!(
+        "unknown consumer; this proxy serves {} (plus `offload`, cImp's own in-app consumer). \
+         A consumer token decides which MCP servers a caller may reach and which tab's taint \
+         latch judges the call, so an unrecognised one is refused rather than defaulted.",
+        crate::harness::registry::harness_ids().join(", ")
+    )
 }
 
 /// Render one `event: push` SSE frame from a [`PushNotice`].
@@ -10356,7 +9672,7 @@ async fn handle_events(
     let consumer = query_param(&req.path, "consumer")
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .unwrap_or("claude")
+        .unwrap_or(crate::harness::DEFAULT_HARNESS.token())
         .to_string();
     // Anything but an explicit affirmative means "no channels" — a pre-V30
     // child sends no `channels` param at all and must never be pushed to.
@@ -10460,6 +9776,12 @@ async fn write_simple(
 mod tests {
     use super::*;
 
+    use crate::harness::claude::hook as claude_hook;
+
+    /// V40 Phase C moved the ingress here; the source-scanning tests that read
+    /// a handler's body follow it.
+    const HOOK_SRC: &str = include_str!("../harness/claude/hook.rs");
+
     /// V32 Phase G: the default posture — both feature switches on. Every
     /// pre-Phase-G latch test asserted this implicitly, so it is the value they
     /// keep asserting; the switched-off behaviour has its own tests below.
@@ -10537,11 +9859,102 @@ mod tests {
             cimp: CimpHeaders::default(),
             body: Vec::new(),
         };
-        assert_eq!(consumer_of(&legacy), Consumer::Claude);
+        assert_eq!(
+            consumer_from_token(query_param(&legacy.path, "consumer")),
+            Some(Consumer::Harness(crate::harness::DEFAULT_HARNESS))
+        );
         assert!(!matches!(
             query_param(&legacy.path, "channels"),
             Some("1") | Some("true")
         ));
+    }
+
+    // ── V40 review H-1: ONE identity per grant-bearing route ──────────────
+
+    /// The grant a call is served under and the taint latch that judges it
+    /// name the **same harness**, on every route that resolves a consumer.
+    ///
+    /// The regression: `?consumer=offload` was folded onto Claude's granted
+    /// server set by [`Consumer::conservative_grant`] while its latch key was
+    /// derived from the RAW token, resolving to the activity source
+    /// `"offload"` — which is no configured tab of any harness, so
+    /// `latch_scope` answered `Unknown`, `LatchRegistry::gate` took its
+    /// documented fail-open and the EXTERNAL budget went uncharged. Claude's
+    /// servers with Claude's latch switched off, on `/mcp/call`, `/run` and
+    /// `/graph_run` alike. Develop had no such spelling, because its
+    /// `source_for_consumer` answered `"claude"` for every token it did not
+    /// recognise.
+    #[test]
+    fn a_grant_bearing_route_resolves_one_identity_for_the_grant_and_the_latch() {
+        // A registered harness resolves to itself, and keys its own latch.
+        for h in crate::harness::registry::all() {
+            let token = h
+                .descriptor()
+                .expect("a registered id has a descriptor")
+                .consumer;
+            let (consumer, agent) =
+                proxy_identity(Some(token)).expect("a registered consumer resolves");
+            assert_eq!(consumer, Consumer::Harness(h));
+            assert_eq!(agent, h.token(), "{token}'s latch key is its own");
+        }
+
+        // Absent: the pre-V30 wire-compatibility default, not a guess.
+        let (consumer, agent) = proxy_identity(None).expect("an absent consumer resolves");
+        assert_eq!(consumer, Consumer::Harness(crate::harness::DEFAULT_HARNESS));
+        assert_eq!(agent, crate::harness::DEFAULT_HARNESS.token());
+
+        // cImp's OWN in-app consumer. It is still served under
+        // `conservative_grant()` — and the latch key is now THAT harness's.
+        let (consumer, agent) = proxy_identity(Some("offload")).expect("`offload` resolves");
+        assert_eq!(consumer, Consumer::conservative_grant());
+        let Consumer::Harness(served_as) = consumer else {
+            panic!("`conservative_grant` answers a harness");
+        };
+        assert_eq!(
+            agent,
+            served_as.token(),
+            "an in-app consumer served out of a harness's grants must be judged under \
+             that harness's latch"
+        );
+        assert_ne!(agent, "offload");
+        assert_ne!(agent, crate::graph::UNKNOWN_SOURCE);
+
+        // A token nobody declared is REFUSED — not degraded to an unscoped,
+        // ungated, unattributed call (locked decision 2).
+        for token in ["codex", "audit", "", "claude-code", "unknown", "  "] {
+            assert_eq!(
+                proxy_identity(Some(token)),
+                None,
+                "{token:?} names nothing this proxy serves and must be refused"
+            );
+        }
+    }
+
+    /// The structural half of the finding: every grant-bearing handler must go
+    /// through [`proxy_identity`], so a route added later cannot re-open the
+    /// split by deriving its latch key from the caller's raw claim.
+    #[test]
+    fn every_grant_bearing_handler_resolves_through_proxy_identity() {
+        let src = include_str!("loopback.rs");
+        for (handler, route) in [
+            ("async fn handle_mcp_list(", "/mcp/list"),
+            ("async fn handle_mcp_call(", "/mcp/call"),
+            ("async fn handle_run(", "/run"),
+            ("async fn handle_graph_run(", "/graph_run"),
+        ] {
+            let start = src
+                .find(handler)
+                .unwrap_or_else(|| panic!("`{handler}` still exists"));
+            let rest = &src[start..];
+            // Handler items are the only things at column 0 in this file, so
+            // a newline followed by a column-0 `}` closes this one.
+            let end = rest.find("\n}\n").unwrap_or(rest.len());
+            assert!(
+                rest[..end].contains("proxy_identity("),
+                "{route} must resolve its consumer through `proxy_identity` — the grant \
+                 and the taint latch have to name one harness (V40 review H-1)"
+            );
+        }
     }
 
     /// The wire contract the child's SSE parser depends on: one `event:` line,
@@ -10576,233 +9989,6 @@ mod tests {
 
     // ── NC-2: permission-hook classification + tab mapping ─────────────────
 
-    #[test]
-    fn permission_denied_resolves_and_unknown_events_are_ignored() {
-        assert_eq!(
-            classify_permission_event("PermissionDenied", "", ""),
-            Some(PermissionEdge::Resolved)
-        );
-        // Events we never registered (and the PermissionRequest we chose NOT to
-        // adopt) must not move the flag even if one somehow reaches the route.
-        for event in ["PermissionRequest", "PreToolUse", "", "Stop"] {
-            assert_eq!(
-                classify_permission_event(event, "permission_prompt", ""),
-                None
-            );
-        }
-    }
-
-    #[test]
-    fn notification_type_drives_classification_when_present() {
-        assert_eq!(
-            classify_permission_event("Notification", "permission_prompt", ""),
-            Some(PermissionEdge::Detected)
-        );
-        // Case/whitespace tolerance — the value is echoed from the payload.
-        assert_eq!(
-            classify_permission_event("Notification", " Permission_Prompt ", ""),
-            Some(PermissionEdge::Detected)
-        );
-        // Every other RECOGNIZED type is ignored, including idle (which is NOT
-        // wired to the question pipe — see the classifier's doc comment) …
-        for kind in IGNORED_NOTIFICATION_TYPES {
-            assert_eq!(classify_permission_event("Notification", kind, ""), None);
-        }
-        // … and a recognized type WINS over the prose fallback, so a future
-        // permission-flavoured message under a non-permission type can't leak
-        // in. Deliberate and pinned: idle notifications stay out of the
-        // permission pipe whatever their wording says.
-        assert_eq!(
-            classify_permission_event(
-                "Notification",
-                "idle_prompt",
-                "Claude needs your permission to use Bash"
-            ),
-            None
-        );
-        assert_eq!(
-            classify_permission_event(
-                "Notification",
-                "Agent_Completed",
-                "Claude needs your permission to use Bash"
-            ),
-            None,
-            "recognized types are matched case-insensitively too"
-        );
-    }
-
-    /// M12 (2026-08-05 review): an UNRECOGNIZED non-empty type must fall
-    /// through to the prose check instead of short-circuiting to "ignored".
-    /// The `Notification` payload shape is explicitly UNVERIFIED
-    /// (`notify_hook.rs` module doc), so a renamed type — or a nested field the
-    /// shim reads into `notification_type` — is the expected drift, and for the
-    /// permission case "ignored" is silence: the badge/TTS never fire and
-    /// nothing logs above debug.
-    #[test]
-    fn unrecognized_notification_type_falls_through_to_the_prose_check() {
-        // Renamed/unknown type + permission prose ⇒ still detected.
-        for kind in ["tool_permission", "permission-prompt", "something_new"] {
-            assert_eq!(
-                classify_permission_event(
-                    "Notification",
-                    kind,
-                    "Claude needs your permission to use Bash"
-                ),
-                Some(PermissionEdge::Detected),
-                "{kind}"
-            );
-        }
-        // Unknown type + unrelated prose ⇒ ignored, as before.
-        for msg in [
-            "Claude is waiting for your input",
-            "Error: permission denied while reading /etc/shadow",
-            "",
-        ] {
-            assert_eq!(
-                classify_permission_event("Notification", "something_new", msg),
-                None,
-                "{msg}"
-            );
-        }
-    }
-
-    #[test]
-    fn notification_message_classifies_when_type_field_is_absent() {
-        assert_eq!(
-            classify_permission_event(
-                "Notification",
-                "",
-                "Claude needs your permission to use Bash"
-            ),
-            Some(PermissionEdge::Detected)
-        );
-        assert_eq!(
-            classify_permission_event("Notification", "", "Permission to use Edit is required"),
-            Some(PermissionEdge::Detected)
-        );
-        // Idle prose, and a "permission denied" error that must NOT be read as
-        // a prompt (why the marker is narrower than a bare "permission").
-        for msg in [
-            "Claude is waiting for your input",
-            "Error: permission denied while reading /etc/shadow",
-            "",
-        ] {
-            assert_eq!(
-                classify_permission_event("Notification", "", msg),
-                None,
-                "{msg}"
-            );
-        }
-    }
-
-    fn cand(tab: &str, session: Option<&str>, cwd: &str) -> PermissionTabCandidate {
-        PermissionTabCandidate {
-            tab: tab.to_string(),
-            session_id: session.map(str::to_string),
-            cwd: PathBuf::from(cwd),
-        }
-    }
-
-    #[test]
-    fn tab_mapping_prefers_session_id_then_transcript_then_unique_cwd() {
-        let tabs = [
-            cand("claude", Some("sess-a"), "C:/proj"),
-            cand("ai-2", Some("sess-b"), "C:/proj/wt"),
-            cand("claude-local", None, "C:/proj"),
-        ];
-        // 1. session id.
-        assert_eq!(
-            resolve_permission_tab(&tabs, "sess-b", "", ""),
-            Some("ai-2".to_string())
-        );
-        // 2. transcript stem, when the session field went missing.
-        assert_eq!(
-            resolve_permission_tab(
-                &tabs,
-                "",
-                "C:/Users/x/.claude/projects/slug/sess-a.jsonl",
-                ""
-            ),
-            Some("claude".to_string())
-        );
-        // 3. cwd, but only where it names exactly one tab: `C:/proj` is shared
-        // by two tabs (ambiguous ⇒ drop), the worktree dir is unique.
-        assert_eq!(resolve_permission_tab(&tabs, "", "", "C:/proj"), None);
-        assert_eq!(
-            resolve_permission_tab(&tabs, "", "", "C:/proj/wt"),
-            Some("ai-2".to_string())
-        );
-        // Separator/trailing-slash normalization (and, on Windows, case).
-        assert_eq!(
-            resolve_permission_tab(&tabs, "", "", "C:\\proj\\wt\\"),
-            Some("ai-2".to_string())
-        );
-        // Nothing matches ⇒ dropped, never guessed.
-        assert_eq!(
-            resolve_permission_tab(&tabs, "sess-zz", "", "D:/elsewhere"),
-            None
-        );
-        assert_eq!(resolve_permission_tab(&tabs, "", "", ""), None);
-        assert_eq!(resolve_permission_tab(&[], "sess-a", "", "C:/proj"), None);
-    }
-
-    #[test]
-    fn tab_mapping_refuses_a_session_claimed_by_two_tabs() {
-        let tabs = [
-            cand("claude", Some("dup"), "C:/a"),
-            cand("claude-local", Some("dup"), "C:/b"),
-        ];
-        assert_eq!(resolve_permission_tab(&tabs, "dup", "", ""), None);
-    }
-
-    /// H1 (2026-08-05 review): two RUNNING Claude tabs on one project make every
-    /// tab-keyed identity claim unprovable, so `live_claude_sessions` (the sole
-    /// source of `session_id` here) hands both candidates `None` — see
-    /// `graph::service::live_claude_tab_sessions`. This pins the resulting
-    /// contract on THIS side of the seam: refuse, never guess.
-    #[test]
-    fn tab_mapping_refuses_when_the_registry_withholds_ambiguous_bindings() {
-        // Both same-root tabs, session bindings withheld at the registry.
-        let tabs = [
-            cand("claude", None, "C:/proj"),
-            cand("claude-local", None, "C:/proj"),
-        ];
-        // The hook payload names a real live session — but nothing claims it.
-        assert_eq!(resolve_permission_tab(&tabs, "sess-b", "", "C:/proj"), None);
-        assert_eq!(
-            resolve_permission_tab(
-                &tabs,
-                "",
-                "C:/Users/x/.claude/projects/slug/sess-b.jsonl",
-                "C:/proj"
-            ),
-            None
-        );
-        // ...and the cwd fallback declines too: the shared root is, by
-        // construction, shared by ≥2 tabs.
-        assert_eq!(resolve_permission_tab(&tabs, "", "", "C:/proj"), None);
-        // A single running tab per root keeps its binding and still resolves.
-        let solo = [
-            cand("claude", Some("sess-a"), "C:/proj"),
-            cand("ai-2", None, "C:/other"),
-        ];
-        assert_eq!(
-            resolve_permission_tab(&solo, "sess-a", "", ""),
-            Some("claude".to_string())
-        );
-    }
-
-    #[test]
-    fn permission_event_body_tolerates_a_minimal_payload() {
-        // Only the event name — every other field defaults, so a drifted
-        // payload still deserializes and is simply unmappable (dropped).
-        let body: PermissionEventBody =
-            serde_json::from_value(serde_json::json!({ "event": "Notification" }))
-                .expect("minimal body deserializes");
-        assert_eq!(body.event, "Notification");
-        assert!(body.session_id.is_none() && body.cwd.is_none());
-    }
-
     // ── V24 Phase F: OpenCode usage-event arm ──────────────────────────────
 
     fn usage_body(json: serde_json::Value) -> MemoryEventBody {
@@ -10818,7 +10004,7 @@ mod tests {
             "in_tok": 100, "out_tok": 40, "cache_read": 20, "cache_make": 5,
         }));
         let (target, event) =
-            usage_event_from_body(&body).expect("well-formed body yields an event");
+            usage_event_from_body(&body, "opencode").expect("well-formed body yields an event");
         assert_eq!(target, "ses_main");
         match &event {
             crate::graph::UsageEvent::Turn {
@@ -10836,7 +10022,7 @@ mod tests {
                     (*in_tok, *out_tok, *cache_read, *cache_make),
                     (100, 40, 20, 5)
                 );
-                assert_eq!(*origin, crate::graph::UsageOrigin::Session);
+                assert_eq!(origin, "session");
             }
             _ => panic!("expected a Turn event"),
         }
@@ -10849,8 +10035,8 @@ mod tests {
         let series = idx.usage_turn_series("ses_main").unwrap();
         assert_eq!(series.len(), 1);
         assert_eq!(series[0].msg_id, "msg_1");
-        assert_eq!(series[0].origin, crate::graph::UsageOrigin::Session);
-        assert_eq!(series[0].in_tok, 100);
+        assert_eq!(series[0].origin, "session");
+        assert_eq!(series[0].tokens.get("input"), Some(100));
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -10864,11 +10050,12 @@ mod tests {
             "msg_id": "msg_a", "model": "qwen3-coder",
             "in_tok": 7, "out_tok": 3, "cache_read": 0, "cache_make": 0,
         }));
-        let (target, event) = usage_event_from_body(&body).expect("child body yields an event");
+        let (target, event) =
+            usage_event_from_body(&body, "opencode").expect("child body yields an event");
         assert_eq!(target, "ses_parent", "spend rolls up to the parent");
         match &event {
             crate::graph::UsageEvent::Turn { origin, .. } => {
-                assert_eq!(*origin, crate::graph::UsageOrigin::Agent);
+                assert_eq!(origin, "agent");
             }
             _ => panic!("expected a Turn event"),
         }
@@ -10881,7 +10068,7 @@ mod tests {
         assert_eq!(idx.usage_turn_series("ses_parent").unwrap().len(), 1);
         assert!(idx.usage_turn_series("ses_child").unwrap().is_empty());
         let series = idx.usage_turn_series("ses_parent").unwrap();
-        assert_eq!(series[0].origin, crate::graph::UsageOrigin::Agent);
+        assert_eq!(series[0].origin, "agent");
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -10892,18 +10079,18 @@ mod tests {
         let no_msg = usage_body(serde_json::json!({
             "kind": "usage", "session_id": "s", "in_tok": 10,
         }));
-        assert!(usage_event_from_body(&no_msg).is_none());
+        assert!(usage_event_from_body(&no_msg, "opencode").is_none());
         // Empty msg_id → no event.
         let empty_msg = usage_body(serde_json::json!({
             "kind": "usage", "session_id": "s", "msg_id": "", "in_tok": 10,
         }));
-        assert!(usage_event_from_body(&empty_msg).is_none());
+        assert!(usage_event_from_body(&empty_msg, "opencode").is_none());
         // All-zero token totals (degenerate/creation emit) → skipped.
         let all_zero = usage_body(serde_json::json!({
             "kind": "usage", "session_id": "s", "msg_id": "m",
             "in_tok": 0, "out_tok": 0, "cache_read": 0, "cache_make": 0,
         }));
-        assert!(usage_event_from_body(&all_zero).is_none());
+        assert!(usage_event_from_body(&all_zero, "opencode").is_none());
     }
 
     #[test]
@@ -10919,13 +10106,13 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("cimp-usage-dup-{}", uuid::Uuid::new_v4()));
         let idx = crate::graph::GraphIndex::open(&dir, ".ckg").expect("open");
         for out in [10u64, 20u64] {
-            let (target, event) = usage_event_from_body(&mk(out)).expect("event");
+            let (target, event) = usage_event_from_body(&mk(out), "opencode").expect("event");
             idx.record_usage_event(&target, "opencode", &event, 100)
                 .unwrap();
         }
         let series = idx.usage_turn_series("ses").unwrap();
         assert_eq!(series.len(), 1, "duplicate msg_id upserts, not appends");
-        assert_eq!(series[0].out_tok, 20, "last emit wins");
+        assert_eq!(series[0].tokens.get("output"), Some(20), "last emit wins");
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -11665,7 +10852,7 @@ mod tests {
         // else shares one; and no input of any kind can key anything else,
         // because the key type is `&'static str` from `DRIFT_SHIMS`.
         let mut all = drift_ledger();
-        for shim in DRIFT_SHIMS {
+        for shim in crate::harness::ingress::drift_tokens() {
             let body = drift_body(shim, &["cwd"], None);
             assert!(contract_drift_row(&body, |k| drift_claim_in(&mut all, k)).is_some());
         }
@@ -11675,13 +10862,14 @@ mod tests {
         }
         assert_eq!(
             all.len(),
-            DRIFT_SHIMS.len() + 1,
+            crate::harness::ingress::drift_tokens().len() + 1,
             "the key space is the shim list plus one sentinel: {:?}",
             all.keys().collect::<Vec<_>>()
         );
         for key in all.keys() {
             assert!(
-                DRIFT_SHIMS.contains(key) || *key == DRIFT_SHIM_UNKNOWN,
+                crate::harness::ingress::drift_tokens().contains(key)
+                    || *key == DRIFT_SHIM_UNKNOWN,
                 "a caller-supplied string reached the ledger's key space: {key}"
             );
         }
@@ -11775,94 +10963,6 @@ mod tests {
         assert_eq!(empty.entry.session.as_deref(), Some(""));
     }
 
-    /// The shim names in [`DRIFT_SHIMS`] are the ones the shims actually send.
-    ///
-    /// A typo would not break anything loudly — the misspelt entry would simply
-    /// never be claimed and its shim would share the sentinel — which is exactly
-    /// why it needs a tripwire rather than a reader's attention.
-    ///
-    /// **What this would still pass if the implementation were wrong:** a NEW
-    /// reporter using an unlisted name. That case degrades safely (it shares the
-    /// sentinel bucket, so it gets fewer rows, never more) and cannot be
-    /// enumerated from here without scanning the source tree at test time.
-    /// **It happened**: `checkpoint_beacon` shipped with V33 Phase F reporting
-    /// drift under its own name and no entry in the list, which is why the
-    /// length assertion below names the failure it is guarding rather than just
-    /// pinning a number.
-    ///
-    /// **V35 Phase J changed the sources, not the names.** Four of the six
-    /// reporters are no longer binaries: `context_hook`, `compact_hook`,
-    /// `read_hook` and `notify_hook` are `type: "http"` routes whose payload
-    /// checks run in-process (`harness::claude_hook`), and their tokens are
-    /// deliberately unchanged — a pre-upgrade tab is still running the old shim
-    /// and still POSTs these exact strings, so both paths land in ONE bucket per
-    /// capability. The scan therefore points at the module that sends them now.
-    #[test]
-    fn the_drift_shim_list_is_spelled_the_way_the_shims_spell_it() {
-        const CLAUDE_HOOK: &str = include_str!("../harness/claude/hook.rs");
-        for (shim, src) in [
-            // 2026-08-17: the last two shim FILES are gone, so every reporter is
-            // now defined in the one module and the route join below is what
-            // proves each name is actually reachable. The two beacon tokens are
-            // unchanged, so a pre-upgrade tab's own binary still lands here.
-            ("checkpoint_beacon", CLAUDE_HOOK),
-            ("compact_hook", CLAUDE_HOOK),
-            ("context_hook", CLAUDE_HOOK),
-            ("notify_hook", CLAUDE_HOOK),
-            ("post_edit_hook", CLAUDE_HOOK),
-            ("read_hook", CLAUDE_HOOK),
-            ("taint_beacon", CLAUDE_HOOK),
-            // V35 Phase L's three. They name no binary either.
-            ("stop_hook", CLAUDE_HOOK),
-            ("subagent_hook", CLAUDE_HOOK),
-            ("tool_result_hook", CLAUDE_HOOK),
-        ] {
-            assert!(
-                DRIFT_SHIMS.contains(&shim),
-                "{shim} reports drift and has no counter"
-            );
-            assert!(
-                src.contains(&format!("\"{shim}\"")),
-                "{shim} is not the name that module sends"
-            );
-            // …and the four converted ones resolve through the route table, so a
-            // renamed token cannot quietly split a capability's reports in two.
-            if src == CLAUDE_HOOK {
-                assert!(
-                    claude_hook::ROUTES
-                        .iter()
-                        .any(|r| claude_hook::drift_token(r) == Some(shim)),
-                    "{shim} is listed but no Claude hook route reports under it"
-                );
-            }
-        }
-        assert_eq!(
-            DRIFT_SHIMS.len(),
-            10,
-            "a new reporter needs BOTH an entry here and its source pinned in the \
-             loop above — otherwise its reports fold into the unrecognized-shim \
-             bucket and nothing fails"
-        );
-        // The never-shipped shim spelling must stay unclaimed: `postedit_hook` is
-        // the name the deleted `--postedit-hook` binary WOULD have reported under
-        // had it ever reported, and nothing can be carrying it.
-        assert!(!DRIFT_SHIMS.contains(&"postedit_hook"));
-        assert_eq!(drift_shim_key("postedit_hook"), DRIFT_SHIM_UNKNOWN);
-        // V35 Phase L: every event whose SILENCE is reportable resolves to a
-        // token in this list. Without this a quiet report would be filed under
-        // the unrecognized-shim bucket, i.e. attributed to nothing.
-        for event in [
-            crate::harness::chp::EV_ASSISTANT_TEXT,
-            crate::harness::chp::EV_SESSION_TOOL_RESULT,
-            crate::harness::chp::EV_SESSION_SUBAGENT,
-        ] {
-            let token = claude_hook::drift_token_for_event(event)
-                .unwrap_or_else(|| panic!("{event} can go quiet but reports under no token"));
-            assert!(DRIFT_SHIMS.contains(&token));
-        }
-        assert!(!DRIFT_SHIMS.contains(&DRIFT_SHIM_UNKNOWN));
-    }
-
     // ── V35 Phase I — CHP: the hello row and the observation seam ────────────
 
     /// A hello writes ONE row, says what the artifact declared, and a
@@ -11899,7 +10999,14 @@ mod tests {
             crate::activity::Attribution::Tab("opencode-1".to_string()),
             "the tab was validated against the configured list before this point"
         );
-        assert!(first.entry.target.contains("chp 1"), "{}", first.entry.target);
+        assert!(
+            first
+                .entry
+                .target
+                .contains(&format!("chp {}", crate::harness::chp::CHP_VERSION)),
+            "{}",
+            first.entry.target
+        );
         assert!(first.entry.target.contains("v1.18.13"), "{}", first.entry.target);
         assert!(first.entry.target.contains("serves 2"), "{}", first.entry.target);
         assert!(first.entry.target.contains("cannot 1"), "{}", first.entry.target);
@@ -11968,12 +11075,17 @@ mod tests {
         assert_eq!(crate::graph::source_for_consumer(env.agent_token()), "claude");
         assert_eq!(tab, "claude-1");
 
-        // …and the body the generated plugin now sends.
-        let (env, _) = crate::harness::chp::envelope(
-            "/latch/beacon",
-            br#"{"chp":1,"tab":"opencode-1","consumer":"opencode","tool":"webfetch"}"#,
-        )
-        .expect("the plugin's beacon body");
+        // …and the body the generated plugin now sends. The literal is built
+        // from `CHP_VERSION` rather than typed, because the point of this arm
+        // is that the observer reads whatever the generator baked in — a
+        // hard-coded number would turn every protocol bump into a red test
+        // about nothing.
+        let body = format!(
+            "{{\"chp\":{},\"tab\":\"opencode-1\",\"consumer\":\"opencode\",\"tool\":\"webfetch\"}}",
+            crate::harness::chp::CHP_VERSION
+        );
+        let (env, _) = crate::harness::chp::envelope("/latch/beacon", body.as_bytes())
+            .expect("the plugin's beacon body");
         assert_eq!(env.chp, Some(crate::harness::chp::CHP_VERSION));
         assert_eq!(
             crate::graph::source_for_consumer(env.agent_token()),
@@ -12003,6 +11115,9 @@ mod tests {
                     | "/session/assistant_text"
                     | "/session/tool_result"
                     | "/session/subagent"
+                    | "/session/output_started"
+                    | "/session/output_stopped"
+                    | "/session/subagents_active"
             );
             assert_eq!(
                 observed, expected,
@@ -12511,7 +11626,13 @@ mod tests {
     /// through it.
     #[test]
     fn a_contaminated_tab_is_refused_a_delegation_and_a_clean_one_is_not() {
-        let s = scope("claude-deleg", Some("ses"));
+        // Opaque inputs: `delegate_admit` never looks at either string -- the
+        // scoping closure below is stubbed, so the tab id is a key and the
+        // consumer is passed straight through. V39 wrote a real harness id and
+        // a `claude-`prefixed tab here, which read as if the gate knew what a
+        // harness was (V40 Phase G, locked decision 28).
+        const WORKER_TAB: &str = "worker-deleg";
+        let s = scope(WORKER_TAB, Some("ses"));
         // `LatchScope` is not `Clone`, so the closure rebuilds the same scope
         // rather than capturing one — the scope KEY is what the registry joins
         // on, and building it twice from the same inputs is the honest way to
@@ -12520,9 +11641,9 @@ mod tests {
             delegate_admit(
                 reg,
                 DELEGATE_TOOL,
-                "claude",
-                Some("claude-deleg"),
-                |_, _| LatchScoping::Scoped(scope("claude-deleg", Some("ses"))),
+                crate::harness::DEFAULT_HARNESS.token(),
+                Some(WORKER_TAB),
+                |_, _| LatchScoping::Scoped(scope(WORKER_TAB, Some("ses"))),
                 |_| ON,
             )
         };
@@ -13280,7 +12401,7 @@ mod tests {
             assert!(reg.snapshot().is_empty(), "{bad}");
         }
         // The set itself, and the two spellings the spawn paths actually send.
-        assert_eq!(AUDIT_CONSUMERS, ["claude", "opencode"]);
+        assert_eq!(audit_consumers(), crate::harness::registry::harness_ids());
         assert_eq!(audit_consumer(None), Ok("claude"));
         assert_eq!(audit_consumer(Some("")), Ok("claude"));
         assert_eq!(audit_consumer(Some("  ")), Ok("claude"));
@@ -13289,7 +12410,7 @@ mod tests {
         // …and the value that reaches `consumer_exposed` is one of those two
         // literals, never the caller's string, so no `expose_*` toggle outside
         // the pair is reachable over HTTP.
-        for c in AUDIT_CONSUMERS {
+        for c in audit_consumers() {
             assert_eq!(audit_consumer(Some(c)), Ok(c));
         }
     }
@@ -13726,11 +12847,11 @@ mod tests {
         // Stated rather than assumed: this L2 shipped `false` under locked
         // decision 17 and ships `true` since V39, and the properties below are
         // about the transitions, not about the shipping value.
-        s.set_l2_for_test(Feature::OpencodeNativeGate, false);
+        s.set_l2_for_test(Feature::HarnessNativeGate, false);
         assert!(!native_gate_verdict(&s, scope.injection()));
 
         // The app-wide L2.
-        s.set_l2_for_test(Feature::OpencodeNativeGate, true);
+        s.set_l2_for_test(Feature::HarnessNativeGate, true);
         assert!(native_gate_verdict(&s, scope.injection()));
 
         // The taint latch is what this gate enforces — with that feature off
@@ -13741,8 +12862,8 @@ mod tests {
         s.set_l2_for_test(Feature::TaintLatch, true);
 
         // The usual way in: L2 off app-wide, one tab's L3 `On`.
-        s.set_l2_for_test(Feature::OpencodeNativeGate, false);
-        s.set_tab_override_for_test(&id, Feature::OpencodeNativeGate, Override::On)
+        s.set_l2_for_test(Feature::HarnessNativeGate, false);
+        s.set_tab_override_for_test(&id, Feature::HarnessNativeGate, Override::On)
             .expect("the OpenCode tab carries a native-gate cell");
         assert!(
             native_gate_verdict(&s, scope.injection()),
@@ -13792,12 +12913,12 @@ mod tests {
         // Off app-wide ⇒ off for a stale id. (The regression was invisible in
         // this direction, which is why #45 shipped.) The `off` is written here
         // rather than inherited from a default: V39 ships this L2 on.
-        s.set_l2_for_test(Feature::OpencodeNativeGate, false);
+        s.set_l2_for_test(Feature::HarnessNativeGate, false);
         assert!(!native_gate_verdict(&s, stale.injection()));
 
         // ON app-wide ⇒ ON for a stale id. This is the assertion that fails if
         // the hard-off comes back.
-        s.set_l2_for_test(Feature::OpencodeNativeGate, true);
+        s.set_l2_for_test(Feature::HarnessNativeGate, true);
         assert!(
             native_gate_verdict(&s, stale.injection()),
             "a stale tab id must inherit the app-wide verdict, not report off"
@@ -15654,12 +14775,23 @@ mod tests {
     /// the prompt tap does, and reads the tool name in the CALLER's
     /// vocabulary.**
     ///
-    /// The vocabulary half is the subtle one. `toolclass::TABLE` is cImp's own
-    /// namespace, where `edit` is an unknown name and `mutates_fs` therefore
-    /// answers `false`; `OPENCODE_NATIVE_TABLE` is the harness's, where `Edit`
-    /// is unknown for the mirror reason. Crossing them would not fail loudly —
-    /// it would silently disable one harness's entire seam while every test that
-    /// only exercised the other stayed green. Both directions are asserted.
+    /// The vocabulary half is the subtle one. `CLAUDE_NATIVE_TABLE` and
+    /// `OPENCODE_NATIVE_TABLE` are two closed sets with no member in common:
+    /// `edit` is unknown in the first and `Edit` in the second. Crossing them
+    /// would not fail loudly — it would silently disable one harness's entire
+    /// seam while every test that only exercised the other stayed green. Both
+    /// directions are asserted.
+    ///
+    /// **V40 Phase A changed what "unknown" answers here, and this is the one
+    /// behaviour change locked decision 16 makes.** The lookup used to be a
+    /// `match` with `"opencode"` in one arm and Claude's table in the `_` arm,
+    /// so an id the addressed harness does not declare — and an id from a
+    /// harness cImp has never heard of — answered `false`: *no checkpoint*. It
+    /// now answers `true`. The asymmetry is the argument: a checkpoint nobody
+    /// needed is one commit into cImp's own shadow repo, while a missed one is a
+    /// destructive tool call with no way back, and "not in Claude's table,
+    /// therefore safe" is exactly what made a third harness's whole mutation
+    /// surface invisible. The rows below that flipped are marked.
     #[test]
     fn the_tool_checkpoint_route_narrows_the_tab_and_reads_the_right_vocabulary() {
         let s = settings_with_tabs(&["claude", "claude-2"]);
@@ -15681,20 +14813,75 @@ mod tests {
         for tool in ["Edit", "Write", "MultiEdit", "Bash"] {
             assert!(tool_checkpoint_is_mutating("claude", tool), "{tool}");
         }
-        for tool in ["Read", "Grep", "WebFetch", "edit"] {
+        // Declared by Claude and declared NON-mutating — the answer that keeps a
+        // read or a web fetch from minting a checkpoint. It is a declaration,
+        // not a default: that is the whole difference from the row below.
+        for tool in ["Read", "Grep", "WebFetch"] {
             assert!(!tool_checkpoint_is_mutating("claude", tool), "{tool}");
         }
         // …and OpenCode's lowercase ids, which are a DIFFERENT table.
         for tool in ["edit", "write", "patch", "apply_patch", "bash"] {
             assert!(tool_checkpoint_is_mutating("opencode", tool), "{tool}");
         }
-        for tool in ["read", "grep", "glob", "webfetch", "task", "Edit"] {
+        for tool in ["read", "grep", "glob", "webfetch"] {
             assert!(!tool_checkpoint_is_mutating("opencode", tool), "{tool}");
         }
-        // An unrecognised harness normalises to Claude (`hook_agent`'s own
-        // default), so it reads Claude's table rather than nothing at all.
+        // **The V40 flip.** A name the addressed harness does not declare now
+        // fails CLOSED. `edit` is OpenCode's id and Claude does not serve it;
+        // `Edit` is Claude's and OpenCode does not; `task` is an OpenCode id
+        // cImp reviewed and deliberately left ungated, so it has no row either.
+        // All three used to answer `false` out of whichever table the `match`
+        // happened to reach.
+        assert!(tool_checkpoint_is_mutating("claude", "edit"));
+        assert!(tool_checkpoint_is_mutating("opencode", "Edit"));
+        assert!(tool_checkpoint_is_mutating("opencode", "task"));
+        // A harness with no `agent` on the wire is Claude (`hook_agent`'s
+        // documented pre-CHP default), so it reads Claude's table.
         assert!(tool_checkpoint_is_mutating(hook_agent(None), "Bash"));
+        // An unrecognised token resolves to no harness at all — and reads no
+        // harness's table. Before Phase A it fell through to Claude's; before
+        // this change, falling through to Claude's is what made it answer at
+        // all. Now it fails closed, for `Bash` and for anything else.
         assert!(tool_checkpoint_is_mutating(hook_agent(Some("nonsense")), "Bash"));
+        assert!(tool_checkpoint_is_mutating(hook_agent(Some("nonsense")), "Read"));
+    }
+
+    /// **An unidentified source is REFUSED at the checkpoint route, not treated
+    /// as mutating** (V40 review finding M-6, parity lens).
+    ///
+    /// `mutates_fs` fails closed for a harness with no vocabulary, which is the
+    /// right answer to "is this NAME mutating" and the wrong answer to "may this
+    /// CALLER mint a checkpoint": it made every tool name from a forged POST
+    /// mutating, and each one staged a snapshot attributed to
+    /// `unknown:<whatever>`. Bounded by the throttle and the tree-sha dedup, but
+    /// a checkpoint is the record a restore is judged against, and the route's
+    /// own doc claimed a POST naming a harness cImp does not know could not get
+    /// through it.
+    #[test]
+    fn an_unidentified_checkpoint_source_is_refused() {
+        // Every registered harness is admitted, under its own token.
+        for h in crate::harness::registry::all() {
+            let id = h.id().expect("registered");
+            assert_eq!(checkpoint_source_admits(Some(id)).as_deref(), Ok(id));
+        }
+        // ABSENT is the pre-CHP shim, and still resolves to the wire default.
+        assert_eq!(
+            checkpoint_source_admits(None).as_deref(),
+            Ok(crate::harness::DEFAULT_HARNESS.token())
+        );
+        assert!(checkpoint_source_admits(Some("")).is_ok(), "empty is absent (M-4)");
+
+        // …and everything else is refused, with the registered list in the
+        // message. `offload` and `audit` included: they are cImp's own in-app
+        // consumers, neither runs tools in a harness's vocabulary, and neither
+        // has any business staging a pre-tool checkpoint.
+        for token in ["codex", "unknown", "offload", "audit", "claude-code", " claude "] {
+            let err = checkpoint_source_admits(Some(token))
+                .expect_err(&format!("{token:?} must be refused"));
+            for h in crate::harness::registry::all() {
+                assert!(err.contains(h.id().expect("registered")), "{err}");
+            }
+        }
     }
 
     /// **The registry's bound, made real.** `latches()`'s doc claimed the map
@@ -16035,7 +15222,7 @@ mod tests {
     /// 2. **even a confirmed rotation cannot clear `contaminated`**, because the
     ///    file the proof is read from is one the attacker writes.
     ///
-    /// Asserted **through** `oob::claude::LiveSessionGate` rather than beside
+    /// Asserted **through** `harness::claude::read::LiveSessionGate` rather than beside
     /// it, so weakening the gate fails this test.
     #[test]
     fn a_forged_rotation_neither_confirms_a_session_nor_clears_contamination() {
@@ -16126,68 +15313,62 @@ mod tests {
         );
     }
 
-    /// **C-2, token variant.** `/memory/event`'s three `mark_live_session`
-    /// calls key the live-session registry on body-supplied strings, with
-    /// `agent` defaulting to `"opencode"` and no validation — the #45 check is
-    /// on the read side only. One map, two key spaces: the Claude tap keys by
-    /// TAB id, OpenCode's loopback path keys by SESSION id. A POST naming a
-    /// configured tab id therefore repointed that tab's session and flapped the
-    /// latch clear in a loop — and the real tap re-stamping the true id within
-    /// 200 ms produced a *second* rotation, so the race helped the attacker.
+    /// **C-2, token variant — closed by construction since V40 Phase D.**
     ///
-    /// Asserted **through** [`mark_live_session_from_event`] — the function the
-    /// handler's three sites call — by observing whether the registry write
-    /// happens, rather than by calling the predicate beside it. Deleting the
-    /// check from that function fails this test.
+    /// `/memory/event`'s three registry writes key on body-supplied strings,
+    /// with `agent` defaulting and no validation. That used to matter because
+    /// the live-session registry was ONE map holding two key spaces: a
+    /// tab-keyed harness's reader wrote the tab id, this route wrote a session
+    /// id. A POST naming a configured tab id therefore repointed that tab's
+    /// session and flapped the latch clear in a loop — and the real tap
+    /// re-stamping the true id within 200 ms produced a *second* rotation, so
+    /// the race helped the attacker. It was closed by refusing any key that
+    /// named a configured tab.
+    ///
+    /// The spaces are separate now (locked decision 20), so the collision
+    /// cannot be expressed and there is no list to keep in step. Asserted
+    /// **through** [`mark_live_session_from_body`] by observing what it would
+    /// write: deleting the key-space decision from that function fails this
+    /// test.
     #[test]
-    fn a_memory_event_cannot_key_the_registry_with_a_tab_id() {
-        let s = settings_with_tabs(&["claude", "opencode-2"]);
-        // Drive the real function; record what it would have written.
-        let written = |settings: &crate::settings::Settings, key: &str| {
-            let mut out: Option<String> = None;
-            mark_live_session_from_event(|k| out = Some(k.to_string()), settings, "opencode", key);
+    fn a_memory_event_can_only_key_the_session_space() {
+        let written = |agent: &str, key: &str| {
+            let mut out: Option<(crate::harness::plugin::SessionKey, String)> = None;
+            mark_live_session_from_body(
+                |space, k| out = Some((space, k.to_string())),
+                agent,
+                key,
+            );
             out
         };
-        for forged in ["claude", "opencode-2"] {
-            assert_eq!(
-                written(&s, forged),
-                None,
-                "{forged:?} names a tab, so /memory/event must not key the registry with it"
-            );
-        }
-        // Every legitimate key still gets through: OpenCode session ids are
-        // UUIDs, and near-misses of a tab id are not tab ids.
-        for real in [
+        // A session-keyed harness writes — including for a string that names a
+        // configured tab, which is now harmless: it lands in the session space,
+        // and every tab-keyed reader looks in the other one.
+        for key in [
             "ses_01JQ8Z2W6R3K4M5N6P7Q8R9S",
             "b3f1c2d4-5e6f-4708-8910-1112131415",
-            "claude-1",
-            "Claude",
-            " claude",
+            "claude",
+            "opencode-2",
             "",
         ] {
-            assert_eq!(written(&s, real), Some(real.to_string()), "{real:?}");
+            assert_eq!(
+                written("opencode", key),
+                Some((crate::harness::plugin::SessionKey::Session, key.to_string())),
+                "{key:?} must key the SESSION space and nothing else"
+            );
         }
-        // The empty-list escape is deliberately NOT inherited: before settings
-        // load, "this string collides with nothing" is the honest answer, and
-        // refusing every key in that window would drop real OpenCode telemetry.
-        let empty = crate::settings::Settings::default();
+        // A tab-keyed harness's live session is bound by cImp's own reader, so
+        // a request body may not claim it at all.
         assert_eq!(
-            written(&empty, "claude"),
-            Some("claude".to_string()),
-            "the availability floor belongs to the latch, not to this route"
+            written("claude", "ses_whatever"),
+            None,
+            "a tab-keyed harness's binding is its reader's, never a POST body's"
         );
-        assert!(
-            is_configured_tab(&empty, "claude", "claude"),
-            "…and the latch's own predicate keeps it"
-        );
+        // An unregistered agent writes nothing — fail closed.
+        assert_eq!(written("not-a-harness", "ses_x"), None);
+        assert_eq!(written("", "ses_x"), None);
     }
 
-    /// **The override's audit row, which had no coverage at all** — every other
-    /// Phase F test calls `apply_override` directly and stops before the row.
-    /// The row is the artifact an incident review reads, so its three
-    /// load-bearing facts are pinned here: the action, the prior latch (because
-    /// "restored full access" from `external` means something very different
-    /// from `local`), and that the override did NOT clear contamination.
     #[test]
     fn an_override_row_records_the_action_the_prior_latch_and_the_surviving_taint() {
         let reg = LatchRegistry::default();
@@ -17110,7 +16291,7 @@ mod tests {
     /// user, one not. The armed tab clears; the unarmed one does not. If step 4
     /// silently reverted H-2, the second half fails.
     ///
-    /// The rotation is driven **through** `oob::claude::LiveSessionGate` rather
+    /// The rotation is driven **through** `harness::claude::read::LiveSessionGate` rather
     /// than beside it, so a build that weakened the decode proof (H-2's own
     /// guard) fails here too rather than quietly clearing on a forged file.
     #[test]
@@ -17879,6 +17060,30 @@ mod tests {
             Containment::NoRegistry("receives one tool result's SIZE; returns nothing"),
         ),
         route(
+            "/session/output_started",
+            "POST",
+            "handle_harness_output",
+            Containment::NoRegistry(
+                "receives a turn boundary; returns nothing and grants no capability — the tab \
+                 must have declared the event in its hello for it to reach the avatar at all",
+            ),
+        ),
+        route(
+            "/session/output_stopped",
+            "POST",
+            "handle_harness_output",
+            Containment::NoRegistry(
+                "receives a turn boundary; returns nothing and grants no capability — the tab \
+                 must have declared the event in its hello for it to reach the avatar at all",
+            ),
+        ),
+        route(
+            "/session/subagents_active",
+            "POST",
+            "handle_subagents_active",
+            Containment::NoRegistry("receives a sub-agent COUNT edge; returns nothing"),
+        ),
+        route(
             "/session/subagent",
             "POST",
             "handle_session_subagent",
@@ -17998,9 +17203,42 @@ mod tests {
                 routes.push(part.split('"').next().expect("a closing quote"));
             }
         }
+        // V40 Phase C, locked decision 15: core's `match` is no longer the whole
+        // surface — every registered plugin's `routes()` is appended after it.
+        // A route this listener serves is a route this listener serves,
+        // whichever file declares it, so the containment enumeration has to see
+        // all of them or a plugin could add an ungated door by declaring it.
+        for h in crate::harness::registry::all() {
+            let Some(p) = h.plugin() else { continue };
+            routes.extend(p.routes().iter().map(|r| r.path));
+        }
         routes.sort_unstable();
         routes.dedup();
         routes
+    }
+
+    /// The `pub const NAME: &str = "<path>";` a plugin source declares for
+    /// `path`, by name.
+    ///
+    /// The join that lets the containment enumeration check a plugin's route
+    /// table without restating its constants: the table is written in terms of
+    /// the constants, the enumeration in terms of the paths, and this is what
+    /// pins the two spellings equal.
+    fn route_const_named(src: &str, path: &str) -> Option<String> {
+        let needle = format!(": &str = \"{path}\";");
+        src.lines().find_map(|l| {
+            let l = l.trim();
+            let rest = l.strip_prefix("pub const ")?;
+            let (name, tail) = rest.split_once(':')?;
+            (format!(":{tail}") == needle).then(|| name.trim().to_string())
+        })
+    }
+
+    /// Whether `path` is served by a plugin rather than by core's own `match`.
+    fn is_plugin_route(path: &str) -> bool {
+        crate::harness::registry::all()
+            .filter_map(|h| h.plugin())
+            .any(|p| p.routes().iter().any(|r| r.path == path))
     }
 
     /// The source text of one top-level `async fn`, signature to closing brace,
@@ -18011,7 +17249,22 @@ mod tests {
     /// Starts at the SIGNATURE, so a handler's doc comment is deliberately not
     /// part of it: a route must not be able to claim a gate in prose.
     fn handler_body(src: &str, name: &str) -> String {
+        // V40 Phase C: the twelve `handle_claude_*` bodies and the legacy
+        // `--notify-hook` route live in `harness/claude/hook.rs` now. These
+        // scans are about the PROPERTY (one core per capability, the gate in
+        // the route's own body), which the move did not change — so the scanner
+        // follows the code rather than the tests being deleted with it.
+        let src = if fn_body_exists(src, name) { src } else { HOOK_SRC };
         fn_body(src, &format!("async fn {name}("))
+    }
+
+    /// Whether `src` declares a top-level `async fn name(` at all — the lookup
+    /// [`handler_body`] uses to pick the file, kept separate so a genuinely
+    /// missing handler still fails loudly in `fn_body`.
+    fn fn_body_exists(src: &str, name: &str) -> bool {
+        let sig = format!("async fn {name}(");
+        src.lines()
+            .any(|l| l.starts_with(&sig) || l.starts_with(&format!("pub(crate) {sig}")))
     }
 
     /// [`handler_body`] for any top-level item, given its exact opening text —
@@ -18022,7 +17275,11 @@ mod tests {
         let mut inside = false;
         for line in src.lines() {
             if !inside {
-                if !line.starts_with(sig) {
+                // V40 Phase C: a moved item is often `pub(crate)` now, because
+                // its one remaining caller is the plugin that used to sit
+                // beside it. The item is still top-level, which is the property
+                // the column-0 `}` terminator depends on.
+                if !line.starts_with(sig) && !line.starts_with(&format!("pub(crate) {sig}")) {
                     continue;
                 }
                 inside = true;
@@ -18074,18 +17331,36 @@ mod tests {
         );
 
         for row in ROUTE_CONTAINMENT {
-            // The declared handler really is the one the dispatch routes to.
-            let arm = format!("(\"{}\", \"{}\") =>", row.method, row.path);
-            let arm_at = src
-                .find(&arm)
-                .unwrap_or_else(|| panic!("no dispatch arm for {}", row.path));
-            if !row.handler.is_empty() {
+            // The declared handler really is the one the route is served by.
+            // For core's own arms that is the dispatch `match`; for a plugin
+            // route it is the `route!` entry in the plugin's table, resolved
+            // through the path constant so the two spellings cannot part.
+            if is_plugin_route(row.path) {
+                let konst = route_const_named(HOOK_SRC, row.path).unwrap_or_else(|| {
+                    panic!("{} is served by a plugin but named by no constant", row.path)
+                });
                 assert!(
-                    src[arm_at..].starts_with(&format!("{arm} {}(", row.handler)),
-                    "{} does not dispatch to `{}`",
+                    HOOK_SRC.contains(&format!(
+                        "route!(\"{}\", {konst}, {})",
+                        row.method, row.handler
+                    )),
+                    "{} does not register `{}` in the plugin's route table",
                     row.path,
                     row.handler
                 );
+            } else {
+                let arm = format!("(\"{}\", \"{}\") =>", row.method, row.path);
+                let arm_at = src
+                    .find(&arm)
+                    .unwrap_or_else(|| panic!("no dispatch arm for {}", row.path));
+                if !row.handler.is_empty() {
+                    assert!(
+                        src[arm_at..].starts_with(&format!("{arm} {}(", row.handler)),
+                        "{} does not dispatch to `{}`",
+                        row.path,
+                        row.handler
+                    );
+                }
             }
             // The two inline arms have no handler to scan; nothing behind them
             // can gate, which is why they are the only rows allowed to omit one.
@@ -18098,8 +17373,18 @@ mod tests {
                 continue;
             }
             let body = handler_body(src, row.handler);
-            let reaches_registry = body.contains("latches()");
+            // V40 Phase C: a plugin route reaches the registry through the
+            // narrow facades (`hook_gate_admits`, `latch_beacon_for`), because
+            // `LatchRegistry` is private to this module and a harness may not
+            // hold it. Same funnels, one indirection further out.
+            let reaches_registry = body.contains("latches()")
+                || body.contains("hook_gate_admits(")
+                || body.contains("latch_beacon_for(");
             let gates = body.contains("latches().gate(")
+                // V40 Phase C: a plugin route cannot hold `LatchRegistry` (it is
+                // private to this module), so its gate call is the narrow
+                // facade. Same funnel, same decision, same ledger.
+                || body.contains("if !hook_gate_admits(")
                 || body.contains("hook_admit(\n        latches(),")
                 || body.contains("audit_admit(\n        latches(),")
                 // V39 Phase B: `/delegate`'s own admit funnel, same shape and same
@@ -18663,7 +17948,7 @@ mod tests {
         let reqst =
             claude_hook::plan_request(input.tool_name.as_deref(), &input.tool_input, &input.cwd)
                 .expect("a Read is a read request");
-        let body = should_read_body_from_hook(&input, &reqst, None, cwd);
+        let body = claude_hook::should_read_body_from_hook(&input, &reqst, None, cwd);
         assert_eq!(body.tab, None, "a sub-agent hook names no tab");
 
         let resolved = resolve_external_root(None, body.cwd.as_deref(), ".cimp")
@@ -18716,16 +18001,84 @@ mod tests {
         assert_eq!(hook_agent(Some("claude")), "claude");
         assert_eq!(hook_agent(Some("opencode")), "opencode");
         assert_eq!(hook_agent(Some("OpenCode")), "opencode");
-        // Anything invented lands on `claude` rather than inventing an agent —
-        // `source_for_consumer`'s locked behaviour, shared verbatim with
-        // `/graph_run`'s `consumer`. Padding is NOT trimmed (that narrowing
-        // lives in `audit_consumer`, whose route requires identity); no shim
-        // sends any, and trimming would buy nothing here because `agent` is
-        // caller-asserted either way — F-4 still holds, the (agent, tab) pair
-        // is verified on no route, and this fix neither relies on it nor makes
-        // it worse.
-        assert_eq!(hook_agent(Some("offload")), "claude");
-        assert_eq!(hook_agent(Some(" opencode ")), "claude");
+        // cImp's own in-app consumer keeps its own name — it is a real source
+        // in the activity feed, not an invented one.
+        assert_eq!(hook_agent(Some("offload")), "offload");
+        // **V40 Phase A: anything INVENTED is `unknown`, not `claude`.** It used
+        // to fall through to Claude, so a forged or hand-run caller asserting
+        // any token at all got Claude's activity badge and Claude's memory
+        // scope — a misattribution in the view whose whole job is attribution.
+        // `agent` is caller-asserted either way (F-4 still holds; the (agent,
+        // tab) pair is verified on no route), so this is about honesty of the
+        // row, and `unknown` scopes to no sessions rather than to another
+        // agent's.
+        assert_eq!(hook_agent(Some("codex")), crate::graph::UNKNOWN_SOURCE);
+        // Padding is still NOT trimmed — that narrowing lives in
+        // `audit_consumer`, whose route requires identity. No shim sends any.
+        assert_eq!(
+            hook_agent(Some(" opencode ")),
+            crate::graph::UNKNOWN_SOURCE
+        );
+        // **V40 review M-4: EMPTY is ABSENT, not unknown.** Both identity
+        // readers answer `""` rather than `None` for a body with no
+        // discriminator — `identity_of_request` is `unwrap_or_default()`,
+        // `chp::Envelope::agent_token` is `unwrap_or("")` — so an artifact from
+        // before the field existed arrives as `Some("")`. On develop
+        // `source_for_consumer("")` was `"claude"` and this never mattered;
+        // resolving it to `unknown` switched CHP stale-artifact recording and
+        // the quiet-hook detector off for exactly the pre-upgrade artifacts they
+        // exist to catch.
+        assert_eq!(hook_agent(Some("")), "claude");
+        assert_eq!(hook_agent(Some("   ")), "claude");
+    }
+
+    /// The same rule on the two routes whose identity-less default is the
+    /// ROUTE's rather than the app's, and on the CHP observer that reads the
+    /// same bytes (V40 review M-4).
+    ///
+    /// The disagreement this closes: on `/memory/event` an identity-less body
+    /// was `opencode` to the handler and `unknown` to the observer, on ONE
+    /// request. Both go through `wire_agent` now.
+    #[test]
+    fn an_identity_less_body_resolves_to_its_routes_declared_default() {
+        for route in [MEMORY_EVENT_ROUTE, LATCH_STATE_ROUTE] {
+            let declared = crate::harness::ingress::wire_default(route).token();
+            assert_eq!(wire_agent(route, None), declared, "{route}");
+            assert_eq!(wire_agent(route, Some("")), declared, "{route}: empty");
+            assert_eq!(wire_agent(route, Some(" ")), declared, "{route}: blank");
+        }
+        // A route nobody claims takes the app default…
+        assert_eq!(wire_agent("/context/compaction", Some("")), "claude");
+        // …and a token with content is still resolved, or refused, on its own
+        // merits: V40's `unknown` narrowing is not what this funnel is about.
+        assert_eq!(wire_agent(MEMORY_EVENT_ROUTE, Some("claude")), "claude");
+        assert_eq!(
+            wire_agent(MEMORY_EVENT_ROUTE, Some("codex")),
+            crate::graph::UNKNOWN_SOURCE
+        );
+
+        // The actual pre-upgrade artifact, end to end: a `/context/compaction`
+        // body with a tab and a session and NO `agent`. Both identity readers
+        // hand `note_chp` an empty token, and it has to land on a real harness
+        // or the tab's stale-artifact report and quiet-hook detection are off.
+        let body = br#"{"tab":"claude","session_id":"s","chp":1}"#;
+        let (env, tab) = crate::harness::chp::envelope("/context/compaction", body)
+            .expect("a body with a tab is observable");
+        assert_eq!(env.agent_token(), "", "precondition: the reader answers empty");
+        assert_eq!(tab, "claude");
+        assert_eq!(
+            wire_agent("/context/compaction", Some(env.agent_token())),
+            "claude"
+        );
+
+        let req = request_for_test("POST", "/claude/hook/pre_compact", Some("claude"), Some(1));
+        let id = crate::harness::ingress::identity_of_request("/claude/hook/pre_compact", &req)
+            .expect("the Claude plugin claims its own hook route");
+        assert_eq!(id.agent, "", "precondition: the reader answers empty");
+        assert_eq!(
+            wire_agent("/claude/hook/pre_compact", Some(id.agent.as_str())),
+            "claude"
+        );
     }
 
     /// All three hook bodies still parse without the two new fields — a shim or
@@ -18760,215 +18113,6 @@ mod tests {
 
     // ── V35 Phase J: the two transports meet at one body ────────────────────
 
-    /// An absolute project root **in the platform's own idiom**, for the hook
-    /// bodies below.
-    ///
-    /// The mapping under test is platform-NEUTRAL, but one branch it crosses is
-    /// not: `claude_hook::plan_request`'s `Bash` arm passes an absolute shell
-    /// path through untouched and joins a relative one against the payload cwd,
-    /// and `Path::is_absolute()` reads `P:\proj\big.rs` as a RELATIVE path off
-    /// Windows. A hard-coded drive-letter literal therefore flips the test onto
-    /// the join branch on Linux and fails there — CI's `tool Bash` failure.
-    /// [`crate::harness::claude::hook`]'s own fixtures are cfg'd for exactly
-    /// this reason; this is the same fact one layer up.
-    #[cfg(windows)]
-    const HOOK_ROOT: &str = "P:\\proj";
-    #[cfg(not(windows))]
-    const HOOK_ROOT: &str = "/proj";
-
-    /// **The convergence assertion.** For the same logical input, the Claude
-    /// `type: "http"` route builds *byte-identically* the CHP body the deleted
-    /// shim used to POST — which is what makes "both paths have the same
-    /// internal effect" a fact rather than a hope, since everything downstream
-    /// of the body is already one shared core per capability.
-    ///
-    /// The expected values are the deleted shims' own `serde_json::json!`
-    /// literals, transcribed. A test that built them from the new mapping would
-    /// assert nothing; these are what `context_hook.rs`, `compact_hook.rs`,
-    /// `read_hook.rs`, `postedit_hook.rs` and `notify_hook.rs` sent on
-    /// `develop` before this phase.
-    ///
-    /// The parse half is the other direction: the same literal, deserialized
-    /// through the route's own body type, must land on the same fields — so a
-    /// pre-upgrade tab's POST and this build's mapping are one body in both
-    /// senses.
-    #[test]
-    fn a_claude_http_hook_builds_the_body_its_shim_used_to_post() {
-        let tab = || Some("claude-1".to_string());
-        let cwd = || Some(HOOK_ROOT.to_string());
-        // Built with `join` so the separator is the platform's own, and reused
-        // as both the payload value and the expected value — the mapping must
-        // carry a path through byte-for-byte on either platform.
-        let big = Path::new(HOOK_ROOT)
-            .join("big.rs")
-            .to_string_lossy()
-            .into_owned();
-        let edited = Path::new(HOOK_ROOT)
-            .join("a.rs")
-            .to_string_lossy()
-            .into_owned();
-
-        // ── UserPromptSubmit / context_hook ──────────────────────────────
-        let input: claude_hook::HookInput = serde_json::from_value(serde_json::json!({
-            "hook_event_name": "UserPromptSubmit",
-            "session_id": "sess-a",
-            "cwd": HOOK_ROOT,
-            "prompt": "why is the build slow?",
-        }))
-        .expect("hook input");
-        let mapped = retrieve_body_from_hook(&input, tab(), cwd());
-        let shim: ContextRetrieveBody = serde_json::from_value(serde_json::json!({
-            "cwd": HOOK_ROOT,
-            "prompt": "why is the build slow?",
-            "session_id": "sess-a",
-            "agent": "claude",
-            "tab": "claude-1",
-        }))
-        .expect("the shim's body");
-        assert_eq!((mapped.cwd, mapped.prompt), (shim.cwd, shim.prompt));
-        assert_eq!(mapped.session_id, shim.session_id);
-        assert_eq!((mapped.agent, mapped.tab), (shim.agent, shim.tab));
-
-        // ── PreCompact / compact_hook ────────────────────────────────────
-        let input: claude_hook::HookInput = serde_json::from_value(serde_json::json!({
-            "hook_event_name": "PreCompact",
-            "session_id": "sess-a",
-            "cwd": HOOK_ROOT,
-            "trigger": "auto",
-        }))
-        .expect("hook input");
-        let mapped = compaction_body_from_hook(&input, tab(), cwd());
-        let shim: ContextCompactionBody = serde_json::from_value(serde_json::json!({
-            "cwd": HOOK_ROOT,
-            "session_id": "sess-a",
-            "trigger": "auto",
-            "agent": "claude",
-            "tab": "claude-1",
-        }))
-        .expect("the shim's body");
-        assert_eq!(mapped.cwd, shim.cwd);
-        assert_eq!(mapped.session_id, shim.session_id);
-        assert_eq!(mapped.trigger, shim.trigger);
-        assert_eq!((mapped.agent, mapped.tab), (shim.agent, shim.tab));
-
-        // ── PreToolUse / read_hook, on BOTH its matchers ─────────────────
-        for (tool_input, want_path, want_offset, want_limit, want_prefix) in [
-            (
-                serde_json::json!({ "file_path": big, "offset": 40, "limit": 80 }),
-                big.as_str(),
-                Some(40u32),
-                Some(80u32),
-                "",
-            ),
-            (
-                serde_json::json!({ "command": format!("cat {big}") }),
-                big.as_str(),
-                None,
-                None,
-                claude_hook::BASH_DENY_PREFIX,
-            ),
-        ] {
-            let tool = if tool_input.get("command").is_some() {
-                "Bash"
-            } else {
-                "Read"
-            };
-            let input: claude_hook::HookInput = serde_json::from_value(serde_json::json!({
-                "hook_event_name": "PreToolUse",
-                "session_id": "sess-a",
-                "cwd": HOOK_ROOT,
-                "tool_name": tool,
-                "tool_input": tool_input,
-            }))
-            .expect("hook input");
-            let plan = claude_hook::plan_request(Some(tool), &input.tool_input, HOOK_ROOT)
-                .expect("a verdict request");
-            assert_eq!(plan.deny_prefix, want_prefix);
-            let mapped = should_read_body_from_hook(&input, &plan, tab(), cwd());
-            let shim: ShouldReadBody = serde_json::from_value(serde_json::json!({
-                "cwd": HOOK_ROOT,
-                "session_id": "sess-a",
-                "file_path": want_path,
-                "offset": want_offset,
-                "limit": want_limit,
-                "agent": "claude",
-                "tab": "claude-1",
-            }))
-            .expect("the shim's body");
-            assert_eq!(mapped.cwd, shim.cwd);
-            assert_eq!(mapped.file_path, shim.file_path, "tool {tool}");
-            assert_eq!((mapped.offset, mapped.limit), (shim.offset, shim.limit));
-            assert_eq!((mapped.agent, mapped.tab), (shim.agent, shim.tab));
-        }
-
-        // ── PostToolUse / postedit_hook ──────────────────────────────────
-        let input: claude_hook::HookInput = serde_json::from_value(serde_json::json!({
-            "hook_event_name": "PostToolUse",
-            "session_id": "sess-a",
-            "cwd": HOOK_ROOT,
-            "tool_name": "Edit",
-            "tool_input": { "file_path": edited },
-        }))
-        .expect("hook input");
-        let mapped = post_edit_body_from_hook(&input, tab(), cwd());
-        let shim: ContextPostEditBody = serde_json::from_value(serde_json::json!({
-            "cwd": HOOK_ROOT,
-            "session_id": "sess-a",
-            "file_path": edited,
-            "tool_name": "Edit",
-            "agent": "claude",
-            "tab": "claude-1",
-        }))
-        .expect("the shim's body");
-        assert_eq!(mapped.cwd, shim.cwd);
-        assert_eq!(mapped.file_path, shim.file_path);
-        assert_eq!((mapped.agent, mapped.tab), (shim.agent, shim.tab));
-
-        // ── Notification / notify_hook, in the NESTED payload shape ──────
-        //
-        // The nested spelling is the one the shim's module doc records as
-        // UNVERIFIED upstream, so it is the shape worth pinning: both spellings
-        // must flatten to the same body.
-        let input: claude_hook::HookInput = serde_json::from_value(serde_json::json!({
-            "hook_event_name": "Notification",
-            "session_id": "sess-a",
-            "cwd": HOOK_ROOT,
-            "transcript_path": "C:/t/sess-a.jsonl",
-            "notification": { "type": "permission_prompt", "message": "needs your permission" },
-        }))
-        .expect("hook input");
-        let mapped = permission_body_from_hook(&input, cwd());
-        let shim: PermissionEventBody = serde_json::from_value(serde_json::json!({
-            "cwd": HOOK_ROOT,
-            "session_id": "sess-a",
-            "transcript_path": "C:/t/sess-a.jsonl",
-            "event": "Notification",
-            "notification_type": "permission_prompt",
-            "message": "needs your permission",
-            "tool_name": "",
-        }))
-        .expect("the shim's body");
-        assert_eq!(mapped.cwd, shim.cwd);
-        assert_eq!(mapped.event, shim.event);
-        assert_eq!(mapped.transcript_path, shim.transcript_path);
-        assert_eq!(mapped.notification_type, shim.notification_type);
-        assert_eq!(mapped.message, shim.message);
-        // …and it carries no identity fields at all, exactly as the shim's did.
-        let raw = serde_json::to_value(serde_json::json!({})).unwrap();
-        assert!(raw.get("agent").is_none() && raw.get("tab").is_none());
-
-        // The classifier reaches the same verdict from both bodies, which is the
-        // effect the two transports have to share.
-        assert_eq!(
-            classify_permission_event(
-                &mapped.event,
-                mapped.notification_type.as_deref().unwrap_or(""),
-                mapped.message.as_deref().unwrap_or("")
-            ),
-            Some(PermissionEdge::Detected)
-        );
-    }
-
     /// Both transports of each capability run through the SAME core function —
     /// scanned from the source, because a shared core that only one side calls
     /// is how two paths silently diverge while every unit test stays green.
@@ -18996,13 +18140,23 @@ mod tests {
                 "permission_signal(",
                 ["handle_permission_event", "handle_claude_notification"],
             ),
+            // V40 Phase C: both permission transports still meet at ONE core,
+            // and that core is now core's — `send_permission_edge`, the neutral
+            // half. The classifier above them is the harness's.
+            (
+                "send_permission_edge(",
+                ["permission_signal", "permission_signal"],
+            ),
             // 2026-08-17: the two migrated beacons. Their cores were extracted
             // from the routes' own handlers in the same change, which is what
             // makes the migration a relocation — the `mutates_fs` re-check, the
             // #45 narrowing, the deadline and the row each engagement writes are
             // one implementation with two envelopes.
             (
-                "latch_beacon_core(",
+                // The plugin route reaches the same core through the narrow
+                // facade `latch_beacon_for`, whose only body is that call — so
+                // scanning for the core's own name would miss it by one hop.
+                "latch_beacon_",
                 ["handle_latch_beacon", "handle_claude_taint_beacon"],
             ),
             (
@@ -19033,7 +18187,7 @@ mod tests {
             "handle_claude_post_tool_use",
         ] {
             assert!(
-                handler_body(src, h).contains("hook_admit(\n        latches(),"),
+                handler_body(src, h).contains("if !hook_gate_admits("),
                 "`{h}` must gate in its own body"
             );
         }
@@ -19057,10 +18211,11 @@ mod tests {
     fn the_checkpoint_hooks_ceiling_sits_above_the_apps_own_budget() {
         let ceiling = Duration::from_secs(claude_hook::TIMEOUT_CHECKPOINT_SECS);
         assert!(
-            ceiling > TOOL_CHECKPOINT_BUDGET,
+            ceiling > tool_checkpoint_budget(),
             "the harness must not stop waiting before the app answers, or an abandoned \
              snapshot and a still-running one become indistinguishable to Claude: \
-             {ceiling:?} vs {TOOL_CHECKPOINT_BUDGET:?}"
+             {ceiling:?} vs {:?}",
+            tool_checkpoint_budget()
         );
         assert_eq!(
             claude_hook::timeout_secs(claude_hook::ROUTE_PRE_TOOL_USE_CHECKPOINT),
@@ -19180,8 +18335,7 @@ mod tests {
     /// an absence has no call to observe.
     #[test]
     fn a_failed_tool_result_is_counted_but_never_reaches_provenance() {
-        let src = include_str!("loopback.rs");
-        let body = handler_body(src, "handle_claude_tool_failure");
+        let body = handler_body(HOOK_SRC, "handle_claude_tool_failure");
         assert!(
             body.contains("tool_result_core("),
             "the failure half must feed the same accounting as the success half"
@@ -19196,40 +18350,12 @@ mod tests {
         // …and what it sizes is the `error` field, through the transcript
         // reader's own sizing function rather than a second implementation.
         assert!(
-            body.contains("claude_hook::tool_result_chars(&input.error)"),
+            body.contains("tool_result_chars(&input.error)"),
             "the error must be sized by the function the reader sizes a failed \
              result's content with, or the two paths report different numbers"
         );
     }
 
-    /// The dispatch arms spell the same paths `claude_hook` exports.
-    ///
-    /// The arms are literals (the route-enumeration test scans this `match` as
-    /// text) while the overlay generator emits the constants, so without this
-    /// the two could part company and every Claude hook would 404 — which,
-    /// being fail-open, would look exactly like a feature quietly switching
-    /// itself off.
-    #[test]
-    fn the_dispatch_arms_spell_the_routes_claude_hook_exports() {
-        let src = include_str!("loopback.rs");
-        let dispatched = dispatched_routes(src);
-        for route in claude_hook::ROUTES {
-            assert!(
-                dispatched.contains(route),
-                "`{route}` is emitted into the overlay but no dispatch arm serves it"
-            );
-        }
-        // The reverse: nothing under the prefix is dispatched that the module
-        // does not declare.
-        for r in &dispatched {
-            if r.starts_with(claude_hook::ROUTE_PREFIX) {
-                assert!(
-                    claude_hook::is_hook_route(r),
-                    "`{r}` is dispatched but is not in `claude_hook::ROUTES`"
-                );
-            }
-        }
-    }
 
     /// The `X-CIMP-*` headers are read under exactly the names the overlay
     /// emits. `read_request` lowercases keys and matches lowercase literals, so
@@ -19469,7 +18595,7 @@ async fn handle_delegate(
     }
 
     let settings = live_settings(app);
-    let agent = crate::graph::source_for_consumer(body.consumer.as_deref().unwrap_or("claude"));
+    let agent = crate::graph::source_for_consumer(body.consumer.as_deref().unwrap_or(crate::harness::DEFAULT_HARNESS.token()));
     // The calling tab must be a CONFIGURED tab of this consumer. An anonymous
     // or unrecognized id is refused rather than fail-open: unlike a latch (where
     // "we do not know who this is" degrades to no containment), delegation has
@@ -19595,7 +18721,7 @@ fn manual_tab_for(settings: &crate::settings::Settings, harness: &str) -> Option
     settings.tabs.iter().find_map(|t| match t {
         crate::settings::TabConfig::AiTool(c)
             if c.delegation_role == crate::settings::DelegationRole::Manual
-                && crate::tabs::tab_consumer(c) == harness =>
+                && crate::tabs::tab_consumer(c) == Some(harness) =>
         {
             Some(c.id.clone())
         }

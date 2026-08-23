@@ -1,11 +1,14 @@
 //! V35 Phase A — the machine-readable harness capability registry.
 //!
 //! One source of truth for everything cImp depends on from a harness it does
-//! not control, replacing the prose table in `docs/MAINTENANCE.md` §
-//! *Claude Code / OpenCode CLIs* as the **authority**. The prose table stays
-//! (it carries the human "how to check" narrative) but is now
-//! generated-checked against this list by
-//! [`tests::matrix_matches_maintenance_doc`], so the two can no longer drift.
+//! not control, and the **authority** over the prose that describes it. Since
+//! V40 Phase G that prose lives with the harness: each registered harness's
+//! rows are its own `harness/<id>/README.md` § *Drift watch*, and only the
+//! harness-NEUTRAL rows stay in `docs/MAINTENANCE.md`. The prose carries the
+//! human "how to check" narrative and is checked against this list, in both
+//! directions and per owner, by [`tests::matrix_matches_maintenance_doc`] — so
+//! a row cannot drift from the registry, name a retired id, or cover two
+//! harnesses at once.
 //!
 //! # Rank by seam, not by feature
 //!
@@ -57,7 +60,7 @@
 //! Phases A–C had none on purpose — the tests below and in
 //! [`crate::harness::canary`] were the consumers. V35 Phase D added the first
 //! real one: [`crate::harness::probe`], reached from `cimp --harness-canary`,
-//! reads [`CAPABILITIES`] to decide what to drive and what to enumerate as
+//! reads [`capabilities`] to decide what to drive and what to enumerate as
 //! `unknown`.
 //!
 //! **Phase E added the other two** (matrix draft § 3, consumers 1 and 2):
@@ -82,75 +85,30 @@ use crate::advisor::{
 };
 use crate::settings::Settings;
 
-/// Which harness serves a capability.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Harness {
-    Claude,
-    OpenCode,
-    /// Harness-neutral — served by whatever adapter is attached.
-    ///
-    /// **Constructed since V39 Phase B**, by exactly one row: `delegation.worker`
-    /// (locked decision 16). Phase A of V35 predicted CHP would produce the
-    /// first neutral row and left this variant under an `#[allow(dead_code)]`;
-    /// what actually produced it is the first capability whose contract is
-    /// *"whatever harness this tab runs, it must serve `assistant_text` and
-    /// accept an input profile"* — a requirement stated about a tab, not about
-    /// a vendor. The `allow` is gone with the prediction.
-    Any,
-}
-
-impl Harness {
-    /// The CHP `agent` discriminator for a concrete harness — the SAME
-    /// two-word vocabulary [`crate::tabs::tab_consumer`] classifies a tab's
-    /// command into, so a tab's id and its rows join without a translation
-    /// table. `None` for [`Harness::Any`], which names no vendor.
-    pub fn id(self) -> Option<&'static str> {
-        match self {
-            Harness::Claude => Some("claude"),
-            Harness::OpenCode => Some("opencode"),
-            Harness::Any => None,
-        }
-    }
-
-    /// What a human (and a generated tool description) calls this harness.
-    ///
-    /// Lives here rather than in a frontend string table because the
-    /// `delegate_task_<id>` descriptions are rendered in Rust, above the seam,
-    /// from the registry — L4 must be able to say "Claude Code" without
-    /// containing the word.
-    pub fn display_name(self) -> &'static str {
-        match self {
-            Harness::Claude => "Claude Code",
-            Harness::OpenCode => "OpenCode",
-            Harness::Any => "any harness",
-        }
-    }
-
-    /// The harness whose CHP agent id is `id`, if any.
-    pub fn from_id(id: &str) -> Option<Harness> {
-        [Harness::Claude, Harness::OpenCode]
-            .into_iter()
-            .find(|h| h.id() == Some(id))
-    }
-}
-
-/// Every concrete harness id the registry has rows for, in declaration order.
+/// Which harness serves a capability — the registry's [`HarnessId`], re-exported
+/// under the name this module has always used for the column.
 ///
-/// **The list `delegate_task_*` is generated from** (locked decision 3): a tool
-/// exists per harness id, so nothing above the seam holds a literal set of
-/// harness names. Derived from [`CAPABILITIES`] rather than from a const array
-/// so a harness that gains rows is delegable by that fact alone.
-pub fn harness_ids() -> Vec<&'static str> {
-    let mut out: Vec<&'static str> = Vec::new();
-    for cap in CAPABILITIES {
-        if let Some(id) = cap.harness.id() {
-            if !out.contains(&id) {
-                out.push(id);
-            }
-        }
-    }
-    out
-}
+/// V40 Phase A folded the enum into the registry (locked decision 3). Its three
+/// variants were three answers to "which harness", and the whole point of the
+/// registry is that there is one; [`Harness::ANY`] survives as the marker for a
+/// row whose contract is stated about a *tab* rather than about a vendor.
+pub use crate::harness::registry::HarnessId as Harness;
+
+/// The declaration-site spellings for the `harness:` column below.
+///
+/// Inside `harness/` naming a harness is the job; what locked decision 10(a)
+/// forbids is core doing it. Checked against the registry by
+/// [`registry::every_declared_id_is_registered`].
+const CLAUDE: Harness = Harness::declared("claude");
+const OPENCODE: Harness = Harness::declared("opencode");
+/// Harness-neutral — served by whatever adapter is attached.
+///
+/// **Constructed since V39 Phase B**, by exactly one row: `delegation.worker`
+/// (locked decision 16). Phase A of V35 predicted CHP would produce the first
+/// neutral row; what actually produced it is the first capability whose contract
+/// is *"whatever harness this tab runs, it must serve `assistant_text` and
+/// accept an input profile"* — a requirement stated about a tab, not a vendor.
+const ANY: Harness = Harness::ANY;
 
 /// The seam a dependency sits in. See the module docs for what each predicts.
 // `A` is unconstructed on purpose: Tier A (MCP) has never broken cImp, so the
@@ -324,13 +282,14 @@ pub const CONTROL_CHECKPOINT_PRE_MUTATION_CLAUDE: &str = "checkpoint.pre_mutatio
 /// join on it and a typo in any of them would silently un-gate a feature: the
 /// registry row's own [`Capability::id`], the two `tabs/config.rs` gate call
 /// sites via [`gate`], and the Settings toggle in `SettingsApp.svelte` (which
-/// mirrors the string as `CAP_PRETOOLUSE_DENY` in `src/lib/settings/types.ts`,
-/// pinned by [`tests::the_gated_capability_ids_reach_the_frontend`]).
+/// since V40 Phase F reads it out of [`GATED_CONTROLS`] over IPC rather than
+/// mirroring the string, so this harness-namespaced id is no longer spelled in
+/// the frontend at all).
 pub const CAP_PRETOOLUSE_DENY: &str = "claude.hook.pretooluse_deny";
 
 /// V39 Phase B, locked decision 16 — **the worker gate**, spelled once.
 ///
-/// The registry's first [`Harness::Any`] row: "this tab's harness serves
+/// The registry's first [`ANY`] row: "this tab's harness serves
 /// `assistant_text` for the session's final message (or has a live fallback
 /// reader) and accepts an [`InputProfile`]". A harness that is not gate-clean
 /// is **not a valid worker** — it gets no `delegate_task_*` tool, its
@@ -338,13 +297,15 @@ pub const CAP_PRETOOLUSE_DENY: &str = "claude.hook.pretooluse_deny";
 /// gate's reason.
 ///
 /// Mirrored to the frontend as `CAP_DELEGATION_WORKER` in
-/// `src/lib/settings/types.ts`, like [`CAP_PRETOOLUSE_DENY`] and pinned by the
-/// same test.
+/// `src/lib/settings/types.ts` — it may be, because the id names no vendor
+/// (locked decision 16's `ANY` row). [`CAP_PRETOOLUSE_DENY`] may not, and
+/// [`tests::the_gated_capability_ids_reach_the_frontend`] enforces the
+/// difference in both directions.
 ///
 /// [`InputProfile`]: crate::harness::InputProfile
 pub const CAP_DELEGATION_WORKER: &str = "delegation.worker";
 
-/// Every control id that is declared somewhere in [`CAPABILITIES`]. Each must
+/// Every control id that is declared somewhere in the registry. Each must
 /// appear exactly once — see [`tests::tcb_controls_are_declared_exactly_once`].
 ///
 /// **A control id names one PLACE enforcement executes, not one concept.** That
@@ -373,12 +334,20 @@ pub const CONTROLS: &[&str] = &[
     CONTROL_CHECKPOINT_PRE_MUTATION_CLAUDE,
 ];
 
-/// The registry. Extracted from the code on `develop`, not invented.
-pub const CAPABILITIES: &[Capability] = &[
+/// The **harness-neutral** half of the registry: every row whose contract is
+/// stated about cImp's own seam or about a tab rather than about one vendor.
+/// Extracted from the code on `develop`, not invented.
+///
+/// Each harness's own rows live with it, behind
+/// [`HarnessPlugin::capabilities`](crate::harness::plugin::HarnessPlugin::capabilities)
+/// (V40 Phase A, locked decision 17). Read the whole registry through
+/// [`capabilities`] — a consumer that iterated this const alone would silently
+/// stop seeing a harness's rows.
+const CORE_CAPABILITIES: &[Capability] = &[
     // ── Claude Code: documented hooks (Tier B) ──────────────────────────────
     Capability {
         id: "claude.hook.user_prompt_submit",
-        harness: Harness::Claude,
+        harness: CLAUDE,
         tier: Seam::B,
         contract: "A `UserPromptSubmit` hook of `type: \"http\"` (Claude Code ≥ 2.1.63, contract \
                    verified unchanged through 2.1.233 on 2026-08-17) POSTs \
@@ -425,7 +394,7 @@ pub const CAPABILITIES: &[Capability] = &[
     },
     Capability {
         id: "claude.hook.precompact",
-        harness: Harness::Claude,
+        harness: CLAUDE,
         tier: Seam::B,
         contract: "A `PreCompact` hook of `type: \"http\"` POSTs `{session_id, trigger, cwd}` and \
                    the `hookSpecificOutput.additionalContext` in its 2xx JSON reply reaches the \
@@ -466,7 +435,7 @@ pub const CAPABILITIES: &[Capability] = &[
     },
     Capability {
         id: CAP_PRETOOLUSE_DENY,
-        harness: Harness::Claude,
+        harness: CLAUDE,
         tier: Seam::B,
         contract: "A `PreToolUse` hook of `type: \"http\"` can deny a tool call by answering 2xx \
                    with `hookSpecificOutput.permissionDecision: \"deny\"`, and the accompanying \
@@ -510,7 +479,7 @@ pub const CAPABILITIES: &[Capability] = &[
     },
     Capability {
         id: "claude.hook.posttooluse",
-        harness: Harness::Claude,
+        harness: CLAUDE,
         tier: Seam::B,
         contract: "A `PostToolUse` hook of `type: \"http\"` fires for `Edit` / `Write` / \
                    `MultiEdit` **on success** with the documented payload (`tool_name`, \
@@ -556,7 +525,7 @@ pub const CAPABILITIES: &[Capability] = &[
     },
     Capability {
         id: "claude.hook.notification",
-        harness: Harness::Claude,
+        harness: CLAUDE,
         tier: Seam::B,
         contract: "`Notification` and `PermissionDenied` hooks of `type: \"http\"` fire (matcher \
                    `\"\"` = all types) with `{hook_event_name, session_id, cwd, transcript_path}` \
@@ -626,7 +595,7 @@ pub const CAPABILITIES: &[Capability] = &[
     // column carries a distinct control id per site (see [`CONTROLS`]).
     Capability {
         id: "claude.hook.taint_beacon",
-        harness: Harness::Claude,
+        harness: CLAUDE,
         tier: Seam::B,
         contract: "A `PreToolUse` hook of `type: \"http\"` with matcher `WebFetch|WebSearch` fires \
                    BEFORE the tool runs, POSTing `{session_id, cwd, tool_name}`, and a 2xx reply \
@@ -678,7 +647,7 @@ pub const CAPABILITIES: &[Capability] = &[
     },
     Capability {
         id: "claude.hook.checkpoint_beacon",
-        harness: Harness::Claude,
+        harness: CLAUDE,
         tier: Seam::B,
         contract: "A `PreToolUse` hook of `type: \"http\"` with matcher \
                    `Edit|Write|MultiEdit|Bash` fires BEFORE the tool runs with the same payload, \
@@ -732,7 +701,7 @@ pub const CAPABILITIES: &[Capability] = &[
     // ── Claude Code: scraped UI (Tier D) ────────────────────────────────────
     Capability {
         id: "perm.tui_scrape",
-        harness: Harness::Claude,
+        harness: CLAUDE,
         tier: Seam::D,
         contract: "Claude Code's approval prompt keeps the footer grammar `<chord> to cancel \
                    [· <chord> to amend] [· <chord> to explain]` with the cancel hint FIRST, and \
@@ -788,7 +757,7 @@ pub const CAPABILITIES: &[Capability] = &[
     // exactly one of the two produces each datum.
     Capability {
         id: "claude.hook.stop",
-        harness: Harness::Claude,
+        harness: CLAUDE,
         tier: Seam::B,
         contract: "A `Stop` hook of `type: \"http\"` fires at the end of every assistant turn \
                    with `last_assistant_message` carrying the complete final assistant text. \
@@ -834,7 +803,7 @@ pub const CAPABILITIES: &[Capability] = &[
     },
     Capability {
         id: "claude.hook.tool_result",
-        harness: Harness::Claude,
+        harness: CLAUDE,
         tier: Seam::B,
         contract: "TWO all-tools (`\"\"`) `type: \"http\"` entries, one per outcome, because \
                    `PostToolUse` fires only when a tool SUCCEEDS. `hooks.PostToolUse` carries \
@@ -897,7 +866,7 @@ pub const CAPABILITIES: &[Capability] = &[
     },
     Capability {
         id: "claude.hook.subagent",
-        harness: Harness::Claude,
+        harness: CLAUDE,
         tier: Seam::B,
         contract: "`SubagentStart` and `SubagentStop` hooks of `type: \"http\"` fire (matcher \
                    `\"\"` = all agent types) carrying `agent_id` and `agent_type`; the pair is a \
@@ -958,7 +927,7 @@ pub const CAPABILITIES: &[Capability] = &[
     // says this may move".
     Capability {
         id: "claude.transcript.assistant_text",
-        harness: Harness::Claude,
+        harness: CLAUDE,
         tier: Seam::C,
         contract: "Assistant transcript lines (`type == \"assistant\"`) carry `message.content[]` \
                    blocks with `type == \"text\"` and a `text` string, written COMPLETE at \
@@ -992,7 +961,7 @@ pub const CAPABILITIES: &[Capability] = &[
     // ten-minute wait rather than an error. One row per way of breaking.
     Capability {
         id: "claude.transcript.stop_reason",
-        harness: Harness::Claude,
+        harness: CLAUDE,
         tier: Seam::C,
         contract: "An assistant transcript line carries `message.stop_reason`, and its value \
                    distinguishes a turn that CONTINUES from one that is OVER: `\"tool_use\"` means \
@@ -1052,7 +1021,7 @@ pub const CAPABILITIES: &[Capability] = &[
     // that text predates this check, and this comment is the correction.
     Capability {
         id: "claude.transcript.usage",
-        harness: Harness::Claude,
+        harness: CLAUDE,
         tier: Seam::C,
         contract: "Assistant transcript lines (`type == \"assistant\"`) carry `message.id`, \
                    `message.model` and a `message.usage` block whose four token counters keep \
@@ -1077,7 +1046,7 @@ pub const CAPABILITIES: &[Capability] = &[
     },
     Capability {
         id: "claude.transcript.tool_result",
-        harness: Harness::Claude,
+        harness: CLAUDE,
         tier: Seam::C,
         contract: "User-role transcript lines carry the preceding turn's tool results as \
                    `message.content[]` blocks with `type == \"tool_result\"`, `tool_use_id` and \
@@ -1113,7 +1082,7 @@ pub const CAPABILITIES: &[Capability] = &[
     },
     Capability {
         id: "claude.transcript.identity",
-        harness: Harness::Claude,
+        harness: CLAUDE,
         tier: Seam::C,
         contract: "Every transcript line carries a top-level `sessionId`; lines also carry \
                    `version` (the CLI build that wrote them, feeding the drift tripwire), \
@@ -1133,7 +1102,7 @@ pub const CAPABILITIES: &[Capability] = &[
         waiver: Some(
             "No L1 fixture canary (Phase B covered the four readers with a *function* to drive; \
              these four fields have no single reader). The V35 Phase D LIVE probe covers it \
-             instead, reading `sessionId` through `oob::claude::record_names_session` and \
+             instead, reading `sessionId` through `harness::claude::read::record_names_session` and \
              `version` through `cli_version_of` on a real transcript tail. Deliberately NOT \
              linked to `drift.harness_version.v1`: that rule is *fed* by `version`, so losing the \
              field silences the tripwire instead of firing it — the inverse of a lagging \
@@ -1144,7 +1113,7 @@ pub const CAPABILITIES: &[Capability] = &[
     },
     Capability {
         id: "claude.transcript.subagents",
-        harness: Harness::Claude,
+        harness: CLAUDE,
         tier: Seam::C,
         contract: "Sub-agent traffic is visible in one of the two known places: inline in the \
                    parent transcript as `isSidechain: true` lines, or as \
@@ -1166,7 +1135,7 @@ pub const CAPABILITIES: &[Capability] = &[
              `drift.subagent_transcripts.v1` already lags it and has fired once for real (the \
              Task→Agent rename), which is the evidence this layout moves. V35 Phase L made this \
              row the FALLBACK behind `claude.hook.subagent` — for the LIFECYCLE only. Sub-agent \
-             TOKEN accounting (`SubagentState::scan`'s `UsageOrigin::Agent` rows) and the \
+             TOKEN accounting (`SubagentState::scan`'s sub-agent-lane rows) and the \
              `launch_seen`/`completion_seen` bookkeeping this waiver's drift rule reads are NOT \
              arbitrated and keep running on every tab: no hook payload carries sub-agent tokens \
              or names a sub-agent transcript path, and suppressing the bookkeeping would make \
@@ -1185,7 +1154,7 @@ pub const CAPABILITIES: &[Capability] = &[
     //     — attribution enrichment, not data. Losing every one of them leaves
     //     the push writing the same numbers; only the M14 multi-tab ownership
     //     of the shared context slot degrades to last-writer-wins, which
-    //     `usage::merge_push` handles by design (`unwrap_or_default()` on the
+    //     `harness::claude::usage::merge_push` handles by design (`unwrap_or_default()` on the
     //     key) rather than by breaking.
     //   * `extract_context`'s `session_name` / `agent.name` / `effort` /
     //     `thinking` / `fast_mode` — display chips. They cannot make a snapshot
@@ -1197,7 +1166,7 @@ pub const CAPABILITIES: &[Capability] = &[
     // into `depends_on` and the canary grows an assertion.
     Capability {
         id: "claude.statusline.stdin",
-        harness: Harness::Claude,
+        harness: CLAUDE,
         tier: Seam::C,
         contract: "The `statusLine` command's stdin JSON carries `model.display_name` (with \
                    `model.id` as the rendered fallback), a `context_window` block \
@@ -1225,7 +1194,7 @@ pub const CAPABILITIES: &[Capability] = &[
             Dep::JsonPath("rate_limits.seven_day.used_percentage"),
             Dep::JsonPath("rate_limits.seven_day.resets_at"),
         ],
-        wired_in: &["src-tauri/src/harness/claude/statusline.rs", "src-tauri/src/statusline/mod.rs"],
+        wired_in: &["src-tauri/src/harness/claude/statusline.rs", "src-tauri/src/harness/claude/statusline.rs"],
         degradation: Degradation::Silent,
         drift_rule: &[],
         canary: Some("claude.statusline.stdin"),
@@ -1237,7 +1206,7 @@ pub const CAPABILITIES: &[Capability] = &[
     // ── Claude Code: spawn flags (Tier B) ───────────────────────────────────
     Capability {
         id: "claude.flag.settings_overlay",
-        harness: Harness::Claude,
+        harness: CLAUDE,
         tier: Seam::B,
         contract: "`claude --settings <json>` accepts a session-scoped overlay and honors the \
                    `hooks`, `statusLine` and `permissions` keys inside it, without cImp ever \
@@ -1268,7 +1237,7 @@ pub const CAPABILITIES: &[Capability] = &[
     },
     Capability {
         id: "claude.flag.session_id",
-        harness: Harness::Claude,
+        harness: CLAUDE,
         tier: Seam::B,
         contract: "`claude --session-id <uuid>` still exists and pins the process to one \
                    transcript file (V34), and the selectors cImp stands down for — `--resume`, \
@@ -1319,7 +1288,7 @@ pub const CAPABILITIES: &[Capability] = &[
     // notice for once, so the reader took the notice (see the two new deps).
     Capability {
         id: "opencode.sse.events",
-        harness: Harness::OpenCode,
+        harness: OPENCODE,
         tier: Seam::C,
         contract: "`GET /event` streams SSE envelopes `{type, properties}` carrying \
                    `message.updated`, `message.part.updated`, `message.part.delta`, \
@@ -1374,7 +1343,7 @@ pub const CAPABILITIES: &[Capability] = &[
     // the field in the source is not that proof.
     Capability {
         id: "opencode.route.push",
-        harness: Harness::OpenCode,
+        harness: OPENCODE,
         tier: Seam::B,
         contract: "`POST /session/:id/message` accepts a hand-built message envelope, and \
                    `noReply: true` (≥ 1.18.13) injects the text into the session **without** \
@@ -1434,7 +1403,7 @@ pub const CAPABILITIES: &[Capability] = &[
     // drives both directions of it.
     Capability {
         id: "opencode.route.noauth",
-        harness: Harness::OpenCode,
+        harness: OPENCODE,
         tier: Seam::B,
         contract: "Setting the documented `OPENCODE_SERVER_PASSWORD` (non-empty) and \
                    `OPENCODE_SERVER_USERNAME` on the `opencode` child enforces HTTP Basic auth on \
@@ -1484,7 +1453,7 @@ pub const CAPABILITIES: &[Capability] = &[
     // about an id that is never live.
     Capability {
         id: "opencode.tool_registry",
-        harness: Harness::OpenCode,
+        harness: OPENCODE,
         tier: Seam::C,
         contract: "Every tool id `GET /experimental/tool/ids` returns on the running binary is \
                    present in `offload::toolclass::OPENCODE_NATIVE_TABLE`. The table is \
@@ -1527,7 +1496,7 @@ pub const CAPABILITIES: &[Capability] = &[
     // `harness::opencode::tools`, beside the gate that IS real).
     Capability {
         id: "opencode.plugin.load_all",
-        harness: Harness::OpenCode,
+        harness: OPENCODE,
         tier: Seam::D,
         contract: "Every file in `.opencode/plugin/` is loaded (config delivered via \
                    `OPENCODE_CONFIG_CONTENT`), the `chat.message`, `tool.execute.before` and \
@@ -1591,7 +1560,7 @@ pub const CAPABILITIES: &[Capability] = &[
     // requirement and names no vendor.
     Capability {
         id: CAP_DELEGATION_WORKER,
-        harness: Harness::Any,
+        harness: ANY,
         tier: Seam::D,
         contract: "A tab may be driven as a delegation worker: its harness serves CHP                    `assistant_text` ONCE PER TURN, carrying that turn's final assistant                    message (or has a live fallback reader that derives the same boundary), and it declares an input profile whose paste +                    submit encoding yields exactly one turn. Harness-neutral by construction —                    the requirement is stated about a tab, not about a vendor.",
         depends_on: &[Dep::Behavior(
@@ -1602,73 +1571,43 @@ pub const CAPABILITIES: &[Capability] = &[
         wired_in: &[
             "src-tauri/src/delegation/mod.rs",
             "src-tauri/src/delegation/engine.rs",
-            "src-tauri/src/harness/input.rs",
+            "src-tauri/src/harness/plugin.rs",
         ],
         degradation: Degradation::FailClosed,
         drift_rule: &[],
         canary: None,
         probe: None,
         waiver: Some(
-            "No fixture and no automatable probe: proving a worker completes needs a REAL turn on              a real TUI, which is the same class as the E1/D0 spikes. Covered meanwhile by (a)              the fail-closed gate itself — preflight refuses a tab with no completion signal and              no input profile rather than typing into it, (b) the recorded spike outcome in              `harness_versions.input_profile_status`, which this row's gate reads, and (c) V39              live-verify recipes 1, 2 and 10. Owner: whoever closes V39 Phase D.",
-        ),
-        controls: &[],
-        drift_token: None,
-    },
-    Capability {
-        id: "claude.input.profile",
-        harness: Harness::Claude,
-        tier: Seam::D,
-        contract: "Claude Code's TUI accepts a bracketed paste (`ESC [ 200 ~` … `ESC [ 201 ~`) as                    ONE literal insertion — embedded newlines land in the composer as newlines,                    not as submits — and a CR written after it submits that buffer as exactly one                    turn.",
-        depends_on: &[Dep::Behavior(
-            "multi-line bracketed paste + submit yields exactly one turn",
-        )],
-        wired_in: &[
-            "src-tauri/src/harness/claude/input.rs",
-            "src-tauri/src/harness/input.rs",
-        ],
-        degradation: Degradation::FailClosed,
-        drift_rule: &[],
-        canary: None,
-        probe: None,
-        waiver: Some(
-            "A `Dep::Behavior` no payload reveals: a TUI that split a paste into two turns would              corrupt the task SILENTLY, which is why the row fails closed instead of degrading.              Verification is the input-profile spike recorded in              `harness_versions.input_profile_status` (recipe in MAINTENANCE.md); a recorded              `\"fail\"` blocks `delegation.worker` for every harness. Owner: V39 Phase D.",
-        ),
-        controls: &[],
-        drift_token: None,
-    },
-    Capability {
-        id: "opencode.input.profile",
-        harness: Harness::OpenCode,
-        tier: Seam::D,
-        contract: "OpenCode's TUI accepts a bracketed paste (`ESC [ 200 ~` … `ESC [ 201 ~`) as                    ONE literal insertion, and a CR written after it submits that buffer as                    exactly one turn.",
-        depends_on: &[Dep::Behavior(
-            "multi-line bracketed paste + submit yields exactly one turn",
-        )],
-        wired_in: &[
-            "src-tauri/src/harness/opencode/input.rs",
-            "src-tauri/src/harness/input.rs",
-        ],
-        degradation: Degradation::FailClosed,
-        drift_rule: &[],
-        canary: None,
-        probe: None,
-        waiver: Some(
-            "Same class as `claude.input.profile`, same spike, same recorded outcome. Owner: V39              Phase D.",
+            "No fixture and no automatable probe: proving a worker completes needs a REAL turn on              a real TUI, which is the same class as the E1/D0 spikes. Covered meanwhile by (a)              the fail-closed gate itself — preflight refuses a tab with no completion signal and              no input profile rather than typing into it, (b) the recorded spike outcome in              `Settings.harness[<id>].input_profile_status`, which this row's gate reads, and (c) V39              live-verify recipes 1, 2 and 10. Owner: whoever closes V39 Phase D.",
         ),
         controls: &[],
         drift_token: None,
     },
 ];
 
+/// **The registry**: the neutral rows, then every registered harness's own, in
+/// registry order.
+///
+/// The one accessor. `CORE_CAPABILITIES` is deliberately private, so "iterate
+/// the capability registry" cannot accidentally mean "iterate the half core
+/// happens to hold" — which is the shape locked decision 17 removes.
+pub fn capabilities() -> impl Iterator<Item = &'static Capability> {
+    CORE_CAPABILITIES.iter().chain(
+        crate::harness::registry::all()
+            .filter_map(|h| h.plugin())
+            .flat_map(|p| p.capabilities().iter()),
+    )
+}
+
 // `all()` lived here from Phase A as the accessor the seeded consumers would
 // use. Phase E deleted it rather than carrying it under an allow: every real
 // consumer — the probe, the gate, the Advisor's two reverse lookups — either
-// iterates `CAPABILITIES` directly or asks by id, so it was an alias for a
+// iterates the registry directly or asks by id, so it was an alias for a
 // public const that nothing called.
 
 /// One capability by id, or `None`. [`gate`] builds on this.
 pub fn get(id: &str) -> Option<&'static Capability> {
-    CAPABILITIES.iter().find(|c| c.id == id)
+    capabilities().find(|c| c.id == id)
 }
 
 // ── Consumer 1: feature gating (V35 Phase E) ────────────────────────────────
@@ -1718,6 +1657,25 @@ pub const UNKNOWN_CAPABILITY: &str = "(unknown capability)";
 /// is a gate no UI can see.
 pub const GATED: &[&str] = &[CAP_PRETOOLUSE_DENY, CAP_DELEGATION_WORKER];
 
+/// **The gated capabilities, keyed by the CONTROL each one gates** (V40 Phase
+/// F, locked decision 27).
+///
+/// The Settings window needs one thing from this list: *is the control I am
+/// drawing gated off, and why?* It used to answer that by holding
+/// [`CAP_PRETOOLUSE_DENY`]'s string — a harness-namespaced capability id — as a
+/// TypeScript constant, so one harness's hook name was spelled in the frontend
+/// and a pin test existed only to keep the two copies equal.
+///
+/// The control names here are cImp's own and neutral; the ids travel in the
+/// `harness_versions_get` payload. A gated capability whose id names a harness
+/// therefore never reaches `types.ts` at all, which is what
+/// [`tests::the_gated_capability_ids_reach_the_frontend`] now asserts — in both
+/// directions, together with the requirement that every gate has a control.
+pub const GATED_CONTROLS: &[(&str, &str)] = &[
+    ("read_advisor", CAP_PRETOOLUSE_DENY),
+    ("delegation_worker", CAP_DELEGATION_WORKER),
+];
+
 /// Whether a recorded spike status BLOCKS its capability.
 ///
 /// Moved here verbatim from `HarnessVersions::status_blocks` in V35 Phase E
@@ -1735,6 +1693,41 @@ pub const GATED: &[&str] = &[CAP_PRETOOLUSE_DENY, CAP_DELEGATION_WORKER];
 /// `"unverified"` too, because the gate's posture is
 /// opt-in-until-proven-broken, not blocked-until-proven-working. The two are
 /// NOT interchangeable and must never be merged.
+/// The input-profile spike outcome this gate should read.
+///
+/// For a named harness: its own row. For [`Harness::ANY`]: the answer to "can
+/// delegation happen at all", which is the status of the best-placed candidate
+/// — a `"pass"` if any harness that declares an input profile has a
+/// non-blocking row, and otherwise the first blocking row, so the reason the
+/// user is shown names a real recorded outcome rather than a synthesized one.
+///
+/// A harness that declares NO input profile is skipped: it is not a worker
+/// whatever its row says, so letting it decide the neutral verdict would be a
+/// gate answered by a harness the mechanism never touches.
+fn worker_spike_status(settings: &Settings, harness: Harness) -> String {
+    if harness != Harness::ANY {
+        return settings
+            .harness_settings(harness)
+            .input_profile_status
+            .clone();
+    }
+    let mut first_blocking: Option<String> = None;
+    for h in crate::harness::registry::all() {
+        if h.plugin().and_then(|p| p.input_profile()).is_none() {
+            continue;
+        }
+        let status = settings.harness_settings(h).input_profile_status.clone();
+        if !spike_status_blocks(status.trim()) {
+            return status;
+        }
+        first_blocking.get_or_insert(status);
+    }
+    // No candidate at all ⇒ the neutral answer is the default, which does not
+    // block: "nobody has run the spike" is not "the spike failed", and the
+    // no-profile case is refused one layer up with a better message.
+    first_blocking.unwrap_or_else(|| crate::settings::SPIKE_UNVERIFIED.to_string())
+}
+
 fn spike_status_blocks(status: &str) -> bool {
     let s = status.trim().to_ascii_lowercase();
     !(s.is_empty() || s == "unverified" || s == "pass")
@@ -1754,6 +1747,27 @@ fn spike_status_blocks(status: &str) -> bool {
 /// [`tests::every_gated_capability_can_actually_block`] proves each declared
 /// gate really can block.
 pub fn gate(id: &str, settings: &Settings) -> Gate {
+    gate_for(id, settings, Harness::ANY)
+}
+
+/// [`gate`], asked **about one harness**.
+///
+/// V40 Phase B, amendment 0-f. `delegation.worker` reads a recorded spike
+/// outcome that used to be ONE scalar for every harness
+/// (`Settings.harness[<id>].input_profile_status`), which was two defects wearing one
+/// field: a `"fail"` recorded against one TUI removed every `delegate_task_*`
+/// tool and refused delegation for every harness, and a `"pass"` recorded
+/// against Claude silently vouched for a harness nobody had ever typed into.
+/// The status is `Settings::harness[<id>].input_profile_status` now, and the
+/// callers that know whose worker they are asking about pass it.
+///
+/// [`Harness::ANY`] is the *neutral* question — "can delegation happen at
+/// all?" — and it is answered by whether ANY harness that could be a worker (it
+/// declares an input profile) has a non-blocking row. That is what the Settings
+/// gate list and the health panel want: a single blocked row there would
+/// otherwise claim delegation is off while a perfectly good worker sits
+/// available.
+pub fn gate_for(id: &str, settings: &Settings, harness: Harness) -> Gate {
     // Resolve through the registry so the returned `id` is the row's own
     // `&'static str` — the join key itself, not a caller-supplied lookalike.
     let Some(cap) = get(id) else {
@@ -1791,15 +1805,23 @@ pub fn gate(id: &str, settings: &Settings) -> Gate {
         // fields interpreted by two different rules is how one of them ends up
         // meaning something nobody wrote down.
         //
-        // ONE gate for both harnesses, on purpose. A TUI that split a paste
-        // into two turns would corrupt the task silently, and the recorded
-        // status is a human's judgement about "typing a turn works here" — not
-        // a per-vendor measurement cImp can take. Per-harness availability is
-        // still expressed, one layer up: a harness with no `input.rs` has no
-        // profile, so `harness::input_profile` answers `None` and that harness
-        // is not a worker regardless of this verdict.
+        // **PER HARNESS since V40 Phase B** (amendment 0-f). It was one gate
+        // for every harness, and the argument for that — "the recorded status
+        // is a human's judgement about typing a turn, not a per-vendor
+        // measurement" — was wrong in both directions: a human runs the spike
+        // against ONE TUI, so a `"fail"` recorded against one product disabled
+        // delegation for every other one, and a `"pass"` recorded against
+        // Claude vouched for a harness nobody had ever typed into. The row is
+        // the worker's own now; a caller with no worker in hand asks the
+        // neutral question (see [`gate_for`]).
+        //
+        // The other half of per-harness availability is unchanged and still one
+        // layer up: a harness with no `input.rs` has no profile, so
+        // `harness::input_profile` answers `None` and that harness is not a
+        // worker regardless of this verdict.
         CAP_DELEGATION_WORKER => {
-            let status = settings.harness_versions.input_profile_status.trim();
+            let status = worker_spike_status(settings, harness);
+            let status = status.trim();
             if spike_status_blocks(status) {
                 Gate {
                     id: cap.id,
@@ -1811,8 +1833,8 @@ pub fn gate(id: &str, settings: &Settings) -> Gate {
                          turns — and the worker would answer the wrong question without anything \
                          failing. Delegation is off: no `delegate_task_*` tool is advertised and \
                          no tab can be driven. Re-run the check in MAINTENANCE.md -> harness \
-                         contracts and record the outcome in \
-                         `harness_versions.input_profile_status`."
+                         contracts and record the outcome in that harness's \
+                         `harness[<id>].input_profile_status`."
                     ),
                 }
             } else {
@@ -1843,9 +1865,40 @@ pub fn gates(settings: &Settings) -> Vec<Gate> {
 /// affected capability. One notice per capability (rather than one naming them
 /// all) is deliberate — the capability id is the dismissal key, so a shared
 /// notice would let dismissing a symptom on one capability silence a sibling.
+/// The row `harness` owns for `rule`, if it owns exactly one.
+///
+/// V40 Phase C, locked decision 23: every V16 drift rule evaluates **per
+/// registered harness**, so "which capability is this notice about" stops being
+/// a question with one global answer. `None` when this harness names no row for
+/// the rule (the rule simply does not apply to it) and when it names several —
+/// the same refusal-to-pick [`capabilities_for_rule`]'s single-row callers
+/// already made, one harness in.
+impl Capability {
+    /// **What to check when this capability drifts**, in the vocabulary of the
+    /// harness that serves it (V40 Phase C, locked decision 23).
+    ///
+    /// The advisor's fix-pointer prose used to name Claude's mechanisms
+    /// directly — `PreToolUse`, `UserPromptSubmit`, `message.usage`,
+    /// `subagents/*.jsonl` — from inside a core rule that fires for whatever
+    /// harness produced the evidence. Those are the harness's words, so the
+    /// harness supplies them; a rule with no hint renders its neutral sentence
+    /// and nothing else, which is the fail-quiet direction (an invented pointer
+    /// is worse than none).
+    pub fn drift_hint(&self) -> Option<&'static str> {
+        self.harness.plugin()?.drift_hint(self.id)
+    }
+}
+
+pub fn capability_for_rule(rule: &str, harness: Harness) -> Option<&'static Capability> {
+    let rows: Vec<&'static Capability> = capabilities_for_rule(rule)
+        .into_iter()
+        .filter(|c| c.harness == harness)
+        .collect();
+    (rows.len() == 1).then(|| rows[0])
+}
+
 pub fn capabilities_for_rule(rule: &str) -> Vec<&'static Capability> {
-    CAPABILITIES
-        .iter()
+    capabilities()
         .filter(|c| c.drift_rule.contains(&rule))
         .collect()
 }
@@ -1881,8 +1934,7 @@ pub fn capability_for_payload_shim(shim: &str) -> Option<&'static Capability> {
     if shim.is_empty() {
         return None;
     }
-    let mut hits = CAPABILITIES
-        .iter()
+    let mut hits = capabilities()
         .filter(|c| c.drift_token == Some(shim) && c.drift_rule.contains(&RULE_DRIFT_PAYLOAD));
     let first = hits.next()?;
     // Two rows naming one token is a registry defect, not a runtime condition —
@@ -1903,19 +1955,50 @@ mod tests {
     use std::collections::BTreeSet;
     use std::path::Path;
 
-    /// The prose drift table, embedded at compile time so it cannot drift from
-    /// the registry silently — same two-sources-of-truth pattern as
-    /// `checks/mod.rs`'s `TS_TYPES` and `graph/memory.rs`. Path is relative to
-    /// this file (`src-tauri/src/harness/`), up to the repo root.
-    const MAINTENANCE_MD: &str = include_str!("../../../docs/MAINTENANCE.md");
+    /// **Where a capability's prose row lives** — one document per owner.
+    ///
+    /// V40 Phase G split the single `docs/MAINTENANCE.md` drift table three
+    /// ways, because a row about Claude Code is not maintenance advice about
+    /// cImp: a registered harness's rows are `harness/<id>/README.md`, and only
+    /// the harness-NEUTRAL rows ([`Harness::ANY`], today `delegation.worker`)
+    /// stay in `MAINTENANCE.md`. Read at runtime rather than `include_str!`d,
+    /// because the path is derived from the registry — adding a harness must
+    /// widen this check by adding a directory, not by editing a literal here.
+    fn drift_doc_for(h: Harness) -> (String, String) {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let rel = match h.id() {
+            Some(id) => format!("src/harness/{id}/README.md"),
+            None => "../docs/MAINTENANCE.md".to_string(),
+        };
+        let text = std::fs::read_to_string(root.join(&rel)).unwrap_or_else(|e| {
+            panic!(
+                "{rel} is the drift-row document for harness `{}` and could not be \
+                 read: {e}. Every registered harness owns one (locked decision 12); \
+                 a new descriptor needs the README beside it.",
+                h.token()
+            )
+        });
+        (rel, text)
+    }
 
-    /// The heading that opens the drift-table section. The section runs to the
-    /// next `## ` (h2) heading.
-    const SECTION_HEADING: &str = "### Claude Code / OpenCode CLIs";
+    /// The heading that opens the drift-table section in each of those
+    /// documents. The section runs to the next `## ` (h2) heading; in a plugin
+    /// README the table IS an h2, so the scan starts after the heading line.
+    const PLUGIN_SECTION_HEADING: &str = "## Drift watch — capability rows";
+    const NEUTRAL_SECTION_HEADING: &str = "### Registered harness CLIs";
 
-    /// Prefixes a capability id can start with. Used to tell registry ids apart
+    /// Prefixes a capability id can start with, used to tell registry ids apart
     /// from the many other backticked tokens in the same table cells.
-    const ID_PREFIXES: [&str; 4] = ["claude.", "opencode.", "perm.", "delegation."];
+    ///
+    /// **Derived from the registry itself** rather than hand-kept: every id's
+    /// own namespace is a prefix, so a harness added later widens the scan by
+    /// that fact alone and a neutral namespace (`perm.`, `delegation.`) needs
+    /// no edit here either.
+    fn id_prefixes() -> BTreeSet<String> {
+        capabilities()
+            .map(|c| format!("{}.", c.id.split('.').next().unwrap_or(c.id)))
+            .collect()
+    }
 
     /// Every backtick-delimited token in `line`. Scans for pairs, so an unmatched
     /// trailing backtick yields nothing rather than swallowing the rest.
@@ -1938,19 +2021,22 @@ mod tests {
     /// known prefixes and is made only of `[a-z0-9_.]`. That rejects the other
     /// backticked prose in the same cells (`opencode --version`,
     /// `.opencode/plugin`, `harness/opencode/read.rs:692`, `drift.payload.v1`, …).
-    fn looks_like_id(tok: &str) -> bool {
-        ID_PREFIXES.iter().any(|p| tok.starts_with(p))
+    fn looks_like_id(prefixes: &BTreeSet<String>, tok: &str) -> bool {
+        prefixes.iter().any(|p| tok.starts_with(p.as_str()))
             && tok
                 .bytes()
                 .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'.')
     }
 
-    /// The `| … |` rows of the drift table, sliced out of `MAINTENANCE.md`.
-    fn drift_table_rows() -> Vec<&'static str> {
-        let start = MAINTENANCE_MD
-            .find(SECTION_HEADING)
-            .unwrap_or_else(|| panic!("MAINTENANCE.md no longer has a `{SECTION_HEADING}` section"));
-        let body = &MAINTENANCE_MD[start + SECTION_HEADING.len()..];
+    /// The `| … |` rows of one document's drift table.
+    ///
+    /// The section runs from `heading` to the next `## ` (h2), so the plugin
+    /// READMEs' own h2 heading is skipped past before the scan starts.
+    fn drift_table_rows(doc: &str, path: &str, heading: &str) -> Vec<String> {
+        let start = doc
+            .find(heading)
+            .unwrap_or_else(|| panic!("{path} no longer has a `{heading}` section"));
+        let body = &doc[start + heading.len()..];
         let end = body
             .lines()
             .scan(0usize, |off, l| {
@@ -1964,51 +2050,91 @@ mod tests {
         body[..end]
             .lines()
             .filter(|l| l.starts_with('|'))
+            .map(str::to_string)
             .collect()
     }
 
     /// Both sources of truth for the harness dependency surface must name the
-    /// same capabilities. The registry is the authority; the `MAINTENANCE.md`
-    /// drift table carries the human narrative and now leads each row with the
-    /// ids it describes. Prose can no longer drift from code in either
-    /// direction: a new registry row with no doc row fails here, and a doc row
-    /// naming a retired id fails here too.
+    /// same capabilities, **and each row must live with its owner**.
+    ///
+    /// The registry is the authority; the prose carries the human narrative and
+    /// leads each row with the ids it describes. V40 Phase G made "with its
+    /// owner" part of the contract: a Claude row belongs in
+    /// `harness/claude/README.md`, an OpenCode row in
+    /// `harness/opencode/README.md`, and only a [`Harness::ANY`] row stays in
+    /// `docs/MAINTENANCE.md`. Three consequences, each a failure here:
+    ///
+    /// * a new registry row with no doc row anywhere — the old check;
+    /// * a doc row naming a retired id — also the old check;
+    /// * **a row covering two harnesses at once** — new. The single
+    ///   `claude.input.profile, opencode.input.profile` row V39 wrote could not
+    ///   be split between two READMEs, so it was split into two rows. A future
+    ///   combined row lands in one harness's README naming another harness's
+    ///   id, and fails as "named by a doc row but not owned by that document".
     #[test]
     fn matrix_matches_maintenance_doc() {
-        let registry: BTreeSet<&str> = CAPABILITIES.iter().map(|c| c.id).collect();
+        let all: BTreeSet<&str> = capabilities().map(|c| c.id).collect();
         assert_eq!(
-            registry.len(),
-            CAPABILITIES.len(),
+            all.len(),
+            capabilities().count(),
             "duplicate capability id in the registry — ids are the join key and must be unique"
         );
+        let prefixes = id_prefixes();
 
-        let mut doc: BTreeSet<&str> = BTreeSet::new();
-        let mut doc_count = 0usize;
-        for row in drift_table_rows() {
-            for tok in backticked(row) {
-                if looks_like_id(tok) {
-                    doc_count += 1;
-                    doc.insert(tok);
+        // Every owner that has at least one row, plus every registered harness,
+        // so a harness whose README lost its table fails rather than passing by
+        // having nothing to compare.
+        let mut owners: BTreeSet<Harness> = capabilities().map(|c| c.harness).collect();
+        owners.extend(crate::harness::registry::all());
+
+        for owner in owners {
+            let expected: BTreeSet<&str> = capabilities()
+                .filter(|c| c.harness == owner)
+                .map(|c| c.id)
+                .collect();
+            let (path, doc) = drift_doc_for(owner);
+            let heading = if owner.id().is_some() {
+                PLUGIN_SECTION_HEADING
+            } else {
+                NEUTRAL_SECTION_HEADING
+            };
+            let mut found: BTreeSet<&str> = BTreeSet::new();
+            let mut count = 0usize;
+            let rows = drift_table_rows(&doc, &path, heading);
+            for row in &rows {
+                for tok in backticked(row) {
+                    if looks_like_id(&prefixes, tok) {
+                        count += 1;
+                        // Borrow the registry's `'static` spelling so the sets
+                        // compare by id rather than by row-local slice.
+                        if let Some(id) = all.iter().find(|id| **id == tok) {
+                            found.insert(id);
+                        } else {
+                            found.insert(Box::leak(tok.to_string().into_boxed_str()));
+                        }
+                    }
                 }
             }
-        }
-        assert_eq!(
-            doc.len(),
-            doc_count,
-            "a capability id appears in more than one MAINTENANCE.md drift-table row; each id \
-             must live in exactly one row"
-        );
+            assert_eq!(
+                found.len(),
+                count,
+                "{path}: a capability id appears in more than one drift-table row; \
+                 each id must live in exactly one row"
+            );
 
-        let missing: Vec<&str> = registry.difference(&doc).copied().collect();
-        let extra: Vec<&str> = doc.difference(&registry).copied().collect();
-        assert!(
-            missing.is_empty() && extra.is_empty(),
-            "harness capability registry and the MAINTENANCE.md drift table disagree.\n  \
-             in the registry but no drift-table row claims them: {missing:?}\n  \
-             named by a drift-table row but not in the registry: {extra:?}\n\
-             Fix by editing BOTH sides in the same commit (docs/MAINTENANCE.md \
-             § 'Claude Code / OpenCode CLIs', leading 'Capability id(s)' column)."
-        );
+            let missing: Vec<&str> = expected.difference(&found).copied().collect();
+            let extra: Vec<&str> = found.difference(&expected).copied().collect();
+            assert!(
+                missing.is_empty() && extra.is_empty(),
+                "the capability registry and {path} — `{heading}` disagree about \
+                 harness `{}`.\n  owned by this harness but no row in {path} claims \
+                 them: {missing:?}\n  named by a row in {path} but not owned by it \
+                 (retired id, or a row covering another harness — split it): \
+                 {extra:?}\nFix by editing BOTH sides in the same commit; the leading \
+                 column is 'Capability id(s)'.",
+                owner.token()
+            );
+        }
     }
 
     /// A `Silent` capability with no canary, no live probe and no explicit
@@ -2027,8 +2153,7 @@ mod tests {
     /// `claude.transcript.identity` have no single reader to drive one through.
     #[test]
     fn every_silent_degradation_has_a_canary_or_a_probe_or_a_waiver() {
-        let naked: Vec<&str> = CAPABILITIES
-            .iter()
+        let naked: Vec<&str> = capabilities()
             .filter(|c| c.degradation == Degradation::Silent)
             .filter(|c| c.canary.is_none() && c.probe.is_none() && c.waiver.is_none())
             .map(|c| c.id)
@@ -2042,7 +2167,7 @@ mod tests {
 
         // Non-empty prose, not merely `Some("")` — global principle 5: a blank
         // waiver would pass the check above while recording nothing.
-        for c in CAPABILITIES {
+        for c in capabilities() {
             if let Some(w) = c.waiver {
                 assert!(
                     w.trim().len() > 20,
@@ -2063,7 +2188,7 @@ mod tests {
         // repo-relative, so climb one level first.
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
         let mut missing: Vec<String> = Vec::new();
-        for c in CAPABILITIES {
+        for c in capabilities() {
             assert!(
                 !c.wired_in.is_empty(),
                 "{}: a capability with no consumer is a dependency nothing needs — delete the \
@@ -2103,8 +2228,7 @@ mod tests {
     /// built to avoid, so it is a build failure here.
     #[test]
     fn probes_and_the_matrix_agree() {
-        let declared: BTreeSet<&str> = CAPABILITIES
-            .iter()
+        let declared: BTreeSet<&str> = capabilities()
             .filter_map(|c| {
                 c.probe.inspect(|p| {
                     assert_eq!(
@@ -2155,8 +2279,7 @@ mod tests {
             .iter()
             .copied()
             .collect();
-        let orphans: Vec<&str> = CAPABILITIES
-            .iter()
+        let orphans: Vec<&str> = capabilities()
             .map(|c| c.id)
             .filter(|id| !declared.contains(id) && !unprobed.contains(id))
             .collect();
@@ -2176,11 +2299,21 @@ mod tests {
         s
     }
 
-    /// V39 Phase B: settings with the input-profile spike outcome set, and
-    /// nothing else touched — the delegation gate's one input.
+    /// V39 Phase B: settings with the input-profile spike outcome set on
+    /// EVERY harness, and nothing else touched.
+    ///
+    /// Every row, because the tests below drive the NEUTRAL question ("can
+    /// delegation happen at all?") and V40 Phase B made that the OR over the
+    /// candidate harnesses — a fixture that set one row would be asserting
+    /// about a harness the neutral gate is allowed to look past. The per-harness
+    /// question has its own test.
     fn settings_with_input_profile(status: &str) -> Settings {
         let mut s = Settings::default();
-        s.harness_versions.input_profile_status = status.to_string();
+        for h in crate::harness::registry::all() {
+            s.harness_settings_mut(h)
+                .expect("registered")
+                .input_profile_status = status.to_string();
+        }
         s
     }
 
@@ -2228,7 +2361,7 @@ mod tests {
             settings_with_input_profile("fail"),
             settings_with_input_profile("nonsense"),
         ];
-        for c in CAPABILITIES {
+        for c in capabilities() {
             for s in &inputs {
                 if gate(c.id, s).blocked {
                     assert!(
@@ -2306,7 +2439,49 @@ mod tests {
         assert!(!gate(CAP_PRETOOLUSE_DENY, &settings_with_input_profile("fail")).blocked);
     }
 
-    /// **The registry's first `Harness::Any` row exists and is the one meant.**
+    /// **V40 Phase B, amendment 0-f: the gate resolves the WORKER's row.**
+    ///
+    /// One scalar for every harness was two defects in one field. A `"fail"`
+    /// recorded against one TUI refused delegation to every other one; a
+    /// `"pass"` recorded against Claude silently vouched for a harness nobody
+    /// had ever typed into. Both directions, plus the neutral question's
+    /// contract: `Harness::ANY` asks "can delegation happen AT ALL", so one
+    /// blocked harness must not make it claim delegation is off while a good
+    /// worker sits available.
+    #[test]
+    fn the_delegation_gate_resolves_the_workers_own_row() {
+        let claude = Harness::from_id("claude").expect("registered");
+        let opencode = Harness::from_id("opencode").expect("registered");
+
+        let mut s = Settings::default();
+        s.harness_settings_mut(claude)
+            .expect("registered")
+            .input_profile_status = "fail".to_string();
+
+        assert!(
+            gate_for(CAP_DELEGATION_WORKER, &s, claude).blocked,
+            "the harness whose spike failed is blocked"
+        );
+        assert!(
+            !gate_for(CAP_DELEGATION_WORKER, &s, opencode).blocked,
+            "…and no other harness is, which is the whole amendment"
+        );
+        assert!(
+            !gate(CAP_DELEGATION_WORKER, &s).blocked,
+            "the neutral question is `can delegation happen at all`, and it can"
+        );
+
+        // Every candidate blocked ⇒ the neutral question blocks too, quoting a
+        // real recorded status rather than a synthesized one.
+        s.harness_settings_mut(opencode)
+            .expect("registered")
+            .input_profile_status = "fail".to_string();
+        let g = gate(CAP_DELEGATION_WORKER, &s);
+        assert!(g.blocked);
+        assert!(g.reason.contains("fail"), "got: {}", g.reason);
+    }
+
+    /// **The registry's first `ANY` row exists and is the one meant.**
     ///
     /// `Any` carried an `#[allow(dead_code)]` from V35 Phase A with a comment
     /// predicting CHP would construct it. This pins what actually did — and
@@ -2314,22 +2489,24 @@ mod tests {
     /// depends on when it looks a harness up by id.
     #[test]
     fn the_neutral_row_is_the_delegation_worker_and_names_no_vendor() {
-        let neutral: Vec<&str> = CAPABILITIES
-            .iter()
-            .filter(|c| c.harness == Harness::Any)
+        let neutral: Vec<&str> = capabilities()
+            .filter(|c| c.harness == ANY)
             .map(|c| c.id)
             .collect();
         assert_eq!(neutral, vec![CAP_DELEGATION_WORKER]);
-        assert_eq!(Harness::Any.id(), None, "a neutral row has no agent id");
-        for id in harness_ids() {
+        assert_eq!(ANY.id(), None, "a neutral row has no agent id");
+        for id in crate::harness::registry::harness_ids() {
             assert_eq!(
                 Harness::from_id(id).and_then(Harness::id),
                 Some(id),
                 "`{id}` must round-trip through the registry's harness vocabulary"
             );
-            assert!(!Harness::from_id(id).unwrap().display_name().is_empty());
+            assert!(!Harness::from_id(id).unwrap().label().is_empty());
         }
-        assert_eq!(harness_ids(), vec!["claude", "opencode"]);
+        assert_eq!(
+            crate::harness::registry::harness_ids(),
+            vec!["claude", "opencode"]
+        );
         assert_eq!(Harness::from_id("aider"), None);
     }
 
@@ -2392,11 +2569,57 @@ mod tests {
             "`harnessStatusBlocks` is back in src/lib/settings/types.ts — the E1 rule must not \
              be re-implemented in TypeScript; read `CapabilityGate.blocked` instead"
         );
+        // V40 Phase F. A gated id that NAMES A HARNESS must not be spelled in
+        // the frontend: it reaches the window inside the payload, keyed by the
+        // neutral control name it gates. A gated id that names none (the
+        // `ANY` rows) still may be, and is still pinned.
         for id in GATED {
+            let names_a_harness = crate::harness::registry::HARNESSES
+                .iter()
+                .any(|d| id.starts_with(&format!("{}.", d.id)));
+            let control = GATED_CONTROLS.iter().find(|(_, cap)| cap == id);
             assert!(
-                TS_TYPES.contains(&format!("'{id}'")),
-                "capability id `{id}` is gated in Rust but is not spelled in \
-                 src/lib/settings/types.ts — the Settings window joins on this exact string"
+                control.is_some(),
+                "capability id `{id}` is gated but has no GATED_CONTROLS row, so no UI can find \
+                 it — a gate nothing can see is a gate that does not exist"
+            );
+            if names_a_harness {
+                assert!(
+                    !TS_TYPES.contains(&format!("'{id}'")),
+                    "capability id `{id}` names a harness and is spelled in \
+                     src/lib/settings/types.ts — the window reads it from the \
+                     `gated_controls` payload instead (locked decision 27)"
+                );
+                // **…and the CONTROL NAME it travels under is pinned** (V40
+                // review finding M-4). For these ids the control name is the
+                // ONLY join key the window has, and nothing checked it:
+                // renaming `read_advisor` here left
+                // `CONTROL_READ_ADVISOR = 'read_advisor'` in `types.ts`
+                // pointing at a key the payload no longer carries, and the
+                // lookup answered "not blocked" — silently un-gating a toggle
+                // that installs a `PreToolUse` hook on a contract the E1 spike
+                // may have recorded as broken. (`controlBlocked` fails closed
+                // on a miss now; this is what stops the miss happening.)
+                let (name, _) = control.expect("checked above");
+                assert!(
+                    TS_TYPES.contains(&format!("'{name}'")),
+                    "control name `{name}` is the only handle the window has on the gate for \
+                     `{id}`, and it is not spelled in src/lib/settings/types.ts"
+                );
+            } else {
+                assert!(
+                    TS_TYPES.contains(&format!("'{id}'")),
+                    "capability id `{id}` is gated in Rust but is not spelled in \
+                     src/lib/settings/types.ts — the Settings window joins on this exact string"
+                );
+            }
+        }
+        // Both directions: a control row for a capability nothing gates would
+        // hand the window an id whose verdict never changes.
+        for (control, cap) in GATED_CONTROLS {
+            assert!(
+                GATED.contains(cap),
+                "GATED_CONTROLS names `{control}` -> `{cap}`, which is not a gated capability"
             );
         }
     }
@@ -2410,7 +2633,7 @@ mod tests {
     #[test]
     fn every_declared_drift_rule_resolves_back_to_its_rows() {
         let mut seen = BTreeSet::new();
-        for c in CAPABILITIES {
+        for c in capabilities() {
             for rule in c.drift_rule {
                 seen.insert(*rule);
                 let rows: Vec<&str> = capabilities_for_rule(rule).iter().map(|r| r.id).collect();
@@ -2475,7 +2698,7 @@ mod tests {
         // claims a lagging indicator that can never attribute to it), and a row
         // that carries a token must name the rule (or the token is decoration).
         let mut tokens: Vec<&str> = Vec::new();
-        for c in CAPABILITIES {
+        for c in capabilities() {
             match (c.drift_token, c.drift_rule.contains(&RULE_DRIFT_PAYLOAD)) {
                 (Some(tok), true) => {
                     tokens.push(tok);
@@ -2516,8 +2739,7 @@ mod tests {
     #[test]
     fn tcb_controls_are_declared_exactly_once() {
         for control in CONTROLS {
-            let owners: Vec<&str> = CAPABILITIES
-                .iter()
+            let owners: Vec<&str> = capabilities()
                 .filter(|c| c.controls.contains(control))
                 .map(|c| c.id)
                 .collect();
@@ -2527,7 +2749,7 @@ mod tests {
                 "control `{control}` must be declared by exactly one capability, found: {owners:?}"
             );
         }
-        for c in CAPABILITIES {
+        for c in capabilities() {
             for declared in c.controls {
                 assert!(
                     CONTROLS.contains(declared),

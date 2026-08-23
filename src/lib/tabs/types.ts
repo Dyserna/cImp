@@ -1,15 +1,16 @@
-// Frontend mirror of `state::TabId`. JSON-serialized as a string —
-// `"claude"` / `"claude-local"` / `"opencode"` for the
-// AI builtins, `"shell-default-1"` for the reserved default Shell tab,
-// or `shell-<uuid>` for user-created shell tabs. The union shape
-// preserves autocomplete on the well-known IDs while leaving room for
-// the dynamic shell IDs created at runtime.
+// Frontend mirror of `state::TabId`. JSON-serialized as a string — a reserved
+// built-in AI tab id for each harness the registry declares (see
+// `../harness.ts`), `"shell-default-1"` for the reserved default Shell tab, or
+// `shell-<uuid>` / `ai-<uuid>` for user-created ones.
+//
+// Deliberately a bare `string`: which ids are the AI builtins is the registry's
+// answer, delivered over `harness_list`, and a union here would be this file
+// re-declaring the roster (V40 Phase F, locked decision 7). Ask
+// `isReservedAiTab` / `harnessForTab` instead of comparing.
 
-export type TabId =
-  | 'claude'
-  | 'claude-local'
-  | 'opencode'
-  | (string & {});
+import { isReservedAiTab } from '../harness';
+
+export type TabId = string;
 
 // The V8-03 "offload-server" reserved tab is retired (schema v25) — the
 // dashboard lives inside the Tool Activity tab as the "Offload server"
@@ -112,32 +113,22 @@ export function isAppRenderedTab(id: TabId): boolean {
   );
 }
 
-/// Type guard for shell tabs — every non-AI-builtin ID is a shell, EXCEPT the
-/// app-rendered tabs (see `isAppRenderedTab`) — none of these get the shell
-/// closed-overlay / restart / keystroke behaviors.
+/// Type guard for shell tabs — every id that is not a reserved AI builtin is a
+/// shell, EXCEPT the app-rendered tabs (see `isAppRenderedTab`) — none of these
+/// get the shell closed-overlay / restart / keystroke behaviors.
+///
+/// V40 Phase F: "is this a reserved AI builtin?" is the registry's question now
+/// (`harness.ts`), not a `!==` chain per shipped harness.
 export function isShellTab(id: TabId): boolean {
-  return (
-    id !== 'claude' &&
-    id !== 'claude-local' &&
-    id !== 'opencode' &&
-    !isAppRenderedTab(id)
-  );
+  return !isReservedAiTab(id) && !isAppRenderedTab(id);
 }
 
-/// Subset of TabId covering only the AI builtins. Used by call sites that
-/// need to iterate over just the AI tabs (e.g. the Settings window's
-/// "Reset to default" wiring, which is meaningful only for AI tabs).
-export type AiTabId = 'claude' | 'claude-local' | 'opencode';
-export const AI_TABS: readonly AiTabId[] = [
-  'claude',
-  'claude-local',
-  'opencode',
-] as const;
-
-/// Type guard for the single OpenCode tab.
-export function isOpencodeTabId(id: string): boolean {
-  return id === 'opencode';
-}
+/// The subset of `TabId` covering the reserved AI builtins. A plain `string`
+/// for the same reason `TabId` is: the roster comes from `harness_list`. Kept
+/// as a named alias because the call sites that iterate *only* the AI builtins
+/// (the Settings window's per-tab forms, `enabled_ai_tabs`) read better for it —
+/// they get the list itself from `reservedAiTabIds($harnesses)`.
+export type AiTabId = string;
 
 /// V14 Phase F: `'preview'` is a genuinely new kind (unlike the reserved
 /// app-rendered dashboards above — Workbench/Graph-monitor/Note/Offload —

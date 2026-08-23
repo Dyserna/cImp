@@ -382,23 +382,25 @@ pub const TABLE: &[ClassRow] = &[
     unrouted("hook_compaction", ToolClass::Trusted, false),
     // ── PERSISTENT-WRITE ───────────────────────────────────────────────────
     row("context_note", ToolClass::PersistentWrite, false),
-    // ── Harness-native tools — classified, NOT enforced ─────────────────────
-    // Claude Code's and OpenCode's own file/shell tools never route through a
-    // cImp router, so NO cImp latch can block them: decision 3's honest limit,
-    // with OS-level containment left to V33 and optional hook-based gating to
-    // Phase E. These rows exist because (a) V33 Phase F reads `mutates_fs`
-    // from this table for tool-sourced checkpoints, and (b) a Phase E hook
-    // that does gate them needs their class from the same reviewed place.
-    unrouted("Edit", ToolClass::LocalCapability, true),
-    unrouted("Write", ToolClass::LocalCapability, true),
-    unrouted("Bash", ToolClass::LocalCapability, true),
-    // V33 Phase F. `MultiEdit` had no row at all, so [`mutates_fs`] answered
-    // `false` for it — while `tabs::config`'s PostToolUse auto-check matcher has
-    // named it (`"Edit|Write|MultiEdit"`) since V12, i.e. cImp already treats it
-    // as an edit everywhere except here. Without this row the Phase F
-    // pre-tool checkpoint route would refuse the one Claude tool that rewrites
-    // several files in a single call — the case a checkpoint is worth most.
-    unrouted("MultiEdit", ToolClass::LocalCapability, true),
+    // ── Harness-native tools live with their harness (V40 Phase A) ──────────
+    //
+    // `Edit` / `Write` / `Bash` / `MultiEdit` had rows here — Claude's
+    // capitalized natives, `unrouted` because no cImp dispatcher serves them,
+    // carried for V33 Phase F's `mutates_fs` consumer. Locked decision 16 moved
+    // them to `harness/claude/tools.rs`, beside the memory classification that
+    // was making the same claims about the same names in a third place
+    // (`graph/memory.rs`), and OpenCode's half has lived in
+    // `harness/opencode/tools.rs` since V35 Phase K.
+    //
+    // The reason is not tidiness. This table's law is **unknown ⇒ EXTERNAL**,
+    // which is right for names cImp ROUTES and wrong for a harness's own closed
+    // registry; keeping one harness's vocabulary here meant core answered for
+    // `Edit` and, through a `_` arm, for every harness it had never heard of.
+    // Read a native name through `harness::native`, which asks the plugin for
+    // the request's source and fails closed when it cannot identify one — and,
+    // since V40 review M-7, which is also what [`classify`] falls through to
+    // before it answers EXTERNAL, so the class a plugin declares is the class
+    // the latch enforces.
 ];
 
 /// The class of `name`. **Unknown ⇒ [`ToolClass::External`]** — the locked
@@ -406,11 +408,22 @@ pub const TABLE: &[ClassRow] = &[
 /// server's `<server>__<tool>` ids are unknown here and must land in the most
 /// restrictive class, never be inferred into a trusted one.
 pub fn classify(name: &str) -> ToolClass {
-    TABLE
-        .iter()
-        .find(|r| r.name == name)
-        .map(|r| r.class)
-        .unwrap_or(ToolClass::External)
+    if let Some(row) = TABLE.iter().find(|r| r.name == name) {
+        return row.class;
+    }
+    // **A harness's OWN natives answer from their own declaration** (V40 review
+    // finding M-7). Phase A moved Claude's four `LocalCapability` rows out of
+    // this table and into `native_tools()` — correctly — but nothing read the
+    // declaration back, so `Edit` fell to the unknown-⇒-EXTERNAL default below.
+    // That default is not a neutral loss here: [`Latch::blocks`] REFUSES
+    // `LocalCapability` under an EXTERNAL latch and ADMITS `External`, and
+    // [`Latch::engage`] moves an open tab to `External` rather than `Local` for
+    // it — so a tainted session's `Edit` stopped being refused and an ordinary
+    // `Edit` started marking its tab externally-contaminated.
+    //
+    // The unknown-⇒-EXTERNAL invariant is untouched: it governs names NOBODY
+    // declares, which is still every proxied `<server>__<tool>` id.
+    crate::harness::native::declared_class(name).unwrap_or(ToolClass::External)
 }
 
 /// **#48, finding M-2** — whether a model-supplied `name` can reach a native
@@ -447,8 +460,12 @@ pub fn dispatchable(name: &str) -> bool {
 /// forged or drifted POST cannot mint a checkpoint for a name cImp does not
 /// classify as mutating.
 ///
-/// **Claude's vocabulary only.** OpenCode's native ids are a separate namespace
-/// with a separate table — see [`crate::harness::opencode::tools::opencode_native_mutates_fs`].
+/// **cImp's OWN routed vocabulary only.** Every harness's native ids are
+/// separate namespaces with separate tables, read through
+/// [`crate::harness::native::mutates_fs`] — which takes the request's source
+/// and fails closed when it cannot identify one. Since V40 Phase A this
+/// function answers `false` for `Edit` exactly as it always did for `edit`:
+/// both are names cImp does not route.
 pub fn mutates_fs(name: &str) -> bool {
     TABLE
         .iter()
@@ -1154,16 +1171,16 @@ mod tests {
         for n in ["ddg__search", "ddg__fetch_content", "context7__query-docs"] {
             assert_eq!(classify(n), ToolClass::External, "{n}");
         }
-        // `mutates_fs`: true only for `run_command` and the harness natives.
+        // `mutates_fs`: true only for `run_command` — cImp's one routed tool
+        // that writes. V40 Phase A: the harness natives are no longer in this
+        // table at all, so BOTH vocabularies now answer `false` here, which is
+        // the honest answer for a lookup over the names cImp routes.
         assert!(mutates_fs("run_command"));
-        for n in ["Edit", "Write", "MultiEdit", "Bash"] {
-            assert!(mutates_fs(n), "{n}");
+        for n in ["Edit", "Write", "MultiEdit", "Bash", "edit"] {
+            assert!(!mutates_fs(n), "{n} is a harness native, not a routed tool");
         }
-        // V33 Phase F: OpenCode's ids are a SECOND vocabulary. `edit` mutates
-        // there and is unknown here, and the two lookups must not be crossed —
-        // reading an OpenCode id through `mutates_fs` would silently answer
-        // "does not mutate" for the whole OpenCode surface.
-        assert!(!mutates_fs("edit"));
+        // …and each harness's own table still answers for its own ids, and only
+        // its own. Crossing the two is the drift the split exists to prevent.
         assert!(opencode_native_mutates_fs("edit"));
         assert!(!opencode_native_mutates_fs("Edit"));
         for n in ["read_file", "code_search", "graph_snippet", "ddg__search"] {
@@ -1601,6 +1618,48 @@ mod tests {
         assert!(PROFILE_TOOL_NOTE.contains("prompt exfiltration cannot be blocked"));
     }
 
+    /// **The pre-V40 classes for the harness-native names** — live-verify 9a's
+    /// golden, written out (V40 review finding M-7, parity lens).
+    ///
+    /// Phase A moved Claude's four `LocalCapability` rows out of `TABLE` and
+    /// into `native_tools()`, and nothing read the declaration back, so
+    /// `classify("Edit")` fell to unknown-⇒-EXTERNAL. That is not a neutral
+    /// loss: [`Latch::blocks`] refuses `LocalCapability` under an EXTERNAL latch
+    /// and ADMITS `External`, and [`Latch::engage`] moves an open tab to
+    /// `External` rather than `Local` for it — so a tainted session's `Edit`
+    /// stopped being refused, and an ordinary `Edit` started marking its own tab
+    /// externally-contaminated.
+    ///
+    /// A GOLDEN: a diff here is a containment answer changing.
+    #[test]
+    fn harness_native_names_classify_from_their_own_declaration() {
+        // Claude's four, the ones develop carried in `TABLE`.
+        for name in ["Edit", "Write", "Bash", "MultiEdit"] {
+            assert_eq!(classify(name), ToolClass::LocalCapability, "{name}");
+            // …and the two properties that class buys, spelled out.
+            assert!(
+                Latch::External.blocks(classify(name)),
+                "{name} must be refused under an EXTERNAL latch"
+            );
+            let mut latch = Latch::Open;
+            assert!(latch.engage(classify(name)), "{name} must move an open latch");
+            assert_eq!(
+                latch,
+                Latch::Local,
+                "{name} must engage the LOCAL latch, not the external one"
+            );
+        }
+        // OpenCode's own file/shell ids answer from ITS declaration, which is
+        // the same class for the same kind of tool — and was `External` on
+        // develop only because no table carried them at all.
+        for name in ["edit", "write", "bash", "patch"] {
+            assert_eq!(classify(name), ToolClass::LocalCapability, "{name}");
+        }
+        // The invariant is untouched for names NOBODY declares.
+        assert_eq!(classify("nothing_declares_this"), ToolClass::External);
+        assert_eq!(classify("ddg__fetch_content"), ToolClass::External);
+    }
+
     /// The reason this is a SECOND table: `classify`'s unknown-⇒-EXTERNAL
     /// invariant is right for cImp's routed vocabulary and wrong for a harness
     /// registry, where an unlisted name must be UNGATED.
@@ -1623,9 +1682,10 @@ mod tests {
         assert!(!opencode_native_mutates_fs("task"));
         // The two tables share no rows: `TABLE`'s harness natives are Claude's
         // capitalized names, kept there for V33's `mutates_fs` consumer.
-        for (name, _, _) in OPENCODE_NATIVE_TABLE {
+        for row in OPENCODE_NATIVE_TABLE {
+            let name = row.name;
             assert!(
-                !TABLE.iter().any(|r| r.name == *name),
+                !TABLE.iter().any(|r| r.name == name),
                 "{name} is in both tables — one lookup, two vocabularies"
             );
         }
@@ -2001,7 +2061,7 @@ mod tests {
     /// a reviewed act, and swapping one for another keeps the count but changes
     /// the meaning.
     #[test]
-    fn classified_but_unrouted_rows_are_the_documented_eight() {
+    fn classified_but_unrouted_rows_are_the_documented_four() {
         let unrouted: Vec<&str> = TABLE
             .iter()
             .filter(|r| !r.dispatchable)
@@ -2024,17 +2084,10 @@ mod tests {
                 "hook_post_edit",
                 "hook_should_read",
                 "hook_compaction",
-                // Claude's own natives. Decision 3's honest limit: they never
-                // route through a cImp router, so no cImp latch can block them.
-                // They are here for V33 Phase F's `mutates_fs` consumer and for
-                // a future Phase E hook.
-                "Edit",
-                "Write",
-                "Bash",
-                // V33 Phase F added `MultiEdit` on the same footing: the
-                // PostToolUse matcher has named it since V12, and without a row
-                // it answered `mutates_fs == false`.
-                "MultiEdit",
+                // Claude's four natives used to be here on the same footing —
+                // V40 Phase A moved them to `harness/claude/tools.rs` (locked
+                // decision 16), so the classified-but-unroutable set is now
+                // exactly the four ROUTE identities above.
             ],
             "the classified-but-unroutable set changed — each member needs a stated reason \
              (see the rows' own comments), because `unrouted` is what tells the gate not to \
@@ -2043,7 +2096,7 @@ mod tests {
         // Every one of them really is absent from the dispatch surface. This is
         // implied by `table_matches_the_native_dispatch_surface`, and it is
         // asserted separately because that test compares whole sets: naming
-        // these seven is what stops a future edit "fixing" a drift by flipping
+        // these four is what stops a future edit "fixing" a drift by flipping
         // the wrong row's flag.
         let served = served_names();
         for name in &unrouted {

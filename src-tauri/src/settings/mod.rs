@@ -23,8 +23,10 @@ mod schema;
 
 pub use broadcaster::SettingsHandle;
 pub use persistence::{
-    apply_portable_avatar_paths, load_readonly, mutate_global_harness_versions,
-    note_harness_version, read_global_harness_versions, read_global_llm_pricing,
+    apply_portable_avatar_paths, load_readonly, mutate_global_harness, note_harness_version,
+    read_global_enabled_ai_tabs, read_global_harness_map, read_global_harness_settings,
+    read_global_harness_versions,
+    read_global_llm_pricing,
     read_global_prompt_templates, read_project_prompt_templates, reconcile_reserved_tabs,
     write_global_llm_pricing, write_global_prompt_templates,
 };
@@ -207,7 +209,7 @@ mod frontend_mirrors {
     /// The members of a TS string-array constant. **Panics on an empty parse**
     /// (property 2 above).
     fn ts_members(src: &str, name: &str) -> Vec<String> {
-        let members = single_quoted(ts_initialiser(src, name, '[', ']'));
+        let members = string_members(src, ts_initialiser(src, name, '[', ']'));
         assert!(
             !members.is_empty(),
             "parsed 0 members out of `{name}`: either the construct changed shape or this \
@@ -215,6 +217,71 @@ mod frontend_mirrors {
              mirror ships (#48 F-27)."
         );
         members
+    }
+
+    /// One array's members, in order, resolving a member spelled as an exported
+    /// CONSTANT to the literal that constant holds.
+    ///
+    /// V40 Phase F: a wire key that names a harness is spelled exactly once in
+    /// `types.ts` now — as `export const HARNESS_NATIVE_GATE_KEY = '…'` — and
+    /// the arrays reference it, because the frontend identity scan
+    /// (`src/lib/harnessIdentity.test.ts`) allows the file exactly one such
+    /// literal. A parser that only saw quoted strings would read that member as
+    /// missing and report a drift that is not there, so it follows the one hop.
+    ///
+    /// Deliberately no deeper: a constant whose value is itself an expression is
+    /// not resolved, and the member is dropped rather than guessed — which the
+    /// non-empty assertion above then turns into a loud failure.
+    fn string_members(src: &str, block: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for raw in block.split(',') {
+            let item = raw.trim();
+            if item.is_empty() {
+                continue;
+            }
+            if item.starts_with('\'') {
+                let quoted = single_quoted(item);
+                if let Some(first) = quoted.into_iter().next() {
+                    out.push(first);
+                }
+            } else if item.chars().all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit())
+            {
+                if let Some(value) = ts_const_string(src, item) {
+                    out.push(value);
+                }
+            }
+        }
+        out
+    }
+
+    /// Every `export const <NAME> = '<value>';` whose value is `value`.
+    ///
+    /// The inverse of [`ts_const_string`], for the constructs that reference a
+    /// wire key as a COMPUTED property (`[NAME]: …`) rather than as a literal.
+    fn ts_const_names_for(src: &str, value: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for line in src.split('\n') {
+            let line = line.trim();
+            let Some(rest) = line.strip_prefix("export const ") else {
+                continue;
+            };
+            let Some((name, tail)) = rest.split_once(" = ") else {
+                continue;
+            };
+            if single_quoted(tail).first().map(String::as_str) == Some(value) {
+                out.push(name.to_string());
+            }
+        }
+        out
+    }
+
+    /// The string an `export const <NAME> = '<value>';` holds, or `None`.
+    fn ts_const_string(src: &str, name: &str) -> Option<String> {
+        let decl = format!("const {name} = ");
+        let at = src.find(&decl)?;
+        let rest = &src[at + decl.len()..];
+        let line = rest.split('\n').next()?;
+        single_quoted(line).into_iter().next()
     }
 
     /// What one side has that the other does not, in both directions.
@@ -368,8 +435,15 @@ mod frontend_mirrors {
             "parsed no SPAWN_BAKED_L2 body — an empty parse must fail"
         );
         for key in &ts {
+            // Either spelled as the literal, or as the COMPUTED key of the one
+            // exported constant holding it (V40 Phase F — a wire key that names
+            // a harness is spelled exactly once in that file).
+            let literal = l2.contains(&format!("{key}:"));
+            let computed = ts_const_names_for(TS_TYPES, key)
+                .iter()
+                .any(|c| l2.contains(&format!("[{c}]:")));
             assert!(
-                l2.contains(&format!("{key}:")),
+                literal || computed,
                 "`{key}` is in SPAWN_BAKED_INJECTION_FEATURES but names no cell in \
                  SPAWN_BAKED_L2, so `spawnBakedInjectionL2` would read undefined for it"
             );

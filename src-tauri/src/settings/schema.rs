@@ -160,7 +160,7 @@ pub const SHELL_BROOT_TAB_ID: &str = "shell-broot";
 /// Files that pre-date V1.10 lack the field entirely; the cascade still
 /// uses the `looks_v1_X` predicates for those, falling through to a final
 /// step that stamps the field with the current value.
-pub const CURRENT_SCHEMA_VERSION: u8 = 35;
+pub const CURRENT_SCHEMA_VERSION: u8 = 36;
 
 fn current_schema_version() -> u8 {
     CURRENT_SCHEMA_VERSION
@@ -193,12 +193,6 @@ pub struct Settings {
     pub usage: UsageSettings,
     /// Bottom-bar system-monitor panel config.
     pub system_stats: SystemStatsSettings,
-    /// Claude Code context-window status line bar. Global (like the avatar
-    /// and TTS voice) — applies to every cImp-launched Claude tab rather
-    /// than per-tab. Drives a `--settings` overlay injected at launch (see
-    /// `tabs::config`) that points Claude Code's `statusLine` at our own
-    /// `cimp --statusline` renderer.
-    pub statusline: StatuslineSettings,
     pub compose: ComposeSettings,
     pub shortcuts: ShortcutSettings,
     /// Ordered list of tabs. AI builtins occupy the canonical leading
@@ -244,13 +238,6 @@ pub struct Settings {
     /// the V1.4-02 background image/color group when that ships.
     /// Distinct from `ui`, which themes the cimp chrome.
     pub terminal: TerminalSettings,
-    /// V1.4-07: local-LLM provider config for AI tabs whose
-    /// `use_local_provider` flag is `true`. The launch-time env
-    /// composition reads `base_url`/`auth_token`/`model_alias` from
-    /// here and synthesizes `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN`
-    /// (and `ANTHROPIC_MODEL` if set) into the spawned process's env.
-    /// Per-tab `env` entries take precedence over synthesized values.
-    pub claude_local: ClaudeLocalSettings,
     /// Optional explicit executable paths for the bundled quick-launch
     /// tools (rustnet / broot). A non-empty field overrides the normal
     /// `ebin/` → PATH resolution for that tool, letting the user point at
@@ -428,7 +415,7 @@ pub struct Settings {
     /// Anthropic API + GitHub Copilot prices via the serde/`Default` default
     /// (a file that carries the key — even as `[]` — keeps what it has, so
     /// deleted seeds stay deleted; no `templates_seeded`-style flag needed).
-    #[serde(default = "default_llm_pricing")]
+    #[serde(default = "crate::pricing::default_llm_pricing")]
     pub llm_pricing: Vec<LlmPricingModel>,
     /// V16 Feature 1: per-install harness version + contract-verification
     /// state. Global-only like `llm_pricing` (a harness install is per
@@ -439,6 +426,25 @@ pub struct Settings {
     /// project overlay diff.
     #[serde(default)]
     pub harness_versions: HarnessVersions,
+    /// V40 Phase B (locked decision 5), schema 36: **per-harness settings**,
+    /// keyed by the registry id (`"claude"`, `"opencode"`, later `"codex"`).
+    ///
+    /// Machine scope, like `harness_versions` and `sandbox`: it carries state
+    /// written out of band (the version the transcript tap observed, the
+    /// auto-verify record) beside configuration that is about the harness
+    /// INSTALL on this machine (where its local proxy is, whether its status
+    /// line is on, whether cImp derived a provider block for it). None of that
+    /// is a property of the project you happen to have open, so `harness` is in
+    /// `OVERLAY_BANNED_KEYS` and a Settings save writes it through to the
+    /// physical global file — the `sandbox` pattern exactly.
+    ///
+    /// A `String` key rather than a `HarnessId`: an id nobody registered must
+    /// survive a load/save round trip (a `harness.codex` block written by a
+    /// newer build, or by hand), and a typed key would refuse to parse it.
+    /// Every ACCESSOR takes a `HarnessId` — see [`Self::harness_settings`] —
+    /// so no reader spells one either.
+    #[serde(default)]
+    pub harness: BTreeMap<String, HarnessSettings>,
     /// V23 Phase A: Code Audit (aggregated security scanning) config. Off by
     /// default; `enabled` gates the reserved Code Audit dashboard tab (mirrors
     /// `ui.tool_activity_tab`) and the bottom-bar entry point. Additive
@@ -470,7 +476,6 @@ impl Default for Settings {
             behavior: BehaviorSettings::default(),
             usage: UsageSettings::default(),
             system_stats: SystemStatsSettings::default(),
-            statusline: StatuslineSettings::default(),
             compose: ComposeSettings::default(),
             shortcuts: ShortcutSettings::default(),
             tabs: Vec::new(),
@@ -480,7 +485,6 @@ impl Default for Settings {
             layout_presets: Vec::new(),
             ui: UiSettings::default(),
             terminal: TerminalSettings::default(),
-            claude_local: ClaudeLocalSettings::default(),
             external_tools: ExternalToolsSettings::default(),
             offload: OffloadSettings::default(),
             graph: GraphSettings::default(),
@@ -499,13 +503,14 @@ impl Default for Settings {
             templates_seeded: false,
             // A fresh install takes the whole current table from
             // `default_llm_pricing`, so it starts already topped up.
-            pricing_seeded_generation: PRICING_GENERATION,
+            pricing_seeded_generation: crate::pricing::PRICING_GENERATION,
             advisor_dismissed: Vec::new(),
             advisor_applied: Vec::new(),
             preview_last_url: None,
             preview_allow_remote: false,
-            llm_pricing: default_llm_pricing(),
+            llm_pricing: crate::pricing::default_llm_pricing(),
             harness_versions: HarnessVersions::default(),
+            harness: default_harness_settings(),
             code_audit: CodeAuditSettings::default(),
             tool_plugins: ToolPluginsSettings::default(),
         }
@@ -612,23 +617,10 @@ pub struct ToolPluginsSettings {
     /// (`loader::LoadedPlugin::tool_key`). The fallback when the current
     /// project names none.
     pub global_paths: BTreeMap<String, String>,
-    /// V38 F-3: advertise the `run_command` MCP tool — the registry's runnable
-    /// `command`-kind entries, under one tool with a `tool` enum — to Claude
-    /// Code tabs.
-    ///
-    /// Default **on**, and the real gate is elsewhere: the tool is hidden unless
-    /// at least one `command`-kind entry is enabled AND path-configured, which
-    /// on a fresh install is none of them. So a default of `false` would only
-    /// mean "the user configured a command tool and then had to find a second
-    /// switch to use it" — the `code_audit.expose_*` precedent, for the same
-    /// reason (there the master `enabled` is the gate; here it is the runnable
-    /// set).
-    pub expose_commands_claude: bool,
-    /// V38 F-3: the same for OpenCode tabs. OpenCode caches `tools/list` at
-    /// connect, so flipping this (or configuring the first command tool)
-    /// refreshes the advertised list only after a tab restart — the same known
-    /// caveat `code_audit.expose_opencode` carries.
-    pub expose_commands_opencode: bool,
+    // V38 F-3's `expose_commands_claude` / `_opencode` pair is
+    // `Settings::harness[<id>].expose_commands` since V40 Phase B (locked
+    // decision 5) — one field per harness instead of one field pair per
+    // question, and no third field to add for a third harness.
 }
 
 impl Default for ToolPluginsSettings {
@@ -637,26 +629,15 @@ impl Default for ToolPluginsSettings {
             plugins: BTreeMap::new(),
             project_paths: BTreeMap::new(),
             global_paths: BTreeMap::new(),
-            expose_commands_claude: true,
-            expose_commands_opencode: true,
         }
     }
 }
 
-impl ToolPluginsSettings {
-    /// Whether `command`-kind tools are advertised to this consumer
-    /// (`"claude"` / `"opencode"`, matched the way
-    /// `graph::mcp::source_for_consumer` matches: anything not OpenCode is
-    /// Claude). The one place the mapping lives, so an unrecognized consumer
-    /// name cannot mean "exposed" on one surface and "hidden" on another.
-    pub fn commands_exposed_to(&self, consumer: &str) -> bool {
-        if consumer.eq_ignore_ascii_case("opencode") {
-            self.expose_commands_opencode
-        } else {
-            self.expose_commands_claude
-        }
-    }
-}
+// `ToolPluginsSettings::commands_exposed_to(consumer)` is gone with the field
+// pair it read: the question "is `run_command` advertised to this harness" is
+// `Settings::harness_settings(h).expose_commands`, asked with a `HarnessId`
+// rather than a free string whose unrecognized values used to resolve as
+// Claude.
 
 /// One plugin's user state.
 ///
@@ -837,97 +818,49 @@ fn object_entries(v: Option<&serde_json::Value>, what: &str) -> Vec<(String, ser
     }
 }
 
-/// V16 Feature 1 (harness version tripwire) + Feature 0 (contract spikes):
-/// what harness versions this install has seen, which Claude Code version
-/// the hook contracts were last hands-on verified against, and the recorded
-/// outcomes of the two V11 `TODO(spike)` contracts. All plain strings so a
-/// hand edit in `settings.json` is always possible (the D0/E1 outcomes are
-/// *recorded* here after a manual spike run — see
-/// `docs/MAINTENANCE.md` → "Claude Code / OpenCode CLIs").
+/// V16 Feature 0 (contract spikes): the recorded outcomes of the two V11
+/// `TODO(spike)` contracts — the questions no payload reveals and no fixture
+/// can settle, answered by a human running the recipe in the owning harness's
+/// `harness/<id>/README.md` -> "Open spikes". Plain strings so a hand edit in
+/// `settings.json` is always possible.
+///
+/// **V40 Phase B emptied the version half of this struct.** The five fields
+/// that used to live here — `claude_last_seen`, `claude_last_verified`,
+/// `opencode_last_seen`, `claude_auto_verify` and `input_profile_status` —
+/// were per-harness state spelled as harness-named scalars, three of them with
+/// no OpenCode twin at all. They are [`HarnessSettings`] rows now
+/// (`Settings::harness`), reached by [`Settings::harness_settings`]. What is
+/// left is genuinely global: two spike outcomes about ONE harness's hook
+/// contracts, kept here because their READER is the neutral capability gate and
+/// their `Capability` rows already say which harness they are about.
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 #[serde(default)]
 pub struct HarnessVersions {
-    /// Latest Claude Code version observed in a transcript (`version` field
-    /// on session JSONL entries), e.g. `"2.1.14"`. Empty until a Claude tab
-    /// has run once. Written by the OOB tap, once per session at most.
-    pub claude_last_seen: String,
-    /// Claude Code version the MAINTENANCE.md contract checks were last run
-    /// against. Set from the Advisor card's "Mark verified" action (or by
-    /// hand). `claude_last_seen != claude_last_verified` ⇒ the Advisor
-    /// raises the `drift.harness_version.v1` notice.
-    pub claude_last_verified: String,
-    /// Latest OpenCode version from `opencode --version` at tab spawn.
-    /// Informational for now (no verified-against tracking — the OpenCode
-    /// contract surface is the generated plugin, gated by its own spike).
-    /// Write-only today: nothing consumes it yet — recorded so the history
-    /// exists when the OpenCode spike lands, not wired anywhere.
-    pub opencode_last_seen: String,
     /// Outcome of the E1 spike (PreToolUse deny `permissionDecisionReason`
     /// reaches the model): `"unverified" | "pass" | "fail"`. `"fail"` hard
-    /// blocks the read advisor — the Settings toggle renders disabled and
-    /// `tabs/config.rs` refuses to install the PreToolUse hook regardless of
+    /// blocks the read advisor — the Settings toggle renders disabled and the
+    /// launch path refuses to install the PreToolUse hook regardless of
     /// `graph.read_advisor`.
     ///
     /// V35 Phase E: this field is **input to a gate, not a gate**. Nothing may
     /// interpret it here — the one query that turns it into a verdict is
     /// [`crate::harness::contract::gate`], keyed by the capability id
-    /// `claude.hook.pretooluse_deny`. (`e1_blocked()` used to live on this
-    /// struct with a hand-kept TypeScript twin; both are gone.) The separate,
-    /// deliberately STRICTER `== "pass"` checks — `advisor::Signals::e1_pass`
-    /// and its reader in `ipc/commands.rs` — mean *proven* rather than *not
-    /// known-broken* and are NOT the same test; see the F2 note on
-    /// `contract::spike_status_blocks`.
+    /// `claude.hook.pretooluse_deny`. The separate, deliberately STRICTER
+    /// `== "pass"` checks — `advisor::Signals::e1_pass` and its reader in
+    /// `ipc/commands.rs` — mean *proven* rather than *not known-broken* and are
+    /// NOT the same test; see the F2 note on `contract::spike_status_blocks`.
     pub e1_status: String,
     /// Outcome of the D0 spike (PreCompact `additionalContext` reaches the
     /// compaction prompt): `"unverified" | "pass" | "fail"`. Informational —
     /// a fail warns (the feature degrades to a no-op, it can't misbehave).
     pub d0_status: String,
-    /// V39 Phase B: outcome of the **input-profile spike** —
-    /// `"unverified" | "pass" | "fail"`.
-    ///
-    /// The question it records: *does a harness TUI on this machine accept a
-    /// pasted multi-line request as ONE turn?* No payload reveals it and no
-    /// fixture can settle it (the same class as [`Self::e1_status`] and
-    /// [`Self::d0_status`]), and getting it wrong is silent — a split paste
-    /// makes the worker answer a truncated question perfectly.
-    ///
-    /// **Input to a gate, not a gate.** The one query that interprets it is
-    /// [`crate::harness::contract::gate`] keyed by `delegation.worker`; a
-    /// recorded `"fail"` (or anything unrecognized —
-    /// `contract::spike_status_blocks` fails closed) turns cross-harness
-    /// delegation off entirely: no `delegate_task_*` tool is advertised and no
-    /// tab can be driven.
-    pub input_profile_status: String,
-    /// V35 Phase F: the last **automatic** verification run for Claude Code —
-    /// the L1 embedded canaries plus the L2 live probes, run in the background
-    /// when [`Self::claude_last_seen`] changes and once at startup when it does
-    /// not match [`Self::claude_last_verified`].
-    ///
-    /// `None` until the first run, which is a genuinely different state from
-    /// "ran and passed": it is what makes the version tripwire the
-    /// *cannot-verify fallback* it became in Phase F (see
-    /// `harness::verify::supersedes_tripwire`). Additive and
-    /// `#[serde(default)]` via the container attribute, so a pre-V35 global
-    /// `settings.json` loads it as `None` — pinned by
-    /// `tests::harness_versions_loads_a_pre_phase_f_file_with_no_auto_verify`.
-    ///
-    /// Written ONLY through
-    /// `settings::persistence::mutate_global_harness_versions`, like every
-    /// other field here (`ipc/commands.rs` bans `harness_versions` from the
-    /// project overlay diff, so a Settings save cannot carry it).
-    pub claude_auto_verify: Option<AutoVerify>,
 }
 
 impl Default for HarnessVersions {
     fn default() -> Self {
         Self {
-            claude_last_seen: String::new(),
-            claude_last_verified: String::new(),
-            opencode_last_seen: String::new(),
-            e1_status: "unverified".to_string(),
-            d0_status: "unverified".to_string(),
-            input_profile_status: "unverified".to_string(),
-            claude_auto_verify: None,
+            e1_status: SPIKE_UNVERIFIED.to_string(),
+            d0_status: SPIKE_UNVERIFIED.to_string(),
         }
     }
 }
@@ -989,9 +922,413 @@ pub struct AutoVerifyFailure {
     pub detail: String,
 }
 
+// ── the per-harness settings map (V40 locked decision 5) ────────────────────
+
+/// **One harness's settings.** The value type of [`Settings::harness`].
+///
+/// V40 Phase B, schema 36. Before it, every one of these was half of a FIELD
+/// PAIR — `expose_commands_claude` / `expose_commands_opencode`,
+/// `code_audit.expose_claude` / `_opencode`, `claude_last_seen` /
+/// `opencode_last_seen`, `claude_access` / `opencode_access` — and adding a
+/// third harness meant finding all of them, adding a field to each, adding a
+/// migration for each, and adding a `match` arm at every reader. The pairs that
+/// were *missing* a half were worse: `claude_last_verified` and
+/// `claude_auto_verify` had no OpenCode twin at all, so half the drift
+/// machinery simply did not exist for the second harness cImp ships.
+///
+/// A map ends both. An absent key reads [`Self::defaults_for`] — the core
+/// defaults plus every declared `ext` default — so **a harness added later
+/// needs no migration**, which is the whole point of the decision.
+///
+/// # `ext`
+///
+/// Settings only ONE harness has (locked decision 6) live in [`Self::ext`], an
+/// opaque object whose schema, defaults and validation are the plugin's
+/// (`HarnessPlugin::settings_schema`). Core stores it, type-checks the declared
+/// keys at the parse boundary and folds the spawn-baked ones into the spawn
+/// signature — and never names a key.
+///
+/// # Unknown keys survive
+///
+/// Both levels round-trip what they do not understand. A `harness.codex` block
+/// written by a newer cImp (or by hand) keeps its fields through a load/save on
+/// a build that has no such harness — [`Self::unknown`] catches anything
+/// outside the core fields, and an ext key nobody declares is left alone. A
+/// downgrade that silently deleted the settings of the harness you just
+/// upgraded for is the failure this exists to prevent.
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct HarnessSettings {
+    /// V38 F-3: advertise the `run_command` MCP tool — the registry's runnable
+    /// `command`-kind entries under one tool with a `tool` enum — to this
+    /// harness's tabs. Was `tool_plugins.expose_commands_{claude,opencode}`.
+    ///
+    /// Default **on**, and the real gate is elsewhere: the tool is hidden
+    /// unless at least one `command`-kind entry is enabled AND path-configured,
+    /// which on a fresh install is none of them.
+    pub expose_commands: bool,
+    /// V26: advertise the `cimp-code-audit` MCP server to this harness's tabs.
+    /// Was `code_audit.expose_{claude,opencode}`. ANDed with the master
+    /// `code_audit.enabled`, and re-checked per run at `/audit/run`, so
+    /// unchecking it blocks scans immediately rather than at the next restart.
+    pub expose_code_audit: bool,
+    /// Latest version of this harness cImp has observed — Claude's from the
+    /// transcript `version` field, OpenCode's from `opencode --version` at tab
+    /// spawn. Empty until the harness has run once. Written by
+    /// `settings::persistence::note_harness_version`, change-guarded.
+    pub last_seen: String,
+    /// The version this harness's MAINTENANCE.md contract checks were last run
+    /// against — by the Advisor card's *Mark verified*, by hand, or by an
+    /// all-pass auto-verify run. `last_seen != last_verified` is the version
+    /// tripwire's condition.
+    pub last_verified: String,
+    /// V39 Phase B, per-harness since V40 Phase B (amendment 0-f): outcome of
+    /// **this harness's** input-profile spike —
+    /// `"unverified" | "pass" | "fail"`.
+    ///
+    /// The question it records: *does this harness's TUI on this machine accept
+    /// a pasted multi-line request as ONE turn?* No payload reveals it and no
+    /// fixture can settle it (the same class as [`HarnessVersions::e1_status`]
+    /// and `d0_status`), and getting it wrong is silent — a split paste makes
+    /// the worker answer a truncated question perfectly.
+    ///
+    /// It was ONE scalar for all harnesses until V40 Phase B, which is two
+    /// defects in one field: a `"fail"` recorded against one TUI removed every
+    /// `delegate_task_*` tool and refused delegation for every harness, and a
+    /// `"pass"` recorded against Claude silently vouched for a harness nobody
+    /// had ever typed into. The 35 -> 36 migration copies the single value into
+    /// every existing key — the honest carry-over, since the recorded spike was
+    /// in fact run against whichever harnesses the user had.
+    ///
+    /// **Input to a gate, not a gate.** The one query that interprets it is
+    /// [`crate::harness::contract::gate_for`] keyed by `delegation.worker`, and
+    /// it resolves the row of the WORKER's harness.
+    pub input_profile_status: String,
+    /// V35 Phase F: this harness's last **automatic** verification run — the L1
+    /// embedded canaries plus the L2 live probes, run in the background when
+    /// [`Self::last_seen`] changes and once at startup when it does not match
+    /// [`Self::last_verified`].
+    ///
+    /// `None` until the first run, which is a genuinely different state from
+    /// "ran and passed": it is what makes the version tripwire the
+    /// *cannot-verify fallback* it became in Phase F (see
+    /// `harness::verify::supersedes_tripwire`).
+    pub auto_verify: Option<AutoVerify>,
+    /// This harness's OWN settings — the plugin's `settings_schema()` fields,
+    /// stored opaquely. See the type docs.
+    pub ext: BTreeMap<String, serde_json::Value>,
+    /// Anything else the file carried. See *Unknown keys survive* above.
+    #[serde(flatten)]
+    pub unknown: serde_json::Map<String, serde_json::Value>,
+}
+
+impl Default for HarnessSettings {
+    fn default() -> Self {
+        Self {
+            expose_commands: true,
+            expose_code_audit: true,
+            last_seen: String::new(),
+            last_verified: String::new(),
+            input_profile_status: SPIKE_UNVERIFIED.to_string(),
+            auto_verify: None,
+            ext: BTreeMap::new(),
+            unknown: serde_json::Map::new(),
+        }
+    }
+}
+
+/// Redacts every `ext` value any registered plugin declares `secret`.
+///
+/// The union across plugins rather than this row's own harness, because a
+/// `HarnessSettings` does not carry its id — and over-redacting a log line is
+/// free where under-redacting one writes an auth token into the rolling log.
+/// This is the defense-in-depth `ClaudeLocalSettings`'s hand-rolled `Debug`
+/// carried before its three fields became `ext` rows.
+impl std::fmt::Debug for HarnessSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let ext: BTreeMap<&str, serde_json::Value> = self
+            .ext
+            .iter()
+            .map(|(k, v)| {
+                if !secret_ext_key(k) {
+                    return (k.as_str(), v.clone());
+                }
+                let shown = if v.as_str().is_some_and(str::is_empty) {
+                    "<empty>"
+                } else {
+                    "<redacted>"
+                };
+                (k.as_str(), serde_json::Value::String(shown.to_string()))
+            })
+            .collect();
+        f.debug_struct("HarnessSettings")
+            .field("ext", &ext)
+            .field("expose_commands", &self.expose_commands)
+            .field("expose_code_audit", &self.expose_code_audit)
+            .field("last_seen", &self.last_seen)
+            .field("last_verified", &self.last_verified)
+            .field("input_profile_status", &self.input_profile_status)
+            .field("auto_verify", &self.auto_verify)
+            .field("unknown", &self.unknown)
+            .finish()
+    }
+}
+
+/// Whether ANY registered plugin declares `key` a credential.
+fn secret_ext_key(key: &str) -> bool {
+    crate::harness::registry::HARNESSES.iter().any(|d| {
+        d.plugin
+            .settings_schema()
+            .iter()
+            .any(|f| f.key == key && f.secret)
+    })
+}
+
+/// The recorded-spike value meaning "nobody has run this check".
+pub const SPIKE_UNVERIFIED: &str = "unverified";
+
+impl HarnessSettings {
+    /// What an ABSENT `harness[<id>]` key reads as: the core defaults above
+    /// plus every field `id`'s plugin declares, at its declared default.
+    pub fn defaults_for(h: crate::harness::HarnessId) -> Self {
+        let mut out = Self::default();
+        if let Some(p) = h.plugin() {
+            for field in p.settings_schema() {
+                out.ext
+                    .insert(field.key.to_string(), field.default.to_json());
+            }
+        }
+        out
+    }
+}
+
+// ── the per-harness map: defaults, accessors, parse-boundary validation ─────
+
+/// Every registered harness's row at its defaults — what a fresh install
+/// materializes into `Settings::harness`.
+///
+/// Materialized rather than left implicit so the block is visible and
+/// hand-editable in `settings.json`; the accessors below fall back to the same
+/// values, so a deleted key behaves identically to a present one.
+pub fn default_harness_settings() -> BTreeMap<String, HarnessSettings> {
+    crate::harness::registry::HARNESSES
+        .iter()
+        .map(|d| (d.id.to_string(), HarnessSettings::defaults_for(d.harness())))
+        .collect()
+}
+
+/// The fallback row for a [`crate::harness::HarnessId`] with no registry slot
+/// (`HarnessId::ANY`). Core defaults, no `ext`.
+fn neutral_harness_settings() -> &'static HarnessSettings {
+    static NEUTRAL: std::sync::OnceLock<HarnessSettings> = std::sync::OnceLock::new();
+    NEUTRAL.get_or_init(HarnessSettings::default)
+}
+
+/// The defaults, built once, so [`Settings::harness_settings`] can hand out a
+/// reference for an absent key instead of cloning one per call.
+fn harness_defaults() -> &'static crate::harness::PerHarness<HarnessSettings> {
+    static DEFAULTS: std::sync::OnceLock<crate::harness::PerHarness<HarnessSettings>> =
+        std::sync::OnceLock::new();
+    DEFAULTS.get_or_init(|| crate::harness::PerHarness::from_fn(HarnessSettings::defaults_for))
+}
+
+impl Settings {
+    /// **The** per-harness settings read (V40 locked decision 5).
+    ///
+    /// Takes a [`crate::harness::HarnessId`], so no caller spells a harness
+    /// name, and answers the declared defaults for a key the file does not
+    /// carry — which is what lets a harness registered later work with no
+    /// migration and no backfill.
+    pub fn harness_settings(&self, h: crate::harness::HarnessId) -> &HarnessSettings {
+        h.id()
+            .and_then(|id| self.harness.get(id))
+            .or_else(|| harness_defaults().get(h))
+            .unwrap_or_else(|| neutral_harness_settings())
+    }
+
+    /// The writable row, created at its declared defaults if absent.
+    ///
+    /// `None` for an id with no registry slot: a write about a harness nobody
+    /// registered would invent a key no reader could ever resolve.
+    pub fn harness_settings_mut(
+        &mut self,
+        h: crate::harness::HarnessId,
+    ) -> Option<&mut HarnessSettings> {
+        let id = h.id()?;
+        Some(
+            self.harness
+                .entry(id.to_string())
+                .or_insert_with(|| HarnessSettings::defaults_for(h)),
+        )
+    }
+
+    /// One declared `ext` value, or its declared default.
+    ///
+    /// Core calls this only on a plugin's behalf (the spawn signature, the
+    /// Settings form); the plugin that declared the key is the one that names
+    /// it.
+    pub fn harness_ext(&self, h: crate::harness::HarnessId, key: &str) -> serde_json::Value {
+        if let Some(v) = self.harness_settings(h).ext.get(key) {
+            return v.clone();
+        }
+        h.plugin()
+            .and_then(|p| p.settings_schema().iter().find(|f| f.key == key))
+            .map(|f| f.default.to_json())
+            .unwrap_or(serde_json::Value::Null)
+    }
+
+    /// [`Self::harness_ext`] as a `bool`. A value of the wrong type reads as
+    /// the declared default — the parse boundary should already have replaced
+    /// it, and answering `false` for a hand-edited `"yes"` would silently turn
+    /// a protection off.
+    pub fn harness_ext_bool(&self, h: crate::harness::HarnessId, key: &str) -> bool {
+        let declared = h
+            .plugin()
+            .and_then(|p| p.settings_schema().iter().find(|f| f.key == key))
+            .map(|f| matches!(f.default, crate::harness::plugin::SettingDefault::Bool(true)))
+            .unwrap_or(false);
+        self.harness_ext(h, key).as_bool().unwrap_or(declared)
+    }
+
+    /// [`Self::harness_ext`] as a `String`; empty for anything not a string.
+    pub fn harness_ext_str(&self, h: crate::harness::HarnessId, key: &str) -> String {
+        self.harness_ext(h, key)
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// Write one `ext` value. Silently ignored for an unregistered id, for the
+    /// reason [`Self::harness_settings_mut`] answers `None`.
+    pub fn set_harness_ext(
+        &mut self,
+        h: crate::harness::HarnessId,
+        key: &str,
+        value: serde_json::Value,
+    ) {
+        if let Some(row) = self.harness_settings_mut(h) {
+            row.ext.insert(key.to_string(), value);
+        }
+    }
+
+    /// **The parse boundary for the harness map** (global principle 4:
+    /// declared is not enforced).
+    ///
+    /// Three things, in this order, and each one is a decision:
+    ///
+    /// 1. Every registered harness gets a row, materialized at its defaults.
+    ///    Visible in the file, hand-editable, and identical to what the
+    ///    accessors would have answered.
+    /// 2. Every DECLARED `ext` key is type-checked against its
+    ///    `SettingKind`; a value the kind rejects is replaced by the declared
+    ///    default and logged. A hand-edited `"statusline": "yes"` would
+    ///    otherwise reach the launch path as a string that every reader
+    ///    answers `false` for — a protection silently off, with the file
+    ///    saying it is on.
+    /// 3. An UNDECLARED key is left exactly as it is. Not a leniency gap: a key
+    ///    a newer cImp declares must survive a downgrade, and deleting it here
+    ///    would make "open the old build once" a data-loss operation. The same
+    ///    reasoning keeps an unregistered harness's whole row.
+    ///
+    /// Returns `true` if anything changed, so the caller can decide whether to
+    /// write back.
+    pub fn normalize_harness_settings(&mut self) -> bool {
+        let mut changed = false;
+        for d in crate::harness::registry::HARNESSES {
+            let h = d.harness();
+            let schema = d.plugin.settings_schema();
+            let row = self
+                .harness
+                .entry(d.id.to_string())
+                .or_insert_with(|| {
+                    changed = true;
+                    HarnessSettings::defaults_for(h)
+                });
+            for field in schema {
+                match row.ext.get(field.key) {
+                    None => {
+                        row.ext
+                            .insert(field.key.to_string(), field.default.to_json());
+                        changed = true;
+                    }
+                    Some(v) if !field.kind.accepts(v) => {
+                        tracing::warn!(
+                            harness = d.id,
+                            key = field.key,
+                            "settings: `harness.{}.ext.{}` holds a value its declared kind \
+                             rejects; reset to the declared default",
+                            d.id,
+                            field.key
+                        );
+                        row.ext
+                            .insert(field.key.to_string(), field.default.to_json());
+                        changed = true;
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+        changed
+    }
+}
+
+/// Test-only conveniences for the per-harness map.
+///
+/// Every one of these names a harness, which is exactly what a fixture is for:
+/// `layering`'s identity scan drops test regions, and what it polices is a
+/// PRODUCTION path spelling a harness name.
+#[cfg(test)]
+impl Settings {
+    /// One harness's row, created at its declared defaults if absent.
+    pub(crate) fn harness_row(&mut self, id: &str) -> &mut HarnessSettings {
+        let h = crate::harness::HarnessId::from_id(id).expect("registered harness");
+        self.harness_settings_mut(h).expect("registered harness")
+    }
+
+    /// One harness's row, read-only.
+    pub(crate) fn harness_row_of(&self, id: &str) -> &HarnessSettings {
+        let h = crate::harness::HarnessId::from_id(id).expect("registered harness");
+        self.harness_settings(h)
+    }
+
+    /// Write one declared `ext` value.
+    pub(crate) fn set_ext(&mut self, id: &str, key: &str, v: serde_json::Value) {
+        let h = crate::harness::HarnessId::from_id(id).expect("registered harness");
+        self.set_harness_ext(h, key, v);
+    }
+}
+
+/// Build an [`McpServerConfig::access`] map from `(id, granted)` pairs —
+/// **tests only**, for the same reason as `harness::per_harness_for_test`.
+#[cfg(test)]
+pub fn access_for_test(pairs: &[(&str, bool)]) -> BTreeMap<String, McpAccess> {
+    pairs
+        .iter()
+        .map(|(id, on)| ((*id).to_string(), McpAccess { enabled: *on }))
+        .collect()
+}
+
+/// Per-server MCP access for ONE harness — the value type of
+/// [`McpServerConfig::access`].
+///
+/// A struct rather than a bare `bool` because that is the shape the pair it
+/// replaced was already growing toward (V37 added a per-server *activation*
+/// question beside the grant, and V38 an audit one), and widening a
+/// `BTreeMap<String, bool>` later would be a second schema bump for a field
+/// that could have carried it from the start.
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct McpAccess {
+    /// Expose this server's tools to this harness, proxied through its
+    /// per-session `cimp-offload --consumer <id>` child. Off by default: a new
+    /// server reaches nothing until the user says so.
+    pub enabled: bool,
+}
+
 /// One provider/model price entry: USD per million tokens (MTok) for the four
-/// billing categories the transcripts report (`UsageTotals`' `in_tok` /
-/// `cache_make` / `cache_read` / `out_tok`). Fully user-editable in
+/// billing categories the transcripts report. The four ids are this table's own
+/// field names and the `usage_stat` columns' declared spellings (`input`,
+/// `cache_write`, `cache_read`, `output`). Fully user-editable in
 /// Settings → LLM pricing; the session-cost popup multiplies these against a
 /// session's token totals. `(provider, model)` is the display identity — no
 /// uniqueness is enforced, the popup just lists rows in order.
@@ -1015,130 +1352,11 @@ pub struct LlmPricingModel {
     pub output: f64,
 }
 
-/// Fresh-install price seeds (as of 2026-07): Anthropic API list prices
-/// and GitHub Copilot's per-token prices from its June 2026 usage-based
-/// billing (the Sonnet 5 row is the promo rate that runs through
-/// 2026-08-31). V16 decision (2026-07-12): the Anthropic rows seed cache
-/// write at the **1-hour-TTL 2x-input rate** — Claude Code sessions use the
-/// 1h cache, so the 5-minute tier's 1.25x would undersell what those
-/// sessions actually pay (cache read stays 0.1x input). Copilot's
-/// OpenAI/Google rows had no published cache-write premium, so those seed
-/// cache_write = input; all values are plain editable rows, not constants
-/// the app depends on. Anthropic rows carry a `model_prefix` so the Usage
-/// view's cost mode can auto-match transcript model ids (longest prefix
-/// wins); Copilot rows are manual-pick only (Copilot sessions never appear
-/// in the Claude transcript tap).
-pub fn default_llm_pricing() -> Vec<LlmPricingModel> {
-    vec![
-        row(
-            "Anthropic",
-            "Claude Fable 5",
-            "claude-fable-5",
-            [10.0, 20.0, 1.0, 50.0],
-        ),
-        // F-19 (2026-08-10): absent until rc.2, which is why a session on the
-        // default model priced at $0. Same list rates as the Opus 4.x rows.
-        row(
-            "Anthropic",
-            "Claude Opus 5",
-            "claude-opus-5",
-            [5.0, 10.0, 0.5, 25.0],
-        ),
-        row(
-            "Anthropic",
-            "Claude Opus 4.8",
-            "claude-opus-4-8",
-            [5.0, 10.0, 0.5, 25.0],
-        ),
-        row(
-            "Anthropic",
-            "Claude Opus 4.7",
-            "claude-opus-4-7",
-            [5.0, 10.0, 0.5, 25.0],
-        ),
-        row(
-            "Anthropic",
-            "Claude Opus 4.6",
-            "claude-opus-4-6",
-            [5.0, 10.0, 0.5, 25.0],
-        ),
-        row(
-            "Anthropic",
-            "Claude Sonnet 5",
-            "claude-sonnet-5",
-            [3.0, 6.0, 0.3, 15.0],
-        ),
-        row(
-            "Anthropic",
-            "Claude Sonnet 4.6",
-            "claude-sonnet-4-6",
-            [3.0, 6.0, 0.3, 15.0],
-        ),
-        row(
-            "Anthropic",
-            "Claude Haiku 4.5",
-            "claude-haiku-4-5",
-            [1.0, 2.0, 0.1, 5.0],
-        ),
-        row(
-            "Copilot",
-            "Claude Sonnet 5 (promo)",
-            "",
-            [2.0, 2.5, 0.2, 10.0],
-        ),
-        row("Copilot", "Claude Sonnet 4.6", "", [3.0, 3.75, 0.3, 15.0]),
-        row("Copilot", "Claude Opus 4.8", "", [5.0, 6.25, 0.5, 25.0]),
-        row("Copilot", "Claude Haiku 4.5", "", [1.0, 1.25, 0.1, 5.0]),
-        row("Copilot", "GPT-5 mini", "", [0.25, 0.25, 0.025, 2.0]),
-        row("Copilot", "GPT-5.4", "", [2.5, 2.5, 0.25, 15.0]),
-        row("Copilot", "GPT-5.5", "", [5.0, 5.0, 0.5, 30.0]),
-        row("Copilot", "Gemini 2.5 Pro", "", [1.25, 1.25, 0.31, 10.0]),
-        row("Copilot", "Gemini 3.5 Flash", "", [1.5, 1.5, 0.38, 9.0]),
-    ]
-}
-
-fn row(provider: &str, model: &str, prefix: &str, prices: [f64; 4]) -> LlmPricingModel {
-    LlmPricingModel {
-        provider: provider.to_string(),
-        model: model.to_string(),
-        model_prefix: prefix.to_string(),
-        input: prices[0],
-        cache_write: prices[1],
-        cache_read: prices[2],
-        output: prices[3],
-    }
-}
-
-/// Which batch of built-in price rows this build knows about. **Bump this by
-/// one, and extend [`pricing_rows_since`], every time a model is added to
-/// [`default_llm_pricing`]** — otherwise the new row reaches fresh installs
-/// only and every existing install silently prices that model at $0 (F-19).
-///
-/// Generation 0 is the pre-2026-08-10 table (no `claude-opus-5`); generation 1
-/// adds it.
-pub const PRICING_GENERATION: u32 = 1;
-
-/// The built-in rows introduced *after* generation `since` — the top-up set
-/// for an install whose stored table predates this build.
-///
-/// Deliberately NOT "every built-in row the stored table is missing". The
-/// price table is user-owned: a row the user deleted must stay deleted, and
-/// only the watermark can tell "deleted" apart from "never shipped". Callers
-/// additionally skip any row whose `model_prefix` the stored table already
-/// carries, so a hand-added row is topped up to a no-op rather than a
-/// duplicate — which is exactly the state the user who reported F-19 is in.
-pub fn pricing_rows_since(since: u32) -> Vec<LlmPricingModel> {
-    let mut out = Vec::new();
-    if since < 1 {
-        out.push(row(
-            "Anthropic",
-            "Claude Opus 5",
-            "claude-opus-5",
-            [5.0, 10.0, 0.5, 25.0],
-        ));
-    }
-    out
-}
+// The seeded price table and its top-up watermark moved to `crate::pricing`
+// (V40 locked decision 29): they are **provider** knowledge, not harness
+// knowledge and not a persisted shape. `LlmPricingModel` above is the on-disk
+// row and stays here; `default_llm_pricing` / `pricing_rows_since` /
+// `PRICING_GENERATION` are `crate::pricing`'s.
 
 /// V14 Phase D2: one dismissed advisor proposal. `rule_id` mirrors
 /// `advisor::Proposal::rule_id` (a versioned string constant, e.g.
@@ -1254,10 +1472,23 @@ impl LogRetention {
     }
 }
 
-/// One of the three reserved AI-tool tab ids. Wire format is the kebab-
+/// One of the reserved AI-tool tab ids. Wire format is the kebab-
 /// case tab-id string (`"claude"`, `"claude-local"`, `"opencode"`); the type
 /// exists so `enabled_ai_tabs` can be a strongly-typed `Vec<AiTabId>` instead
 /// of an untyped string list.
+///
+/// **This enum is still closed, and the registry is what fills it** (V40 review
+/// finding M-3). Locked decision 3 kept the wire encodings and turned the
+/// per-harness `match` arms into registry lookups; the arms below are the half
+/// that did not move, because `Vec<AiTabId>` on disk is a wire format and
+/// widening it to `Vec<String>` is a schema change, not a refactor. What DOES
+/// exist is the join: `layering::every_registry_entry_is_fully_wired` (10(b))
+/// fails, naming the id, if a descriptor declares a `tab_ids` entry that has no
+/// variant here, no `TabId::from_str` arm and no `default_ai_tab` arm — so a
+/// third harness cannot ship half-wired, silently dropped from
+/// [`canonical_ai_tab_order`] and un-enableable by the user. Closing it
+/// properly is `HarnessDescriptor::default_tab(tab_id)` plus a
+/// `Vec<String>` `enabled_ai_tabs`, and it is a recorded residual.
 ///
 /// V19 ships a single OpenCode tab (not a cloud/local pair like Claude):
 /// OpenCode addresses many providers as `provider/model`, switches between
@@ -1278,6 +1509,14 @@ pub enum AiTabId {
 }
 
 impl AiTabId {
+    /// Every variant, in declaration order.
+    ///
+    /// Hand-kept, and pinned in both directions by
+    /// `the_ai_tab_enum_and_the_registry_are_the_same_list`: a variant with no
+    /// descriptor and a descriptor with no variant both fail a test rather than
+    /// producing a tab nothing can enable.
+    pub const ALL: &'static [AiTabId] = &[Self::Claude, Self::ClaudeLocal, Self::OpenCode];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Claude => CLAUDE_TAB_ID,
@@ -1286,13 +1525,10 @@ impl AiTabId {
         }
     }
 
+    /// Over [`Self::ALL`] rather than a second literal table: the id spellings
+    /// live in [`Self::as_str`] once, so the two cannot drift.
     pub fn from_id(id: &str) -> Option<Self> {
-        match id {
-            CLAUDE_TAB_ID => Some(Self::Claude),
-            CLAUDE_LOCAL_TAB_ID => Some(Self::ClaudeLocal),
-            OPENCODE_TAB_ID => Some(Self::OpenCode),
-            _ => None,
-        }
+        Self::ALL.iter().copied().find(|t| t.as_str() == id)
     }
 
     /// True for the local-provider variants (`claude-local`). The integrity
@@ -1307,12 +1543,42 @@ impl AiTabId {
     /// `integrity_check` so re-adding a previously-disabled AI tab lands in
     /// the same slot every time.
     pub fn canonical_order(self) -> usize {
-        match self {
-            Self::Claude => 0,
-            Self::ClaudeLocal => 1,
-            Self::OpenCode => 2,
-        }
+        // V40 Phase A: the registry's canonical order, not a literal ranking.
+        // A reserved tab id no descriptor claims sorts last rather than
+        // colliding with slot 0 — an unknown built-in is not "the first one".
+        canonical_ai_tab_order()
+            .iter()
+            .position(|&id| id == self)
+            .unwrap_or(usize::MAX)
     }
+}
+
+/// The reserved AI tab ids in **canonical tab-bar order**, flattened out of the
+/// registry (`claude` → `claude-local` → `opencode` today).
+///
+/// V40 Phase A: this used to be a literal `[AiTabId::Claude, ..]` array written
+/// out in three places (`persistence::restore_enabled_ai_builtins`,
+/// `ipc::tab_lifecycle`, and `AiTabId::canonical_order`), which is three places
+/// a new harness's tab could be forgotten and only one of them would have said
+/// so. The order is the descriptors' declaration order and each descriptor's own
+/// `tab_ids` order — so a harness owns where its tabs sit relative to its own,
+/// and the registry owns where harnesses sit relative to each other.
+///
+/// V40 review M-3: the `filter_map` **drops** a registered tab id that has no
+/// `AiTabId` variant, which is the one way a third harness could reach a shipped
+/// build with no canonical position and no way for the user to enable it. That
+/// cannot happen silently any more — 10(b) refuses the descriptor — and the
+/// assertion below is the runtime half, so a debug build says which id went
+/// missing rather than rendering a tab bar one entry short.
+pub fn canonical_ai_tab_order() -> Vec<AiTabId> {
+    let declared = crate::harness::registry::canonical_tab_ids();
+    let out: Vec<AiTabId> = declared.iter().filter_map(|id| AiTabId::from_id(id)).collect();
+    debug_assert_eq!(
+        out.len(),
+        declared.len(),
+        "a registered reserved tab id has no `AiTabId` variant: {declared:?}"
+    );
+    out
 }
 
 impl Settings {
@@ -1349,7 +1615,7 @@ impl Settings {
     /// permission signal on a default install. Tripwire:
     /// `tabs::config::tests::every_advertised_mcp_server_gets_a_loopback`.
     pub fn loopback_needed(&self) -> bool {
-        self.offload.mcp_host_needed() || self.graph.enabled || self.code_audit.mcp_exposed()
+        self.offload.mcp_host_needed() || self.graph.enabled || self.code_audit.mcp_exposed(self)
     }
 
     /// **The whole offload pool: configured backends + the V39 facades.**
@@ -1841,51 +2107,12 @@ pub struct PreviewTabConfig {
     pub auto_reload: bool,
 }
 
-/// V1.4-07: local-LLM provider configuration. When an AI tab has
-/// `use_local_provider: true`, the launch flow composes env vars from
-/// these fields onto the spawn process, allowing Claude Code to talk
-/// to a local proxy (typically LiteLLM bridging to Ollama / LM Studio /
-/// other OpenAI-compatible endpoints) instead of api.anthropic.com.
-/// Stored cleartext in settings.json — local proxies typically accept
-/// dummy tokens. OS-keychain integration is documented as a future
-/// upgrade in `docs/FUTURE-FEATURES-keyring.md`.
-///
-/// The `Debug` impl is hand-rolled to redact `auth_token` so any
-/// accidental `?settings` / `?cfg` log line cannot leak the secret to
-/// the rolling log file. This is defense-in-depth against future code
-/// that adds such a log line; today no caller logs the struct.
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ClaudeLocalSettings {
-    pub base_url: String,
-    pub auth_token: String,
-    pub model_alias: String,
-}
-
-impl std::fmt::Debug for ClaudeLocalSettings {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let redacted = if self.auth_token.is_empty() {
-            "<empty>"
-        } else {
-            "<redacted>"
-        };
-        f.debug_struct("ClaudeLocalSettings")
-            .field("base_url", &self.base_url)
-            .field("auth_token", &redacted)
-            .field("model_alias", &self.model_alias)
-            .finish()
-    }
-}
-
-impl Default for ClaudeLocalSettings {
-    fn default() -> Self {
-        Self {
-            base_url: "http://localhost:4000".to_string(),
-            auth_token: "sk-dummy".to_string(),
-            model_alias: String::new(),
-        }
-    }
-}
+// `ClaudeLocalSettings` moved to the Claude plugin's declared settings in V40
+// Phase B (locked decision 6): `base_url` / `auth_token` / `model_alias` are
+// three `ext` rows on `Settings::harness["claude"]`, declared by
+// `HarnessPlugin::settings_schema` and read only by the code that synthesizes
+// the `ANTHROPIC_*` env. The hand-rolled `Debug` that redacted the token is
+// now `HarnessSettings`'s, driven by the `secret` column on the declaration.
 
 /// Optional explicit executable paths for the bundled quick-launch tools
 /// (the bottom-bar rustnet / broot buttons). Each field, when non-empty, is
@@ -1941,22 +2168,11 @@ pub struct CodeAuditSettings {
     /// This switch stays here because it is a property of the Code Audit
     /// FEATURE rather than of any one tool.
     pub quality_auto_select: bool,
-    /// V26: advertise the `cimp-code-audit` MCP server to Claude Code tabs.
-    /// When on (default), `tabs::config::build_pre_args` inserts the server
-    /// into the session's `--mcp-config` overlay so `security_audit` /
-    /// `quality_audit` appear in Claude's tool list. Exposure is ANDed with the
-    /// master `enabled` switch at the injection site (a disabled feature never
-    /// advertises), the loopback `/audit/run` route re-checks this flag per run
-    /// (so unchecking it takes effect for already-running tabs, no restart
-    /// needed), and `begin_scan` re-enforces the master switch.
-    pub expose_claude: bool,
-    /// V26: advertise the `cimp-code-audit` MCP server to OpenCode tabs,
-    /// injected into the generated `OPENCODE_CONFIG_CONTENT` `mcp` block by
-    /// `tabs::config::build_opencode_config`. Same `enabled`-AND gate and
-    /// per-run `/audit/run` re-check as `expose_claude` (unchecking blocks
-    /// scans immediately). OpenCode caches `tools/list` at connect, so the
-    /// *advertised list* only refreshes after a tab restart (known caveat).
-    pub expose_opencode: bool,
+    // The `expose_claude` / `expose_opencode` pair is
+    // `Settings::harness[<id>].expose_code_audit` since V40 Phase B (locked
+    // decision 5). `expose_offload` stays here: the offload worker is cImp's
+    // own in-process consumer, not a harness, and folding it into the harness
+    // map would have invented a harness to hold it.
     /// V26: advertise the code-audit native tools to the offload worker (the
     /// local model), gated in `offload::service::run_on` alongside the graph
     /// tools — enabled AND this flag AND a local backend. The scan always runs
@@ -1978,8 +2194,6 @@ impl Default for CodeAuditSettings {
             // install advertises nothing until Code Audit is turned on, at
             // which point every consumer sees the tools unless the user opts a
             // specific one out.
-            expose_claude: true,
-            expose_opencode: true,
             expose_offload: true,
         }
     }
@@ -1987,12 +2201,18 @@ impl Default for CodeAuditSettings {
 
 impl CodeAuditSettings {
     /// Whether the `cimp-code-audit` MCP server is advertised to at least one
-    /// stdio consumer (Claude Code or OpenCode) — i.e. an out-of-process
-    /// child will need the loopback. `expose_offload` is deliberately absent:
+    /// **harness** — i.e. an out-of-process child will need the loopback.
+    ///
+    /// Takes the whole `Settings` since V40 Phase B: the per-harness flags are
+    /// `Settings::harness[<id>].expose_code_audit`, and this iterates the
+    /// registry rather than OR-ing two named fields, so a third harness is
+    /// counted the day it registers. `expose_offload` is deliberately absent:
     /// the offload worker runs in-process and is already covered by
     /// `offload.enabled`.
-    pub fn mcp_exposed(&self) -> bool {
-        self.enabled && (self.expose_claude || self.expose_opencode)
+    pub fn mcp_exposed(&self, settings: &Settings) -> bool {
+        self.enabled
+            && crate::harness::registry::all()
+                .any(|h| settings.harness_settings(h).expose_code_audit)
     }
 }
 
@@ -2140,26 +2360,12 @@ pub struct OffloadSettings {
     /// unless a second, quality-tier backend exists, so zero-config setups are
     /// unaffected.
     pub escalate_partial: bool,
-    /// The OpenCode `local-llama` custom provider, derived from a Local
-    /// backend's `server_command` via the Offload settings "Add to OpenCode"
-    /// button (or kept in sync when [`opencode_provider_auto`] is on). When
-    /// `Some`, `build_opencode_config` injects a `provider.local-llama` block +
-    /// selects it as the default `model`, so a freshly opened OpenCode tab
-    /// talks to the local `llama-server` out of the box. `None` = never
-    /// registered. Additive `#[serde(default)]`.
-    ///
-    /// [`opencode_provider_auto`]: Self::opencode_provider_auto
-    pub opencode_provider: Option<OpencodeLocalProvider>,
-    /// When `true` AND the local offload server is [`enabled`], keep
-    /// [`opencode_provider`] in step with the primary Local backend's command:
-    /// re-derived at each OpenCode launch and re-persisted on a settings save
-    /// whenever the command changed. When the local server is disabled this
-    /// does nothing (the last snapshot, if any, stands). Off = the provider is
-    /// a manual snapshot the button wrote once.
-    ///
-    /// [`enabled`]: Self::enabled
-    /// [`opencode_provider`]: Self::opencode_provider
-    pub opencode_provider_auto: bool,
+    // The `opencode_provider` / `opencode_provider_auto` pair moved to the
+    // OpenCode plugin's declared settings in V40 Phase B (locked decision 6):
+    // `Settings::harness["opencode"].ext["provider"]` (the derived block, an
+    // opaque `SettingKind::Json` cImp writes and the user never types) and
+    // `ext["provider_auto"]`. `harness::opencode::config` resolves them; core
+    // stores them and names neither.
     /// V30 Phase A: register the `cimp-offload` MCP child as a Claude Code
     /// **channel** so it can push out-of-band notices straight into a live
     /// session (`notifications/claude/channel` → a `<channel source="…">`
@@ -2377,10 +2583,10 @@ pub struct OffloadSettings {
 /// [`injection`](crate::settings::injection) for the full reconciliation.
 ///
 /// **Every default is `true`** since the V39 posture decision — master on, and
-/// every sub-protection on. V32 Phase H's
-/// [`opencode_native_gate_enabled`](Self::opencode_native_gate_enabled) was the
-/// one exception until then; its opt-in nature now lives one level down, on a
-/// new tab's all-`Off` L3 row
+/// every sub-protection on. V32 Phase H's harness-scoped native-tool gate was
+/// the one exception until then (its L2 is a plugin `ext` row since V40 Phase
+/// B); its opt-in nature now lives one level down, on a new tab's all-`Off` L3
+/// row
 /// ([`injection::TabInjectionOverrides::all_off`](crate::settings::injection::TabInjectionOverrides)).
 /// An untouched settings file therefore resolves every app-wide level on, which
 /// is the ceiling the per-tab rows sit under.
@@ -2434,18 +2640,11 @@ pub struct InjectionSettings {
     /// own shell. Written into the same guidance channel as the hygiene
     /// paragraph, so it is spawn-baked too.
     pub(in crate::settings) tool_steering_enabled: bool,
-    /// L2: V32 Phase H (locked decision 17) — the OpenCode plugin denying the
-    /// harness's OWN native tools against the tab's taint latch, rather than
-    /// only beaconing on the web ones. Spawn-baked (the flag is compiled into
-    /// the generated plugin).
-    ///
-    /// **It defaulted `false` until V39**, by locked decision 17: whole-surface
-    /// denial of `bash`/`read`/`edit` under an EXTERNAL latch changes everyday
-    /// tab UX materially, so it had to be opt-in. V39 keeps the opt-in and moves
-    /// it down a level — a new tab's L3 row ships all `Off` — so this L2 joins
-    /// the others at `true`. See `settings::injection`
-    /// (`Feature::default_enabled`) for the full history.
-    pub(in crate::settings) opencode_native_gate_enabled: bool,
+    // V32 Phase H's `opencode_native_gate_enabled` is the OpenCode plugin's
+    // `ext["native_gate"]` since V40 Phase B (locked decision 6). It is the L2
+    // of a feature whose MECHANISM lives inside one harness's generated plugin,
+    // so core held an app-wide flag for a control that could only ever reach
+    // one harness — see `injection::Feature::scoped_harnesses`.
     /// L2: stripping terminal control sequences out of external text cImp
     /// composes into non-HTML sinks. App-wide — no per-scope row, because TTS
     /// and toasts are global surfaces (the global-only avatar/TTS decision).
@@ -2476,9 +2675,6 @@ impl Default for InjectionSettings {
             memory_quarantine_enabled: true,
             consumer_hygiene_enabled: true,
             tool_steering_enabled: true,
-            // V39: no longer the exception — see the field's docs and
-            // `injection::Feature::default_enabled`.
-            opencode_native_gate_enabled: true,
             terminal_escape_hygiene_enabled: true,
             worker: Default::default(),
         }
@@ -2516,10 +2712,8 @@ impl std::fmt::Debug for OffloadSettings {
             .field("max_queue_depth", &self.max_queue_depth)
             .field("escalate_partial", &self.escalate_partial)
             // No secrets beyond the (already-cleartext) `--api-key` the user
-            // themselves put in the server command; `OpencodeLocalProvider`
+            // themselves put in the server command; `LocalProviderBlock`
             // derives Debug.
-            .field("opencode_provider", &self.opencode_provider)
-            .field("opencode_provider_auto", &self.opencode_provider_auto)
             .field("session_push", &self.session_push)
             .field("external_fetch_max_calls", &self.external_fetch_max_calls)
             .field("external_fetch_max_bytes", &self.external_fetch_max_bytes)
@@ -2560,7 +2754,7 @@ impl std::fmt::Debug for OffloadSettings {
 /// session config OpenCode receives via `OPENCODE_CONFIG_CONTENT`.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(default)]
-pub struct OpencodeLocalProvider {
+pub struct LocalProviderBlock {
     /// OpenAI-compatible base URL, ending in `/v1`
     /// (e.g. `http://127.0.0.1:8080/v1`). Host + port come from `--host`
     /// (default `127.0.0.1`) and `--port` in the command.
@@ -2609,8 +2803,6 @@ impl Default for OffloadSettings {
             global_concurrency: None,
             max_queue_depth: None,
             escalate_partial: true,
-            opencode_provider: None,
-            opencode_provider_auto: false,
             session_push: false,
             // 40 fetches / 4 MiB per scope. Sized against real research
             // behaviour: a thorough multi-source task runs well under a dozen
@@ -3658,17 +3850,28 @@ pub struct McpServerConfig {
     /// Settings would never reconnect the server and the change would silently
     /// do nothing.
     pub auth_token: String,
-    /// Expose this server's tools to **Claude Code** (proxied through the
-    /// per-session `cimp-offload` child). Off by default — a deliberate opt-in.
-    pub claude_access: bool,
+    /// **Per-harness exposure**, keyed by registry id — V40 Phase B (locked
+    /// decision 5), schema 36. Replaces the `claude_access` / `opencode_access`
+    /// pair the 35 -> 36 migration copies into it.
+    ///
+    /// An absent key is *not exposed* ([`McpAccess::default`]), which is both
+    /// the pre-existing default for a new server and the only safe answer to a
+    /// grant question about a harness nobody has decided about. A key for an
+    /// unregistered harness round-trips untouched, so a downgrade does not
+    /// silently revoke a grant the user will get back on the next upgrade.
+    ///
+    /// Read through `offload::mcp_host::Consumer::wants`, never field by field:
+    /// that is where the offload/audit consumers' conservative fold onto the
+    /// same flags lives.
+    pub access: BTreeMap<String, McpAccess>,
     /// Expose this server's tools to the **offload worker** (the local model,
     /// via the warm `McpHost`). This is the legacy `enabled` behavior.
+    ///
+    /// Not in [`Self::access`] on purpose: the worker is cImp's own in-process
+    /// consumer, not a harness, and a map keyed by `HarnessId` has no honest
+    /// slot for it (locked decision 25 — `Consumer::conservative_grant` stays
+    /// core because it is a security default, not a harness fact).
     pub offload_access: bool,
-    /// V19: expose this server's tools to **OpenCode** (proxied through the
-    /// per-session `cimp-offload --consumer opencode` child). Off by default;
-    /// the v18 → v19 migration seeds it from `claude_access` so upgraders keep
-    /// their web-research tools across both agents.
-    pub opencode_access: bool,
     /// V37 (contract C2): where this server came from — see [`McpOrigin`].
     /// Metadata only in V37: it badges the Settings row and scopes the Phase E
     /// tool-description screen to external surfaces. Defaults to `external`.
@@ -3709,9 +3912,8 @@ impl std::fmt::Debug for McpServerConfig {
                     "<redacted>"
                 },
             )
-            .field("claude_access", &self.claude_access)
+            .field("access", &self.access)
             .field("offload_access", &self.offload_access)
-            .field("opencode_access", &self.opencode_access)
             .field("origin", &self.origin)
             .field("enabled", &self.enabled)
             .finish()
@@ -3727,9 +3929,8 @@ impl Default for McpServerConfig {
             env: HashMap::new(),
             url: String::new(),
             auth_token: String::new(),
-            claude_access: false,
+            access: BTreeMap::new(),
             offload_access: true,
-            opencode_access: false,
             // V37 C2: unknown provenance ⇒ external (untrusted), and a server
             // exists unless the user says otherwise.
             origin: McpOrigin::External,
@@ -4142,49 +4343,11 @@ impl OffloadSettings {
             })
     }
 
-    /// The effective `local-llama` provider to inject into an OpenCode session,
-    /// or `None` to inject nothing. When auto-sync is on and the local server
-    /// is enabled, re-derive from the current primary Local command so edits
-    /// take effect at launch without re-clicking the button; if that command is
-    /// missing/incomplete, fall back to the last persisted snapshot. Otherwise
-    /// use the stored snapshot as-is.
-    pub fn resolve_opencode_provider(&self) -> Option<OpencodeLocalProvider> {
-        if self.opencode_provider_auto && self.enabled {
-            if let Some(cmd) = self.primary_local_command() {
-                if let Ok(p) = crate::offload::server::derive_opencode_provider(&cmd) {
-                    return Some(p);
-                }
-            }
-        }
-        self.opencode_provider.clone()
-    }
-
-    /// Re-sync the persisted `local-llama` snapshot on a settings save. No-op
-    /// unless auto-sync is on AND the local server is enabled (per the auto
-    /// contract: disabled ⇒ do nothing). Re-derives only when the primary Local
-    /// command differs from the snapshot's `source_command`, so unrelated saves
-    /// don't churn. A derive failure (missing `--port`/model) leaves the prior
-    /// snapshot untouched rather than clearing it.
-    pub fn sync_opencode_provider_on_save(&mut self) {
-        if !(self.opencode_provider_auto && self.enabled) {
-            return;
-        }
-        let Some(cmd) = self.primary_local_command() else {
-            return;
-        };
-        let unchanged = self
-            .opencode_provider
-            .as_ref()
-            .is_some_and(|p| p.source_command == cmd);
-        if unchanged {
-            return;
-        }
-        if let Ok(p) = crate::offload::server::derive_opencode_provider(&cmd) {
-            self.opencode_provider = Some(p);
-        }
-    }
-
-    /// Whether at least one MCP server is exposed to Claude Code.
+    /// Whether at least one MCP server is exposed to **any harness**.
+    ///
+    /// V40 Phase B collapsed `any_claude_mcp` + `any_opencode_mcp` into this
+    /// one predicate: both bodies asked the same question of a different half
+    /// of the same field pair, and every caller wanted the OR of them.
     ///
     /// # V37 D-1, amended by Phase F: NOTHING here is spawn-baked any more
     ///
@@ -4212,17 +4375,10 @@ impl OffloadSettings {
     /// everything was toggled off would have nothing left to turn back on.
     ///
     /// Spawn broadly — now maximally broadly — and enforce at dispatch.
-    pub fn any_claude_mcp(&self) -> bool {
-        self.mcp_servers.iter().any(|m| m.claude_access)
-    }
-
-    /// V19: whether at least one MCP server is exposed to OpenCode.
-    ///
-    /// V37 D-1 (as amended by Phase F): reads `opencode_access` and NOT
-    /// `enabled`, and gates no injection at all, for the reasons spelled out on
-    /// [`Self::any_claude_mcp`].
-    pub fn any_opencode_mcp(&self) -> bool {
-        self.mcp_servers.iter().any(|m| m.opencode_access)
+    pub fn any_harness_mcp(&self) -> bool {
+        self.mcp_servers
+            .iter()
+            .any(|m| m.access.values().any(|a| a.enabled))
     }
 
     /// Whether the warm MCP HOST (the pool of user-configured MCP servers)
@@ -4234,7 +4390,7 @@ impl OffloadSettings {
     /// need the loopback without needing the host.
     ///
     /// V37 D-1: composed from the two `*_access` predicates, so it inherits
-    /// their deliberate blindness to `enabled` (see [`Self::any_claude_mcp`]).
+    /// their deliberate blindness to `enabled` (see [`Self::any_harness_mcp`]).
     /// The warm host must run whenever a server COULD become reachable: it is
     /// the host that owns `effective_enable`, holds the disabled set behind
     /// contract C4's refusal, and is the thing a re-enable has to reconcile
@@ -4251,7 +4407,7 @@ impl OffloadSettings {
     /// are unaffected). The first grant flips this predicate, `warm_host`
     /// reconciles, and the pulse reaches the tab that was already listening.
     pub fn mcp_host_needed(&self) -> bool {
-        self.enabled || self.any_claude_mcp() || self.any_opencode_mcp()
+        self.enabled || self.any_harness_mcp()
     }
 }
 
@@ -5063,11 +5219,11 @@ pub struct UsageSettings {
     // write. No migration, no schema-version bump — same treatment as
     // `detection_update_classifier_mode` above.
     //
-    // Only the widget went: `usage::extract_push`, the `context_window` slot
-    // in the push file, `get_claude_usage`'s wire shape and the terminal
+    // Only the widget went: the statusline extractor, the `context_window` slot
+    // in the push file, `harness_usage`'s wire shape and the terminal
     // status line all still carry and render the context reading.
     /// How often the frontend re-reads the status-line usage push (a local
-    /// file — see `crate::usage`), in seconds. The UI clamps this to a sane
+    /// file — see `harness::claude::usage`), in seconds. The UI clamps this to a sane
     /// minimum as busy-poll hygiene.
     pub poll_interval_secs: u32,
 }
@@ -5116,30 +5272,11 @@ impl Default for SystemStatsSettings {
     }
 }
 
-/// Context-window status line config. When `enabled`, the AI launch path
-/// injects a session-scoped `--settings` overlay into cImp-launched
-/// Claude Code tabs that points `statusLine.command` at `cimp
-/// --statusline` — our own renderer for a themed context-usage bar
-/// (`Opus  ▓▓▓▓▓░░░░░ 50% (100k/200k)`). The overlay *merges* with the
-/// user's own Claude Code settings (CLI flags outrank settings files and
-/// only `statusLine` is set), so the user's global `~/.claude` config is
-/// left untouched and the bar appears only inside cImp.
-///
-/// Additive `#[serde(default)]` field — settings files written before this
-/// landed round-trip with the bar enabled. Enabled by default, mirroring
-/// the TTS/STT defaults; toggle off in Settings → Bottom bar.
-#[derive(Clone, Copy, Serialize, Deserialize, Debug)]
-#[serde(default)]
-pub struct StatuslineSettings {
-    pub enabled: bool,
-}
-
-impl Default for StatuslineSettings {
-    fn default() -> Self {
-        Self { enabled: true }
-    }
-}
-
+// `StatuslineSettings` moved to the Claude plugin's declared settings in V40
+// Phase B (locked decision 6). It was one `bool` that only Claude's
+// `--settings` overlay ever read, so it is the `statusline` `ext` row on
+// `Settings::harness["claude"]` now — no core field, no core reader, and a
+// harness without a status line declares nothing.
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(default)]
 pub struct UiSettings {
@@ -5968,74 +6105,172 @@ mod tests {
     }
 
 
-    /// **V35 Phase F, and the V32 F-19 trap it walks past.** A global
-    /// `settings.json` written before Phase F loads with
-    /// `claude_auto_verify == None` — a genuine default, not a masked seed —
-    /// and every field beside it survives untouched.
+    /// **The V32 F-19 trap, on the two spike fields `HarnessVersions` still
+    /// holds.** A global `settings.json` written before V40 Phase B carries
+    /// five more keys in this block; they are `Settings::harness` rows now (the
+    /// 35 -> 36 migration moves them) and this struct must load the old shape
+    /// without them without failing — a `HarnessVersions` that refused to parse
+    /// would quarantine the whole settings file over two fields the migration
+    /// has already emptied.
     ///
-    /// F-19's lesson was that the container-level `#[serde(default)]` on
-    /// `Settings` silently fills a missing field, so an additive field whose
-    /// *correct* pre-upgrade value is NOT its `Default` ships broken and looks
-    /// fine. Here `None` genuinely is right — it means "auto-verify has never
-    /// completed on this install", which is exactly the state a pre-Phase-F
-    /// file is in, and it is what keeps the version tripwire speaking as the
-    /// fallback until the first run. This test is what makes that a checked
-    /// claim rather than an assumption: it deserializes the OLD shape (the five
-    /// V16 fields, no sixth key) and pins the answer.
-    ///
-    /// It is also why no schema-version bump was needed: there is no data
-    /// transform a migration could perform, and no pre-existing file whose
-    /// meaning changes.
+    /// F-19's lesson was that the container-level `#[serde(default)]` silently
+    /// fills a missing field, so an additive field whose *correct* pre-upgrade
+    /// value is NOT its `Default` ships broken and looks fine. Here the two
+    /// survivors are exactly the ones whose value must NOT change, and both are
+    /// pinned.
     #[test]
-    fn harness_versions_loads_a_pre_phase_f_file_with_no_auto_verify() {
+    fn harness_versions_loads_a_pre_phase_b_file_and_keeps_the_two_spike_outcomes() {
         let old_shape = json!({
             "claude_last_seen": "2.1.232",
             "claude_last_verified": "2.1.14",
             "opencode_last_seen": "1.18.13",
+            "input_profile_status": "pass",
+            "claude_auto_verify": null,
             "e1_status": "pass",
             "d0_status": "unverified"
         });
         let hv: HarnessVersions =
-            serde_json::from_value(old_shape.clone()).expect("the pre-V35 shape still loads");
-        assert_eq!(hv.claude_auto_verify, None);
-        assert_eq!(hv.claude_last_seen, "2.1.232");
-        assert_eq!(hv.claude_last_verified, "2.1.14");
-        assert_eq!(hv.opencode_last_seen, "1.18.13");
+            serde_json::from_value(old_shape.clone()).expect("the pre-Phase-B shape still loads");
         assert_eq!(hv.e1_status, "pass");
         assert_eq!(hv.d0_status, "unverified");
 
         // …and through the whole `Settings` round trip, which is the shape
-        // `settings::persistence` actually reads: a v31 file with the old
-        // `harness_versions` block and nothing else about it.
+        // `settings::persistence` actually reads.
         let mut file = json!({ "schema_version": CURRENT_SCHEMA_VERSION });
         file["harness_versions"] = old_shape;
         let s: Settings = serde_json::from_value(file).expect("whole-settings round trip");
-        assert_eq!(s.harness_versions.claude_auto_verify, None);
-        assert_eq!(s.harness_versions.claude_last_seen, "2.1.232");
         // The E1 spike outcome is the field a lost record would silently
-        // un-gate a feature through — pinned here too, since this is the
-        // struct that grew a field.
+        // un-gate a feature through.
         assert_eq!(s.harness_versions.e1_status, "pass");
+        assert_eq!(s.harness_versions, HarnessVersions {
+            e1_status: "pass".to_string(),
+            d0_status: "unverified".to_string(),
+        });
+    }
 
-        // A record round-trips as itself.
-        let with_record = HarnessVersions {
-            claude_auto_verify: Some(AutoVerify {
-                version: "2.2.0".to_string(),
-                at_ms: 7,
-                status: AutoVerify::FAIL.to_string(),
-                failures: vec![AutoVerifyFailure {
-                    capability: "claude.statusline.stdin".to_string(),
-                    evidence: "harness.canary.l1".to_string(),
-                    detail: "context_window gone".to_string(),
-                }],
-            }),
-            ..HarnessVersions::default()
-        };
-        let text = serde_json::to_string(&with_record).expect("serialize");
+    /// **The per-harness map is what an absent key means** (V40 locked
+    /// decision 5).
+    ///
+    /// The whole promise of the map is that a harness registered LATER needs no
+    /// migration: its row is absent from every file ever written, and every
+    /// read has to answer the declared defaults anyway. This drives that
+    /// directly — a `Settings` with an EMPTY `harness` block, which is the
+    /// state a hand-edit or a future harness produces.
+    #[test]
+    fn an_absent_harness_row_reads_its_declared_defaults() {
+        let mut file = json!({ "schema_version": CURRENT_SCHEMA_VERSION });
+        file["harness"] = json!({});
+        let s: Settings = serde_json::from_value(file).expect("round trip");
+        assert!(s.harness.is_empty(), "the fixture is the absent case");
+
+        for h in crate::harness::registry::all() {
+            let row = s.harness_settings(h);
+            assert!(row.expose_commands, "{h}: expose_commands defaults on");
+            assert!(row.expose_code_audit, "{h}: expose_code_audit defaults on");
+            assert_eq!(row.last_seen, "", "{h}: nothing observed yet");
+            assert_eq!(
+                row.input_profile_status, SPIKE_UNVERIFIED,
+                "{h}: an unrun spike is `unverified`, never `fail`"
+            );
+            // Every DECLARED ext field answers its declared default, whether or
+            // not the file carries it — the property that makes a plugin's new
+            // setting cost one table row and no migration.
+            for field in h.plugin().expect("registered").settings_schema() {
+                assert_eq!(
+                    s.harness_ext(h, field.key),
+                    field.default.to_json(),
+                    "{h}.ext.{} must read its declared default when absent",
+                    field.key
+                );
+            }
+        }
+    }
+
+    /// **A row for a harness this build does not know survives a load/save.**
+    ///
+    /// Downgrade safety, and it is not hypothetical: V41 adds Codex, and a user
+    /// who opens an older cImp once must not come back to a wiped `codex`
+    /// block. The map is keyed by `String` for exactly this, and
+    /// `HarnessSettings::unknown` catches the fields inside the row that this
+    /// build has no name for.
+    #[test]
+    fn an_unregistered_harness_row_round_trips_untouched() {
+        let mut file = json!({ "schema_version": CURRENT_SCHEMA_VERSION });
+        file["harness"] = json!({
+            "codex": {
+                "expose_commands": false,
+                "last_seen": "0.9.1",
+                "input_profile_status": "pass",
+                "ext": { "sandbox_mode": "workspace-write" },
+                "a_field_this_build_never_heard_of": 7
+            }
+        });
+        let mut s: Settings = serde_json::from_value(file).expect("round trip");
+        // The parse boundary must not delete it either.
+        s.normalize_harness_settings();
+
+        let back = serde_json::to_value(&s).expect("re-serialize");
+        let row = &back["harness"]["codex"];
+        assert_eq!(row["expose_commands"], json!(false));
+        assert_eq!(row["last_seen"], json!("0.9.1"));
+        assert_eq!(row["input_profile_status"], json!("pass"));
+        assert_eq!(row["ext"]["sandbox_mode"], json!("workspace-write"));
         assert_eq!(
-            serde_json::from_str::<HarnessVersions>(&text).expect("deserialize"),
-            with_record
+            row["a_field_this_build_never_heard_of"],
+            json!(7),
+            "a field outside the core set must ride through, or a downgrade is \
+             a data-loss operation"
         );
+    }
+
+    /// **The parse boundary enforces the declared kinds** (global principle 4).
+    ///
+    /// A declared schema is a claim about a file the user can hand-edit. A
+    /// `"statusline": "yes"` would otherwise reach the launch path as a string
+    /// that every boolean reader answers `false` for — a control the file says
+    /// is ON, silently off. An UNDECLARED key is left alone on purpose: a key a
+    /// newer cImp declares must survive a downgrade.
+    #[test]
+    fn the_parse_boundary_resets_a_declared_ext_key_of_the_wrong_kind() {
+        let claude = crate::harness::HarnessId::from_id("claude").expect("registered");
+        let statusline = crate::harness::claude::settings::STATUSLINE;
+
+        let mut s = Settings::default();
+        s.set_ext("claude", statusline, json!("yes"));
+        s.set_ext("claude", "a.key.nobody.declares", json!({ "kept": true }));
+        assert!(s.normalize_harness_settings(), "the bad value is a change");
+
+        assert_eq!(
+            s.harness_ext(claude, statusline),
+            json!(true),
+            "a value its declared kind rejects is reset to the declared default"
+        );
+        assert_eq!(
+            s.harness_ext(claude, "a.key.nobody.declares"),
+            json!({ "kept": true }),
+            "an UNDECLARED key is not core's to delete"
+        );
+    }
+
+    /// A `secret` ext value never reaches a log line through `Debug`.
+    ///
+    /// The defense-in-depth `ClaudeLocalSettings`'s hand-rolled `Debug` carried
+    /// before its three fields became `ext` rows — now driven by the `secret`
+    /// column, so it covers every plugin at once instead of one struct.
+    #[test]
+    fn a_secret_ext_value_is_redacted_in_debug() {
+        let mut s = Settings::default();
+        s.set_ext(
+            "claude",
+            crate::harness::claude::settings::LOCAL_AUTH_TOKEN,
+            json!("sk-super-secret"),
+        );
+        let shown = format!("{:?}", s.harness_row_of("claude"));
+        assert!(
+            !shown.contains("sk-super-secret"),
+            "an auth token must not reach the rolling log: {shown}"
+        );
+        assert!(shown.contains("<redacted>"), "…and it must say so: {shown}");
     }
 
     /// **#48 — the G-1 defect class, on the enum-ish STRING settings.**
@@ -6109,113 +6344,9 @@ mod tests {
         }
     }
 
-    /// **F-19 tripwire. If you added a model to [`default_llm_pricing`] and
-    /// landed here, that is this test working:** bump [`PRICING_GENERATION`],
-    /// add the row to [`pricing_rows_since`] under the new generation, and add
-    /// its prefix to `GEN_0` below only if it shipped before 2026-08-10.
-    ///
-    /// A row added to `default_llm_pricing` alone reaches **fresh installs
-    /// only** — every existing install keeps its stored table and prices that
-    /// model at $0, with no error anywhere. That is exactly how the missing
-    /// `claude-opus-5` row survived into a release candidate, and nothing about
-    /// adding the next model makes it more noticeable.
-    #[test]
-    fn every_built_in_priced_model_is_reachable_by_existing_installs() {
-        /// Prefixed rows that shipped before the watermark existed. Installs
-        /// that predate F-19 already have these, so they are NOT in
-        /// `pricing_rows_since` — adding one here retroactively would mean
-        /// resurrecting it for users who deleted it.
-        const GEN_0: &[&str] = &[
-            "claude-fable-5",
-            "claude-opus-4-8",
-            "claude-opus-4-7",
-            "claude-opus-4-6",
-            "claude-sonnet-5",
-            "claude-sonnet-4-6",
-            "claude-haiku-4-5",
-        ];
 
-        let shipped: Vec<String> = default_llm_pricing()
-            .into_iter()
-            .map(|r| r.model_prefix)
-            .filter(|p| !p.is_empty())
-            .collect();
-
-        // Every prefix reaches an existing install via exactly one route.
-        let migrated: Vec<String> = pricing_rows_since(0)
-            .into_iter()
-            .map(|r| r.model_prefix)
-            .collect();
-        for prefix in &shipped {
-            let in_gen_0 = GEN_0.contains(&prefix.as_str());
-            let in_migration = migrated.iter().any(|p| p == prefix);
-            assert!(
-                in_gen_0 || in_migration,
-                "`{prefix}` is seeded into fresh installs by default_llm_pricing but is \
-                 neither a pre-watermark row nor returned by pricing_rows_since(0) — every \
-                 EXISTING install will price it at $0. Bump PRICING_GENERATION and add it \
-                 to pricing_rows_since."
-            );
-            assert!(
-                !(in_gen_0 && in_migration),
-                "`{prefix}` is both a pre-watermark row and a migration row; the migration \
-                 would re-add a row those installs may have deleted"
-            );
-        }
-
-        // …and the migration never offers a row fresh installs don't get, or
-        // the two populations end up with different tables.
-        for prefix in &migrated {
-            assert!(
-                shipped.contains(prefix),
-                "pricing_rows_since offers `{prefix}` to existing installs but \
-                 default_llm_pricing doesn't give it to fresh ones"
-            );
-        }
-
-        // Prices must agree between the two routes, for the same reason.
-        for row in pricing_rows_since(0) {
-            let shipped_row = default_llm_pricing()
-                .into_iter()
-                .find(|r| r.model_prefix == row.model_prefix)
-                .expect("checked above");
-            assert_eq!(
-                (
-                    shipped_row.input,
-                    shipped_row.cache_write,
-                    shipped_row.cache_read,
-                    shipped_row.output
-                ),
-                (row.input, row.cache_write, row.cache_read, row.output),
-                "`{}` is priced differently for fresh vs migrated installs",
-                row.model_prefix
-            );
-        }
-    }
-
-    /// The default model has to be priced, or the Usage view's cost mode reads
-    /// $0 for the sessions the user actually runs — the F-19 symptom.
-    #[test]
-    fn the_current_default_model_has_a_price_row() {
-        let priced = default_llm_pricing()
-            .into_iter()
-            .any(|r| r.model_prefix == "claude-opus-5");
-        assert!(priced, "no claude-opus-5 row in the seeded price table");
-    }
-
-    fn local_backend(cmd: &str) -> OffloadBackend {
-        OffloadBackend {
-            name: "local".to_string(),
-            enabled: true,
-            kind: OffloadBackendKind::Local {
-                server_command: cmd.to_string(),
-                autostart: false,
-                show_command_on_start: false,
-                auth_token: String::new(),
-            },
-            ..Default::default()
-        }
-    }
+    // `local_backend` moved to `harness::opencode::settings` with the two
+    // provider tests that were its only callers (V40 Phase B).
 
     // ── V23 Phase A: Code Audit settings ──────────────────────────────────
 
@@ -6275,8 +6406,6 @@ mod tests {
             enabled: true,
             timeout_secs: 600,
             quality_auto_select: true,
-            expose_claude: true,
-            expose_opencode: true,
             expose_offload: true,
         };
         let top = serde_json::to_value(&s).expect("CodeAuditSettings serializes");
@@ -6374,11 +6503,14 @@ mod tests {
         // (and every fresh install) follows the project's language census until
         // the user edits a quality checkbox.
         assert!(s.code_audit.quality_auto_select);
-        // V26: all three MCP-exposure flags default on. The master `enabled`
+        // V26: every MCP-exposure flag defaults on. The master `enabled`
         // switch (false above) is what actually keeps a fresh install silent;
-        // these gate per-consumer opt-out once the feature is turned on.
-        assert!(s.code_audit.expose_claude);
-        assert!(s.code_audit.expose_opencode);
+        // these gate per-consumer opt-out once the feature is turned on. V40
+        // Phase B moved the per-HARNESS half into `harness[<id>]`, so this now
+        // covers a third harness the day one registers instead of naming two.
+        for h in crate::harness::registry::all() {
+            assert!(s.harness_settings(h).expose_code_audit, "{h}");
+        }
         assert!(s.code_audit.expose_offload);
         // The roster no longer needs seeding into settings at all: it IS the
         // embedded manifest, and an untouched container means "every tool at
@@ -6406,8 +6538,8 @@ mod tests {
         assert!(ca.enabled);
         assert_eq!(ca.timeout_secs, 120);
         assert!(!ca.quality_auto_select);
-        // …and the additive V26 flags still fill in.
-        assert!(ca.expose_claude);
+        // …and the additive V26 flag still fills in.
+        assert!(ca.expose_offload);
     }
 
     #[test]
@@ -6425,9 +6557,15 @@ mod tests {
             "tools": []
         }))
         .expect("v23 code_audit block deserializes");
-        assert!(ca.expose_claude);
-        assert!(ca.expose_opencode);
         assert!(ca.expose_offload);
+        // The per-harness half is `harness[<id>].expose_code_audit` since V40
+        // Phase B; a settings file with no `harness` block at all reads the
+        // same default, which `an_absent_harness_row_reads_its_declared_defaults`
+        // is the direct check on.
+        let s = Settings::default();
+        for h in crate::harness::registry::all() {
+            assert!(s.harness_settings(h).expose_code_audit, "{h}");
+        }
     }
 
     #[test]
@@ -6781,48 +6919,11 @@ mod tests {
         assert!(McpCategory::default().enabled);
     }
 
-    #[test]
-    fn sync_provider_noop_when_auto_off_or_server_disabled() {
-        // Auto off ⇒ untouched even with offload enabled.
-        let mut o = OffloadSettings {
-            enabled: true,
-            opencode_provider_auto: false,
-            backends: vec![local_backend("llama-server -a m --port 8080")],
-            ..Default::default()
-        };
-        o.sync_opencode_provider_on_save();
-        assert!(o.opencode_provider.is_none(), "auto off ⇒ no sync");
-
-        // Auto on but server disabled ⇒ do nothing (the auto contract).
-        o.opencode_provider_auto = true;
-        o.enabled = false;
-        o.sync_opencode_provider_on_save();
-        assert!(o.opencode_provider.is_none(), "disabled server ⇒ no sync");
-    }
-
-    #[test]
-    fn sync_provider_derives_when_enabled_and_rederives_on_change() {
-        let mut o = OffloadSettings {
-            enabled: true,
-            opencode_provider_auto: true,
-            backends: vec![local_backend("llama-server -a first --port 8080")],
-            ..Default::default()
-        };
-        o.sync_opencode_provider_on_save();
-        assert_eq!(o.opencode_provider.as_ref().unwrap().model, "first");
-
-        // Same command again ⇒ unchanged snapshot (source_command matches).
-        let snap = o.opencode_provider.clone();
-        o.sync_opencode_provider_on_save();
-        assert_eq!(o.opencode_provider, snap, "no change ⇒ no churn");
-
-        // Command edited ⇒ re-derived.
-        o.backends = vec![local_backend("llama-server -a second --port 9099")];
-        o.sync_opencode_provider_on_save();
-        let p = o.opencode_provider.as_ref().unwrap();
-        assert_eq!(p.model, "second");
-        assert_eq!(p.base_url, "http://127.0.0.1:9099/v1");
-    }
+    // `sync_provider_noop_when_auto_off_or_server_disabled` and
+    // `sync_provider_derives_when_enabled_and_rederives_on_change` moved to
+    // `harness::opencode::settings` with the two fields they drive (V40 Phase B,
+    // locked decision 6): same cases, same commands, asserted through the
+    // harness map instead of two `OffloadSettings` fields named after a harness.
 
     #[test]
     fn ai_tab_id_serde_wire_format_matches_tab_ids() {
@@ -6846,6 +6947,61 @@ mod tests {
             );
             assert_eq!(variant.as_str(), id, "as_str {id}");
         }
+        // Every variant is covered above, so the serde wire format cannot gain
+        // an unpinned spelling.
+        assert_eq!(AiTabId::ALL.len(), 3);
+    }
+
+    /// **The tab enum and the registry are one list** (V40 review finding M-3).
+    ///
+    /// `AiTabId` is still closed while the harness set is data, so the two can
+    /// part company in either direction and neither failure is loud:
+    ///
+    /// * a descriptor tab id with no variant is dropped by
+    ///   `canonical_ai_tab_order()`, cannot be held by `enabled_ai_tabs`, has no
+    ///   `default_ai_tab` arm to seed it and falls through `TabId::from_str` to
+    ///   `Shell` while `TabId::kind()` calls it `AiTool`. That direction is
+    ///   caught by 10(b) (`every_registry_entry_is_fully_wired`), which names
+    ///   the id and the three places to add it;
+    /// * a VARIANT with no descriptor is a tab id the tab bar orders and the
+    ///   integrity check can restore, backed by no harness at all. That
+    ///   direction is this test.
+    ///
+    /// The variant count is read off the declaration so `ALL` cannot silently
+    /// stop being every variant. Newline-agnostic: CI checks this tree out with
+    /// CRLF.
+    #[test]
+    fn the_ai_tab_enum_and_the_registry_are_the_same_list() {
+        let from_enum: Vec<&str> = AiTabId::ALL.iter().map(|t| t.as_str()).collect();
+        assert_eq!(
+            from_enum,
+            crate::harness::registry::canonical_tab_ids(),
+            "`AiTabId::ALL` and the registry's canonical tab ids must be the same list, in the              same order — a variant with no descriptor is a tab the bar orders and nothing backs"
+        );
+
+        let src = include_str!("schema.rs");
+        let start = src
+            .find("pub enum AiTabId {")
+            .expect("`AiTabId` is gone — re-point this test");
+        let decl = &src[start..];
+        let decl = &decl[..decl.find("
+}").expect("the declaration closes")];
+        let variants = decl
+            .lines()
+            .filter(|l| {
+                let t = l.trim();
+                !t.is_empty()
+                    && !t.starts_with("//")
+                    && !t.starts_with('#')
+                    && !t.starts_with("pub enum")
+                    && t.ends_with(',')
+            })
+            .count();
+        assert_eq!(
+            variants,
+            AiTabId::ALL.len(),
+            "`AiTabId::ALL` is not every variant — add the new one to it, and give it a              `HarnessDescriptor` tab id, a `TabId::from_str` arm and a `default_ai_tab` arm"
+        );
     }
 
     #[test]

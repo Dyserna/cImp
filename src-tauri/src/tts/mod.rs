@@ -64,7 +64,7 @@ pub type SpeakSession = Arc<AtomicU64>;
 
 /// Shared "suppress AI-tag TTS" flag. Set by `tts_stop` (Esc) so the rest of
 /// the current Claude output burst's `[[TTS]]` segments are dropped instead of
-/// played; cleared by the state manager on the next `ClaudeOutputStarted` (new
+/// played; cleared by the state manager on the next `HarnessOutputStarted` (new
 /// output). Only gates `TtsRequest::Synthesize { suppressible: true }` —
 /// notifications and selection reads are never affected.
 pub type AiTtsSuppressed = Arc<std::sync::atomic::AtomicBool>;

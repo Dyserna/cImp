@@ -18,6 +18,7 @@ import type {
   Settings,
   TabConfig,
 } from './settings/types';
+import { attributionLine, harnessForCommand, harnessLabel } from './harness';
 
 /// A tab's delegation role (locked decision 8) — re-exported from the settings
 /// mirror rather than spelled again here.
@@ -50,7 +51,7 @@ export interface GlyphInput {
   /// supplies it; absent it the title says "another tab" rather than nothing.
   driverName?: string | null;
   /// The driving tab's HARNESS id (`InFlightView.driver_agent`), which is what
-  /// the attribution line names first — "delegated by OpenCode" is the fact the
+  /// the attribution line names first — "delegated by <that harness>" is the fact the
   /// user needs; the tab name only disambiguates which of that harness's tabs.
   driverAgent?: string | null;
   /// The user-chosen backend name of a Remote-offload tab (Phase C).
@@ -278,7 +279,7 @@ function isWheelButton(cb: number): boolean {
 /// Recognize the backend's read-only refusal in a rejected `pty_write`.
 ///
 /// `AppError` serializes to its `Display` string, so this matches the shape
-/// `AppError::ReadOnly` produces — ``tab `claude` is read-only (user)`` — and
+/// `AppError::ReadOnly` produces — ``tab `<id>` is read-only (user)`` — and
 /// returns the whole sentence for the toast. Anything else returns `null` and
 /// keeps the existing console-error path: a refusal must be surfaced, but an
 /// unrelated PTY failure must not be mislabelled as one.
@@ -306,7 +307,7 @@ export interface InFlightView {
   /// Driver tab display name, snapshotted when the flight started — it keeps
   /// naming the tab the user saw even if that tab is renamed or closed.
   driver_name: string;
-  /// Driver HARNESS id (`claude` / `opencode`).
+  /// Driver HARNESS id — a registry id, as `harness_list` publishes it.
   driver_agent: string;
   mode: 'explicit' | 'facade';
   started_ms: number;
@@ -331,45 +332,20 @@ export interface RoleChange {
   displaced: string | null;
 }
 
-/// Harness id → the name a person uses for it.
+/// The display name for a harness id, and V39's attribution line — both from
+/// the registry now (V40 Phase F, locked decision 27 / amendment 0-d).
 ///
-/// **The one mapping this phase adds, and it is added here deliberately.** The
-/// only other spelling of it in the frontend is inline inside App.svelte's
-/// `ai-tab-restart-hint` listener, which is neither exported nor reachable — so
-/// there was nothing to reuse. Everything V39 renders reads this one: the
-/// banner, the local echo, the glyph title and the popover. An id with no entry
-/// falls through to itself rather than to a guess, which is also how a harness
-/// added after this build renders (its id, never "unknown").
-const HARNESS_LABELS: Readonly<Record<string, string>> = {
-  claude: 'Claude Code',
-  opencode: 'OpenCode',
-};
-
-/// The display name for a harness id. Unknown ids render as themselves.
-export function harnessLabel(id: string | null | undefined): string {
-  const key = (id ?? '').trim();
-  if (key.length === 0) return 'another harness';
-  return HARNESS_LABELS[key] ?? key;
-}
-
-/// The attribution line of locked decision 2a, spelled ONCE.
+/// V39 added a `HARNESS_LABELS` map and a hand-written template here, which was
+/// the right call then (nothing else in the frontend held either) and is a
+/// second declaration of the roster now. `harness.ts` reads both off
+/// `harness_list`: the label is the descriptor's, and the line comes from the
+/// driver harness's declared `attributionTemplate`, so the banner, the local
+/// echo and the glyph title still share ONE source — it just is not this file.
 ///
-/// `[delegated by OpenCode · tab "api-work" · via cImp]`
-///
-/// **Client-side only.** It is rendered in the banner, echoed into the xterm
-/// widget and repeated in the glyph title — and it never reaches the PTY: the
-/// worker model receives the task verbatim, with no header and no marker, so
-/// nothing here can be read by it as provenance. Nothing in this module calls
-/// `pty_write`, and a test pins that the local-echo helper writes to a terminal
-/// object rather than through `invoke`.
-export function attributionLine(
-  driverAgent: string | null | undefined,
-  driverName: string | null | undefined,
-): string {
-  const who = (driverName ?? '').trim();
-  const tab = who.length > 0 ? who : 'another tab';
-  return `[delegated by ${harnessLabel(driverAgent)} · tab "${tab}" · via cImp]`;
-}
+/// Re-exported rather than moved-and-repointed so the V39 call sites (banner,
+/// popover, chip, local echo) keep reading them from the delegation module they
+/// belong to.
+export { harnessLabel, attributionLine };
 
 /// Elapsed time for the banner, as a short human string. Seconds under a
 /// minute, `Nm SSs` above it — a delegation that has been running for four
@@ -449,23 +425,22 @@ export function backendOf(settings: Settings, tabId: string): DelegationBackend 
   );
 }
 
-/// Which HARNESS a configured AI tab runs.
+/// Which HARNESS a configured AI tab runs, or `null` for one that runs neither.
 ///
-/// Mirror of Rust `tabs::config::tab_consumer` — `command_is(command,
-/// "claude") ? claude : opencode`, compared on the file stem so `claude`,
-/// `claude.exe` and a full path all answer `claude`. The frontend needs it
-/// because "at most one Manual tab per harness" is a rule ABOUT this grouping,
-/// and the popover has to name the tab that currently holds it before the user
-/// clicks.
+/// The frontend needs it because "at most one Manual tab per harness" is a rule
+/// ABOUT this grouping, and the popover has to name the tab that currently
+/// holds it before the user clicks.
 ///
-/// A wrapper command is `opencode` to both ends, exactly as Rust classifies it —
-/// deliberately the same answer, not a better one: the two must agree, or the
-/// popover names a tab the backend would not have displaced.
-export function tabHarness(cfg: AiToolTabConfig): string {
-  const command = cfg.command ?? '';
-  const last = command.split(/[\\/]/).pop() ?? '';
-  const stem = last.replace(/\.[^.]*$/, '');
-  return stem.toLowerCase() === 'claude' ? 'claude' : 'opencode';
+/// **V40 Phase F (locked decision 2, frontend half).** This used to be a second
+/// hand-written classifier whose `else` branch made every unrecognised command
+/// one particular harness — so a tab running a harness this build does not know
+/// was not rejected, it was MISATTRIBUTED: eligible for another harness's
+/// Manual slot, and typed into with that harness's paste rules. It resolves through the registry's declared binaries now and answers
+/// `null` for a command nobody declared, exactly as Rust's `tab_consumer` does
+/// after Phase A — the two must agree, or the popover names a tab the backend
+/// would not have displaced.
+export function tabHarness(cfg: AiToolTabConfig): string | null {
+  return harnessForCommand(cfg.command ?? '')?.id ?? null;
 }
 
 /// The tab that currently holds `Manual` for `tabId`'s harness, other than
@@ -481,6 +456,9 @@ export function manualHolderFor(
   const self = aiTabConfig(settings, tabId);
   if (!self) return null;
   const harness = tabHarness(self);
+  // A tab running no registered harness holds no harness's Manual slot, so
+  // there is nobody to displace and nothing to name.
+  if (harness === null) return null;
   for (const t of settings.tabs) {
     if (t.kind !== 'ai_tool' || t.id === tabId) continue;
     if (t.delegation_role === 'manual' && tabHarness(t) === harness) {

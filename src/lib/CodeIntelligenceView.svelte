@@ -24,6 +24,7 @@
     graphUsage,
     graphSessionUsage,
     graphTabSession,
+    advisorRules,
     graphUsageAdvice,
     advisorDismiss,
     advisorMarkApplied,
@@ -75,7 +76,6 @@
     donutArcs,
     arcPath,
     fmtPct,
-    type CostTokens,
     type PriceRates,
     type CostOverride,
     type CostRowState,
@@ -105,6 +105,9 @@
     saveViewString,
   } from './viewSection';
   import { harnessMarkVerified } from './graph';
+  import { harnesses, harnessLabel } from './harness';
+  import { harnessUsage, type DeclaredOrigin } from './ipc';
+  import { get } from 'svelte/store';
 
   // The graph_* tool reference list, the recent-calls activity feed, and the
   // graph index dashboard all moved to the Tool Activity tab
@@ -714,7 +717,7 @@
 
   // ── V34: follow the focused agent tab ────────────────────────────────
   // `usage.current` is "the session with the most recent activity across all
-  // agents" — with two Claude tabs open that is whichever tab last WROTE, not
+  // agents" — with two tabs of one harness open that is whichever tab last WROTE, not
   // the one being looked at, so the card appeared stuck on one tab's session.
   // The fix is to select the focused tab's session automatically, using the
   // same drill-in path a click uses.
@@ -1130,7 +1133,7 @@
     usageTurns.length > TURN_RENDER_CAP ? usageTurns.slice(-TURN_RENDER_CAP) : usageTurns,
   );
   let usageMax = $derived(maxTurnTotal(shownTurns));
-  // V24 Phase C: merged same-origin runs for the S/A lane under the bars.
+  // V24 Phase C: merged same-lane runs for the lane strip under the bars.
   let laneSegs = $derived(laneSegments(shownTurns));
 
   // ── Chart zoom + horizontal scroll ───────────────────────────────────
@@ -1254,12 +1257,17 @@
   // the backend); `chartPreview` holds the live value while a picker is open
   // (`oninput` fires per drag tick) so the chart recolors immediately without
   // a settings round-trip per tick.
+  // `kind` is the PRICING CATEGORY id each segment reads out of a turn's
+  // `tokens` map (V40 Phase G) — the same four ids `PriceRates` names its
+  // fields after, which is cImp's own vocabulary, not a harness's. `tool` has
+  // none: tool-result chars are an estimate cImp derives, never a billed
+  // category anybody reported.
   const CHART_SEGS = [
-    { key: 'in', label: 'input', field: 'usage_color_in' },
-    { key: 'cache', label: 'cache-read', field: 'usage_color_cache' },
-    { key: 'write', label: 'cache-write', field: 'usage_color_write' },
-    { key: 'out', label: 'output', field: 'usage_color_out' },
-    { key: 'tool', label: 'est. tool-result', field: 'usage_color_tool' },
+    { key: 'in', kind: 'input', label: 'input', field: 'usage_color_in' },
+    { key: 'cache', kind: 'cache_read', label: 'cache-read', field: 'usage_color_cache' },
+    { key: 'write', kind: 'cache_write', label: 'cache-write', field: 'usage_color_write' },
+    { key: 'out', kind: 'output', label: 'output', field: 'usage_color_out' },
+    { key: 'tool', kind: null, label: 'est. tool-result', field: 'usage_color_tool' },
   ] as const;
   // The S/A lane's two origin colors — same picker/preview/commit machinery
   // as the bar segments, separate list because these feed the lane (and the
@@ -1291,21 +1299,41 @@
     chartPreview[seg.key] = undefined;
   }
 
-  const ADVISOR_RULES_TOOLTIP =
-    'advisor.raise_context_min_score.v1: ≥5 sessions, ≥200 injections, ≥70% never re-touched → raise context_min_score.\n' +
-    'advisor.raise_read_advisor_min_lines.v1: ≥5 sessions, ≥20 reminders, ≥50% re-read anyway → raise read_advisor_min_lines.\n' +
-    'advisor.lower_context_turn_budget_chars.v1: ≥5 sessions, ≥200 injections, ≥50 turns, ≥70% unread AND ≥50% turns maxed → lower context_turn_budget_chars.\n' +
-    'drift.harness_version.v1: Claude Code version ≠ last-verified → re-verify the hook contracts (Mark verified).\n' +
-    'drift.read_reason.v1: ≥15 reminders, ≥90% immediately re-read → the deny reason isn’t reaching the model; disable read_advisor.\n' +
-    'drift.read_hook_silent.v1: ≥3 sessions, ≥10 large re-reads (est.), 0 reminders → the PreToolUse hook isn’t firing.\n' +
-    'drift.injection_unseen.v1: ≥5 sessions, ≥30 injections, ≤2% follow → injected context likely never reaches the model.\n' +
-    'drift.usage_fields_gone.v1: ≥2 Claude sessions, all without token fields → the transcript usage schema changed.\n' +
-    'drift.payload.v1: any shim-reported payload missing required fields.\n' +
-    'drift.read_bypass.v1: ≥10 reminders, ≥40% answered via shell reads (est.) → disable read_advisor.\n' +
-    'surface.lean.v1: ≥10 sessions, 0 calls to any cold-tail graph tool (cycles, dead_exports, struct_search, path, architecture) → enable lean_tools (hide them from the advertised surface; they still answer if called).\n' +
-    'adopt.read_advisor.v1: ≥5 sessions, E1 verified (pass), ≥3 redundant large re-reads per session across ≥10 sessions (est.; external tools may have changed the file between reads) → enable read_advisor.\n' +
-    'adopt.read_advisor_substitute.v1: read_advisor on in advise mode, ≥20 reminders, ≤20% re-read anyway, low shell bypass → switch read_advisor_mode to substitute.\n' +
-    'After an Apply, that rule stays quiet for 3 further sessions so fresh post-change data can accumulate before it re-evaluates.';
+  // V40 Phase F (locked decision 23): the rule reference is PUBLISHED by the
+  // backend now. It used to be a hard-coded string here — a second copy of
+  // every threshold `advisor.rs` owns, which a tuning change left lying, with
+  // one harness's mechanisms named in it (a product's version, a named hook)
+  // for rules that fire per registered harness.
+  //
+  // What each card says about the FIX still comes from the card: the pointer is
+  // `Capability::drift_hint()`, supplied by the harness that raised it, so it
+  // can name that harness's mechanism where this reference cannot.
+  //
+  // Empty until the fetch lands (one paint): the tooltip is a reference, and an
+  // absent one is better than a stale one.
+  let advisorRulesTooltip = $state('');
+
+  /// How each harness receives an injected prompt, named by the harness (V40
+  /// Phase F, locked decision 27). The sentence used to enumerate the two
+  /// shipped harnesses and their mechanisms in markup here.
+  const injectMechanisms = $derived(
+    $harnesses
+      .filter((h) => h.affordances.injectMechanism)
+      .map((h) => `for ${h.label} via ${h.affordances.injectMechanism}`)
+      .join(', '),
+  );
+
+  async function loadAdvisorRules(): Promise<void> {
+    try {
+      const doc = await advisorRules();
+      advisorRulesTooltip = [
+        ...doc.rules.map((r) => `${r.id}: ${r.thresholds}`),
+        doc.footer,
+      ].join('\n');
+    } catch (e) {
+      console.error('advisor_rules failed:', e);
+    }
+  }
 
   // ── V16 Feature 8: tokens | est. cost toggle ─────────────────────────
   // Cost mode multiplies each bar segment by its $/MTok price before
@@ -1346,54 +1374,171 @@
   // kinds per origin (aligned under their outer arc — same cumulative
   // angles). Sourced from the full turn series of the shown session, so it
   // follows drill-in/live exactly like the other cards.
-  const DASH_KIND_SEGS = CHART_SEGS.filter((s) => s.key !== 'tool');
-  const DASH_KIND_FIELD = {
-    in: 'in_tok',
-    cache: 'cache_read',
-    write: 'cache_make',
-    out: 'out_tok',
-  } as const;
+  const DASH_KIND_SEGS = CHART_SEGS.filter((s) => s.kind !== null);
+  // The Cost card's four fixed table columns (Input / Cache write / Cache read
+  // / Output) and the Sessions row's four stats read these pricing category
+  // ids out of a `TokenKinds`. Fixed at four because cImp's PRICE TABLE has
+  // exactly four rates — the columns are its vocabulary, not a harness's — and
+  // a category the session's harness did not declare renders 0 here rather
+  // than shifting the table out from under the $/MTok row beside it.
+  const COST_TABLE_KINDS = ['input', 'cache_write', 'cache_read', 'output'] as const;
+  const SESSION_STAT_KINDS = [
+    { id: 'input', short: 'in', long: 'input' },
+    { id: 'cache_write', short: 'cache-write', long: 'cache-write' },
+    { id: 'cache_read', short: 'cache-read', long: 'cache-read' },
+    { id: 'output', short: 'out', long: 'output' },
+  ] as const;
   // ≈2px surface gap at each ring's mid-radius (viewBox units = px at the
   // rendered size below).
   const DASH_GAP_OUTER = 2 / 54;
   const DASH_GAP_INNER = 2 / 35;
-  const dashKinds = $derived(originKindTotals(usageTurns));
-  const dashSessionTok = $derived(kindsTotal(dashKinds.session));
-  const dashAgentTok = $derived(kindsTotal(dashKinds.agent));
-  const dashTokenTotal = $derived(dashSessionTok + dashAgentTok);
+  // The lanes the donut, its legend and the per-model share line iterate:
+  // the harness's DECLARED origins once `loadDeclaredOrigins` has answered,
+  // else whatever lanes the DATA actually carries. Never a hard-coded pair —
+  // that closed shape was this file's half of the ledger row.
+  const dashLaneIds = $derived.by(() => {
+    if (declaredOrigins.length > 0) return declaredOrigins.map((o) => o.id);
+    return [...new Set(usageTurns.map((t) => t.origin))].sort();
+  });
+  const dashKinds = $derived(originKindTotals(usageTurns, dashLaneIds));
+  // Every lane the donut can draw = declared ∪ present-in-data, so a stored
+  // row is never dropped because its harness has not answered yet.
+  const dashLaneKeys = $derived(Object.keys(dashKinds));
+  const dashLaneTok = $derived(
+    Object.fromEntries(dashLaneKeys.map((id) => [id, kindsTotal(dashKinds[id])])),
+  );
+  const dashTokenTotal = $derived(
+    dashLaneKeys.reduce((sum, id) => sum + dashLaneTok[id], 0),
+  );
   const dashOuterArcs = $derived(
     donutArcs(
-      [
-        { key: 'session', value: dashSessionTok },
-        { key: 'agent', value: dashAgentTok },
-      ],
+      dashLaneKeys.map((id) => ({ key: id, value: dashLaneTok[id] })),
       DASH_GAP_OUTER,
     ),
   );
-  // A kind-seg key ('in' | 'cache' | 'write' | 'out') looked up in one
-  // origin's CostTokens — shared by the inner ring and the legend.
-  function dashKindValue(kinds: CostTokens, key: string): number {
-    return kinds[DASH_KIND_FIELD[key as keyof typeof DASH_KIND_FIELD]];
+  // One declared category's tokens within one lane. `?? 0` is right here and
+  // only here: a segment the harness never declared draws nothing, which is
+  // the same pixel as a zero — the ABSENCE is preserved in the legend, which
+  // iterates the declared list, not this lookup.
+  function dashKindValue(kinds: Record<string, number>, kind: string | null): number {
+    return kind === null ? 0 : (kinds[kind] ?? 0);
   }
   const dashInnerArcs = $derived(
     donutArcs(
-      (['session', 'agent'] as const).flatMap((o) =>
+      dashLaneKeys.flatMap((o) =>
         DASH_KIND_SEGS.map((s) => ({
           key: `${o}:${s.key}`,
-          value: dashKindValue(dashKinds[o], s.key),
+          value: dashKindValue(dashKinds[o] ?? {}, s.kind),
         })),
       ),
       DASH_GAP_INNER,
     ),
   );
-  const DASH_ORIGIN_LABEL: Record<string, string> = {
-    session: 'main session',
-    agent: 'sub-agents',
-  };
+  /// The lanes the donut, its legend and the per-model share line print — as
+  /// the harnesses DECLARE them, in declared order.
+  ///
+  /// **V40 Phase F (locked decision 19)** made the lane NAMES declared: the
+  /// `session | agent` split is one harness's sidechain model, and a harness
+  /// that attributes turns some other way had no way to say so. **V40 Phase G
+  /// removed the two-lane SHAPE with it** — the payload carried
+  /// `OriginSplit { session_tok, agent_tok }`, a closed pair, so a harness with
+  /// one lane rendered a fabricated second at 0 and one with three had nowhere
+  /// to put the third. `ModelUsage.origins` is a per-lane map now and this list
+  /// is what iterates it. A lane no harness declares still renders under its own
+  /// id, the same posture every other unknown gets.
+  /// Each harness's declared turn lanes, **keyed by harness** (V40 review
+  /// finding F-4).
+  ///
+  /// This was one flat list, unioned across the roster, first-id-wins, rendered
+  /// for every session. Two consequences, both latent only because the two
+  /// shipped harnesses declare byte-identical origins — and V40 exists to make
+  /// a third one easy:
+  ///
+  /// * a lane only harness B declares became a permanent `0 tok` row on every
+  ///   harness-A session's Cost card and an empty ring in the donut legend — a
+  ///   lane that collects nothing, asserted as a real zero, which is exactly
+  ///   the absent-vs-zero distinction Phase G's payload change preserves;
+  /// * two harnesses declaring the same lane id with different `subagent`
+  ///   flags meant the first one's flag decided for both, so `subagentOrigins`
+  ///   painted the outline and the `A` badge on the other harness's bars.
+  let declaredOriginsByHarness = $state<Record<string, DeclaredOrigin[]>>({});
+  /// The harness whose session the usage surface is currently showing — the
+  /// pinned row's, else the live session's row in the sessions list. `''` when
+  /// nothing is selected and the live session has no row yet, which degrades
+  /// the lanes to whatever the DATA carries (bare ids), never to another
+  /// harness's wording.
+  const dashHarnessId = $derived.by(() => {
+    if (selectedRow) return selectedRow.agent;
+    const sid = usage?.current?.session_id ?? '';
+    if (!sid) return '';
+    return usage?.sessions.find((r) => r.session_id === sid)?.agent ?? '';
+  });
+  const declaredOrigins = $derived<DeclaredOrigin[]>(
+    declaredOriginsByHarness[dashHarnessId] ?? [],
+  );
+  const DASH_ORIGIN_LABEL = $derived(
+    Object.fromEntries(declaredOrigins.map((o) => [o.id, o.label])) as Record<string, string>,
+  );
+  /// The lanes `originShareLine` prints, with their declared labels. Falls
+  /// back to the lanes present in the data so a share line still renders before
+  /// the declaration lands (bare ids, never another harness's wording).
+  const dashShareLanes = $derived(
+    declaredOrigins.length > 0
+      ? declaredOrigins.map((o) => ({ id: o.id, label: o.label }))
+      : dashLaneIds.map((id) => ({ id })),
+  );
+  /// The declared lanes that carry FAN-OUT spend — what marks a chart bar as a
+  /// sub-agent turn. The harness's own statement (`origins[].subagent`), never
+  /// the word "agent".
+  const subagentOrigins = $derived(declaredOrigins.filter((o) => o.subagent).map((o) => o.id));
+
+  /// Ask each harness what its recorded turns look like, once.
+  ///
+  /// V40 Phase G: asked of EVERY harness in the roster, not just those with a
+  /// `session_usage`-shaped quota answer, and read off `harness_usage`'s
+  /// top-level `origins` rather than out of `source` — a harness can record
+  /// turns without reporting quota (one shipped harness does exactly that), and
+  /// nesting the declaration under `source` is why its sessions' lanes had no
+  /// labels at all. Best-effort in both directions: a harness that declares no turn shape
+  /// contributes nothing, and a failed call leaves the list as it is — the
+  /// labels degrade to bare ids, never to another harness's wording.
+  // Driven by the roster rather than by mount: `harness_list` and this
+  // component's mount race, and an empty roster would leave every lane labelled
+  // with its bare id. Re-runs once, when the list arrives.
+  let originsAsked = false;
+  $effect(() => {
+    if (originsAsked || $harnesses.length === 0) return;
+    originsAsked = true;
+    void loadDeclaredOrigins();
+  });
+
+  async function loadDeclaredOrigins(): Promise<void> {
+    const next: Record<string, DeclaredOrigin[]> = {};
+    for (const h of get(harnesses)) {
+      try {
+        const answer = await harnessUsage(h.id);
+        // Kept under the harness that DECLARED them (V40 review F-4). A
+        // harness that declares nothing gets no key, and its sessions fall back
+        // to the lanes present in the data — which is the honest answer, not a
+        // neighbour's lane list.
+        if (answer.origins.length > 0) next[h.id] = answer.origins;
+      } catch (e) {
+        console.warn('harness_usage origins failed:', e);
+      }
+    }
+    if (Object.keys(next).length > 0) declaredOriginsByHarness = next;
+  }
   const DASH_KIND_LABEL = Object.fromEntries(DASH_KIND_SEGS.map((s) => [s.key, s.label])) as Record<
     string,
     string
   >;
+  /// The color-picker entry backing a lane's legend dot. The two settings
+  /// fields (`usage_color_session` / `usage_color_agent`) are a fixed pair, so
+  /// lanes beyond the second share the second's swatch rather than gaining a
+  /// setting this phase is not allowed to add.
+  function laneSeg(i: number): (typeof SA_SEGS)[number] {
+    return SA_SEGS[Math.min(i, SA_SEGS.length - 1)];
+  }
   // An inner arc's "session:cache"-style key split back into its parts for
   // the tooltip / fill class.
   function dashInnerParts(key: string): { origin: string; kind: string } {
@@ -1404,10 +1549,14 @@
   // `seg` is the SA_SEGS entry backing the row's color picker — same
   // settings-backed commit machinery as the This-session legend, so a pick
   // in either card recolors both.
-  const dashLegendRows = $derived([
-    { origin: 'session', seg: SA_SEGS[0], tok: dashSessionTok, kinds: dashKinds.session },
-    { origin: 'agent', seg: SA_SEGS[1], tok: dashAgentTok, kinds: dashKinds.agent },
-  ]);
+  const dashLegendRows = $derived(
+    dashLaneKeys.map((id, i) => ({
+      origin: id,
+      seg: laneSeg(i),
+      tok: dashLaneTok[id],
+      kinds: dashKinds[id] ?? {},
+    })),
+  );
 
   // Cost donut: per-model share of the session's estimated cost, at the same
   // resolved rates as the Cost card (overrides included) — the two can never
@@ -1493,7 +1642,11 @@
   async function markVerified(p: AdvisorProposal): Promise<void> {
     advisorBusy = proposalKey(p);
     try {
-      await harnessMarkVerified();
+      // A `mark_verified` card always carries the harness it is about; a card
+      // without one has nothing to stamp, and stamping the default harness
+      // instead is exactly the misattribution Phase C's field removed.
+      if (!p.harness) return;
+      await harnessMarkVerified(p.harness);
       dropProposal(p);
     } catch (e) {
       console.error('harness_mark_verified failed', e);
@@ -1645,6 +1798,8 @@
   });
 
   onMount(async () => {
+    // Static backend data, once — see `loadAdvisorRules`.
+    void loadAdvisorRules();
     await refresh();
     // A light poll backstops the event for the section-gated fetches (memory,
     // usage) and the checks-suggestion readiness edge.
@@ -1760,7 +1915,7 @@
                 {#each dashOuterArcs as a (a.key)}
                   <path class="dseg {a.key}" d={arcPath(66, 66, 62, 46, a.a0, a.a1)}>
                     <title
-                      >{DASH_ORIGIN_LABEL[a.key]}: {a.value.toLocaleString()} tok · {fmtPct(
+                      >{DASH_ORIGIN_LABEL[a.key] ?? a.key}: {a.value.toLocaleString()} tok · {fmtPct(
                         a.share,
                       )}</title
                     >
@@ -1770,7 +1925,7 @@
                   {@const p = dashInnerParts(a.key)}
                   <path class="dseg {p.kind}" d={arcPath(66, 66, 42, 28, a.a0, a.a1)}>
                     <title
-                      >{DASH_ORIGIN_LABEL[p.origin]} {DASH_KIND_LABEL[p.kind]}: {a.value.toLocaleString()} tok
+                      >{DASH_ORIGIN_LABEL[p.origin] ?? p.origin} {DASH_KIND_LABEL[p.kind]}: {a.value.toLocaleString()} tok
                       · {fmtPct(a.share)}</title
                     >
                   </path>
@@ -1789,13 +1944,13 @@
                       oninput={(e) => (chartPreview[r.seg.key] = e.currentTarget.value)}
                       onchange={(e) => commitChartColor(r.seg, e.currentTarget.value)}
                     />
-                    <span class="dl-name">{DASH_ORIGIN_LABEL[r.origin]}</span>
+                    <span class="dl-name">{DASH_ORIGIN_LABEL[r.origin] ?? r.origin}</span>
                     <span class="tnum" title="{r.tok.toLocaleString()} tokens">{fmtTok(r.tok)}</span>
                     <span class="muted">{fmtPct(dashTokenTotal > 0 ? r.tok / dashTokenTotal : 0)}</span>
                   </div>
                   <div class="dl-kinds">
                     {#each DASH_KIND_SEGS as s (s.key)}
-                      {@const v = dashKindValue(r.kinds, s.key)}
+                      {@const v = dashKindValue(r.kinds, s.kind)}
                       <span class="dl-kind" title="{s.label}: {v.toLocaleString()} tokens">
                         <input
                           type="color"
@@ -2064,11 +2219,11 @@
               {@const turnNo = usageTurns.length - shownTurns.length + i + 1}
               <div class="ubar-col" style={fixedCols ? `flex: 0 0 ${colPx}px` : undefined}>
                 <div
-                  class="ubar {agentBarClass(t.origin)}"
+                  class="ubar {agentBarClass(t.origin, subagentOrigins)}"
                   style="height: {barHeightPct(total, max)}%"
                   title={cost
                     ? `turn ${turnNo} (est.): ${fmtUsd(cost.input)} in / ${fmtUsd(cost.cache_read)} cache-read / ${fmtUsd(cost.cache_write)} cache-write / ${fmtUsd(cost.output)} out / ${fmtUsd(cost.tool)} est. tool — ${fmtUsd(cost.total)}`
-                    : `turn ${turnNo}: ${t.in_tok} in / ${t.cache_read} cache-read / ${t.cache_make} cache-write / ${t.out_tok} out / ~${est_tool} est. tool`}
+                    : `turn ${turnNo}: ${DASH_KIND_SEGS.map((s) => `${t.tokens[s.kind!] ?? 0} ${s.label}`).join(' / ')} / ~${est_tool} est. tool`}
                 >
                   {#if total > 0}
                     <!-- One segment list for both modes (order matches
@@ -2079,7 +2234,7 @@
                       ? [cost.input, cost.cache_read, cost.cache_write, cost.output, cost.tool].map(
                           (v) => v * 1e6,
                         )
-                      : [t.in_tok, t.cache_read, t.cache_make, t.out_tok, est_tool]}
+                      : [...DASH_KIND_SEGS.map((s) => t.tokens[s.kind!] ?? 0), est_tool]}
                     {#each CHART_SEGS as s, si (s.key)}
                       <span class="useg {s.key}" style="flex-grow: {segs[si]}"></span>
                     {/each}
@@ -2100,7 +2255,7 @@
                 <span
                   class="saseg {seg.origin}"
                   style="flex-grow: {seg.count}"
-                  title="{seg.origin === 'agent' ? 'sub-agent' : 'main session'} · {seg.count} turn{seg.count ===
+                  title="{DASH_ORIGIN_LABEL[seg.origin] ?? seg.origin} · {seg.count} turn{seg.count ===
                   1
                     ? ''
                     : 's'}"
@@ -2173,8 +2328,8 @@
                   <option value={pricingRows.length + 1}>Free ($0)</option>
                 </select>
               </div>
-              <!-- Secondary line: the main-session vs sub-agent token share. -->
-              <div class="cm-share muted">{originShareLine(m.origins)}</div>
+              <!-- Secondary line: this model's token share per declared lane. -->
+              <div class="cm-share muted">{originShareLine(m.origins, dashShareLanes)}</div>
               {#if st.selIdx === pricingRows.length && costCustomByModel[m.model]}
                 <div class="cost-custom">
                   <label><span>Input $/MTok</span><input type="number" min="0" step="0.01" bind:value={costCustomByModel[m.model].input} /></label>
@@ -2196,10 +2351,10 @@
                 <tbody>
                   <tr>
                     <th>Tokens</th>
-                    <td title={m.totals.in_tok.toLocaleString()}>{fmtTok(m.totals.in_tok)}</td>
-                    <td title={m.totals.cache_make.toLocaleString()}>{fmtTok(m.totals.cache_make)}</td>
-                    <td title={m.totals.cache_read.toLocaleString()}>{fmtTok(m.totals.cache_read)}</td>
-                    <td title={m.totals.out_tok.toLocaleString()}>{fmtTok(m.totals.out_tok)}</td>
+                    {#each COST_TABLE_KINDS as k (k)}
+                      {@const v = m.totals[k] ?? 0}
+                      <td title={v.toLocaleString()}>{fmtTok(v)}</td>
+                    {/each}
                   </tr>
                   <tr>
                     <th>$ / MTok</th>
@@ -2233,7 +2388,7 @@
     <details class="card advisor" bind:open={advisorCardOpen}>
       <summary class="history-head">
         Budget-tuning advisor
-        <span class="muted" title={ADVISOR_RULES_TOOLTIP}>ⓘ rules</span>
+        <span class="muted" title={advisorRulesTooltip}>ⓘ rules</span>
       </summary>
       {#if advisorError}
         <p class="placeholder">{advisorError}</p>
@@ -2261,7 +2416,7 @@
                   <button
                     class="mini"
                     disabled={advisorBusy !== null}
-                    title="Stamp the currently-seen Claude Code version as verified — do this AFTER re-running the MAINTENANCE.md contract checks"
+                    title="Stamp the currently-seen {harnessLabel(p.harness)} version as verified — do this AFTER re-running the MAINTENANCE.md contract checks"
                     onclick={() => markVerified(p)}
                   >{advisorBusy === proposalKey(p) ? 'Marking…' : 'Mark verified'}</button>
                 {:else if !p.warn_only}
@@ -2297,12 +2452,13 @@
         <div class="rows scroll10">
           {#each usage.sessions as s (s.session_id)}
             {@const nCommits = commitCounts[s.session_id] ?? 0}
+            {@const hit = cacheHitRatio(s.totals)}
             {@const rowState = sessionRowState(s.session_id, selectedId, usage.active_session_ids)}
             <div class="sessrow-wrap">
               <button
                 type="button"
                 class="arow sessrow {rowState.selected ? 'selected' : ''} {rowState.active ? 'active' : ''}"
-                title={`${s.totals.in_tok.toLocaleString()} input · ${s.totals.cache_make.toLocaleString()} cache-write · ${s.totals.cache_read.toLocaleString()} cache-read · ${s.totals.out_tok.toLocaleString()} output tokens — click to view this session's usage`}
+                title={`${SESSION_STAT_KINDS.map((k) => `${(s.totals[k.id] ?? 0).toLocaleString()} ${k.long}`).join(' · ')} tokens — click to view this session's usage`}
                 onclick={() => void selectSession(s)}
               >
                 <span class="aname">{#if rowState.active}<span class="active-dot" title="active now" aria-label="active now"></span>{/if}{s.agent}{#if s.est_only}<span class="est-badge" title="No real token data for this session — chars-only estimate">est</span>{/if}<span class="sess-date">{fmtDate(s.started_ms)}</span></span>
@@ -2329,13 +2485,14 @@
                   {/if}
                 {:else}
                   <span class="sess-stats tnum">
-                    <span><b>{fmtTok(s.totals.in_tok)}</b> in</span>
-                    <span><b>{fmtTok(s.totals.cache_make)}</b> cache-write</span>
-                    <span><b>{fmtTok(s.totals.cache_read)}</b> cache-read</span>
-                    <span><b>{fmtTok(s.totals.out_tok)}</b> out</span>
+                    {#each SESSION_STAT_KINDS as k (k.id)}
+                      <span><b>{fmtTok(s.totals[k.id] ?? 0)}</b> {k.short}</span>
+                    {/each}
                   </span>
                 {/if}
-                <span class="aloc">cache-hit {Math.round(cacheHitRatio(s.totals.cache_read, s.totals.in_tok) * 100)}%</span>
+                <span class="aloc"
+                  >cache-hit {hit === null ? '—' : `${Math.round(hit * 100)}%`}</span
+                >
               </button>
               {#if $settings.workbench.enabled}
                 <button
@@ -2538,7 +2695,7 @@
 
     {#if !memory || (memory.working_set.length === 0 && memory.notes.length === 0 && memory.sessions.length === 0)}
       <p class="placeholder">
-        No session memory yet. As Claude reads, edits, and queries files (with the
+        No session memory yet. As the agent reads, edits, and queries files (with the
         graph enabled), its working set and notes appear here.
       </p>
     {:else}
@@ -2576,7 +2733,7 @@
       <section class="card">
         <div class="history-head">Notes <span class="muted">({memory.notes.length})</span></div>
         {#if memory.notes.length === 0}
-          <p class="placeholder">No notes. Ask Claude to <code>context_note</code> a decision.</p>
+          <p class="placeholder">No notes. Ask the agent to <code>context_note</code> a decision.</p>
         {:else}
           <div class="rows">
             {#each memory.notes as n (n.note_id)}
@@ -2617,9 +2774,9 @@
         When enabled (Settings → Code Intelligence → Token efficiency → Context
         injection), cImp
         prepends a budget-bounded digest of the most relevant files to each
-        prompt — for Claude via a <code>UserPromptSubmit</code> hook, for OpenCode
-        via a generated plugin. Preview below shows what <em>would</em> be injected
-        for a prompt, regardless of the toggle.
+        prompt{injectMechanisms ? ` — ${injectMechanisms}` : ''}. Preview below
+        shows what <em>would</em> be injected for a prompt, regardless of the
+        toggle.
       </p>
 
       <section class="card">

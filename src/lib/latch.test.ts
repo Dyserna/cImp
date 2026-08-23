@@ -1,4 +1,17 @@
-import { describe, it, expect } from 'vitest';
+import { beforeEach, describe, it, expect } from 'vitest';
+import {
+  FIRST_HARNESS,
+  SECOND_HARNESS,
+  fixtureAiTabs,
+  installFixtureHarnesses,
+} from './harness.fixture';
+
+const H1 = FIRST_HARNESS.id;
+const H2 = SECOND_HARNESS.id;
+
+// V40 Phase F: the wire keys and tab ids below come from the committed registry
+// fixture, and the store the helpers read is filled from the same source.
+beforeEach(installFixtureHarnesses);
 import {
   reducedFeaturesFor,
   isReducedRow,
@@ -34,6 +47,7 @@ import {
   defaultSettings,
   TAB_INJECTION_FEATURES,
   type Settings,
+  HARNESS_NATIVE_GATE_KEY,
 } from './settings/types';
 
 /// The three readings the backend can hand us, named (#48, M-25).
@@ -48,7 +62,7 @@ const INERT: RulesHealth = { armed: false, healthy: false, files_failed: 0 };
 
 /// V32 Phase G/H — the tab badge's "what is switched off here?" filter.
 ///
-/// The Phase H case is the one worth a test: the OpenCode native gate ships OFF
+/// The Phase H case is the one worth a test: the harness native gate ships OFF
 /// (locked decision 17), so a fresh install must not raise the muted
 /// reduced-protection badge on every tab. The rule lives in the backend's
 /// `protection_reduced`; this side must apply the same one, using the
@@ -73,11 +87,11 @@ function status(features: FeatureState[]): InjectionStatus {
   return {
     protection: true,
     reduced: false,
-    scopes: [{ scope: 'opencode', label: 'OpenCode', features }],
+    scopes: [{ scope: H2, label: SECOND_HARNESS.label, features }],
   };
 }
 
-const TAB = 'opencode' as TabId;
+const TAB = H2 as TabId;
 
 describe('reducedFeaturesFor', () => {
   it('reports a feature that ships on and is switched off', () => {
@@ -87,7 +101,7 @@ describe('reducedFeaturesFor', () => {
 
   it('ignores a default-off feature that is simply off (the Phase H baseline)', () => {
     const s = status([
-      feature({ feature: 'opencode_native_gate', effective: false, default_on: false }),
+      feature({ feature: HARNESS_NATIVE_GATE_KEY, effective: false, default_on: false }),
     ]);
     expect(reducedFeaturesFor(s, TAB)).toEqual([]);
   });
@@ -95,7 +109,7 @@ describe('reducedFeaturesFor', () => {
   it('still ignores a default-off feature that is switched ON — that is more protection', () => {
     const s = status([
       feature({
-        feature: 'opencode_native_gate',
+        feature: HARNESS_NATIVE_GATE_KEY,
         effective: true,
         default_on: false,
         decided_by: 'scope',
@@ -143,7 +157,7 @@ describe('reducedFeaturesFor', () => {
 
   it('reports nothing for an unknown tab or a missing status', () => {
     expect(reducedFeaturesFor(null, TAB)).toEqual([]);
-    expect(reducedFeaturesFor(status([]), 'claude' as TabId)).toEqual([]);
+    expect(reducedFeaturesFor(status([]), H1 as TabId)).toEqual([]);
   });
 
   /// #48, G-2: the status chip counted `in_scope && !effective` and omitted the
@@ -153,7 +167,7 @@ describe('reducedFeaturesFor', () => {
   it('is the predicate both surfaces call, so they cannot disagree', () => {
     const rows = [
       feature({ feature: 'taint_latch', effective: false }),
-      feature({ feature: 'opencode_native_gate', effective: false, default_on: false }),
+      feature({ feature: HARNESS_NATIVE_GATE_KEY, effective: false, default_on: false }),
       feature({ feature: 'canary', effective: false, in_scope: false }),
       feature({ feature: 'spotlighting' }),
     ];
@@ -229,7 +243,7 @@ describe('reducedFeaturesFor', () => {
     expect(isReducedRow(own, 'offload-worker')).toBe(true);
     expect(isTabScope('offload-worker')).toBe(false);
     expect(isTabScope('app')).toBe(false);
-    expect(isTabScope('claude')).toBe(true);
+    expect(isTabScope(H1)).toBe(true);
   });
 });
 
@@ -290,19 +304,27 @@ describe('tabProtectionRows / protectionTint / protectionSummary', () => {
 /// (never a mutation of the store's object), one settings object per action
 /// however many cells moved, and only the tab that was clicked.
 describe('withTabInjectionOverrides / setAllOverrides', () => {
-  const base = (): Settings => defaultSettings();
+  // V40 Phase F: `DEFAULT_SETTINGS.tabs` is empty (the roster comes from the
+  // backend), so the AI tabs these patches move are built from the committed
+  // registry fixture.
+  const base = (): Settings => {
+    const s = defaultSettings();
+    s.tabs = fixtureAiTabs();
+    return s;
+  };
+  const TAB = FIRST_HARNESS.tab_ids[0];
 
   it('patches one tab’s cell without touching the object it was given', () => {
     const before = base();
     const snapshot = JSON.stringify(before);
-    const after = withTabInjectionOverrides(before, 'claude' as TabId, { taint_latch: 'on' });
+    const after = withTabInjectionOverrides(before, TAB as TabId, { taint_latch: 'on' });
     expect(JSON.stringify(before)).toBe(snapshot);
     expect(after).not.toBe(before);
-    const tab = after.tabs.find((t) => t.kind === 'ai_tool' && t.id === 'claude');
+    const tab = after.tabs.find((t) => t.kind === 'ai_tool' && t.id === TAB);
     expect(tab?.kind === 'ai_tool' && tab.injection_overrides.taint_latch).toBe('on');
     // Every other cell of that tab, and every other tab, is untouched.
     expect(tab?.kind === 'ai_tool' && tab.injection_overrides.spotlighting).toBe('off');
-    const other = after.tabs.find((t) => t.kind === 'ai_tool' && t.id !== 'claude');
+    const other = after.tabs.find((t) => t.kind === 'ai_tool' && t.id !== TAB);
     expect(other?.kind === 'ai_tool' && other.injection_overrides.taint_latch).toBe('off');
   });
 
@@ -315,14 +337,14 @@ describe('withTabInjectionOverrides / setAllOverrides', () => {
     expect(Object.keys(all).sort()).toEqual([...TAB_INJECTION_FEATURES].sort());
     expect(Object.values(all).every((v) => v === 'on')).toBe(true);
 
-    const after = withTabInjectionOverrides(base(), 'claude' as TabId, all);
-    const tab = after.tabs.find((t) => t.kind === 'ai_tool' && t.id === 'claude');
+    const after = withTabInjectionOverrides(base(), TAB as TabId, all);
+    const tab = after.tabs.find((t) => t.kind === 'ai_tool' && t.id === TAB);
     expect(tab?.kind === 'ai_tool' && Object.values(tab.injection_overrides)).toEqual(
       TAB_INJECTION_FEATURES.map(() => 'on'),
     );
 
-    const offAgain = withTabInjectionOverrides(after, 'claude' as TabId, setAllOverrides(rows, 'off'));
-    const back = offAgain.tabs.find((t) => t.kind === 'ai_tool' && t.id === 'claude');
+    const offAgain = withTabInjectionOverrides(after, TAB as TabId, setAllOverrides(rows, 'off'));
+    const back = offAgain.tabs.find((t) => t.kind === 'ai_tool' && t.id === TAB);
     expect(back?.kind === 'ai_tool' && back.injection_overrides).toEqual(
       allOffInjectionOverrides(),
     );
@@ -369,8 +391,8 @@ describe('reducedSummary', () => {
       reduced: true,
       scopes: [
         { scope: 'offload-worker', label: 'Offload worker', features: [off] },
-        { scope: 'claude', label: 'Claude', features: [off] },
-        { scope: 'opencode', label: 'OpenCode', features: [off] },
+        { scope: H1, label: FIRST_HARNESS.label, features: [off] },
+        { scope: H2, label: SECOND_HARNESS.label, features: [off] },
       ],
     };
     expect(reducedSummary(s)).toBe('1 control switched off');
@@ -379,7 +401,7 @@ describe('reducedSummary', () => {
   it('excludes the default-off Phase H gate, exactly as the badge does', () => {
     const s = status([
       feature({ feature: 'taint_latch', effective: false }),
-      feature({ feature: 'opencode_native_gate', effective: false, default_on: false }),
+      feature({ feature: HARNESS_NATIVE_GATE_KEY, effective: false, default_on: false }),
     ]);
     expect(reducedSummary(s)).toBe('1 control switched off');
   });
@@ -860,7 +882,7 @@ describe('reducedTabLine / featureStateWord', () => {
 describe('isTainted', () => {
   it('is true when latched either way or contaminated, false for a clean row', () => {
     const row = {
-      consumer: 'opencode',
+      consumer: H2,
       tab: TAB,
       session: null,
       latch: 'open',
@@ -882,7 +904,7 @@ describe('isTainted', () => {
 
 describe('taintColor', () => {
   const row = {
-    consumer: 'claude',
+    consumer: H1,
     tab: TAB,
     session: null,
     latch: 'open',

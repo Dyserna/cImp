@@ -1,7 +1,7 @@
 [package]
 name = "cimp"
 version = "0.53.0-rc.5"
-description = "Claude Code wrapper with TTS, avatar, and compose overlay"
+description = "A terminal for AI coding agents, with TTS, avatar, and compose overlay"
 authors = ["Amir Amashe"]
 edition = "2021"
 rust-version = "1.88"

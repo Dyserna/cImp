@@ -7,7 +7,10 @@ import { writable, get } from 'svelte/store';
 import { ptyWrite } from './ipc';
 import { activeTab } from './tabs/state';
 import { focusTerminal } from './terminalFocus';
-import { appendAttachments } from './compose/attachments';
+import { appendAttachments, DEFAULT_ATTACHMENT_FORMAT } from './compose/attachments';
+import { harnessForCommand, harnessForTab } from './harness';
+import { settings } from './settings/store';
+import { harnessInstruction } from './harnessText';
 
 export const composeOpen = writable<boolean>(false);
 export const composeContent = writable<string>('');
@@ -79,19 +82,47 @@ export function closeCompose(): void {
 export async function submitCompose(): Promise<void> {
   const content = get(composeContent);
   const attachments = get(composeAttachments);
+  // V40 Phase E: the trailing instruction is the TARGET TAB's, fetched from the
+  // backend inventory (locked decision 24). Asked only when there is something
+  // to attach, so a plain-text submit still costs no IPC round trip.
+  const tab = get(activeTab);
+  const instruction =
+    attachments.length > 0 ? await harnessInstruction(tab, 'attachment') : '';
   // `appendAttachments` returns `content` unchanged when there are no
   // attachments, so an image-only draft (empty textarea, one pasted image)
   // still submits — only a truly empty draft (no text AND no attachments)
   // is a no-op.
-  const message = appendAttachments(content, attachments);
+  const message = appendAttachments(
+    content,
+    attachments,
+    instruction,
+    // V40 review L-14: a user-created `ai-<uuid>` duplicate is not a reserved
+    // tab id, so `harnessForTab` answers `null` for it and the format fell to
+    // the neutral default — while the INSTRUCTION on the line above is resolved
+    // by harness backend-side. Its harness is knowable from its command, which
+    // is the same thing the backend uses.
+    (harnessForTab(tab) ?? harnessForCommand(aiTabCommand(tab)))?.affordances
+      .attachmentFormat ?? DEFAULT_ATTACHMENT_FORMAT,
+  );
   if (!message) {
     closeCompose();
     return;
   }
   try {
-    await ptyWrite(get(activeTab), message + '\r');
+    await ptyWrite(tab, message + '\r');
   } catch (e) {
     console.error('compose submit pty_write failed:', e);
   }
   closeCompose();
+}
+
+/// The configured command of an AI tab, or `''`.
+///
+/// V40 review L-14: a user-created `ai-<uuid>` duplicate is not a reserved tab
+/// id, so the registry cannot answer "which harness" from the id alone — but it
+/// can from the command, which is the same thing `HarnessId::from_command`
+/// answers backend-side for the instruction on the line above.
+function aiTabCommand(tabId: string): string {
+  const cfg = get(settings).tabs.find((t) => t.id === tabId);
+  return cfg && cfg.kind === 'ai_tool' ? cfg.command : '';
 }

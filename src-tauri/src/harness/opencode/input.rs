@@ -40,7 +40,8 @@
 //! degradation. The engine's preflight accepts either source; what it refuses
 //! is a tab with neither.
 
-use crate::harness::input::{InputProfile, PasteMode};
+use crate::harness::contract::{Capability, Degradation, Dep, Harness, Seam};
+use crate::harness::plugin::{InputProfile, PasteMode};
 
 /// Milliseconds between the paste and the submit. See the module docs.
 const SETTLE_MS: u64 = 80;
@@ -57,6 +58,44 @@ pub fn input_profile() -> InputProfile {
         max_paste_bytes: MAX_PASTE_BYTES,
     }
 }
+
+
+/// This harness, as the registry's own opaque id — the same value
+/// `contract.rs` spells for its neutral rows, declared here because a row that
+/// names its harness by hand is a row that can name the wrong one.
+const HARNESS: Harness = Harness::declared("opencode");
+
+/// The registry row this profile depends on, contributed to
+/// [`crate::harness::contract::capabilities`] by
+/// [`HarnessPlugin::capabilities`](crate::harness::plugin::HarnessPlugin::capabilities).
+///
+/// It lives here rather than in the neutral table because its CONTRACT is a
+/// sentence about OpenCode's TUI, and it is the same sentence the module
+/// docs above state: the row and the values it is about are one edit.
+pub const CAPABILITIES: &[Capability] = &[
+    Capability {
+        id: "opencode.input.profile",
+        harness: HARNESS,
+        tier: Seam::D,
+        contract: "OpenCode's TUI accepts a bracketed paste (`ESC [ 200 ~` … `ESC [ 201 ~`) as                    ONE literal insertion, and a CR written after it submits that buffer as                    exactly one turn.",
+        depends_on: &[Dep::Behavior(
+            "multi-line bracketed paste + submit yields exactly one turn",
+        )],
+        wired_in: &[
+            "src-tauri/src/harness/opencode/input.rs",
+            "src-tauri/src/harness/plugin.rs",
+        ],
+        degradation: Degradation::FailClosed,
+        drift_rule: &[],
+        canary: None,
+        probe: None,
+        waiver: Some(
+            "Same class as `claude.input.profile`, same spike, same recorded outcome. Owner: V39              Phase D.",
+        ),
+        controls: &[],
+        drift_token: None,
+    },
+];
 
 #[cfg(test)]
 mod tests {

@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicI32;
-use std::sync::{Arc, Mutex as StdMutex, RwLock};
+use std::sync::{Arc, RwLock};
 
 use tauri::ipc::Channel;
 use tauri::AppHandle;
@@ -279,7 +279,6 @@ impl TabRegistry {
         launch_cwd: &std::path::Path,
         invocation_args: &[String],
         tts_segments: mpsc::Sender<TtsRequest>,
-        user_typed_tts: Arc<StdMutex<HashSet<String>>>,
         settings: SettingsHandle,
         // V39 review R-5: this start's generation, from
         // `TabActivity::begin_start`.
@@ -318,7 +317,6 @@ impl TabRegistry {
                 rows,
                 cols,
                 tts_segments,
-                user_typed_tts,
                 self.state_signals.clone(),
                 self.patterns.clone(),
                 start_gen,
@@ -356,7 +354,6 @@ impl TabRegistry {
         launch_cwd: &std::path::Path,
         invocation_args: &[String],
         tts_segments: mpsc::Sender<TtsRequest>,
-        user_typed_tts: Arc<StdMutex<HashSet<String>>>,
         settings: SettingsHandle,
         // V39 review R-5: this start's generation, from
         // `TabActivity::begin_start`.
@@ -386,7 +383,6 @@ impl TabRegistry {
                 rows,
                 cols,
                 tts_segments,
-                user_typed_tts,
                 self.state_signals.clone(),
                 self.patterns.clone(),
                 start_gen,

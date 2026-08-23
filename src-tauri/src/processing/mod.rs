@@ -33,7 +33,7 @@ mod prose;
 mod sanitize;
 mod screen;
 mod segmenter;
-mod tags;
+
 
 pub use prose::to_speakable;
 pub use sanitize::strip_terminal_escapes;
@@ -42,7 +42,7 @@ pub use sanitize::strip_terminal_escapes;
 // rather than re-exported — nothing outside that one call site names it.
 pub use sanitize::scrub_payload;
 pub use segmenter::segment_sentences;
-pub use tags::normalize_for_dedup;
+
 
 #[cfg(test)]
 mod tests;

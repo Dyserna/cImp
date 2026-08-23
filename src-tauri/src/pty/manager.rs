@@ -1,4 +1,4 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::io::Write;
 use std::sync::{Arc, Mutex as StdMutex};
 
@@ -282,9 +282,6 @@ impl PtyManager {
         initial_rows: u16,
         initial_cols: u16,
         tts_segments: mpsc::Sender<TtsRequest>,
-        // V20: retained for the registry's call shape; the processing layer no
-        // longer consumes a user-typed echo filter (TTS is out-of-band).
-        _user_typed_tts: Arc<StdMutex<HashSet<String>>>,
         state_signals: mpsc::Sender<StateSignal>,
         patterns: Arc<Vec<PermissionPattern>>,
         // V39 review R-5: the generation this start is filed under, from

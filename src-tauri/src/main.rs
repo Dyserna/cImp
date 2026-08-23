@@ -41,7 +41,6 @@ mod theming;
 mod tts;
 mod workbench;
 
-use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, RwLock};
@@ -668,8 +667,6 @@ fn main() {
         tts_segments: tts_tx,
         speak_session: speak_session.clone(),
         ai_tts_suppressed: ai_tts_suppressed.clone(),
-        user_typed_tts: Arc::new(Mutex::new(HashSet::new())),
-        user_input_buf: Arc::new(Mutex::new(HashMap::new())),
         state_signals: state_tx.clone(),
         input_lengths: input_lengths.clone(),
         read_only: read_only_tabs.clone(),

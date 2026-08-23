@@ -829,10 +829,11 @@ async fn run_flight(
     mark_submitted(worker, submit_ms);
 
     // The ONE input pipeline (the V39 cross-module invariant): the same
-    // `write_through_pipeline` `pty_write` runs — TTS-marker registration,
-    // `note_typed_input`, the `UserSubmit` signal — reached without the
-    // read-only check, which is the only thing the engine bypasses and only
-    // because it holds the lock itself.
+    // `write_through_pipeline` `pty_write` runs — the unsent-input counters and
+    // the `UserSubmit` signal — reached without the read-only check, which is
+    // the only thing the engine bypasses and only because it holds the lock
+    // itself. (It also listed the V20 echo-suppression bookkeeping until #113
+    // deleted that subsystem; nothing consumed it.)
     let paste = String::from_utf8_lossy(&profile.paste_bytes(typed)).into_owned();
     // V39 review L-1: the paste is NOT the submit, whatever its bytes look
     // like. A multi-line request is one bracketed paste full of newlines, and

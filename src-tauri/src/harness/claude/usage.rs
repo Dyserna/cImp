@@ -77,11 +77,12 @@
 //! subscription plan.
 
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
+use crate::activity::now_ms;
 use crate::harness::plugin::{
     ContextReading, QuotaWindow, QuotaWindowSpec, TokenKindSpec, TokenKinds, TurnOrigin,
     TurnUsageShape, UsageReading, UsageSource,
@@ -356,12 +357,6 @@ fn push_path() -> Option<PathBuf> {
     Some(exe.parent()?.join(PUSH_FILE))
 }
 
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
 
 /// Persist a snapshot extracted from a status-line payload. Called from the
 /// short-lived `cimp --statusline` child process, so it must never panic or

@@ -32,6 +32,7 @@ use tokio::sync::{broadcast, mpsc, Mutex as TokioMutex, OwnedSemaphorePermit, Se
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use crate::activity::now_ms;
 use crate::error::{AppError, AppResult};
 use crate::settings::{
     BackendTier, OffloadBackend, OffloadBackendKind, OffloadSettings, Settings, SettingsHandle,
@@ -3126,14 +3127,6 @@ fn thinking_label(m: ThinkingMode) -> &'static str {
     }
 }
 
-/// Current wall-clock as epoch millis (formatted on the frontend).
-fn now_ms() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
 
 /// Whether an agent-loop error looks like a transport/connection failure (so
 /// a fail-over re-route is worth trying). Mirrors the child's heuristic.

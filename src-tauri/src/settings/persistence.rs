@@ -2301,23 +2301,19 @@ const RESERVED_TAB_SPECS: &[ReservedTabSpec] = &[
         default_tab: default_events_tab,
         sync_name: true,
     },
-    // The V23 "Code Audit" reserved tab is retired (schema v27) — its
-    // Security | Quality panels live inside the Tool Activity tab as the
-    // "Code audit" section now; the v26 → v27 migration drops old persisted
-    // entries.
-    // The V25 "Code Quality" reserved tab is retired (schema v23) — the
-    // Quality view lives inside the Code Audit surface as a sub-tab now; the
-    // v22 → v23 migration drops old persisted entries.
 ];
 
 /// Retired reserved feature tab ids — their dashboards moved inside other
 /// tabs and the ids must never reach the runtime: a surviving entry
 /// deserializes as a plain closable Shell tab with no view behind it, which
 /// then tries to spawn a PTY. The schema migrations prune them from the
-/// *global* file, but the per-folder overlay is deliberately never migrated
-/// (see `load`), so an overlay written by an older version re-introduces the
-/// entry through the merge. This list feeds the integrity check's fail-safe
-/// prune, which catches every source: overlays, hand-edits, imported files.
+/// *global* file, and V40 Phase I extended the cascade to the per-folder
+/// overlay too — but only from [`migration::MIN_OVERLAY_SCHEMA_VERSION`] up:
+/// an overlay older than that (or carrying no version at all) is deliberately
+/// left unmigrated rather than run through the presence-archaeology steps on a
+/// partial file, and re-introduces the entry through the merge. This list feeds
+/// the integrity check's fail-safe prune, which catches every source that
+/// survives: pre-v10 overlays, hand-edits, imported files.
 const RETIRED_TAB_IDS: [&str; 4] = [
     OFFLOAD_SERVER_TAB_ID,
     CODE_QUALITY_TAB_ID,
@@ -2562,9 +2558,11 @@ pub fn integrity_check(settings: &mut Settings) -> bool {
 
     // 4a. Drop retired reserved feature tabs (offload-server, code-quality,
     //     graph-view, code-audit).
-    //     The global-file schema migrations prune these, but the per-folder
-    //     overlay is never migrated (see `load`) — an overlay written by an
-    //     older version re-introduces the entry through the merge, where it
+    //     The schema migrations prune these from the global file and (since
+    //     V40 Phase I) from an overlay that states a version at or above
+    //     `MIN_OVERLAY_SCHEMA_VERSION`. An older or unversioned overlay is
+    //     left unmigrated by design, and re-introduces the entry through
+    //     the merge, where it
     //     deserializes as a plain Shell tab with no view behind it and tries
     //     to spawn a PTY. Runs before the layout pass so step 5 also scrubs
     //     the id from the layout tree, and the post-repair save rewrites the

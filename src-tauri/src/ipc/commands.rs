@@ -1717,13 +1717,14 @@ pub async fn settings_update(
         // renders it as a per-tab restart hint beside its own Restart buttons;
         // the main window keeps its toast for the case where Settings is
         // already closed.
-        for label in [crate::ipc::windows::SETTINGS_LABEL, "main"] {
-            let _ = app.emit_to(
-                EventTarget::webview_window(label),
-                "ai-tab-restart-hint",
-                consumers.clone(),
-            );
-        }
+        //
+        // ONE broadcast, not one `emit_to` per window (rc.9 live-verify A1):
+        // a JS `listen()` registers with `EventTarget::Any`, and Tauri's
+        // `match_any_or_filter` lets an `Any` listener receive EVERY emit
+        // regardless of the target it was addressed to — so two targeted
+        // emits reached the main window's listener twice and it showed the
+        // toast twice. `emit` delivers once to every webview.
+        let _ = app.emit("ai-tab-restart-hint", consumers);
     }
     Ok(())
 }

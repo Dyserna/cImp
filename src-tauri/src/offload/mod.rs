@@ -78,7 +78,6 @@ use crate::settings::{BackendTier, ToolScope};
 /// `name`/`tier` round out the seam for the warm-pool target design (the
 /// router currently reads these from config via [`router::BackendView`]),
 /// so they're allowed to be unused today.
-#[allow(dead_code)]
 pub trait Backend: Send + Sync {
     /// Stable display/routing name (`main`, `lan-3070`, `cloud`).
     fn name(&self) -> &str;

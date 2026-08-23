@@ -23,14 +23,22 @@
 // CRLF: CI checks out the repo with CRLF on Windows while local trees are
 // mixed, so every file is read with `\r` stripped before matching — the same
 // lesson the Rust source-scanners learned in V35 (green locally, red in CI).
+//
+// Why it lives in `tests/` rather than beside the themes it guards: it reads
+// the repo off disk, and `tsconfig.json` type-checks `src/**` without
+// `@types/node`, so `node:fs` there is an unresolved module in svelte-check.
+// Pulling `@types/node` in for one file would put Node's `setTimeout` (and
+// friends) in front of the DOM's for the whole frontend -- a much larger
+// change than this guard is worth. `vite.config.ts` sits outside the same
+// include for the same reason. Vitest's default discovery finds it here.
 
 import { readdirSync, readFileSync } from 'node:fs';
 import { dirname, join, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, test } from 'vitest';
 
-// this file: <repo>/src/lib/themes/tokens.test.ts
-const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
+// this file: <repo>/tests/cssTokens.test.ts
+const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 
 function walk(dir: string, exts: string[]): string[] {
   const out: string[] = [];

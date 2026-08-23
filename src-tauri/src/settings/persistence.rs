@@ -160,33 +160,56 @@ pub struct LoadOutcome {
 /// global baseline when it's absent or corrupt; the custom overlay is
 /// merely skipped if absent and quarantined if corrupt.
 ///
-/// Migration runs on the global value only. The overlay is a partial diff
-/// always written in the current schema, so it is merged as-is (see the
-/// inline note at step 2 for why running the legacy cascade on a partial
-/// overlay caused silent data loss and unbounded `.bak` growth).
+/// **Migration runs on the overlay too, since V40 Phase I** (issue #107 item
+/// 5) — from the version the overlay states, or (for one written before the
+/// stamp existed) the version the global file stated beside it. See
+/// `migration::migrate_overlay` for why entering the cascade blind was the
+/// thing that was wrong, not migrating the overlay at all.
 pub fn load(default_shell: &ShellSpec, launch_cwd: &Path) -> LoadOutcome {
     // 1. Load and migrate the global baseline. After this `global` is in
     //    the current schema shape; a v1.x file on disk has been backed up
-    //    next to the global path and rewritten.
-    let mut global = load_global(default_shell);
+    //    next to the global path and rewritten. `global_stated` is the version
+    //    the file claimed BEFORE that, which step 2a needs.
+    let (mut global, global_stated) = load_global(default_shell);
 
-    // 2. Load the overlay (if any). We deliberately DON'T run the legacy
-    //    migration cascade on it: the overlay is a *partial* diff (see
-    //    `diff`), always written by this app's `save` in the current schema.
-    //    The migration detectors (`looks_v1_2` etc.) key off absent top-level
-    //    fields, which a partial overlay legitimately lacks — so migrating it
-    //    both stamps full-object defaults that override global through the
-    //    merge (silent data loss) and, because the overlay never gains a
-    //    `schema_version`, re-fires every launch (unbounded `.v1.2.bak`
-    //    growth). Missing fields are handled correctly downstream anyway:
-    //    deep-merge fills from the (already-migrated) global, and serde
-    //    `#[serde(default)]` covers the rest.
+    // 2. Load the overlay (if any).
     //    First fold any pre-consolidation loose overlay into `.cimp/`, then
     //    read from the resolved location (canonical `.cimp/config.json`, or the
     //    legacy file if the move couldn't happen).
     migrate_legacy_overlay(launch_cwd);
     let overlay_path = overlay_read_path(launch_cwd);
     let overlay_value = read_overlay(&overlay_path, true).map(|mut v| {
+        // 2a. **Migrate it, before anything reads its shape** (V40 Phase I).
+        //     Until Phase I this was skipped, for two reasons that were both
+        //     about entering the cascade BLIND: the presence-archaeology
+        //     detectors key off top-level keys a partial diff legitimately
+        //     lacks, and a value with no version re-migrates every launch,
+        //     growing `.bak` files without bound. `migrate_overlay` is told the
+        //     version, refuses to start below where the archaeology ends, and
+        //     writes no file at all — so neither reason survives, and the gap
+        //     they were covering does not: a project that set
+        //     `claude_local.base_url` before schema 36 kept a top-level
+        //     `claude_local` block that reached nothing after the global moved
+        //     the field, with the file still on disk saying otherwise.
+        //
+        //     The version comes from the overlay's own `schema_version` stamp
+        //     (written by `save` since Phase I) and falls back to what the
+        //     global file stated: an overlay beside a v35 global was written
+        //     against a v35 baseline. Neither present ⇒ the overlay is current,
+        //     which is what every reader assumed before Phase I anyway.
+        //     The stamp is stripped inside `migrate_overlay`; it must never
+        //     reach the merge, or an old overlay would pin the merged
+        //     `schema_version` below the global's.
+        let from = migration::stated_schema_version(&v)
+            .or(global_stated)
+            .unwrap_or(crate::settings::schema::CURRENT_SCHEMA_VERSION as u64);
+        if migration::migrate_overlay(&mut v, from, default_shell) {
+            tracing::info!(
+                path = %overlay_path.display(),
+                from,
+                "settings: project overlay migrated in memory (written back on the next save)"
+            );
+        }
         // Per-install fields never belong in an overlay (see
         // `OVERLAY_BANNED_KEYS`) — drop them before the merge so an overlay
         // contaminated by a pre-guard version can't shadow the global file.
@@ -703,12 +726,20 @@ pub fn read_project_prompt_templates(root: &Path) -> Vec<PromptTemplate> {
 /// failure quarantines the file and returns defaults. Runs migration on
 /// the global file in place — backup goes next to the global path itself,
 /// not next to whatever path the merged result resolved to.
-fn load_global(default_shell: &ShellSpec) -> Settings {
+///
+/// The second half of the answer is the `schema_version` the file **stated
+/// before migration** (V40 Phase I, issue #107 item 5). It is what [`load`]
+/// falls back to for an overlay written by a build that predates the overlay
+/// stamp: an overlay sitting beside a v35 global file was written against a v35
+/// baseline, so that is the version to enter its cascade at. `None` for a file
+/// that stated none (pre-v1.10, before `schema_version` existed) and for every
+/// path that never got to read one.
+fn load_global(default_shell: &ShellSpec) -> (Settings, Option<u64>) {
     let path = match global_path() {
         Ok(p) => p,
         Err(e) => {
             tracing::warn!(error = %e, "settings: cannot resolve global path; using defaults");
-            return seeded_defaults(default_shell);
+            return (seeded_defaults(default_shell), None);
         }
     };
 
@@ -719,14 +750,14 @@ fn load_global(default_shell: &ShellSpec) -> Settings {
         } else {
             tracing::info!(path = %path.display(), "settings: wrote global defaults");
         }
-        return s;
+        return (s, None);
     }
 
     let text = match fs::read_to_string(&path) {
         Ok(t) => t,
         Err(e) => {
             tracing::warn!(error = %e, path = %path.display(), "settings: read global failed; using defaults");
-            return seeded_defaults(default_shell);
+            return (seeded_defaults(default_shell), None);
         }
     };
 
@@ -741,9 +772,14 @@ fn load_global(default_shell: &ShellSpec) -> Settings {
             migration::quarantine_corrupt_file(&path);
             let s = seeded_defaults(default_shell);
             let _ = save_to(&path, &s);
-            return s;
+            return (s, None);
         }
     };
+
+    // Read the stated version BEFORE migrating — after it, every file says
+    // `CURRENT`, and the version an overlay beside this file was written
+    // against is gone (see this function's doc comment).
+    let stated = migration::stated_schema_version(&value);
 
     // Migrate the global file in place. Backup is named after the global
     // file, which is the source of truth for the global baseline shape.
@@ -755,7 +791,7 @@ fn load_global(default_shell: &ShellSpec) -> Settings {
                 path = %path.display(),
                 "settings: global migration aborted (backup failed); using defaults"
             );
-            return seeded_defaults(default_shell);
+            return (seeded_defaults(default_shell), None);
         }
     };
 
@@ -770,7 +806,7 @@ fn load_global(default_shell: &ShellSpec) -> Settings {
             migration::quarantine_corrupt_file(&path);
             let s = seeded_defaults(default_shell);
             let _ = save_to(&path, &s);
-            return s;
+            return (s, None);
         }
     };
 
@@ -808,7 +844,7 @@ fn load_global(default_shell: &ShellSpec) -> Settings {
     } else {
         tracing::info!(path = %path.display(), "settings: global loaded");
     }
-    typed
+    (typed, stated)
 }
 
 /// Read and parse the custom overlay file as a generic `Value`. Returns
@@ -1813,6 +1849,22 @@ pub fn save(settings: &Settings, launch_cwd: &Path, global: &Settings) -> AppRes
         Some(delta) => {
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent).map_err(AppError::Io)?;
+            }
+            // **Stamp the overlay with the schema it was written in** (V40
+            // Phase I, issue #107 item 5). `diff` drops `schema_version`
+            // because it always equals the baseline's — which is exactly why an
+            // overlay could go stale invisibly: after the global migrated,
+            // nothing on disk said which schema the project's keys were in, so
+            // `load` could only guess or (as it did until Phase I) skip
+            // migrating it. One key, re-stamped on every save, and
+            // `migrate_overlay` strips it again before the merge so it never
+            // reaches the merged `Settings`.
+            let mut delta = delta;
+            if let Some(obj) = delta.as_object_mut() {
+                obj.insert(
+                    "schema_version".to_string(),
+                    serde_json::json!(crate::settings::schema::CURRENT_SCHEMA_VERSION),
+                );
             }
             let text = serde_json::to_string_pretty(&delta)
                 .map_err(|e| AppError::Settings(format!("serialize overlay: {e}")))?;
@@ -3737,6 +3789,71 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// **The load path migrates the overlay, and the child reader deliberately
+    /// does not** (V40 Phase I, issue #107 item 5).
+    ///
+    /// Structural for the same reason
+    /// `every_settings_reader_runs_the_harness_parse_boundary` is: neither
+    /// `load` nor `load_readonly` can be called from a unit test without
+    /// writing next to the test binary. The behaviour of the thing they call is
+    /// covered in `settings::migration`; what this pins is that they call it —
+    /// and that the asymmetry between them is deliberate.
+    ///
+    /// `load_readonly` (the `cimp --offload-mcp` child) migrates NEITHER file:
+    /// it reads the global raw, so a v35 global and a v35 overlay are merged
+    /// consistently. Migrating only the overlay there would put a v36-shaped
+    /// diff on top of a v35-shaped baseline, which is worse than either. Its
+    /// contract is no side effects and the app process repairs the file
+    /// moments later, so the child reads a stale-but-coherent view.
+    /// Newline-agnostic: CI checks this tree out with CRLF.
+    #[test]
+    fn the_load_path_migrates_the_overlay_and_the_child_reader_does_not() {
+        let src = include_str!("persistence.rs");
+        let body_of = |sig: &str| {
+            let start = src
+                .find(sig)
+                .unwrap_or_else(|| panic!("`{sig}` is gone — re-point this test"));
+            let body = &src[start..];
+            &body[..body.find("\n}").unwrap_or(body.len())]
+        };
+        assert!(
+            body_of("pub fn load(").contains("migrate_overlay"),
+            "`load` must run the migration chain on the project overlay: a v35-shaped overlay \
+             beside a migrated global carries keys nothing reads, and the project's setting \
+             stops applying with the file still on disk saying otherwise"
+        );
+        assert!(
+            !body_of("pub fn load_readonly(").contains("migrate_overlay"),
+            "`load_readonly` migrates neither file on purpose — see this test's doc comment. If \
+             that changes, migrate the GLOBAL there too or the child merges shapes from two \
+             different schemas"
+        );
+        assert!(
+            body_of("pub fn save(").contains("schema_version"),
+            "`save` must stamp the overlay with the schema it was written in, or `load` has \
+             nothing to enter the cascade at once the global file has moved on"
+        );
+    }
+
+    /// **Tests only** — drop the overlay's schema stamp, asserting it was
+    /// there.
+    ///
+    /// `save` stamps every overlay it writes with the schema it was written in
+    /// (V40 Phase I, issue #107 item 5) so `load` can migrate a stale one
+    /// instead of guessing. Every test that pins the overlay's exact object
+    /// goes through here, which makes each of them a check that the stamp is
+    /// written as well as a check of its own subject.
+    #[track_caller]
+    fn without_schema_stamp(mut v: Value) -> Value {
+        let stamp = v.as_object_mut().and_then(|o| o.remove("schema_version"));
+        assert_eq!(
+            stamp,
+            Some(serde_json::json!(crate::settings::schema::CURRENT_SCHEMA_VERSION)),
+            "a saved overlay must carry the schema it was written in"
+        );
+        v
+    }
+
     #[test]
     fn save_writes_overlay_when_diff_nonempty_and_removes_when_empty() {
         let _shell = fake_default_shell();
@@ -3758,7 +3875,7 @@ mod tests {
         let text = fs::read_to_string(&overlay).unwrap();
         let parsed: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(
-            parsed,
+            without_schema_stamp(parsed),
             serde_json::json!({ "ui": { "theme": "future-light" } })
         );
 
@@ -3847,7 +3964,7 @@ mod tests {
         let text = fs::read_to_string(&overlay).unwrap();
         let overlay_val: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(
-            overlay_val,
+            without_schema_stamp(overlay_val.clone()),
             serde_json::json!({ "checks_allow_remote_worker": true }),
             "overlay: {text}"
         );
@@ -3908,7 +4025,7 @@ mod tests {
         let text = fs::read_to_string(&overlay).unwrap();
         let val: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(
-            val,
+            without_schema_stamp(val),
             serde_json::json!({ "checks_allow_remote_worker": true }),
             "overlay: {text}"
         );
@@ -4206,7 +4323,7 @@ mod tests {
         let text = fs::read_to_string(custom_path(&dir)).unwrap();
         let overlay: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(
-            overlay,
+            without_schema_stamp(overlay.clone()),
             serde_json::json!({ "harness": { claude: { "ext": {
                 "statusline": false,
                 "local.base_url": "http://myproxy:9000"
@@ -4669,7 +4786,7 @@ mod tests {
         let text = fs::read_to_string(dir.join(".cimp").join("config.json")).unwrap();
         let val: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(
-            val,
+            without_schema_stamp(val),
             serde_json::json!({
                 "tool_plugins": { "plugins": { "acme@1.0.0": { "tools": { "scan": {
                     "variables": { "ruleset": "p/ci" },

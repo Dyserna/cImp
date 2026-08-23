@@ -64,6 +64,99 @@ fn legacy_aider_v1_2_entry() -> Value {
     })
 }
 
+/// The oldest schema version the **overlay** cascade can be entered at.
+///
+/// `schema_version` was introduced by the v1.9 → v1.10 step, and every detector
+/// from v1.10 on is the trivial `schema_version == N` form. Below it the
+/// detectors are *presence archaeology* — "has `claude_code`, has no `tabs`",
+/// "`tabs` is an object" — which key off keys a **partial** overlay legitimately
+/// lacks, and which the v1.2 → v1.4 transforms answer by inserting whole-object
+/// defaults (`layout`, `terminal`). Running those on a sparse diff is exactly
+/// the silent data loss the pre-Phase-I comment in `persistence::load` warned
+/// about, so the overlay cascade refuses to start below this.
+pub const MIN_OVERLAY_SCHEMA_VERSION: u64 = 10;
+
+/// The `schema_version` a value states, if it states one.
+pub fn stated_schema_version(value: &Value) -> Option<u64> {
+    value.get("schema_version").and_then(Value::as_u64)
+}
+
+/// **Run the cascade on a project OVERLAY** (V40 Phase I, issue #107 item 5).
+///
+/// The overlay is a sparse diff against the global baseline, and until Phase I
+/// it was never migrated at all — `persistence::load`'s step 2 said so, and
+/// gave two correct reasons: the presence-archaeology detectors fire on the
+/// keys a partial file legitimately lacks, and a value with no `schema_version`
+/// re-migrates on every launch, growing `.bak` files without bound.
+///
+/// Both reasons are about *entering the cascade blind*. Neither survives being
+/// told the version: this takes `from` as a parameter, refuses anything below
+/// [`MIN_OVERLAY_SCHEMA_VERSION`] (where the archaeology begins), stamps the
+/// value so the numeric detectors — and ONLY the numeric detectors — can match,
+/// and strips the stamp again on the way out so the overlay never carries a
+/// schema version into the merge.
+///
+/// It writes **no backup and no file**: an overlay is reconstructible from the
+/// global baseline plus the user's next save, and a `.bak` per launch beside a
+/// user's project is the unbounded growth the old comment named. The migrated
+/// shape reaches disk when the user next saves, through the ordinary `diff`.
+///
+/// The gap this closes is real and not hypothetical: a project that set
+/// `claude_local.base_url` before schema 36 kept a top-level `claude_local`
+/// block in its overlay, the global file moved that field to
+/// `harness.claude.ext["local.base_url"]`, and the project's value then reached
+/// nothing — a per-project setting that silently stopped applying, with the file
+/// still on disk saying otherwise.
+///
+/// Returns whether anything changed.
+pub fn migrate_overlay(overlay: &mut Value, from: u64, default_shell: &ShellSpec) -> bool {
+    // Dropped on EVERY path below: an overlay's own stamp is an entry marker
+    // for this function and must never survive into the merge, where it would
+    // `deep_merge` over the global's `schema_version` and pin the merged
+    // `Settings` below whatever the global file actually reached.
+    let stamped = overlay
+        .as_object_mut()
+        .and_then(|r| r.remove("schema_version"))
+        .is_some();
+    let current = crate::settings::schema::CURRENT_SCHEMA_VERSION as u64;
+    if from >= current {
+        return stamped;
+    }
+    if from < MIN_OVERLAY_SCHEMA_VERSION {
+        tracing::warn!(
+            from,
+            min = MIN_OVERLAY_SCHEMA_VERSION,
+            "settings: project overlay predates the schema_version field; leaving it unmigrated \
+             rather than entering the presence-archaeology steps on a partial file"
+        );
+        return stamped;
+    }
+    let Some(root) = overlay.as_object_mut() else {
+        return stamped;
+    };
+    let before = Value::Object(root.clone());
+    // Stamped so the numeric detectors can match, and so the archaeology
+    // detectors (every one of which requires `schema_version` to be ABSENT)
+    // cannot.
+    root.insert(
+        "schema_version".to_string(),
+        Value::Number(serde_json::Number::from(from)),
+    );
+    for step in MIGRATION_STEPS {
+        if (step.detect)(overlay) {
+            (step.transform)(overlay, default_shell);
+        }
+    }
+    // No force-stamp twin of `migrate_if_needed`'s: an overlay that did not
+    // reach `current` is one whose steps found nothing of theirs in it, which is
+    // the ordinary case for a sparse diff. Stamping it would only put a key into
+    // the merge that must not be there.
+    if let Some(root) = overlay.as_object_mut() {
+        root.remove("schema_version");
+    }
+    stamped || *overlay != before
+}
+
 /// Detect file shape and run the appropriate transform on `value`. Returns
 /// `Ok(true)` if the file changed shape (caller should write back to disk),
 /// `Ok(false)` if the file was already v1.2, or `Err` if a backup write
@@ -4239,6 +4332,124 @@ mod tests {
     /// of this; this is the mechanical one, driven over a file carrying every
     /// pair the step moves, with values chosen so a swapped Claude/OpenCode
     /// copy would be visible rather than symmetric.
+    // ── V40 Phase I: the PROJECT OVERLAY cascade (issue #107 item 5) ───────
+
+    /// **A stale project overlay is migrated, and the `claude_*` pair lands in
+    /// `harness.<id>`** — the gap item 5 names.
+    ///
+    /// A project that set `claude_local.base_url` and `statusline.enabled`
+    /// before schema 36 kept them as top-level keys in `.cimp/config.json`. The
+    /// GLOBAL file's v35 -> v36 step moved those fields under `harness.claude`,
+    /// the overlay was never migrated, and the project's values then reached
+    /// nothing — with the file still on disk saying otherwise. Silent, and
+    /// exactly the "empty is not absent" shape: the merged settings were not
+    /// missing a value, they were carrying the harness default while a file
+    /// two directories away stated a different one.
+    #[test]
+    fn a_v35_overlay_migrates_its_claude_pair_into_the_harness_map() {
+        let shell = fake_default_shell();
+        let mut overlay = json!({
+            "claude_local": { "base_url": "http://myproxy:9000" },
+            "statusline": { "enabled": false },
+            "ui": { "theme": "future-light" },
+        });
+        assert!(migrate_overlay(&mut overlay, 35, &shell), "the overlay changed");
+        assert_eq!(
+            overlay["harness"]["claude"]["ext"]["local.base_url"],
+            json!("http://myproxy:9000")
+        );
+        assert_eq!(overlay["harness"]["claude"]["ext"]["statusline"], json!(false));
+        // The v35 spellings are GONE — leaving them would re-merge a key the
+        // current schema does not read, which is how the value went stale in
+        // the first place.
+        assert!(overlay.get("claude_local").is_none());
+        assert!(overlay.get("statusline").is_none());
+        // Everything the step does not own is untouched, and the overlay stays
+        // SPARSE: a cascade that stamped whole-object defaults here would
+        // override the global baseline through `deep_merge`, which is the
+        // silent data loss that kept the overlay unmigrated until now.
+        assert_eq!(overlay["ui"], json!({ "theme": "future-light" }));
+        let keys: Vec<&str> = overlay
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, ["ui", "harness"]);
+    }
+
+    /// **The entry stamp never survives into the merge.**
+    ///
+    /// `save` writes `schema_version` into the overlay so `load` knows which
+    /// schema the project's keys are in. It is an entry marker for
+    /// `migrate_overlay` and nothing else: left in place it would `deep_merge`
+    /// over the global's own `schema_version` and pin the merged `Settings`
+    /// below whatever the global file actually reached.
+    #[test]
+    fn the_overlay_entry_stamp_is_always_stripped() {
+        let shell = fake_default_shell();
+        let current = crate::settings::schema::CURRENT_SCHEMA_VERSION as u64;
+        // Current-schema overlay: nothing to do but drop the stamp.
+        let mut cur = json!({ "schema_version": current, "ui": { "theme": "tui" } });
+        assert!(migrate_overlay(&mut cur, current, &shell));
+        assert_eq!(cur, json!({ "ui": { "theme": "tui" } }));
+        // Stale overlay: migrated AND unstamped.
+        let mut old = json!({ "schema_version": 35, "statusline": { "enabled": true } });
+        assert!(migrate_overlay(&mut old, 35, &shell));
+        assert!(old.get("schema_version").is_none());
+        assert_eq!(old["harness"]["claude"]["ext"]["statusline"], json!(true));
+        // Too old to enter: still unstamped, and NOT dragged through the
+        // presence-archaeology steps.
+        let mut ancient = json!({ "schema_version": 9, "tabs": [] });
+        migrate_overlay(&mut ancient, 9, &shell);
+        assert_eq!(ancient, json!({ "tabs": [] }));
+    }
+
+    /// **The cascade refuses to start where the archaeology begins.**
+    ///
+    /// Below `schema_version` (v1.10) the detectors key off ABSENT top-level
+    /// keys — `looks_v1` is "has `claude_code`, has no `tabs`" — which every
+    /// sparse overlay satisfies by construction, and the v1.2/v1.3 transforms
+    /// answer by inserting whole `layout` and `terminal` objects. That is the
+    /// data loss the pre-Phase-I comment described, and it is the one case
+    /// knowing the version does not rescue.
+    #[test]
+    fn the_overlay_cascade_refuses_the_pre_version_era() {
+        let shell = fake_default_shell();
+        let before = json!({ "claude_code": { "command": "claude" } });
+        let mut v = before.clone();
+        assert!(!migrate_overlay(&mut v, MIN_OVERLAY_SCHEMA_VERSION - 1, &shell));
+        assert_eq!(v, before, "an overlay too old to place must be left alone");
+        // …and the same file WOULD have been rewritten by the real cascade, so
+        // the refusal is doing work rather than describing a no-op.
+        let mut through = before.clone();
+        for step in MIGRATION_STEPS {
+            if (step.detect)(&through) {
+                (step.transform)(&mut through, &shell);
+            }
+        }
+        assert_ne!(through, before);
+    }
+
+    /// **A current-shape overlay is not touched.**
+    ///
+    /// The ordinary case, and the one the old skip was protecting: a sparse
+    /// diff written by this build must come out of `migrate_overlay` byte for
+    /// byte, whatever keys it happens to lack.
+    #[test]
+    fn a_current_overlay_passes_through_unchanged() {
+        let shell = fake_default_shell();
+        let current = crate::settings::schema::CURRENT_SCHEMA_VERSION as u64;
+        let before = json!({
+            "checks_allow_remote_worker": true,
+            "harness": { "claude": { "ext": { "statusline": false } } },
+            "tabs": [],
+        });
+        let mut v = before.clone();
+        assert!(!migrate_overlay(&mut v, current, &shell));
+        assert_eq!(v, before);
+    }
+
     #[test]
     fn v35_to_v36_copies_every_field_pair_into_the_harness_map() {
         let mut v = json!({

@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.53.0-rc.9] — 2026-08-23
+
+### Changed
+
+- **Harness registry, residuals closed (V40 Phase I, #107).** The built-in
+  tab ids, `enabled_ai_tabs` and the default AI tab are read from the
+  registry instead of a closed enum — a test-only extra harness now
+  round-trips the whole tab machinery with no enum edit. The `/memory/event`
+  body is OpenCode's plugin's, probe ids are declared per plugin, usage lane
+  colours come from the declared turn origins (schema 36 → 37: the fixed
+  session/agent colour pair becomes a per-lane map), and a project
+  `.cimp/config.json` now runs the same schema migrations as the global
+  file at load (it gains an additive `schema_version` stamp; it is never
+  written back unless you save).
+- `docs/RELEASE.md` gains the four CI-only pre-tag gates that killed
+  rc.6/rc.7.
+
 ## [0.53.0-rc.8] — 2026-08-23
 
 _rc.6 and rc.7 were tagged but never built: rc.6 failed CI on a Linux-only path test, CRLF-checked-out goldens and clippy; rc.7 failed only the ignored-test rename tripwire (the node-backed tests moved module in Phase G). rc.8 is rc.6 plus those four `fix(ci)` commits._

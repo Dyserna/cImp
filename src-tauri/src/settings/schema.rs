@@ -605,7 +605,7 @@ impl Default for DelegationSettings {
 /// dropped from a project's `.cimp/config.json` without anyone adding a rule,
 /// which is the right default for a switch that decides what a model may
 /// execute.
-#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
 #[serde(default)]
 pub struct ToolPluginsSettings {
     /// Per-plugin state, keyed `name@version` (`loader::LoadedPlugin::key`).
@@ -621,16 +621,6 @@ pub struct ToolPluginsSettings {
     // `Settings::harness[<id>].expose_commands` since V40 Phase B (locked
     // decision 5) — one field per harness instead of one field pair per
     // question, and no third field to add for a third harness.
-}
-
-impl Default for ToolPluginsSettings {
-    fn default() -> Self {
-        Self {
-            plugins: BTreeMap::new(),
-            project_paths: BTreeMap::new(),
-            global_paths: BTreeMap::new(),
-        }
-    }
 }
 
 // `ToolPluginsSettings::commands_exposed_to(consumer)` is gone with the field
@@ -7372,7 +7362,6 @@ mod tests {
                 "acme@1.0.0/scan".to_string(),
                 "D:\\tools\\acme.exe".to_string(),
             )]),
-            ..ToolPluginsSettings::default()
         };
         let s = Settings {
             tool_plugins: cfg.clone(),
@@ -7455,7 +7444,6 @@ mod tests {
             plugins: BTreeMap::from([("a@1".to_string(), PluginState { enabled: true, tools })]),
             project_paths: BTreeMap::from([("root".to_string(), BTreeMap::new())]),
             global_paths: BTreeMap::new(),
-            ..ToolPluginsSettings::default()
         };
         let value = serde_json::to_value(&cfg).expect("serializes");
         let mut keys: Vec<String> = value

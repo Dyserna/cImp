@@ -576,8 +576,10 @@ pub fn read_global_enabled_ai_tabs() -> Vec<crate::settings::AiTabId> {
 pub fn read_global_harness_settings(
     harness: crate::harness::HarnessId,
 ) -> crate::settings::HarnessSettings {
-    let mut probe = crate::settings::Settings::default();
-    probe.harness = read_global_harness_map();
+    let probe = crate::settings::Settings {
+        harness: read_global_harness_map(),
+        ..Default::default()
+    };
     probe.harness_settings(harness).clone()
 }
 

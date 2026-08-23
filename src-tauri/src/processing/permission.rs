@@ -115,7 +115,7 @@ pub struct PatternSpec {
 
 impl PatternSpec {
     /// The owned row the detector and the on-disk file speak.
-    pub fn to_pattern(&self) -> PermissionPattern {
+    pub fn to_pattern(self) -> PermissionPattern {
         PermissionPattern {
             name: self.name.to_string(),
             kind: self.kind,
@@ -151,7 +151,7 @@ pub fn default_patterns() -> Vec<PermissionPattern> {
     crate::harness::registry::all()
         .filter_map(|h| h.plugin())
         .flat_map(|p| p.permission_patterns())
-        .map(PatternSpec::to_pattern)
+        .map(|p| p.to_pattern())
         .collect()
 }
 

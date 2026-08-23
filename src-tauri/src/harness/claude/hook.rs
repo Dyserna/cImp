@@ -2054,8 +2054,6 @@ async fn handle_claude_checkpoint(
     Ok(HookReply::ok(no_op.clone()))
 }
 
-/// A `400` body, spelled once for the three Phase L routes.
-
 // ── NC-2 (issue #5): hook-driven permission detection ────────────────────────
 
 /// A `POST /permission/event` request body — the Claude `--notify-hook` shim

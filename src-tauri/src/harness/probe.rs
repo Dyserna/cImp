@@ -245,6 +245,7 @@ const IMPLEMENTED: &[&str] = &[
 ///   inside a harness plugin ran. They stay manual spikes (D0 / E1 /
 ///   OpenCode-veto) by locked decision 7, and *Mark verified* survives for
 ///   exactly these.
+///
 /// The rows the RUNNER declares permanently unprobed — the harness-neutral ones
 /// only.
 ///

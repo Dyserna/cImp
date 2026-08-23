@@ -1097,53 +1097,54 @@ impl TabState {
     }
 }
 
+/// Everything the state manager is wired to at startup, other than the app
+/// handle and its own signal channel.
+///
+/// One struct rather than six positional arguments: four of these are cloneable
+/// handles whose types say nothing about their role, so a transposed pair at
+/// the single call site in `main` would compile and mis-wire the manager
+/// silently.
+pub struct StateManagerWiring {
+    /// The same `StateEvent`s emitted to the frontend, for in-process
+    /// subscribers (e.g. the notification manager) that must react to state
+    /// edges without going through the IPC layer.
+    pub state_events: broadcast::Sender<StateEvent>,
+    /// The readable mirror of each tab's input length.
+    pub input_lengths: InputLengths,
+    /// V39 Phase B: the readable mirror of the prompt/burst/exit flags. Handed
+    /// in rather than owned here for the same reason `input_lengths` is — the
+    /// IPC layer and the delegation engine hold the other end.
+    pub activity: TabActivity,
+    /// Every tab the manager tracks (kind + name); the manager keys its per-tab
+    /// state map by `TabId` from this list, in this order.
+    pub tab_metas: Vec<TabMeta>,
+    /// The tab whose avatar is displayed at startup.
+    pub initial_active: TabId,
+    /// The per-tab AI-TTS suppression mirror.
+    pub ai_tts_suppressed: crate::tts::AiTtsSuppressed,
+}
+
 /// Spawn the state-manager task. The channel is created at app startup so
 /// AppState can hold a clone of the sender before the AppHandle exists.
-///
-/// `state_events` receives the same `StateEvent`s emitted to the frontend,
-/// so in-process subscribers (e.g. the notification manager) can react to
-/// state edges without going through the IPC layer.
-///
-/// `tab_metas` defines every tab the manager tracks (kind + name); the
-/// manager keys its per-tab state map by `TabId` from this list.
 pub fn spawn_state_manager(
     app: AppHandle,
     rx: mpsc::Receiver<StateSignal>,
-    state_events: broadcast::Sender<StateEvent>,
-    input_lengths: InputLengths,
-    // V39 Phase B: the readable mirror of the prompt/burst/exit flags. Handed
-    // in rather than owned here for the same reason `input_lengths` is — the
-    // IPC layer and the delegation engine hold the other end.
-    activity: TabActivity,
-    tab_metas: Vec<TabMeta>,
-    initial_active: TabId,
-    ai_tts_suppressed: crate::tts::AiTtsSuppressed,
+    wiring: StateManagerWiring,
 ) {
     tauri::async_runtime::spawn(async move {
-        run(
-            app,
-            rx,
-            state_events,
-            input_lengths,
-            activity,
-            tab_metas,
-            initial_active,
-            ai_tts_suppressed,
-        )
-        .await;
+        run(app, rx, wiring).await;
     });
 }
 
-async fn run(
-    app: AppHandle,
-    mut rx: mpsc::Receiver<StateSignal>,
-    state_events: broadcast::Sender<StateEvent>,
-    input_lengths: InputLengths,
-    activity: TabActivity,
-    tab_metas: Vec<TabMeta>,
-    initial_active: TabId,
-    ai_tts_suppressed: crate::tts::AiTtsSuppressed,
-) {
+async fn run(app: AppHandle, mut rx: mpsc::Receiver<StateSignal>, wiring: StateManagerWiring) {
+    let StateManagerWiring {
+        state_events,
+        input_lengths,
+        activity,
+        tab_metas,
+        initial_active,
+        ai_tts_suppressed,
+    } = wiring;
     // Preserve tab_metas order so the startup TabCreated emit positions
     // match the registry's tab order (registry uses the same launch_seed).
     let seed_metas: Vec<TabMeta> = tab_metas;

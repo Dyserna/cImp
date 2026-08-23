@@ -659,6 +659,26 @@ impl Drop for PushGuard {
     }
 }
 
+/// The request half of a facade run, grouped so [`OffloadService::run_facade`]
+/// takes the backend, the request and the cancel token rather than eight
+/// positional arguments — five of which are `Option`s that a caller could
+/// transpose without the compiler noticing.
+struct FacadeCall<'a> {
+    /// The task text handed to the worker tab.
+    instructions: &'a str,
+    /// Extra context appended to it, if the caller supplied any.
+    context: Option<String>,
+    /// The routing request's tab — narrowed at the loopback through
+    /// `tab_identity`, so this is a configured tab of the calling consumer or
+    /// nothing at all.
+    tab: Option<&'a str>,
+    /// The answer grammar the caller asked for. A worker tab cannot be
+    /// constrained to it, so it is also the flag that makes the reply parse.
+    schema: Option<&'a serde_json::Value>,
+    /// The routing profile, for the format note only.
+    profile: Option<Profile>,
+}
+
 impl OffloadService {
     /// Construct the service. Sizes the global gate from config (or the
     /// explicit `global_concurrency` override) and wires the MCP host's
@@ -1657,20 +1677,20 @@ impl OffloadService {
     async fn run_facade(
         &self,
         facade: &HarnessTabBackend,
-        instructions: &str,
-        context: Option<String>,
-        tab: Option<&str>,
-        schema: Option<&serde_json::Value>,
-        profile: Option<Profile>,
+        call: FacadeCall<'_>,
         cancel: &CancellationToken,
     ) -> AppResult<String> {
+        let FacadeCall {
+            instructions,
+            context,
+            tab,
+            schema,
+            profile,
+        } = call;
         let reply = crate::delegation::drive_watching(
             &self.app,
             crate::delegation::DriveRequest {
                 worker: facade.tab().clone(),
-                // The routing request's tab — narrowed at the loopback through
-                // `tab_identity`, so this is a configured tab of the calling
-                // consumer or nothing at all.
                 driver: tab.map(crate::state::TabId::from_str),
                 mode: crate::delegation::DelegationMode::Facade,
                 task: instructions.to_string(),
@@ -1841,11 +1861,13 @@ impl OffloadService {
             return self
                 .run_facade(
                     facade,
-                    instructions,
-                    context,
-                    tab,
-                    schema.as_ref(),
-                    profile,
+                    FacadeCall {
+                        instructions,
+                        context,
+                        tab,
+                        schema: schema.as_ref(),
+                        profile,
+                    },
                     cancel,
                 )
                 .await;
@@ -3149,9 +3171,10 @@ mod tests {
     /// whole file (V39 Phase C: a facade tab is a slot too), so its tests must
     /// hand it one.
     fn with_offload(snap: OffloadSettings) -> Settings {
-        let mut s = Settings::default();
-        s.offload = snap;
-        s
+        Settings {
+            offload: snap,
+            ..Default::default()
+        }
     }
 
     #[test]

@@ -104,6 +104,25 @@ pub fn declared_class(name: &str) -> Option<ToolClass> {
     super::registry::all().find_map(|h| class(h, name))
 }
 
+/// The value `harness` records for one memory event's [`MemArg`], from the tool
+/// call's own argument map.
+///
+/// The neutral half of locked decision 16's argument vocabulary: core asks for
+/// "the thing this event is about" and the plugin decides which keys carry it.
+/// `None` for an unidentified source, and for a payload that carries none of the
+/// declared keys — recording nothing is the conservative answer for a
+/// bookkeeping ring.
+pub fn memory_arg(
+    harness: Option<HarnessId>,
+    arg: MemArg,
+    args: &serde_json::Value,
+) -> Option<String> {
+    let keys = harness?.plugin()?.memory_arg_keys(arg);
+    keys.iter()
+        .find_map(|k| args.get(*k).and_then(|v| v.as_str()))
+        .map(str::to_string)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -354,23 +373,4 @@ mod tests {
             );
         }
     }
-}
-
-/// The value `harness` records for one memory event's [`MemArg`], from the tool
-/// call's own argument map.
-///
-/// The neutral half of locked decision 16's argument vocabulary: core asks for
-/// "the thing this event is about" and the plugin decides which keys carry it.
-/// `None` for an unidentified source, and for a payload that carries none of the
-/// declared keys — recording nothing is the conservative answer for a
-/// bookkeeping ring.
-pub fn memory_arg(
-    harness: Option<HarnessId>,
-    arg: MemArg,
-    args: &serde_json::Value,
-) -> Option<String> {
-    let keys = harness?.plugin()?.memory_arg_keys(arg);
-    keys.iter()
-        .find_map(|k| args.get(*k).and_then(|v| v.as_str()))
-        .map(str::to_string)
 }

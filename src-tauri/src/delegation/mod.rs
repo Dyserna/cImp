@@ -1252,10 +1252,12 @@ mod tests {
                 }
                 let d = driver();
                 let w = worker();
-                r.in_flight.get_mut(&w).map(|f| f.driver = TabId::ClaudeLocal);
-                r.in_flight
-                    .get_mut(&TabId::ClaudeLocal)
-                    .map(|f| f.driver = w.clone());
+                if let Some(f) = r.in_flight.get_mut(&w) {
+                    f.driver = TabId::ClaudeLocal;
+                }
+                if let Some(f) = r.in_flight.get_mut(&TabId::ClaudeLocal) {
+                    f.driver = w.clone();
+                }
                 let _ = d;
             });
             let _ = depth_from(&worker());

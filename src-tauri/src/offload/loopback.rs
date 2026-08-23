@@ -8209,7 +8209,6 @@ pub(crate) async fn send_permission_edge(
     };
     let signals = state.state_signals.clone();
     let registry = state.tabs.clone();
-    drop(state);
     let tab_id = crate::state::TabId::from_str(tab);
     let signal = match edge {
         PermissionEdge::Detected => crate::state::StateSignal::PermissionPromptDetected {

@@ -34,7 +34,6 @@ mod sanitize;
 mod screen;
 mod segmenter;
 
-
 pub use prose::to_speakable;
 pub use sanitize::strip_terminal_escapes;
 // V35 Phase H: the disk-bound scrubber (strip + credential redaction), used by
@@ -42,7 +41,6 @@ pub use sanitize::strip_terminal_escapes;
 // rather than re-exported — nothing outside that one call site names it.
 pub use sanitize::scrub_payload;
 pub use segmenter::segment_sentences;
-
 
 #[cfg(test)]
 mod tests;

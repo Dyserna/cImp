@@ -879,7 +879,6 @@ mod tests {
         );
     }
 
-
     /// The envelope reads `chp` off a body whose own type knows nothing about
     /// it, tolerates its absence, and accepts either spelling of the
     /// discriminator — because the live wire genuinely uses both.

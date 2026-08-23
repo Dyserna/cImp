@@ -34,7 +34,6 @@
 //! compiled. [`PerHarness`] is sized by the registry, so the same mistake is a
 //! type error.
 
-
 use super::plugin::HarnessPlugin;
 
 // ── the id ──────────────────────────────────────────────────────────────────
@@ -633,6 +632,7 @@ impl<T> PerHarness<T> {
     pub fn get(&self, id: HarnessId) -> Option<&T> {
         id.ordinal().map(|i| &self.0[i])
     }
+
     /// This harness's slot, mutably. `None` for [`HarnessId::ANY`].
     ///
     /// Written by `McpHost::surface_fingerprint`, which fills one digest per
@@ -642,7 +642,6 @@ impl<T> PerHarness<T> {
     pub fn get_mut(&mut self, id: HarnessId) -> Option<&mut T> {
         id.ordinal().map(move |i| &mut self.0[i])
     }
-
 
     /// Every `(harness, value)` pair, in registry order.
     pub fn iter(&self) -> impl Iterator<Item = (HarnessId, &T)> {
@@ -665,8 +664,6 @@ impl<T> std::ops::Index<usize> for PerHarness<T> {
         &self.0[i]
     }
 }
-
-
 
 /// Build a `PerHarness<bool>` from `(id, value)` pairs — **tests only**.
 ///

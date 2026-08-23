@@ -357,7 +357,6 @@ fn push_path() -> Option<PathBuf> {
     Some(exe.parent()?.join(PUSH_FILE))
 }
 
-
 /// Persist a snapshot extracted from a status-line payload. Called from the
 /// short-lived `cimp --statusline` child process, so it must never panic or
 /// block for long: any failure is silently dropped (the next refresh retries

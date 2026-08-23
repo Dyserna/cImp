@@ -3127,7 +3127,6 @@ fn thinking_label(m: ThinkingMode) -> &'static str {
     }
 }
 
-
 /// Whether an agent-loop error looks like a transport/connection failure (so
 /// a fail-over re-route is worth trying). Mirrors the child's heuristic.
 fn is_connection_error(e: &str) -> bool {

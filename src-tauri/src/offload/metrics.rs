@@ -507,7 +507,6 @@ fn parse_metrics(text: Option<&str>) -> ParsedMetrics {
     out
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

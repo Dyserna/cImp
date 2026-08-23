@@ -134,7 +134,7 @@ pub fn off_note(s: &crate::settings::Settings) -> &'static str {
 /// cannot be started at all — and if it started it could not find the app: it
 /// resolves the loopback port + token from
 /// `<exe-dir>/.cimp-discovery/<pid>.json`, falling back to the legacy
-/// `<exe-dir>/.cimp-offload.json` (`offload::loopback::select_discovery`). Each
+/// `<exe-dir>/.cimp-offload.json` (`offload::discovery::select_discovery`). Each
 /// of those is a denial row, which is loud — and still a broken tab.
 ///
 /// **Three file-scoped rows, never the directory.** `<exe-dir>` is cImp's
@@ -188,7 +188,7 @@ fn cimp_child_rows(exe: Option<&Path>) -> Vec<GrantRow> {
             required: false,
         },
         GrantRow {
-            path: dir.join(crate::offload::loopback::DISCOVERY_FILE),
+            path: dir.join(crate::offload::discovery::DISCOVERY_FILE),
             access: GrantAccess::ReadExecute,
             is_file: true,
             reason: "the legacy discovery file the proxy child reads to find this app's loopback \
@@ -197,7 +197,7 @@ fn cimp_child_rows(exe: Option<&Path>) -> Vec<GrantRow> {
             required: false,
         },
         GrantRow {
-            path: dir.join(crate::offload::loopback::DISCOVERY_DIR),
+            path: dir.join(crate::offload::discovery::DISCOVERY_DIR),
             access: GrantAccess::ReadExecute,
             is_file: false,
             reason: "the per-instance discovery directory (<pid>.json per running instance), how \

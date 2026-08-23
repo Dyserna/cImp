@@ -236,7 +236,7 @@ pub(crate) fn build_pre_args(
     cfg: &AiToolTabConfig,
     settings: &Settings,
     tab: &str,
-    endpoint: Option<&crate::offload::loopback::Discovery>,
+    endpoint: Option<&crate::offload::discovery::Discovery>,
 ) -> Vec<String> {
     // Belt and braces: `ClaudePlugin::pre_args` is the only production caller
     // and it is reached only for a Claude tab, but the tests drive this

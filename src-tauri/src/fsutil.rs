@@ -321,7 +321,7 @@ fn has_vcs_marker(dir: &Path) -> bool {
 /// A caller whose project legitimately sits at a `<db_subdir>`-only directory
 /// INSIDE a git repo (a sub-project opened as its own tab) is not served by the
 /// walk and must not be: that root is known from the tab's configuration, which
-/// every caller here consults FIRST — see `loopback::external_project_root`.
+/// every caller here consults FIRST — see `discovery::external_project_root`.
 ///
 /// Purely observational: no directory is created, and nothing is deleted.
 pub fn find_project_root(start: &Path, db_subdir: &str) -> Option<ProjectRoot> {

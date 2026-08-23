@@ -9,6 +9,14 @@
 
 use super::*;
 
+// V42 R2 (#114): the discovery half of this module now lives in
+// `offload::discovery`; these are the items only its tests reach for, so the
+// production `use` above stays exactly as wide as production needs.
+use crate::offload::discovery::{
+    dispatch_discovery_report, report_skipped_to_app, resolve_external_root, responds,
+    select_verified, ChildIdentity, DISCOVERY_REPORT_TIMEOUT, DISCOVERY_SKIPPED_PATH,
+};
+
 use crate::harness::claude::hook as claude_hook;
 
 /// V40 Phase C moved the ingress here; the source-scanning tests that read
@@ -1516,8 +1524,9 @@ fn the_discovery_report_never_reaches_the_hook_shims_path() {
     assert!(reqs[0].starts_with("GET /health "), "{}", reqs[0]);
 
     // …and structurally: the ONE report site sits in `proxy_base_for`, after
-    // the `?` that proves an endpoint resolved.
-    let src = include_str!("../loopback.rs");
+    // the `?` that proves an endpoint resolved. V42 R2 (#114) moved the
+    // resolver to `offload/discovery.rs`; the scan follows the code.
+    let src = include_str!("../discovery.rs");
     let resolver = top_level_fn(src, "pub fn proxy_base_for(");
     let after_q = resolver.find("let d = d?;").expect("the `?` is the guard");
     let report = resolver
@@ -1534,9 +1543,11 @@ fn the_discovery_report_never_reaches_the_hook_shims_path() {
          not survive, and the reason this resolver stays silent"
     );
     // The production ledger really is what the route claims: the process-wide
-    // doubling map, not a per-call one that would bound nothing.
+    // doubling map, not a per-call one that would bound nothing. This half is
+    // about the APP side of the seam, so it reads the file the handler is in.
     assert!(
-        top_level_fn(src, "fn note_discovery_skipped(").contains("claim_discovery_report"),
+        top_level_fn(include_str!("../loopback.rs"), "fn note_discovery_skipped(")
+            .contains("claim_discovery_report"),
         "the handler must claim against the process ledger"
     );
 }
@@ -6849,18 +6860,25 @@ fn clearing_the_bit_does_not_promote_anything_already_quarantined() {
     // it into this module fails the build's own test rather than a review.
     // `concat!` throughout: a needle written whole would match its own text
     // in the file it scans.
-    let src = include_str!("../loopback.rs");
-    for promotion in [
-        concat!("mem_", "promote_note"),
-        concat!("mem_", "delete_note"),
-        concat!("mem_", "quarantined_notes"),
+    // V42 R2 (#114): this module was one file when the scan was written, so it
+    // read one. Every file the split produced is read, or the needle could
+    // simply move next door.
+    for (file, src) in [
+        ("offload/loopback.rs", include_str!("../loopback.rs")),
+        ("offload/discovery.rs", include_str!("../discovery.rs")),
     ] {
-        assert!(
-            !src.contains(promotion),
-            "`{promotion}` appeared in loopback.rs — promoting a quarantined note is \
-             the Memory view's own review (locked decision 10), not a side effect of \
-             clearing a tab's contamination flag"
-        );
+        for promotion in [
+            concat!("mem_", "promote_note"),
+            concat!("mem_", "delete_note"),
+            concat!("mem_", "quarantined_notes"),
+        ] {
+            assert!(
+                !src.contains(promotion),
+                "`{promotion}` appeared in {file} — promoting a quarantined note is \
+                 the Memory view's own review (locked decision 10), not a side effect of \
+                 clearing a tab's contamination flag"
+            );
+        }
     }
 }
 

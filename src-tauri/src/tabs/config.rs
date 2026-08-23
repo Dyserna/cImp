@@ -103,7 +103,7 @@ fn build_ai_tool_spec(
     // harness will substitute it). `read_own_discovery` is pid-keyed — never the
     // shared last-writer-wins file a sibling instance may have overwritten —
     // exactly as `write_opencode_plugin` reads it for the same reason.
-    let endpoint = crate::offload::loopback::read_own_discovery();
+    let endpoint = crate::offload::discovery::read_own_discovery();
     // V40 Phase A: which harness this tab is, resolved ONCE, here — the
     // function that already knew. Everything harness-specific below is asked of
     // its plugin; `None` is a tab whose command matches no registered harness,
@@ -875,7 +875,7 @@ fn compose_ai_env(
     cfg: &AiToolTabConfig,
     settings: &Settings,
     tab: &str,
-    endpoint: Option<&crate::offload::loopback::Discovery>,
+    endpoint: Option<&crate::offload::discovery::Discovery>,
 ) -> HashMap<String, String> {
     let mut env: HashMap<String, String> = HashMap::new();
     // Everything harness-specific — the hook bearer token, the injected config
@@ -992,8 +992,8 @@ mod tests {
     /// other input to `build_pre_args` is one: the emitted overlay has to be
     /// assertable byte for byte, and a test that read the live discovery file
     /// would pass or fail depending on whether a cImp happened to be running.
-    fn hook_endpoint() -> crate::offload::loopback::Discovery {
-        crate::offload::loopback::Discovery {
+    fn hook_endpoint() -> crate::offload::discovery::Discovery {
+        crate::offload::discovery::Discovery {
             port: 41999,
             token: "test-loopback-token".to_string(),
             pid: 0,
@@ -2281,6 +2281,9 @@ mod tests {
         for (file, src) in [
             ("harness/claude/hook.rs", include_str!("../harness/claude/hook.rs")),
             ("offload/loopback.rs", include_str!("../offload/loopback.rs")),
+            // V42 R2 (#114) split the loopback module; the scan follows every
+            // file it produced, or the needle could just move next door.
+            ("offload/discovery.rs", include_str!("../offload/discovery.rs")),
         ] {
             // The needle is the JSON KEY form, so the prose and the assertions
             // that name the field (including this one) are not false positives —

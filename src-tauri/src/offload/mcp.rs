@@ -33,7 +33,8 @@ use tokio::sync::Semaphore;
 use crate::error::AppError;
 use crate::mcp_stdio::tool_error;
 
-use super::loopback::{forget_resolved_discovery, parse_result_line, proxy_base_for, ChildIdentity};
+use super::discovery::{forget_resolved_discovery, proxy_base_for, ChildIdentity};
+use super::loopback::parse_result_line;
 
 /// Root-aware endpoint resolution for this child: its cwd is the agent's
 /// project directory (inherited at spawn — the injected mcp-config sets no
@@ -1174,10 +1175,10 @@ async fn proxy_graph(params: &Value) -> Option<Result<Value, (i64, String)>> {
 /// `.cimp-offload.json` still resolves (#48 F-26) — and a well-formed entry with
 /// a dead port used to produce [`Transport`](Self::Transport) in ONE write, which
 /// Claude's own `Write` tool reaches. **Locked decision 30 (#48 F-11) closed that
-/// one write:** `loopback::select_verified` now requires a candidate to answer a
+/// one write:** `discovery::select_verified` now requires a candidate to answer a
 /// token-authenticated `GET /health`, so a planted entry naming a dead port is
 /// skipped and the real instance serves the call. What remains, accepted
-/// knowingly, is one write **plus a listener** — see `loopback::responds`.
+/// knowingly, is one write **plus a listener** — see `discovery::responds`.
 /// `HttpStatus(500)` means the app answered and refused, which is a completely
 /// different fact about the system and used to be indistinguishable from "cImp is
 /// not running".
@@ -1195,7 +1196,7 @@ async fn proxy_graph(params: &Value) -> Option<Result<Value, (i64, String)>> {
 enum ProxyMiss {
     /// No usable loopback endpoint from EITHER discovery store: no parseable
     /// per-instance entry under `.cimp-discovery/` **and** no parseable
-    /// `.cimp-offload.json` (`loopback::select_discovery`'s legacy fallback).
+    /// `.cimp-offload.json` (`discovery::select_discovery`'s legacy fallback).
     ///
     /// #48 F-26: this was documented as "no discovery file, or none of the
     /// entries parsed", which reads as one write. It is two — the legacy file
@@ -1214,7 +1215,7 @@ enum ProxyMiss {
     /// as a safety guarantee and is not one (#48 F-11, sharpened by F-26). One
     /// `Write` of a *well-formed* `.cimp-discovery/<n>.json` naming a deeper root
     /// than the running instance and a dead `port` used to make
-    /// `loopback::select_discovery` prefer that entry, and the dead port landed
+    /// `discovery::select_discovery` prefer that entry, and the dead port landed
     /// here.
     ///
     /// Locked decision 30 removed the write-only form of that steer — a candidate

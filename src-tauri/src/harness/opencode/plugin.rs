@@ -129,7 +129,7 @@ pub(crate) fn write_opencode_plugin(working_dir: &Path, settings: &Settings, tab
     // whatever is there alone and say so: a stale file's baked port/token simply
     // fail to connect, and this file's whole posture is "never throws, never
     // denies on doubt", so a dead endpoint costs a beacon, not a session.
-    let Some(disc) = crate::offload::loopback::read_own_discovery() else {
+    let Some(disc) = crate::offload::discovery::read_own_discovery() else {
         tracing::warn!(
             target: "tabs",
             tab,

@@ -4393,14 +4393,6 @@ mod tests {
         assert!(!s.offload.mcp_servers[1].offload_access);
     }
 
-    /// **v35 → v36: every field pair lands in its harness's row** (V40 locked
-    /// decision 5).
-    ///
-    /// The one thing a settings migration has to get right is that the user's
-    /// EXISTING answers survive it. Live-verify 1 and 10 are the human version
-    /// of this; this is the mechanical one, driven over a file carrying every
-    /// pair the step moves, with values chosen so a swapped Claude/OpenCode
-    /// copy would be visible rather than symmetric.
     // ── V40 Phase I: lane colours (issue #107 item 4) ─────────────────────
 
     /// **The user's two picked lane colours survive becoming a map** (schema
@@ -4627,6 +4619,14 @@ mod tests {
         assert_eq!(v, before);
     }
 
+    /// **v35 → v36: every field pair lands in its harness's row** (V40 locked
+    /// decision 5).
+    ///
+    /// The one thing a settings migration has to get right is that the user's
+    /// EXISTING answers survive it. Live-verify 1 and 10 are the human version
+    /// of this; this is the mechanical one, driven over a file carrying every
+    /// pair the step moves, with values chosen so a swapped Claude/OpenCode
+    /// copy would be visible rather than symmetric.
     #[test]
     fn v35_to_v36_copies_every_field_pair_into_the_harness_map() {
         let mut v = json!({

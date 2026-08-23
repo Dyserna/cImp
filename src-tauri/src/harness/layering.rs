@@ -876,8 +876,7 @@ fn an_unshipped_descriptor_round_trips_through_the_tab_machinery() {
 
         // 4. `enabled_ai_tabs` can hold it, on the wire in both directions.
         assert_eq!(serde_json::to_value(zeta).unwrap(), serde_json::json!("zeta"));
-        let mut s = Settings::default();
-        s.enabled_ai_tabs = vec![zeta];
+        let s = Settings { enabled_ai_tabs: vec![zeta], ..Default::default() };
         let round: Settings = serde_json::from_value(serde_json::to_value(&s).unwrap())
             .expect("a settings file naming this tab parses");
         assert_eq!(round.enabled_ai_tabs, vec![zeta]);

@@ -441,7 +441,7 @@ fn pending_harness_excluding(ran: &[(Harness, String)]) -> Option<(Harness, Stri
 fn harness_has_enabled_tab(harness: Harness, enabled: &[crate::settings::AiTabId]) -> bool {
     harness
         .descriptor()
-        .is_some_and(|d| d.tab_ids.iter().any(|t| enabled.iter().any(|e| e.as_str() == *t)))
+        .is_some_and(|d| d.tab_ids().any(|t| enabled.iter().any(|e| e.as_str() == t)))
 }
 
 /// The selection itself, over `(harness, last_seen, last_verified)` rows —
@@ -1058,7 +1058,7 @@ mod tests {
         let (a, b) = (ids[0], ids[1]);
         let tab_of = |h: Harness| {
             crate::settings::AiTabId::from_id(
-                h.descriptor().expect("registered").tab_ids[0],
+                h.descriptor().expect("registered").tab_ids().next().expect("has a tab"),
             )
             .expect("10(b) requires every reserved tab id to have a variant")
         };
@@ -1070,7 +1070,7 @@ mod tests {
         assert!(!harness_has_enabled_tab(a, &[]));
         // Every reserved tab of a harness counts, not only the first.
         for h in [a, b] {
-            for t in h.descriptor().expect("registered").tab_ids {
+            for t in h.descriptor().expect("registered").tab_ids() {
                 let one = crate::settings::AiTabId::from_id(t).expect("has a variant");
                 assert!(harness_has_enabled_tab(h, &[one]), "{h}: {t}");
             }

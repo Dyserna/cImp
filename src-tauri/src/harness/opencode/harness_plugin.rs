@@ -405,6 +405,26 @@ impl HarnessPlugin for OpenCodePlugin {
         true
     }
 
+    /// The ids [`Self::probe`] emits, in emission order. `tool_registry` is
+    /// first on purpose: it is the security-relevant one, the standing manual
+    /// maintenance obligation, and the reason the probe phase exists at all.
+    fn probes(&self) -> &'static [&'static str] {
+        &["opencode.tool_registry", "opencode.route.noauth"]
+    }
+
+    /// The generated plugin's `POST /memory/event` body — see [`super::hook`].
+    ///
+    /// This harness's SSE stream carries no tool events and no token totals, so
+    /// this hook is its ONLY memory and usage ingress. Core keeps the route and
+    /// the recording; what is here is the body shape and the lane choice, both
+    /// of which are this harness's claim.
+    fn memory_event(
+        &self,
+        body: &[u8],
+    ) -> Option<Result<crate::harness::plugin::MemoryEvent, String>> {
+        Some(super::hook::memory_event(body))
+    }
+
     fn declared_unprobed(&self) -> &'static [(&'static str, &'static str)] {
         DECLARED_UNPROBED
     }

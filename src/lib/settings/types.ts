@@ -1719,11 +1719,14 @@ export interface GraphSettings {
   usage_color_tool: string;
   // V16 Feature 8: the cache-write segment's color.
   usage_color_write: string;
-  // V24 Phase C follow-up: the S/A lane colors — main-session and sub-agent
-  // segments under the chart (the agent color also tints the sub-agent
-  // bars' outline).
-  usage_color_session: string;
-  usage_color_agent: string;
+  /// Per-lane colors keyed by the harness's DECLARED `TurnOrigin` id (V40
+  /// Phase I, schema 37). Was the fixed pair `usage_color_session` /
+  /// `usage_color_agent` — two core settings named after one harness's two
+  /// lanes, which left a third declared lane sharing the second's swatch and
+  /// with no fill rule of its own. Sparse: an absent lane takes the palette
+  /// slot for its declared position, so only a lane the user picked a color
+  /// for appears here.
+  usage_lane_colors: Record<string, string>;
 }
 
 /// V33 Phase A: OS-level sandboxing. Mirror of Rust `SandboxSettings`.
@@ -2612,8 +2615,7 @@ export function defaultSettings(): Settings {
       usage_color_out: '#3fb950',
       usage_color_tool: '#f0c674',
       usage_color_write: '#e3738d',
-      usage_color_session: '#30363d',
-      usage_color_agent: '#3b6ea5',
+      usage_lane_colors: {},
     },
     workbench: {
       enabled: true,

@@ -8466,109 +8466,6 @@ pub(crate) async fn post_edit_diagnostics(
         .unwrap_or_default()
 }
 
-/// A `POST /memory/event` request body (the OpenCode plugin's tool hook — the
-/// only memory ingress for OpenCode, whose OOB SSE stream carries no tool
-/// events, AND — V14 Phase C — the only *usage* ingress for OpenCode, for the
-/// same reason). Claude records both in-process via the transcript tap instead.
-#[derive(Deserialize)]
-struct MemoryEventBody {
-    #[serde(default)]
-    cwd: Option<String>,
-    session_id: String,
-    #[serde(default)]
-    agent: Option<String>,
-    // Tool-event shape (V10): present on `tool.execute.after` POSTs. Optional
-    // now that the same route also carries usage bodies (V24 Phase F), which
-    // have no `tool`.
-    #[serde(default)]
-    tool: Option<String>,
-    #[serde(default)]
-    args: Value,
-    // V24 Phase F usage shape: `kind == "usage"`, emitted by the plugin's
-    // `event` hook on a completed assistant turn.
-    #[serde(default)]
-    kind: Option<String>,
-    #[serde(default)]
-    parent_session_id: Option<String>,
-    #[serde(default)]
-    msg_id: Option<String>,
-    #[serde(default)]
-    model: Option<String>,
-    #[serde(default)]
-    in_tok: u32,
-    #[serde(default)]
-    out_tok: u32,
-    #[serde(default)]
-    cache_read: u32,
-    #[serde(default)]
-    cache_make: u32,
-}
-
-/// V24 Phase F: from a harness's usage POST body, the target session id and the
-/// [`crate::graph::UsageEvent::Turn`] to record — or `None` when the body has no
-/// usable data (missing/empty `msg_id`, or all four token totals are zero).
-///
-/// When `parent_session_id` is present the spend rolls up to the PARENT session
-/// in the reporting harness's **declared sub-agent lane** (sub-agent spend is
-/// the parent's spend); otherwise it's the reporting session in its declared
-/// main lane. A model id that is absent/empty maps to `None` (unknown model),
-/// matching the Claude tap. Pure, so the mapping is unit-tested without a live
-/// handler.
-///
-/// **V40 Phase G (locked decision 19).** This used to hard-code
-/// `UsageOrigin::Agent` / `::Session` — core writing one harness's two lane
-/// names into another harness's rows. `agent` is the request's asserted harness
-/// id, and the lanes come from that harness's
-/// [`TurnUsageShape`](crate::harness::plugin::TurnUsageShape). A harness that
-/// declares NO shape records **nothing**: guessing a lane for a harness that
-/// never told cImp what its lanes are would put real tokens in a fabricated
-/// bucket, and a dropped row is recoverable where a mis-attributed one is not.
-fn usage_event_from_body(
-    body: &MemoryEventBody,
-    agent: &str,
-) -> Option<(String, crate::graph::UsageEvent)> {
-    let msg_id = body.msg_id.clone().filter(|m| !m.is_empty())?;
-    // The plugin only forwards COMPLETED turns, so an all-zero body is a
-    // degenerate/creation emit — skip it rather than plant an empty turn row.
-    // `est_only` is unaffected either way (it's derived from the summed token
-    // totals, which a zero row doesn't move), so skipping only keeps the turn
-    // series free of noise; it never resurrects real data.
-    if body.in_tok == 0 && body.out_tok == 0 && body.cache_read == 0 && body.cache_make == 0 {
-        return None;
-    }
-    let shape = crate::harness::HarnessId::from_id(agent)
-        .and_then(|h| h.plugin())
-        .and_then(|p| p.turn_usage_shape())?;
-    let (target, origin) = match body.parent_session_id.as_deref() {
-        Some(p) if !p.is_empty() => (p.to_string(), shape.subagent_origin()?),
-        _ => (body.session_id.clone(), shape.main_origin()?),
-    };
-    Some((
-        target,
-        crate::graph::UsageEvent::Turn {
-            msg_id,
-            model: body.model.clone().filter(|m| !m.is_empty()),
-            in_tok: body.in_tok,
-            out_tok: body.out_tok,
-            cache_read: body.cache_read,
-            cache_make: body.cache_make,
-            origin: origin.to_string(),
-        },
-    ))
-}
-
-/// V24 Phase F: for a tool-event body (`tool.execute.after`), the parent
-/// session id when the reporting session is a task-tool CHILD (sub-agent), else
-/// `None`. A child's tool events mirror the Claude sidechain contract (see
-/// `harness/claude/read.rs` `record_tool_events`, which early-returns on `isSidechain`):
-/// they are dropped rather than recorded against the child, and only the parent
-/// is marked live. Pure, so the routing is unit-tested without a live handler.
-fn tool_event_parent(body: &MemoryEventBody) -> Option<String> {
-    body.parent_session_id
-        .as_deref()
-        .filter(|p| !p.is_empty())
-        .map(str::to_string)
-}
 /// **The live-session write a `/memory/event` body asks for** (V40 Phase D,
 /// locked decision 20).
 ///
@@ -8617,158 +8514,193 @@ fn mark_live_session_from_body(
     }
 }
 
-/// `POST /memory/event`: classify an agent tool call and record it as a memory
-/// event, AND (V14 Phase C) record its estimated usage. Best-effort — an
-/// unclassifiable tool or a missing graph service is a silent no-op (200 with
-/// memory recording skipped; usage recording no-ops internally the same way),
-/// never an error the plugin has to handle.
+/// `POST /memory/event`: record what a harness's memory-ingress body reports —
+/// its tool events, and (V14 Phase C) the usage the same hook is the only
+/// source of. Best-effort — an unclassifiable tool or a missing graph service is
+/// a silent no-op (200 with the recording skipped), never an error the plugin
+/// has to handle.
+///
+/// **V40 Phase I (issue #107 item 2): the body shape is the harness's.** This
+/// function used to declare the wire struct itself and read every field of it —
+/// `msg_id`, `in_tok`, `parent_session_id`, `tool`, `args`. It named no harness
+/// *id*, so the layering allowlists stayed clean, but the row shape was one
+/// plugin's, and a second harness's would have had nowhere to live but here.
+/// [`crate::harness::plugin::HarnessPlugin::memory_event`] reads it now and
+/// answers a neutral [`crate::harness::plugin::MemoryEvent`]; what stays is the
+/// recording, which is cImp's: the `cwd` resolution, the graph writes and the
+/// live-session registry.
 async fn handle_memory_event(
     stream: &mut TcpStream,
     app: &AppHandle,
     req: &Request,
 ) -> AppResult<()> {
-    let body: MemoryEventBody = match serde_json::from_slice(&req.body) {
-        Ok(b) => b,
-        Err(e) => {
-            return write_json(
-                stream,
-                400,
-                &serde_json::json!({ "ok": false, "error": format!("bad request body: {e}") }),
-            )
-            .await;
+    use crate::harness::plugin::MemoryEventKind;
+
+    // Which harness is speaking. The `agent` discriminator is CHP's, not any
+    // harness's, so core reads that one field itself; everything else in the
+    // body belongs to whoever sent it. An identity-less body resolves through
+    // `wire_default`, which is this route's compatibility promise to plugins
+    // generated before the field existed.
+    let asserted = serde_json::from_slice::<serde_json::Value>(&req.body)
+        .ok()
+        .and_then(|v| v.get("agent").and_then(|a| a.as_str()).map(str::to_string));
+    let agent = wire_agent(MEMORY_EVENT_ROUTE, asserted.as_deref());
+    let ok = serde_json::json!({ "ok": true });
+    // A harness with no memory ingress — or an `agent` naming no registered
+    // harness at all — records nothing. Locked decision 2: `None` is a
+    // first-class answer here, not a reason to fall back to whichever harness
+    // core happens to know the body shape of.
+    let Some(parsed) = crate::harness::HarnessId::from_id(agent)
+        .and_then(|h| h.plugin())
+        .and_then(|p| p.memory_event(&req.body))
+    else {
+        return write_json(stream, 200, &ok).await;
+    };
+    let event = match parsed {
+        Ok(e) => e,
+        Err(why) => {
+            return write_json(stream, 400, &serde_json::json!({ "ok": false, "error": why })).await;
         }
     };
-    let ok = serde_json::json!({ "ok": true });
+
     let Some(graph) = app.try_state::<Arc<crate::graph::GraphService>>() else {
         return write_json(stream, 200, &ok).await;
     };
     let graph = graph.inner().clone();
     // #104: every arm below opens the project's store (memory rows, usage
     // totals), so the plugin-supplied `cwd` is resolved to a real root first.
-    // This body carries no `tab` — the OpenCode plugin's memory POST never had
-    // one — so an unresolvable cwd has nothing to fall back to and the event is
-    // dropped rather than filed against a directory that is not a project.
-    let Some(cwd) = external_project_root(app, &live_settings(app), None, body.cwd.as_deref())
+    // This body carries no `tab` — the memory POST never had one — so an
+    // unresolvable cwd has nothing to fall back to and the event is dropped
+    // rather than filed against a directory that is not a project.
+    let Some(cwd) = external_project_root(app, &live_settings(app), None, event.cwd.as_deref())
     else {
         return write_json(stream, 200, &ok).await;
     };
-    let agent = wire_agent(MEMORY_EVENT_ROUTE, body.agent.as_deref());
     // C-2 (2026-08-07 review) used to read settings here, once for the whole
     // request, so the three live-session writes below could refuse a key that
     // named a configured tab. V40 Phase D removed the read with the check: the
     // registry has two key spaces now and `mark_live_session_from_body` decides
     // which one a body-supplied id lands in, which needs no settings at all.
-
-    // V24 Phase F: the usage arm — a completed assistant turn's real token
-    // totals (OpenCode's only exact-token ingress; see the spike note atop
-    // `harness/opencode/read.rs`). Distinct body shape (`kind == "usage"`, no `tool`),
-    // so it short-circuits the tool-event path below.
-    if body.kind.as_deref() == Some("usage") {
-        if let Some((target, event)) = usage_event_from_body(&body, agent) {
-            // Roll-up target = the parent when a child (sub-agent) session
-            // reported, else the reporting session itself. `record_usage`
-            // upserts by `msg_id`, so the plugin's duplicate final emit is
-            // harmless.
-            graph.record_usage(&cwd, &target, agent, event);
-            // Mark the SAME id live: the target is the session row that exists
-            // / gets the spend attributed (the parent when a child reports),
-            // so that's the row the Sessions list should flag active.
-            mark_live_session_from_body(|space, k| graph.mark_live_session(space, k, agent, k), agent, &target);
-        }
-        return write_json(stream, 200, &ok).await;
-    }
-
-    // Tool-event path (V10): requires a `tool` name. A body without one and not
-    // a usage event has nothing to record.
-    let Some(tool_name) = body.tool.clone() else {
-        return write_json(stream, 200, &ok).await;
+    let mark_live = |target: &str| {
+        mark_live_session_from_body(
+            |space, k| graph.mark_live_session(space, k, agent, k),
+            agent,
+            target,
+        )
     };
 
-    // V24 Phase F: a task-tool CHILD (sub-agent) session's tool events are the
-    // sub-agent's own working set, not the parent's — mirror the Claude sidechain
-    // contract (harness/claude/read.rs `record_tool_events` early-returns on isSidechain)
-    // and drop them entirely: no mem event, no tool-result chars against the
-    // child, and the child is never marked live. The child's real token spend
-    // still reaches the parent via the usage arm above; mark the PARENT live so
-    // the sub-agent's activity keeps the parent's row active.
-    if let Some(parent) = tool_event_parent(&body) {
-        mark_live_session_from_body(|space, k| graph.mark_live_session(space, k, agent, k), agent, &parent);
-        return write_json(stream, 200, &ok).await;
-    }
-
-    // V40 Phase A, locked decision 16: the memory classification is the
-    // SENDING harness's, resolved through the registry. A body whose `agent`
-    // names no registered harness records nothing — where the old single
-    // `match` would have answered it out of whichever vocabulary happened to
-    // contain the name.
-    let source = crate::harness::HarnessId::from_id(agent);
-    if let Some((kind, arg)) = crate::harness::native::memory_kind(source, &tool_name) {
-        // V40 Phase C, locked decision 16: which KEY carries the target is the
-        // sending harness's vocabulary, not core's. This was a chain of four
-        // `or_else`s mixing Claude's snake_case with OpenCode's camelCase in one
-        // lookup — see `HarnessPlugin::memory_arg_keys`.
-        let value = crate::harness::native::memory_arg(source, arg, &body.args);
-        let (path, detail) = match arg {
-            crate::harness::plugin::MemArg::Path
-            | crate::harness::plugin::MemArg::Pattern => {
-                (value.unwrap_or_default(), None)
-            }
-            crate::harness::plugin::MemArg::Command => (
-                String::new(),
-                value.map(|c| c.chars().take(200).collect::<String>()),
-            ),
-        };
-        // Skip an event with no usable target: an empty path (Path/Pattern) or a
-        // Command whose `command` arg was absent (detail is None) — recording it
-        // would just evict useful events from the ring.
-        let recordable = match arg {
-            crate::harness::plugin::MemArg::Command => detail.is_some(),
-            _ => !path.is_empty(),
-        };
-        if recordable {
-            graph.record_mem_event(
+    match event.kind {
+        // V24 Phase F: a completed assistant turn's real token totals. The
+        // roll-up target and the declared lane are the sending harness's choice
+        // (locked decision 19); `record_usage` upserts by `msg_id`, so the
+        // plugin's duplicate final emit is harmless.
+        MemoryEventKind::Turn {
+            target,
+            origin,
+            msg_id,
+            model,
+            in_tok,
+            out_tok,
+            cache_read,
+            cache_make,
+        } => {
+            graph.record_usage(
                 &cwd,
-                &body.session_id,
+                &target,
                 agent,
-                kind,
-                &path,
-                None,
-                None,
-                detail.as_deref(),
+                crate::graph::UsageEvent::Turn {
+                    msg_id,
+                    model,
+                    in_tok,
+                    out_tok,
+                    cache_read,
+                    cache_make,
+                    origin: origin.to_string(),
+                },
             );
+            // Mark the SAME id live: the target is the session row that exists
+            // / gets the spend attributed (the parent when a child reports), so
+            // that's the row the Sessions list should flag active.
+            mark_live(&target);
         }
+        // A sub-agent's tool call: recorded against nobody, but the PARENT
+        // stays live — the child's activity is the parent still working.
+        MemoryEventKind::SubagentTool { parent } => mark_live(&parent),
+        MemoryEventKind::Tool { tool, args } => {
+            // V40 Phase A, locked decision 16: the memory classification is the
+            // SENDING harness's, resolved through the registry. A body whose
+            // `agent` names no registered harness records nothing — where the
+            // old single `match` would have answered it out of whichever
+            // vocabulary happened to contain the name.
+            let source = crate::harness::HarnessId::from_id(agent);
+            if let Some((kind, arg)) = crate::harness::native::memory_kind(source, &tool) {
+                // V40 Phase C, locked decision 16: which KEY carries the target
+                // is the sending harness's vocabulary, not core's. This was a
+                // chain of four `or_else`s mixing one harness's snake_case with
+                // another's camelCase in one lookup — see
+                // `HarnessPlugin::memory_arg_keys`.
+                let value = crate::harness::native::memory_arg(source, arg, &args);
+                let (path, detail) = match arg {
+                    crate::harness::plugin::MemArg::Path
+                    | crate::harness::plugin::MemArg::Pattern => (value.unwrap_or_default(), None),
+                    crate::harness::plugin::MemArg::Command => (
+                        String::new(),
+                        value.map(|c| c.chars().take(200).collect::<String>()),
+                    ),
+                };
+                // Skip an event with no usable target: an empty path
+                // (Path/Pattern) or a Command whose `command` arg was absent
+                // (detail is None) — recording it would just evict useful
+                // events from the ring.
+                let recordable = match arg {
+                    crate::harness::plugin::MemArg::Command => detail.is_some(),
+                    _ => !path.is_empty(),
+                };
+                if recordable {
+                    graph.record_mem_event(
+                        &cwd,
+                        &event.session_id,
+                        agent,
+                        kind,
+                        &path,
+                        None,
+                        None,
+                        detail.as_deref(),
+                    );
+                }
+            }
+
+            // V14 Phase C: the usage tap. Unlike the memory recording above,
+            // this runs for EVERY tool call, not just ones the native table
+            // maps to a filesystem/query target — usage wants the full picture.
+            // `chars` is estimated from the tool's serialized INPUT args (its
+            // actual output isn't visible to this hook). This path records only
+            // tool-result chars, never Turn tokens, so a session that never got
+            // a real usage event stays est-only in the X-ray (V24 Phase E
+            // derives `est_only` from zero token totals — see
+            // `usage_row_for_session`).
+            let chars = serde_json::to_string(&args)
+                .map(|s| s.chars().count())
+                .unwrap_or(0) as u32;
+            graph.record_usage(
+                &cwd,
+                &event.session_id,
+                agent,
+                crate::graph::UsageEvent::ToolResult {
+                    tool: Some(tool),
+                    chars,
+                },
+            );
+
+            // V24 Phase B: this harness has no tab binding on this path, so the
+            // live-session registry is keyed by the reporting session id itself;
+            // the entry expires by TTL (there is no cancel signal to clear it).
+            // C-2: which is exactly why the key must not be allowed to name a
+            // TAB — the other half of the same map.
+            mark_live(&event.session_id);
+        }
+        MemoryEventKind::Nothing => {}
     }
-
-    // V14 Phase C: OpenCode's usage tap (see the C3 spike note atop
-    // `harness/opencode/read.rs` — its SSE stream carries no usage fields, so this
-    // hook, which already fires after every tool call, is the only place
-    // that can record OpenCode usage). Unlike the memory recording above,
-    // this runs for EVERY tool call, not just ones the native table maps to a
-    // filesystem/query target — usage wants the full picture. `chars` is
-    // estimated from the tool's serialized INPUT args (its actual output
-    // isn't visible to this hook). This path records only tool-result chars,
-    // never Turn tokens, so a session that never got a real usage event stays
-    // est-only in the X-ray (V24 Phase E derives `est_only` from zero token
-    // totals — see `usage_row_for_session`).
-    let chars = serde_json::to_string(&body.args)
-        .map(|s| s.chars().count())
-        .unwrap_or(0) as u32;
-    graph.record_usage(
-        &cwd,
-        &body.session_id,
-        agent,
-        crate::graph::UsageEvent::ToolResult {
-            tool: Some(tool_name.clone()),
-            chars,
-        },
-    );
-
-    // V24 Phase B: OpenCode has no tab binding on this path, so the live-session
-    // registry is keyed by the reporting session id itself; the entry expires by
-    // TTL (there is no cancel signal to clear it — see the C3 spike note atop
-    // `harness/opencode/read.rs`). C-2: which is exactly why the key must not be allowed
-    // to name a TAB — the other half of the same map.
-    mark_live_session_from_body(|space, k| graph.mark_live_session(space, k, agent, k), agent, &body.session_id);
 
     write_json(stream, 200, &ok).await
 }
@@ -9988,22 +9920,64 @@ mod tests {
 
     // ── NC-2: permission-hook classification + tab mapping ─────────────────
 
-    // ── V24 Phase F: OpenCode usage-event arm ──────────────────────────────
+    // ── V24 Phase F: the memory-ingress usage arm ──────────────────────────
+    //
+    // V40 Phase I (issue #107 item 2): the BODY these drove is the harness's
+    // now, and its pure mapping is tested beside it in
+    // `harness::opencode::hook`. What is still core's — and still tested here —
+    // is what the handler does with the neutral `MemoryEvent`: which
+    // `graph::UsageEvent` it builds, which session it files it against, and
+    // that the row lands in a real store. So these go through the same two
+    // steps `handle_memory_event` takes, without a live listener.
 
-    fn usage_body(json: serde_json::Value) -> MemoryEventBody {
-        serde_json::from_value(json).expect("usage body deserializes")
+    /// Read a `/memory/event` body the way the handler does — the sending
+    /// harness's plugin — and build the `graph::UsageEvent` the handler builds
+    /// from a `Turn`. `None` when the body carries no recordable turn.
+    fn memory_turn(json: serde_json::Value) -> Option<(String, crate::graph::UsageEvent)> {
+        use crate::harness::plugin::MemoryEventKind;
+        let plugin = crate::harness::HarnessId::from_id("opencode")
+            .and_then(|h| h.plugin())
+            .expect("opencode is registered");
+        let parsed = plugin
+            .memory_event(json.to_string().as_bytes())
+            .expect("this harness serves the memory route")
+            .expect("the fixture parses");
+        match parsed.kind {
+            MemoryEventKind::Turn {
+                target,
+                origin,
+                msg_id,
+                model,
+                in_tok,
+                out_tok,
+                cache_read,
+                cache_make,
+            } => Some((
+                target,
+                crate::graph::UsageEvent::Turn {
+                    msg_id,
+                    model,
+                    in_tok,
+                    out_tok,
+                    cache_read,
+                    cache_make,
+                    origin: origin.to_string(),
+                },
+            )),
+            _ => None,
+        }
     }
 
     #[test]
     fn usage_body_well_formed_records_session_turn() {
-        // No parent → recorded against the reporting session with origin Session.
-        let body = usage_body(serde_json::json!({
+        // No parent → recorded against the reporting session, in the declared
+        // main lane.
+        let (target, event) = memory_turn(serde_json::json!({
             "cwd": ".", "agent": "opencode", "kind": "usage",
             "session_id": "ses_main", "msg_id": "msg_1", "model": "qwen3-coder",
             "in_tok": 100, "out_tok": 40, "cache_read": 20, "cache_make": 5,
-        }));
-        let (target, event) =
-            usage_event_from_body(&body, "opencode").expect("well-formed body yields an event");
+        }))
+        .expect("well-formed body yields an event");
         assert_eq!(target, "ses_main");
         match &event {
             crate::graph::UsageEvent::Turn {
@@ -10042,15 +10016,14 @@ mod tests {
 
     #[test]
     fn usage_body_with_parent_rolls_up_as_agent() {
-        // A child (sub-agent) session's spend is attributed to the PARENT with
-        // origin Agent — mirrors the Claude sub-agent contract.
-        let body = usage_body(serde_json::json!({
+        // A child (sub-agent) session's spend is attributed to the PARENT in
+        // the declared sub-agent lane — mirrors the Claude sub-agent contract.
+        let (target, event) = memory_turn(serde_json::json!({
             "kind": "usage", "session_id": "ses_child", "parent_session_id": "ses_parent",
             "msg_id": "msg_a", "model": "qwen3-coder",
             "in_tok": 7, "out_tok": 3, "cache_read": 0, "cache_make": 0,
-        }));
-        let (target, event) =
-            usage_event_from_body(&body, "opencode").expect("child body yields an event");
+        }))
+        .expect("child body yields an event");
         assert_eq!(target, "ses_parent", "spend rolls up to the parent");
         match &event {
             crate::graph::UsageEvent::Turn { origin, .. } => {
@@ -10074,38 +10047,36 @@ mod tests {
 
     #[test]
     fn usage_body_malformed_or_empty_is_ignored() {
-        // Missing msg_id → no event.
-        let no_msg = usage_body(serde_json::json!({
+        // Missing msg_id → no turn.
+        assert!(memory_turn(serde_json::json!({
             "kind": "usage", "session_id": "s", "in_tok": 10,
-        }));
-        assert!(usage_event_from_body(&no_msg, "opencode").is_none());
-        // Empty msg_id → no event.
-        let empty_msg = usage_body(serde_json::json!({
+        }))
+        .is_none());
+        // Empty msg_id → no turn.
+        assert!(memory_turn(serde_json::json!({
             "kind": "usage", "session_id": "s", "msg_id": "", "in_tok": 10,
-        }));
-        assert!(usage_event_from_body(&empty_msg, "opencode").is_none());
+        }))
+        .is_none());
         // All-zero token totals (degenerate/creation emit) → skipped.
-        let all_zero = usage_body(serde_json::json!({
+        assert!(memory_turn(serde_json::json!({
             "kind": "usage", "session_id": "s", "msg_id": "m",
             "in_tok": 0, "out_tok": 0, "cache_read": 0, "cache_make": 0,
-        }));
-        assert!(usage_event_from_body(&all_zero, "opencode").is_none());
+        }))
+        .is_none());
     }
 
     #[test]
     fn usage_upsert_by_msg_id_does_not_duplicate() {
         // The plugin emits the final turn twice (spike-confirmed) — same msg_id,
         // so the second overwrites the first in place rather than appending.
-        let mk = |out: u64| {
-            usage_body(serde_json::json!({
-                "kind": "usage", "session_id": "ses", "msg_id": "dup",
-                "in_tok": 50, "out_tok": out, "cache_read": 0, "cache_make": 0,
-            }))
-        };
         let dir = std::env::temp_dir().join(format!("cimp-usage-dup-{}", uuid::Uuid::new_v4()));
         let idx = crate::graph::GraphIndex::open(&dir, ".ckg").expect("open");
         for out in [10u64, 20u64] {
-            let (target, event) = usage_event_from_body(&mk(out), "opencode").expect("event");
+            let (target, event) = memory_turn(serde_json::json!({
+                "kind": "usage", "session_id": "ses", "msg_id": "dup",
+                "in_tok": 50, "out_tok": out, "cache_read": 0, "cache_make": 0,
+            }))
+            .expect("event");
             idx.record_usage_event(&target, "opencode", &event, 100)
                 .unwrap();
         }
@@ -10116,34 +10087,32 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// **A harness that serves no memory ingress records nothing** (V40 Phase
+    /// I, issue #107 item 2).
+    ///
+    /// The route's body shape belongs to whoever generated the producer. Core
+    /// used to declare it and read it for whatever `agent` the body asserted,
+    /// which meant a harness cImp taps in-process — and which has no producer
+    /// for this route at all — was still served out of another harness's
+    /// vocabulary. `None` from the plugin is the fail-closed answer locked
+    /// decision 2 asks for everywhere else.
     #[test]
-    fn tool_event_parent_flags_child_sessions_only() {
-        // V24 code-review: a tool event with no parent is the reporting session's
-        // own event (recorded normally); one carrying a non-empty parent is a
-        // task-tool child whose events are dropped and rolled up to the parent.
-        let own = usage_body(serde_json::json!({
-            "session_id": "s", "tool": "read", "args": {}
-        }));
-        assert_eq!(
-            tool_event_parent(&own),
-            None,
-            "no parent field → own session"
-        );
-        let empty_parent = usage_body(serde_json::json!({
-            "session_id": "s", "tool": "read", "args": {}, "parent_session_id": ""
-        }));
-        assert_eq!(
-            tool_event_parent(&empty_parent),
-            None,
-            "empty parent → own session"
-        );
-        let child = usage_body(serde_json::json!({
-            "session_id": "ses_child", "tool": "read", "args": {}, "parent_session_id": "ses_parent"
-        }));
-        assert_eq!(
-            tool_event_parent(&child),
-            Some("ses_parent".to_string()),
-            "child → parent"
+    fn a_harness_with_no_memory_ingress_answers_none() {
+        let body = serde_json::json!({
+            "kind": "usage", "session_id": "s", "msg_id": "m", "in_tok": 10,
+        })
+        .to_string();
+        let has = |id: &str| {
+            crate::harness::HarnessId::from_id(id)
+                .and_then(|h| h.plugin())
+                .and_then(|p| p.memory_event(body.as_bytes()))
+                .is_some()
+        };
+        assert!(has("opencode"), "the generated plugin's own route");
+        assert!(
+            !has("claude"),
+            "this harness's tool and usage events come from the transcript tap; it posts nothing \\
+             here, so serving it out of another harness's body shape would be a guess"
         );
     }
 
@@ -14697,14 +14666,14 @@ mod tests {
     /// tab. The consumer of a tab is its COMMAND (`tabs::tab_consumer`), so
     /// these are built from the real defaults rather than by stamping a field.
     fn settings_with_consumer_tabs(tabs_in: &[(&str, &str)]) -> crate::settings::Settings {
-        use crate::settings::{default_ai_tab, default_graph_monitor_tab, AiTabId, TabConfig};
+        use crate::settings::{default_ai_tab, default_graph_monitor_tab, TabConfig};
         let mut tabs = vec![default_graph_monitor_tab()];
         for (consumer, id) in tabs_in {
             let mut t = crate::settings::ai_tab_inheriting_injection(default_ai_tab(
                 if *consumer == "claude" {
-                    AiTabId::Claude
+                    crate::settings::ai_tab_id("claude")
                 } else {
-                    AiTabId::OpenCode
+                    crate::settings::ai_tab_id("opencode")
                 },
             ));
             if let TabConfig::AiTool(c) = &mut t {

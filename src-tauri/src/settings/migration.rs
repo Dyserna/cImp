@@ -64,6 +64,99 @@ fn legacy_aider_v1_2_entry() -> Value {
     })
 }
 
+/// The oldest schema version the **overlay** cascade can be entered at.
+///
+/// `schema_version` was introduced by the v1.9 → v1.10 step, and every detector
+/// from v1.10 on is the trivial `schema_version == N` form. Below it the
+/// detectors are *presence archaeology* — "has `claude_code`, has no `tabs`",
+/// "`tabs` is an object" — which key off keys a **partial** overlay legitimately
+/// lacks, and which the v1.2 → v1.4 transforms answer by inserting whole-object
+/// defaults (`layout`, `terminal`). Running those on a sparse diff is exactly
+/// the silent data loss the pre-Phase-I comment in `persistence::load` warned
+/// about, so the overlay cascade refuses to start below this.
+pub const MIN_OVERLAY_SCHEMA_VERSION: u64 = 10;
+
+/// The `schema_version` a value states, if it states one.
+pub fn stated_schema_version(value: &Value) -> Option<u64> {
+    value.get("schema_version").and_then(Value::as_u64)
+}
+
+/// **Run the cascade on a project OVERLAY** (V40 Phase I, issue #107 item 5).
+///
+/// The overlay is a sparse diff against the global baseline, and until Phase I
+/// it was never migrated at all — `persistence::load`'s step 2 said so, and
+/// gave two correct reasons: the presence-archaeology detectors fire on the
+/// keys a partial file legitimately lacks, and a value with no `schema_version`
+/// re-migrates on every launch, growing `.bak` files without bound.
+///
+/// Both reasons are about *entering the cascade blind*. Neither survives being
+/// told the version: this takes `from` as a parameter, refuses anything below
+/// [`MIN_OVERLAY_SCHEMA_VERSION`] (where the archaeology begins), stamps the
+/// value so the numeric detectors — and ONLY the numeric detectors — can match,
+/// and strips the stamp again on the way out so the overlay never carries a
+/// schema version into the merge.
+///
+/// It writes **no backup and no file**: an overlay is reconstructible from the
+/// global baseline plus the user's next save, and a `.bak` per launch beside a
+/// user's project is the unbounded growth the old comment named. The migrated
+/// shape reaches disk when the user next saves, through the ordinary `diff`.
+///
+/// The gap this closes is real and not hypothetical: a project that set
+/// `claude_local.base_url` before schema 36 kept a top-level `claude_local`
+/// block in its overlay, the global file moved that field to
+/// `harness.claude.ext["local.base_url"]`, and the project's value then reached
+/// nothing — a per-project setting that silently stopped applying, with the file
+/// still on disk saying otherwise.
+///
+/// Returns whether anything changed.
+pub fn migrate_overlay(overlay: &mut Value, from: u64, default_shell: &ShellSpec) -> bool {
+    // Dropped on EVERY path below: an overlay's own stamp is an entry marker
+    // for this function and must never survive into the merge, where it would
+    // `deep_merge` over the global's `schema_version` and pin the merged
+    // `Settings` below whatever the global file actually reached.
+    let stamped = overlay
+        .as_object_mut()
+        .and_then(|r| r.remove("schema_version"))
+        .is_some();
+    let current = crate::settings::schema::CURRENT_SCHEMA_VERSION as u64;
+    if from >= current {
+        return stamped;
+    }
+    if from < MIN_OVERLAY_SCHEMA_VERSION {
+        tracing::warn!(
+            from,
+            min = MIN_OVERLAY_SCHEMA_VERSION,
+            "settings: project overlay predates the schema_version field; leaving it unmigrated \
+             rather than entering the presence-archaeology steps on a partial file"
+        );
+        return stamped;
+    }
+    let Some(root) = overlay.as_object_mut() else {
+        return stamped;
+    };
+    let before = Value::Object(root.clone());
+    // Stamped so the numeric detectors can match, and so the archaeology
+    // detectors (every one of which requires `schema_version` to be ABSENT)
+    // cannot.
+    root.insert(
+        "schema_version".to_string(),
+        Value::Number(serde_json::Number::from(from)),
+    );
+    for step in MIGRATION_STEPS {
+        if (step.detect)(overlay) {
+            (step.transform)(overlay, default_shell);
+        }
+    }
+    // No force-stamp twin of `migrate_if_needed`'s: an overlay that did not
+    // reach `current` is one whose steps found nothing of theirs in it, which is
+    // the ordinary case for a sparse diff. Stamping it would only put a key into
+    // the merge that must not be there.
+    if let Some(root) = overlay.as_object_mut() {
+        root.remove("schema_version");
+    }
+    stamped || *overlay != before
+}
+
 /// Detect file shape and run the appropriate transform on `value`. Returns
 /// `Ok(true)` if the file changed shape (caller should write back to disk),
 /// `Ok(false)` if the file was already v1.2, or `Err` if a backup write
@@ -345,6 +438,11 @@ const MIGRATION_STEPS: &[MigrationStep] = &[
         from_version: "v35",
         detect: looks_v35,
         transform: migrate_v35_to_v36_step,
+    },
+    MigrationStep {
+        from_version: "v36",
+        detect: looks_v36,
+        transform: migrate_v36_to_v37_step,
     },
 ];
 
@@ -2911,6 +3009,73 @@ fn migrate_v35_to_v36_step(value: &mut Value, _shell: &ShellSpec) {
     migrate_v35_to_v36(value)
 }
 
+fn looks_v36(value: &Value) -> bool {
+    value
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .is_some_and(|v| v == 36)
+}
+
+fn migrate_v36_to_v37_step(value: &mut Value, _shell: &ShellSpec) {
+    migrate_v36_to_v37(value)
+}
+
+/// v36 -> v37: the two fixed usage-lane colors become a **map keyed by the
+/// harness's declared `TurnOrigin` id** (V40 Phase I, issue #107 item 4).
+///
+/// | v36 | v37 |
+/// |---|---|
+/// | `graph.usage_color_session` | `graph.usage_lane_colors["session"]` |
+/// | `graph.usage_color_agent` | `graph.usage_lane_colors["agent"]` |
+///
+/// `session` and `agent` are the two lane ids both shipped harnesses declare,
+/// so the keys are the ids the user's colors were already about — the pair was
+/// simply spelled into core's schema instead of read off the declaration. A
+/// harness with a third lane could not be given a color at all; now every lane
+/// falls back to the palette slot for its declared position, and this map holds
+/// only what the user actually picked.
+///
+/// Absent or non-string values are dropped rather than defaulted: an absent
+/// entry means "use the declared position's palette slot", which is the answer
+/// a fresh install gets and the right answer for a file that never set one.
+fn migrate_v36_to_v37(value: &mut Value) {
+    let Some(root) = value.as_object_mut() else {
+        return;
+    };
+    if let Some(graph) = root.get_mut("graph").and_then(Value::as_object_mut) {
+        let mut lanes = serde_json::Map::new();
+        for (field, lane) in [
+            ("usage_color_session", "session"),
+            ("usage_color_agent", "agent"),
+        ] {
+            if let Some(v) = graph.remove(field) {
+                if v.is_string() {
+                    lanes.insert(lane.to_string(), v);
+                }
+            }
+        }
+        // Merge rather than replace, for the same reason the v35 step merges
+        // its harness rows: a hand-written `usage_lane_colors` is the user's
+        // and outranks a field this step is retiring.
+        if !lanes.is_empty() {
+            match graph.get_mut("usage_lane_colors").and_then(Value::as_object_mut) {
+                Some(existing) => {
+                    for (k, v) in lanes {
+                        existing.entry(k).or_insert(v);
+                    }
+                }
+                None => {
+                    graph.insert("usage_lane_colors".to_string(), Value::Object(lanes));
+                }
+            }
+        }
+    }
+    root.insert(
+        "schema_version".to_string(),
+        Value::Number(serde_json::Number::from(37u8)),
+    );
+}
+
 /// The two harness ids the v35 file format had FIELDS for.
 ///
 /// A frozen list, like every other constant in this module (locked decision
@@ -4228,6 +4393,232 @@ mod tests {
         assert!(!s.offload.mcp_servers[1].offload_access);
     }
 
+    // ── V40 Phase I: lane colours (issue #107 item 4) ─────────────────────
+
+    /// **The user's two picked lane colours survive becoming a map** (schema
+    /// 36 -> 37).
+    ///
+    /// The one thing a settings migration has to get right is that the user's
+    /// existing answers survive it. `session` and `agent` are the lane ids both
+    /// shipped harnesses declare, so the keys are what the two retired fields
+    /// were already about — the pair was spelled into core's schema instead of
+    /// read off the declaration.
+    #[test]
+    fn v36_to_v37_moves_the_lane_pair_into_the_map() {
+        let mut v = json!({
+            "schema_version": 36,
+            "graph": {
+                "usage_color_session": "#112233",
+                "usage_color_agent": "#445566",
+                "usage_color_in": "#58a6ff",
+            },
+        });
+        migrate_v36_to_v37(&mut v);
+        assert_eq!(v["schema_version"], json!(37));
+        assert_eq!(
+            v["graph"]["usage_lane_colors"],
+            json!({ "session": "#112233", "agent": "#445566" })
+        );
+        assert!(v["graph"].get("usage_color_session").is_none());
+        assert!(v["graph"].get("usage_color_agent").is_none());
+        // The KIND colours are cImp's own pricing vocabulary, not a lane —
+        // they stay exactly where they are.
+        assert_eq!(v["graph"]["usage_color_in"], json!("#58a6ff"));
+        // The result deserializes, which is the half a shape assertion misses.
+        let mut full = serde_json::to_value(crate::settings::Settings::default()).unwrap();
+        full["graph"] = v["graph"].clone();
+        let typed: crate::settings::Settings = serde_json::from_value(full).unwrap();
+        assert_eq!(
+            typed.graph.usage_lane_colors.get("agent").map(String::as_str),
+            Some("#445566")
+        );
+    }
+
+    /// **A file that never picked a colour gets no row.**
+    ///
+    /// Absent means "the palette slot for this lane's declared position", which
+    /// is the answer a fresh install gets. Writing the old defaults in as
+    /// explicit rows would pin every existing install to today's palette and
+    /// make a future palette change invisible to everyone but new users — the
+    /// "empty is not absent" mistake in the other direction.
+    #[test]
+    fn v36_to_v37_writes_no_lane_map_for_a_file_that_carried_nothing() {
+        let mut v = json!({ "schema_version": 36, "graph": { "usage_color_in": "#58a6ff" } });
+        migrate_v36_to_v37(&mut v);
+        assert!(v["graph"].get("usage_lane_colors").is_none());
+        // …and a file with no `graph` block at all is untouched but stamped.
+        let mut bare = json!({ "schema_version": 36 });
+        migrate_v36_to_v37(&mut bare);
+        assert_eq!(bare, json!({ "schema_version": 37 }));
+    }
+
+    /// **The first two palette slots are the colours the retired settings
+    /// defaulted to** (V40 Phase I, issue #107 item 4).
+    ///
+    /// The acceptance for item 4 is that a user who never picked a colour sees
+    /// no change: lane 0 stays `#30363d` and lane 1 stays `#3b6ea5`. Those
+    /// values moved from `GraphSettings`'s defaults into a palette array in
+    /// `CodeIntelligenceView.svelte`, where no Rust test would otherwise see
+    /// them — so this reads the array out of the component, the same way
+    /// `every_settings_reader_runs_the_harness_parse_boundary` reads a function
+    /// body out of its own file.
+    ///
+    /// Newline-agnostic: CI checks this tree out with CRLF.
+    #[test]
+    fn the_first_two_lane_palette_slots_are_the_shipped_colours() {
+        let src = include_str!("../../../src/lib/CodeIntelligenceView.svelte").replace('\r', "");
+        let at = src
+            .find("const LANE_PALETTE = [")
+            .expect("`LANE_PALETTE` is gone — re-point this test");
+        let rest = &src[at..];
+        let body = &rest[rest.find('[').expect("the array opens") + 1
+            ..rest.find(']').expect("the array closes")];
+        let slots: Vec<&str> = body
+            .split(',')
+            .map(|s| s.trim().trim_matches('\'').trim_matches('"'))
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert!(
+            slots.len() >= 4,
+            "the lane palette has {} slots — a harness with four lanes would fall through to the \
+             overflow colour before the reader could tell them apart: {slots:?}",
+            slots.len()
+        );
+        assert_eq!(
+            &slots[..2],
+            ["#30363d", "#3b6ea5"],
+            "slots 0 and 1 are the colours `usage_color_session` / `usage_color_agent` defaulted \
+             to; changing them recolours every existing install's usage donut, which item 4 \
+             promised it would not"
+        );
+        let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        for s in &slots {
+            assert!(
+                s.len() == 7 && s.starts_with('#'),
+                "{s:?} is not a `#rrggbb` literal"
+            );
+            assert!(seen.insert(s), "duplicate palette slot {s} — two lanes would paint alike");
+        }
+    }
+
+    // ── V40 Phase I: the PROJECT OVERLAY cascade (issue #107 item 5) ───────
+
+    /// **A stale project overlay is migrated, and the `claude_*` pair lands in
+    /// `harness.<id>`** — the gap item 5 names.
+    ///
+    /// A project that set `claude_local.base_url` and `statusline.enabled`
+    /// before schema 36 kept them as top-level keys in `.cimp/config.json`. The
+    /// GLOBAL file's v35 -> v36 step moved those fields under `harness.claude`,
+    /// the overlay was never migrated, and the project's values then reached
+    /// nothing — with the file still on disk saying otherwise. Silent, and
+    /// exactly the "empty is not absent" shape: the merged settings were not
+    /// missing a value, they were carrying the harness default while a file
+    /// two directories away stated a different one.
+    #[test]
+    fn a_v35_overlay_migrates_its_claude_pair_into_the_harness_map() {
+        let shell = fake_default_shell();
+        let mut overlay = json!({
+            "claude_local": { "base_url": "http://myproxy:9000" },
+            "statusline": { "enabled": false },
+            "ui": { "theme": "future-light" },
+        });
+        assert!(migrate_overlay(&mut overlay, 35, &shell), "the overlay changed");
+        assert_eq!(
+            overlay["harness"]["claude"]["ext"]["local.base_url"],
+            json!("http://myproxy:9000")
+        );
+        assert_eq!(overlay["harness"]["claude"]["ext"]["statusline"], json!(false));
+        // The v35 spellings are GONE — leaving them would re-merge a key the
+        // current schema does not read, which is how the value went stale in
+        // the first place.
+        assert!(overlay.get("claude_local").is_none());
+        assert!(overlay.get("statusline").is_none());
+        // Everything the step does not own is untouched, and the overlay stays
+        // SPARSE: a cascade that stamped whole-object defaults here would
+        // override the global baseline through `deep_merge`, which is the
+        // silent data loss that kept the overlay unmigrated until now.
+        assert_eq!(overlay["ui"], json!({ "theme": "future-light" }));
+        let keys: Vec<&str> = overlay
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, ["ui", "harness"]);
+    }
+
+    /// **The entry stamp never survives into the merge.**
+    ///
+    /// `save` writes `schema_version` into the overlay so `load` knows which
+    /// schema the project's keys are in. It is an entry marker for
+    /// `migrate_overlay` and nothing else: left in place it would `deep_merge`
+    /// over the global's own `schema_version` and pin the merged `Settings`
+    /// below whatever the global file actually reached.
+    #[test]
+    fn the_overlay_entry_stamp_is_always_stripped() {
+        let shell = fake_default_shell();
+        let current = crate::settings::schema::CURRENT_SCHEMA_VERSION as u64;
+        // Current-schema overlay: nothing to do but drop the stamp.
+        let mut cur = json!({ "schema_version": current, "ui": { "theme": "tui" } });
+        assert!(migrate_overlay(&mut cur, current, &shell));
+        assert_eq!(cur, json!({ "ui": { "theme": "tui" } }));
+        // Stale overlay: migrated AND unstamped.
+        let mut old = json!({ "schema_version": 35, "statusline": { "enabled": true } });
+        assert!(migrate_overlay(&mut old, 35, &shell));
+        assert!(old.get("schema_version").is_none());
+        assert_eq!(old["harness"]["claude"]["ext"]["statusline"], json!(true));
+        // Too old to enter: still unstamped, and NOT dragged through the
+        // presence-archaeology steps.
+        let mut ancient = json!({ "schema_version": 9, "tabs": [] });
+        migrate_overlay(&mut ancient, 9, &shell);
+        assert_eq!(ancient, json!({ "tabs": [] }));
+    }
+
+    /// **The cascade refuses to start where the archaeology begins.**
+    ///
+    /// Below `schema_version` (v1.10) the detectors key off ABSENT top-level
+    /// keys — `looks_v1` is "has `claude_code`, has no `tabs`" — which every
+    /// sparse overlay satisfies by construction, and the v1.2/v1.3 transforms
+    /// answer by inserting whole `layout` and `terminal` objects. That is the
+    /// data loss the pre-Phase-I comment described, and it is the one case
+    /// knowing the version does not rescue.
+    #[test]
+    fn the_overlay_cascade_refuses_the_pre_version_era() {
+        let shell = fake_default_shell();
+        let before = json!({ "claude_code": { "command": "claude" } });
+        let mut v = before.clone();
+        assert!(!migrate_overlay(&mut v, MIN_OVERLAY_SCHEMA_VERSION - 1, &shell));
+        assert_eq!(v, before, "an overlay too old to place must be left alone");
+        // …and the same file WOULD have been rewritten by the real cascade, so
+        // the refusal is doing work rather than describing a no-op.
+        let mut through = before.clone();
+        for step in MIGRATION_STEPS {
+            if (step.detect)(&through) {
+                (step.transform)(&mut through, &shell);
+            }
+        }
+        assert_ne!(through, before);
+    }
+
+    /// **A current-shape overlay is not touched.**
+    ///
+    /// The ordinary case, and the one the old skip was protecting: a sparse
+    /// diff written by this build must come out of `migrate_overlay` byte for
+    /// byte, whatever keys it happens to lack.
+    #[test]
+    fn a_current_overlay_passes_through_unchanged() {
+        let shell = fake_default_shell();
+        let current = crate::settings::schema::CURRENT_SCHEMA_VERSION as u64;
+        let before = json!({
+            "checks_allow_remote_worker": true,
+            "harness": { "claude": { "ext": { "statusline": false } } },
+            "tabs": [],
+        });
+        let mut v = before.clone();
+        assert!(!migrate_overlay(&mut v, current, &shell));
+        assert_eq!(v, before);
+    }
+
     /// **v35 → v36: every field pair lands in its harness's row** (V40 locked
     /// decision 5).
     ///
@@ -4830,7 +5221,11 @@ mod tests {
                 (step.transform)(&mut v, &shell);
             }
         }
-        assert_eq!(v["schema_version"], json!(36));
+        assert_eq!(
+            v["schema_version"],
+            json!(crate::settings::schema::CURRENT_SCHEMA_VERSION),
+            "the cascade must reach the current version, not stop at whatever was current when              this test was written"
+        );
         assert_eq!(v["tabs"][0]["injection_overrides"]["taint_latch"], json!("inherit"));
     }
 
@@ -4873,7 +5268,10 @@ mod tests {
             "tool_plugins": { "plugins": {}, "project_paths": {}, "global_paths": {} },
             "code_audit": { "tools": [{ "id": "semgrep", "enabled": false }] },
         }));
-        assert_eq!(a["schema_version"], json!(36));
+        assert_eq!(
+            a["schema_version"],
+            json!(crate::settings::schema::CURRENT_SCHEMA_VERSION)
+        );
         assert!(a["code_audit"].get("tools").is_none(), "the array still moves");
         assert_eq!(
             a["tool_plugins"]["plugins"]["cimp-audit@1"]["tools"]["semgrep"]["enabled"],
@@ -4894,7 +5292,10 @@ mod tests {
             },
             "code_audit": { "enabled": true },
         }));
-        assert_eq!(b["schema_version"], json!(36));
+        assert_eq!(
+            b["schema_version"],
+            json!(crate::settings::schema::CURRENT_SCHEMA_VERSION)
+        );
         assert_eq!(
             b["tool_plugins"]["plugins"]["cimp-audit@1"]["tools"]["semgrep"]["parameters"],
             json!(["--foo"])

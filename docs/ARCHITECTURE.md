@@ -367,7 +367,9 @@ that plugin's README.
 
 **New local loopback routes** (`offload/loopback.rs`), same authenticated-
 localhost trust model as `/graph_run`: `POST /context/retrieve` (gated on
-`context_injection`) and `POST /memory/event` (OpenCode's memory ingress).
+`context_injection`) and `POST /memory/event` (OpenCode's memory ingress —
+its BODY is `harness/opencode/hook.rs` since V40 Phase I; core keeps the route
+and the recording and receives a neutral `plugin::MemoryEvent`).
 
 ---
 
@@ -907,10 +909,12 @@ tests in `harness/layering.rs` keep it that way:
     one that did. → `canary::tests::canaries_and_the_matrix_agree`,
     `embedded_canaries_are_exactly_the_declared_ones`,
     `every_fixture_version_dir_has_a_manifest`.
-13. **`probe()`** (plus `probes_share_one_child()` and `declared_unprobed()`) —
-    the L2 half, driven against the installed CLI. `harness/probe.rs` stays core:
-    it owns the runner, the report shape and `IMPLEMENTED`, the **declared report
-    order**. → `contract::tests::probes_and_the_matrix_agree`,
+13. **`probe()`** (plus `probes()`, `probes_share_one_child()` and
+    `declared_unprobed()`) — the L2 half, driven against the installed CLI.
+    `harness/probe.rs` stays core: it owns the runner, the report shape and the
+    **declared report order** — but since V40 Phase I the order is a
+    CONCATENATION of each plugin's own `probes()` in `drive_order()`, not a
+    hand-kept list of both harnesses' ids in core. → `contract::tests::probes_and_the_matrix_agree`,
     `every_silent_degradation_has_a_canary_or_a_probe_or_a_waiver`.
 14. **Goldens if the artifact is a file** — declare `HarnessFeature::FileArtifact`
     and commit `src-tauri/fixtures/harness/<id>/goldens/`, so a change to what the

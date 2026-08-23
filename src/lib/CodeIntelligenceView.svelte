@@ -61,6 +61,7 @@
     matchPricing,
     turnCost,
     laneSegments,
+    laneLabel,
     laneLabelVisible,
     agentBarClass,
     sessionRowState,
@@ -1269,14 +1270,7 @@
     { key: 'out', kind: 'output', label: 'output', field: 'usage_color_out' },
     { key: 'tool', kind: null, label: 'est. tool-result', field: 'usage_color_tool' },
   ] as const;
-  // The S/A lane's two origin colors — same picker/preview/commit machinery
-  // as the bar segments, separate list because these feed the lane (and the
-  // sub-agent bar outline), not the stacked segments.
-  const SA_SEGS = [
-    { key: 'session', label: 'S session', field: 'usage_color_session' },
-    { key: 'agent', label: 'A agent', field: 'usage_color_agent' },
-  ] as const;
-  type ChartSegKey = (typeof CHART_SEGS)[number]['key'] | (typeof SA_SEGS)[number]['key'];
+  type ChartSegKey = (typeof CHART_SEGS)[number]['key'];
   let chartPreview = $state<Partial<Record<ChartSegKey, string>>>({});
   let chartColors = $derived({
     in: chartPreview.in ?? $settings.graph.usage_color_in,
@@ -1284,11 +1278,9 @@
     write: chartPreview.write ?? $settings.graph.usage_color_write,
     out: chartPreview.out ?? $settings.graph.usage_color_out,
     tool: chartPreview.tool ?? $settings.graph.usage_color_tool,
-    session: chartPreview.session ?? $settings.graph.usage_color_session,
-    agent: chartPreview.agent ?? $settings.graph.usage_color_agent,
   });
   async function commitChartColor(
-    seg: (typeof CHART_SEGS)[number] | (typeof SA_SEGS)[number],
+    seg: (typeof CHART_SEGS)[number],
     value: string,
   ): Promise<void> {
     const next = structuredClone($settings);
@@ -1297,6 +1289,45 @@
     // failure), so the preview can be dropped afterwards either way.
     await applySettings(next);
     chartPreview[seg.key] = undefined;
+  }
+
+  // ── lane colors: the DECLARED order picks the swatch (V40 Phase I) ────────
+  //
+  // Was `SA_SEGS`, a fixed pair of settings fields (`usage_color_session` /
+  // `usage_color_agent`) named after one harness's two lanes — so a harness
+  // declaring a THIRD lane got the second lane's legend swatch (`laneSeg`
+  // clamped to the last entry) and no `.dseg`/`.saseg` fill rule at all, which
+  // painted it SVG-default black in the donut and transparent in the strip.
+  // The lane IDS have been the harness's declaration since Phase D; their
+  // colors are read off the same declaration now — palette slot N for the Nth
+  // lane the harness declares, with `graph.usage_lane_colors[id]` overriding
+  // when the user has picked one.
+  //
+  // Slots 0 and 1 are the exact colors the two retired settings defaulted to,
+  // so every lane the shipped harnesses declare keeps the exact colour it
+  // had before this change.
+  const LANE_PALETTE = ['#30363d', '#3b6ea5', '#7d6b3f', '#4f6f5a', '#6b4f6f', '#3f5f6f'];
+  const LANE_OVERFLOW = '#8b8b86';
+  let lanePreview = $state<Record<string, string>>({});
+  /// Readable text on a user-picked fill. The two retired settings hard-coded
+  /// this per lane (`--text-quiet` on the dark session swatch, `#fff` on the
+  /// blue agent one), which cannot generalise to a color someone picks for a
+  /// lane core has never heard of.
+  function laneTextColor(hex: string): string {
+    const m = /^#([0-9a-fA-F]{6})$/.exec(hex);
+    if (!m) return '#fff';
+    const n = parseInt(m[1], 16);
+    // Rec. 601 luma, the usual cheap approximation.
+    const luma = (0.299 * ((n >> 16) & 255) + 0.587 * ((n >> 8) & 255) + 0.114 * (n & 255)) / 255;
+    return luma > 0.6 ? '#111' : '#fff';
+  }
+  async function commitLaneColor(id: string, value: string): Promise<void> {
+    const next = structuredClone($settings);
+    next.graph.usage_lane_colors = { ...(next.graph.usage_lane_colors ?? {}), [id]: value };
+    // applySettings updates the store optimistically (and rolls back on
+    // failure), so the preview can be dropped afterwards either way.
+    await applySettings(next);
+    delete lanePreview[id];
   }
 
   // V40 Phase F (locked decision 23): the rule reference is PUBLISHED by the
@@ -1532,13 +1563,34 @@
     string,
     string
   >;
-  /// The color-picker entry backing a lane's legend dot. The two settings
-  /// fields (`usage_color_session` / `usage_color_agent`) are a fixed pair, so
-  /// lanes beyond the second share the second's swatch rather than gaining a
-  /// setting this phase is not allowed to add.
-  function laneSeg(i: number): (typeof SA_SEGS)[number] {
-    return SA_SEGS[Math.min(i, SA_SEGS.length - 1)];
-  }
+  /// A lane's palette slot: its position in the harness's DECLARED order.
+  ///
+  /// A lane that appears only in stored data — its harness has not answered
+  /// `harness_usage` yet, or the row predates the declaration — sorts after
+  /// every declared one rather than stealing slot 0, so a late IPC answer
+  /// cannot recolor a declared lane out from under the reader.
+  const laneSlot = $derived((id: string): number => {
+    const at = declaredOrigins.findIndex((o) => o.id === id);
+    return at >= 0 ? at : declaredOrigins.length + Math.max(0, dashLaneKeys.indexOf(id));
+  });
+  /// The color a lane paints with: the user's pick if there is one, else the
+  /// palette slot for its declared position.
+  const laneColor = $derived(
+    (id: string): string =>
+      lanePreview[id] ??
+      $settings.graph.usage_lane_colors?.[id] ??
+      LANE_PALETTE[laneSlot(id)] ??
+      LANE_OVERFLOW,
+  );
+  /// The sub-agent bars' outline color. Was `usage_color_agent` — a settings
+  /// field named after one harness's fan-out lane; it is the first lane the
+  /// harness
+  /// DECLARES `subagent: true` for now, and falls back to the accent when the
+  /// harness declares none (a harness with no fan-out has no sub-agent bars to
+  /// outline, so the value is inert rather than wrong).
+  const subagentLaneColor = $derived(
+    subagentOrigins.length > 0 ? laneColor(subagentOrigins[0]) : 'var(--accent, #3b6ea5)',
+  );
   // An inner arc's "session:cache"-style key split back into its parts for
   // the tooltip / fill class.
   function dashInnerParts(key: string): { origin: string; kind: string } {
@@ -1546,13 +1598,12 @@
     return { origin: key.slice(0, i), kind: key.slice(i + 1) };
   }
   // The token donut's legend: one row per origin, each with its kind split.
-  // `seg` is the SA_SEGS entry backing the row's color picker — same
-  // settings-backed commit machinery as the This-session legend, so a pick
-  // in either card recolors both.
+  // The row's color picker writes `graph.usage_lane_colors[origin]` — the same
+  // per-lane store the This-session legend writes, so a pick in either card
+  // recolors both, for any number of lanes.
   const dashLegendRows = $derived(
-    dashLaneKeys.map((id, i) => ({
+    dashLaneKeys.map((id) => ({
       origin: id,
-      seg: laneSeg(i),
       tok: dashLaneTok[id],
       kinds: dashKinds[id] ?? {},
     })),
@@ -1887,7 +1938,7 @@
     <details
       class="card"
       bind:open={dashCardOpen}
-      style="--ubar-in: {chartColors.in}; --ubar-cache: {chartColors.cache}; --ubar-write: {chartColors.write}; --ubar-out: {chartColors.out}; --sa-session: {chartColors.session}; --sa-agent: {chartColors.agent}"
+      style="--ubar-in: {chartColors.in}; --ubar-cache: {chartColors.cache}; --ubar-write: {chartColors.write}; --ubar-out: {chartColors.out}; --sa-agent: {subagentLaneColor}"
     >
       <summary class="history-head">
         Dashboard
@@ -1913,7 +1964,11 @@
                 aria-label="Session vs sub-agent token usage"
               >
                 {#each dashOuterArcs as a (a.key)}
-                  <path class="dseg {a.key}" d={arcPath(66, 66, 62, 46, a.a0, a.a1)}>
+                  <path
+                    class="dseg"
+                    style="fill: {laneColor(a.key)}"
+                    d={arcPath(66, 66, 62, 46, a.a0, a.a1)}
+                  >
                     <title
                       >{DASH_ORIGIN_LABEL[a.key] ?? a.key}: {a.value.toLocaleString()} tok · {fmtPct(
                         a.share,
@@ -1939,10 +1994,10 @@
                     <input
                       type="color"
                       class="dot"
-                      value={chartColors[r.seg.key]}
-                      title="{r.seg.label} — click to pick a color (shared with the This-session chart)"
-                      oninput={(e) => (chartPreview[r.seg.key] = e.currentTarget.value)}
-                      onchange={(e) => commitChartColor(r.seg, e.currentTarget.value)}
+                      value={laneColor(r.origin)}
+                      title="{DASH_ORIGIN_LABEL[r.origin] ?? r.origin} — click to pick a color (shared with the This-session chart)"
+                      oninput={(e) => (lanePreview[r.origin] = e.currentTarget.value)}
+                      onchange={(e) => commitLaneColor(r.origin, e.currentTarget.value)}
                     />
                     <span class="dl-name">{DASH_ORIGIN_LABEL[r.origin] ?? r.origin}</span>
                     <span class="tnum" title="{r.tok.toLocaleString()} tokens">{fmtTok(r.tok)}</span>
@@ -2079,7 +2134,7 @@
     <details
       class="card"
       bind:open={sessionCardOpen}
-      style="--ubar-in: {chartColors.in}; --ubar-cache: {chartColors.cache}; --ubar-write: {chartColors.write}; --ubar-out: {chartColors.out}; --ubar-tool: {chartColors.tool}; --sa-session: {chartColors.session}; --sa-agent: {chartColors.agent}"
+      style="--ubar-in: {chartColors.in}; --ubar-cache: {chartColors.cache}; --ubar-write: {chartColors.write}; --ubar-out: {chartColors.out}; --ubar-tool: {chartColors.tool}; --sa-agent: {subagentLaneColor}"
     >
       <summary class="history-head">
         {#if selectedRow}
@@ -2179,20 +2234,23 @@
               {s.label}
             </span>
           {/each}
-          <!-- V24 Phase C: S/A lane key — now color pickers too, persisted
-               like the segment colors (the agent color also tints the
-               sub-agent bars' outline). -->
-          {#each SA_SEGS as s (s.key)}
+          <!-- V24 Phase C: the lane key — color pickers too, persisted like the
+               segment colors (the sub-agent lane's color also tints the
+               sub-agent bars' outline). V40 Phase I: ONE ROW PER DECLARED LANE
+               rather than a hard-coded S/A pair, so a harness with a third lane
+               gets a third swatch instead of sharing the second's. -->
+          {#each dashLaneKeys as id (id)}
             <span>
               <input
                 type="color"
                 class="dot"
-                value={chartColors[s.key]}
-                title="{s.label} — click to pick a color"
-                oninput={(e) => (chartPreview[s.key] = e.currentTarget.value)}
-                onchange={(e) => commitChartColor(s, e.currentTarget.value)}
+                value={laneColor(id)}
+                title="{DASH_ORIGIN_LABEL[id] ?? id} — click to pick a color"
+                oninput={(e) => (lanePreview[id] = e.currentTarget.value)}
+                onchange={(e) => commitLaneColor(id, e.currentTarget.value)}
               />
-              {s.label}
+              {laneLabel(id)}
+              {DASH_ORIGIN_LABEL[id] ?? id}
             </span>
           {/each}
           {#if shownTurns.length > 1}
@@ -2253,8 +2311,10 @@
             <div class="salane" style={fixedCols ? `width: ${chartWidthPx}px` : undefined}>
               {#each laneSegs as seg, i (i)}
                 <span
-                  class="saseg {seg.origin}"
-                  style="flex-grow: {seg.count}"
+                  class="saseg"
+                  style="flex-grow: {seg.count}; background: {laneColor(
+                    seg.origin,
+                  )}; color: {laneTextColor(laneColor(seg.origin))}"
                   title="{DASH_ORIGIN_LABEL[seg.origin] ?? seg.origin} · {seg.count} turn{seg.count ===
                   1
                     ? ''
@@ -3977,12 +4037,12 @@
     height: 132px;
     flex: 0 0 auto;
   }
-  .dseg.session {
-    fill: var(--sa-session, #30363d);
-  }
-  .dseg.agent {
-    fill: var(--sa-agent, #3b6ea5);
-  }
+  /* V40 Phase I: no `.dseg.<lane-id>` rules. A lane's fill is inline, from
+     `laneColor()` — the harness's declared position in the palette, or the
+     user's pick. The per-id rules could only ever color the lanes core knew
+     the names of, so a third declared lane painted SVG-default black. The
+     KIND rules below stay: `in`/`cache`/`write`/`out` are cImp's own pricing
+     vocabulary, not a harness's declaration. */
   .dseg.in {
     fill: var(--ubar-in, #58a6ff);
   }
@@ -4116,17 +4176,12 @@
     letter-spacing: 0.5px;
   }
   /* Colors flow from settings via the legend pickers (like the segments). */
-  .saseg.session {
-    background: var(--sa-session, #30363d);
-    color: var(--text-quiet, #999);
-  }
-  .saseg.agent {
-    background: var(--sa-agent, #3b6ea5);
-    /* Deliberately theme-independent: the fill is a user-picked chart color
-       (settings legend picker), so the text contrasts with that, not the
-       theme. */
-    color: #fff;
-  }
+  /* V40 Phase I: `background` and `color` are inline, from `laneColor()` and
+     `laneTextColor()`. Deliberately theme-independent, for the reason the two
+     retired per-id rules gave: the fill is a chart color (declared slot or the
+     user's pick), so the text contrasts with THAT, not with the theme — and
+     picking it by luma is the only form of that rule which survives a lane
+     core has never heard of. */
 
   /* V24 Phase C: card title + selected-session controls. */
   .history-head .card-title {

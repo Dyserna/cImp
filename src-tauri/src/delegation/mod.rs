@@ -899,7 +899,7 @@ pub(crate) mod testing {
 
     /// **The harness a tab runs, from the registry** — never a literal.
     ///
-    /// V39's tests paired `TabId::OpenCode` with the string `"opencode"` by
+    /// V39's tests paired `TabId::from_str("opencode")` with the string `"opencode"` by
     /// hand at nine sites, which is the shape V40 exists to end: a tab id and a
     /// harness id are joined by a descriptor, and a test that hard-codes the
     /// join asserts today's roster rather than the relation. `expect` rather
@@ -951,9 +951,9 @@ pub(crate) mod testing {
     pub(crate) fn claim_and_submit(worker: &TabId) {
         claim(
             worker,
-            TabId::OpenCode,
+            TabId::from_str("opencode"),
             "the driver".to_string(),
-            agent_of(&TabId::OpenCode),
+            agent_of(&TabId::from_str("opencode")),
             DelegationMode::Explicit,
             0,
             u64::MAX,
@@ -975,10 +975,10 @@ mod tests {
     use super::*;
 
     fn worker() -> TabId {
-        TabId::Claude
+        TabId::from_str("claude")
     }
     fn driver() -> TabId {
-        TabId::OpenCode
+        TabId::from_str("opencode")
     }
 
     fn claim_one(w: &TabId, d: &TabId, now: u64) -> Result<u64, String> {
@@ -1000,7 +1000,7 @@ mod tests {
     fn a_worker_slot_admits_one_and_refuses_the_second() {
         with_clean_registry(|| {
             assert!(claim_one(&worker(), &driver(), 100).is_ok());
-            let second = claim_one(&worker(), &TabId::ClaudeLocal, 200)
+            let second = claim_one(&worker(), &TabId::from_str("claude-local"), 200)
                 .expect_err("the second claim must be refused");
             assert!(second.starts_with("busy:"), "{second}");
             assert!(
@@ -1009,7 +1009,7 @@ mod tests {
             );
             release(&worker());
             assert!(
-                claim_one(&worker(), &TabId::ClaudeLocal, 300).is_ok(),
+                claim_one(&worker(), &TabId::from_str("claude-local"), 300).is_ok(),
                 "the slot is free again once released"
             );
         });
@@ -1152,11 +1152,11 @@ mod tests {
                     std::thread::spawn(move || {
                         gate.wait();
                         claim_checked(
-                            &TabId::Claude,
+                            &TabId::from_str("claude"),
                             "the worker",
-                            TabId::OpenCode,
+                            TabId::from_str("opencode"),
                             "B".to_string(),
-                            testing::agent_of(&TabId::OpenCode),
+                            testing::agent_of(&TabId::from_str("opencode")),
                             DelegationMode::Explicit,
                             100,
                             1_000,
@@ -1169,11 +1169,11 @@ mod tests {
                     std::thread::spawn(move || {
                         gate.wait();
                         claim_checked(
-                            &TabId::OpenCode,
+                            &TabId::from_str("opencode"),
                             "the worker",
-                            TabId::Claude,
+                            TabId::from_str("claude"),
                             "A".to_string(),
-                            testing::agent_of(&TabId::Claude),
+                            testing::agent_of(&TabId::from_str("claude")),
                             DelegationMode::Explicit,
                             100,
                             1_000,
@@ -1221,7 +1221,7 @@ mod tests {
             // Same DRIVER, a second worker: the driver is not itself driven, so
             // the refusal that fires is the depth bound rather than the cycle.
             let too_deep = claim_checked(
-                &TabId::ClaudeLocal,
+                &TabId::from_str("claude-local"),
                 "the second worker",
                 driver(),
                 "A".to_string(),
@@ -1243,7 +1243,7 @@ mod tests {
     fn depth_counts_hops_and_terminates_on_a_cycle() {
         with_clean_registry(|| {
             claim_one(&worker(), &driver(), 100).expect("claim a<-b");
-            claim_one(&TabId::ClaudeLocal, &worker(), 100).expect("claim b<-c");
+            claim_one(&TabId::from_str("claude-local"), &worker(), 100).expect("claim b<-c");
             assert_eq!(depth_from(&driver()), 2);
             // Force the pathological shape the walk must survive.
             registry(|r| {
@@ -1253,9 +1253,9 @@ mod tests {
                 let d = driver();
                 let w = worker();
                 if let Some(f) = r.in_flight.get_mut(&w) {
-                    f.driver = TabId::ClaudeLocal;
+                    f.driver = TabId::from_str("claude-local");
                 }
-                if let Some(f) = r.in_flight.get_mut(&TabId::ClaudeLocal) {
+                if let Some(f) = r.in_flight.get_mut(&TabId::from_str("claude-local")) {
                     f.driver = w.clone();
                 }
                 let _ = d;

@@ -77,6 +77,24 @@ npm run check                       # svelte-check
 npm run test                        # vitest
 ```
 
+`cargo check` + a locally green `cargo test` are **not** the CI gate. The
+v0.53.0-rc.6/rc.7 tags (2026-08-23) both died in CI on things that only the
+runners see; run these four before tagging, with the runner's exact flags:
+
+```sh
+# 1. clippy is -D warnings in CI (.github/workflows/clippy.yml)
+cd src-tauri && cargo clippy --locked --all-targets --features tts-webgpu -- -D warnings
+# 2. the Windows runner checks out CRLF; every byte-compared or include_str!'d
+#    fixture must be pinned LF in .gitattributes — this must print nothing
+git ls-files --eol src-tauri/fixtures | grep -v 'i/lf'
+# 3. tests.yml hardcodes the node-backed #[ignore] test names as a rename
+#    tripwire — the list here must equal the one in the workflow
+cargo test --locked --bin cimp -- --ignored --list | grep ': test$'
+# 4. a Windows path literal in a test (C:\...) must still pass on the Linux
+#    runner: drive-letter paths are not absolute there and Path does not
+#    split on '' — grep new tests for backslash fixtures
+```
+
 You can also exercise the portable layout locally without the workflow:
 
 ```sh

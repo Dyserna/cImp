@@ -50,12 +50,23 @@ each claim.
 
 1. **`harness/<id>/mod.rs`** — and add `pub mod <id>;` here.
 1a. **A `HarnessDescriptor` row in `registry.rs`** (V40 Phase A) — id, label,
-   binaries, reserved tab ids in canonical order, consumer token, `expects_chp`,
-   the environment markers to strip, the features core mounts for you, and a
-   `&'static dyn HarnessPlugin`. This is what every "which harness is this?"
-   question in the tree now resolves against, so a harness without a row is not
-   misclassified, it is simply not a harness. `every_registry_entry_is_fully_wired`
-   checks the row against everything below.
+   binaries, your reserved built-in tabs in canonical order, consumer token,
+   `expects_chp`, the environment markers to strip, the features core mounts for
+   you, and a `&'static dyn HarnessPlugin`. This is what every "which harness is
+   this?" question in the tree now resolves against, so a harness without a row
+   is not misclassified, it is simply not a harness.
+   `every_registry_entry_is_fully_wired` checks the row against everything below.
+
+   **Your tabs are `BuiltinTab` rows, and that is the whole cost of a reserved
+   tab** (V40 Phase I). Each carries the id, the tab-bar name, the command a
+   freshly seeded tab launches and whether it is your local-provider variant —
+   and core builds the rest: `TabId`, `AiTabId`, the canonical tab-bar order,
+   `enabled_ai_tabs`, the seeded `TabConfig` (its four notification slots are
+   phrased from the name) and the integrity check's restore/drop, all by
+   resolving your id through `registry::builtin_tab`. Until Phase I those were
+   three closed enums, and a third harness's tab compiled and then silently had
+   no tab-bar position, no way to be enabled and no config to be seeded from —
+   V40 review finding M-3.
 1b. **`impl HarnessPlugin`** in your directory — the code half. Every method has
    a harness-neutral default, so implement only what is true of your harness;
    what you do not declare, you do not get (`input_profile() == None` means your
@@ -106,10 +117,15 @@ each claim.
    needs a negative twin: the same fixture with one load-bearing field renamed,
    proving the positive one is load-bearing. `_synthetic/` fixtures carry a
    `MANIFEST.toml` like every other.
-7. **`probe()` / `declared_unprobed()`** — what can be driven against the
-   *installed* CLI (`harness/<id>/probe.rs`), and what cannot, each with the
-   reason. The runner in `probe.rs` iterates the registry; it spawns nothing
-   itself, so a spawn you add there needs a `spawn_ledger::LEDGER` row.
+7. **`probes()` / `probe()` / `declared_unprobed()`** — the ids you drive
+   against the *installed* CLI in the order you emit them, the code that drives
+   them (`harness/<id>/probe.rs`), and the rows that cannot be driven with the
+   reason for each. `probes()` is what the `--harness-canary` report is
+   assembled from (V40 Phase I): declare an id your `probe()` never emits and
+   the report carries a loud `unknown` for it; emit one you did not declare and
+   it lands as an undeclared extra. The runner in `probe.rs` iterates the
+   registry and owns only the ORDER; it spawns nothing itself, so a spawn you
+   add there needs a `spawn_ledger::LEDGER` row.
 8. **`settings_schema()`** — the settings only YOUR harness has
    (`harness/<id>/settings.rs`), one `SettingField` per key: kind, label, hint,
    default, and whether it is `spawn_baked` or a `secret`. Core stores them
@@ -204,8 +220,10 @@ each claim.
    the same way. Neutral rows — a contract stated about a *tab* rather than
    about a product — stay in `docs/MAINTENANCE.md`.
 
-What you must **not** need: a new enum variant outside `harness/`, a new match
-arm in `tabs/config.rs`, a bespoke gate constant. What you **do** need and the
+What you must **not** need: a new enum variant outside `harness/` — including
+for your reserved tabs, which was the last place this claim was aspirational
+until V40 Phase I — a new match arm in `tabs/config.rs`, a bespoke gate
+constant. What you **do** need and the
 pre-V40 version of this list wrongly denied: a **frontend mirror** — but a
 generated one. `harness_list` publishes your descriptor, features and
 affordances over IPC, `src/lib/harness.ts` is the only file that mirrors it, and
@@ -213,12 +231,13 @@ the committed `fixtures/harness/registry.json` (emitted by `cargo test`) is what
 a vitest parity suite checks the TypeScript unions against. A descriptor field
 added in Rust with no TS mirror fails `npx vitest`.
 
-Four tests hold the rest of the claim up rather than leaving it to good
+Five tests hold the rest of the claim up rather than leaving it to good
 intentions:
 
 | Claim | Test |
 |---|---|
 | Your row reaches every place it must — directory, capability rows, hello, `spawn_sig` slot, sandbox grants, health panel, plugin README, goldens | `harness::layering::tests::every_registry_entry_is_fully_wired` |
+| A descriptor **this build has never heard of** goes through the whole tab machinery with no enum edit — `TabId`, `AiTabId`, `enabled_ai_tabs`, the canonical order, `default_ai_tab`, `harness_list` | `harness::layering::tests::an_unshipped_descriptor_round_trips_through_the_tab_machinery` (+ `settings::persistence::tests::the_integrity_check_seeds_and_drops_an_unshipped_harnesss_tab` for the repair half) |
 | Nothing outside `harness/` spells a harness id, or branches on a `HarnessId` | `harness::layering::tests::no_harness_identity_outside_registry` (allowlisted files carry a reason; the survivors are persisted wire forms and one word collision) |
 | The same rule on the frontend | `src/lib/harnessIdentity.test.ts` |
 | Prose cannot drift from the registry | `harness::contract::tests::matrix_matches_maintenance_doc`, `harness::native::tests::the_native_tools_doc_matches_the_declared_tables` |

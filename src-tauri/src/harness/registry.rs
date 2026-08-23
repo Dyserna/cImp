@@ -97,7 +97,7 @@ impl HarnessId {
 
     /// This harness's descriptor — `None` for [`Self::ANY`].
     pub fn descriptor(self) -> Option<&'static HarnessDescriptor> {
-        HARNESSES.iter().find(|d| d.id == self.0)
+        descriptors().find(|d| d.id == self.0)
     }
 
     /// This harness's plugin — `None` for [`Self::ANY`].
@@ -117,7 +117,7 @@ impl HarnessId {
     /// to drive, probe or spawn. Callers that legitimately want the neutral
     /// marker name [`Self::ANY`] directly.
     pub fn from_id(id: &str) -> Option<HarnessId> {
-        HARNESSES.iter().find(|d| d.id == id).map(|d| HarnessId(d.id))
+        descriptors().find(|d| d.id == id).map(|d| HarnessId(d.id))
     }
 
     /// The harness a configured command launches, comparing on the file stem so
@@ -135,8 +135,7 @@ impl HarnessId {
     pub fn from_command(command: &str) -> Option<HarnessId> {
         let file = command.rsplit(['/', '\\']).next().unwrap_or(command);
         let stem = std::path::Path::new(file).file_stem().and_then(|s| s.to_str())?;
-        HARNESSES
-            .iter()
+        descriptors()
             .find(|d| d.binaries.iter().any(|b| b.eq_ignore_ascii_case(stem)))
             .map(|d| HarnessId(d.id))
     }
@@ -145,9 +144,8 @@ impl HarnessId {
     /// `claude-local`, `opencode`). `None` for a user-created `ai-<uuid>` tab —
     /// those are classified by their command, not by their id.
     pub fn from_tab_id(tab_id: &str) -> Option<HarnessId> {
-        HARNESSES
-            .iter()
-            .find(|d| d.tab_ids.contains(&tab_id))
+        descriptors()
+            .find(|d| d.tabs.iter().any(|t| t.id == tab_id))
             .map(|d| HarnessId(d.id))
     }
 
@@ -163,8 +161,7 @@ impl HarnessId {
     /// require identity (`audit_consumer`, `resolve_consumer`), which trim
     /// before they ask.
     pub fn from_consumer(consumer: &str) -> Option<HarnessId> {
-        HARNESSES
-            .iter()
+        descriptors()
             .find(|d| d.consumer.eq_ignore_ascii_case(consumer))
             .map(|d| HarnessId(d.id))
     }
@@ -215,6 +212,38 @@ pub enum HarnessFeature {
     LocalProviderConfig,
 }
 
+/// One reserved built-in tab a harness owns — **everything core needs to seed
+/// that tab without naming the product** (V40 Phase I, issue #107 item 1).
+///
+/// Before this, `tab_ids: &[&str]` said only that the id existed; the tab's
+/// name, its command, its notification prose and its `use_local_provider` flag
+/// lived in three hand-written `default_*_tab()` constructors in
+/// `settings::schema` plus a `match` per tab id. That match is exactly what
+/// locked decision 3's residual was about: a third harness's tab compiled, and
+/// then there was no arm to seed it from.
+///
+/// The fields are the *only* places the three shipped defaults differed. Every
+/// other field of the seeded `AiToolTabConfig` is the same for all of them, so
+/// [`crate::settings::default_ai_tab`] is now one constructor over this row —
+/// and its output for `claude` / `claude-local` / `opencode` is byte-identical
+/// to what the three hand-written constructors produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuiltinTab {
+    /// The reserved tab id — a **persisted wire form** (locked decision 29).
+    /// It is in every settings file's `tabs[]`, `enabled_ai_tabs` and layout
+    /// panes, and in every frontend payload.
+    pub id: &'static str,
+    /// The tab-bar name a freshly seeded tab carries, and the noun each of its
+    /// four default notification slots is phrased around ("<name> is idle").
+    pub name: &'static str,
+    /// The command a freshly seeded tab launches. A wire form too: it is what
+    /// lands in the user's settings file, editable from there afterwards.
+    pub command: &'static str,
+    /// Seeded `use_local_provider` — whether this tab is the harness's
+    /// local-provider variant. `claude-local` is the only `true` today.
+    pub local_provider: bool,
+}
+
 /// One harness, as data. All `'static`; no I/O.
 ///
 /// Every field here is something core used to ask a bespoke function for. The
@@ -228,10 +257,10 @@ pub struct HarnessDescriptor {
     pub label: &'static str,
     /// The binaries whose file stem identifies this harness.
     pub binaries: &'static [&'static str],
-    /// The reserved built-in tab ids, **in canonical order** — the order
+    /// The reserved built-in tabs, **in canonical order** — the order
     /// `restore_enabled_ai_builtins` and the tab-lifecycle inserter place them
     /// in, so a re-enabled built-in lands where the user expects it.
-    pub tab_ids: &'static [&'static str],
+    pub tabs: &'static [BuiltinTab],
     /// The MCP consumer token the per-session child is launched with.
     pub consumer: &'static str,
     /// Whether a tab of this harness is expected to speak CHP — i.e. whether a
@@ -260,6 +289,11 @@ impl HarnessDescriptor {
     pub fn harness(&'static self) -> HarnessId {
         HarnessId(self.id)
     }
+
+    /// This harness's reserved tab ids, in canonical order.
+    pub fn tab_ids(&'static self) -> impl Iterator<Item = &'static str> {
+        self.tabs.iter().map(|t| t.id)
+    }
 }
 
 impl std::fmt::Debug for HarnessDescriptor {
@@ -284,7 +318,22 @@ const REGISTRY: &[HarnessDescriptor] = &[
         binaries: &["claude"],
         // `claude-local` is the same binary with a synthesized provider env, so
         // it is the same harness with the same state directories.
-        tab_ids: &["claude", "claude-local"],
+        tabs: &[
+            BuiltinTab {
+                id: "claude",
+                name: "Claude",
+                command: "claude",
+                local_provider: false,
+            },
+            // V1.4-07: the same binary, preconfigured to talk to a local LLM
+            // through the `claude_local` provider settings.
+            BuiltinTab {
+                id: "claude-local",
+                name: "Claude (local)",
+                command: "claude",
+                local_provider: true,
+            },
+        ],
         consumer: "claude",
         // Since V35 Phase J: Claude's `type: "http"` hook entries carry
         // `X-CIMP-Chp`, substituted from `CHP_VERSION` at overlay generation,
@@ -312,8 +361,13 @@ const REGISTRY: &[HarnessDescriptor] = &[
         label: "OpenCode",
         binaries: &["opencode"],
         // V19: OpenCode picks its own provider/model, so (unlike Claude) there
-        // is no local variant.
-        tab_ids: &["opencode"],
+        // is no local variant — the one tab covers cloud and local.
+        tabs: &[BuiltinTab {
+            id: "opencode",
+            name: "OpenCode",
+            command: "opencode",
+            local_provider: false,
+        }],
         consumer: "opencode",
         expects_chp: true,
         env_strip: &[],
@@ -331,6 +385,107 @@ pub static HARNESSES: &[HarnessDescriptor] = REGISTRY;
 /// How many harnesses are registered. `const`, so [`PerHarness`] is sized by
 /// the registry rather than by a literal somebody has to remember to widen.
 pub const COUNT: usize = REGISTRY.len();
+
+/// The descriptors an **identity lookup** sees: the shipped registry, plus the
+/// scoped test descriptor when one is installed.
+///
+/// V40 Phase I. Locked decision 1 says adding a harness is a data row — and the
+/// only honest proof of that is a test that adds one and drives the real
+/// production functions with it. The extra slot is `#[cfg(test)]`-only,
+/// thread-scoped (so it perturbs nothing running in parallel) and empty unless
+/// [`with_extra_harness`] installed it; in a release build this is
+/// `HARNESSES.iter().chain(None)`, which is the bare iterator.
+///
+/// **Identity only.** [`HarnessId::ordinal`], [`all`] and therefore
+/// [`PerHarness`] deliberately stay on [`HARNESSES`]: `PerHarness` is a
+/// `[T; COUNT]` sized at compile time, and a lookup that could hand it an
+/// out-of-range ordinal would turn a test fixture into a panic in production
+/// code. A scoped extra harness has no `PerHarness` slot, exactly like
+/// [`HarnessId::ANY`].
+pub(in crate::harness) fn descriptors() -> impl Iterator<Item = &'static HarnessDescriptor> {
+    HARNESSES.iter().chain(extra_harness())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The scoped test descriptor, if [`with_extra_harness`] installed one.
+    static EXTRA_HARNESS: std::cell::Cell<Option<&'static HarnessDescriptor>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn extra_harness() -> Option<&'static HarnessDescriptor> {
+    EXTRA_HARNESS.with(|c| c.get())
+}
+
+#[cfg(not(test))]
+fn extra_harness() -> Option<&'static HarnessDescriptor> {
+    None
+}
+
+/// Run `f` with `extra` visible to every identity lookup and to the tab
+/// machinery — **tests only**.
+///
+/// Restores the previous value on the way out, including on unwind, so a
+/// failing assertion inside `f` cannot leak the fixture into the rest of the
+/// thread.
+#[cfg(test)]
+pub(crate) fn with_extra_harness<R>(
+    extra: &'static HarnessDescriptor,
+    f: impl FnOnce() -> R,
+) -> R {
+    struct Restore(Option<&'static HarnessDescriptor>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            EXTRA_HARNESS.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(EXTRA_HARNESS.with(|c| c.replace(Some(extra))));
+    f()
+}
+
+/// **A harness no build ships** — the fixture behind
+/// `harness::layering::an_unshipped_descriptor_round_trips_through_the_tab_machinery`
+/// (V40 Phase I).
+///
+/// Locked decision 1 says adding a harness is a descriptor row plus a
+/// `harness/<id>/` directory, and *not* an enum variant. That claim was only
+/// ever checked by tests asserting the two shipped harnesses still worked —
+/// which is the same evidence a build with three hard-coded enum arms would
+/// produce. This row is the counter-example: nothing in the tree has ever seen
+/// the id `zeta`, its plugin declares nothing at all (`HarnessPlugin` has no
+/// required methods, by design), and the tab machinery has to carry it anyway.
+///
+/// It is deliberately NOT in [`HARNESSES`]: the shipped registry is what
+/// `every_registry_entry_is_fully_wired` requires a directory, a capability row,
+/// a hello, a spawn signature and an input profile for, and what [`PerHarness`]
+/// is sized by. This one is installed for the length of one closure, on one
+/// thread, by [`with_extra_harness`].
+#[cfg(test)]
+pub(crate) static EXTRA_TEST_HARNESS: HarnessDescriptor = HarnessDescriptor {
+    id: "zeta",
+    label: "Zeta",
+    binaries: &["zeta"],
+    tabs: &[BuiltinTab {
+        id: "zeta",
+        name: "Zeta",
+        command: "zeta",
+        local_provider: false,
+    }],
+    consumer: "zeta",
+    expects_chp: true,
+    env_strip: &[],
+    features: &[],
+    plugin: &BARE_TEST_PLUGIN,
+};
+
+/// The plugin half of [`EXTRA_TEST_HARNESS`]: every method defaulted.
+#[cfg(test)]
+struct BareTestPlugin;
+#[cfg(test)]
+impl HarnessPlugin for BareTestPlugin {}
+#[cfg(test)]
+static BARE_TEST_PLUGIN: BareTestPlugin = BareTestPlugin;
 
 /// Every registered harness id, in declaration order.
 pub fn harness_ids() -> Vec<&'static str> {
@@ -387,9 +542,19 @@ pub fn passthrough_harness() -> Option<HarnessId> {
 /// The order `[claude, claude-local, opencode]` used to be a literal array in
 /// three places (`persistence.rs`, `ipc/tab_lifecycle.rs`, `tabs/config.rs`);
 /// it is now the registry's declaration order flattened through
-/// [`HarnessDescriptor::tab_ids`].
+/// [`HarnessDescriptor::tabs`].
 pub fn canonical_tab_ids() -> Vec<&'static str> {
-    HARNESSES.iter().flat_map(|d| d.tab_ids.iter().copied()).collect()
+    descriptors().flat_map(|d| d.tab_ids()).collect()
+}
+
+/// The declaration behind a reserved built-in tab id, or `None` for an id no
+/// harness claims (a shell tab, an `ai-<uuid>` duplicate, a retired id).
+///
+/// V40 Phase I: the single lookup `TabId::from_str`, `AiTabId` and
+/// `default_ai_tab` all resolve a tab id through, so the three cannot disagree
+/// about what a reserved id is.
+pub fn builtin_tab(tab_id: &str) -> Option<&'static BuiltinTab> {
+    descriptors().flat_map(|d| d.tabs.iter()).find(|t| t.id == tab_id)
 }
 
 // ── the one named default ───────────────────────────────────────────────────
@@ -671,7 +836,7 @@ mod tests {
             assert!(!d.id.is_empty(), "the empty id is reserved for HarnessId::ANY");
             assert!(seen.insert(d.id), "duplicate harness id {}", d.id);
             assert!(!d.binaries.is_empty(), "{} declares no binary", d.id);
-            assert!(!d.tab_ids.is_empty(), "{} declares no tab id", d.id);
+            assert!(!d.tabs.is_empty(), "{} declares no tab id", d.id);
         }
     }
 

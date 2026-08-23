@@ -160,33 +160,56 @@ pub struct LoadOutcome {
 /// global baseline when it's absent or corrupt; the custom overlay is
 /// merely skipped if absent and quarantined if corrupt.
 ///
-/// Migration runs on the global value only. The overlay is a partial diff
-/// always written in the current schema, so it is merged as-is (see the
-/// inline note at step 2 for why running the legacy cascade on a partial
-/// overlay caused silent data loss and unbounded `.bak` growth).
+/// **Migration runs on the overlay too, since V40 Phase I** (issue #107 item
+/// 5) — from the version the overlay states, or (for one written before the
+/// stamp existed) the version the global file stated beside it. See
+/// `migration::migrate_overlay` for why entering the cascade blind was the
+/// thing that was wrong, not migrating the overlay at all.
 pub fn load(default_shell: &ShellSpec, launch_cwd: &Path) -> LoadOutcome {
     // 1. Load and migrate the global baseline. After this `global` is in
     //    the current schema shape; a v1.x file on disk has been backed up
-    //    next to the global path and rewritten.
-    let mut global = load_global(default_shell);
+    //    next to the global path and rewritten. `global_stated` is the version
+    //    the file claimed BEFORE that, which step 2a needs.
+    let (mut global, global_stated) = load_global(default_shell);
 
-    // 2. Load the overlay (if any). We deliberately DON'T run the legacy
-    //    migration cascade on it: the overlay is a *partial* diff (see
-    //    `diff`), always written by this app's `save` in the current schema.
-    //    The migration detectors (`looks_v1_2` etc.) key off absent top-level
-    //    fields, which a partial overlay legitimately lacks — so migrating it
-    //    both stamps full-object defaults that override global through the
-    //    merge (silent data loss) and, because the overlay never gains a
-    //    `schema_version`, re-fires every launch (unbounded `.v1.2.bak`
-    //    growth). Missing fields are handled correctly downstream anyway:
-    //    deep-merge fills from the (already-migrated) global, and serde
-    //    `#[serde(default)]` covers the rest.
+    // 2. Load the overlay (if any).
     //    First fold any pre-consolidation loose overlay into `.cimp/`, then
     //    read from the resolved location (canonical `.cimp/config.json`, or the
     //    legacy file if the move couldn't happen).
     migrate_legacy_overlay(launch_cwd);
     let overlay_path = overlay_read_path(launch_cwd);
     let overlay_value = read_overlay(&overlay_path, true).map(|mut v| {
+        // 2a. **Migrate it, before anything reads its shape** (V40 Phase I).
+        //     Until Phase I this was skipped, for two reasons that were both
+        //     about entering the cascade BLIND: the presence-archaeology
+        //     detectors key off top-level keys a partial diff legitimately
+        //     lacks, and a value with no version re-migrates every launch,
+        //     growing `.bak` files without bound. `migrate_overlay` is told the
+        //     version, refuses to start below where the archaeology ends, and
+        //     writes no file at all — so neither reason survives, and the gap
+        //     they were covering does not: a project that set
+        //     `claude_local.base_url` before schema 36 kept a top-level
+        //     `claude_local` block that reached nothing after the global moved
+        //     the field, with the file still on disk saying otherwise.
+        //
+        //     The version comes from the overlay's own `schema_version` stamp
+        //     (written by `save` since Phase I) and falls back to what the
+        //     global file stated: an overlay beside a v35 global was written
+        //     against a v35 baseline. Neither present ⇒ the overlay is current,
+        //     which is what every reader assumed before Phase I anyway.
+        //     The stamp is stripped inside `migrate_overlay`; it must never
+        //     reach the merge, or an old overlay would pin the merged
+        //     `schema_version` below the global's.
+        let from = migration::stated_schema_version(&v)
+            .or(global_stated)
+            .unwrap_or(crate::settings::schema::CURRENT_SCHEMA_VERSION as u64);
+        if migration::migrate_overlay(&mut v, from, default_shell) {
+            tracing::info!(
+                path = %overlay_path.display(),
+                from,
+                "settings: project overlay migrated in memory (written back on the next save)"
+            );
+        }
         // Per-install fields never belong in an overlay (see
         // `OVERLAY_BANNED_KEYS`) — drop them before the merge so an overlay
         // contaminated by a pre-guard version can't shadow the global file.
@@ -705,12 +728,20 @@ pub fn read_project_prompt_templates(root: &Path) -> Vec<PromptTemplate> {
 /// failure quarantines the file and returns defaults. Runs migration on
 /// the global file in place — backup goes next to the global path itself,
 /// not next to whatever path the merged result resolved to.
-fn load_global(default_shell: &ShellSpec) -> Settings {
+///
+/// The second half of the answer is the `schema_version` the file **stated
+/// before migration** (V40 Phase I, issue #107 item 5). It is what [`load`]
+/// falls back to for an overlay written by a build that predates the overlay
+/// stamp: an overlay sitting beside a v35 global file was written against a v35
+/// baseline, so that is the version to enter its cascade at. `None` for a file
+/// that stated none (pre-v1.10, before `schema_version` existed) and for every
+/// path that never got to read one.
+fn load_global(default_shell: &ShellSpec) -> (Settings, Option<u64>) {
     let path = match global_path() {
         Ok(p) => p,
         Err(e) => {
             tracing::warn!(error = %e, "settings: cannot resolve global path; using defaults");
-            return seeded_defaults(default_shell);
+            return (seeded_defaults(default_shell), None);
         }
     };
 
@@ -721,14 +752,14 @@ fn load_global(default_shell: &ShellSpec) -> Settings {
         } else {
             tracing::info!(path = %path.display(), "settings: wrote global defaults");
         }
-        return s;
+        return (s, None);
     }
 
     let text = match fs::read_to_string(&path) {
         Ok(t) => t,
         Err(e) => {
             tracing::warn!(error = %e, path = %path.display(), "settings: read global failed; using defaults");
-            return seeded_defaults(default_shell);
+            return (seeded_defaults(default_shell), None);
         }
     };
 
@@ -743,9 +774,14 @@ fn load_global(default_shell: &ShellSpec) -> Settings {
             migration::quarantine_corrupt_file(&path);
             let s = seeded_defaults(default_shell);
             let _ = save_to(&path, &s);
-            return s;
+            return (s, None);
         }
     };
+
+    // Read the stated version BEFORE migrating — after it, every file says
+    // `CURRENT`, and the version an overlay beside this file was written
+    // against is gone (see this function's doc comment).
+    let stated = migration::stated_schema_version(&value);
 
     // Migrate the global file in place. Backup is named after the global
     // file, which is the source of truth for the global baseline shape.
@@ -757,7 +793,7 @@ fn load_global(default_shell: &ShellSpec) -> Settings {
                 path = %path.display(),
                 "settings: global migration aborted (backup failed); using defaults"
             );
-            return seeded_defaults(default_shell);
+            return (seeded_defaults(default_shell), None);
         }
     };
 
@@ -772,7 +808,7 @@ fn load_global(default_shell: &ShellSpec) -> Settings {
             migration::quarantine_corrupt_file(&path);
             let s = seeded_defaults(default_shell);
             let _ = save_to(&path, &s);
-            return s;
+            return (s, None);
         }
     };
 
@@ -810,7 +846,7 @@ fn load_global(default_shell: &ShellSpec) -> Settings {
     } else {
         tracing::info!(path = %path.display(), "settings: global loaded");
     }
-    typed
+    (typed, stated)
 }
 
 /// Read and parse the custom overlay file as a generic `Value`. Returns
@@ -1816,6 +1852,22 @@ pub fn save(settings: &Settings, launch_cwd: &Path, global: &Settings) -> AppRes
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent).map_err(AppError::Io)?;
             }
+            // **Stamp the overlay with the schema it was written in** (V40
+            // Phase I, issue #107 item 5). `diff` drops `schema_version`
+            // because it always equals the baseline's — which is exactly why an
+            // overlay could go stale invisibly: after the global migrated,
+            // nothing on disk said which schema the project's keys were in, so
+            // `load` could only guess or (as it did until Phase I) skip
+            // migrating it. One key, re-stamped on every save, and
+            // `migrate_overlay` strips it again before the merge so it never
+            // reaches the merged `Settings`.
+            let mut delta = delta;
+            if let Some(obj) = delta.as_object_mut() {
+                obj.insert(
+                    "schema_version".to_string(),
+                    serde_json::json!(crate::settings::schema::CURRENT_SCHEMA_VERSION),
+                );
+            }
             let text = serde_json::to_string_pretty(&delta)
                 .map_err(|e| AppError::Settings(format!("serialize overlay: {e}")))?;
             write_atomic(&path, text.as_bytes())?;
@@ -2401,23 +2453,24 @@ pub fn integrity_check(settings: &mut Settings) -> bool {
 
     // 0. Empty enabled_ai_tabs is invalid — repair to the FIRST REGISTERED
     //    harness's first built-in tab. V40 Phase B replaced a literal
-    //    `[AiTabId::Claude]`, which made ONE harness load-bearing for the app
+    //    `[crate::settings::ai_tab_id("claude")]`, which made ONE harness load-bearing for the app
     //    booting at all; Phase E replaced `DEFAULT_HARNESS` with the registry's
     //    own order, because that constant is a wire-compatibility promise about
     //    identity-less loopback bodies (locked decision 22) and not an answer to
     //    "which tab should this install boot with".
+    //    Phase I: `AiTabId` is a registry lookup now, so the fallback is the
+    //    canonical order's own first entry and there is no literal left to
+    //    `unwrap_or`. A build that registers NO harness has no AI tab to repair
+    //    to; it leaves the list empty rather than inventing one.
     if settings.enabled_ai_tabs.is_empty() {
-        let fallback = crate::harness::registry::HARNESSES
-            .first()
-            .and_then(|d| d.tab_ids.first())
-            .and_then(|id| AiTabId::from_id(id))
-            .unwrap_or(AiTabId::Claude);
-        settings.enabled_ai_tabs = vec![fallback];
-        changed = true;
-        tracing::warn!(
-            tab = fallback.as_str(),
-            "integrity: enabled_ai_tabs was empty; reset to the default harness's tab"
-        );
+        if let Some(fallback) = crate::settings::canonical_ai_tab_order().first().copied() {
+            settings.enabled_ai_tabs = vec![fallback];
+            changed = true;
+            tracing::warn!(
+                tab = fallback.as_str(),
+                "integrity: enabled_ai_tabs was empty; reset to the default harness's tab"
+            );
+        }
     }
 
     // 1. Force builtin: true on every reserved AI id if it exists with
@@ -2653,7 +2706,7 @@ mod tests {
     #[test]
     fn integrity_seeds_both_when_enabled_ai_tabs_is_both_claudes() {
         let mut s = base_test_settings();
-        s.enabled_ai_tabs = vec![AiTabId::Claude, AiTabId::ClaudeLocal];
+        s.enabled_ai_tabs = vec![crate::settings::ai_tab_id("claude"), crate::settings::ai_tab_id("claude-local")];
         let _shell = fake_default_shell();
         let changed = integrity_check(&mut s);
         assert!(changed);
@@ -2662,10 +2715,47 @@ mod tests {
         assert_eq!(s.tabs[1].id(), CLAUDE_LOCAL_TAB_ID);
     }
 
+    /// **The integrity check repairs a harness this build has never heard of**
+    /// (V40 Phase I, issue #107 item 1).
+    ///
+    /// The other half of
+    /// `harness::layering::an_unshipped_descriptor_round_trips_through_the_tab_machinery`,
+    /// and it lives here because `integrity_check` is private to this module —
+    /// a test that reached around that boundary would be asserting about a copy.
+    ///
+    /// Three claims, and the first two are exactly what review finding M-3 said
+    /// a third harness silently lost: an enabled tab no `AiTabId` variant
+    /// existed for was never restored (nothing to seed it from), and a disabled
+    /// one was never dropped (it was outside the membership check). The third is
+    /// the canonical position, which used to be a literal ranking.
+    #[test]
+    fn the_integrity_check_seeds_and_drops_an_unshipped_harnesss_tab() {
+        crate::harness::registry::with_extra_harness(
+            &crate::harness::registry::EXTRA_TEST_HARNESS,
+            || {
+                let zeta = crate::settings::ai_tab_id("zeta");
+                // 1. Enabled ⇒ restored, from the descriptor's own row.
+                let mut s = base_test_settings();
+                s.enabled_ai_tabs = vec![crate::settings::ai_tab_id("claude"), zeta];
+                assert!(integrity_check(&mut s));
+                assert_eq!(s.tabs.len(), 2);
+                // 2. …at its CANONICAL position: after every tab the shipped
+                //    harnesses declare, because it is declared after them.
+                assert_eq!(s.tabs[0].id(), CLAUDE_TAB_ID);
+                assert_eq!(s.tabs[1].id(), "zeta");
+                assert!(s.tabs[1].builtin());
+                // 3. Disabled ⇒ dropped, like any other reserved AI id.
+                s.enabled_ai_tabs = vec![crate::settings::ai_tab_id("claude")];
+                assert!(integrity_check(&mut s));
+                assert!(s.tabs.iter().all(|t| t.id() != "zeta"));
+            },
+        );
+    }
+
     #[test]
     fn integrity_seeds_only_claude_local_when_setting_is_claude_local_only() {
         let mut s = base_test_settings();
-        s.enabled_ai_tabs = vec![AiTabId::ClaudeLocal];
+        s.enabled_ai_tabs = vec![crate::settings::ai_tab_id("claude-local")];
         let _shell = fake_default_shell();
         let changed = integrity_check(&mut s);
         assert!(changed);
@@ -2677,7 +2767,7 @@ mod tests {
     fn integrity_backfills_default_question_slot_on_upgraded_ai_tab() {
         use crate::settings::schema::{NotificationSlot, TabConfig};
         let mut s = base_test_settings();
-        s.enabled_ai_tabs = vec![AiTabId::Claude];
+        s.enabled_ai_tabs = vec![crate::settings::ai_tab_id("claude")];
         integrity_check(&mut s); // seed the claude tab
 
         // Simulate a file that upgraded before the `question` slot existed:
@@ -2702,7 +2792,7 @@ mod tests {
     fn integrity_does_not_clobber_user_customized_question_slot() {
         use crate::settings::schema::{NotificationSlot, TabConfig};
         let mut s = base_test_settings();
-        s.enabled_ai_tabs = vec![AiTabId::Claude];
+        s.enabled_ai_tabs = vec![crate::settings::ai_tab_id("claude")];
         integrity_check(&mut s);
 
         // User deliberately disabled the slot but kept (non-empty) text.
@@ -2726,7 +2816,7 @@ mod tests {
     #[test]
     fn integrity_seeds_opencode_at_canonical_position() {
         let mut s = base_test_settings();
-        s.enabled_ai_tabs = vec![AiTabId::Claude, AiTabId::ClaudeLocal, AiTabId::OpenCode];
+        s.enabled_ai_tabs = vec![crate::settings::ai_tab_id("claude"), crate::settings::ai_tab_id("claude-local"), crate::settings::ai_tab_id("opencode")];
         integrity_check(&mut s);
         assert_eq!(s.tabs.len(), 3);
         assert_eq!(s.tabs[0].id(), CLAUDE_TAB_ID);
@@ -2744,7 +2834,7 @@ mod tests {
     #[test]
     fn integrity_materializes_graph_monitor_tab_after_ai_builtins() {
         let mut s = base_test_settings();
-        s.enabled_ai_tabs = vec![AiTabId::Claude, AiTabId::ClaudeLocal];
+        s.enabled_ai_tabs = vec![crate::settings::ai_tab_id("claude"), crate::settings::ai_tab_id("claude-local")];
         s.graph.enabled = true;
         integrity_check(&mut s);
         // Lands right after the two AI builtins, before any shell tab.
@@ -3023,7 +3113,7 @@ mod tests {
         // opencode. The new tab should land at index 2 (after claude-local,
         // before the shell), not at the end.
         let mut s = base_test_settings();
-        s.enabled_ai_tabs = vec![AiTabId::Claude, AiTabId::ClaudeLocal, AiTabId::OpenCode];
+        s.enabled_ai_tabs = vec![crate::settings::ai_tab_id("claude"), crate::settings::ai_tab_id("claude-local"), crate::settings::ai_tab_id("opencode")];
         integrity_check(&mut s);
         // Insert a user shell tab to simulate the existing layout.
         s.tabs
@@ -3055,11 +3145,11 @@ mod tests {
         // hand-edit, or post-migration drift) reconciles to the setting.
         let mut s = base_test_settings();
         let _shell = fake_default_shell();
-        s.enabled_ai_tabs = vec![AiTabId::Claude, AiTabId::ClaudeLocal];
+        s.enabled_ai_tabs = vec![crate::settings::ai_tab_id("claude"), crate::settings::ai_tab_id("claude-local")];
         integrity_check(&mut s);
         assert_eq!(s.tabs.len(), 2);
 
-        s.enabled_ai_tabs = vec![AiTabId::Claude];
+        s.enabled_ai_tabs = vec![crate::settings::ai_tab_id("claude")];
         let changed = integrity_check(&mut s);
         assert!(changed);
         assert_eq!(s.tabs.len(), 1);
@@ -3075,7 +3165,7 @@ mod tests {
         s.enabled_ai_tabs = Vec::new();
         let changed = integrity_check(&mut s);
         assert!(changed);
-        assert_eq!(s.enabled_ai_tabs, vec![AiTabId::Claude]);
+        assert_eq!(s.enabled_ai_tabs, vec![crate::settings::ai_tab_id("claude")]);
         assert_eq!(s.tabs.len(), 1);
         assert_eq!(s.tabs[0].id(), CLAUDE_TAB_ID);
     }
@@ -3220,7 +3310,7 @@ mod tests {
     fn v1_2_round_trip() {
         let _shell = fake_default_shell();
         let mut s = base_test_settings();
-        s.enabled_ai_tabs = vec![AiTabId::Claude, AiTabId::ClaudeLocal];
+        s.enabled_ai_tabs = vec![crate::settings::ai_tab_id("claude"), crate::settings::ai_tab_id("claude-local")];
         integrity_check(&mut s);
         let text = serde_json::to_string(&s).unwrap();
         let parsed: Settings = serde_json::from_str(&text).unwrap();
@@ -3235,7 +3325,7 @@ mod tests {
         // subscription Claude tab into local-LLM mode (or vice versa).
         // Enable both so the check has both AI tabs to validate.
         let mut s = base_test_settings();
-        s.enabled_ai_tabs = vec![AiTabId::Claude, AiTabId::ClaudeLocal];
+        s.enabled_ai_tabs = vec![crate::settings::ai_tab_id("claude"), crate::settings::ai_tab_id("claude-local")];
         let _shell = fake_default_shell();
         integrity_check(&mut s);
 
@@ -3266,7 +3356,7 @@ mod tests {
     #[test]
     fn integrity_corrects_use_local_provider_on_opencode() {
         let mut s = base_test_settings();
-        s.enabled_ai_tabs = vec![AiTabId::OpenCode];
+        s.enabled_ai_tabs = vec![crate::settings::ai_tab_id("opencode")];
         integrity_check(&mut s);
         // Tamper: opencode → local (it has no local variant; canonical is false).
         if let TabConfig::AiTool(c) = s
@@ -3701,6 +3791,71 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// **The load path migrates the overlay, and the child reader deliberately
+    /// does not** (V40 Phase I, issue #107 item 5).
+    ///
+    /// Structural for the same reason
+    /// `every_settings_reader_runs_the_harness_parse_boundary` is: neither
+    /// `load` nor `load_readonly` can be called from a unit test without
+    /// writing next to the test binary. The behaviour of the thing they call is
+    /// covered in `settings::migration`; what this pins is that they call it —
+    /// and that the asymmetry between them is deliberate.
+    ///
+    /// `load_readonly` (the `cimp --offload-mcp` child) migrates NEITHER file:
+    /// it reads the global raw, so a v35 global and a v35 overlay are merged
+    /// consistently. Migrating only the overlay there would put a v36-shaped
+    /// diff on top of a v35-shaped baseline, which is worse than either. Its
+    /// contract is no side effects and the app process repairs the file
+    /// moments later, so the child reads a stale-but-coherent view.
+    /// Newline-agnostic: CI checks this tree out with CRLF.
+    #[test]
+    fn the_load_path_migrates_the_overlay_and_the_child_reader_does_not() {
+        let src = include_str!("persistence.rs");
+        let body_of = |sig: &str| {
+            let start = src
+                .find(sig)
+                .unwrap_or_else(|| panic!("`{sig}` is gone — re-point this test"));
+            let body = &src[start..];
+            &body[..body.find("\n}").unwrap_or(body.len())]
+        };
+        assert!(
+            body_of("pub fn load(").contains("migrate_overlay"),
+            "`load` must run the migration chain on the project overlay: a v35-shaped overlay \
+             beside a migrated global carries keys nothing reads, and the project's setting \
+             stops applying with the file still on disk saying otherwise"
+        );
+        assert!(
+            !body_of("pub fn load_readonly(").contains("migrate_overlay"),
+            "`load_readonly` migrates neither file on purpose — see this test's doc comment. If \
+             that changes, migrate the GLOBAL there too or the child merges shapes from two \
+             different schemas"
+        );
+        assert!(
+            body_of("pub fn save(").contains("schema_version"),
+            "`save` must stamp the overlay with the schema it was written in, or `load` has \
+             nothing to enter the cascade at once the global file has moved on"
+        );
+    }
+
+    /// **Tests only** — drop the overlay's schema stamp, asserting it was
+    /// there.
+    ///
+    /// `save` stamps every overlay it writes with the schema it was written in
+    /// (V40 Phase I, issue #107 item 5) so `load` can migrate a stale one
+    /// instead of guessing. Every test that pins the overlay's exact object
+    /// goes through here, which makes each of them a check that the stamp is
+    /// written as well as a check of its own subject.
+    #[track_caller]
+    fn without_schema_stamp(mut v: Value) -> Value {
+        let stamp = v.as_object_mut().and_then(|o| o.remove("schema_version"));
+        assert_eq!(
+            stamp,
+            Some(serde_json::json!(crate::settings::schema::CURRENT_SCHEMA_VERSION)),
+            "a saved overlay must carry the schema it was written in"
+        );
+        v
+    }
+
     #[test]
     fn save_writes_overlay_when_diff_nonempty_and_removes_when_empty() {
         let _shell = fake_default_shell();
@@ -3722,7 +3877,7 @@ mod tests {
         let text = fs::read_to_string(&overlay).unwrap();
         let parsed: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(
-            parsed,
+            without_schema_stamp(parsed),
             serde_json::json!({ "ui": { "theme": "future-light" } })
         );
 
@@ -3811,7 +3966,7 @@ mod tests {
         let text = fs::read_to_string(&overlay).unwrap();
         let overlay_val: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(
-            overlay_val,
+            without_schema_stamp(overlay_val.clone()),
             serde_json::json!({ "checks_allow_remote_worker": true }),
             "overlay: {text}"
         );
@@ -3872,7 +4027,7 @@ mod tests {
         let text = fs::read_to_string(&overlay).unwrap();
         let val: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(
-            val,
+            without_schema_stamp(val),
             serde_json::json!({ "checks_allow_remote_worker": true }),
             "overlay: {text}"
         );
@@ -4170,7 +4325,7 @@ mod tests {
         let text = fs::read_to_string(custom_path(&dir)).unwrap();
         let overlay: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(
-            overlay,
+            without_schema_stamp(overlay.clone()),
             serde_json::json!({ "harness": { claude: { "ext": {
                 "statusline": false,
                 "local.base_url": "http://myproxy:9000"
@@ -4633,7 +4788,7 @@ mod tests {
         let text = fs::read_to_string(dir.join(".cimp").join("config.json")).unwrap();
         let val: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(
-            val,
+            without_schema_stamp(val),
             serde_json::json!({
                 "tool_plugins": { "plugins": { "acme@1.0.0": { "tools": { "scan": {
                     "variables": { "ruleset": "p/ci" },

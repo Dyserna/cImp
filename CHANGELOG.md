@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.53.0-rc.6] — 2026-08-23
+
+### Added
+
+- **Cross-harness delegation (V39).** One AI tab can hand a task to another
+  harness's tab and get the answer back: `delegate_task_<harness>` MCP tools,
+  a per-tab delegation role (driver / worker / off) in the tab popover, a
+  delegation lane in Events, and remote-backend facades. Nine
+  verification-pass fixes (R-1..R-9) ride along; live-verify is #105.
+- **Harness registry (V40).** Every harness-specific behaviour now lives
+  behind a `HarnessPlugin` (`src-tauri/src/harness/<id>/`) and a single
+  `HARNESSES` registry; two layering tests refuse a harness identity or
+  literal anywhere else, and the frontend learns harnesses from the new
+  `harness_list` IPC (labels, tab ids, binaries, affordances) instead of
+  re-declaring them. Adding a harness is one directory plus registry row
+  (`harness/README.md`). Settings schema 35 → 36: per-harness settings
+  become a `harness.<id>` map with plugin-declared `ext` fields rendered by
+  a generic form; existing values migrate, a hand-written unknown harness
+  key round-trips untouched. CHP bumped to 2 (additive events:
+  `harness.output_started/_stopped`, `subagents.active`,
+  `permission.detected/.resolved`, `turn.usage`, `drift`).
+
+### Changed
+
+- OpenCode tabs are now told their own tool names (`read`/`bash`) in the
+  graph guidance; Claude Code's system-prompt addendum is pinned
+  byte-identical by a golden.
+- The drift advisor evaluates every registered harness (OpenCode gains
+  `drift.version.v1`); a dismissed Claude version notice re-fires once
+  after this upgrade. Auto-verify runs per harness, gated on that
+  harness's tab being enabled.
+- Unknown inputs fail closed: an unregistered `--consumer` / `agent` token,
+  an undeclared native tool, or an AI tab whose command matches no harness
+  is refused or treated as mutating rather than silently handled as Claude.
+  `?consumer=offload` is again gated by the calling tab's taint latch.
+- Settings labels read "Claude Code" / "Claude Code (local)" / "OpenCode";
+  the session-usage panel hides itself when no harness declares one.
+- Open tabs report `old_plugin` after this upgrade until restarted (the
+  documented meaning of a CHP bump) — restart AI tabs once.
+
+### Fixed
+
+- A cwd handed in by a hook or an external caller is never taken as the
+  project root; it resolves to the nearest marker (#104).
+- Usage lanes and token categories are declared by the harness; an
+  unreported category is absent rather than zero.
+
 ## [0.53.0-rc.5] — 2026-08-20
 
 ### Fixed

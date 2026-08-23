@@ -2034,6 +2034,17 @@
             </p>
           {:else if pricingTable === null}
             <p class="placeholder">loading prices…</p>
+          {:else if dashCostRows.every((r) => r.unpriced)}
+            <!-- rc.9 live-verify (#100 item 23, OpenCode on a local model): when
+                 NOTHING in the session is priced, a donut with no arcs, a
+                 legend of $0.0000 · 0% rows and a badge per model says the same
+                 thing four ways and the empty-donut prose overflowed the card.
+                 One sentence, naming the models, is the whole message. -->
+            <p class="placeholder">
+              No price data for model{dashCostRows.length === 1 ? '' : 's'}:
+              {#each dashCostRows as r, i (r.model)}{#if i > 0}, {/if}<code>{r.model}</code>{/each}
+              (Settings → LLM pricing).
+            </p>
           {:else}
             <div class="donut-row">
               {#if costGrand > 0}

@@ -1446,7 +1446,36 @@
   /// to put the third. `ModelUsage.origins` is a per-lane map now and this list
   /// is what iterates it. A lane no harness declares still renders under its own
   /// id, the same posture every other unknown gets.
-  let declaredOrigins = $state<DeclaredOrigin[]>([]);
+  /// Each harness's declared turn lanes, **keyed by harness** (V40 review
+  /// finding F-4).
+  ///
+  /// This was one flat list, unioned across the roster, first-id-wins, rendered
+  /// for every session. Two consequences, both latent only because the two
+  /// shipped harnesses declare byte-identical origins — and V40 exists to make
+  /// a third one easy:
+  ///
+  /// * a lane only harness B declares became a permanent `0 tok` row on every
+  ///   harness-A session's Cost card and an empty ring in the donut legend — a
+  ///   lane that collects nothing, asserted as a real zero, which is exactly
+  ///   the absent-vs-zero distinction Phase G's payload change preserves;
+  /// * two harnesses declaring the same lane id with different `subagent`
+  ///   flags meant the first one's flag decided for both, so `subagentOrigins`
+  ///   painted the outline and the `A` badge on the other harness's bars.
+  let declaredOriginsByHarness = $state<Record<string, DeclaredOrigin[]>>({});
+  /// The harness whose session the usage surface is currently showing — the
+  /// pinned row's, else the live session's row in the sessions list. `''` when
+  /// nothing is selected and the live session has no row yet, which degrades
+  /// the lanes to whatever the DATA carries (bare ids), never to another
+  /// harness's wording.
+  const dashHarnessId = $derived.by(() => {
+    if (selectedRow) return selectedRow.agent;
+    const sid = usage?.current?.session_id ?? '';
+    if (!sid) return '';
+    return usage?.sessions.find((r) => r.session_id === sid)?.agent ?? '';
+  });
+  const declaredOrigins = $derived<DeclaredOrigin[]>(
+    declaredOriginsByHarness[dashHarnessId] ?? [],
+  );
   const DASH_ORIGIN_LABEL = $derived(
     Object.fromEntries(declaredOrigins.map((o) => [o.id, o.label])) as Record<string, string>,
   );
@@ -1484,21 +1513,20 @@
   });
 
   async function loadDeclaredOrigins(): Promise<void> {
-    const next: DeclaredOrigin[] = [];
-    const seen = new Set<string>();
+    const next: Record<string, DeclaredOrigin[]> = {};
     for (const h of get(harnesses)) {
       try {
         const answer = await harnessUsage(h.id);
-        for (const o of answer.origins) {
-          if (seen.has(o.id)) continue;
-          seen.add(o.id);
-          next.push(o);
-        }
+        // Kept under the harness that DECLARED them (V40 review F-4). A
+        // harness that declares nothing gets no key, and its sessions fall back
+        // to the lanes present in the data — which is the honest answer, not a
+        // neighbour's lane list.
+        if (answer.origins.length > 0) next[h.id] = answer.origins;
       } catch (e) {
         console.warn('harness_usage origins failed:', e);
       }
     }
-    if (next.length > 0) declaredOrigins = next;
+    if (Object.keys(next).length > 0) declaredOriginsByHarness = next;
   }
   const DASH_KIND_LABEL = Object.fromEntries(DASH_KIND_SEGS.map((s) => [s.key, s.label])) as Record<
     string,

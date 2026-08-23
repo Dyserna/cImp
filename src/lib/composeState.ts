@@ -8,7 +8,8 @@ import { ptyWrite } from './ipc';
 import { activeTab } from './tabs/state';
 import { focusTerminal } from './terminalFocus';
 import { appendAttachments, DEFAULT_ATTACHMENT_FORMAT } from './compose/attachments';
-import { harnessForTab } from './harness';
+import { harnessForCommand, harnessForTab } from './harness';
+import { settings } from './settings/store';
 import { harnessInstruction } from './harnessText';
 
 export const composeOpen = writable<boolean>(false);
@@ -95,7 +96,13 @@ export async function submitCompose(): Promise<void> {
     content,
     attachments,
     instruction,
-    harnessForTab(tab)?.affordances.attachmentFormat ?? DEFAULT_ATTACHMENT_FORMAT,
+    // V40 review L-14: a user-created `ai-<uuid>` duplicate is not a reserved
+    // tab id, so `harnessForTab` answers `null` for it and the format fell to
+    // the neutral default — while the INSTRUCTION on the line above is resolved
+    // by harness backend-side. Its harness is knowable from its command, which
+    // is the same thing the backend uses.
+    (harnessForTab(tab) ?? harnessForCommand(aiTabCommand(tab)))?.affordances
+      .attachmentFormat ?? DEFAULT_ATTACHMENT_FORMAT,
   );
   if (!message) {
     closeCompose();
@@ -107,4 +114,15 @@ export async function submitCompose(): Promise<void> {
     console.error('compose submit pty_write failed:', e);
   }
   closeCompose();
+}
+
+/// The configured command of an AI tab, or `''`.
+///
+/// V40 review L-14: a user-created `ai-<uuid>` duplicate is not a reserved tab
+/// id, so the registry cannot answer "which harness" from the id alone — but it
+/// can from the command, which is the same thing `HarnessId::from_command`
+/// answers backend-side for the instruction on the line above.
+function aiTabCommand(tabId: string): string {
+  const cfg = get(settings).tabs.find((t) => t.id === tabId);
+  return cfg && cfg.kind === 'ai_tool' ? cfg.command : '';
 }

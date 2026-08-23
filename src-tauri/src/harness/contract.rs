@@ -2590,6 +2590,22 @@ mod tests {
                      src/lib/settings/types.ts — the window reads it from the \
                      `gated_controls` payload instead (locked decision 27)"
                 );
+                // **…and the CONTROL NAME it travels under is pinned** (V40
+                // review finding M-4). For these ids the control name is the
+                // ONLY join key the window has, and nothing checked it:
+                // renaming `read_advisor` here left
+                // `CONTROL_READ_ADVISOR = 'read_advisor'` in `types.ts`
+                // pointing at a key the payload no longer carries, and the
+                // lookup answered "not blocked" — silently un-gating a toggle
+                // that installs a `PreToolUse` hook on a contract the E1 spike
+                // may have recorded as broken. (`controlBlocked` fails closed
+                // on a miss now; this is what stops the miss happening.)
+                let (name, _) = control.expect("checked above");
+                assert!(
+                    TS_TYPES.contains(&format!("'{name}'")),
+                    "control name `{name}` is the only handle the window has on the gate for \
+                     `{id}`, and it is not spelled in src/lib/settings/types.ts"
+                );
             } else {
                 assert!(
                     TS_TYPES.contains(&format!("'{id}'")),

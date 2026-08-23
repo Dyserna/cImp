@@ -59,6 +59,34 @@
     return typeof v === 'number' ? v : '';
   }
 
+  /// The options an `enum` select offers: what the plugin declared, plus the
+  /// STORED value when the file holds one the declaration no longer lists.
+  ///
+  /// V40 review finding M-7. A `<select>` whose `value` matches no `<option>`
+  /// renders the FIRST one, so a settings file carrying a retired enum value —
+  /// a hand edit, or a value a newer build wrote — showed the user a setting
+  /// they do not have, and any other interaction with the form would have
+  /// silently saved that misreading back. Shown as itself and marked instead.
+  function optionsOf(field: SettingFieldView): { value: string; stale: boolean }[] {
+    const out = field.options.map((value) => ({ value, stale: false }));
+    const current = asText(field);
+    if (current !== '' && !field.options.includes(current)) {
+      out.unshift({ value: current, stale: true });
+    }
+    return out;
+  }
+
+  /// The kinds this build knows how to render. Anything else is a field a NEWER
+  /// cImp declared: it gets a note, not a control (V40 review F-5). Rendering it
+  /// as a text box — which is what the `{:else}` used to do — would have written
+  /// a `String` into a key whose declared kind is something else, and the parse
+  /// boundary would then reset it to the declared default at some later
+  /// out-of-band read, with a `tracing::warn!` as the only trace.
+  const RENDERABLE = ['bool', 'enum', 'int', 'text', 'path'] as const;
+  function renderable(field: SettingFieldView): boolean {
+    return (RENDERABLE as readonly string[]).includes(field.kind);
+  }
+
   /// Which secret fields are currently revealed. Per key, so showing one token
   /// does not reveal another.
   let revealed = $state<Record<string, boolean>>({});
@@ -85,8 +113,10 @@
             value={asText(field)}
             onchange={(e) => patch(harness.id, field.key, (e.currentTarget as HTMLSelectElement).value)}
           >
-            {#each field.options as option (option)}
-              <option value={option}>{option}</option>
+            {#each optionsOf(field) as option (option.value)}
+              <option value={option.value}
+                >{option.value}{option.stale ? ' (stored, no longer offered)' : ''}</option
+              >
             {/each}
           </select>
         </label>
@@ -98,11 +128,29 @@
             value={asNumber(field)}
             oninput={(e) => {
               const raw = (e.currentTarget as HTMLInputElement).value;
+              // V40 review M-7: an EMPTIED box is an edit, not a non-event. It
+              // used to be dropped on the floor — `parseInt('')` is `NaN` — so
+              // the control showed blank while the stored value stood, and the
+              // user's clear was silently discarded. Clearing resets to the
+              // declared default, which is the one value the backend also
+              // resolves for an absent key.
+              if (raw.trim() === '') {
+                patch(harness.id, field.key, field.default);
+                return;
+              }
               const n = Number.parseInt(raw, 10);
               if (Number.isFinite(n)) patch(harness.id, field.key, n);
             }}
           />
         </label>
+      {:else if !renderable(field)}
+        <div class="unrenderable">
+          <span>{field.label}</span>
+          <small class="hint">
+            This build cannot show this setting (declared as <code>{field.kind}</code>). Its
+            stored value is kept exactly as it is — update cImp to edit it.
+          </small>
+        </div>
       {:else if field.secret}
         <label>
           <span>{field.label}</span>
@@ -131,7 +179,11 @@
           />
         </label>
       {/if}
-      {#if field.hint}
+      <!-- V40 review M-7: the restart warning is NOT part of the hint. It used
+           to be nested inside `{#if field.hint}`, so a declared field with no
+           hint — an ordinary thing to declare — got no warning at all and its
+           flip looked like it had taken effect. -->
+      {#if field.hint || field.spawn_baked}
         <small class="hint">
           {field.hint}
           {#if field.spawn_baked}

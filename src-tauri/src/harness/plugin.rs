@@ -980,6 +980,21 @@ pub struct HarnessAffordances {
     /// button does, for the paragraph under it. Only read for a harness that
     /// declares `LocalProviderConfig`.
     pub local_provider_config_note: Option<&'static str>,
+    /// The `ext` key the derived provider block is stored under, and the key of
+    /// the flag that keeps it in step with the primary local backend.
+    ///
+    /// **Declared rather than conventional** (V40 review finding F-6). The
+    /// Offload section is MOUNTED from the `LocalProviderConfig` feature but
+    /// wrote its two `ext` keys as string literals, shared with the plugin only
+    /// by a comment — so a harness declaring the feature under different key
+    /// names got an undeclared key written (which
+    /// `normalize_harness_settings` deliberately preserves untouched, so it is
+    /// stored forever and read by nobody) while its real setting stayed at its
+    /// default. `a_declared_config_writer_exists` checks both against
+    /// `settings_schema()`.
+    pub local_provider_config_block_key: Option<&'static str>,
+    /// See [`Self::local_provider_config_block_key`].
+    pub local_provider_config_auto_key: Option<&'static str>,
     /// How many stacked rows this harness's status-line widget needs in the
     /// bottom strip. Locked decision 19: the 44 px `.status-bar` height was two
     /// rows of Claude Code's 5h + 7d pair, asserted in a stylesheet.
@@ -1026,6 +1041,8 @@ impl Default for HarnessAffordances {
             local_provider: None,
             local_provider_note: None,
             local_provider_config_note: None,
+            local_provider_config_block_key: None,
+            local_provider_config_auto_key: None,
             statusline_rows: 0,
             attribution_template: "[delegated by {label} · tab \"{tab}\" · via cImp]",
             inject_mechanism: None,

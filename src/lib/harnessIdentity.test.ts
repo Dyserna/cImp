@@ -103,11 +103,27 @@ function hits(text: string, terms: string[]): string[] {
   const found: string[] = [];
   for (const term of terms) {
     // Whole word, case-insensitive. A hyphenated reserved tab id counts, a
-    // dotfile path built from a harness id counts, and a camel-cased asset
-    // folder named after one counts (which is why the sprite file has a row) —
-    // while an unrelated word that merely contains the letters does not.
-    const re = new RegExp(`(^|[^A-Za-z0-9])${escapeRe(term)}([^A-Za-z0-9]|$)`, 'i');
-    if (re.test(text)) found.push(term);
+    // dotfile path built from a harness id counts, and an unrelated word that
+    // merely contains the letters does not.
+    //
+    // **…and a camelCase IDENTIFIER counts** (V40 review finding L-16). The
+    // boundary used to be `[^A-Za-z0-9]` on both sides, which is exactly the
+    // spelling the identifiers develop actually had — `getClaudeUsage`,
+    // `claudePushTabActive`, `isClaudeTab` — so the tripwire would have passed
+    // on the pre-V40 tree it was written to police. A term is also a hit when
+    // it sits at a case boundary: preceded by a lowercase letter or digit and
+    // starting uppercase (`getClaudeUsage`), or followed by an uppercase letter
+    // (`claudePushTab`). One helper name away from decorative, before this.
+    const t = escapeRe(term);
+    const patterns = [
+      // Whole word.
+      new RegExp(`(^|[^A-Za-z0-9])${t}([^A-Za-z0-9]|$)`, 'i'),
+      // `…somethingClaude…` — a lowercase/digit run, then the term capitalised.
+      new RegExp(`[a-z0-9]${t}([^a-z0-9]|$)`),
+      // `…claudeSomething` — the term, then an uppercase letter.
+      new RegExp(`(^|[^A-Za-z0-9])${t}[A-Z]`, 'i'),
+    ];
+    if (patterns.some((re) => re.test(text))) found.push(term);
   }
   return found;
 }

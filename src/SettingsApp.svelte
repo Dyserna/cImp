@@ -41,7 +41,7 @@
     findTabIndex,
     CONTROL_READ_ADVISOR,
     OUTCOME_NO_FAILURE,
-    capabilityBlocked,
+    controlBlocked,
     // V32 / #48 F-27: the ONE list of spawn-baked injection features, read by
     // both restart-hint shapes below.
     spawnBakedInjectionL2,
@@ -53,11 +53,13 @@
     harnessRow,
     setHarnessExt,
   } from './lib/settings/types';
+  import type { HarnessInfo } from './lib/harness';
   import {
     findHarnessByTabId,
     harnesses,
     harnessLabels,
     harnessLabelsProse,
+    harnessLoadState,
     labelForTabId,
     loadHarnesses,
     reservedAiTabIds,
@@ -411,16 +413,18 @@
   // the harness whose writer runs is the one whose button was clicked — with
   // two such harnesses the backend would otherwise have refused, asking which.
   let providerMsg = $state<{ i: number; text: string; ok: boolean } | null>(null);
-  async function registerLocalProvider(i: number, harness: string): Promise<void> {
+  async function registerLocalProvider(i: number, h: HarnessInfo): Promise<void> {
     const backend = snapshot?.offload.backends[i];
-    if (!backend || backend.kind.type !== 'local') return;
+    const blockKey = h.affordances.localProviderConfigBlockKey;
+    if (!backend || backend.kind.type !== 'local' || !blockKey) return;
     providerMsg = null;
     try {
-      const provider = await offloadDeriveLocalProvider(harness, backend.kind.server_command);
+      const provider = await offloadDeriveLocalProvider(h.id, backend.kind.server_command);
       // V40 Phase B: the derived block is that plugin's own `ext` row
       // (`SettingKind::Json` — written by cImp, never typed), not a field in
-      // the offload block named after a harness.
-      patch((s) => setHarnessExt(s, harness, 'provider', provider));
+      // the offload block named after a harness. V40 review F-6: under the key
+      // the plugin DECLARES, not the one this file used to spell.
+      patch((s) => setHarnessExt(s, h.id, blockKey, provider));
       providerMsg = {
         i,
         ok: true,
@@ -1178,9 +1182,11 @@
   // V40 Phase F: the capability id comes from the payload, keyed by the neutral
   // control name (locked decision 27). An id the backend has not sent yet
   // (first paint) reads as "not blocked", the same as a capability with no gate.
-  const e1Gate = $derived(
-    capabilityBlocked(harnessFresh, harnessFresh?.gated_controls?.[CONTROL_READ_ADVISOR] ?? ''),
-  );
+  // V40 review M-4: through `controlBlocked`, which fails CLOSED when the
+  // payload carries no row for the control. `gated_controls?.[…] ?? ''` handed
+  // `capabilityBlocked` an empty id, which answers "not blocked" — so a control
+  // renamed in Rust silently un-gated the toggle it protects.
+  const e1Gate = $derived(controlBlocked(harnessFresh, CONTROL_READ_ADVISOR));
   const e1Blocked = $derived(e1Gate !== null);
 
   // ── V35 Phase G: Harness health ─────────────────────────────────────────
@@ -1429,6 +1435,19 @@
   /// below iterates it, so a window that opened a frame early renders no AI tab
   /// sections rather than sections for a roster it guessed.
   const aiTabIds = $derived(reservedAiTabIds($harnesses));
+  /// Whether the roster has actually ARRIVED (V40 review findings F-2/F-3).
+  ///
+  /// `aiTabIds` above is deliberately non-empty before it does —
+  /// `reservedAiTabIds` carries the bootstrap fallback locked decision 7
+  /// sanctions — so the comment that used to sit here, claiming this window
+  /// "renders no AI tab sections rather than sections for a roster it guessed",
+  /// was false. What it rendered was three enable checkboxes with NO label
+  /// (`labelForTabId` had no fallback) and three blank sub-tab buttons; ticking
+  /// one of those unlabelled boxes kills that tab's PTY and drops its
+  /// scrollback. Every block that renders per reserved tab id gates on this and
+  /// shows a loading — or, since `loadHarnesses` retries and reports, a
+  /// FAILED — state instead.
+  const rosterReady = $derived($harnesses.length > 0);
   /// The harnesses that MOUNT each feature panel (V40 Phase F, locked decision
   /// 6). The two bottom-bar sections used to exist unconditionally and name one
   /// product in their headings; they are feature slots now, so a build with no
@@ -1439,6 +1458,23 @@
   );
   const contextBarHarnesses = $derived(
     $harnesses.filter((h) => h.features.includes('context_bar')),
+  );
+  /// The harnesses whose local-provider block the Offload card renders.
+  ///
+  /// V40 review F-6: the feature MOUNTS the block and the plugin DECLARES the
+  /// two `ext` keys it writes, so a harness that declares the feature without
+  /// them renders nothing here rather than having an undeclared key written
+  /// under it — one the backend preserves untouched, so it would be stored
+  /// forever and read by nobody while the real setting stayed at its default.
+  /// `harness::info::tests::a_declared_config_writer_exists` makes that
+  /// combination fail a Rust test, so this filter is belt and braces.
+  const localProviderConfigHarnesses = $derived(
+    $harnesses.filter(
+      (h) =>
+        h.features.includes('local_provider_config') &&
+        h.affordances.localProviderConfigBlockKey &&
+        h.affordances.localProviderConfigAutoKey,
+    ),
   );
   /// The shipped roster, as copy. Every sentence that used to enumerate the
   /// harnesses by hand ("restart the X/Y tab") interpolates one of
@@ -1576,7 +1612,7 @@
     // once, since it is `'static` backend data, and read by the per-harness
     // form, the enable checkboxes, the sub-tab nav, the two exposure lists and
     // the MCP access boxes, so none of them re-declares the roster.
-    void loadHarnesses();
+    const roster = loadHarnesses();
     startBackendStatusPolling();
     void refreshPlugins();
     pluginsProjectKey()
@@ -1588,6 +1624,23 @@
     snapshot = structuredClone(get(settings));
     for (const t of aiTabIds) captureBaseline(t);
     injectionAppBaseline = injectionAppShape(snapshot);
+    // **The restart baselines are re-taken once the roster is in** (V40 review
+    // finding F-1). One cell of `injectionAppShape` — the harness-scoped
+    // native-tool gate — is resolved through `harness_list`, and
+    // `spawnBakedInjectionL2` reads that roster with a non-reactive `get()`
+    // inside a rune, so the `$derived` does NOT re-run when it arrives: it
+    // re-runs on the user's first edit, against a baseline captured when the
+    // answer was unknown, and the section's "AI tabs launch differently —
+    // restart them" hint fires with no user change behind it. Re-taken from the
+    // SAME snapshot, and only while the user has not touched it, so this can
+    // never absorb an edit made in the gap.
+    const preRoster = JSON.stringify(snapshot);
+    await roster;
+    if (disposed) return;
+    if (JSON.stringify(snapshot) === preRoster) {
+      for (const t of aiTabIds) captureBaseline(t);
+      injectionAppBaseline = injectionAppShape(snapshot);
+    }
     unsub = settings.subscribe((s) => {
       draftSync.broadcast(s);
     });
@@ -2316,6 +2369,24 @@
      per TAB, what it renders is per HARNESS, and this window should not be
      where those two get confused. A harness that declares no fields renders
      nothing, with no work here. -->
+<!-- V40 review F-2/F-3: what a block that renders per harness shows while the
+     roster is not in. `loadHarnesses` retries and reports, so the two states are
+     distinguishable and the failed one offers the retry rather than leaving the
+     window permanently missing its per-harness controls with no explanation. -->
+{#snippet rosterPending()}
+  {#if $harnessLoadState === 'failed'}
+    <div class="roster-error" role="status">
+      <span
+        >The harness registry could not be read, so the per-harness controls are
+        hidden. Nothing is lost — your settings are untouched.</span
+      >
+      <button type="button" onclick={() => void loadHarnesses()}>Try again</button>
+    </div>
+  {:else}
+    <small class="hint">Loading the harness registry…</small>
+  {/if}
+{/snippet}
+
 {#snippet harnessSettingsFor(harnessId: string)}
   {#if snapshot}
     {#each $harnesses.filter((h) => h.id === harnessId) as h (h.id)}
@@ -3706,6 +3777,12 @@
               and its scrollback dropped). At least one tab must remain
               checked.
             </small>
+            <!-- V40 review F-2: not before the roster is in. These are
+                 DESTRUCTIVE controls (a tick kills a PTY), and until the
+                 registry answers there is no label to put on them. -->
+            {#if !rosterReady}
+              {@render rosterPending()}
+            {:else}
             <div class="radio-row">
               <!-- V40 Phase F (locked decision 7): one checkbox per RESERVED
                    tab id the registry declares, in its canonical order. It was
@@ -3729,6 +3806,7 @@
                 </label>
               {/each}
             </div>
+            {/if}
             {#if aiTabsError}
               <small class="error">{aiTabsError}</small>
             {/if}
@@ -3787,17 +3865,19 @@
             <!-- V40 Phase F: one sub-tab per reserved AI tab id, from the
                  registry (locked decision 7). Three hand-written buttons
                  before, each naming a tab id and a product. -->
-            {#each aiTabIds as aiTabId (aiTabId)}
-              <button
-                type="button"
-                role="tab"
-                class:active={tabsSubSection === aiTabId}
-                aria-selected={tabsSubSection === aiTabId}
-                onclick={() => (tabsSubSection = aiTabId)}
-              >
-                {labelForTabId($harnesses, aiTabId)}
-              </button>
-            {/each}
+            {#if rosterReady}
+              {#each aiTabIds as aiTabId (aiTabId)}
+                <button
+                  type="button"
+                  role="tab"
+                  class:active={tabsSubSection === aiTabId}
+                  aria-selected={tabsSubSection === aiTabId}
+                  onclick={() => (tabsSubSection = aiTabId)}
+                >
+                  {labelForTabId($harnesses, aiTabId)}
+                </button>
+              {/each}
+            {/if}
             <button
               type="button"
               role="tab"
@@ -3812,7 +3892,9 @@
             </button>
           </div>
 
-          {#if aiTabIds.includes(tabsSubSection)}
+          {#if !rosterReady && tabsSubSection !== 'shells'}
+            {@render rosterPending()}
+          {:else if rosterReady && aiTabIds.includes(tabsSubSection)}
             <!--
               V40 Phase F (locked decision 7): ONE body for every reserved AI
               tab, instead of a `{:else if}` per tab id. The two facts that used
@@ -4665,23 +4747,24 @@
                      `local_provider_config` — i.e. one cImp can WRITE a provider
                      block for. It was hard-coded for one harness, so a second
                      one with a config writer would have had no button at all. -->
-                {#each $harnesses.filter((h) => h.features.includes('local_provider_config')) as h (h.id)}
+                {#each localProviderConfigHarnesses as h (h.id)}
+                  {@const autoKey = h.affordances.localProviderConfigAutoKey ?? ''}
                   <div class="button-row">
                     <button
                       type="button"
                       class="secondary"
-                      onclick={() => registerLocalProvider(i, h.id)}
+                      onclick={() => registerLocalProvider(i, h)}
                     >Add to {h.label}</button>
                     <label class="checkbox inline">
                       <input
                         type="checkbox"
-                        checked={harnessRow(snapshot, h.id).ext?.['provider_auto'] === true}
+                        checked={harnessRow(snapshot, h.id).ext?.[autoKey] === true}
                         onchange={(e) =>
                           patch((s) =>
                             setHarnessExt(
                               s,
                               h.id,
-                              'provider_auto',
+                              autoKey,
                               (e.currentTarget as HTMLInputElement).checked,
                             ),
                           )}
@@ -9212,6 +9295,16 @@
     flex: 1;
   }
   small.error {
+    color: var(--text-error);
+    font-size: var(--font-size-xs);
+  }
+  /* V40 review F-3: the roster-load failure banner. Same weight as a field
+     error — it explains why a block is missing, and carries the retry. */
+  .roster-error {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    flex-wrap: wrap;
     color: var(--text-error);
     font-size: var(--font-size-xs);
   }

@@ -622,6 +622,17 @@ export type SpawnBakedInjectionFeature = (typeof SPAWN_BAKED_INJECTION_FEATURES)
 /// not a field in the offload block. [`HARNESS_NATIVE_GATE_KEY`] is that
 /// feature's frozen wire key; V40 Phase F made the harness it belongs to a
 /// registry lookup.
+/// What a spawn-baked cell answers when the roster cannot decide it — the
+/// window between mount and `harness_list`, and a build where no harness scopes
+/// the feature.
+///
+/// A STRING, so it can never be confused with the `true`/`false` a real answer
+/// takes, and stable, so two shapes computed while pending compare equal. The
+/// Settings window additionally captures its restart baseline after the roster
+/// lands (V40 review F-1), so this should not reach a comparison at all — it is
+/// what makes the failure visible if it ever does.
+export const ROSTER_PENDING = '(roster pending)';
+
 const SPAWN_BAKED_L2: Record<
   SpawnBakedInjectionFeature,
   (s: Settings) => string | boolean
@@ -632,13 +643,32 @@ const SPAWN_BAKED_L2: Record<
   tool_steering: (s) => s.offload.injection.tool_steering_enabled,
   // V40 Phase F: WHICH harness holds this feature's app-wide cell is the
   // registry's answer (`harness_list`'s `scoped_features`), not a name written
-  // here. A build whose registry has not answered yet — or one where no harness
-  // scopes the feature — reads the declared-on default, which is what the
-  // backend resolves for an absent row.
+  // here.
+  //
+  // **A roster that has not answered yet is NOT a value** (V40 review finding
+  // F-1). This used to return the literal `true`, which is a guess that reads
+  // as a real answer: a user who had turned the gate OFF opened Settings, the
+  // restart baseline was captured in the window before `harness_list` resolved
+  // (`[…, true]`), the first edit re-ran the derived against the real value
+  // (`[…, false]`), and the section's "AI tabs launch differently — restart
+  // them" hint fired with no user change behind it. The literal was also wrong
+  // in the other direction for any future feature whose declared default is
+  // `false`. [`ROSTER_PENDING`] cannot be mistaken for either, and the declared
+  // default is read off the owner's field rather than assumed.
   [HARNESS_NATIVE_GATE_KEY]: (s) => {
-    const owner = scopedFeatureOwner(harnessList(), HARNESS_NATIVE_GATE_KEY);
-    if (!owner) return true;
-    return harnessRow(s, owner.harness.id).ext[owner.extKey] !== false;
+    const list = harnessList();
+    if (list.length === 0) return ROSTER_PENDING;
+    const owner = scopedFeatureOwner(list, HARNESS_NATIVE_GATE_KEY);
+    // No harness scopes the feature: nothing bakes it into a launch, so there
+    // is no app-wide cell to compare. Its own sentinel, not a boolean that
+    // would flip the moment a harness declaring it appeared.
+    if (!owner) return ROSTER_PENDING;
+    const stored = harnessRow(s, owner.harness.id).ext[owner.extKey];
+    if (stored === undefined) {
+      const declared = owner.harness.fields.find((f) => f.key === owner.extKey);
+      return declared ? declared.default !== false : true;
+    }
+    return stored !== false;
   },
 };
 
@@ -1353,6 +1383,38 @@ export function capabilityBlocked(
   id: string,
 ): CapabilityGate | null {
   return status?.capability_gates.find((g) => g.id === id && g.blocked) ?? null;
+}
+
+/// The verdict for the capability a neutral CONTROL name gates, resolved
+/// through `HarnessStatus.gated_controls`.
+///
+/// **A control the payload does not carry fails CLOSED** (V40 review finding
+/// M-4). The window used to do `gated_controls?.[CONTROL] ?? ''` and hand the
+/// empty string to [`capabilityBlocked`], which answers "not blocked" — so a
+/// control renamed in Rust, or dropped from `GATED_CONTROLS`, silently
+/// UN-GATED the toggle it protects. That toggle installs a `PreToolUse` hook on
+/// a contract the E1 spike may have recorded as broken; the whole point of the
+/// gate is that it is the one thing standing between a `fail` and a hook that
+/// denies the model's reads.
+///
+/// `null` while the payload has not arrived at all — that is "not yet", not "no
+/// gate", and it is the pre-Phase-E behaviour (`snapshot` is null then too).
+export function controlBlocked(
+  status: HarnessStatus | null | undefined,
+  control: string,
+): CapabilityGate | null {
+  if (!status) return null;
+  const id = status.gated_controls?.[control];
+  if (!id) {
+    return {
+      id: control,
+      blocked: true,
+      reason:
+        'this build cannot find the gate for this control (the harness registry did not ' +
+        'publish it), so it stays off rather than running ungated',
+    } as CapabilityGate;
+  }
+  return capabilityBlocked(status, id);
 }
 
 /// V14 Phase D2: one dismissed advisor proposal. Mirror of Rust

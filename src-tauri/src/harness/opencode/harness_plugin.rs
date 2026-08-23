@@ -488,6 +488,8 @@ impl HarnessPlugin for OpenCodePlugin {
             local_provider_config_note: Some(
                 "Registers this server as OpenCode's local-llama provider (base URL + model read                  from the command above) and selects it as the default model, so a freshly opened                  OpenCode tab is ready to work. Overrides any existing local-llama. Auto-sync                  re-derives it from the primary local backend at launch and on save, but only                  while the offload server is enabled. OpenCode reads the provider from its launch                  config — restart the OpenCode tab to apply a change.",
             ),
+            local_provider_config_block_key: Some(super::settings::PROVIDER),
+            local_provider_config_auto_key: Some(super::settings::PROVIDER_AUTO),
             inject_mechanism: Some("a generated .opencode/plugin"),
             default_command: "opencode",
             accent: "var(--accent-purple, #d2a8ff)",

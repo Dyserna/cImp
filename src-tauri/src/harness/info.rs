@@ -93,6 +93,11 @@ pub struct AffordancesView {
     pub local_provider: Option<Vec<LocalProviderVarView>>,
     pub local_provider_note: Option<&'static str>,
     pub local_provider_config_note: Option<&'static str>,
+    /// The two `ext` keys the Offload card's local-provider block writes.
+    /// `null` for a harness that does not declare `local_provider_config`.
+    pub local_provider_config_block_key: Option<&'static str>,
+    /// See [`Self::local_provider_config_block_key`].
+    pub local_provider_config_auto_key: Option<&'static str>,
     pub statusline_rows: u8,
     pub attribution_template: &'static str,
     pub inject_mechanism: Option<&'static str>,
@@ -169,6 +174,8 @@ fn affordances_view(a: &HarnessAffordances) -> AffordancesView {
         }),
         local_provider_note: a.local_provider_note,
         local_provider_config_note: a.local_provider_config_note,
+        local_provider_config_block_key: a.local_provider_config_block_key,
+        local_provider_config_auto_key: a.local_provider_config_auto_key,
         statusline_rows: a.statusline_rows,
         attribution_template: a.attribution_template,
         inject_mechanism: a.inject_mechanism,
@@ -307,6 +314,39 @@ mod tests {
                 "{}: declares local_provider_config = {declared} but config_writer() = {has}",
                 d.id
             );
+
+            // V40 review F-6: …and the two `ext` keys that block writes are
+            // DECLARED, not a convention shared with the Settings window by
+            // comment. An undeclared key would be stored forever and read by
+            // nobody while the real setting stayed at its default.
+            let a = d.plugin.affordances();
+            let schema = d.plugin.settings_schema();
+            let field = |key: &str| schema.iter().find(|f| f.key == key).map(|f| f.kind);
+            assert_eq!(
+                declared,
+                a.local_provider_config_block_key.is_some()
+                    && a.local_provider_config_auto_key.is_some(),
+                "{}: local_provider_config = {declared} but its two `ext` keys are {:?}/{:?}",
+                d.id,
+                a.local_provider_config_block_key,
+                a.local_provider_config_auto_key
+            );
+            if let Some(key) = a.local_provider_config_block_key {
+                assert_eq!(
+                    field(key),
+                    Some(crate::harness::plugin::SettingKind::Json),
+                    "{}: `{key}` is the derived provider BLOCK — cImp writes it, the user never                      types it, so it has to be a declared `Json` field",
+                    d.id
+                );
+            }
+            if let Some(key) = a.local_provider_config_auto_key {
+                assert_eq!(
+                    field(key),
+                    Some(crate::harness::plugin::SettingKind::Bool),
+                    "{}: `{key}` is the auto-sync flag and has to be a declared `Bool` field",
+                    d.id
+                );
+            }
         }
     }
 

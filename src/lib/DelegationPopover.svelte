@@ -277,15 +277,22 @@
       </label>
     </li>
     <li>
-      <label class:disabled={driven || busy}>
+      <!-- V40 review L-12: a tab whose command matches no registered harness
+           has no `delegate_task_*` tool to be the target OF, so the row is
+           disabled rather than offering a click the backend refuses. -->
+      <label class:disabled={driven || busy || !harness}>
         <input
           type="radio"
           name="delegation-role-{tab}"
           checked={role === 'manual'}
-          disabled={driven || busy}
+          disabled={driven || busy || !harness}
           onchange={() => void setRole('manual')}
         />
-        <span class="name">Manual — the {harnessLabel(harness)} delegation target</span>
+        <span class="name"
+          >{harness
+            ? `Manual — the ${harnessLabel(harness)} delegation target`
+            : 'Manual — unavailable: this tab runs no harness cImp knows'}</span
+        >
       </label>
     </li>
     <li>
@@ -312,7 +319,7 @@
       Manual for {harnessLabel(harness)} is on “{manualHolder.name}”. Choosing it
       here moves it — that tab drops to None.
     </small>
-  {:else if role === 'manual'}
+  {:else if role === 'manual' && harness}
     <small class="hint">
       <code>delegate_task_{harness}</code> drives this tab. Other tabs see the tool
       on their next turn; nothing restarts.

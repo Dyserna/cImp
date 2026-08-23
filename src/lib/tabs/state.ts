@@ -17,18 +17,45 @@ import { type TabId } from './types';
 /// written here. It is a placeholder in the strictest sense: the backend's
 /// `ActiveTabChanged` overwrites it within the first frames, and until then no
 /// PTY routing depends on it.
-export const activeTab: Writable<TabId> = writable(defaultTabId(get(harnesses)));
+const active = writable<TabId>(defaultTabId(get(harnesses)));
 
-// The registry arrives after mount, so re-seed the placeholder once — but ONLY
-// while nothing else has set it. A backend broadcast that already landed is the
-// truth and must not be walked back (the store reflects backend truth; see the
-// header).
+/// True once anything AUTHORITATIVE has written the store — a backend
+/// `ActiveTabChanged` broadcast, or a restored `session.active_tab_id`. The
+/// placeholder re-seed below is inert from that moment on, whatever the
+/// ordering.
+let claimed = false;
+
+/// The active tab, as the backend reports it.
+///
+/// Writes go through this wrapper so the store can tell "the placeholder" from
+/// "something that knows" (V40 review findings L-18 and the ordering hazard
+/// beside it). The re-seed used to guard on `cur === ''`, which
+/// `defaultTabId(get(harnesses))` can never produce — `reservedAiTabIds` has a
+/// bootstrap fallback — so the correction was dead code AND, had the bootstrap
+/// ever gone away, it could have fired after a restored tab id had already
+/// landed and yanked the user back to the first harness's tab.
+export const activeTab: Writable<TabId> = {
+  subscribe: active.subscribe,
+  set: (v) => {
+    claimed = true;
+    active.set(v);
+  },
+  update: (fn) => {
+    claimed = true;
+    active.update(fn);
+  },
+};
+
+// The registry arrives after mount, so correct the placeholder once — but ONLY
+// while nothing authoritative has spoken. The store reflects backend truth (see
+// the header), and a value that came from the backend is never walked back.
 let seeded = false;
 harnesses.subscribe((list) => {
   if (seeded || list.length === 0) return;
   seeded = true;
+  if (claimed) return;
   const fallback = defaultTabId(list);
-  activeTab.update((cur) => (cur === '' && fallback !== '' ? fallback : cur));
+  if (fallback !== '' && get(active) !== fallback) active.set(fallback);
 });
 
 /// Request a tab switch. The store updates when the backend broadcasts

@@ -3,6 +3,7 @@ import { describe, expect, test } from 'vitest';
 import registry from '../../src-tauri/fixtures/harness/registry.json';
 import {
   HARNESS_FEATURES,
+  SETTING_KINDS,
   accentFor,
   defaultTabId,
   findHarness,
@@ -69,6 +70,8 @@ const AFFORDANCE_KEYS = [
   'localProvider',
   'localProviderNote',
   'localProviderConfigNote',
+  'localProviderConfigBlockKey',
+  'localProviderConfigAutoKey',
   'statuslineRows',
   'attributionTemplate',
   'injectMechanism',
@@ -77,6 +80,26 @@ const AFFORDANCE_KEYS = [
   'accent',
   'tier',
 ] as const;
+
+/// The keys `SettingFieldView` declares — the per-field half of the payload.
+///
+/// V40 review F-5: the parity test checked `HarnessInfo` and its affordances
+/// and then stopped at the container, so `fields[]` and `scoped_features[]`
+/// were unchecked in both shape and vocabulary. A `SettingField` column added
+/// in Rust reached this form as `undefined`, silently.
+const SETTING_FIELD_KEYS = [
+  'key',
+  'kind',
+  'options',
+  'label',
+  'hint',
+  'default',
+  'spawn_baked',
+  'secret',
+] as const;
+
+/// The keys `ScopedFeatureView` declares.
+const SCOPED_FEATURE_KEYS = ['feature', 'extKey'] as const;
 
 describe('registry parity (locked decision 11)', () => {
   test('the fixture is non-empty and every harness declares its identity', () => {
@@ -122,6 +145,66 @@ describe('registry parity (locked decision 11)', () => {
     for (const h of RAW) {
       const a = h.affordances as Record<string, unknown>;
       expect(Object.keys(a).sort()).toEqual([...AFFORDANCE_KEYS].sort());
+    }
+  });
+
+  test('SettingFieldView declares exactly the field columns the payload carries', () => {
+    let seen = 0;
+    for (const h of RAW) {
+      for (const f of h.fields as Record<string, unknown>[]) {
+        expect(Object.keys(f).sort()).toEqual([...SETTING_FIELD_KEYS].sort());
+        seen++;
+      }
+    }
+    // Non-vacuity: at least one harness declares at least one setting, so a
+    // fixture that lost its `fields` would fail here rather than pass silently.
+    expect(seen).toBeGreaterThan(0);
+  });
+
+  test('ScopedFeatureView declares exactly the columns the payload carries', () => {
+    let seen = 0;
+    for (const h of RAW) {
+      for (const f of h.scoped_features as Record<string, unknown>[]) {
+        expect(Object.keys(f).sort()).toEqual([...SCOPED_FEATURE_KEYS].sort());
+        seen++;
+      }
+    }
+    expect(seen).toBeGreaterThan(0);
+  });
+
+  test('the TypeScript SettingKind union covers every declared kind', () => {
+    const declared = new Set<string>();
+    for (const h of RAW) {
+      for (const f of h.fields as Record<string, unknown>[]) {
+        declared.add(f.kind as string);
+        expect(
+          SETTING_KINDS as readonly string[],
+          `kind ${f.kind} is declared in Rust but is not in the TypeScript union — the form would render it as a text box and write the wrong type`,
+        ).toContain(f.kind as string);
+      }
+    }
+    // The other direction is deliberately weaker than for features: a kind the
+    // union knows and no shipped harness happens to declare is not drift, it is
+    // an unused case in a closed vocabulary. What must not happen is the union
+    // shrinking below what is declared, which the loop above pins.
+    expect(declared.size).toBeGreaterThan(0);
+  });
+
+  test('a declared local-provider config block names keys the harness declares', () => {
+    for (const h of FIXTURE_HARNESSES) {
+      const a = h.affordances;
+      const mounts = h.features.includes('local_provider_config');
+      expect(
+        Boolean(a.localProviderConfigBlockKey && a.localProviderConfigAutoKey),
+        `${h.id}: local_provider_config = ${mounts} but its two ext keys are ${a.localProviderConfigBlockKey}/${a.localProviderConfigAutoKey}`,
+      ).toBe(mounts);
+      for (const key of [a.localProviderConfigBlockKey, a.localProviderConfigAutoKey]) {
+        if (!key) continue;
+        expect(
+          h.fields.map((f) => f.key),
+          `${h.id}: the Offload card writes ${key}, which this harness does not declare`,
+        ).toContain(key);
+      }
     }
   });
 
@@ -207,7 +290,40 @@ describe('the lookups agree with every descriptor', () => {
     }
     expect(labelForHarness(FIXTURE_HARNESSES, 'nobody')).toBe('nobody');
     expect(labelForHarness(FIXTURE_HARNESSES, '')).toBe('another harness');
-    expect(labelForTabId(FIXTURE_HARNESSES, 'shell-default-1')).toBe('');
+    // V40 review F-2: a tab id no harness owns renders as ITSELF, never as the
+    // empty string. It used to answer `''`, and the Settings window renders
+    // AI-tab enable checkboxes from `reservedAiTabIds`, which HAS a bootstrap
+    // fallback — so between mount and the roster's arrival the user saw three
+    // unlabelled checkboxes, each of which kills a tab's PTY when ticked.
+    expect(labelForTabId(FIXTURE_HARNESSES, 'shell-default-1')).toBe('shell-default-1');
+    // …and the pre-roster window itself: an EMPTY roster still labels every
+    // bootstrap id, so no destructive control can render blank.
+    for (const id of reservedAiTabIds([])) {
+      expect(labelForTabId([], id)).toBe(id);
+    }
+    expect(labelForTabId(FIXTURE_HARNESSES, '')).toBe('');
+  });
+
+  // V40 review finding L-11: the two `from_command` implementations disagree on
+  // exactly two inputs, and `delegation.ts` promises they agree. Pinned here so
+  // the divergence stays a documented decision (see `findHarnessByCommand`)
+  // rather than becoming a surprise — the window is deliberately the forgiving
+  // side, and every gate that matters is answered backend-side.
+  test('findHarnessByCommand is forgiving where Rust is not, deliberately', () => {
+    const h = FIXTURE_HARNESSES[0];
+    const bin = h.binaries[0];
+    // The forms both sides agree on.
+    expect(findHarnessByCommand(FIXTURE_HARNESSES, bin)?.id).toBe(h.id);
+    expect(findHarnessByCommand(FIXTURE_HARNESSES, `${bin}.exe`)?.id).toBe(h.id);
+    expect(findHarnessByCommand(FIXTURE_HARNESSES, `/usr/local/bin/${bin}`)?.id).toBe(h.id);
+    // The two this side answers and `Path::file_stem` does not: a trailing
+    // space typed into the Settings command box, and a Windows-written path
+    // read on a POSIX host.
+    expect(findHarnessByCommand(FIXTURE_HARNESSES, `${bin} `)?.id).toBe(h.id);
+    expect(findHarnessByCommand(FIXTURE_HARNESSES, `C:\\bin\\${bin}.exe`)?.id).toBe(h.id);
+    // …and nothing else resolves.
+    expect(findHarnessByCommand(FIXTURE_HARNESSES, `not-${bin}`)).toBeNull();
+    expect(findHarnessByCommand(FIXTURE_HARNESSES, '')).toBeNull();
   });
 
   test('the roster renders as copy, in registry order', () => {

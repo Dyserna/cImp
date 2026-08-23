@@ -78,6 +78,11 @@ export interface HarnessAffordances {
   localProvider: LocalProviderVar[] | null;
   localProviderNote: string | null;
   localProviderConfigNote: string | null;
+  /// The `ext` keys the Offload card's local-provider block writes: the derived
+  /// provider object, and the auto-sync flag. `null` for a harness that does
+  /// not declare `local_provider_config` — and the block does not render.
+  localProviderConfigBlockKey: string | null;
+  localProviderConfigAutoKey: string | null;
   statuslineRows: number;
   attributionTemplate: string;
   injectMechanism: string | null;
@@ -93,6 +98,22 @@ export interface HarnessAffordances {
 /// derived `local-llama` provider block): stored, round-tripped, and
 /// deliberately NOT rendered, because its shape is the plugin's business.
 export type SettingKind = 'bool' | 'int' | 'text' | 'path' | 'enum' | 'json';
+
+/// Every kind this build knows, as data — the runtime half of the union above,
+/// so the parity test can check the two against the fixture in both directions
+/// (V40 review finding F-5).
+///
+/// Nothing checked this before, so a kind added in Rust passed the whole
+/// frontend suite and `HarnessExtForm`'s `{:else}` rendered it as a TEXT BOX
+/// that wrote a `String` into a key whose declared kind was something else.
+export const SETTING_KINDS: readonly SettingKind[] = [
+  'bool',
+  'int',
+  'text',
+  'path',
+  'enum',
+  'json',
+] as const;
 
 /// One declared `ext` field. Mirror of Rust `harness::info::SettingFieldView`.
 export interface SettingFieldView {
@@ -164,16 +185,56 @@ export const harnesses = writable<HarnessInfo[]>([]);
 /// again.
 const BOOTSTRAP_RESERVED_TAB_IDS: readonly string[] = ['claude', 'claude-local', 'opencode'];
 
-/// Fetch the registry. Best-effort: a failure leaves the store empty and logs,
-/// because a window that refuses to open over a harness list is worse than one
-/// missing a section.
+/// Where the roster fetch stands.
+///
+/// **`'loading'` and `'failed'` are different answers and consumers must be able
+/// to tell them apart** (V40 review finding F-3 / frontend H-2). Until this
+/// existed the store simply stayed `[]` on failure, forever and silently, so a
+/// window whose `harness_list` call had failed was indistinguishable from one
+/// still waiting — and what a user saw was the per-harness settings form never
+/// mounting, the per-tab *Use local provider* checkbox missing, the MCP access
+/// columns gone and the usage widget hidden, with nothing anywhere saying why.
+export type HarnessLoadState = 'loading' | 'ready' | 'failed';
+
+/// See [`HarnessLoadState`]. Read as `$harnessLoadState` in components.
+export const harnessLoadState = writable<HarnessLoadState>('loading');
+
+/// How many times [`loadHarnesses`] tries before giving up, and how long it
+/// waits between tries. Short and few: the backend is in the same process and
+/// the realistic failure is a startup race, not a network.
+const LOAD_ATTEMPTS = 3;
+const LOAD_BACKOFF_MS = [200, 600];
+
+/// Fetch the registry, retrying a transient failure.
+///
+/// Still best-effort in the sense that it never throws — a window that refuses
+/// to open over a harness list is worse than one missing a section — but it no
+/// longer fails *silently*: [`harnessLoadState`] ends at `'failed'` and the
+/// Settings window says so, with a button that calls this again.
 export async function loadHarnesses(): Promise<void> {
-  try {
-    const list = await invoke<HarnessInfo[]>('harness_list');
-    harnesses.set(list ?? []);
-  } catch (e) {
-    console.error('harness_list failed:', e);
+  harnessLoadState.set(get(harnesses).length > 0 ? 'ready' : 'loading');
+  for (let attempt = 0; attempt < LOAD_ATTEMPTS; attempt++) {
+    try {
+      const list = await invoke<HarnessInfo[]>('harness_list');
+      // An EMPTY roster is not a successful load: the registry always has at
+      // least one entry, so `[]` means the call answered something this build
+      // cannot use. Treated as a failure so the retry runs and the banner
+      // shows, rather than rendering a window with every harness section gone.
+      if (list && list.length > 0) {
+        harnesses.set(list);
+        harnessLoadState.set('ready');
+        return;
+      }
+      console.error('harness_list returned an empty roster');
+    } catch (e) {
+      console.error('harness_list failed:', e);
+    }
+    const wait = LOAD_BACKOFF_MS[attempt];
+    if (wait !== undefined) {
+      await new Promise((r) => setTimeout(r, wait));
+    }
   }
+  harnessLoadState.set(get(harnesses).length > 0 ? 'ready' : 'failed');
 }
 
 /// The current list, for the module functions that cannot take a store
@@ -212,6 +273,18 @@ export function findHarnessByTabId(
 /// The harness a configured command launches, compared on the path's file stem
 /// so `opencode`, `C:\bin\opencode.exe` and `/usr/local/bin/opencode.cmd` all
 /// resolve. Mirror of Rust `HarnessId::from_command`.
+///
+/// **Deliberately MORE forgiving than the Rust twin on two inputs** (V40 review
+/// L-11), and this is where the difference is written down: Rust's
+/// `Path::file_stem` does not trim, and on Linux it does not split a Windows
+/// path. So a trailing space typed into the Settings command box, and a
+/// Windows-written absolute path read on Linux, resolve here and not there.
+/// Both are the SAFE direction for this side — the window offers the harness's
+/// affordances for a command the backend will treat as a shell, which shows the
+/// user their typo instead of hiding it — and neither reaches a grant: every
+/// gate that matters (sandbox rows, MCP grants, delegation) is answered
+/// backend-side. `harness.test.ts` pins both inputs so the divergence stays
+/// deliberate rather than becoming a surprise.
 ///
 /// **`null` is a first-class answer**: a tab whose command is nobody's binary is
 /// a shell tab, not the default harness (locked decision 2). Both separators are
@@ -272,7 +345,13 @@ export function labelForHarness(list: readonly HarnessInfo[], id: string | null 
 /// second label table would be one more thing to keep in step.
 export function labelForTabId(list: readonly HarnessInfo[], tabId: string): string {
   const h = findHarnessByTabId(list, tabId);
-  if (!h) return '';
+  // **The id itself, never the empty string** (V40 review F-2 / frontend H-1).
+  // `reservedAiTabIds` has a bootstrap fallback and this did not, so between
+  // mount and the roster's arrival the Settings window rendered three AI-tab
+  // enable checkboxes with NO label — and clicking one kills that tab's PTY and
+  // drops its scrollback. Same posture `labelForHarness` already takes for an
+  // id it does not know: render it, do not guess and do not vanish.
+  if (!h) return (tabId ?? '').trim();
   const prefix = `${h.id}-`;
   return tabId.startsWith(prefix) ? `${h.label} (${tabId.slice(prefix.length)})` : h.label;
 }

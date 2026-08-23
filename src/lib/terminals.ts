@@ -78,7 +78,7 @@ import { perTabClosedState } from './avatarState';
 import { openConfigureTabDialog } from './dialog/store';
 import { clearTabError, setTabError } from './tabs/errorState';
 import { isShellTab, isAppRenderedTab, type TabId } from './tabs/types';
-import { tabLabel } from './harness';
+import { isReservedAiTab, tabLabel } from './harness';
 import {
   courtesyRefusal,
   readOnlyAdvice,
@@ -272,8 +272,14 @@ async function ensureModuleListeners(): Promise<void> {
 /// V40 Phase F (locked decision 7): a lookup in the registry rather than a
 /// branch per shipped tab id, so a harness added after this build gets its own
 /// name in "X failed to start." instead of being called a shell.
+///
+/// V40 review L-13: a RESERVED AI tab id whose label is not known yet is called
+/// by its id, not "Shell". `tabLabel` answers `''` until `harness_list` lands,
+/// and a spawn failure is the tightest race there is — it happens at startup —
+/// so "**Shell** failed to start." was landing in a reserved AI tab's error
+/// card.
 function displayNameFor(t: TabId): string {
-  return tabLabel(t) || 'Shell';
+  return isReservedAiTab(t) ? tabLabel(t) || t : 'Shell';
 }
 
 /// True when the entry's host has real layout — attached to a slot

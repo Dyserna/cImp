@@ -3,7 +3,7 @@ import {
   FIXTURE_HARNESSES,
   installFixtureHarnesses,
 } from '../harness.fixture';
-import { scopedFeatureOwner } from '../harness';
+import { harnesses, scopedFeatureOwner } from '../harness';
 
 // V40 Phase F: the harness-scoped feature's owner is a registry lookup now, so
 // the store has to be filled for `spawnBakedInjectionL2` to read its cell.
@@ -19,6 +19,7 @@ import {
   spawnBakedTabOverrides,
   toolScopeMode,
   HARNESS_NATIVE_GATE_KEY,
+  ROSTER_PENDING,
 } from './types';
 import type { Settings, TabInjectionOverrides } from './types';
 
@@ -171,6 +172,34 @@ describe('spawnBakedInjectionL2', () => {
       flip[f](s);
       expect(JSON.stringify(spawnBakedInjectionL2(s)), f).not.toBe(baseline);
     }
+  });
+
+  // V40 review finding F-1. `beforeEach(installFixtureHarnesses)` means every
+  // test above runs with a roster, so the branch that answers before
+  // `harness_list` has resolved had ZERO coverage — and it returned the literal
+  // `true`, a guess that reads as a real answer. A user who had turned the gate
+  // off saw the section's "AI tabs launch differently — restart them" hint fire
+  // on their first edit with no change of theirs behind it.
+  test('a roster that has not answered is a sentinel, never a boolean', () => {
+    harnesses.set([]);
+    const cells = spawnBakedInjectionL2(base());
+    const i = SPAWN_BAKED_INJECTION_FEATURES.indexOf(HARNESS_NATIVE_GATE_KEY);
+    expect(cells[i]).toBe(ROSTER_PENDING);
+    expect(typeof cells[i]).toBe('string');
+    // Stable, so two shapes computed while pending compare equal — the hint
+    // must not fire just because the roster arrived between two reads.
+    expect(spawnBakedInjectionL2(base())[i]).toBe(cells[i]);
+  });
+
+  test('an absent ext row reads the DECLARED default, not a literal', () => {
+    const owner = scopedFeatureOwner(FIXTURE_HARNESSES, HARNESS_NATIVE_GATE_KEY);
+    expect(owner).not.toBeNull();
+    const declared = owner!.harness.fields.find((f) => f.key === owner!.extKey);
+    expect(declared, 'the scoped feature names a declared field').toBeTruthy();
+    const s = base();
+    s.harness = {};
+    const i = SPAWN_BAKED_INJECTION_FEATURES.indexOf(HARNESS_NATIVE_GATE_KEY);
+    expect(spawnBakedInjectionL2(s)[i]).toBe(declared!.default !== false);
   });
 
   test('native-web rides as its tri-mode, not as a boolean', () => {

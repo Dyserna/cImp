@@ -53,7 +53,7 @@
     harnessRow,
     setHarnessExt,
   } from './lib/settings/types';
-  import type { HarnessInfo } from './lib/harness';
+  import type { HarnessInfo, SettingFieldView } from './lib/harness';
   import {
     findHarnessByTabId,
     harnesses,
@@ -1908,8 +1908,11 @@
     });
   }
 
-  // Restart-affecting subset: command + args + cwd + env + the local-provider
-  // toggle (it synthesizes the harness's local-provider env at launch).
+  // Restart-affecting subset: command + args + cwd + env + the custom-provider
+  // flag (it synthesizes the harness's provider env at launch). Since issue
+  // #109 that flag is tab-determined and has no control, so it never differs
+  // from the baseline in practice — it stays in the shape because the value is
+  // still on the wire, and a hand-edited settings file can still move it.
   // Notifications,
   // first_launch_notice_dismissed, and (V20) the tts_injection speak gate
   // apply live and are excluded — the out-of-band TTS source reads the toggle
@@ -2387,13 +2390,14 @@
   {/if}
 {/snippet}
 
-{#snippet harnessSettingsFor(harnessId: string)}
+{#snippet harnessSettingsFor(harnessId: string, filter: (f: SettingFieldView) => boolean = () => true)}
   {#if snapshot}
     {#each $harnesses.filter((h) => h.id === harnessId) as h (h.id)}
       <HarnessExtForm
         harness={h}
         snapshot={snapshot}
         patch={(id, key, value) => patch((s) => setHarnessExt(s, id, key, value))}
+        {filter}
       />
     {/each}
   {/if}
@@ -3901,15 +3905,31 @@
               to be spelled per branch are registry lookups now:
 
               * the harness's declared settings render under its FIRST reserved
-                tab, because they are the harness's and not the tab's — a second
-                reserved tab of the same harness (a local-provider variant) gets
-                a pointer to that section rather than a second copy of the form;
+                tab, because they are the harness's and not the tab's — with
+                ONE declared exception (issue #109): the rows a plugin marks
+                `provider_tab` describe the custom-provider variant, so they
+                render on THAT tab's page instead, next to the tab they
+                configure. A reserved tab that is neither gets a pointer rather
+                than a second copy of the form;
               * every name comes from the descriptor, so a harness added over
                 IPC arrives with its own heading and no markup here.
             -->
             {@const harness = findHarnessByTabId($harnesses, tabsSubSection)}
             {@const live = aiTabAt(tabsSubSection)}
-            {@const ownsForm = harness?.tab_ids[0] === tabsSubSection}
+            <!--
+              Where a declared field renders: its harness's custom-provider tab
+              if it is marked `provider_tab` AND such a tab exists, otherwise
+              the harness's first reserved tab. The fallback is deliberate — a
+              harness that declares provider rows and no provider tab shows them
+              rather than hiding them (no shipped harness does).
+            -->
+            {@const fieldHome = (f: SettingFieldView) =>
+              f.provider_tab && harness?.provider_tab_id
+                ? harness.provider_tab_id
+                : (harness?.tab_ids[0] ?? '')}
+            {@const ownsForm =
+              harness?.tab_ids[0] === tabsSubSection ||
+              harness?.provider_tab_id === tabsSubSection}
             <div id="tab-section-{tabsSubSection}">
               {#if live}
                 <TabSettingsSection
@@ -3931,10 +3951,13 @@
                 >
               {/if}
               {#if harness && ownsForm}
-                {@render harnessSettingsFor(harness.id)}
+                {@render harnessSettingsFor(
+                  harness.id,
+                  (f) => fieldHome(f) === tabsSubSection,
+                )}
               {:else if harness}
                 <small class="hint top">
-                  This tab's local-provider values (and everything else this
+                  This tab's custom-provider values (and everything else this
                   harness declares) are {harness.label}'s own settings — see
                   <strong>Tabs → {labelForTabId($harnesses, harness.tab_ids[0])}</strong>.
                 </small>

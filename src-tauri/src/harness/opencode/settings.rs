@@ -47,6 +47,7 @@ pub const FIELDS: &[SettingField] = &[
         default: SettingDefault::Bool(true),
         spawn_baked: true,
         secret: false,
+        provider_tab: false,
     },
     SettingField {
         key: PROVIDER_AUTO,
@@ -58,6 +59,7 @@ pub const FIELDS: &[SettingField] = &[
         default: SettingDefault::Bool(false),
         spawn_baked: true,
         secret: false,
+        provider_tab: false,
     },
     SettingField {
         key: PROVIDER,
@@ -68,6 +70,7 @@ pub const FIELDS: &[SettingField] = &[
         default: SettingDefault::Null,
         spawn_baked: true,
         secret: false,
+        provider_tab: false,
     },
 ];
 

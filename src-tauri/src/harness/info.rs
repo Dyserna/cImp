@@ -44,6 +44,16 @@ pub struct HarnessInfo {
     pub label: &'static str,
     /// Reserved built-in tab ids, in canonical order.
     pub tab_ids: Vec<&'static str>,
+    /// The reserved tab that launches against a CUSTOM provider — the id of
+    /// the descriptor's tab whose
+    /// [`crate::harness::registry::BuiltinTab::local_provider`] is set, or
+    /// `null` for a harness that has no such tab (issue #109).
+    ///
+    /// The window needs it to decide which tab's page carries the
+    /// [`SettingFieldView::provider_tab`] rows, and it is a registry LOOKUP
+    /// rather than "the second tab" so a harness whose custom-provider variant
+    /// is not second still lands right.
+    pub provider_tab_id: Option<&'static str>,
     /// The binaries whose file stem identifies this harness — what the
     /// frontend's "which harness runs in this tab?" lookup compares against.
     pub binaries: &'static [&'static str],
@@ -139,6 +149,10 @@ pub struct SettingFieldView {
     pub spawn_baked: bool,
     /// A credential: the form masks it.
     pub secret: bool,
+    /// This row belongs on the harness's custom-provider tab page rather than
+    /// on its primary tab page. See
+    /// [`crate::harness::plugin::SettingField::provider_tab`].
+    pub provider_tab: bool,
 }
 
 /// The name a [`HarnessFeature`] travels under. Spelled here rather than
@@ -192,6 +206,7 @@ fn one(d: &'static HarnessDescriptor) -> HarnessInfo {
         id: d.id,
         label: d.label,
         tab_ids: d.tab_ids().collect(),
+        provider_tab_id: d.provider_tab_id(),
         binaries: d.binaries,
         features: d.features.iter().copied().map(feature_token).collect(),
         consumer: d.consumer,
@@ -228,6 +243,7 @@ fn one(d: &'static HarnessDescriptor) -> HarnessInfo {
                 default: f.default.to_json(),
                 spawn_baked: f.spawn_baked,
                 secret: f.secret,
+                provider_tab: f.provider_tab,
             })
             .collect(),
     }

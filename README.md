@@ -29,12 +29,13 @@ AI tabs are the registry's list — today `claude`, `claude-local`, and
 
 - **Claude** — your normal Claude Code, running with whatever auth flow
   you configured (Pro/Max subscription via OAuth, or `ANTHROPIC_API_KEY`).
-- **Claude (local)** — the *same harness's* second reserved tab: another
+- **Claude (custom provider)** — the *same harness's* second reserved tab: another
   `claude` instance with `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` (and
-  optionally `ANTHROPIC_MODEL`) injected at spawn time so it talks to a
-  local Anthropic-compatible proxy instead of `api.anthropic.com`.
-  Configured in *Settings → Tabs → Claude (local) → Local LLM provider*. A
-  harness that picks its own provider declares no such variant.
+  optionally `ANTHROPIC_MODEL`) injected at spawn time so it talks to an
+  Anthropic-API-compatible endpoint instead of `api.anthropic.com`.
+  Configured in *Settings → Tabs → Claude (custom provider)*. The tab IS
+  the choice — there is no per-tab toggle. A harness that picks its own
+  provider declares no such variant.
 - **OpenCode** — the [OpenCode](https://opencode.ai) agent, which manages
   its own providers and credentials (configured inside OpenCode, switchable
   in-session), so it has one reserved tab, not two. cImp injects only its
@@ -69,8 +70,8 @@ the tab is active). Click it to spawn **another tab of the same type** — a
 second tab of whichever reserved tab you clicked. A duplicate:
 
 - clones the origin tab's live config (CLI flags, environment, per-tab speak
-  toggle, *Use local LLM provider*), so a Claude (local) duplicate gets the
-  same `ANTHROPIC_*` injection as the tab it came from;
+  toggle) and its harness's provider settings, so a Claude (custom provider)
+  duplicate gets the same `ANTHROPIC_*` injection as the tab it came from;
 - is auto-named after its origin (`Claude 2`, `OpenCode 2`, …) — rename via
   double-click;
 - is **closable** — it shows a `×` and accepts `Ctrl+W`, unlike the builtin
@@ -102,7 +103,7 @@ no permission detection, and a reduced notification set (`error` and
   subprocess and respawns it with the current configuration. Useful after
   changing the command in Configure.
 - **Close:** click the `×` on the tab, or press `Ctrl+W` while the tab is
-  active. The **builtin** AI tabs (Claude, Claude (local), OpenCode) cannot
+  active. The **builtin** AI tabs (Claude, Claude (custom provider), OpenCode) cannot
   be closed via the `×` — toggle them via the **AI tabs enabled** checkboxes
   in Settings instead — but **spawned duplicates** (see *Multiple tabs of the
   same type*) are closable like any shell. The default first shell tab
@@ -158,7 +159,7 @@ Common alternatives, paste into Configure → command + arguments:
   type `exit` and press Enter on the closed-shell overlay.
 - **How do I delete a Shell tab?** Hover the tab and click `×`, or press
   `Ctrl+W` while the tab is active. The *builtin* AI tabs (Claude, Claude
-  (local), OpenCode) aren't closable from the tab bar — use the *AI tabs
+  (custom provider), OpenCode) aren't closable from the tab bar — use the *AI tabs
   enabled* checkboxes in *Settings → Tabs*; *spawned* AI duplicates are
   closable with `×` like any shell.
 - **My settings.json got corrupted.** Each migration writes a backup
@@ -255,15 +256,16 @@ All shortcuts are rebindable in *Settings → Shortcuts*.
 The default isn't changed — different setups have different conflicts; the
 rebind path covers them.
 
-## Local LLM provider (the Claude (local) tab)
+## Custom provider (the Claude (custom provider) tab)
 
-A harness may declare a **local-provider variant**: a second reserved tab of
+A harness may declare a **custom-provider variant**: a second reserved tab of
 the same binary that cImp spawns with provider environment synthesized from
 settings. Claude Code declares one; OpenCode picks its own provider in-app
-and declares none. The variables below are Claude Code's, which is why they
-are named here and nowhere in cImp's own core.
+and declares none. Which tab it is comes from the registry, so there is no
+per-tab switch to get wrong. The variables below are Claude Code's, which is
+why they are named here and nowhere in cImp's own core.
 
-The **Claude (local)** tab runs the same `claude` binary as the
+The **Claude (custom provider)** tab runs the same `claude` binary as the
 subscription tab but with environment injected at spawn time:
 
 ```
@@ -272,9 +274,9 @@ ANTHROPIC_AUTH_TOKEN=<token your proxy expects>
 ANTHROPIC_MODEL=<optional model alias>
 ```
 
-Configure these under *Settings → Tabs → Claude (local) → Local LLM
-provider*. Claude Code speaks only the Anthropic Messages API, so to point
-it at a local model you run a translating proxy — **LiteLLM** (or any
+Configure these under *Settings → Tabs → Claude (custom provider)*. Claude
+Code speaks only the Anthropic Messages API, so to point it at a local model
+you run a translating proxy — **LiteLLM** (or any
 Anthropic-compatible bridge) in front of Ollama, LM Studio, vLLM, or
 llama-server. cImp does **not** start the proxy; you run it separately.
 
@@ -283,15 +285,15 @@ A typical setup:
 1. Run a LiteLLM proxy (default port `4000`) mapping a model name to your
    local backend. See the
    [LiteLLM docs](https://docs.litellm.ai/docs/proxy/quick_start).
-2. In cImp: *Settings → Tabs → AI tabs enabled* → tick **Claude (local)**.
-3. *Settings → Tabs → Claude (local) → Local LLM provider* → set the Proxy
-   URL (e.g. `http://localhost:4000`), an Auth token (a dummy like
-   `sk-dummy` works for most proxies), and optionally a Model alias.
-4. Restart the Claude (local) tab.
+2. In cImp: *Settings → Tabs → AI tabs enabled* → tick **Claude (custom provider)**.
+3. *Settings → Tabs → Claude (custom provider)* → set the base URL (e.g.
+   `http://localhost:4000`), an auth token (a dummy like `sk-dummy` works
+   for most proxies), and optionally a model alias.
+4. Restart the Claude (custom provider) tab.
 
 Per-tab `env` entries always take precedence over the synthesized values,
 so you can also point a single tab at a different endpoint by setting
-`ANTHROPIC_BASE_URL` directly in *Settings → Tabs → Claude (local) →
+`ANTHROPIC_BASE_URL` directly in *Settings → Tabs → Claude (custom provider) →
 Environment*.
 
 **Caveats:**
@@ -351,7 +353,7 @@ interaction*).
 - **At least one harness CLI:** cImp spawns the harness binary as a
   subprocess, so the binary of every AI tab you enable must be on `PATH` (or
   dropped into `ebin/`). The two that ship registered:
-  - **Claude Code** — the `claude` binary, for the Claude and Claude (local)
+  - **Claude Code** — the `claude` binary, for the Claude and Claude (custom provider)
     tabs. Install per
     <https://docs.anthropic.com/en/docs/claude-code/setup>.
   - **OpenCode** — the `opencode` binary, for the OpenCode tab. It manages
@@ -361,13 +363,12 @@ interaction*).
   A fresh install enables the Claude tab only, so `claude` is what an
   out-of-the-box run needs; enable the tabs you actually want under
   *Settings → Tabs → AI tabs enabled*.
-- **Local proxy (optional, for the Claude (local) tab):** if that tab's
-  *Use local LLM provider* flag is on, you need a running Anthropic-
-  compatible proxy (e.g. LiteLLM bridging to Ollama / LM Studio / vLLM /
-  llama-server) at the URL configured under *Local LLM provider*. cImp does
-  not start it. If it isn't reachable, the tab fails on first message —
-  disable the flag, or just stop using that tab; the other tabs are
-  unaffected.
+- **Local proxy (optional, for the Claude (custom provider) tab):** that tab
+  always launches against the configured endpoint, so you need a running
+  Anthropic-API-compatible proxy (e.g. LiteLLM bridging to Ollama / LM
+  Studio / vLLM / llama-server) at that base URL. cImp does not start it. If
+  it isn't reachable, the tab fails on first message — just stop using that
+  tab; the other tabs are unaffected.
 - **WebView2 (Windows):** preinstalled on updated Windows 10/11. Older
   systems may need the WebView2 runtime installed manually.
 
@@ -456,7 +457,7 @@ The local model does the searching/reading/summarizing; the frontier model's
 context grows by a paragraph instead of a megabyte. Everything stays local
 (unless you opt a cloud backend in).
 
-This is **not** the *Claude (local)* tab — that swaps the whole session's brain to
+This is **not** the *Claude (custom provider)* tab — that swaps the whole session's brain to
 a local model. Offload keeps the frontier model in charge and delegates a bounded
 subtask to a subordinate worker, exposed as an `offload_task` MCP tool.
 
@@ -739,18 +740,18 @@ localhost/LAN-only dev-server webview with **Snapshot → compose**, turning
 
 Per-tab subprocess configuration lives under **Settings → Tabs**, which
 iterates the harness registry: one sub-section per reserved AI tab — today
-**Claude**, **Claude (local)** and **OpenCode** — plus **Shells**. A newly
+**Claude**, **Claude (custom provider)** and **OpenCode** — plus **Shells**. A newly
 registered harness gets its section for free. Each AI tab exposes:
 
 - **Command** (read-only on AI tabs): the binary cImp spawns, from that
   harness's registered default — `claude` for the Claude tabs, `opencode`
   for the OpenCode tab.
 - **Persistent CLI flags:** flags appended to every spawn of that tab.
-- **Use local LLM provider** (only on tabs whose harness declares a
-  local-provider variable set — the Claude tabs today): toggle that gates
-  env synthesis from the global *Local LLM provider* settings (off by
-  default for the subscription Claude tab; on by default for the Claude
-  (local) tab).
+- **Custom provider** (only on a harness's custom-provider tab — *Claude
+  (custom provider)* today): base URL, auth token and model alias, plus a
+  preview of the `ANTHROPIC_*` env that tab launches with. There is no
+  toggle: the reserved tab IS the choice, so the subscription Claude tab
+  can never be pointed at the proxy by accident.
 - **TTS injection** (AI tabs): the toggle that gates whether the tab speaks
   its assistant prose (out of band), plus an editable instructions block
   injected on each spawn through whatever mechanism that harness declares
@@ -829,7 +830,7 @@ Open with `Ctrl+,` or the cog button on the avatar.
   GitHub Dark) plus a 22-color Custom editor for foreground, background,
   cursor, selection, ANSI 8, and bright 8. Each tab can override the
   global palette via Configure Tab → Appearance — useful for color-coding
-  Claude vs. Claude (local) vs. OpenCode vs. shells. Per-tab overrides
+  Claude vs. Claude (custom provider) vs. OpenCode vs. shells. Per-tab overrides
   travel with the tab through drag-and-drop. Plus **terminal background**
   — a solid color or user-supplied image rendered beneath the terminal
   text, with named **global presets** you can save and apply across tabs.
@@ -852,7 +853,7 @@ Open with `Ctrl+,` or the cog button on the avatar.
   splits, new shell tab, close active tab, and close pane. The full
   default set is in *Multi-pane Layout → Keyboard shortcuts* above.
 - **Tabs:** the **AI tabs enabled** checkboxes — one per reserved AI tab in
-  the registry (Claude / Claude (local) / OpenCode today) — plus per-tab
+  the registry (Claude / Claude (custom provider) / OpenCode today) — plus per-tab
   command, CLI flags, TTS injection, notification
   text, and appearance overrides — see *Configuring Tabs* above.
 - **Processing:** stability and max-hold timers for the byte-burst
@@ -901,10 +902,10 @@ are needed, since the per-state behaviour comes from the manifest.
   Install the harness or drop its executable in `ebin/`, then re-enable the
   tab. Claude Code: <https://docs.anthropic.com/en/docs/claude-code/setup>.
   OpenCode: <https://opencode.ai/docs>.
-- **Claude (local) tab errors.** Most often: the local proxy isn't running or
-  the URL in *Local LLM provider* is wrong. Confirm the proxy is reachable.
-  Until you fix it you can simply use the subscription Claude tab, which is
-  unaffected.
+- **Claude (custom provider) tab errors.** Most often: the proxy isn't
+  running, or the base URL on that tab's settings page is wrong. Confirm the
+  proxy is reachable. Until you fix it you can simply use the subscription
+  Claude tab, which is unaffected.
 - **CUDA EP errors per segment (silent output).** You're on a GPU not yet
   covered by the bundled ORT prebuilt (Blackwell / RTX 5090). Switch
   *Settings → Audio → TTS → Process on* to **CPU**. See `docs/MAINTENANCE.md`.
@@ -927,7 +928,7 @@ are needed, since the per-state behaviour comes from the manifest.
   Claude Code's transcript JSONL, OpenCode's event stream. A harness with no
   such source (or a future format change in one) would speak nothing until
   its plugin's reader is updated.
-- Tool-use (Edit / Write / Bash / etc.) on the Claude (local) tab depends
+- Tool-use (Edit / Write / Bash / etc.) on the Claude (custom provider) tab depends
   on the local model supporting Anthropic-style tool calling. Test before
   committing to a particular model.
 - cImp does not bundle or auto-spawn the local proxy/backend — you run

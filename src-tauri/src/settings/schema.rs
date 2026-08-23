@@ -7014,7 +7014,7 @@ mod tests {
             );
         };
         expect("claude", "Claude", "claude", false);
-        expect("claude-local", "Claude (local)", "claude", true);
+        expect("claude-local", "Claude (custom provider)", "claude", true);
         expect("opencode", "OpenCode", "opencode", false);
         // The named constructors the frozen migrations call still answer the
         // same thing as the generic one.

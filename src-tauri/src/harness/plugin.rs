@@ -359,6 +359,20 @@ pub struct SettingField {
     /// before its three fields became `ext` rows, kept so an accidental
     /// `?settings` log line cannot leak an auth token to the rolling log.
     pub secret: bool,
+    /// Whether this field belongs on the harness's CUSTOM-PROVIDER tab page
+    /// rather than on its primary tab page (issue #109).
+    ///
+    /// The harness's `ext` rows are the HARNESS's, not any one tab's, so they
+    /// all used to render under the first reserved tab. That put the fields
+    /// that only ever describe the custom-provider variant on the page of the
+    /// tab they do not apply to, one heading away from the tab they do.
+    ///
+    /// `true` moves the row to the page of the tab whose
+    /// [`crate::harness::registry::BuiltinTab::local_provider`] is set. It is a
+    /// DECLARATION, not a `key.starts_with("local.")` in the window: core never
+    /// spells a key, and a harness with no such tab keeps every row on its
+    /// primary page (fail-open).
+    pub provider_tab: bool,
 }
 
 /// One injection-hierarchy feature a harness declares itself subject to, with

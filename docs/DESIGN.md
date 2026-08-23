@@ -913,7 +913,7 @@ If a complete response contains no TTS tags, the wrapper does not speak any of i
 
 ### Local-LLM TTS reliability
 
-The Claude (local) tab passes the same TTS injection instructions as the subscription Claude tab (Claude Code is identical between the two — only the auth/endpoint env differs). Whether `[[TTS]]…[[/TTS]]` markup actually appears in output depends on the model behind the local proxy. Smaller models (e.g., 7-13B class) often don't follow the markup convention reliably even when instructed; larger models (32B+ or proprietary class) tend to be more compliant. cImp treats missing markup the same way it treats any non-markup output — silently. This is fallback behavior, not an error.
+The Claude (custom provider) tab passes the same TTS injection instructions as the subscription Claude tab (Claude Code is identical between the two — only the auth/endpoint env differs). Whether `[[TTS]]…[[/TTS]]` markup actually appears in output depends on the model behind the local proxy. Smaller models (e.g., 7-13B class) often don't follow the markup convention reliably even when instructed; larger models (32B+ or proprietary class) tend to be more compliant. cImp treats missing markup the same way it treats any non-markup output — silently. This is fallback behavior, not an error.
 
 ---
 

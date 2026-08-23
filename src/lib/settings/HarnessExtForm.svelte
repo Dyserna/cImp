@@ -21,6 +21,7 @@
     harness,
     snapshot,
     patch,
+    filter = () => true,
   }: {
     /// The harness whose declared fields this renders.
     harness: HarnessInfo;
@@ -29,12 +30,20 @@
     /// The window's own settings mutator. Given the key and the new value, so
     /// this component never touches the store directly.
     patch: (harnessId: string, key: string, value: unknown) => void;
+    /// Which of the harness's declared fields this instance owns (issue #109).
+    ///
+    /// One harness's `ext` rows can render on more than one page — the
+    /// custom-provider rows belong on the custom-provider tab's page — and the
+    /// caller decides the split from the DECLARATION
+    /// (`SettingFieldView.provider_tab`), never from the key. Default: all of
+    /// them, which is the single-page case every other caller wants.
+    filter?: (field: SettingFieldView) => boolean;
   } = $props();
 
   /// Fields the form renders. `json` values are written by cImp, not typed —
   /// see `SettingKind` — so they are stored and round-tripped but have no
   /// control here.
-  const rendered = $derived(harness.fields.filter((f) => f.kind !== 'json'));
+  const rendered = $derived(harness.fields.filter((f) => f.kind !== 'json' && filter(f)));
 
   /// The stored value for a field, or its declared default. Never `undefined`:
   /// an absent key is the ordinary case (the backend resolves the same default

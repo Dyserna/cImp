@@ -132,6 +132,13 @@ export interface SettingFieldView {
   spawn_baked: boolean;
   /// A credential: the form masks it behind a Show/Hide button.
   secret: boolean;
+  /// This row belongs on the harness's CUSTOM-PROVIDER tab page (the tab named
+  /// by `HarnessInfo.provider_tab_id`) rather than on its primary tab page.
+  ///
+  /// A declaration, not a prefix match on the key: the window never spells an
+  /// `ext` key, so which fields describe the custom provider is the plugin's
+  /// answer to give.
+  provider_tab: boolean;
 }
 
 /// One registered harness. Mirror of Rust `harness::info::HarnessInfo`.
@@ -140,6 +147,9 @@ export interface HarnessInfo {
   label: string;
   /// Reserved built-in tab ids, in canonical order.
   tab_ids: string[];
+  /// The reserved tab that launches against a custom provider, or `null` for a
+  /// harness with no such tab. Its page carries the `provider_tab` fields.
+  provider_tab_id: string | null;
   /// Binaries whose file stem identifies this harness.
   binaries: string[];
   features: HarnessFeature[];

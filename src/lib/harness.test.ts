@@ -50,6 +50,7 @@ const INFO_KEYS: (keyof HarnessInfo)[] = [
   'id',
   'label',
   'tab_ids',
+  'provider_tab_id',
   'binaries',
   'features',
   'consumer',
@@ -96,6 +97,7 @@ const SETTING_FIELD_KEYS = [
   'default',
   'spawn_baked',
   'secret',
+  'provider_tab',
 ] as const;
 
 /// The keys `ScopedFeatureView` declares.
@@ -188,6 +190,26 @@ describe('registry parity (locked decision 11)', () => {
     // an unused case in a closed vocabulary. What must not happen is the union
     // shrinking below what is declared, which the loop above pins.
     expect(declared.size).toBeGreaterThan(0);
+  });
+
+  test('a declared custom-provider tab is one of the harness reserved tabs', () => {
+    // Issue #109: the Settings window routes every `provider_tab` field to the
+    // page of `provider_tab_id`. An id that is not one of `tab_ids` has no
+    // page, so those fields would render nowhere at all — silently, because
+    // the primary page filters them out on the strength of the same value.
+    let withProviderRows = 0;
+    for (const h of FIXTURE_HARNESSES) {
+      if (h.provider_tab_id !== null) {
+        expect(h.tab_ids, `${h.id}: provider_tab_id names no reserved tab`).toContain(
+          h.provider_tab_id,
+        );
+      }
+      const provider = h.fields.filter((f) => f.provider_tab);
+      if (provider.length > 0) withProviderRows++;
+    }
+    // Non-vacuity: some harness declares provider-tab rows, so a payload that
+    // lost the column fails here rather than passing silently.
+    expect(withProviderRows).toBeGreaterThan(0);
   });
 
   test('a declared local-provider config block names keys the harness declares', () => {

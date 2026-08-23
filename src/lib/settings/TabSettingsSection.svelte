@@ -52,11 +52,21 @@
   /// not know (and for the frame before `harness_list` answers).
   const harness = $derived(findHarnessByTabId($harnesses, tabId));
   const affordances = $derived(harness?.affordances ?? null);
-  /// The env vars a local-provider tab of this harness synthesizes, in render
-  /// order. `null` means this harness has NO local-provider control — it
-  /// manages its own providers — and the checkbox is hidden with the harness's
-  /// own explanation in its place.
+  /// The env vars a custom-provider tab of this harness synthesizes, in render
+  /// order. `null` means this harness has NO custom-provider variant — it
+  /// manages its own providers — and the harness's own explanation renders in
+  /// place of the env preview.
   const localProvider = $derived(affordances?.localProvider ?? null);
+
+  /// Whether THIS tab is its harness's custom-provider tab (issue #109).
+  ///
+  /// It used to be a per-tab checkbox, which was a second, editable spelling of
+  /// something the registry already decides — the backend's integrity pass
+  /// forced the stored flag back to the reserved tab's declared value on every
+  /// load, so ticking it on the primary tab was a control that could not stick.
+  /// The reserved tab IS the choice now; the stored `use_local_provider` field
+  /// stays on the wire, tab-determined.
+  const isProviderTab = $derived(harness?.provider_tab_id === tabId);
 
   /// The preview rows for the local-provider env, filled from the harness's own
   /// `ext` values so the user sees what THIS tab will actually launch with.
@@ -254,39 +264,26 @@
       />
       <small class="hint">
         Extra environment variables for this tab's subprocess. They
-        override any values cImp synthesizes (the set this harness declares for
-        "Use local LLM provider", below). Values are stored cleartext in
-        settings.json. Restart this tab after changing.
+        override any values cImp synthesizes (the custom-provider set this
+        harness declares, where this tab has one). Values are stored cleartext
+        in settings.json. Restart this tab after changing.
       </small>
     </label>
 
-    {#if localProvider}
-      <label class="checkbox">
-        <input
-          type="checkbox"
-          checked={settings.use_local_provider}
-          onchange={(e) =>
-            update(
-              'use_local_provider',
-              (e.currentTarget as HTMLInputElement).checked,
-            )}
-        />
-        <span>
-          Use local LLM provider
-          {#if restartRequired}
-            <Pill variant="orange" size="xs">restart required</Pill>
-          {/if}
-        </span>
-      </label>
-      {#if settings.use_local_provider}
-        <p class="hint hint-effective-env">
-          On launch this tab synthesizes
-          {#each envPreview() as row, i}{#if i > 0}, {/if}<code>{row}</code>{/each}
-          from the harness's own settings (Tabs → {harness?.label ?? ''}).
-          Per-tab env entries below override these.
-        </p>
-      {/if}
-    {:else if affordances?.localProviderNote}
+    <!-- Issue #109: the custom provider is the TAB, not a checkbox. This tab
+         either is its harness's custom-provider tab — and then it always
+         launches against the provider configured below it — or it is not, and
+         there is nothing here to say. A harness with no custom-provider variant
+         at all keeps its own explanation of why. -->
+    {#if localProvider && isProviderTab}
+      <p class="hint hint-effective-env">
+        This tab always launches against the custom provider configured below:
+        it synthesizes
+        {#each envPreview() as row, i}{#if i > 0}, {/if}<code>{row}</code>{/each}
+        from the harness's own settings. Per-tab env entries above override
+        these.
+      </p>
+    {:else if !localProvider && affordances?.localProviderNote}
       <p class="hint hint-effective-env">{affordances.localProviderNote}</p>
     {/if}
   </div>
@@ -520,7 +517,8 @@
     color: var(--text-faint);
   }
 
-  /* Effective-env block shown when "Use local LLM provider" is on.
+  /* Effective-env block on a harness's custom-provider tab (and the
+     "manages its own providers" note in its place elsewhere).
      Different shape than the inline hints — a tinted callout, not a
      mini caption. */
   p.hint-effective-env {

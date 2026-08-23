@@ -294,6 +294,18 @@ impl HarnessDescriptor {
     pub fn tab_ids(&'static self) -> impl Iterator<Item = &'static str> {
         self.tabs.iter().map(|t| t.id)
     }
+
+    /// The id of this harness's CUSTOM-PROVIDER tab — the one reserved tab
+    /// whose [`BuiltinTab::local_provider`] is set — or `None` (issue #109).
+    ///
+    /// The declaration already existed; what did not was a way to ask it by
+    /// harness rather than by tab, which is the question the Settings window
+    /// has ("whose page do the provider fields belong on?"). At most one tab
+    /// answers it: `at_most_one_provider_tab_per_harness` pins that, so `find`
+    /// is not hiding a second one.
+    pub fn provider_tab_id(&'static self) -> Option<&'static str> {
+        self.tabs.iter().find(|t| t.local_provider).map(|t| t.id)
+    }
 }
 
 impl std::fmt::Debug for HarnessDescriptor {
@@ -325,11 +337,14 @@ const REGISTRY: &[HarnessDescriptor] = &[
                 command: "claude",
                 local_provider: false,
             },
-            // V1.4-07: the same binary, preconfigured to talk to a local LLM
-            // through the `claude_local` provider settings.
+            // V1.4-07: the same binary, preconfigured to talk to a custom
+            // Anthropic-API-compatible endpoint through the `local.*` settings.
+            // Issue #109 renamed what the user SEES ("local" read as "on this
+            // machine", which the endpoint need not be); the id, the `ext` keys
+            // and the `local_provider` flag are wire forms and did not move.
             BuiltinTab {
                 id: "claude-local",
-                name: "Claude (local)",
+                name: "Claude (custom provider)",
                 command: "claude",
                 local_provider: true,
             },
@@ -714,6 +729,37 @@ mod tests {
                      — the guidance would steer the model at a name it does not serve"
                 );
             }
+        }
+    }
+
+    /// **At most one reserved tab per harness is the custom-provider one**
+    /// (issue #109).
+    ///
+    /// [`HarnessDescriptor::provider_tab_id`] answers with `find`, and the
+    /// Settings window routes every `provider_tab` field to that one page. A
+    /// second `local_provider: true` tab would make the answer arbitrary and
+    /// silently hide those fields from one of the two.
+    #[test]
+    fn at_most_one_provider_tab_per_harness() {
+        for d in HARNESSES {
+            let providers: Vec<&str> = d
+                .tabs
+                .iter()
+                .filter(|t| t.local_provider)
+                .map(|t| t.id)
+                .collect();
+            assert!(
+                providers.len() <= 1,
+                "{}: {providers:?} all declare local_provider — the custom-provider settings \
+                 page would be one of them, arbitrarily",
+                d.id
+            );
+            assert_eq!(
+                d.provider_tab_id(),
+                providers.first().copied(),
+                "{}: provider_tab_id disagrees with the declared tabs",
+                d.id
+            );
         }
     }
 

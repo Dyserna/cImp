@@ -6,6 +6,7 @@
       "claude",
       "claude-local"
     ],
+    "provider_tab_id": "claude-local",
     "binaries": [
       "claude"
     ],
@@ -66,37 +67,41 @@
         "hint": "Inject a session-scoped `--settings` overlay pointing Claude Code's status line at cImp's own themed context-usage bar. Merges with your own Claude Code settings; your global ~/.claude config is left untouched.",
         "default": true,
         "spawn_baked": true,
-        "secret": false
+        "secret": false,
+        "provider_tab": false
       },
       {
         "key": "local.base_url",
         "kind": "text",
         "options": [],
-        "label": "Local provider — base URL",
-        "hint": "Used only by tabs with `use_local_provider` on: synthesized into ANTHROPIC_BASE_URL at spawn. Typically a LiteLLM proxy bridging to Ollama or LM Studio.",
+        "label": "Custom provider — base URL",
+        "hint": "Synthesized into ANTHROPIC_BASE_URL at spawn. Point it at an Anthropic-API-compatible endpoint (e.g. a LiteLLM proxy in front of Ollama / LM Studio).",
         "default": "http://localhost:4000",
         "spawn_baked": true,
-        "secret": false
+        "secret": false,
+        "provider_tab": true
       },
       {
         "key": "local.auth_token",
         "kind": "text",
         "options": [],
-        "label": "Local provider — auth token",
-        "hint": "Synthesized into ANTHROPIC_AUTH_TOKEN. Stored cleartext in settings.json — local proxies typically accept dummy tokens.",
+        "label": "Custom provider — auth token",
+        "hint": "Synthesized into ANTHROPIC_AUTH_TOKEN. Stored cleartext in settings.json — an Anthropic-API-compatible endpoint (e.g. a LiteLLM proxy in front of Ollama / LM Studio) typically accepts a dummy token.",
         "default": "sk-dummy",
         "spawn_baked": true,
-        "secret": true
+        "secret": true,
+        "provider_tab": true
       },
       {
         "key": "local.model_alias",
         "kind": "text",
         "options": [],
-        "label": "Local provider — model alias",
-        "hint": "Optional. Synthesized into ANTHROPIC_MODEL, which some proxies honour; empty leaves the model to the --model flag.",
+        "label": "Custom provider — model alias",
+        "hint": "Optional. Synthesized into ANTHROPIC_MODEL, which some Anthropic-API-compatible endpoints (e.g. a LiteLLM proxy in front of Ollama / LM Studio) honour; empty leaves the model to the --model flag.",
         "default": "",
         "spawn_baked": true,
-        "secret": false
+        "secret": false,
+        "provider_tab": true
       }
     ],
     "scoped_features": []
@@ -107,6 +112,7 @@
     "tab_ids": [
       "opencode"
     ],
+    "provider_tab_id": null,
     "binaries": [
       "opencode"
     ],
@@ -152,7 +158,8 @@
         "hint": "Let the generated OpenCode plugin DENY the harness's own native tools against the tab's taint latch, rather than only beaconing on them. App-wide ceiling; each tab opts in from its shield badge.",
         "default": true,
         "spawn_baked": true,
-        "secret": false
+        "secret": false,
+        "provider_tab": false
       },
       {
         "key": "provider_auto",
@@ -162,7 +169,8 @@
         "hint": "Re-derive the injected provider block from the primary Local backend's command at each launch and on save, so editing the command takes effect without re-clicking Add to OpenCode.",
         "default": false,
         "spawn_baked": true,
-        "secret": false
+        "secret": false,
+        "provider_tab": false
       },
       {
         "key": "provider",
@@ -172,7 +180,8 @@
         "hint": "Written by cImp, not typed: the provider block injected into OPENCODE_CONFIG_CONTENT.",
         "default": null,
         "spawn_baked": true,
-        "secret": false
+        "secret": false,
+        "provider_tab": false
       }
     ],
     "scoped_features": [

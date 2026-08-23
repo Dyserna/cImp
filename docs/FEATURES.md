@@ -17,9 +17,9 @@ dependency/component breadth) — this is the *capability* breadth.
 ## AI Tabs
 - Hosts **registered harnesses** — real coding CLIs cImp does not ship — each in its own native fullscreen TUI; a harness is one registry row + one `harness/<id>/` plugin directory (`../src-tauri/src/harness/README.md`), and core never branches on which one it is looking at
 - Two harnesses ship registered: **Claude Code** (`claude`) and **OpenCode** (`opencode`); each declares its own reserved tab ids, so the built-in AI tabs are the registry's list (`claude`, `claude-local`, `opencode`)
-- A harness may declare a **local-provider variant** — a second reserved tab of the same binary spawned with provider env synthesized from settings. Claude Code declares one (`claude-local`: `ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN`/`ANTHROPIC_MODEL`, aimed at a local Anthropic-compatible proxy such as LiteLLM bridging Ollama / LM Studio / vLLM / llama-server); OpenCode picks its own provider in-app and declares none
+- A harness may declare a **custom-provider variant** — a second reserved tab of the same binary spawned with provider env synthesized from settings; which tab it is comes from the registry, not from a per-tab toggle. Claude Code declares one (`claude-local`: `ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN`/`ANTHROPIC_MODEL`, aimed at a local Anthropic-compatible proxy such as LiteLLM bridging Ollama / LM Studio / vLLM / llama-server); OpenCode picks its own provider in-app and declares none
 - An AI tab whose command matches **no registered harness** is not misattributed to one — it gets no TUI activity inference, no harness badge, no harness-scoped injection
-- "AI tabs enabled" checkboxes, one per reserved AI tab id in the registry (Claude / Claude (local) / OpenCode today); Claude only on a fresh install
+- "AI tabs enabled" checkboxes, one per reserved AI tab id in the registry (Claude / Claude (custom provider) / OpenCode today); Claude only on a fresh install
 - Fullscreen interaction: mouse kept shell-like (select-copy, Shift+right-click paste) with a hold-`Alt` bypass to the TUI
 - Per-type tab duplication via the `+` button, cloning live config, auto-named & closable
 - Tab context menu: Configure / Restart / Rename / TTS toggle

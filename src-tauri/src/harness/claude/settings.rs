@@ -55,37 +55,43 @@ pub const FIELDS: &[SettingField] = &[
         default: SettingDefault::Bool(true),
         spawn_baked: true,
         secret: false,
+        provider_tab: false,
     },
     SettingField {
         key: LOCAL_BASE_URL,
         kind: SettingKind::Text,
-        label: "Local provider — base URL",
-        hint: "Used only by tabs with `use_local_provider` on: synthesized into \
-               ANTHROPIC_BASE_URL at spawn. Typically a LiteLLM proxy bridging to Ollama or \
-               LM Studio.",
+        label: "Custom provider — base URL",
+        hint: "Synthesized into ANTHROPIC_BASE_URL at spawn. Point it at an \
+               Anthropic-API-compatible endpoint (e.g. a LiteLLM proxy in front of Ollama / \
+               LM Studio).",
         default: SettingDefault::Text("http://localhost:4000"),
         spawn_baked: true,
         secret: false,
+        provider_tab: true,
     },
     SettingField {
         key: LOCAL_AUTH_TOKEN,
         kind: SettingKind::Text,
-        label: "Local provider — auth token",
-        hint: "Synthesized into ANTHROPIC_AUTH_TOKEN. Stored cleartext in settings.json — \
-               local proxies typically accept dummy tokens.",
+        label: "Custom provider — auth token",
+        hint: "Synthesized into ANTHROPIC_AUTH_TOKEN. Stored cleartext in settings.json — an \
+               Anthropic-API-compatible endpoint (e.g. a LiteLLM proxy in front of Ollama / \
+               LM Studio) typically accepts a dummy token.",
         default: SettingDefault::Text("sk-dummy"),
         spawn_baked: true,
         secret: true,
+        provider_tab: true,
     },
     SettingField {
         key: LOCAL_MODEL_ALIAS,
         kind: SettingKind::Text,
-        label: "Local provider — model alias",
-        hint: "Optional. Synthesized into ANTHROPIC_MODEL, which some proxies honour; empty \
+        label: "Custom provider — model alias",
+        hint: "Optional. Synthesized into ANTHROPIC_MODEL, which some Anthropic-API-compatible \
+               endpoints (e.g. a LiteLLM proxy in front of Ollama / LM Studio) honour; empty \
                leaves the model to the --model flag.",
         default: SettingDefault::Text(""),
         spawn_baked: true,
         secret: false,
+        provider_tab: true,
     },
 ];
 

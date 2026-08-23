@@ -206,6 +206,10 @@ pub struct CapabilityHealth {
     pub tier: &'static str,
     /// The human sentence: what upstream must keep doing.
     pub contract: &'static str,
+    /// What the user loses when this row is broken — [`Capability::user_effect`]
+    /// verbatim. The user view of the panel shows this for a failing row; the
+    /// contract sentence is maintainer detail.
+    pub user_effect: &'static str,
     pub degradation: DegradationView,
     pub coverage: Coverage,
     /// The TCB column (matrix decision 10): security controls that *execute
@@ -392,6 +396,7 @@ pub fn health(settings: &Settings) -> Vec<HarnessHealth> {
                     harness: harness_name(c.harness),
                     tier: tier_name(c.tier),
                     contract: c.contract,
+                    user_effect: c.user_effect,
                     degradation: DegradationView::of(c.degradation),
                     coverage: Coverage {
                         canary: c.canary,
@@ -741,6 +746,7 @@ mod tests {
         const TS_TYPES: &str = include_str!("../../../src/lib/settings/types.ts");
         for field in [
             "harness_health",
+            "user_effect",
             "verify_in_flight",
             "last_verify",
             "unproven",

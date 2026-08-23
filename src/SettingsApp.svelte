@@ -7858,7 +7858,7 @@
                         <span class="badge bad">failed</span>
                       {/if}
                     </div>
-                    <p class="cap-contract">{cap.contract}</p>
+                    <p class="cap-contract issue-effect">{cap.user_effect}</p>
                     {#if cap.gate?.blocked}
                       <small class="error">{cap.gate.reason}</small>
                     {/if}
@@ -7870,7 +7870,7 @@
                       </small>
                     {/if}
                     <small class="hint">
-                      <strong>Effect:</strong>
+                      <strong>Detail:</strong> {cap.contract}
                       {cap.degradation.label}{#if cap.degradation.user_message}
                         — “{cap.degradation.user_message}”{/if}{#if cap.degradation.fallback_to}
                         — <code>{cap.degradation.fallback_to}</code> takes over{/if}.
@@ -8776,6 +8776,9 @@
     align-items: center;
     flex-wrap: wrap;
     font-weight: 600;
+  }
+  .issue-effect {
+    font-size: var(--font-size-md);
   }
   .issue-action {
     display: block;

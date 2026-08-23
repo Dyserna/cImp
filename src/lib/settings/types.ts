@@ -1279,6 +1279,10 @@ export interface CapabilityHealth {
   /// `'A'`..`'D'` — the seam, which predicts how it breaks.
   tier: string;
   contract: string;
+  /// What the user loses when this row is broken, in the user's words
+  /// (`Capability::user_effect`). The status-first view shows this for a
+  /// failing or gated-off row; `contract` is maintainer detail.
+  user_effect: string;
   degradation: DegradationView;
   coverage: Coverage;
   /// The TCB column: security controls that EXECUTE inside this capability.

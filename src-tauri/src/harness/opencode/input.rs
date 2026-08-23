@@ -86,6 +86,7 @@ pub const CAPABILITIES: &[Capability] = &[
             "src-tauri/src/harness/plugin.rs",
         ],
         degradation: Degradation::FailClosed,
+        user_effect: "OpenCode tabs cannot receive delegated tasks — a pasted task might split into several turns, so delegation to them is refused.",
         drift_rule: &[],
         canary: None,
         probe: None,

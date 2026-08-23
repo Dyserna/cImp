@@ -183,6 +183,14 @@ pub struct Capability {
     /// keeps honest during refactors.
     pub wired_in: &'static [&'static str],
     pub degradation: Degradation,
+    /// What the USER loses when this row is broken, in their words — "TTS has
+    /// nothing to speak", not "`message.content[]` is missing". The Settings
+    /// *Harness health* page shows it for a failing or gated-off row (restyle
+    /// 2026-08-23); [`Capability::contract`] says what upstream must keep
+    /// doing, this says why anyone should care. One full sentence, no
+    /// backticks — [`tests::every_user_effect_is_a_user_sentence`] holds it
+    /// to that.
+    pub user_effect: &'static str,
     /// The V16 statistical rules that lag this row, if any. Always the
     /// `crate::advisor::RULE_DRIFT_*` constants — never a duplicated literal,
     /// since those constants are the ids the Advisor actually emits.
@@ -379,6 +387,7 @@ const CORE_CAPABILITIES: &[Capability] = &[
             "src-tauri/src/harness/claude/overlay.rs",
         ],
         degradation: Degradation::Silent,
+        user_effect: "Session memory and cImp's context block stop being added to your prompts — Claude works without project memory in this tab.",
         drift_rule: &[RULE_DRIFT_INJECTION_UNSEEN, RULE_DRIFT_PAYLOAD],
         canary: None,
         probe: None,
@@ -419,6 +428,7 @@ const CORE_CAPABILITIES: &[Capability] = &[
             "src-tauri/src/harness/claude/overlay.rs",
         ],
         degradation: Degradation::Silent,
+        user_effect: "After a compaction the session loses the notes cImp would have carried across, so Claude forgets more than it should.",
         drift_rule: &[RULE_DRIFT_PAYLOAD],
         canary: None,
         probe: None,
@@ -465,6 +475,7 @@ const CORE_CAPABILITIES: &[Capability] = &[
             "src-tauri/src/harness/claude/overlay.rs",
         ],
         degradation: Degradation::FailClosed,
+        user_effect: "cImp cannot veto a tool call, so the protections that rely on a veto (injection containment) are refused rather than run unprotected.",
         drift_rule: &[
             RULE_DRIFT_READ_REASON,
             RULE_DRIFT_HOOK_SILENT,
@@ -504,6 +515,7 @@ const CORE_CAPABILITIES: &[Capability] = &[
             "src-tauri/src/harness/claude/overlay.rs",
         ],
         degradation: Degradation::Silent,
+        user_effect: "cImp stops hearing about Claude's file edits — change tracking, checkpoints and tool activity for this tab go quiet.",
         drift_rule: &[RULE_DRIFT_PAYLOAD],
         canary: None,
         probe: None,
@@ -558,6 +570,7 @@ const CORE_CAPABILITIES: &[Capability] = &[
         degradation: Degradation::Fallback {
             to: "perm.tui_scrape",
         },
+        user_effect: "Permission prompts are no longer announced by hook; cImp falls back to reading the screen, which is slower and less reliable.",
         drift_rule: &[RULE_DRIFT_PAYLOAD],
         canary: None,
         probe: None,
@@ -624,6 +637,7 @@ const CORE_CAPABILITIES: &[Capability] = &[
             "src-tauri/src/harness/claude/overlay.rs",
         ],
         degradation: Degradation::Silent,
+        user_effect: "Web fetches and searches are no longer flagged, so content from the web is not treated as untrusted by injection protection.",
         drift_rule: &[RULE_DRIFT_PAYLOAD],
         canary: None,
         probe: None,
@@ -680,6 +694,7 @@ const CORE_CAPABILITIES: &[Capability] = &[
             "src-tauri/src/harness/claude/overlay.rs",
         ],
         degradation: Degradation::Silent,
+        user_effect: "Automatic checkpoints stop firing before Claude edits files; manual checkpoints still work.",
         drift_rule: &[RULE_DRIFT_PAYLOAD],
         canary: None,
         probe: None,
@@ -726,6 +741,7 @@ const CORE_CAPABILITIES: &[Capability] = &[
         ],
         wired_in: &["src-tauri/src/processing/permission.rs"],
         degradation: Degradation::Silent,
+        user_effect: "Permission prompts are not detected from the screen — no announcement or spoken alert, and a prompt can sit unnoticed.",
         drift_rule: &[],
         canary: None,
         probe: None,
@@ -792,6 +808,7 @@ const CORE_CAPABILITIES: &[Capability] = &[
         degradation: Degradation::Fallback {
             to: "claude.transcript.assistant_text",
         },
+        user_effect: "Turn end is not announced by hook; idle notifications and TTS fall back to the transcript and may arrive late.",
         drift_rule: &[RULE_DRIFT_PAYLOAD],
         canary: None,
         probe: None,
@@ -849,6 +866,7 @@ const CORE_CAPABILITIES: &[Capability] = &[
         degradation: Degradation::Fallback {
             to: "claude.transcript.tool_result",
         },
+        user_effect: "Tool results stop arriving by hook; tool activity is read from the transcript instead and may lag.",
         drift_rule: &[RULE_DRIFT_PAYLOAD],
         canary: None,
         probe: None,
@@ -897,6 +915,7 @@ const CORE_CAPABILITIES: &[Capability] = &[
         degradation: Degradation::Fallback {
             to: "claude.transcript.subagents",
         },
+        user_effect: "Sub-agent start/stop are not reported by hook; cImp reads them from the transcript, so sub-agent usage may be incomplete.",
         // `drift.subagent_transcripts.v1` is deliberately NOT listed, even
         // though it is about sub-agents: that rule is fed by
         // `SubagentState::drift_tick`, which reads the TRANSCRIPT layout, so it
@@ -951,6 +970,7 @@ const CORE_CAPABILITIES: &[Capability] = &[
             "src-tauri/src/tts/prose.rs",
         ],
         degradation: Degradation::Silent,
+        user_effect: "TTS has nothing to speak, idle detection from the transcript stops, and this tab cannot complete delegated tasks.",
         drift_rule: &[],
         canary: Some("claude.transcript.assistant_text"),
         probe: Some("claude.transcript.assistant_text"),
@@ -991,6 +1011,7 @@ const CORE_CAPABILITIES: &[Capability] = &[
         degradation: Degradation::Fallback {
             to: "claude.hook.stop",
         },
+        user_effect: "Turn boundaries are no longer read from the transcript; cImp relies on the Stop hook alone.",
         drift_rule: &[],
         canary: Some("claude.transcript.stop_reason"),
         probe: Some("claude.transcript.stop_reason"),
@@ -1043,6 +1064,7 @@ const CORE_CAPABILITIES: &[Capability] = &[
         ],
         wired_in: &["src-tauri/src/harness/claude/read.rs"],
         degradation: Degradation::Silent,
+        user_effect: "Token usage and cost for this tab stop updating — the usage widget, session insights and pricing show nothing new.",
         drift_rule: &[RULE_DRIFT_USAGE_FIELDS],
         canary: Some("claude.transcript.usage"),
         probe: Some("claude.transcript.usage"),
@@ -1079,6 +1101,7 @@ const CORE_CAPABILITIES: &[Capability] = &[
         // counted twice; a tab that declares nothing (pre-upgrade, no loopback,
         // OpenCode) is served here exactly as before.
         degradation: Degradation::Silent,
+        user_effect: "Tool results are no longer read from the transcript; if the hook path is also down, tool activity for this tab stops.",
         drift_rule: &[],
         canary: Some("claude.transcript.tool_result"),
         probe: Some("claude.transcript.tool_result"),
@@ -1102,6 +1125,7 @@ const CORE_CAPABILITIES: &[Capability] = &[
         ],
         wired_in: &["src-tauri/src/harness/claude/read.rs"],
         degradation: Degradation::Silent,
+        user_effect: "cImp cannot tell which tab a transcript belongs to — per-tab memory, usage and insights may be misattributed or dropped.",
         drift_rule: &[],
         canary: None,
         probe: Some("claude.transcript.identity"),
@@ -1133,6 +1157,7 @@ const CORE_CAPABILITIES: &[Capability] = &[
         ],
         wired_in: &["src-tauri/src/harness/claude/read.rs"],
         degradation: Degradation::Silent,
+        user_effect: "Sub-agent work becomes invisible — its token usage and tool calls are missing from insights and cost.",
         drift_rule: &[RULE_DRIFT_SUBAGENT],
         canary: None,
         probe: None,
@@ -1202,6 +1227,7 @@ const CORE_CAPABILITIES: &[Capability] = &[
         ],
         wired_in: &["src-tauri/src/harness/claude/statusline.rs"],
         degradation: Degradation::Silent,
+        user_effect: "The status line stops showing model, context and rate limits, and the Usage widget goes stale.",
         drift_rule: &[],
         canary: Some("claude.statusline.stdin"),
         probe: None,
@@ -1228,6 +1254,7 @@ const CORE_CAPABILITIES: &[Capability] = &[
             "src-tauri/src/settings/injection.rs",
         ],
         degradation: Degradation::Silent,
+        user_effect: "cImp's per-session settings (hooks, status line, MCP) are not applied — most cImp features in Claude tabs silently stop.",
         drift_rule: &[],
         canary: None,
         probe: Some("claude.flag.settings_overlay"),
@@ -1277,6 +1304,7 @@ const CORE_CAPABILITIES: &[Capability] = &[
         // remove the flag this row becomes `VisibleOff` *and* that branch
         // becomes reachable in the same commit.
         degradation: Degradation::FailClosed,
+        user_effect: "Per-tab session pinning is refused, so per-tab memory scope and usage attribution are unavailable for new Claude tabs.",
         drift_rule: &[],
         canary: None,
         probe: Some("claude.flag.session_id"),
@@ -1333,6 +1361,7 @@ const CORE_CAPABILITIES: &[Capability] = &[
         ],
         wired_in: &["src-tauri/src/harness/opencode/read.rs"],
         degradation: Degradation::Silent,
+        user_effect: "cImp hears nothing from OpenCode tabs — no TTS, no idle notifications, no tool activity or usage.",
         drift_rule: &[],
         canary: Some("opencode.sse.events"),
         probe: None,
@@ -1360,6 +1389,7 @@ const CORE_CAPABILITIES: &[Capability] = &[
         ],
         wired_in: &["src-tauri/src/harness/opencode/read.rs"],
         degradation: Degradation::Silent,
+        user_effect: "Pushing prompts into OpenCode tabs — including delegation — stops working.",
         drift_rule: &[],
         canary: None,
         probe: None,
@@ -1439,6 +1469,7 @@ const CORE_CAPABILITIES: &[Capability] = &[
                            live session tap and the V30 push fanout are off for OpenCode tabs \
                            until the authentication scheme is rewired.",
         },
+        user_effect: "cImp cannot talk to OpenCode's local server; the OpenCode integration switches itself off and says so.",
         drift_rule: &[],
         canary: None,
         probe: Some("opencode.route.noauth"),
@@ -1474,6 +1505,7 @@ const CORE_CAPABILITIES: &[Capability] = &[
             "src-tauri/src/harness/opencode/templates/plugin.js",
         ],
         degradation: Degradation::Silent,
+        user_effect: "Tool-call blocking in OpenCode may miss tools cImp does not know about, so containment is not enforced for them.",
         drift_rule: &[],
         canary: None,
         probe: Some("opencode.tool_registry"),
@@ -1530,6 +1562,7 @@ const CORE_CAPABILITIES: &[Capability] = &[
             "src-tauri/src/offload/loopback.rs",
         ],
         degradation: Degradation::Silent,
+        user_effect: "cImp's OpenCode plugin is not loaded — tool-call blocking, tool activity and session reporting for OpenCode tabs stop.",
         drift_rule: &[],
         canary: None,
         probe: None,
@@ -1580,6 +1613,7 @@ const CORE_CAPABILITIES: &[Capability] = &[
             "src-tauri/src/harness/plugin.rs",
         ],
         degradation: Degradation::FailClosed,
+        user_effect: "This tab cannot be used as a delegation worker; delegating to it is refused rather than attempted.",
         drift_rule: &[],
         canary: None,
         probe: None,
@@ -2157,6 +2191,27 @@ mod tests {
     /// are structurally reachable by only one of them — a CLI flag has no
     /// fixture to canary, and the four transcript fields of
     /// `claude.transcript.identity` have no single reader to drive one through.
+    /// `user_effect` is the ONE column written for the user rather than the
+    /// maintainer, so it is held to the user's register: a full sentence,
+    /// and none of the identifier vocabulary (backticks, capability ids)
+    /// the other columns are made of.
+    #[test]
+    fn every_user_effect_is_a_user_sentence() {
+        for c in capabilities() {
+            let e = c.user_effect.trim();
+            assert!(
+                e.len() >= 40 && e.ends_with('.'),
+                "{}: user_effect must be a full sentence ending in '.': {e:?}",
+                c.id
+            );
+            assert!(
+                !e.contains('`') && !e.contains(c.id),
+                "{}: user_effect is written for the user — no backticks or capability ids: {e:?}",
+                c.id
+            );
+        }
+    }
+
     #[test]
     fn every_silent_degradation_has_a_canary_or_a_probe_or_a_waiver() {
         let naked: Vec<&str> = capabilities()

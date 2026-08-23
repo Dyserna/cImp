@@ -2035,7 +2035,7 @@
           {:else if pricingTable === null}
             <p class="placeholder">loading prices…</p>
           {:else if dashCostRows.every((r) => r.unpriced)}
-            <!-- rc.9 live-verify (#100 item 23, OpenCode on a local model): when
+            <!-- rc.9 live-verify (#100 item 23, a session on a local model): when
                  NOTHING in the session is priced, a donut with no arcs, a
                  legend of $0.0000 · 0% rows and a badge per model says the same
                  thing four ways and the empty-donut prose overflowed the card.

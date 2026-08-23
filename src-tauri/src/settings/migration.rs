@@ -439,6 +439,11 @@ const MIGRATION_STEPS: &[MigrationStep] = &[
         detect: looks_v35,
         transform: migrate_v35_to_v36_step,
     },
+    MigrationStep {
+        from_version: "v36",
+        detect: looks_v36,
+        transform: migrate_v36_to_v37_step,
+    },
 ];
 
 // --- Uniform-signature wrappers -------------------------------------------
@@ -3004,6 +3009,73 @@ fn migrate_v35_to_v36_step(value: &mut Value, _shell: &ShellSpec) {
     migrate_v35_to_v36(value)
 }
 
+fn looks_v36(value: &Value) -> bool {
+    value
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .is_some_and(|v| v == 36)
+}
+
+fn migrate_v36_to_v37_step(value: &mut Value, _shell: &ShellSpec) {
+    migrate_v36_to_v37(value)
+}
+
+/// v36 -> v37: the two fixed usage-lane colors become a **map keyed by the
+/// harness's declared `TurnOrigin` id** (V40 Phase I, issue #107 item 4).
+///
+/// | v36 | v37 |
+/// |---|---|
+/// | `graph.usage_color_session` | `graph.usage_lane_colors["session"]` |
+/// | `graph.usage_color_agent` | `graph.usage_lane_colors["agent"]` |
+///
+/// `session` and `agent` are the two lane ids both shipped harnesses declare,
+/// so the keys are the ids the user's colors were already about — the pair was
+/// simply spelled into core's schema instead of read off the declaration. A
+/// harness with a third lane could not be given a color at all; now every lane
+/// falls back to the palette slot for its declared position, and this map holds
+/// only what the user actually picked.
+///
+/// Absent or non-string values are dropped rather than defaulted: an absent
+/// entry means "use the declared position's palette slot", which is the answer
+/// a fresh install gets and the right answer for a file that never set one.
+fn migrate_v36_to_v37(value: &mut Value) {
+    let Some(root) = value.as_object_mut() else {
+        return;
+    };
+    if let Some(graph) = root.get_mut("graph").and_then(Value::as_object_mut) {
+        let mut lanes = serde_json::Map::new();
+        for (field, lane) in [
+            ("usage_color_session", "session"),
+            ("usage_color_agent", "agent"),
+        ] {
+            if let Some(v) = graph.remove(field) {
+                if v.is_string() {
+                    lanes.insert(lane.to_string(), v);
+                }
+            }
+        }
+        // Merge rather than replace, for the same reason the v35 step merges
+        // its harness rows: a hand-written `usage_lane_colors` is the user's
+        // and outranks a field this step is retiring.
+        if !lanes.is_empty() {
+            match graph.get_mut("usage_lane_colors").and_then(Value::as_object_mut) {
+                Some(existing) => {
+                    for (k, v) in lanes {
+                        existing.entry(k).or_insert(v);
+                    }
+                }
+                None => {
+                    graph.insert("usage_lane_colors".to_string(), Value::Object(lanes));
+                }
+            }
+        }
+    }
+    root.insert(
+        "schema_version".to_string(),
+        Value::Number(serde_json::Number::from(37u8)),
+    );
+}
+
 /// The two harness ids the v35 file format had FIELDS for.
 ///
 /// A frozen list, like every other constant in this module (locked decision
@@ -4332,6 +4404,114 @@ mod tests {
     /// of this; this is the mechanical one, driven over a file carrying every
     /// pair the step moves, with values chosen so a swapped Claude/OpenCode
     /// copy would be visible rather than symmetric.
+    // ── V40 Phase I: lane colours (issue #107 item 4) ─────────────────────
+
+    /// **The user's two picked lane colours survive becoming a map** (schema
+    /// 36 -> 37).
+    ///
+    /// The one thing a settings migration has to get right is that the user's
+    /// existing answers survive it. `session` and `agent` are the lane ids both
+    /// shipped harnesses declare, so the keys are what the two retired fields
+    /// were already about — the pair was spelled into core's schema instead of
+    /// read off the declaration.
+    #[test]
+    fn v36_to_v37_moves_the_lane_pair_into_the_map() {
+        let mut v = json!({
+            "schema_version": 36,
+            "graph": {
+                "usage_color_session": "#112233",
+                "usage_color_agent": "#445566",
+                "usage_color_in": "#58a6ff",
+            },
+        });
+        migrate_v36_to_v37(&mut v);
+        assert_eq!(v["schema_version"], json!(37));
+        assert_eq!(
+            v["graph"]["usage_lane_colors"],
+            json!({ "session": "#112233", "agent": "#445566" })
+        );
+        assert!(v["graph"].get("usage_color_session").is_none());
+        assert!(v["graph"].get("usage_color_agent").is_none());
+        // The KIND colours are cImp's own pricing vocabulary, not a lane —
+        // they stay exactly where they are.
+        assert_eq!(v["graph"]["usage_color_in"], json!("#58a6ff"));
+        // The result deserializes, which is the half a shape assertion misses.
+        let mut full = serde_json::to_value(crate::settings::Settings::default()).unwrap();
+        full["graph"] = v["graph"].clone();
+        let typed: crate::settings::Settings = serde_json::from_value(full).unwrap();
+        assert_eq!(
+            typed.graph.usage_lane_colors.get("agent").map(String::as_str),
+            Some("#445566")
+        );
+    }
+
+    /// **A file that never picked a colour gets no row.**
+    ///
+    /// Absent means "the palette slot for this lane's declared position", which
+    /// is the answer a fresh install gets. Writing the old defaults in as
+    /// explicit rows would pin every existing install to today's palette and
+    /// make a future palette change invisible to everyone but new users — the
+    /// "empty is not absent" mistake in the other direction.
+    #[test]
+    fn v36_to_v37_writes_no_lane_map_for_a_file_that_carried_nothing() {
+        let mut v = json!({ "schema_version": 36, "graph": { "usage_color_in": "#58a6ff" } });
+        migrate_v36_to_v37(&mut v);
+        assert!(v["graph"].get("usage_lane_colors").is_none());
+        // …and a file with no `graph` block at all is untouched but stamped.
+        let mut bare = json!({ "schema_version": 36 });
+        migrate_v36_to_v37(&mut bare);
+        assert_eq!(bare, json!({ "schema_version": 37 }));
+    }
+
+    /// **The first two palette slots are the colours the retired settings
+    /// defaulted to** (V40 Phase I, issue #107 item 4).
+    ///
+    /// The acceptance for item 4 is that a user who never picked a colour sees
+    /// no change: lane 0 stays `#30363d` and lane 1 stays `#3b6ea5`. Those
+    /// values moved from `GraphSettings`'s defaults into a palette array in
+    /// `CodeIntelligenceView.svelte`, where no Rust test would otherwise see
+    /// them — so this reads the array out of the component, the same way
+    /// `every_settings_reader_runs_the_harness_parse_boundary` reads a function
+    /// body out of its own file.
+    ///
+    /// Newline-agnostic: CI checks this tree out with CRLF.
+    #[test]
+    fn the_first_two_lane_palette_slots_are_the_shipped_colours() {
+        let src = include_str!("../../../src/lib/CodeIntelligenceView.svelte").replace('\r', "");
+        let at = src
+            .find("const LANE_PALETTE = [")
+            .expect("`LANE_PALETTE` is gone — re-point this test");
+        let rest = &src[at..];
+        let body = &rest[rest.find('[').expect("the array opens") + 1
+            ..rest.find(']').expect("the array closes")];
+        let slots: Vec<&str> = body
+            .split(',')
+            .map(|s| s.trim().trim_matches('\'').trim_matches('"'))
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert!(
+            slots.len() >= 4,
+            "the lane palette has {} slots — a harness with four lanes would fall through to the \
+             overflow colour before the reader could tell them apart: {slots:?}",
+            slots.len()
+        );
+        assert_eq!(
+            &slots[..2],
+            ["#30363d", "#3b6ea5"],
+            "slots 0 and 1 are the colours `usage_color_session` / `usage_color_agent` defaulted \
+             to; changing them recolours every existing install's usage donut, which item 4 \
+             promised it would not"
+        );
+        let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        for s in &slots {
+            assert!(
+                s.len() == 7 && s.starts_with('#'),
+                "{s:?} is not a `#rrggbb` literal"
+            );
+            assert!(seen.insert(s), "duplicate palette slot {s} — two lanes would paint alike");
+        }
+    }
+
     // ── V40 Phase I: the PROJECT OVERLAY cascade (issue #107 item 5) ───────
 
     /// **A stale project overlay is migrated, and the `claude_*` pair lands in
@@ -5044,7 +5224,11 @@ mod tests {
                 (step.transform)(&mut v, &shell);
             }
         }
-        assert_eq!(v["schema_version"], json!(36));
+        assert_eq!(
+            v["schema_version"],
+            json!(crate::settings::schema::CURRENT_SCHEMA_VERSION),
+            "the cascade must reach the current version, not stop at whatever was current when              this test was written"
+        );
         assert_eq!(v["tabs"][0]["injection_overrides"]["taint_latch"], json!("inherit"));
     }
 
@@ -5087,7 +5271,10 @@ mod tests {
             "tool_plugins": { "plugins": {}, "project_paths": {}, "global_paths": {} },
             "code_audit": { "tools": [{ "id": "semgrep", "enabled": false }] },
         }));
-        assert_eq!(a["schema_version"], json!(36));
+        assert_eq!(
+            a["schema_version"],
+            json!(crate::settings::schema::CURRENT_SCHEMA_VERSION)
+        );
         assert!(a["code_audit"].get("tools").is_none(), "the array still moves");
         assert_eq!(
             a["tool_plugins"]["plugins"]["cimp-audit@1"]["tools"]["semgrep"]["enabled"],
@@ -5108,7 +5295,10 @@ mod tests {
             },
             "code_audit": { "enabled": true },
         }));
-        assert_eq!(b["schema_version"], json!(36));
+        assert_eq!(
+            b["schema_version"],
+            json!(crate::settings::schema::CURRENT_SCHEMA_VERSION)
+        );
         assert_eq!(
             b["tool_plugins"]["plugins"]["cimp-audit@1"]["tools"]["semgrep"]["parameters"],
             json!(["--foo"])

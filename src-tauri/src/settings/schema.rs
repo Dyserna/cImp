@@ -160,7 +160,7 @@ pub const SHELL_BROOT_TAB_ID: &str = "shell-broot";
 /// Files that pre-date V1.10 lack the field entirely; the cascade still
 /// uses the `looks_v1_X` predicates for those, falling through to a final
 /// step that stamps the field with the current value.
-pub const CURRENT_SCHEMA_VERSION: u8 = 36;
+pub const CURRENT_SCHEMA_VERSION: u8 = 37;
 
 fn current_schema_version() -> u8 {
     CURRENT_SCHEMA_VERSION
@@ -3153,11 +3153,21 @@ pub struct GraphSettings {
     /// V16 Feature 8: the cache-write segment's color — new alongside the
     /// four above now that `cache_make` is plotted as its own segment.
     pub usage_color_write: String,
-    /// V24 Phase C follow-up: the S/A lane colors — main-session and
-    /// sub-agent segments under the chart (the agent color also tints the
-    /// sub-agent bars' outline). Edited via the same legend swatches.
-    pub usage_color_session: String,
-    pub usage_color_agent: String,
+    /// **Per-lane colors, keyed by the harness's declared `TurnOrigin` id**
+    /// (V40 Phase I, issue #107 item 4; schema 36 -> 37).
+    ///
+    /// Was a fixed pair, `usage_color_session` / `usage_color_agent` — two
+    /// settings fields named after one harness's two lanes. `TurnOrigin` has
+    /// been declared data since Phase D, so a harness with a third lane got the
+    /// second lane's swatch (the legend `laneSeg` clamped) and no donut fill
+    /// rule of its own, which painted it SVG-default black. Sparse on purpose:
+    /// **absent means "the palette slot for this lane's declared position"**,
+    /// so a harness's lanes are colored the day they are declared and only a
+    /// lane the user actually picked a color for carries a row here.
+    ///
+    /// The v36 -> v37 step moves the two old fields in under the keys
+    /// `"session"` and `"agent"`, so a user's picked colors survive.
+    pub usage_lane_colors: std::collections::BTreeMap<String, String>,
 }
 
 impl std::fmt::Debug for GraphSettings {
@@ -3248,8 +3258,7 @@ impl std::fmt::Debug for GraphSettings {
             .field("usage_color_out", &self.usage_color_out)
             .field("usage_color_tool", &self.usage_color_tool)
             .field("usage_color_write", &self.usage_color_write)
-            .field("usage_color_session", &self.usage_color_session)
-            .field("usage_color_agent", &self.usage_color_agent)
+            .field("usage_lane_colors", &self.usage_lane_colors)
             .finish()
     }
 }
@@ -3362,8 +3371,7 @@ impl Default for GraphSettings {
             usage_color_out: "#3fb950".to_string(),
             usage_color_tool: "#f0c674".to_string(),
             usage_color_write: "#e3738d".to_string(),
-            usage_color_session: "#30363d".to_string(),
-            usage_color_agent: "#3b6ea5".to_string(),
+            usage_lane_colors: std::collections::BTreeMap::new(),
         }
     }
 }

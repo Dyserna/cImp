@@ -659,7 +659,7 @@ Cloud backends are gated behind an explicit data-egress consent toggle and badge
 
 ## Settings Schema
 
-The on-disk JSON shape (`schema_version` 36). The example below is an abridged view of the fully-resolved global file — it shows the groups that matter architecturally, not every field; the per-folder overlay (`.cimp/config.json`) is a partial subset of the same shape.
+The on-disk JSON shape (`schema_version` 37). The example below is an abridged view of the fully-resolved global file — it shows the groups that matter architecturally, not every field; the per-folder overlay (`.cimp/config.json`) is a partial subset of the same shape.
 
 Two groups are harness-shaped and neither names a harness in code. `harness` is a **map keyed by registry id**, one block per harness, so adding a harness needs no settings migration: core's own per-harness fields (`expose_commands`, `expose_code_audit`, `last_seen`, `last_verified`, `input_profile_status`, `auto_verify`) plus `ext`, an opaque object whose schema, defaults and validation belong to that harness's plugin (`HarnessPlugin::settings_schema`) — core stores it, type-checks the declared keys at the parse boundary, folds the spawn-baked ones into the spawn signature, and never names a key. `enabled_ai_tabs` is a list of reserved AI tab ids drawn from the same registry.
 

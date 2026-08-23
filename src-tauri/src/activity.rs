@@ -199,10 +199,19 @@ const FILE_COMPACT_SLACK: usize = 500;
 /// store onto it. `compaction_leaves_room_to_append` pins the relation.
 const FILE_COMPACT_LINES: usize = TOTAL_CAPACITY + FILE_COMPACT_SLACK;
 
-/// The relation above, enforced at **compile time**: adding a lane (or raising
-/// a cap) past the compaction trigger must not build. A test could only catch
-/// it after someone ran it.
-const _: () = assert!(FILE_COMPACT_LINES >= TOTAL_CAPACITY + FILE_COMPACT_SLACK);
+/// The headroom above, enforced at **compile time**: a compaction rewrite
+/// resets `file_lines` to at most [`TOTAL_CAPACITY`], so the trigger must sit
+/// STRICTLY above it — at or below, a saturated store rewrites the whole file
+/// on every single record. `compaction_leaves_room_to_append` pins the same
+/// relation at runtime, but only for whoever runs the test; this one refuses
+/// to build.
+///
+/// Stated against `TOTAL_CAPACITY` rather than against
+/// `TOTAL_CAPACITY + FILE_COMPACT_SLACK` on purpose: the latter is the *defining*
+/// expression of [`FILE_COMPACT_LINES`], so asserting it was a tautology that
+/// could not fire — including in the one case that matters, `FILE_COMPACT_SLACK`
+/// being edited to 0 (survey defect D3).
+const _: () = assert!(FILE_COMPACT_LINES > TOTAL_CAPACITY);
 
 /// The feed kind an activity belongs to. Kept as a closed enum at every
 /// recording site (see [`ActivityEntry::new`]) so a new recorder can't typo a

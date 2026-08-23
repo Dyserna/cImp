@@ -2200,7 +2200,7 @@ mod tests {
                 for entry in list {
                     assert!(
                         seen.insert(*entry),
-                        "{}: `{what}` lists {entry:?} twice — the Settings window keys its                          rows by it and refuses to render the page",
+                        "{}: `{what}` lists {entry:?} twice — the Settings window keys its rows by it and refuses to render the page",
                         c.id
                     );
                 }

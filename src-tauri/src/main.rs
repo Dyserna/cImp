@@ -242,7 +242,7 @@ fn resolve_consumer(args: &[String], in_app_ok: bool) -> Result<&'static str, St
     match crate::harness::HarnessId::from_consumer(named) {
         Some(h) => Ok(h.id().expect("from_consumer never answers ANY")),
         None => Err(format!(
-            "cimp: --consumer {named:?} names no registered harness. Registered: {known}{}. A              consumer token decides which MCP servers this child may reach, so an unrecognised              one is refused rather than defaulted.",
+            "cimp: --consumer {named:?} names no registered harness. Registered: {known}{}. A consumer token decides which MCP servers this child may reach, so an unrecognised one is refused rather than defaulted.",
             if in_app_ok {
                 " (plus `offload`, cImp's own in-app consumer)"
             } else {

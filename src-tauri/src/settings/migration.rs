@@ -3020,6 +3020,11 @@ fn migrate_v36_to_v37_step(value: &mut Value, _shell: &ShellSpec) {
     migrate_v36_to_v37(value)
 }
 
+/// The v36 schema's serialised defaults for the two lane fields — what a file
+/// that never opened the colour picker carried (see [`migrate_v36_to_v37`]).
+const V36_USAGE_COLOR_SESSION: &str = "#30363d";
+const V36_USAGE_COLOR_AGENT: &str = "#3b6ea5";
+
 /// v36 -> v37: the two fixed usage-lane colors become a **map keyed by the
 /// harness's declared `TurnOrigin` id** (V40 Phase I, issue #107 item 4).
 ///
@@ -3038,18 +3043,26 @@ fn migrate_v36_to_v37_step(value: &mut Value, _shell: &ShellSpec) {
 /// Absent or non-string values are dropped rather than defaulted: an absent
 /// entry means "use the declared position's palette slot", which is the answer
 /// a fresh install gets and the right answer for a file that never set one.
+///
+/// **A value equal to the v36 default is dropped too** (rc.9 live-verify item
+/// 38). The v36 fields were plain always-serialised strings, so EVERY v36 file
+/// carried `#30363d` / `#3b6ea5` whether or not the user ever opened the
+/// picker — copying those would pin every upgrading install to the v36 palette
+/// and make a future palette change invisible to everyone but new users, the
+/// exact mistake the test below names. A user who picked the default colour on
+/// purpose loses nothing: the palette slot for that position IS that colour.
 fn migrate_v36_to_v37(value: &mut Value) {
     let Some(root) = value.as_object_mut() else {
         return;
     };
     if let Some(graph) = root.get_mut("graph").and_then(Value::as_object_mut) {
         let mut lanes = serde_json::Map::new();
-        for (field, lane) in [
-            ("usage_color_session", "session"),
-            ("usage_color_agent", "agent"),
+        for (field, lane, v36_default) in [
+            ("usage_color_session", "session", V36_USAGE_COLOR_SESSION),
+            ("usage_color_agent", "agent", V36_USAGE_COLOR_AGENT),
         ] {
             if let Some(v) = graph.remove(field) {
-                if v.is_string() {
+                if v.as_str().is_some_and(|s| s != v36_default) {
                     lanes.insert(lane.to_string(), v);
                 }
             }
@@ -4441,6 +4454,36 @@ mod tests {
     /// explicit rows would pin every existing install to today's palette and
     /// make a future palette change invisible to everyone but new users — the
     /// "empty is not absent" mistake in the other direction.
+    /// **The v36 defaults are not a pick.** Every v36 file carried them (the
+    /// fields were always serialised), so copying them would pin every
+    /// upgrading install to that palette — rc.9 live-verify item 38 found
+    /// exactly this on a real profile. One default + one real pick ⇒ only the
+    /// pick survives.
+    #[test]
+    fn v36_to_v37_drops_lane_values_equal_to_the_v36_defaults() {
+        let mut v = json!({
+            "schema_version": 36,
+            "graph": {
+                "usage_color_session": "#30363d",
+                "usage_color_agent": "#3b6ea5",
+            },
+        });
+        migrate_v36_to_v37(&mut v);
+        assert!(v["graph"].get("usage_lane_colors").is_none());
+        assert!(v["graph"].get("usage_color_session").is_none());
+        assert!(v["graph"].get("usage_color_agent").is_none());
+
+        let mut mixed = json!({
+            "schema_version": 36,
+            "graph": {
+                "usage_color_session": "#30363d",
+                "usage_color_agent": "#445566",
+            },
+        });
+        migrate_v36_to_v37(&mut mixed);
+        assert_eq!(mixed["graph"]["usage_lane_colors"], json!({ "agent": "#445566" }));
+    }
+
     #[test]
     fn v36_to_v37_writes_no_lane_map_for_a_file_that_carried_nothing() {
         let mut v = json!({ "schema_version": 36, "graph": { "usage_color_in": "#58a6ff" } });

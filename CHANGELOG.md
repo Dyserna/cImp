@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.53.0-rc.10] — 2026-08-23
+
+_rc.9 live-verify fixes (#100, first half). Settings schema 37 → 38._
+
+### Changed
+
+- **Idle announcements stop spamming (#112).** "<tab> is idle" is now
+  announced at the harness's real turn end — Claude Code's `Stop` hook —
+  never on the terminal heuristic's per-tool-call edges, and only when the
+  turn ran at least `behavior.idle_announce_min_working_secs` (default 120;
+  0 restores every-idle). Permission, question and error announcements are
+  not gated. Notification texts gain a `{tab}` placeholder (the tab's
+  current name); seeded texts migrate to it, so a duplicated or renamed tab
+  names itself.
+- **Claude (custom provider) is the custom-provider tab (#109).** The
+  per-tab *Use local LLM provider* checkbox is gone (the backend already
+  forced it per reserved tab, so it silently reverted). The base URL / auth
+  token / model alias fields live on that tab's page and read "Custom
+  provider — …"; the reserved tab seeds as "Claude (custom provider)".
+- An all-unpriced session's cost card is one sentence naming the models
+  instead of an empty donut, `$0.0000 · 0%` rows and a badge per model.
+
+### Fixed
+
+- Settings → Harness health rendered nothing (a capability listed one
+  `wired_in` path twice; the page's keyed list threw). Duplicates are now a
+  test failure.
+- The "restart the tab" hint toasted twice in the main window (one emit per
+  window reached every `Any` listener).
+- The 36 → 37 migration pinned every upgrading profile to the v36 lane
+  colours; values equal to the old defaults are dropped so the palette slot
+  answers.
+- The `--consumer` refusal no longer carries leaked indentation.
+
+### Known
+
+- #111 a Notification hook arriving after the prompt was answered re-flags
+  it; #110 eSpeak-ng fallback fails to initialise in the installed build;
+  #108 leaked indentation in ~50 other continued string literals.
+
 ## [0.53.0-rc.9] — 2026-08-23
 
 ### Changed

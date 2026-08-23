@@ -7717,18 +7717,24 @@
             that answers "what is actually broken right now" without reading
             source. Everything below is RENDERED, not decided: the grouping,
             the tier order, the coverage marks, the gate verdicts and every
-            outcome come from `harness::health::health()`. The one piece of
-            logic here is display grouping, which is the whole point — a rule
-            about the registry re-implemented in Svelte is a rule with no test.
+            outcome come from `harness::health::health()`.
+
+            Restyled 2026-08-23 (user decision): STATUS FIRST. The registry's
+            columns — tier, degradation, coverage, TCB, wired-in — are the
+            maintainer's bookkeeping ("which rows need a canary"), not a
+            status, and a page full of "Breaks silently" marks read as a to-do
+            list the user could do nothing about. The user's view is now one
+            verdict line per harness, plus the rows that are ACTUALLY failing
+            or gated off, each written as consequence + what they can do. The
+            full matrix is still here, behind a maintainer disclosure — the
+            same data, nothing removed from the wire.
           -->
           <h2>Harness health</h2>
           <small class="hint top">
-            cImp rides two user-installed CLIs it does not pin, and both
-            self-update. Each row below is one thing cImp depends on from them,
-            ranked by the <strong>seam</strong> it sits in — Tier D (scraped UI,
-            undocumented behavior) breaks silently on a cosmetic upstream change
-            and is listed first; Tier A (MCP) has never broken cImp at all. This
-            page is read-only apart from <em>Run checks now</em>.
+            cImp rides user-installed CLIs it does not pin, and they self-update.
+            When a CLI update changes something cImp depends on, a feature can
+            stop working with no error — this page says when that has happened,
+            what stops working, and what you can do about it.
           </small>
           {#if !harnessFresh}
             <small class="hint">Reading the capability registry…</small>
@@ -7744,16 +7750,24 @@
               </small>
             {/if}
             {#each harnessFresh.harness_health as panel (panel.harness)}
-              <div class="harness-panel">
+              {@const broken = brokenNow(panel)}
+              {@const stale = panel.stale_plugins?.length ?? 0}
+              {@const behind =
+                !!panel.last_seen &&
+                !!panel.last_verified &&
+                panel.last_seen !== panel.last_verified}
+              <div
+                class="harness-panel"
+                class:harness-panel-bad={broken.length > 0}
+                class:harness-panel-warn={broken.length === 0 && (stale > 0 || behind)}
+              >
                 <div class="harness-head">
                   <span class="harness-title">{panel.label}</span>
                   <!--
                     Every button is disabled while ANY run is in flight — the
                     single flight is process-wide (one set of probe children at
-                    a time), so a second harness's
-                    click would be dropped rather than queued. Only the harness
-                    actually running says so, and the shared note below covers
-                    the case where the run is an automatic one nobody clicked.
+                    a time), so a second harness's click would be dropped
+                    rather than queued.
                   -->
                   <button
                     onclick={() => void runHarnessChecks(panel.harness)}
@@ -7764,172 +7778,283 @@
                       : 'Run checks now'}
                   </button>
                 </div>
-                <ul class="harness-facts">
-                  <li>
-                    <span class="fact-key">Version seen</span>
-                    <code>{panel.last_seen || 'not observed yet'}</code>
-                  </li>
-                  {#if panel.last_verified != null}
-                    <li>
-                      <span class="fact-key">Contracts verified against</span>
-                      <code>{panel.last_verified || 'never verified'}</code>
-                      {#if panel.last_seen && panel.last_verified && panel.last_seen !== panel.last_verified}
-                        <span class="badge warn">behind the installed build</span>
+                <!--
+                  The verdict line. One sentence, computed from the same facts
+                  the old facts-list showed; the facts themselves moved into
+                  the maintainer disclosure.
+                -->
+                <p class="harness-verdict">
+                  {#if broken.length > 0}
+                    <span class="badge bad">{broken.length} broken</span>
+                  {:else if panel.last_verified == null}
+                    <span class="badge quiet">nothing to verify</span>
+                  {:else if !panel.last_seen}
+                    <span class="badge quiet">not seen yet</span>
+                  {:else if behind}
+                    <span class="badge warn">not yet verified</span>
+                  {:else}
+                    <span class="badge good">all checks passed</span>
+                  {/if}
+                  <span class="fact-detail">
+                    {#if panel.last_seen}
+                      <code>{panel.last_seen}</code> installed
+                    {/if}
+                    {#if panel.auto_verify}
+                      · last automatic check {ageOf(panel.auto_verify.at_ms)}
+                    {/if}
+                    {#if panel.last_run}
+                      · last run {ageOf(panel.last_run.at_ms)}
+                      ({panel.last_run.pass} pass, {panel.last_run.fail} fail{#if panel.last_run.unknown > 0},
+                        {panel.last_run.unknown} could not be checked{/if})
+                    {/if}
+                  </span>
+                </p>
+                {#if behind && broken.length === 0}
+                  <small class="hint">
+                    <code>{panel.last_seen}</code> is installed but cImp last verified
+                    its contracts against <code>{panel.last_verified || 'nothing'}</code>.
+                    An automatic check runs after an update; <em>Run checks now</em>
+                    runs it immediately.
+                  </small>
+                {/if}
+                {#if stale > 0}
+                  <!--
+                    V35 Phase I. The plugin/overlay a tab runs is baked at
+                    LAUNCH, so upgrading cImp with a tab open leaves an old
+                    artifact talking to new loopback code. This one the user
+                    CAN fix — open a fresh tab — so it stays in the user view.
+                  -->
+                  <div class="harness-issue warn">
+                    <div class="issue-title">
+                      {stale === 1 ? 'One tab is' : `${stale} tabs are`} running an
+                      out-of-date cImp plugin
+                    </div>
+                    <small class="hint">
+                      {#each panel.stale_plugins as sp (sp.tab)}
+                        <div><code>{sp.tab}</code> — {sp.note}</div>
+                      {/each}
+                    </small>
+                    <small class="hint issue-action">
+                      <strong>What to do:</strong> close and reopen
+                      {stale === 1 ? 'that tab' : 'those tabs'}; a fresh tab
+                      gets the current plugin.
+                    </small>
+                  </div>
+                {/if}
+                {#each broken as cap (cap.id)}
+                  <!--
+                    A failing or gated-off row, in user terms: what it is, what
+                    that costs, what can be done. The contract sentence is the
+                    registry's own, the effect is the degradation sentence, and
+                    the remedy is the one the user actually has: reinstall the
+                    verified CLI version, wait for a cImp update, or report it.
+                  -->
+                  <div class="harness-issue bad">
+                    <div class="issue-title">
+                      <code class="cap-id">{cap.id}</code>
+                      {#if cap.gate?.blocked}
+                        <span class="badge bad">gated off</span>
+                      {:else}
+                        <span class="badge bad">failed</span>
                       {/if}
-                    </li>
-                  {/if}
-                  {#if panel.auto_verify}
+                    </div>
+                    <p class="cap-contract">{cap.contract}</p>
+                    {#if cap.gate?.blocked}
+                      <small class="error">{cap.gate.reason}</small>
+                    {/if}
+                    {#if cap.last_verify?.outcome === 'fail'}
+                      <small class="hint">
+                        {cap.last_verify.detail}
+                        — {ageOf(cap.last_verify.at_ms)}, against
+                        <code>{cap.last_verify.version || 'no recorded version'}</code>
+                      </small>
+                    {/if}
+                    <small class="hint">
+                      <strong>Effect:</strong>
+                      {cap.degradation.label}{#if cap.degradation.user_message}
+                        — “{cap.degradation.user_message}”{/if}{#if cap.degradation.fallback_to}
+                        — <code>{cap.degradation.fallback_to}</code> takes over{/if}.
+                      {#if cap.wired_in.length > 0}
+                        Affects
+                        {#each cap.wired_in as path, i (path)}<code>{path}</code>{i < cap.wired_in.length - 1 ? ', ' : ''}{/each}.
+                      {/if}
+                    </small>
+                    <small class="hint issue-action">
+                      <strong>What to do:</strong>
+                      {#if cap.gate?.blocked}
+                        the feature is switched off until this is resolved.
+                      {/if}
+                      If this started after the CLI updated, installing the last
+                      version cImp verified{#if panel.last_verified}
+                        (<code>{panel.last_verified}</code>){/if}
+                      brings it back; otherwise wait for a cImp update, or report it
+                      together with the output of <em>Run checks now</em>.
+                    </small>
+                  </div>
+                {/each}
+                <!--
+                  The maintainer view: the whole registry, as before. Same
+                  data, same marks; only the default visibility changed.
+                -->
+                <details class="cap-more harness-matrix">
+                  <summary>
+                    All {panel.capabilities.length} dependencies (maintainer view)
+                  </summary>
+                  <small class="hint">
+                    Each row is one thing cImp depends on from this CLI, ranked by
+                    the <strong>seam</strong> it sits in — Tier D (scraped UI,
+                    undocumented behavior) is most fragile and listed first; Tier A
+                    (MCP) has never broken cImp. "Breaks silently" is the
+                    classification of a row, not its status: it says a break would
+                    produce no error, which is why cImp checks it.
+                  </small>
+                  <ul class="harness-facts">
                     <li>
-                      <span class="fact-key">Last automatic run</span>
-                      <span class="badge {recordClass(panel.auto_verify.status)}"
-                        >{panel.auto_verify.status}</span
-                      >
-                      <span class="fact-detail">
-                        against <code>{panel.auto_verify.version || 'no version'}</code>,
-                        {ageOf(panel.auto_verify.at_ms)}
-                      </span>
+                      <span class="fact-key">Version seen</span>
+                      <code>{panel.last_seen || 'not observed yet'}</code>
                     </li>
-                  {/if}
-                  {#if panel.last_run}
-                    <li>
-                      <span class="fact-key">Last run this session</span>
-                      <span class="fact-detail">
-                        {panel.last_run.pass} pass · {panel.last_run.fail} fail ·
-                        {panel.last_run.unknown} unknown · {panel.last_run.transition}
-                        transition, {ageOf(panel.last_run.at_ms)}
-                        {#if panel.last_run.capped}
-                          — the live-probe half was skipped for time
+                    {#if panel.last_verified != null}
+                      <li>
+                        <span class="fact-key">Contracts verified against</span>
+                        <code>{panel.last_verified || 'never verified'}</code>
+                        {#if behind}
+                          <span class="badge warn">behind the installed build</span>
                         {/if}
-                      </span>
-                    </li>
-                  {/if}
-                  {#if panel.stale_plugins?.length}
-                    <!--
-                      V35 Phase I. The plugin/overlay a tab runs is baked at
-                      LAUNCH, so upgrading cImp with a tab open leaves an old
-                      artifact talking to new loopback code — V32 met that four
-                      times and each time it read as a mysterious failure. The
-                      `chp` version on the wire is what makes it sayable. The
-                      sentence comes from Rust; this only paints it.
-                    -->
-                    <li>
-                      <span class="fact-key">Out-of-step tabs</span>
-                      <span class="badge warn">{panel.stale_plugins.length}</span>
-                      <span class="fact-detail">
-                        {#each panel.stale_plugins as sp (sp.tab)}
-                          <div>
-                            <code>{sp.tab}</code> — sends CHP {sp.seen_chp}, this build
-                            writes CHP {sp.expected}. {sp.note}
-                          </div>
-                        {/each}
-                      </span>
-                    </li>
-                  {/if}
-                  {#if brokenNow(panel).length > 0}
-                    <li>
-                      <span class="fact-key">Broken now</span>
-                      <span class="badge bad">{brokenNow(panel).length}</span>
-                      <span class="fact-detail"
-                        >{brokenNow(panel)
-                          .map((c) => c.id)
-                          .join(', ')}</span
+                      </li>
+                    {/if}
+                    {#if panel.auto_verify}
+                      <li>
+                        <span class="fact-key">Last automatic run</span>
+                        <span class="badge {recordClass(panel.auto_verify.status)}"
+                          >{panel.auto_verify.status}</span
+                        >
+                        <span class="fact-detail">
+                          against <code>{panel.auto_verify.version || 'no version'}</code>,
+                          {ageOf(panel.auto_verify.at_ms)}
+                        </span>
+                      </li>
+                    {/if}
+                    {#if panel.last_run}
+                      <li>
+                        <span class="fact-key">Last run this session</span>
+                        <span class="fact-detail">
+                          {panel.last_run.pass} pass · {panel.last_run.fail} fail ·
+                          {panel.last_run.unknown} unknown · {panel.last_run.transition}
+                          transition, {ageOf(panel.last_run.at_ms)}
+                          {#if panel.last_run.capped}
+                            — the live-probe half was skipped for time
+                          {/if}
+                        </span>
+                      </li>
+                    {/if}
+                    {#if stale > 0}
+                      <li>
+                        <span class="fact-key">Out-of-step tabs</span>
+                        <span class="badge warn">{stale}</span>
+                        <span class="fact-detail">
+                          {#each panel.stale_plugins as sp (sp.tab)}
+                            <div>
+                              <code>{sp.tab}</code> — sends CHP {sp.seen_chp}, this build
+                              writes CHP {sp.expected}. {sp.note}
+                            </div>
+                          {/each}
+                        </span>
+                      </li>
+                    {/if}
+                  </ul>
+                  <ul class="cap-list">
+                    {#each panel.capabilities as cap (cap.id)}
+                      <li
+                        class="cap"
+                        class:cap-bad={cap.last_verify?.outcome === 'fail' ||
+                          cap.gate?.blocked}
                       >
-                    </li>
-                  {/if}
-                </ul>
-                <ul class="cap-list">
-                  {#each panel.capabilities as cap (cap.id)}
-                    <li
-                      class="cap"
-                      class:cap-bad={cap.last_verify?.outcome === 'fail' ||
-                        cap.gate?.blocked}
-                    >
-                      <div class="cap-head">
-                        <span class="badge tier tier-{cap.tier}">Tier {cap.tier}</span>
-                        <code class="cap-id">{cap.id}</code>
-                        {#if cap.controls.length > 0}
-                          <!--
-                            Matrix decision 10: a TCB row does not merely carry
-                            data for a security control, the control EXECUTES
-                            inside it. Marked distinctly so a reviewer cannot
-                            read it as another data pipe.
-                          -->
-                          <span class="badge tcb" title="Security control executes here"
-                            >TCB</span
+                        <div class="cap-head">
+                          <span class="badge tier tier-{cap.tier}">Tier {cap.tier}</span>
+                          <code class="cap-id">{cap.id}</code>
+                          {#if cap.controls.length > 0}
+                            <!--
+                              Matrix decision 10: a TCB row does not merely carry
+                              data for a security control, the control EXECUTES
+                              inside it.
+                            -->
+                            <span class="badge tcb" title="Security control executes here"
+                              >TCB</span
+                            >
+                          {/if}
+                          {#if cap.last_verify}
+                            <span class="badge {outcomeClass(cap.last_verify.outcome)}"
+                              >{outcomeLabel(cap.last_verify.outcome)}</span
+                            >
+                          {:else}
+                            <span class="badge quiet">never checked</span>
+                          {/if}
+                        </div>
+                        <p class="cap-contract">{cap.contract}</p>
+                        <div class="cap-marks">
+                          <span class="mark {cap.degradation.kind === 'silent' ? 'bad' : ''}"
+                            >{cap.degradation.label}</span
                           >
+                          {#if cap.degradation.user_message}
+                            <span class="mark quiet">“{cap.degradation.user_message}”</span>
+                          {/if}
+                          {#if cap.degradation.fallback_to}
+                            <span class="mark quiet"
+                              >Falls back to <code>{cap.degradation.fallback_to}</code></span
+                            >
+                          {/if}
+                        </div>
+                        <div class="cap-marks">
+                          {#if cap.coverage.canary}
+                            <span class="badge good">canary L1</span>
+                          {/if}
+                          {#if cap.coverage.probe}
+                            <span class="badge good">live probe L2</span>
+                          {/if}
+                          {#if cap.coverage.unproven}
+                            <span class="badge warn">waiver only — nothing checks this</span>
+                          {:else if cap.coverage.waiver}
+                            <span class="badge quiet">waiver</span>
+                          {/if}
+                          {#if !cap.coverage.canary && !cap.coverage.probe && !cap.coverage.waiver}
+                            <span class="badge quiet">no automatic check</span>
+                          {/if}
+                          {#each cap.controls as control (control)}
+                            <span class="badge tcb">{control}</span>
+                          {/each}
+                        </div>
+                        {#if cap.gate?.blocked}
+                          <small class="error">Gated off: {cap.gate.reason}</small>
                         {/if}
                         {#if cap.last_verify}
-                          <span class="badge {outcomeClass(cap.last_verify.outcome)}"
-                            >{outcomeLabel(cap.last_verify.outcome)}</span
-                          >
-                        {:else}
-                          <span class="badge quiet">never checked</span>
+                          <small class="hint">
+                            {cap.last_verify.detail}
+                            <br />
+                            {ageOf(cap.last_verify.at_ms)}, against
+                            <code>{cap.last_verify.version || 'no recorded version'}</code>
+                            {#if cap.last_verify.evidence}
+                              · <code>{cap.last_verify.evidence}</code>
+                            {/if}
+                          </small>
                         {/if}
-                      </div>
-                      <p class="cap-contract">{cap.contract}</p>
-                      <div class="cap-marks">
-                        <span class="mark {cap.degradation.kind === 'silent' ? 'bad' : ''}"
-                          >{cap.degradation.label}</span
-                        >
-                        {#if cap.degradation.user_message}
-                          <span class="mark quiet">“{cap.degradation.user_message}”</span>
+                        {#if cap.coverage.waiver}
+                          <details class="cap-more">
+                            <summary>Why nothing automatic covers it</summary>
+                            <small class="hint">{cap.coverage.waiver}</small>
+                          </details>
                         {/if}
-                        {#if cap.degradation.fallback_to}
-                          <span class="mark quiet"
-                            >Falls back to <code>{cap.degradation.fallback_to}</code></span
-                          >
-                        {/if}
-                      </div>
-                      <div class="cap-marks">
-                        {#if cap.coverage.canary}
-                          <span class="badge good">canary L1</span>
-                        {/if}
-                        {#if cap.coverage.probe}
-                          <span class="badge good">live probe L2</span>
-                        {/if}
-                        {#if cap.coverage.unproven}
-                          <span class="badge warn">waiver only — nothing checks this</span>
-                        {:else if cap.coverage.waiver}
-                          <span class="badge quiet">waiver</span>
-                        {/if}
-                        {#if !cap.coverage.canary && !cap.coverage.probe && !cap.coverage.waiver}
-                          <span class="badge quiet">no automatic check</span>
-                        {/if}
-                        {#each cap.controls as control (control)}
-                          <span class="badge tcb">{control}</span>
-                        {/each}
-                      </div>
-                      {#if cap.gate?.blocked}
-                        <small class="error">Gated off: {cap.gate.reason}</small>
-                      {/if}
-                      {#if cap.last_verify}
-                        <small class="hint">
-                          {cap.last_verify.detail}
-                          <br />
-                          {ageOf(cap.last_verify.at_ms)}, against
-                          <code>{cap.last_verify.version || 'no recorded version'}</code>
-                          {#if cap.last_verify.evidence}
-                            · <code>{cap.last_verify.evidence}</code>
-                          {/if}
-                        </small>
-                      {/if}
-                      {#if cap.coverage.waiver}
                         <details class="cap-more">
-                          <summary>Why nothing automatic covers it</summary>
-                          <small class="hint">{cap.coverage.waiver}</small>
+                          <summary>What breaks if this drifts</summary>
+                          <small class="hint">
+                            {#each cap.wired_in as path (path)}
+                              <code>{path}</code>{' '}
+                            {/each}
+                          </small>
                         </details>
-                      {/if}
-                      <details class="cap-more">
-                        <summary>What breaks if this drifts</summary>
-                        <small class="hint">
-                          {#each cap.wired_in as path (path)}
-                            <code>{path}</code>{' '}
-                          {/each}
-                        </small>
-                      </details>
-                    </li>
-                  {/each}
-                </ul>
+                      </li>
+                    {/each}
+                  </ul>
+                </details>
               </div>
             {/each}
             <small class="hint down">
@@ -8614,6 +8739,53 @@
   .badge.tier-C {
     color: var(--text-warning, #d08770);
     border-color: var(--border-warning, #d08770);
+  }
+  /* Status-first restyle (2026-08-23): the panel border repeats the verdict so
+     a scroll past the header still reads; the issue cards are the only thing
+     a user sees besides the verdict line. */
+  .harness-panel-bad {
+    border-left: 3px solid var(--text-danger-soft, #d06b6b);
+  }
+  .harness-panel-warn {
+    border-left: 3px solid var(--text-warning, #d08770);
+  }
+  .harness-verdict {
+    display: flex;
+    gap: 0.5rem;
+    align-items: baseline;
+    flex-wrap: wrap;
+    margin: 0.5rem 0 0.25rem;
+    font-size: var(--font-size-sm);
+  }
+  .harness-issue {
+    border: 1px solid var(--border-subtle);
+    border-radius: 6px;
+    padding: 0.5rem 0.6rem;
+    margin: 0.5rem 0;
+    background: var(--surface-sunken);
+  }
+  .harness-issue.bad {
+    border-left: 3px solid var(--text-danger-soft, #d06b6b);
+  }
+  .harness-issue.warn {
+    border-left: 3px solid var(--text-warning, #d08770);
+  }
+  .issue-title {
+    display: flex;
+    gap: 0.4rem;
+    align-items: center;
+    flex-wrap: wrap;
+    font-weight: 600;
+  }
+  .issue-action {
+    display: block;
+    margin-top: 0.3rem;
+  }
+  .harness-matrix {
+    margin-top: 0.5rem;
+  }
+  .harness-matrix > summary {
+    font-weight: 600;
   }
   .harness-panel {
     border: 1px solid var(--border-subtle);

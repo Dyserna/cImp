@@ -9510,7 +9510,7 @@
     flex: 1;
   }
   small.error {
-    color: var(--text-error);
+    color: var(--text-danger-soft);
     font-size: var(--font-size-xs);
   }
   /* V40 review F-3: the roster-load failure banner. Same weight as a field
@@ -9520,7 +9520,7 @@
     align-items: center;
     gap: var(--space-2);
     flex-wrap: wrap;
-    color: var(--text-error);
+    color: var(--text-danger-soft);
     font-size: var(--font-size-xs);
   }
   .preset-list {

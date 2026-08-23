@@ -817,6 +817,68 @@ mod tests {
         assert!(!is_push_route("/mcp/call"));
         assert!(!is_push_route("/activity/discovery_skipped"));
     }
+    /// The `live` column IS the route table, in both directions.
+    ///
+    /// [`EVENTS`] restates 22 route literals that `offload::loopback`'s dispatch
+    /// `match` also spells, and nothing used to assert the two agree. Both
+    /// disagreements are silent with every other test green:
+    ///
+    ///   * a route marked `live` that loopback does not dispatch — a CHP client
+    ///     POSTs it, gets a 404, and `is_push_route` still says the push is
+    ///     observed, so arbitration hands a capability to a peer that cannot
+    ///     actually serve it;
+    ///   * a route NOT marked `live` that loopback does dispatch — the handler
+    ///     runs, but `event_for_route` answers `None`, so the push is never
+    ///     attributed and the quiet detector never notices it stop.
+    ///
+    /// Renaming a core route (V40 Phase C moved twelve of them) hits the first
+    /// case; wiring a reserved route's producer without flipping its column hits
+    /// the second. `core_route_paths()` reads the dispatch `match` as text, so
+    /// this joins the two tables at their real sources rather than at a third
+    /// hand-kept list (survey defect D4).
+    ///
+    /// "Dispatched" is both halves of the router, the same way
+    /// `every_inverted_wire_default_names_a_route_that_exists` reads it: core's
+    /// own `match` arms, then the plugin tables its fallthrough consults.
+    /// `permission.event` lives in the second half - V40 Phase C moved
+    /// `/permission/event` into the Claude plugin because only that harness's
+    /// legacy `--notify-hook` shim can post it - and it is live either way.
+    #[test]
+    fn every_live_route_is_dispatched_and_every_reserved_one_is_not() {
+        let core = crate::offload::loopback::core_route_paths();
+        let dispatched = |route: &str| {
+            core.contains(route) || crate::harness::ingress::route("POST", route).is_some()
+        };
+        // Vacuity guard: the scan panics on an arm it cannot read, but an
+        // empty-but-parseable block would make both directions trivially true.
+        assert!(
+            core.len() > 20,
+            "core_route_paths() returned {} routes - the dispatch scan is not seeing the `match`",
+            core.len()
+        );
+
+        let mut missing = Vec::new();
+        let mut premature = Vec::new();
+        for e in EVENTS {
+            match (e.live, dispatched(e.route)) {
+                (true, false) => missing.push((e.id, e.route)),
+                (false, true) => premature.push((e.id, e.route)),
+                _ => {}
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "CHP marks these events live but loopback dispatches no such route, \
+             so a POST to them 404s while arbitration believes they are served: {missing:?}"
+        );
+        assert!(
+            premature.is_empty(),
+            "loopback dispatches these routes but CHP still marks them reserved, \
+             so the handler runs, the push is never attributed, and it going quiet \
+             is never noticed - flip the `live` column: {premature:?}"
+        );
+    }
+
 
     /// The envelope reads `chp` off a body whose own type knows nothing about
     /// it, tolerates its absence, and accepts either spelling of the

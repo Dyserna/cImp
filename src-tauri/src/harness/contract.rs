@@ -763,7 +763,12 @@ const CORE_CAPABILITIES: &[Capability] = &[
                    with `last_assistant_message` carrying the complete final assistant text. \
                    `MessageDisplay` is deliberately NOT used: it delivers per-chunk deltas on the \
                    streaming hot path, which would change the unit the sentence segmenter is fed \
-                   (milestone locked decision 2, live-verify recipe 10).",
+                   (milestone locked decision 2, live-verify recipe 10). The FIRING ITSELF is a \
+                   second consumer's datum: it is the only once-per-turn boundary this harness \
+                   offers, so `notifications` announces an idle tab on it rather than on the \
+                   avatar's Idle edge, which this harness's TUI activity heuristic fires once per \
+                   output burst (i.e. once per tool call). That consumer needs no field of the \
+                   payload — only that the hook fires, once, at the end of a turn.",
         depends_on: &[
             Dep::ConfigKey("hooks.Stop"),
             Dep::ConfigKey("type=http"),
@@ -781,6 +786,7 @@ const CORE_CAPABILITIES: &[Capability] = &[
             "src-tauri/src/harness/claude/hook.rs",
             "src-tauri/src/harness/claude/overlay.rs",
             "src-tauri/src/offload/loopback.rs",
+            "src-tauri/src/notifications/manager.rs",
             "src-tauri/src/tts/prose.rs",
         ],
         degradation: Degradation::Fallback {

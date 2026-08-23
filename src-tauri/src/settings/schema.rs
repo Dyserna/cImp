@@ -160,7 +160,7 @@ pub const SHELL_BROOT_TAB_ID: &str = "shell-broot";
 /// Files that pre-date V1.10 lack the field entirely; the cascade still
 /// uses the `looks_v1_X` predicates for those, falling through to a final
 /// step that stamps the field with the current value.
-pub const CURRENT_SCHEMA_VERSION: u8 = 37;
+pub const CURRENT_SCHEMA_VERSION: u8 = 38;
 
 fn current_schema_version() -> u8 {
     CURRENT_SCHEMA_VERSION
@@ -4559,9 +4559,14 @@ impl Default for ShellNotificationConfig {
 /// `claude` / `claude-local` / `opencode` is byte-identical to what the three
 /// constructors produced (pinned by `the_seeded_builtins_are_unchanged`).
 ///
-/// The notification prose is derived from the tab's `name` — "<name> is idle" —
-/// which is exactly the pattern all three followed ("Claude is idle", "Claude
-/// (local) is idle", "OpenCode is idle").
+/// The notification prose is seeded with the `{tab}` PLACEHOLDER — "{tab} is
+/// idle" — which [`crate::notifications`] resolves to the tab's *current*
+/// display name when the announcement is spoken. It used to be the name baked
+/// in at seed time ("Claude is idle", "OpenCode is idle"), which went stale the
+/// moment a tab was renamed or duplicated — a "Claude 2" tab clones this config
+/// and would announce "Claude is idle". Schema step 37 → 38 rewrites the baked
+/// form in existing files; the placeholder makes the clone correct by
+/// construction.
 fn ai_tab_from_spec(spec: &'static crate::harness::registry::BuiltinTab) -> TabConfig {
     let name = spec.name;
     TabConfig::AiTool(AiToolTabConfig {
@@ -4579,12 +4584,12 @@ fn ai_tab_from_spec(spec: &'static crate::harness::registry::BuiltinTab) -> TabC
         // the toggle on and injects nothing, which is inert rather than wrong.
         tts_injection: TtsInjection { enabled: true },
         notifications: AiNotificationConfig {
-            idle: NotificationSlot::enabled(format!("{name} is idle")),
-            awaiting_permission: NotificationSlot::enabled(format!(
-                "{name} is awaiting permission"
-            )),
-            question: NotificationSlot::enabled(format!("{name} has a question")),
-            error: NotificationSlot::enabled(format!("{name} encountered an error")),
+            idle: NotificationSlot::enabled("{tab} is idle".to_string()),
+            awaiting_permission: NotificationSlot::enabled(
+                "{tab} is awaiting permission".to_string(),
+            ),
+            question: NotificationSlot::enabled("{tab} has a question".to_string()),
+            error: NotificationSlot::enabled("{tab} encountered an error".to_string()),
         },
         // Pre-dismissed so the overlay code can use a single per-tab
         // predicate. Aider used to fire a first-launch banner (V1.1)
@@ -5159,6 +5164,21 @@ pub struct BehaviorSettings {
     /// don't want to hear "awaiting permission" for the tab they're
     /// staring at.
     pub announce_focused_tab: bool,
+    /// Minimum number of seconds a tab must have been *working* — the span
+    /// from its avatar entering `Thinking` to it settling back — before an
+    /// **idle** announcement is allowed to fire. Fast turns (a one-line
+    /// answer, a single tool call) otherwise announce "… is idle" every few
+    /// seconds, which is the noise this exists to kill.
+    ///
+    /// `0` announces every idle (the historical behavior). Only
+    /// `NotificationEvent::Idle` is gated — permission, question, error and
+    /// exit announcements are never suppressed by this. A settle into Idle
+    /// with no preceding working span (e.g. a harness's startup banner) counts
+    /// as "worked for nothing" and is suppressed whenever this is above 0.
+    ///
+    /// Backward-compatible via the struct's serde-default — an absent key
+    /// reads as the default below, no migration needed.
+    pub idle_announce_min_working_secs: u32,
     /// When true, an AI tab's spoken prose plays even when that tab is not
     /// the active one. Default off keeps the v2 behavior — only the
     /// foreground tab's TTS plays. Independent of announcement TTS,
@@ -5188,6 +5208,7 @@ impl Default for BehaviorSettings {
             announcements_enabled: true,
             follow_avatar: false,
             announce_focused_tab: false,
+            idle_announce_min_working_secs: 120,
             speak_background_tabs: false,
             copy_on_select: true,
             paste_on_right_click: true,
@@ -7002,16 +7023,16 @@ mod tests {
             assert!(c.tts_injection.enabled);
             assert!(c.first_launch_notice_dismissed);
             assert!(c.args.is_empty() && c.cwd.is_none() && c.env.is_empty());
-            assert_eq!(c.notifications.idle.text, format!("{name} is idle"));
+            // The prose is name-INDEPENDENT since schema 38: `{tab}` resolves
+            // to the tab's live display name when the announcement is spoken,
+            // so a rename or a duplicate stays correct without a reseed.
+            assert_eq!(c.notifications.idle.text, "{tab} is idle");
             assert_eq!(
                 c.notifications.awaiting_permission.text,
-                format!("{name} is awaiting permission")
+                "{tab} is awaiting permission"
             );
-            assert_eq!(c.notifications.question.text, format!("{name} has a question"));
-            assert_eq!(
-                c.notifications.error.text,
-                format!("{name} encountered an error")
-            );
+            assert_eq!(c.notifications.question.text, "{tab} has a question");
+            assert_eq!(c.notifications.error.text, "{tab} encountered an error");
         };
         expect("claude", "Claude", "claude", false);
         expect("claude-local", "Claude (custom provider)", "claude", true);

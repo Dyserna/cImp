@@ -143,6 +143,15 @@ struct NotificationManager {
     /// announced. The default is `true`, so an unclassified tab keeps the
     /// pre-V40 behaviour.
     interacted: HashSet<TabId>,
+    /// Turn-boundary bookkeeping for the idle announcement — see [`IdleGate`].
+    /// Split out of this struct because everything about it is testable and
+    /// nothing about the manager is: `NotificationManager` owns an
+    /// [`AudioOutput`], which opens a real output device.
+    gate: IdleGate,
+    /// Tabs whose pending permission / question prompt was just cleared by
+    /// input. Consumed by the next avatar edge for that tab, which is the
+    /// `Listening` the answering keystroke produces.
+    prompt_answered: std::collections::HashSet<TabId>,
 }
 
 impl NotificationManager {
@@ -173,6 +182,8 @@ impl NotificationManager {
             drain_deadline: None,
             just_dispatched: HashMap::new(),
             interacted: HashSet::new(),
+            gate: IdleGate::default(),
+            prompt_answered: std::collections::HashSet::new(),
         }
     }
 
@@ -230,6 +241,22 @@ impl NotificationManager {
                 if prev == state {
                     return;
                 }
+                // Turn-span bookkeeping. Runs ahead of every suppression
+                // `return` below, so a turn is measured over the real
+                // transitions rather than over the subset that survives as far
+                // as an enqueue.
+                // A keystroke that ANSWERS a pending permission / question
+                // prompt is not the user taking the tab back: the turn
+                // continues the moment the answer lands. Keep the clock, or a
+                // long turn with a prompt near its end is judged by its tail
+                // alone and goes silent (rc.9 live-verify, orchestrator review).
+                // The prompt-cleared event is dispatched BEFORE this avatar
+                // edge, so `last_awaiting` already reads false here; the
+                // one-shot `prompt_answered` flag set there is what survives.
+                let answering_prompt = self.prompt_answered.remove(&tab);
+                if !(state == AvatarState::Listening && answering_prompt) {
+                    self.gate.note_avatar_state(&tab, state, Instant::now());
+                }
                 // Suppress the `Speaking → Idle` echo from our own
                 // notification's audio playback ending. The audio thread
                 // emits `TtsPlaybackStarted/Stopped` for the active tab on
@@ -270,6 +297,25 @@ impl NotificationManager {
                 }
                 let nev = match state {
                     AvatarState::Idle if prev != AvatarState::Idle => {
+                        // **Is this edge even this tab's turn boundary?**
+                        //
+                        // For a harness that pushes an explicit end-of-turn
+                        // signal it is not: its Idle edges come from a TUI
+                        // activity heuristic that fires once per output BURST,
+                        // so one tool-heavy turn settles to Idle once per tool
+                        // call. Measured live on 2026-08-23: eight
+                        // "<tab> is idle" announcements inside ONE turn. Those
+                        // tabs are announced on `StateEvent::TurnEnded` and
+                        // nowhere else; every other tab (OpenCode, and any tab
+                        // whose binary core cannot classify) keeps this edge.
+                        if self.turn_end_push(&tab) {
+                            debug!(
+                                ?tab,
+                                "notifications: Idle edge is not a turn boundary \
+                                 (this harness pushes its turn end)"
+                            );
+                            return;
+                        }
                         // Pre-interaction settle (e.g. the startup welcome
                         // banner cycling Idle → Thinking → Idle as it prints):
                         // the user has never driven this tab to Listening, so
@@ -309,6 +355,9 @@ impl NotificationManager {
                             debug!(?tab, "notifications: suppressing Idle (awaiting question)");
                             return;
                         }
+                        if !self.turn_worth_announcing(&tab) {
+                            return;
+                        }
                         NotificationEvent::Idle
                     }
                     AvatarState::Error => NotificationEvent::Error,
@@ -321,6 +370,9 @@ impl NotificationManager {
                     .last_awaiting
                     .insert(tab.clone(), awaiting)
                     .unwrap_or(false);
+                if prev && !awaiting {
+                    self.prompt_answered.insert(tab.clone());
+                }
                 if prev == awaiting || !awaiting {
                     return;
                 }
@@ -334,6 +386,9 @@ impl NotificationManager {
                     .last_awaiting_question
                     .insert(tab.clone(), awaiting)
                     .unwrap_or(false);
+                if prev && !awaiting {
+                    self.prompt_answered.insert(tab.clone());
+                }
                 if prev == awaiting || !awaiting {
                     return;
                 }
@@ -376,11 +431,54 @@ impl NotificationManager {
                 self.last_awaiting_question.remove(&tab);
                 self.just_dispatched.remove(&tab);
                 self.interacted.remove(&tab);
+                self.gate.forget(&tab);
+                self.prompt_answered.remove(&tab);
                 // Drop any queued notifications targeting the closed tab —
                 // playing them after close would refer to a tab that no
                 // longer exists in the UI.
                 self.queue.retain(|q| q.tab != tab);
                 return;
+            }
+            StateEvent::TurnEnded { tab } => {
+                // The harness itself said the assistant turn is over. For a
+                // harness that pushes this it is the ONLY idle-announcement
+                // trigger (see the `AvatarState::Idle` arm above); for any
+                // other tab a stray push is a no-op, so the two paths can never
+                // both fire for one turn.
+                if !self.turn_end_push(&tab) {
+                    return;
+                }
+                if self.suppress_for_focus(&tab) {
+                    return;
+                }
+                // The same two "this Idle is really a prompt" guards the Idle
+                // edge runs: a `Stop` can land immediately before the prompt
+                // that follows it, and the user would hear "idle" for what is
+                // actually "awaiting permission".
+                if self.last_awaiting.get(&tab).copied().unwrap_or(false) {
+                    debug!(?tab, "notifications: suppressing turn end (awaiting permission)");
+                    return;
+                }
+                if self
+                    .last_awaiting_question
+                    .get(&tab)
+                    .copied()
+                    .unwrap_or(false)
+                {
+                    debug!(?tab, "notifications: suppressing turn end (awaiting question)");
+                    return;
+                }
+                // Deliberately NOT behind the `interacted` guard the Idle edge
+                // runs. That guard exists because a fresh tab's startup banner
+                // cycles the avatar like a finished turn — and a turn-end push
+                // cannot come from a banner: it fires only after a genuine
+                // assistant turn, which IS the proof of activity the guard
+                // stands in for. A resumed session that finishes a turn before
+                // the user has typed anything is a real event and gets said.
+                if !self.turn_worth_announcing(&tab) {
+                    return;
+                }
+                self.try_enqueue(tab, NotificationEvent::Idle)
             }
             StateEvent::ActiveTabChanged { .. }
             | StateEvent::DoneWhileAwayChanged { .. }
@@ -412,6 +510,50 @@ impl NotificationManager {
         crate::tabs::tab_harness_by_id(&self.settings.current(), tab.as_str())
             .and_then(|h| h.plugin())
             .is_none_or(|p| p.emits_startup_chrome())
+    }
+
+    /// Whether `tab`'s harness pushes an explicit end-of-turn signal
+    /// ([`crate::harness::plugin::HarnessPlugin::turn_end_push`]) — i.e.
+    /// whether this tab is announced on `StateEvent::TurnEnded` instead of on
+    /// the avatar's `Idle` edge.
+    ///
+    /// A tab running no registered harness answers `false`, which is the
+    /// trait default and the safe direction: it keeps the Idle-edge path, so an
+    /// unclassified tab announces (possibly a little more than it should)
+    /// rather than going silent waiting for a push that has no producer.
+    fn turn_end_push(&self, tab: &TabId) -> bool {
+        crate::tabs::tab_harness_by_id(&self.settings.current(), tab.as_str())
+            .and_then(|h| h.plugin())
+            .is_some_and(|p| p.turn_end_push())
+    }
+
+    /// Close `tab`'s open turn and answer whether it ran long enough to be
+    /// worth an announcement — `behavior.idle_announce_min_working_secs`.
+    ///
+    /// Read-and-clear either way: the caller only reaches this once it has
+    /// decided the edge really is a turn boundary. Re-reads settings on every
+    /// call so a changed value applies to the next turn without a restart, like
+    /// the focus filter — a tab that is mid-turn when the number changes is
+    /// judged by the NEW number, since the measurement is a timestamp and not a
+    /// decision taken at turn start.
+    fn turn_worth_announcing(&mut self, tab: &TabId) -> bool {
+        let min_secs = self
+            .settings
+            .current()
+            .behavior
+            .idle_announce_min_working_secs;
+        let min = Duration::from_secs(u64::from(min_secs));
+        match self.gate.close_turn(tab, Instant::now(), min) {
+            IdleVerdict::Announce => true,
+            IdleVerdict::TooShort { worked } => {
+                let worked_secs = worked.map(|d| d.as_secs_f32()).unwrap_or(0.0);
+                debug!(
+                    ?tab,
+                    "notifications: idle suppressed (worked {worked_secs:.1}s < {min_secs}s)"
+                );
+                false
+            }
+        }
     }
 
     /// True if `tab` should be skipped because it's the currently-focused
@@ -595,7 +737,115 @@ fn notification_text(
     if !slot.enabled {
         return String::new();
     }
-    interpolate_code(&slot.text, exit_code)
+    // `{code}` first, then `{tab}`: a display name that happens to contain the
+    // literal "{code}" must stay literal instead of being re-scanned.
+    interpolate_tab(&interpolate_code(&slot.text, exit_code), entry.name())
+}
+
+/// Replace `{tab}` with the tab's **current** display name.
+///
+/// This is what makes a seeded notification survive a rename or a duplicate.
+/// The four AI slots ship as "{tab} is idle" / "{tab} is awaiting permission" /
+/// "{tab} has a question" / "{tab} encountered an error" rather than with the
+/// name baked in at seed time, so the tab-duplicate path — which clones the
+/// source tab's whole config, notification texts included (see
+/// `ipc::tab_lifecycle::create_ai_tab`) — is correct by construction: "Claude 2"
+/// says "Claude 2 is idle", where a baked name said "Claude is idle".
+///
+/// Existing settings files carrying the baked form are rewritten by schema step
+/// 37 → 38. A user-edited text is left exactly as typed and simply has no
+/// placeholder to resolve.
+fn interpolate_tab(template: &str, name: &str) -> String {
+    if !template.contains("{tab}") {
+        return template.to_string();
+    }
+    template.replace("{tab}", name)
+}
+
+/// What closing a turn says about announcing it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdleVerdict {
+    /// Say it.
+    Announce,
+    /// The turn ran for less than the configured minimum — or there was no
+    /// turn at all (`worked: None`), which is what a settle with nothing in
+    /// front of it looks like: startup chrome, not a finished task.
+    TooShort { worked: Option<Duration> },
+}
+
+/// Per-tab turn-boundary bookkeeping for the idle announcement.
+///
+/// One open turn per tab, opened by the avatar entering `Thinking` and closed
+/// by whichever edge that tab's harness makes its turn boundary. Split out of
+/// [`NotificationManager`] so it can be driven by tests with synthetic
+/// instants: the manager owns an [`AudioOutput`], which opens a real device.
+///
+/// The invariant worth stating: **an open turn survives every intermediate
+/// edge.** A tool-heavy Claude turn cycles `Thinking → Idle → Thinking → …`
+/// once per tool call and a mid-turn TTS tag cycles `Thinking → Speaking →
+/// Thinking`; neither restarts the clock, or a 3-minute turn would measure as
+/// the 60 ms of its last burst and slip through a gate it should have passed on
+/// its real length.
+#[derive(Default)]
+struct IdleGate {
+    turn_started_at: HashMap<TabId, Instant>,
+}
+
+impl IdleGate {
+    /// Fold one avatar transition in.
+    ///
+    /// * `Thinking` OPENS a turn — `or_insert`, so only the first burst of a
+    ///   turn sets the clock.
+    /// * `Listening` CLOSES one without a verdict: it is reachable only from a
+    ///   keystroke or compose input, so the user has taken the tab back and
+    ///   whatever comes next is a new turn.
+    /// * `Idle`, `Speaking` and `Error` say nothing. `Idle` in particular is
+    ///   NOT a close: for a pushed-boundary harness it is a mid-turn burst
+    ///   edge, and for every other harness the caller closes it explicitly via
+    ///   [`Self::close_turn`] once it has cleared its own suppressions.
+    fn note_avatar_state(&mut self, tab: &TabId, state: AvatarState, now: Instant) {
+        match state {
+            AvatarState::Thinking => {
+                self.turn_started_at.entry(tab.clone()).or_insert(now);
+            }
+            AvatarState::Listening => {
+                self.turn_started_at.remove(tab);
+            }
+            AvatarState::Idle | AvatarState::Speaking | AvatarState::Error => {}
+        }
+    }
+
+    /// Close `tab`'s turn and judge it against `min`. Read-and-clear.
+    fn close_turn(&mut self, tab: &TabId, now: Instant, min: Duration) -> IdleVerdict {
+        let worked = self
+            .turn_started_at
+            .remove(tab)
+            .map(|start| now.saturating_duration_since(start));
+        if idle_announce_allowed(worked, min) {
+            IdleVerdict::Announce
+        } else {
+            IdleVerdict::TooShort { worked }
+        }
+    }
+
+    /// Drop `tab` entirely (it closed).
+    fn forget(&mut self, tab: &TabId) {
+        self.turn_started_at.remove(tab);
+    }
+}
+
+/// Whether a finished turn passes the fast-turn gate.
+///
+/// `min == 0` disables the gate outright — every turn end announces, the
+/// behavior before `behavior.idle_announce_min_working_secs` existed, and the
+/// one case where a `None` span still passes (there is nothing to be too short
+/// about). Otherwise the turn must have run for at least `min`, and `None`
+/// never passes.
+fn idle_announce_allowed(worked: Option<Duration>, min: Duration) -> bool {
+    if min.is_zero() {
+        return true;
+    }
+    matches!(worked, Some(d) if d >= min)
 }
 
 /// Replace `{code}` with the exit code (or `?` when none was reported).
@@ -755,6 +1005,190 @@ mod tests {
     #[test]
     fn interpolate_falls_back_to_question_mark_when_code_missing() {
         assert_eq!(interpolate_code("exit {code}", None), "exit ?");
+    }
+
+    // ── {tab} interpolation ────────────────────────────────────────────────
+
+    #[test]
+    fn interpolate_tab_resolves_the_seeded_placeholder() {
+        assert_eq!(interpolate_tab("{tab} is idle", "Claude 2"), "Claude 2 is idle");
+        assert_eq!(
+            interpolate_tab("{tab} is awaiting permission", "OpenCode"),
+            "OpenCode is awaiting permission"
+        );
+    }
+
+    #[test]
+    fn interpolate_tab_replaces_all_occurrences_and_passes_others_through() {
+        assert_eq!(interpolate_tab("{tab}: {tab}", "A"), "A: A");
+        // A user-edited text with no placeholder is left exactly as typed —
+        // including one that hard-codes a name, which is a choice, not a bug.
+        assert_eq!(interpolate_tab("Claude is idle", "Claude 2"), "Claude is idle");
+        assert_eq!(interpolate_tab("", "Claude"), "");
+    }
+
+    #[test]
+    fn interpolate_tab_does_not_rescan_a_name_for_the_code_token() {
+        // The caller resolves `{code}` first, so a display name containing the
+        // literal "{code}" survives verbatim rather than being substituted.
+        let once = interpolate_code("{tab} exited {code}", Some(3));
+        assert_eq!(interpolate_tab(&once, "weird {code} name"), "weird {code} name exited 3");
+    }
+
+    // ── the fast-turn gate ─────────────────────────────────────────────────
+
+    #[test]
+    fn a_short_turn_is_suppressed_and_a_long_one_is_not() {
+        let min = Duration::from_secs(120);
+        assert!(!idle_announce_allowed(Some(Duration::from_millis(500)), min));
+        assert!(!idle_announce_allowed(Some(Duration::from_secs(119)), min));
+        assert!(idle_announce_allowed(Some(min), min), "exactly the minimum counts");
+        assert!(idle_announce_allowed(Some(Duration::from_secs(130)), min));
+    }
+
+    #[test]
+    fn a_settle_with_no_turn_in_front_of_it_is_suppressed_unless_the_gate_is_off() {
+        assert!(!idle_announce_allowed(None, Duration::from_secs(120)));
+        // …but 0 means "announce every idle", which includes this one.
+        assert!(idle_announce_allowed(None, Duration::ZERO));
+    }
+
+    #[test]
+    fn a_zero_minimum_announces_every_turn() {
+        for worked in [None, Some(Duration::ZERO), Some(Duration::from_millis(60))] {
+            assert!(idle_announce_allowed(worked, Duration::ZERO), "{worked:?}");
+        }
+    }
+
+    // ── turn spans ─────────────────────────────────────────────────────────
+
+    /// The failure this whole change exists for: on a Claude tab the activity
+    /// heuristic cycles `Thinking → Idle → Thinking` once per tool-call output
+    /// burst, so ONE turn produces a series of short spans. The turn clock must
+    /// be the first burst's, and the pushed boundary must judge the WHOLE turn.
+    #[test]
+    fn intermediate_idle_bursts_do_not_restart_the_turn_clock() {
+        let tab = TabId::from_str("claude");
+        let t0 = Instant::now();
+        let mut gate = IdleGate::default();
+        let min = Duration::from_secs(120);
+
+        gate.note_avatar_state(&tab, AvatarState::Listening, t0);
+        gate.note_avatar_state(&tab, AvatarState::Thinking, t0);
+        // Three tool-call bursts inside the one turn. A pushed-boundary tab
+        // never asks the gate about these edges (the manager returns before
+        // `close_turn`), and they must leave the open turn alone.
+        for i in 1..=3 {
+            let at = t0 + Duration::from_secs(i * 20);
+            gate.note_avatar_state(&tab, AvatarState::Idle, at);
+            gate.note_avatar_state(&tab, AvatarState::Thinking, at + Duration::from_millis(60));
+        }
+        // …and the mid-turn TTS interlude is not a restart either.
+        gate.note_avatar_state(&tab, AvatarState::Speaking, t0 + Duration::from_secs(90));
+        gate.note_avatar_state(&tab, AvatarState::Thinking, t0 + Duration::from_secs(95));
+
+        // The push lands at 130 s: judged on the whole turn, so it announces —
+        // exactly once, because closing is read-and-clear.
+        let at = t0 + Duration::from_secs(130);
+        assert_eq!(gate.close_turn(&tab, at, min), IdleVerdict::Announce);
+        assert_eq!(
+            gate.close_turn(&tab, at, min),
+            IdleVerdict::TooShort { worked: None },
+            "a second close of the same turn has nothing left to announce"
+        );
+    }
+
+    /// The same turn shape, ended at 5 s: no announcement at all — not on the
+    /// intermediate bursts (the manager never asks) and not at the boundary.
+    #[test]
+    fn a_short_pushed_turn_announces_nothing() {
+        let tab = TabId::from_str("claude");
+        let t0 = Instant::now();
+        let mut gate = IdleGate::default();
+        gate.note_avatar_state(&tab, AvatarState::Thinking, t0);
+        gate.note_avatar_state(&tab, AvatarState::Idle, t0 + Duration::from_millis(500));
+        gate.note_avatar_state(&tab, AvatarState::Thinking, t0 + Duration::from_millis(700));
+        assert_eq!(
+            gate.close_turn(&tab, t0 + Duration::from_secs(5), Duration::from_secs(120)),
+            IdleVerdict::TooShort {
+                worked: Some(Duration::from_secs(5))
+            }
+        );
+    }
+
+    /// A harness with no push (OpenCode, and any unclassified tab) closes its
+    /// turn on the avatar's own Idle edge — one per turn there, because that
+    /// edge comes from the SSE `session.idle` rather than from an output-burst
+    /// heuristic.
+    #[test]
+    fn a_tab_without_a_push_closes_its_turn_on_the_idle_edge() {
+        let tab = TabId::from_str("opencode");
+        let t0 = Instant::now();
+        let mut gate = IdleGate::default();
+        let min = Duration::from_secs(120);
+        gate.note_avatar_state(&tab, AvatarState::Thinking, t0);
+        let at = t0 + Duration::from_secs(200);
+        gate.note_avatar_state(&tab, AvatarState::Idle, at);
+        assert_eq!(gate.close_turn(&tab, at, min), IdleVerdict::Announce);
+    }
+
+    #[test]
+    fn a_zero_minimum_announces_a_pushed_turn_however_short() {
+        let tab = TabId::from_str("claude");
+        let t0 = Instant::now();
+        let mut gate = IdleGate::default();
+        gate.note_avatar_state(&tab, AvatarState::Thinking, t0);
+        assert_eq!(
+            gate.close_turn(&tab, t0 + Duration::from_millis(60), Duration::ZERO),
+            IdleVerdict::Announce
+        );
+        // And with no turn open at all.
+        assert_eq!(gate.close_turn(&tab, t0, Duration::ZERO), IdleVerdict::Announce);
+    }
+
+    #[test]
+    fn user_input_ends_the_turn_and_the_next_one_starts_fresh() {
+        let tab = TabId::from_str("claude");
+        let t0 = Instant::now();
+        let mut gate = IdleGate::default();
+        let min = Duration::from_secs(120);
+        gate.note_avatar_state(&tab, AvatarState::Thinking, t0);
+        // The user types: whatever was running is no longer the turn we would
+        // announce, so the clock is dropped rather than carried into the next.
+        gate.note_avatar_state(&tab, AvatarState::Listening, t0 + Duration::from_secs(300));
+        gate.note_avatar_state(&tab, AvatarState::Thinking, t0 + Duration::from_secs(301));
+        assert_eq!(
+            gate.close_turn(&tab, t0 + Duration::from_secs(310), min),
+            IdleVerdict::TooShort {
+                worked: Some(Duration::from_secs(9))
+            },
+            "the new turn is 9 s old, not 310"
+        );
+    }
+
+    #[test]
+    fn spans_are_per_tab_and_a_closed_tab_is_forgotten() {
+        let a = TabId::from_str("claude");
+        let b = TabId::from_str("opencode");
+        let t0 = Instant::now();
+        let mut gate = IdleGate::default();
+        let min = Duration::from_secs(120);
+        gate.note_avatar_state(&a, AvatarState::Thinking, t0);
+        gate.note_avatar_state(&b, AvatarState::Thinking, t0 + Duration::from_secs(200));
+        let at = t0 + Duration::from_secs(210);
+        assert_eq!(gate.close_turn(&a, at, min), IdleVerdict::Announce);
+        assert_eq!(
+            gate.close_turn(&b, at, min),
+            IdleVerdict::TooShort {
+                worked: Some(Duration::from_secs(10))
+            }
+        );
+        gate.note_avatar_state(&a, AvatarState::Thinking, t0);
+        gate.forget(&a);
+        assert_eq!(
+            gate.close_turn(&a, at, min),
+            IdleVerdict::TooShort { worked: None }
+        );
     }
 
     #[test]

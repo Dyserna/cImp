@@ -8233,6 +8233,28 @@ pub(crate) async fn send_permission_edge(
     true
 }
 
+/// **The harness said this tab's assistant turn is over.** Relays it to the
+/// state manager as [`crate::state::StateSignal::HarnessTurnEnded`], which
+/// re-emits it as `StateEvent::TurnEnded` without touching the avatar.
+///
+/// Shaped like [`send_permission_edge`] — same lookup, same `try_send`, same
+/// "no app state yet ⇒ drop it" answer. A dropped signal costs one missed idle
+/// announcement, never correctness: nothing downstream latches on it.
+///
+/// Only a harness whose plugin declares
+/// [`crate::harness::plugin::HarnessPlugin::turn_end_push`] has a producer for
+/// this; see that method for why the Idle edge is not the same thing.
+pub(crate) async fn send_turn_ended(app: &AppHandle, tab: &str) -> bool {
+    let Some(state) = app.try_state::<crate::ipc::AppState>() else {
+        return false;
+    };
+    let signal = crate::state::StateSignal::HarnessTurnEnded {
+        tab: crate::state::TabId::from_str(tab),
+    };
+    let _ = state.state_signals.try_send(signal);
+    true
+}
+
 /// A `POST /context/post_edit` request body (the Claude `PostToolUse` shim, or
 /// the OpenCode plugin's `tool.execute.after` hook).
 #[derive(Deserialize)]

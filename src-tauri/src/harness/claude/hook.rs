@@ -98,7 +98,7 @@ use crate::offload::loopback::{
     assistant_text_core, bounded_declarations, bounded_id, bounded_tool, claim_contract_drift,
     claim_hello, compaction_block, contract_drift_row, context_retrieve_core, hello_row,
     hook_gate_admits, hook_tab_root, is_configured_tab, latch_beacon_for, live_settings,
-    permission_tab_candidates, post_edit_diagnostics, send_permission_edge,
+    permission_tab_candidates, post_edit_diagnostics, send_permission_edge, send_turn_ended,
     should_read_verdict, subagent_core, tool_checkpoint_core, tool_result_core,
     ContextCompactionBody, ContextPostEditBody, ContextRetrieveBody, ContractDriftBody,
     PermissionOutcome, PermissionTabCandidate, Request, ShouldReadBody,
@@ -1797,6 +1797,16 @@ async fn handle_claude_stop(
     report_hook_drift(route, &input);
     let settings = live_settings(app);
     if let Some(tab) = claude_hook_tab(&settings, req) {
+        // **The turn boundary**, pushed before the text is filed.
+        //
+        // Deliberately NOT inside `assistant_text_core`'s `chp::served` gate:
+        // that gate asks whether THIS tab's artifact declares the
+        // assistant-TEXT capability, so the transcript reader and this route
+        // cannot both speak — it says nothing about whether the turn ended.
+        // Receiving this POST at all is the proof that it did, which is the
+        // whole reason `HarnessPlugin::turn_end_push` is a declaration about
+        // the harness rather than about one payload field.
+        send_turn_ended(app, &tab).await;
         assistant_text_core(app, "claude", &tab, &input.last_assistant_message).await;
     }
     Ok(HookReply::ok(no_op.clone()))

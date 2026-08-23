@@ -886,7 +886,8 @@ fn an_unshipped_descriptor_round_trips_through_the_tab_machinery() {
             panic!("default_ai_tab did not seed an AI-kind tab");
         };
         assert_eq!((cfg.id.as_str(), cfg.name.as_str(), cfg.command.as_str()), ("zeta", "Zeta", "zeta"));
-        assert_eq!(cfg.notifications.idle.text, "Zeta is idle");
+        // Name-independent since schema 38 — `{tab}` resolves at speak time.
+        assert_eq!(cfg.notifications.idle.text, "{tab} is idle");
         assert!(cfg.builtin);
 
         // (The integrity-repair half lives beside the repair, in

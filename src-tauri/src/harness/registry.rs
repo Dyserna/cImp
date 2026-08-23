@@ -233,8 +233,10 @@ pub struct BuiltinTab {
     /// It is in every settings file's `tabs[]`, `enabled_ai_tabs` and layout
     /// panes, and in every frontend payload.
     pub id: &'static str,
-    /// The tab-bar name a freshly seeded tab carries, and the noun each of its
-    /// four default notification slots is phrased around ("<name> is idle").
+    /// The tab-bar name a freshly seeded tab carries. Since schema 38 the four
+    /// default notification slots are phrased around the `{tab}` placeholder
+    /// ("{tab} is idle"), which resolves to the tab's *live* name at speak
+    /// time — so this is no longer baked into the seeded prose.
     pub name: &'static str,
     /// The command a freshly seeded tab launches. A wire form too: it is what
     /// lands in the user's settings file, editable from there afterwards.

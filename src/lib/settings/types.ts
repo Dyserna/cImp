@@ -149,6 +149,13 @@ export interface BehaviorSettings {
   /// When true, tab announcements fire even for the currently-focused tab.
   /// Default false reproduces the historical background-only behavior.
   announce_focused_tab: boolean;
+  /// Minimum number of seconds a tab must have been working — the span from
+  /// the harness starting a turn to it reporting the turn done — before an
+  /// **idle** announcement is allowed to fire. Fast turns otherwise announce
+  /// "… is idle" every few seconds. `0` announces every idle. Only the idle
+  /// announcement is gated; permission, question and error announcements
+  /// always fire.
+  idle_announce_min_working_secs: number;
   /// When true, tagged-content TTS plays even for tabs that aren't the
   /// active one. Default false matches the v2 behavior — only the
   /// foreground tab speaks. Independent of `announce_focused_tab`, which
@@ -2346,6 +2353,7 @@ export function defaultSettings(): Settings {
       announcements_enabled: true,
       follow_avatar: false,
       announce_focused_tab: false,
+      idle_announce_min_working_secs: 120,
       speak_background_tabs: false,
       copy_on_select: true,
       paste_on_right_click: true,

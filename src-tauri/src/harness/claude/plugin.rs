@@ -606,6 +606,19 @@ impl HarnessPlugin for ClaudePlugin {
         true
     }
 
+    /// This harness's `Stop` hook (`claude.hook.stop`) fires exactly once per
+    /// assistant turn, and [`super::hook`]'s route for it sends
+    /// `StateSignal::HarnessTurnEnded`.
+    ///
+    /// Without the push, the turn boundary would have to be read off this
+    /// harness's TUI activity heuristic — which fires per output burst.
+    /// Measured live (2026-08-23): ONE tool-heavy turn produced eight
+    /// `Idle → Thinking → Idle` cycles, and the notification layer announced
+    /// "is idle" eight times for a turn that had not finished.
+    fn turn_end_push(&self) -> bool {
+        true
+    }
+
     /// The `claude --help` probe's row in the spawn ledger (locked decision 26):
     /// the argv is this product's, so the row lives with the code that runs it.
     fn spawn_sites(&self) -> &'static [crate::spawn_ledger::SpawnSite] {

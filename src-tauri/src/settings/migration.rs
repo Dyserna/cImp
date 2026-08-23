@@ -444,6 +444,11 @@ const MIGRATION_STEPS: &[MigrationStep] = &[
         detect: looks_v36,
         transform: migrate_v36_to_v37_step,
     },
+    MigrationStep {
+        from_version: "v37",
+        detect: looks_v37,
+        transform: migrate_v37_to_v38_step,
+    },
 ];
 
 // --- Uniform-signature wrappers -------------------------------------------
@@ -3020,6 +3025,17 @@ fn migrate_v36_to_v37_step(value: &mut Value, _shell: &ShellSpec) {
     migrate_v36_to_v37(value)
 }
 
+fn looks_v37(value: &Value) -> bool {
+    value
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .is_some_and(|v| v == 37)
+}
+
+fn migrate_v37_to_v38_step(value: &mut Value, _shell: &ShellSpec) {
+    migrate_v37_to_v38(value)
+}
+
 /// The v36 schema's serialised defaults for the two lane fields — what a file
 /// that never opened the colour picker carried (see [`migrate_v36_to_v37`]).
 const V36_USAGE_COLOR_SESSION: &str = "#30363d";
@@ -3086,6 +3102,99 @@ fn migrate_v36_to_v37(value: &mut Value) {
     root.insert(
         "schema_version".to_string(),
         Value::Number(serde_json::Number::from(37u8)),
+    );
+}
+
+/// The four AI notification slots, and the SUFFIX each one's seeded text ends
+/// with.
+///
+/// A frozen list, like every other constant in this module (locked decision
+/// 14). It describes the prose `default_ai_tab` wrote into files up to schema
+/// 37 — "<name> is idle" and its three siblings — and rebuilding it from
+/// today's seed would change what a v37 file becomes the day the wording does.
+const V37_AI_NOTIFICATION_SUFFIXES: &[(&str, &str)] = &[
+    ("idle", " is idle"),
+    ("awaiting_permission", " is awaiting permission"),
+    ("question", " has a question"),
+    ("error", " encountered an error"),
+];
+
+/// v37 → v38: **the seeded AI notification prose becomes the `{tab}`
+/// placeholder.**
+///
+/// Up to schema 37 a freshly seeded AI tab got its own name baked into all four
+/// notification texts ("Claude is idle"). That went stale the moment the tab was
+/// renamed, and it was simply wrong for a duplicate: `create_ai_tab` clones the
+/// source tab's whole config, so "Claude 2" announced "Claude is idle".
+/// `notifications::manager` now resolves `{tab}` to the tab's LIVE display name
+/// at speak time, so this step moves existing files onto the placeholder.
+///
+/// **The rewrite rule, and why it is not "compare against this tab's name".**
+/// For each of the four slots on each `ai_tool` tab: if the text ENDS WITH that
+/// slot's seeded suffix and the prefix is non-empty and contains no `{`, the
+/// text is replaced by `"{tab}<suffix>"`. Anything else is left exactly as the
+/// user typed it.
+///
+/// Matching on the suffix rather than on `format!("{name}{suffix}")` is
+/// deliberate: the stored `name` is the tab's name TODAY, and the text carries
+/// the name it had when it was seeded. A tab duplicated from `claude` is named
+/// "Claude 2" and carries "Claude is idle"; a renamed tab is named "Backend" and
+/// carries "Claude is idle". Both are seeded prose that must move, and neither
+/// matches its own name. Nor is a registry lookup enough — the source tab could
+/// have been renamed before the duplicate was made, so the baked prefix may be
+/// a string no registry ever contained.
+///
+/// The two guards are what keep a user-edited text safe:
+/// * **non-empty prefix** — "" and " is idle" alone are not seeded prose.
+/// * **no `{`** — a text already carrying `{tab}` (or any other placeholder) is
+///   this build's own output or the user's, and re-writing it would be a
+///   second, lossy pass. This is also what makes the step idempotent, which the
+///   frozen-cascade guarantee needs: a v1 file reaching here has already been
+///   handed the placeholder by the v1 → v2 step's embedded default.
+///
+/// **Only `ai_tool` tabs.** A Shell tab's seeded error text is
+/// "Shell encountered an error", which ends with the same suffix; the kind check
+/// is the only thing standing between that and a rewrite. A tab entry carrying
+/// no `kind` at all (possible in a sparse project overlay) is skipped for the
+/// same reason — leaving a text alone is always the recoverable direction.
+fn migrate_v37_to_v38(value: &mut Value) {
+    let Some(root) = value.as_object_mut() else {
+        return;
+    };
+    if let Some(tabs) = root.get_mut("tabs").and_then(Value::as_array_mut) {
+        for tab in tabs.iter_mut() {
+            let Some(obj) = tab.as_object_mut() else {
+                continue;
+            };
+            if obj.get("kind").and_then(Value::as_str) != Some("ai_tool") {
+                continue;
+            }
+            let Some(notifs) = obj.get_mut("notifications").and_then(Value::as_object_mut) else {
+                continue;
+            };
+            for (field, suffix) in V37_AI_NOTIFICATION_SUFFIXES {
+                // v1.11 promoted every slot to `{ enabled, text }`, so a v37
+                // file always carries objects here; a bare string is a shape
+                // this step does not know and does not touch.
+                let Some(slot) = notifs.get_mut(*field).and_then(Value::as_object_mut) else {
+                    continue;
+                };
+                let Some(text) = slot.get("text").and_then(Value::as_str) else {
+                    continue;
+                };
+                let Some(prefix) = text.strip_suffix(suffix) else {
+                    continue;
+                };
+                if prefix.is_empty() || prefix.contains('{') {
+                    continue;
+                }
+                slot.insert("text".to_string(), Value::String(format!("{{tab}}{suffix}")));
+            }
+        }
+    }
+    root.insert(
+        "schema_version".to_string(),
+        Value::Number(serde_json::Number::from(38u8)),
     );
 }
 
@@ -4493,6 +4602,164 @@ mod tests {
         let mut bare = json!({ "schema_version": 36 });
         migrate_v36_to_v37(&mut bare);
         assert_eq!(bare, json!({ "schema_version": 37 }));
+    }
+
+    // --- v37 → v38 ----------------------------------------------------------
+
+    /// The seeded prose moves onto the placeholder — including on a tab whose
+    /// NAME no longer matches what was baked into it, which is the case that
+    /// made "Claude 2" announce "Claude is idle".
+    #[test]
+    fn v37_to_v38_rewrites_seeded_notification_prose_to_the_tab_placeholder() {
+        let mut v = json!({
+            "schema_version": 37,
+            "tabs": [
+                {
+                    "kind": "ai_tool",
+                    "id": "claude",
+                    "name": "Claude",
+                    "notifications": {
+                        "idle": { "enabled": true, "text": "Claude is idle" },
+                        "awaiting_permission": { "enabled": true, "text": "Claude is awaiting permission" },
+                        "question": { "enabled": true, "text": "Claude has a question" },
+                        "error": { "enabled": false, "text": "Claude encountered an error" }
+                    }
+                },
+                {
+                    // Duplicated from `claude`, then the source was renamed:
+                    // neither this tab's name nor any registry name matches the
+                    // baked prefix. The suffix rule still catches it.
+                    "kind": "ai_tool",
+                    "id": "ai-7f3c",
+                    "name": "Claude 2",
+                    "notifications": {
+                        "idle": { "enabled": true, "text": "Backend work is idle" },
+                        "awaiting_permission": { "enabled": true, "text": "OpenCode is awaiting permission" },
+                        "question": { "enabled": true, "text": "Claude (custom provider) has a question" },
+                        "error": { "enabled": true, "text": "Zeta encountered an error" }
+                    }
+                }
+            ]
+        });
+        assert!(looks_v37(&v));
+        migrate_v37_to_v38(&mut v);
+        let tabs = v["tabs"].as_array().unwrap();
+        for t in tabs {
+            let n = &t["notifications"];
+            assert_eq!(n["idle"]["text"], "{tab} is idle");
+            assert_eq!(n["awaiting_permission"]["text"], "{tab} is awaiting permission");
+            assert_eq!(n["question"]["text"], "{tab} has a question");
+            assert_eq!(n["error"]["text"], "{tab} encountered an error");
+        }
+        // `enabled` is the user's and is not touched by a prose rewrite.
+        assert_eq!(tabs[0]["notifications"]["error"]["enabled"], json!(false));
+        assert_eq!(v["schema_version"], json!(38));
+        assert!(!looks_v37(&v));
+    }
+
+    /// A user-edited text is left exactly as typed, and so is a Shell tab whose
+    /// seeded error prose ends with the very same suffix.
+    #[test]
+    fn v37_to_v38_leaves_edited_texts_and_shell_tabs_alone() {
+        let mut v = json!({
+            "schema_version": 37,
+            "tabs": [
+                {
+                    "kind": "ai_tool",
+                    "id": "claude",
+                    "name": "Claude",
+                    "notifications": {
+                        "idle": { "enabled": true, "text": "hey, your build finished" },
+                        "awaiting_permission": { "enabled": true, "text": " is awaiting permission" },
+                        "question": { "enabled": true, "text": "{tab} has a question" },
+                        "error": { "enabled": true, "text": "" }
+                    }
+                },
+                {
+                    "kind": "shell",
+                    "id": "shell-1",
+                    "name": "Shell 1",
+                    "notifications": {
+                        "error": { "enabled": true, "text": "Shell encountered an error" },
+                        "exited": { "enabled": true, "text": "Shell exited (code {code})" }
+                    }
+                },
+                // No `kind` (a sparse project overlay): skipped, not guessed at.
+                {
+                    "id": "ai-9",
+                    "notifications": { "idle": { "enabled": true, "text": "Nine is idle" } }
+                }
+            ]
+        });
+        migrate_v37_to_v38(&mut v);
+        let tabs = v["tabs"].as_array().unwrap();
+        let ai = &tabs[0]["notifications"];
+        assert_eq!(ai["idle"]["text"], "hey, your build finished");
+        assert_eq!(
+            ai["awaiting_permission"]["text"], " is awaiting permission",
+            "an empty prefix is not seeded prose"
+        );
+        assert_eq!(
+            ai["question"]["text"], "{tab} has a question",
+            "already-migrated text is left alone \u{2014} the step is idempotent"
+        );
+        assert_eq!(ai["error"]["text"], "");
+        assert_eq!(tabs[1]["notifications"]["error"]["text"], "Shell encountered an error");
+        assert_eq!(tabs[2]["notifications"]["idle"]["text"], "Nine is idle");
+    }
+
+    /// Running the step twice must change nothing the second time — the
+    /// cascade re-enters at whatever version a file is stamped with, and a
+    /// frozen step has to survive being reached from every entry point.
+    #[test]
+    fn v37_to_v38_is_idempotent() {
+        let seed = json!({
+            "schema_version": 37,
+            "tabs": [{
+                "kind": "ai_tool", "id": "claude", "name": "Claude",
+                "notifications": { "idle": { "enabled": true, "text": "Claude is idle" } }
+            }]
+        });
+        let mut once = seed.clone();
+        migrate_v37_to_v38(&mut once);
+        let mut twice = once.clone();
+        twice["schema_version"] = json!(37);
+        migrate_v37_to_v38(&mut twice);
+        assert_eq!(once, twice);
+        // …and a file with no `tabs` at all is untouched but stamped.
+        let mut bare = json!({ "schema_version": 37 });
+        migrate_v37_to_v38(&mut bare);
+        assert_eq!(bare, json!({ "schema_version": 38 }));
+    }
+
+    /// As a CASCADE member: a file entering well below still lands on the
+    /// current version with its seeded prose on the placeholder.
+    #[test]
+    fn the_cascade_rewrites_notification_prose_on_the_way_to_the_current_version() {
+        let shell = fake_default_shell();
+        let mut v = json!({
+            "schema_version": 33,
+            "tabs": [{
+                "kind": "ai_tool", "id": "claude", "name": "Claude", "command": "claude",
+                "notifications": {
+                    "idle": { "enabled": true, "text": "Claude is idle" },
+                    "awaiting_permission": { "enabled": true, "text": "Claude is awaiting permission" },
+                    "question": { "enabled": true, "text": "Claude has a question" },
+                    "error": { "enabled": true, "text": "Claude encountered an error" }
+                }
+            }],
+            "offload": {},
+        });
+        for step in MIGRATION_STEPS {
+            if (step.detect)(&v) {
+                (step.transform)(&mut v, &shell);
+            }
+        }
+        assert_eq!(
+            v["schema_version"],
+            json!(crate::settings::schema::CURRENT_SCHEMA_VERSION)
+        );
+        assert_eq!(v["tabs"][0]["notifications"]["idle"]["text"], "{tab} is idle");
     }
 
     /// **The first two palette slots are the colours the retired settings

@@ -317,8 +317,10 @@
         defaults={defaults?.notifications ?? settings.notifications}
       />
       <small class="hint">
-        Text used for inactive-tab notifications. Notification firing
-        itself ships in V2-04; the configuration is wired now.
+        Text used for inactive-tab notifications. Write <code>{'{tab}'}</code>
+        for this tab's current name — it follows renames and duplicates, which
+        a typed-in name does not. A shell tab's exit text also takes
+        <code>{'{code}'}</code> for the exit code.
       </small>
     </label>
   </div>

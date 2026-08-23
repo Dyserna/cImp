@@ -2785,7 +2785,9 @@ mod tests {
             _ => panic!("expected AI tab"),
         };
         assert!(q.enabled);
-        assert_eq!(q.text, "Claude has a question");
+        // Name-independent since schema 38: the backfill reseeds from
+        // `default_ai_tab`, whose prose is the `{tab}` placeholder.
+        assert_eq!(q.text, "{tab} has a question");
     }
 
     #[test]

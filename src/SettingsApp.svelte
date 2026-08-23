@@ -2554,6 +2554,23 @@
             exit) only fire for background tabs. Turn on to hear them for the
             tab you're currently looking at as well.
           </small>
+          <label>
+            <span>Announce idle only after working for … seconds</span>
+            <input
+              type="number"
+              min="0"
+              max="3600"
+              step="10"
+              value={snapshot.behavior.idle_announce_min_working_secs}
+              onchange={(e) =>
+                patch((s) => (s.behavior.idle_announce_min_working_secs = Math.max(0, Math.round(+(e.currentTarget as HTMLInputElement).value || 0))))}
+            />
+          </label>
+          <small class="hint">
+            An idle announcement is skipped when the tab worked for less than
+            this. 0 announces every idle. Permission, question and error
+            announcements are never gated.
+          </small>
           <label class="checkbox">
             <input
               type="checkbox"

@@ -190,14 +190,17 @@ each claim.
    `every_harness_declares_every_slot` refuses a plugin that overrode
    `instructions()` and dropped a row.
 14. **`preflight()`, `needs_tree_reap()`, `emits_startup_chrome()`,
-   `session_selector_flags()`, `accepts_passthrough_argv()`** — the CLI facts
-   core used to branch on. Whether your binary must be resolvable before a tab
-   of yours can be enabled (and the install hint the refusal carries), whether
-   your process forks children a plain kill would orphan, whether a fresh tab
-   prints a banner the notification layer must not ring for, which of your flags
-   select a session (so cImp does not double-pin one), and whether unrecognised
-   `cimp` argv is forwarded to you at all. Each is a declaration with a default;
-   none of them is a branch anywhere else.
+   `turn_end_push()`, `session_selector_flags()`, `accepts_passthrough_argv()`**
+   — the CLI facts core used to branch on. Whether your binary must be
+   resolvable before a tab of yours can be enabled (and the install hint the
+   refusal carries), whether your process forks children a plain kill would
+   orphan, whether a fresh tab prints a banner the notification layer must not
+   ring for, whether you PUSH an explicit end-of-turn signal (`true` ⇒ your
+   tabs are announced on `StateSignal::HarnessTurnEnded` instead of on the
+   avatar's Idle edge, which for a TUI-scraped harness fires once per output
+   burst), which of your flags select a session (so cImp does not double-pin
+   one), and whether unrecognised `cimp` argv is forwarded to you at all. Each
+   is a declaration with a default; none of them is a branch anywhere else.
 15. **`spawn_sites()` and `config_writer()`** — anything that spawns or writes.
    `spawn_ledger`'s tripwire scans every `.rs` under `src/`, so a spawn inside
    your directory must be described by a row; the row stays in core and the

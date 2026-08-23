@@ -1818,6 +1818,27 @@ pub trait HarnessPlugin: Sync + Send {
         true
     }
 
+    /// Whether this harness **pushes an explicit end-of-turn signal** instead
+    /// of leaving the turn boundary to be inferred from output activity.
+    ///
+    /// The distinction is not cosmetic. `HarnessOutputStarted/Stopped` — and so
+    /// the avatar's settle to `Idle` — come from whatever activity signal a
+    /// harness offers, and for a TUI that is one edge per output BURST: a
+    /// tool-heavy turn settles to `Idle` once per tool call, so the Idle edge is
+    /// not a turn boundary and a consumer that treats it as one fires once per
+    /// tool call. A harness answering `true` promises to send
+    /// [`crate::state::StateSignal::HarnessTurnEnded`] exactly once per
+    /// assistant turn, and its tabs are read on THAT edge instead.
+    ///
+    /// **Defaults to `false`** — the direction that keeps working with no push
+    /// wired at all. `true` opts this harness's tabs OUT of the Idle-edge path
+    /// entirely, so declaring it without a producer means those tabs go silent;
+    /// inheriting the default only means a chattier tab, which the consumer's
+    /// own minimum-work threshold already trims.
+    fn turn_end_push(&self) -> bool {
+        false
+    }
+
     /// This harness's rows in the external-process spawn ledger
     /// ([`crate::spawn_ledger`]), or none.
     ///

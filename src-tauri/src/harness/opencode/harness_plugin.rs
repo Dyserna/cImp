@@ -531,6 +531,17 @@ impl HarnessPlugin for OpenCodePlugin {
         true
     }
 
+    /// No end-of-turn push, and none is needed: this harness is read over its
+    /// SSE stream, where `session.idle` already IS the turn boundary —
+    /// [`super::read`] emits `HarnessOutputStopped` from exactly that event, so
+    /// the avatar's settle to `Idle` is one per turn here and the Idle edge is
+    /// the right thing for a consumer to read. Declared rather than inherited
+    /// because the default is a *posture* ("assume nothing is pushed") and this
+    /// is an observation about the stream.
+    fn turn_end_push(&self) -> bool {
+        false
+    }
+
     /// The `local-llama` provider block, derived from the offload server's own
     /// command line (locked decision 26) — the Settings "Add to OpenCode"
     /// button's backend.

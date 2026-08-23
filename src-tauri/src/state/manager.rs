@@ -780,6 +780,26 @@ pub enum StateSignal {
     HarnessOutputStopped {
         tab: TabId,
     },
+    /// **Out-of-band: the harness says the assistant turn is over.**
+    ///
+    /// `HarnessOutputStarted/Stopped` come from the TUI activity heuristic,
+    /// which fires per output BURST — a tool-heavy turn produces a whole series
+    /// of `Idle → Thinking → Idle` cycles and not one of them is the turn
+    /// boundary. This signal IS the boundary, pushed by the harness that
+    /// actually knows it (Claude Code's `Stop` hook fires exactly once per
+    /// assistant turn).
+    ///
+    /// **It does not move the avatar.** The heuristic keeps driving the visuals
+    /// — that is what makes the avatar responsive mid-turn — so this is a pure
+    /// pass-through, re-emitted as [`StateEvent::TurnEnded`] for the
+    /// notification manager exactly as `TtsSelectionProgress` is re-emitted for
+    /// the frontend's read-along. Only a harness declaring
+    /// [`crate::harness::plugin::HarnessPlugin::turn_end_push`] sends it; a
+    /// harness whose output edges already ARE turn boundaries (OpenCode's SSE
+    /// session-idle) does not, and its consumers keep using the Idle edge.
+    HarnessTurnEnded {
+        tab: TabId,
+    },
     /// Out-of-band (transcript): the count of in-flight `Task` sub-agents for
     /// `tab` crossed the zero boundary. `active: true` when Claude launches
     /// one or more agents and none had been running; `active: false` when the
@@ -919,6 +939,7 @@ impl StateSignal {
             | Self::UserSubmit { tab }
             | Self::HarnessOutputStarted { tab }
             | Self::HarnessOutputStopped { tab }
+            | Self::HarnessTurnEnded { tab }
             | Self::SubagentsActiveChanged { tab, .. }
             | Self::TtsPlaybackStarted { tab }
             | Self::TtsPlaybackStopped { tab }
@@ -1014,6 +1035,17 @@ pub enum StateEvent {
     TabRenamed {
         tab: TabId,
         name: String,
+    },
+    /// The harness pushed "this assistant turn is over"
+    /// ([`StateSignal::HarnessTurnEnded`]). Carries no avatar state — the
+    /// activity heuristic still owns the visuals — and is the turn boundary the
+    /// notification manager announces an idle tab on, for a harness that
+    /// declares the push. Nothing in the frontend consumes it yet; it is
+    /// dispatched like every other event so a future consumer (and the devtools
+    /// event log) sees the same boundary the backend does. Wire tag:
+    /// `turn-ended`.
+    TurnEnded {
+        tab: TabId,
     },
 }
 
@@ -1338,6 +1370,21 @@ async fn run(app: AppHandle, mut rx: mpsc::Receiver<StateSignal>, wiring: StateM
                             session: *session,
                             index: *index,
                         },
+                    );
+                    continue;
+                }
+
+                // A harness-pushed turn boundary is a pure pass-through too:
+                // it carries no avatar-state meaning (the activity heuristic
+                // keeps driving the visuals), so relay it as an event and skip
+                // the per-tab transition routing. `TabActivity::note_signal`
+                // above has already seen it and, correctly, says nothing about
+                // it — a turn ending is not one of the four facts it mirrors.
+                if let StateSignal::HarnessTurnEnded { tab } = &signal {
+                    dispatch(
+                        &app,
+                        &state_events,
+                        StateEvent::TurnEnded { tab: tab.clone() },
                     );
                     continue;
                 }
@@ -1945,6 +1992,28 @@ mod tests {
     #[test]
     fn thinking_claude_done_returns_idle() {
         assert_eq!(t(Thinking, HarnessOutputStopped { tab: tab() }), Idle);
+    }
+
+    /// A harness-pushed turn boundary must not move the avatar: the run loop
+    /// relays it and `continue`s before `transition` is reached, and this pins
+    /// the second half of that — if the relay is ever removed, the signal still
+    /// cannot make the avatar lie about what the tab is doing.
+    #[test]
+    fn harness_turn_ended_never_moves_the_avatar() {
+        for state in [
+            AvatarState::Idle,
+            AvatarState::Listening,
+            AvatarState::Thinking,
+            AvatarState::Speaking,
+        ] {
+            assert_eq!(
+                t(state, HarnessTurnEnded { tab: tab() }),
+                state,
+                "{state:?} moved on a turn-ended push"
+            );
+        }
+        // And it is tagged with the tab it came from, like every other signal.
+        assert_eq!(HarnessTurnEnded { tab: tab() }.tab(), tab());
     }
 
     #[test]

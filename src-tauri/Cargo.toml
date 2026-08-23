@@ -1,6 +1,6 @@
 [package]
 name = "cimp"
-version = "0.53.0-rc.7"
+version = "0.53.0-rc.8"
 description = "A terminal for AI coding agents, with TTS, avatar, and compose overlay"
 authors = ["Amir Amashe"]
 edition = "2021"

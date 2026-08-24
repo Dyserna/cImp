@@ -10,11 +10,9 @@ use crate::ipc::AppState;
 use crate::pty::PtyHost;
 use crate::service::on_blocking_pool as run_on_blocking_pool;
 use crate::service::pty::PtyService;
+use crate::service::settings::SettingsService;
 use crate::service::sink::{OutputSink, TauriEventSink};
-use crate::settings::{
-    default_claude_local_tab, default_claude_tab, default_opencode_tab, AiToolTabConfig, Settings,
-    TabConfig, CLAUDE_LOCAL_TAB_ID, CLAUDE_TAB_ID, OPENCODE_TAB_ID,
-};
+use crate::settings::{AiToolTabConfig, Settings, TabConfig};
 use crate::state::{ReadOnlySource, StateSignal, TabId, TabKind};
 
 /// V1.4-04 D: `pty_start` returns the persisted-scrollback bytes from the
@@ -1051,85 +1049,64 @@ pub async fn compose_content_changed(state: State<'_, AppState>, non_empty: bool
     Ok(())
 }
 
-/// V14 Phase A: the compose overlay's `/` picker data source. Resolves the
-/// global prompt-template library (from the physical global `settings.json`)
-/// against `root`'s project-scope additions (its `.cimp/config.json`
-/// overlay's own `prompt_templates` array) by name — a project entry
-/// shadows a same-named global one. Deliberately reads both scopes directly
-/// off disk rather than through the merged `Settings` the rest of the app
-/// uses; see `PromptTemplate`'s doc comment for why the normal deep-merge
-/// would silently replace the global list instead of shadowing it.
-/// `root` defaults to the launch directory, mirroring `graph_rebuild`.
+/// V14 Phase A: the compose overlay's `/` picker data source — the global
+/// prompt-template library resolved against `root`'s project-scope additions.
+/// `root` defaults to the launch directory, mirroring `graph_rebuild`. See
+/// [`service::settings::resolved_prompt_templates`](crate::service::settings::resolved_prompt_templates).
 #[tauri::command]
 pub async fn compose_templates(
     root: Option<String>,
 ) -> AppResult<Vec<crate::settings::ResolvedTemplate>> {
     let root = resolve_graph_root(root)?;
-    let global = crate::settings::read_global_prompt_templates();
-    let project = crate::settings::read_project_prompt_templates(&root);
-    Ok(crate::settings::resolve_prompt_templates(global, project))
+    Ok(crate::service::settings::resolved_prompt_templates(&root))
 }
 
 /// V14 Phase A: the Settings window's Compose section reads the raw global
-/// list (unshadowed — a template currently shadowed by a project override
-/// still needs to be editable here) directly from the physical global file.
+/// list (unshadowed). See
+/// [`service::settings::global_prompt_templates`](crate::service::settings::global_prompt_templates).
 #[tauri::command]
 pub async fn compose_templates_global_get() -> AppResult<Vec<crate::settings::PromptTemplate>> {
-    Ok(crate::settings::read_global_prompt_templates())
+    Ok(crate::service::settings::global_prompt_templates())
 }
 
-/// V14 Phase A: the Settings window's Compose section save. Writes straight
-/// to the physical global `settings.json` — NOT through `settings_update`'s
-/// normal per-project overlay diff — so the library really is global
-/// regardless of which project this cImp session was launched from. See
-/// `settings::persistence::write_global_prompt_templates`'s doc comment.
+/// V14 Phase A: the Settings window's Compose section save. See
+/// [`service::settings::set_global_prompt_templates`](crate::service::settings::set_global_prompt_templates).
 #[tauri::command]
 pub async fn compose_templates_global_set(
     templates: Vec<crate::settings::PromptTemplate>,
 ) -> AppResult<()> {
-    crate::settings::write_global_prompt_templates(templates)
+    crate::service::settings::set_global_prompt_templates(templates)
 }
 
-/// LLM price table for the session-cost popup and its Settings editor. Reads
-/// the raw global list directly from the physical global `settings.json`
-/// (missing file/key → the seeded Anthropic/Copilot defaults) — same
-/// global-only posture as `compose_templates_global_get`.
+/// LLM price table for the session-cost popup and its Settings editor. See
+/// [`service::settings::llm_pricing`](crate::service::settings::llm_pricing).
 #[tauri::command]
 pub async fn llm_pricing_get() -> AppResult<Vec<crate::settings::LlmPricingModel>> {
-    Ok(crate::settings::read_global_llm_pricing())
+    Ok(crate::service::settings::llm_pricing())
 }
 
-/// Save the LLM price table straight to the physical global `settings.json` —
-/// NOT through `settings_update`'s per-project overlay diff — so provider
-/// price edits apply to every project. Mirror of
-/// `compose_templates_global_set`; see
-/// `settings::persistence::write_global_llm_pricing`'s doc comment.
-///
-/// Because this bypasses the `SettingsHandle` (and therefore the
-/// `settings-changed` broadcast), it emits its own `llm-pricing-changed`
-/// event after a successful write so already-open cost surfaces (Code
-/// Intelligence Cost/Dashboard cards, Sessions rows) refetch instead of
-/// showing a stale table until restart.
+/// Save the LLM price table straight to the physical global `settings.json`.
+/// See
+/// [`service::settings::set_llm_pricing`](crate::service::settings::set_llm_pricing)
+/// — this is the wire boundary only: it names the sink the out-of-band write's
+/// own `llm-pricing-changed` announcement goes to.
 #[tauri::command]
 pub async fn llm_pricing_set(
     app: AppHandle,
     pricing: Vec<crate::settings::LlmPricingModel>,
 ) -> AppResult<()> {
-    crate::settings::write_global_llm_pricing(pricing)?;
-    let _ = app.emit("llm-pricing-changed", ());
-    Ok(())
+    crate::service::settings::set_llm_pricing(pricing, &TauriEventSink::new(app))
 }
 
 /// V14 Phase A: read-only project-scope listing for the Settings window's
-/// Compose section (edited by hand in `.cimp/config.json`, not from
-/// Settings — matching the milestone's scope rule). `root` defaults to the
-/// launch directory.
+/// Compose section. `root` defaults to the launch directory. See
+/// [`service::settings::project_prompt_templates`](crate::service::settings::project_prompt_templates).
 #[tauri::command]
 pub async fn compose_templates_project_get(
     root: Option<String>,
 ) -> AppResult<Vec<crate::settings::PromptTemplate>> {
     let root = resolve_graph_root(root)?;
-    Ok(crate::settings::read_project_prompt_templates(&root))
+    Ok(crate::service::settings::project_prompt_templates(&root))
 }
 
 /// V14 Phase B: writes a pasted clipboard image (already re-encoded to PNG
@@ -1189,327 +1166,55 @@ pub async fn list_tabs(state: State<'_, AppState>) -> AppResult<Vec<crate::tabs:
     Ok(registry.list())
 }
 
+/// The live in-memory settings snapshot. See [`SettingsService::get`].
 #[tauri::command]
 pub async fn settings_get(state: State<'_, AppState>) -> AppResult<Settings> {
-    Ok(state.settings.current())
+    Ok(settings_service(&state).get())
+}
+
+/// Build the settings service over this app's handles. One place, so the
+/// settings commands cannot drift in what they hand it.
+fn settings_service(state: &AppState) -> SettingsService<'_> {
+    SettingsService::new(
+        &state.settings,
+        &state.tabs,
+        &state.state_signals,
+        &state.lifecycle_serializer,
+        &state.stt,
+    )
 }
 
 /// V21 F7: merge the curated read-only command preset (`git` + `cargo`
-/// metadata/tree, with the `cargo` policy that pins it to those verbs) into the
-/// live offload settings, and return the updated `Settings` so the Settings
-/// window can refresh its snapshot. Idempotent — re-invoking adds nothing and
-/// never clobbers a user-authored `cargo` policy (see
-/// [`crate::settings::merge_readonly_preset`]). A merge-into-settings action:
-/// the user sees exactly what got added in the allowlist / policy editors and
-/// can prune it. Mutates atomically under the settings lock (broadcast +
-/// debounced save), like every other settings write.
+/// metadata/tree) into the live offload settings and return the updated
+/// snapshot. See [`SettingsService::enable_readonly_commands`].
 #[tauri::command]
 pub async fn offload_enable_readonly_commands(state: State<'_, AppState>) -> AppResult<Settings> {
-    state.settings.mutate(|s| {
-        crate::settings::merge_readonly_preset(
-            &mut s.offload.command_allowlist,
-            &mut s.offload.command_policies,
-        );
-    });
-    Ok(state.settings.current())
+    Ok(settings_service(&state).enable_readonly_commands())
 }
 
-/// Per-AI-tab default config. Used by the Settings window's "Reset to
-/// default" buttons so the frontend doesn't have to mirror Rust-side
-/// tab defaults.
-///
-/// Only AI tabs have a meaningful "default" in v1.2 — Shell tab defaults
-/// depend on the host platform's auto-detected shell, and "reset" on a
-/// user-created Shell tab is not a meaningful UX (use the New Shell Tab
-/// dialog to spawn a fresh one). Shell ids return an error.
+/// Per-AI-tab default config, for the Settings window's "Reset to default"
+/// buttons. See
+/// [`service::settings::ai_tool_tab_defaults`](crate::service::settings::ai_tool_tab_defaults).
 #[tauri::command]
 pub async fn ai_tool_tab_defaults(tab: TabId) -> AppResult<AiToolTabConfig> {
-    let config = match tab.as_str() {
-        CLAUDE_TAB_ID => default_claude_tab(),
-        CLAUDE_LOCAL_TAB_ID => default_claude_local_tab(),
-        OPENCODE_TAB_ID => default_opencode_tab(),
-        other => {
-            return Err(AppError::Pty(format!(
-                "ai_tool_tab_defaults: tab {other} has no AI defaults"
-            )))
-        }
-    };
-    match config {
-        TabConfig::AiTool(c) => Ok(c),
-        TabConfig::Shell(_) | TabConfig::Preview(_) => Err(AppError::Pty(
-            "ai_tool_tab_defaults: reserved id resolved to a non-AI-tool config".into(),
-        )),
-    }
+    crate::service::settings::ai_tool_tab_defaults(&tab)
 }
 
-/// The body of `settings_update`'s read-modify-write, factored out so it can
-/// be exercised directly in a unit test without a full Tauri `AppState`
-/// harness (`SettingsHandle::mutate` requires the closure to run under its
-/// own lock; this is the pure logic that closure runs).
-///
-/// `incoming` is the Settings-window's full snapshot; `cur` is the live
-/// in-memory state. See the call site in `settings_update` for why
-/// `layout`/`session`/`prompt_templates`/`templates_seeded`/
-/// `pricing_seeded_generation` are preserved from `cur` rather than taken from
-/// `incoming`.
-fn apply_incoming_settings(cur: &mut Settings, mut incoming: Settings) {
-    incoming.layout = cur.layout.clone();
-    incoming.session = cur.session.clone();
-    incoming.prompt_templates = cur.prompt_templates.clone();
-    incoming.templates_seeded = cur.templates_seeded;
-    // `llm_pricing` is out-of-band exactly like `prompt_templates`: written
-    // only by `llm_pricing_set` -> `write_global_llm_pricing`, straight to
-    // the physical global file. Preserve it so a stale Settings-window
-    // snapshot can't stomp a price edit made through the dedicated IPC.
-    incoming.llm_pricing = cur.llm_pricing.clone();
-    // F-19: the watermark travels with `llm_pricing` and must be preserved for
-    // a sharper reason than the table itself. A Settings-window snapshot that
-    // omits the field deserializes it as 0 (its serde default), so taking it
-    // from `incoming` would reset the watermark on every settings save — and
-    // the next launch would then re-run the top-up and resurrect a built-in
-    // row the user had deliberately deleted.
-    incoming.pricing_seeded_generation = cur.pricing_seeded_generation;
-    // `harness_versions` is likewise out-of-band (V16): written by the OOB
-    // transcript tap / tab spawn / `harness_mark_verified`, straight to the
-    // physical global file. A stale Settings-window snapshot must not revert
-    // a version observation or a Mark-verified. (The persistence layer
-    // additionally bans `llm_pricing`/`harness_versions` from project
-    // overlays wholesale — `OVERLAY_BANNED_KEYS` in settings/persistence.rs;
-    // this list here covers the in-memory round trip, that one the on-disk
-    // diff/merge. Keep both in mind when adding an out-of-band field.)
-    incoming.harness_versions = cur.harness_versions.clone();
-    // V40 Phase B: the same rule, one level down. `Settings::harness` is NOT
-    // preserved wholesale — `expose_commands`, `expose_code_audit`, the
-    // recorded spike outcome and every plugin `ext` value are what the Settings
-    // window is FOR — but the three OUT-OF-BAND fields on each row are
-    // (`sync_harness_into` excludes them from the disk write for the same
-    // reason). The window's snapshot is taken when it opens; the transcript tap
-    // or the auto-verify worker may have written a newer version since, and a
-    // save must not revert a version observation or a Mark-verified.
-    //
-    // V40 review L-1: iterate the REGISTRY, not `cur.harness`. A registered
-    // harness with no live row used to take all three straight from the
-    // incoming snapshot — and the frontend fabricates them for an absent key
-    // (`harnessRow` answers `last_seen: ''`, `auto_verify: null`), so the health
-    // panel would read "never auto-verified" until the next restart.
-    // `harness_settings` supplies the declared defaults for an absent row, which
-    // is the same answer every other reader gets.
-    for h in crate::harness::registry::all() {
-        let Some(id) = h.id() else {
-            continue;
-        };
-        let live = cur.harness_settings(h).clone();
-        let row = incoming
-            .harness
-            .entry(id.to_string())
-            .or_insert_with(|| live.clone());
-        row.last_seen = live.last_seen;
-        row.last_verified = live.last_verified;
-        row.auto_verify = live.auto_verify;
-    }
-    // A row for a harness this build does not know can only have come from the
-    // file, through `cur`; keep it whole rather than letting a window snapshot
-    // that never showed it decide its shape.
-    for (id, live) in &cur.harness {
-        if crate::harness::HarnessId::from_id(id).is_none() {
-            incoming.harness.entry(id.clone()).or_insert_with(|| live.clone());
-        }
-    }
-    *cur = incoming;
-    // V40 review M-1: the declared parse boundary, on the IPC write path too.
-    // The Settings window can post an out-of-enum `SettingKind::Enum` value or a
-    // non-object `Json` block (its generic form has an `{:else}` branch), and
-    // without this the wrong-typed value would live in memory — and in the file
-    // it is saved to — until some later out-of-band read repaired it.
-    cur.normalize_harness_settings();
-    // Keep the reserved feature tabs (Code Graph monitor / Workbench / ...)
-    // present-iff-enabled in the persisted list.
-    crate::settings::reconcile_reserved_tabs(cur);
-    // V38 Phase E: there is nothing to reconcile for the audit roster any more.
-    // The fourteen built-in tools are an embedded manifest read at invocation
-    // time, so a settings file that predates one of them simply has no state for
-    // it and the registry supplies the manifest default — which is what made the
-    // old top-up (`reconcile_audit_tools`, appending missing built-ins to a
-    // persisted array) unnecessary rather than merely moved.
-    // V21: when a harness declares a config writer that tracks cImp's own
-    // offload command, re-derive its snapshot if the primary Local command
-    // changed (no-op otherwise). V40 Phase B moved the two settings behind the
-    // OpenCode plugin, so this calls the plugin's own sync rather than a method
-    // on `OffloadSettings` named after one harness.
-    crate::harness::opencode::settings::sync_provider_on_save(cur);
-}
-
+/// Apply the Settings window's whole-struct save. See
+/// [`SettingsService::update`] for the ordering contract and the five edges the
+/// save computes across one atomic write. This is the wire boundary only: it
+/// names the two collaborators the service cannot get for itself — the warm
+/// code-graph index and the event sink.
 #[tauri::command]
 pub async fn settings_update(
     app: AppHandle,
     state: State<'_, AppState>,
     graph: State<'_, std::sync::Arc<crate::graph::GraphService>>,
-    mut settings: Settings,
+    settings: Settings,
 ) -> AppResult<()> {
-    // Re-point bundled avatar videos at the (possibly just-changed) theme's
-    // on-disk subfolder before broadcasting, so switching theme switches the
-    // avatar. User overrides are preserved; see `apply_portable_avatar_paths`.
-    crate::settings::apply_portable_avatar_paths(&mut settings);
-
-    // The reserved feature tabs and the settings flag gating each. ONE table
-    // drives both the pre-update snapshot and the post-update live
-    // materialize/remove below, so a new reserved tab can't be snapshotted
-    // but not synced (or vice versa) — the miss used to surface as "the tab
-    // only appears after a restart". The integrity pass that normally owns
-    // these tabs only runs at load.
-    type ReservedTabFlag = (TabId, fn(&Settings) -> bool);
-    const RESERVED_TAB_FLAGS: &[ReservedTabFlag] = &[
-        (TabId::GraphMonitor, |s| s.graph.enabled),
-        (TabId::Workbench, |s| s.workbench.enabled),
-        (TabId::ToolActivity, |s| s.ui.tool_activity_tab),
-        (TabId::Events, |s| s.ui.events_tab),
-    ];
-
-    // Snapshot the pre-update flags (reserved tabs via the table, plus the
-    // STT pair handled separately below) and the effective `graph.ignore`
-    // list for the resync edge at the bottom.
-    let (was_reserved, was_stt, was_stt_device, was_graph_ignore, was_spawn_sig) = {
-        let old = state.settings.current();
-        let was: Vec<bool> = RESERVED_TAB_FLAGS
-            .iter()
-            .map(|(_, flag)| flag(&old))
-            .collect();
-        (
-            was,
-            old.stt.enabled,
-            old.stt.device,
-            normalized_ignore(&old.graph.ignore),
-            crate::tabs::spawn_inject_sig(&old),
-        )
-    };
-
-    // The Settings window holds a full snapshot and replaces wholesale, but it
-    // never edits `layout` or `session` (those are driven only by the main
-    // window's save_layout / set_active_tab commands). Preserve them from the
-    // live state so a stale snapshot from the settings webview can't clobber a
-    // layout the user just dragged or the active-tab the main window just set.
-    // `tabs` IS legitimately edited here (TabBar reorder, ConfigureTabDialog,
-    // reset-to-defaults), so it is taken from the incoming struct.
-    //
-    // V14 code-review fix (HIGH, data loss): `prompt_templates` +
-    // `templates_seeded` are ALSO out-of-band fields — they're written only
-    // by `compose_templates_global_set` -> `write_global_prompt_templates`,
-    // straight to the physical global `settings.json`, bypassing this
-    // `SettingsHandle` entirely (see that command's doc comment). The
-    // Settings window's generic snapshot can easily be stale for these two
-    // fields (e.g. fetched before a Compose-section edit), and without this
-    // preservation a completely unrelated save (theme, a toggle, ...) would
-    // stomp the live in-memory copy with that stale value, which a later
-    // read (or a diff-and-persist elsewhere) could then present as the
-    // template library having reverted or lost entries. Preserve both here,
-    // exactly like `layout`/`session`, so the dedicated compose IPC stays
-    // the only writer of the template library.
-    state
-        .settings
-        .mutate(move |cur| apply_incoming_settings(cur, settings));
-
-    // On an `stt.enabled` edge, load or unload the Whisper model so the toggle
-    // actually frees/reclaims memory (not just hides the record button). When
-    // the feature stays enabled but the device (GPU↔CPU) changed, preload
-    // reloads the model on the new device — `needs_reload` in the worker
-    // detects the device mismatch and rebuilds the context, freeing the old
-    // device's memory. (Unlike TTS, the STT worker isn't a settings subscriber;
-    // it's driven by these control messages, so the reload must be nudged here.)
-    let now = state.settings.current();
-    if now.stt.enabled != was_stt {
-        if now.stt.enabled {
-            state.stt.preload();
-        } else {
-            state.stt.unload();
-        }
-    } else if now.stt.enabled && now.stt.device != was_stt_device {
-        state.stt.preload();
-    }
-
-    // On an actual enable/disable edge, mirror the change into the runtime so
-    // the reserved tab appears/disappears live (tab bar + pane placement).
-    let now_reserved: Vec<bool> = RESERVED_TAB_FLAGS
-        .iter()
-        .map(|(_, flag)| flag(&now))
-        .collect();
-    if now_reserved != was_reserved {
-        // Serialize against create/close_tab while we touch the registry.
-        let _serializer = state.lifecycle_serializer.lock().await;
-        for (i, (tab, _)) in RESERVED_TAB_FLAGS.iter().enumerate() {
-            if now_reserved[i] != was_reserved[i] {
-                super::tab_lifecycle::sync_reserved_feature_tab(
-                    state.inner(),
-                    tab.clone(),
-                    now_reserved[i],
-                )
-                .await;
-            }
-        }
-    }
-
-    // On an effective `graph.ignore` edge, reconcile the live index: drop
-    // newly-excluded files, index newly-included ones. Compared normalized
-    // (trimmed, empties out) but ORDER-SENSITIVE — gitignore semantics are
-    // last-match-wins, so reordering `!` re-includes is a real change. The
-    // resync is a no-op walk when the edit doesn't affect any indexed file.
-    if now.graph.enabled && normalized_ignore(&now.graph.ignore) != was_graph_ignore {
-        graph.spawn_ignore_resync();
-    }
-
-    // On a spawn-injection edge — anything baked into an AI tab only at
-    // launch: the advertised MCP server set (`--mcp-config` for Claude,
-    // `OPENCODE_CONFIG_CONTENT` for OpenCode), the guidance addendum, the
-    // `--settings` statusline/hooks overlay, the local-provider env, the
-    // OpenCode plugin flags/provider — tell the main window to show a restart
-    // hint: a running AI tab keeps its old injection until restarted. The V26
-    // field report: Code Audit enabled mid-session advertised nothing, the
-    // agent went probing for a CLI and opened GUI instances. Payload = the
-    // consumer names whose spawn injection changed.
-    let now_spawn_sig = crate::tabs::spawn_inject_sig(&now);
-    if now_spawn_sig != was_spawn_sig {
-        // Locked decision 8: iterate the map instead of reading slots 0 and 1.
-        // A positional pair meant a harness with no slot got NO restart hint
-        // when a spawn-baked setting changed — the exact failure the mechanism
-        // exists to prevent, and one that compiled. Phase A made it a
-        // registry-sized `PerHarness`; Phase B made it the
-        // `BTreeMap<HarnessId, Value>` the decision asks for, and folded every
-        // plugin's `spawn_baked` `ext` rows into it automatically, so the flag
-        // and its hint are one declaration.
-        let consumers: Vec<&'static str> = now_spawn_sig
-            .iter()
-            .filter(|(h, v)| was_spawn_sig.get(*h) != Some(*v))
-            .filter_map(|(h, _)| h.id())
-            .collect();
-        // Best-effort UI hint — never fail the save over it.
-        //
-        // BOTH windows (#48, F-x). This used to target `main` only, whose
-        // listener is a toast — and the user who just flipped the switch is
-        // standing in the SETTINGS window, which never heard the event that
-        // exists to tell them their change needs a restart. The Settings window
-        // renders it as a per-tab restart hint beside its own Restart buttons;
-        // the main window keeps its toast for the case where Settings is
-        // already closed.
-        //
-        // ONE broadcast, not one `emit_to` per window (rc.9 live-verify A1):
-        // a JS `listen()` registers with `EventTarget::Any`, and Tauri's
-        // `match_any_or_filter` lets an `Any` listener receive EVERY emit
-        // regardless of the target it was addressed to — so two targeted
-        // emits reached the main window's listener twice and it showed the
-        // toast twice. `emit` delivers once to every webview.
-        let _ = app.emit("ai-tab-restart-hint", consumers);
-    }
-    Ok(())
-}
-
-/// `graph.ignore` as the backend effectively applies it: trimmed, empty lines
-/// dropped (the Settings editor's just-added blank row is not a change).
-fn normalized_ignore(globs: &[String]) -> Vec<String> {
-    globs
-        .iter()
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect()
+    settings_service(&state)
+        .update(settings, graph.inner(), &TauriEventSink::new(app))
+        .await
 }
 
 // ── V8-01 local task offload ────────────────────────────────────────────
@@ -4221,10 +3926,9 @@ pub async fn restart_shell_tab(app: AppHandle, tab: TabId) -> AppResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::apply_incoming_settings;
     use super::is_automatic_terminal_response as auto_reply;
     use super::read_only_refusal;
-    use crate::settings::{PromptTemplate, Settings};
+    use crate::settings::Settings;
     use crate::state::{ReadOnlySource, TabId};
 
     /// **"No quota source" and "records no turns" are two answers, and this
@@ -4642,97 +4346,6 @@ mod tests {
             super::to_ignore_glob(&outside, false, &roots),
             outside.to_string_lossy().replace('\\', "/")
         );
-    }
-
-    /// The resync edge fires on real changes only: trimming and blank rows
-    /// (the editor's just-added empty line) don't count, order does.
-    #[test]
-    fn normalized_ignore_drops_blanks_keeps_order() {
-        let norm = |v: &[&str]| {
-            super::normalized_ignore(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>())
-        };
-        assert_eq!(
-            norm(&["/gen/", "", "  ", " *.snap "]),
-            vec!["/gen/", "*.snap"]
-        );
-        assert_ne!(norm(&["/gen/", "!keep"]), norm(&["!keep", "/gen/"]));
-    }
-
-    // V14 code-review FIX 1 (HIGH, data loss): `prompt_templates` /
-    // `templates_seeded` are written out-of-band by
-    // `compose_templates_global_set` (straight to the physical global
-    // `settings.json`, bypassing `SettingsHandle`), so the live in-memory
-    // copy can legitimately hold templates the Settings window's generic
-    // snapshot doesn't know about. Simulate that: `cur` already has
-    // templates (as if the dedicated compose path had just run), the
-    // incoming snapshot is stale/empty, and applying it must NOT clobber
-    // the live templates or the seeded flag.
-    #[test]
-    fn settings_update_preserves_out_of_band_prompt_templates() {
-        let mut cur = Settings {
-            prompt_templates: vec![
-                PromptTemplate {
-                    name: "review-this-diff".to_string(),
-                    body: "R".to_string(),
-                },
-                PromptTemplate {
-                    name: "my-new-template".to_string(),
-                    body: "N".to_string(),
-                },
-            ],
-            templates_seeded: true,
-            ..Settings::default()
-        };
-
-        // The incoming snapshot represents an unrelated Settings-window save
-        // (e.g. a theme flip) whose local copy of the template library is
-        // stale/empty because it was fetched before the compose-section edit.
-        let mut incoming = Settings::default();
-        incoming.ui.theme = "future-light".to_string();
-        assert!(incoming.prompt_templates.is_empty());
-        assert!(!incoming.templates_seeded);
-
-        apply_incoming_settings(&mut cur, incoming);
-
-        // The unrelated field DID apply...
-        assert_eq!(cur.ui.theme, "future-light");
-        // ...but the out-of-band template library and its seeded flag must
-        // be exactly as they were live, not reverted/deleted by the stale
-        // incoming snapshot.
-        assert_eq!(cur.prompt_templates.len(), 2);
-        assert_eq!(cur.prompt_templates[0].name, "review-this-diff");
-        assert_eq!(cur.prompt_templates[1].name, "my-new-template");
-        assert!(cur.templates_seeded);
-    }
-
-    // Same stale-snapshot scenario for the LLM price table, which is written
-    // only by `llm_pricing_set` -> `write_global_llm_pricing`: an unrelated
-    // Settings-window save must not revert live price edits.
-    #[test]
-    fn settings_update_preserves_out_of_band_llm_pricing() {
-        let mut cur = Settings {
-            llm_pricing: vec![crate::settings::LlmPricingModel {
-                provider: "Custom".to_string(),
-                model: "my-model".to_string(),
-                model_prefix: String::new(),
-                input: 1.0,
-                cache_write: 2.0,
-                cache_read: 0.5,
-                output: 4.0,
-            }],
-            ..Settings::default()
-        };
-
-        let mut incoming = Settings::default();
-        incoming.ui.theme = "future-light".to_string();
-        assert_ne!(incoming.llm_pricing, cur.llm_pricing); // stale (seeded defaults)
-
-        apply_incoming_settings(&mut cur, incoming);
-
-        assert_eq!(cur.ui.theme, "future-light");
-        assert_eq!(cur.llm_pricing.len(), 1);
-        assert_eq!(cur.llm_pricing[0].provider, "Custom");
-        assert_eq!(cur.llm_pricing[0].model, "my-model");
     }
 
     #[test]

@@ -715,6 +715,97 @@ pub fn request_tab_restart(
     Ok(())
 }
 
+/// V8-03/V9-01: materialize or tear down a reserved, app-rendered feature tab
+/// (Code Graph monitor / Workbench / ...) **live** when its feature flag is
+/// toggled in Settings, so the tab appears/disappears without an app restart.
+///
+/// The persisted `settings.tabs` list is kept consistent separately by
+/// [`crate::settings::reconcile_reserved_tabs`]; this drives the runtime
+/// registry plus the `tab-created`/`tab-closed` events the frontend uses to add
+/// the tab to the bar and place it in (or remove it from) a pane. Idempotent in
+/// both directions, so a redundant settings broadcast is a no-op. The caller
+/// should hold `lifecycle_serializer` so this can't race `create`/`close_tab`.
+///
+/// **The fourth commit variant** (locked decision 3). It is not a
+/// [`TabService`] method yet: it commits a tab whose position comes from
+/// SETTINGS rather than from the registry, which is the one difference
+/// `commit_new_tab` has to absorb as a named parameter rather than inherit by
+/// accident. It moved here from `ipc::tab_lifecycle` in the A1 settings run
+/// because its only caller — the settings save — stopped having an `AppState`
+/// to hand it; folding it into `commit_new_tab` is the tab-lifecycle run's
+/// work, and doing it here would have been a behaviour change smuggled into a
+/// mechanical wrap.
+pub(crate) async fn sync_reserved_feature_tab(
+    settings: &SettingsHandle,
+    registry: &TabRegistryHandle,
+    signals: &mpsc::Sender<StateSignal>,
+    tab: TabId,
+    enabled: bool,
+) {
+    if enabled {
+        // Name + canonical position come from the (already-reconciled) settings.
+        let snap = settings.current();
+        let Some(entry) = snap.find_tab(tab.as_str()) else {
+            return; // reconcile didn't add it (feature still off) — nothing to do
+        };
+        let name = entry.name().to_string();
+        let position = snap
+            .tabs
+            .iter()
+            .position(|t| t.id() == tab.as_str())
+            .unwrap_or(snap.tabs.len());
+        {
+            let mut registry = registry.lock().await;
+            if registry.has_tab(&tab) {
+                return; // already live
+            }
+            registry.insert_user_tab(tab.clone(), name.clone());
+        }
+        let meta = TabMeta {
+            id: tab.clone(),
+            kind: tab.kind(),
+            name,
+        };
+        if let Err(e) = signals.send(StateSignal::TabAdded { meta, position }).await {
+            warn!(error = %e, ?tab, "sync_reserved_feature_tab: add signal channel closed");
+            // Roll back the registry entry so it doesn't linger without a view.
+            registry.lock().await.remove_tab(&tab).await;
+        } else {
+            info!(?tab, "reserved feature tab materialized (feature enabled)");
+        }
+    } else {
+        let removed = {
+            let mut registry = registry.lock().await;
+            if !registry.has_tab(&tab) {
+                return; // already gone
+            }
+            // If the tab being removed is active, hand focus to a neighbor first
+            // so `active` never dangles at the removed tab (mirrors close_tab).
+            if registry.active() == tab {
+                let target = registry
+                    .previous_tab(&tab)
+                    .or_else(|| registry.next_tab(&tab));
+                if let Some(target) = target {
+                    if let Err(e) = registry.activate(target).await {
+                        warn!(error = %e, "sync_reserved_feature_tab: activate neighbor failed");
+                    }
+                }
+            }
+            registry.remove_tab(&tab).await
+        };
+        if removed {
+            if let Err(e) = signals
+                .send(StateSignal::TabRemoved { tab: tab.clone() })
+                .await
+            {
+                warn!(error = %e, ?tab, "sync_reserved_feature_tab: remove signal channel closed");
+            } else {
+                info!(?tab, "reserved feature tab removed (feature disabled)");
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

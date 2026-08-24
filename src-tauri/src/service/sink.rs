@@ -189,6 +189,29 @@ impl WebviewHost for crate::preview::PreviewRegistry {
     }
 }
 
+/// The warm code-graph index, as the *settings* save needs it.
+///
+/// A second host trait rather than another method on [`WebviewHost`], and it
+/// exists for a different reason than that one. `GraphService` is not a UI
+/// concern at all — but it is not constructible without a Tauri app either
+/// ([`GraphService::new`](crate::graph::GraphService::new) takes an
+/// `AppHandle`), so a service that names it concretely is a service no test can
+/// build. One method, for the one effect a settings save has on the index; a
+/// `GraphIndexHost` that grew a method per `GraphService` capability would be
+/// `GraphService` with extra steps.
+pub trait GraphIndexHost: Send + Sync {
+    /// Reconcile the live index against a changed `graph.ignore`: drop
+    /// newly-excluded files, index newly-included ones. Returns immediately —
+    /// the walk runs on its own thread.
+    fn spawn_ignore_resync(&self);
+}
+
+impl GraphIndexHost for std::sync::Arc<crate::graph::GraphService> {
+    fn spawn_ignore_resync(&self) {
+        crate::graph::GraphService::spawn_ignore_resync(self);
+    }
+}
+
 /// In-process implementations, for tests that drive the service without a
 /// WebView. Test-only on purpose: shipping them would put two unused `impl`s in
 /// the binary and invite production code to depend on a recorder.
@@ -302,6 +325,28 @@ pub mod testing {
 
     impl WebviewHost for NoWebviews {
         fn destroy_preview(&self, _tab_id: &str) {}
+    }
+
+    /// A graph index that counts the resyncs it was asked for instead of
+    /// walking anything. The count is the assertion: the `graph.ignore` edge is
+    /// "did the save decide a resync was needed", and a test that walked a real
+    /// index would be testing the walker instead.
+    #[derive(Default)]
+    pub struct NoGraphIndex {
+        resyncs: std::sync::atomic::AtomicUsize,
+    }
+
+    impl NoGraphIndex {
+        pub fn resyncs(&self) -> usize {
+            self.resyncs.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    impl GraphIndexHost for NoGraphIndex {
+        fn spawn_ignore_resync(&self) {
+            self.resyncs
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 

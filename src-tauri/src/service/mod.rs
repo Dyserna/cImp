@@ -39,6 +39,7 @@
 //! increment, not a prototype — but it is deliberately not the whole surface.
 
 pub mod pty;
+pub mod settings;
 pub mod sink;
 pub mod tabs;
 pub mod view;

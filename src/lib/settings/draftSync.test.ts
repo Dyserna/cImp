@@ -58,6 +58,26 @@ function settingsWindow(gated: boolean) {
         done();
       });
     },
+    /**
+     * `resetSettingsToDefaults` — the hard reset. It pushes the DEFAULTS
+     * rather than a mutation of the draft, but is otherwise shaped like
+     * `patch()`: assign the draft, then push it under the gate.
+     *
+     * `likePatch: false` reproduces the pre-fix reset, which pushed the
+     * defaults, left the draft alone (relying on the echo to bring it down)
+     * and — precisely because it never assigned the draft — did not register
+     * the push either. The two halves went together, and so does the fix.
+     */
+    reset(likePatch = true): void {
+      const next = structuredClone(ZERO); // `defaultSettings()`, a fresh clone per call
+      if (likePatch) draft = next;
+      pushed.push(structuredClone(next));
+      const done = likePatch ? sync.beginPush() : () => {};
+      settlers.push(() => {
+        backend = structuredClone(next);
+        done();
+      });
+    },
     settle(i: number): void {
       settlers[i]();
     },
@@ -147,6 +167,53 @@ describe('settings draft sync', () => {
     expect(w.draft).toEqual({ a: 1, b: 1, c: 0, external: 0 });
   });
 
+  // ── The reset (#129) ────────────────────────────────────────────────────
+  //
+  // The reset pushes the defaults. Until it assigned the draft too, there was
+  // a window between its push and its echo in which the draft still held the
+  // PRE-reset settings — and an edit made in that window clones the draft and
+  // pushes it wholesale, so every setting the user had just reset comes back,
+  // in the backend as well as on screen. Same lost-update shape as the burst,
+  // with the reset playing the part of the edit that gets undone.
+  test('an edit right after a reset does not resurrect the pre-reset settings', () => {
+    const w = settingsWindow(true);
+    w.patch((s) => (s.a = 1)); // the setting the user is about to reset away
+    w.settleAll();
+    w.echo(0);
+    expect(w.draft.a).toBe(1);
+
+    w.reset();
+    expect(w.draft).toEqual(ZERO); // the draft is at defaults IMMEDIATELY
+    w.patch((s) => (s.b = 1)); // …so an edit before the reset's echo builds on defaults
+    w.echo(1); // the reset's echo
+    w.echo(2);
+    w.settleAll();
+
+    expect(w.draft).toEqual({ a: 0, b: 1, c: 0, external: 0 });
+    expect(w.backend).toEqual({ a: 0, b: 1, c: 0, external: 0 });
+  });
+
+  // The discriminating control: the pre-fix reset, on the same interleaving.
+  // `a` is back — in the draft the user is looking at and, because the push is
+  // wholesale, in the backend for good.
+  test('the pre-fix reset lets the following edit undo the reset', () => {
+    const w = settingsWindow(true);
+    w.patch((s) => (s.a = 1));
+    w.settleAll();
+    w.echo(0);
+
+    w.reset(false); // pushes defaults, leaves the draft alone
+    expect(w.draft.a).toBe(1); // still pre-reset — this is the hole
+    w.patch((s) => (s.b = 1)); // clones the stale draft…
+    w.echo(1);
+    w.echo(2);
+    w.settleAll();
+
+    // …and the wholesale push puts `a` back, permanently.
+    expect(w.draft.a).toBe(1);
+    expect(w.backend.a).toBe(1);
+  });
+
   // The gate must never wedge shut. A push whose promise settles twice (wired
   // through both `.then` and `.catch`, say) must not over-count acks, and a
   // failed push still closes its window.
@@ -184,8 +251,8 @@ describe('settings draft sync', () => {
 /// A comment saying "register your push" is the kind of contract this codebase
 /// has repeatedly re-learned gets violated by someone who never read it, so the
 /// rule is enforced here instead: in `SettingsApp.svelte`, every top-level
-/// function that calls `applySettings` must also call `draftSync.beginPush()`,
-/// with one named exemption below.
+/// function that calls `applySettings` must also call `draftSync.beginPush()`.
+/// The exemption list below is EMPTY, and staying empty is the point.
 ///
 /// Read through Vite's own glob rather than `node:fs` — the app's tsconfig has
 /// no node types, and the emptiness assertions below fail loudly if this ever
@@ -197,24 +264,20 @@ const WINDOW_SOURCES = import.meta.glob(['/src/SettingsApp.svelte'], {
 }) as Record<string, string>;
 
 /**
- * The one sanctioned unregistered push, with the reason it is one.
+ * Sanctioned unregistered pushes, each with the reason it is one — currently
+ * NONE, and a row is a review decision rather than a formality.
  *
- * `resetSettingsToDefaults` does not push the DRAFT — it pushes
- * `defaultSettings()` and never assigns `snapshot`, deliberately letting the
- * echo bring the draft to defaults. Registering it would not help and would
- * mislead: the gate suppresses broadcasts so the draft can win, and here there
- * is no draft that should win. Making the reset gate-safe means having it
- * assign `snapshot` as `patch()` does, which is a behaviour change to the
- * reset, not a wiring fix — filed rather than smuggled in.
- *
- * Adding a row here is a review decision, not a formality.
+ * It held exactly one row for a while: `resetSettingsToDefaults`, which pushed
+ * `defaultSettings()` and never assigned `snapshot`, letting the echo bring the
+ * draft to defaults. That was not gate-safe, it was gate-SHAPED — the reset
+ * left the pre-reset draft standing until the echo landed, and an edit made in
+ * that window cloned it and pushed it wholesale, undoing the reset. The fix was
+ * the behaviour change the row said it would take: the reset now assigns the
+ * draft and registers its push exactly as `patch()` does, so the row is gone
+ * and `the reset assigns the draft and takes the gate (#129)` below pins the
+ * new shape.
  */
-const UNREGISTERED_PUSHES = new Map<string, string>([
-  [
-    'resetSettingsToDefaults',
-    'pushes defaultSettings(), not the draft, and never assigns snapshot — the echo is meant to replace the draft',
-  ],
-]);
+const UNREGISTERED_PUSHES = new Map<string, string>();
 
 /** Every top-level `function name(…) { … }` block in the component's script. */
 function topLevelFunctions(src: string): Map<string, string> {
@@ -265,13 +328,41 @@ describe('every settings push registers with the draft-sync gate', () => {
     expect(body).toMatch(/\.finally\(settled\)/);
   });
 
+  test('the reset assigns the draft and takes the gate (#129)', () => {
+    const body = topLevelFunctions(src).get('resetSettingsToDefaults');
+    expect(body, 'resetSettingsToDefaults is no longer a top-level function of the window').toBeTypeOf(
+      'string',
+    );
+    // The two halves of the fix, and both are load-bearing: registering the
+    // push without assigning the draft would leave the pre-reset state
+    // standing (the gate would then actively DEFEND it against the reset's own
+    // echo), and assigning without registering re-opens the burst race.
+    expect(body, 'the reset must assign the draft, not wait for its own echo').toMatch(
+      /\bsnapshot = \w+/,
+    );
+    expect(body).toContain('draftSync.beginPush()');
+    expect(body).toMatch(/\.finally\(settled\)/);
+    // …and it is still the DEFAULTS that get assigned and pushed, not the draft.
+    expect(body).toMatch(/=\s*defaultSettings\(\)/);
+  });
+
   test('the exemption list has no stale rows', () => {
     const fns = topLevelFunctions(src);
-    for (const [name] of UNREGISTERED_PUSHES) {
+    for (const [name, reason] of UNREGISTERED_PUSHES) {
       const body = fns.get(name);
       expect(body, `${name} is exempted but no longer exists`).toBeTypeOf('string');
       expect(body).toMatch(/\bapplySettings\(/);
       expect(body).not.toContain('draftSync.beginPush()');
+      expect(reason, `${name} is exempted with no reason given`).not.toBe('');
     }
+    // The list is empty today, so the loop above asserts nothing — and a test
+    // that asserts nothing is not a test. Adding a row is meant to be a
+    // deliberate act with a reviewer behind it, so it has to come through this
+    // line: state the roster, and let a silent new exemption fail here.
+    expect(
+      [...UNREGISTERED_PUSHES.keys()],
+      'a push was exempted from the draft-sync gate — that is a review decision: ' +
+        'name it here with the reason it cannot register',
+    ).toEqual([]);
   });
 });

@@ -1078,6 +1078,19 @@
   /// defaults from `defaultSettings()`. Wipes user-created shell tabs,
   /// saved layouts, shortcut overrides, etc. — fully destructive, so
   /// gated on a native `confirm()` prompt.
+  ///
+  /// Shaped exactly like `patch()`, and for the same reason (#129). The reset
+  /// used to push the defaults and leave `snapshot` alone, letting the echo
+  /// bring the draft down — which left a window in which the draft still held
+  /// the PRE-reset settings: an edit made in that window cloned the stale
+  /// draft and pushed it wholesale, resurrecting everything the user had just
+  /// reset. So the draft is assigned here, immediately, and the push is
+  /// registered with `draftSync` like every other one.
+  ///
+  /// `defaultSettings()` already hands back a fresh deep clone per call, so
+  /// the assign-and-push pair aliases one private object exactly as `patch()`
+  /// does with its `structuredClone` — no second clone is needed, and nothing
+  /// else holds a reference through which to mutate it under the push.
   function resetSettingsToDefaults() {
     const ok = confirm(
       'Reset every setting to its default? This wipes:\n' +
@@ -1088,7 +1101,10 @@
         '\nThis cannot be undone.',
     );
     if (!ok) return;
-    void applySettings(defaultSettings());
+    const next = defaultSettings();
+    snapshot = next;
+    const settled = draftSync.beginPush();
+    void applySettings(next).finally(settled);
   }
 
   // ── Code Audit ─────────────────────────────────────────────────────────

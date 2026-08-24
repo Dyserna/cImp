@@ -814,9 +814,9 @@ impl TurnUsageShape {
     }
 
     /// Whether this harness declares `id` as a token category. The read
-    /// boundary in `graph/index.rs` asks this per query to decide which stored
-    /// columns become entries in a [`TokenKinds`] — a category the harness
-    /// never declared must not appear as a structural zero.
+    /// boundary in `graph/index/usage.rs` asks this per query to decide which
+    /// stored columns become entries in a [`TokenKinds`] — a category the
+    /// harness never declared must not appear as a structural zero.
     pub fn declares_kind(&self, id: &str) -> bool {
         self.token_kinds.iter().any(|k| k.id == id)
     }
@@ -1696,7 +1696,7 @@ pub trait HarnessPlugin: Sync + Send {
     /// `usage_source`: OpenCode declares a shape and no source (it records
     /// turns, it reports no quota), and the reverse would be equally legal.
     ///
-    /// The read boundary (`graph/index.rs`) resolves a stored session's harness
+    /// The read boundary (`graph/index/usage.rs`) resolves a stored session's harness
     /// and asks this which categories to emit. A session whose harness declares
     /// no shape falls back to emitting only the columns that are non-zero — an
     /// undeclared category is never invented.

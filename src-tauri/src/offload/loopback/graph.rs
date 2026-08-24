@@ -167,26 +167,28 @@ pub(super) async fn handle_graph_run(stream: &mut TcpStream, app: &AppHandle, re
     let r = match graph
         .run_graph_tool(
             &cwd,
-            &body.name,
-            &body.args,
             consumer,
-            session.as_deref(),
-            // V32 Phase G: the second resolved verdict this route carries — the
-            // memory-read tools it serves (`context_recall` / `context_notes`)
-            // are the recall envelope's delivery point, and only this frame
-            // knows the tab whose scope decides it.
-            toolclass::CallGuards {
-                taint,
-                spotlight_recall: crate::settings::injection::effective(
-                    crate::settings::injection::Feature::Spotlighting,
-                    crate::settings::injection::Scope::for_tab(
-                        consumer_source,
-                        body.tab.as_deref(),
+            crate::graph::ToolCall {
+                name: &body.name,
+                args: &body.args,
+                session: session.as_deref(),
+                // V32 Phase G: the second resolved verdict this route carries —
+                // the memory-read tools it serves (`context_recall` /
+                // `context_notes`) are the recall envelope's delivery point, and
+                // only this frame knows the tab whose scope decides it.
+                guards: toolclass::CallGuards {
+                    taint,
+                    spotlight_recall: crate::settings::injection::effective(
+                        crate::settings::injection::Feature::Spotlighting,
+                        crate::settings::injection::Scope::for_tab(
+                            consumer_source,
+                            body.tab.as_deref(),
+                        ),
+                        &settings,
                     ),
-                    &settings,
-                ),
+                },
+                tab: tab_attr,
             },
-            tab_attr,
         )
         .await
     {

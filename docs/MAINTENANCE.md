@@ -610,7 +610,7 @@ verified* takes the harness from the row clicked:
   zero reminds ⇒ the harness's injection mechanism is not firing),
   `drift.injection_unseen.v1` (injection follow-rate ~0%),
   `drift.usage_fields_gone.v1` (sessions without token fields). All on the
-  Advisor card, `src-tauri/src/advisor.rs`; each rule's *fix hint* names the
+  Advisor card, `src-tauri/src/advisor/drift.rs`; each rule's *fix hint* names the
   mechanism the plugin declares, not a hard-coded one.
 - **Payload validation** — a harness's ingress routes POST
   `/activity/contract_drift` when required fields go missing (still fail open);

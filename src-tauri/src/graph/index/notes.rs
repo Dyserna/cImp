@@ -23,9 +23,10 @@
 //! are private to `graph::index`, so no other module can reach the relation by
 //! any spelling. Nothing here adds to that half.
 //!
-//! **"Only ONE query applies the filter"** was not. `graph/index.rs` is ~8,800
-//! lines, "the second note query in this file is the bug" is not a property a
-//! reviewer can hold in their head, and the test that claimed to hold it passed
+//! **"Only ONE query applies the filter"** was not. `graph/index.rs` was ~8,800
+//! lines then (V42 R13 has since split it into submodules, this one included),
+//! "the second note query in this file is the bug" is not a property a reviewer
+//! can hold in their head, and the test that claimed to hold it passed
 //! **vacuously**: it lived in the very file it allowed and self-matched on its
 //! own doc comment and its own search literal, so renaming the relation would
 //! have left decision 10 unguarded with a green suite (V32 review, Part 4
@@ -41,8 +42,8 @@
 //! the retired scan, but over a few hundred lines instead of 8,800, and with
 //! the three self-guards the old one lacked.
 //!
-//! Deletes live here too, as the `RM_*` script constants `graph/index.rs`'s
-//! transaction paths use. They cannot leak a quarantined note (they remove
+//! Deletes live here too, as the `RM_*` script constants the parent's
+//! transaction cascades (`graph/index/memory.rs`) use. They cannot leak a quarantined note (they remove
 //! rows), but keeping their text here is what lets the scan assert "**no**
 //! query outside this module" instead of maintaining an exception list.
 //!
@@ -71,13 +72,13 @@
 //!   Fixed by **removing the interpolation**: [`GraphIndex::mem_note_stage_row_count`]
 //!   spells the stage relation out, and `tests::no_interpolated_relation_atom`
 //!   makes a new one a red test. The residue: an interpolated atom is only
-//!   banned *here*. `graph/index.rs` legitimately has two (over `usage_stat` and
-//!   the session relations) and a blanket ban would be wrong there, so a future
+//!   banned *here*. The parent tree legitimately has two (over `usage_stat` and
+//!   the graph relations) and a blanket ban would be wrong there, so a future
 //!   parameterized read in the parent whose parameter happens to be this
-//!   relation is still covered by the module boundary alone — 8,800 lines of it.
+//!   relation is still covered by the module boundary alone.
 //!   Narrowing that is a type problem (a relation newtype), not a scan problem.
 //!
-//! - **Statements that name the relation without an atom.** `graph/index.rs`'s
+//! - **Statements that name the relation without an atom.** The parent's
 //!   `#[cfg(test)] mod tests` ran four — a `::remove`, a pre-C2 `:create`, and
 //!   two `:put`s — to build the fixtures the migration tests need. None could
 //!   *read* a row (they are DDL and writes), so none could bypass the filter,
@@ -98,14 +99,14 @@ use std::collections::{BTreeMap, HashSet};
 
 use cozo::{DataValue, Num, ScriptMutability};
 
-use crate::error::{AppError, AppResult};
+use crate::error::AppResult;
 use crate::graph::memory::{MemNote, NoteQuarantine, QuarantineReview};
 use crate::graph::secrets::ScreenedNote;
 use crate::offload::toolclass::WriteTaint;
 
-use super::{cell_bool, cell_i64, cell_str, GraphIndex};
+use super::{cell_bool, cell_i64, cell_str, GraphIndex, StageAndSwap};
 
-// ── Delete scripts used by `graph/index.rs`'s transaction cascades ─────────
+// ── Delete scripts used by `graph/index/memory.rs`'s cascades ─────────────
 //
 // `session_id` is a VALUE column on this relation (the key is `note_id`), so
 // unlike the session-keyed relations there is no prefix bind to inline and the
@@ -154,7 +155,7 @@ impl GraphIndex {
     /// shapes cannot drift.
     pub(super) fn ensure_mem_note_relation(&self, existing: &HashSet<String>) -> AppResult<()> {
         if !existing.contains("mem_note") {
-            self.run_mut(&Self::mem_note_create_ddl("mem_note"), BTreeMap::new())?;
+            self.exec(&Self::mem_note_create_ddl("mem_note"))?;
         }
         Ok(())
     }
@@ -200,13 +201,14 @@ impl GraphIndex {
     /// meaningfully triage. The compensating control for unauditable memory is
     /// the delivery-time spotlighting envelope, which wraps clean notes too.
     ///
-    /// Mechanically identical to [`Self::migrate_usage_stat_origin`] — see that
-    /// method for why the crash-safe stage-and-swap is shaped this way (CozoDB
-    /// autocommits each script, so a naive remove→create→put loses data if the
-    /// process dies mid-sequence). Called from the writable [`Self::open`]
-    /// migration path only; `open_existing` consumers are read-only and are
-    /// protected instead by the [`super::GRAPH_SCHEMA_VERSION`] gate, which refuses a
-    /// store whose `mem_note` has not been migrated yet.
+    /// Runs [`GraphIndex::stage_and_swap`], the engine `usage_stat`'s V24
+    /// migration runs too — see it for why the crash-safe sequence is shaped
+    /// this way (CozoDB autocommits each script, so a naive remove→create→put
+    /// loses data if the process dies mid-sequence). Called from the writable
+    /// [`Self::open`] migration path only; `open_existing` consumers are
+    /// read-only and are protected instead by the
+    /// [`super::GRAPH_SCHEMA_VERSION`] gate, which refuses a store whose
+    /// `mem_note` has not been migrated yet.
     pub(super) fn migrate_mem_note_tainted(&self) -> AppResult<()> {
         self.migrate_mem_note_shape(
             "tainted",
@@ -235,86 +237,41 @@ impl GraphIndex {
         self.migrate_mem_note_shape("quarantine", READ_C2, &[DataValue::Str("".into())])
     }
 
-    /// The stage-and-swap engine both `mem_note` migrations run: read the old
-    /// shape with `read_script`, append `defaults` for the columns being added,
-    /// stage the result in the CURRENT shape, verify the row count, then swap.
-    ///
-    /// One engine rather than two copies because the crash-safety is the subtle
-    /// part (CozoDB autocommits each script, so a naive remove→create→put loses
-    /// data if the process dies mid-sequence), and a second hand-rolled copy of
-    /// it is a second chance to get the abort path wrong. `added_column` is the
-    /// idempotence probe: present ⇒ this migration already ran.
-    ///
-    /// The recovery branch is shared too, and deliberately: [`Self::MEM_NOTE_STAGE`]
-    /// always holds the *current* shape, whichever migration built it, so
-    /// whichever one runs first may adopt it. What must never happen is adopting
-    /// `mem_note` over a populated stage — that is the direction that loses notes.
+    /// The per-relation half of `mem_note`'s stage-and-swap migration: the two
+    /// historical shapes it can start from, the defaults for the columns being
+    /// added, and the two statements that have to name the relation as a
+    /// literal in this file (its stage row count and its promote). The
+    /// crash-safety, and the recovery branch both migrations share, are
+    /// [`GraphIndex::stage_and_swap`]'s — see it for why the sequence is shaped
+    /// this way (V42 R12 folded the second hand-written copy of it into the
+    /// first). `added_column` is the idempotence probe: present ⇒ this
+    /// migration already ran.
     fn migrate_mem_note_shape(
         &self,
         added_column: &str,
         read_script: &str,
         defaults: &[DataValue],
     ) -> AppResult<()> {
-        let existing = self.existing_relations()?;
-        // Recovery: a leftover stage means a prior migration was interrupted
-        // after the stage was durably populated. Adopt the stage over whatever
-        // `mem_note` currently is — never the reverse, so no notes are lost.
-        if existing.contains(Self::MEM_NOTE_STAGE) {
-            return self.promote_mem_note_stage();
-        }
-        if !existing.contains("mem_note") {
-            return Ok(());
-        }
-        if self.relation_has_column("mem_note", added_column)? {
-            return Ok(());
-        }
-        let rows = self.run(read_script, BTreeMap::new(), ScriptMutability::Immutable)?;
-        let expected = rows.rows.len();
-        let migrated: Vec<DataValue> = rows
-            .rows
-            .into_iter()
-            .map(|mut r| {
-                r.extend(defaults.iter().cloned());
-                DataValue::List(r)
-            })
-            .collect();
-        if migrated.is_empty() {
-            self.run_mut(
-                &Self::mem_note_create_ddl(Self::MEM_NOTE_STAGE),
-                BTreeMap::new(),
-            )?;
-        } else {
-            let mut p = BTreeMap::new();
-            p.insert("rows".to_string(), DataValue::List(migrated));
-            self.run_mut(
-                &format!(
-                    "?[note_id, session_id, text, ts_ms, pinned, tainted, quarantine] <- $rows\n{}",
-                    Self::mem_note_create_ddl(Self::MEM_NOTE_STAGE)
-                ),
-                p,
-            )?;
-        }
-        // Verify the stage captured every old row before dropping the original.
-        let staged = self.mem_note_stage_row_count()?;
-        if staged != expected {
-            self.run_mut(&format!("::remove {}", Self::MEM_NOTE_STAGE), BTreeMap::new())?;
-            return Err(AppError::Graph(format!(
-                "mem_note migration stage captured {staged} of {expected} rows; aborting"
-            )));
-        }
-        self.promote_mem_note_stage()
+        self.stage_and_swap(StageAndSwap {
+            live: "mem_note",
+            stage: Self::MEM_NOTE_STAGE,
+            added_column,
+            read_script,
+            defaults,
+            stage_columns: "note_id, session_id, text, ts_ms, pinned, tainted, quarantine",
+            stage_ddl: &Self::mem_note_create_ddl(Self::MEM_NOTE_STAGE),
+            count_stage: &|| self.mem_note_stage_row_count(),
+            promote: &|| self.promote_mem_note_stage(),
+        })
     }
 
     /// Promote a fully-populated [`Self::MEM_NOTE_STAGE`] to `mem_note`.
     /// Idempotent on retry, exactly like [`Self::promote_usage_stat_stage`].
     fn promote_mem_note_stage(&self) -> AppResult<()> {
         if self.existing_relations()?.contains("mem_note") {
-            self.run_mut("::remove mem_note", BTreeMap::new())?;
+            self.exec("::remove mem_note")?;
         }
-        self.run_mut(
-            &format!("::rename {} -> mem_note", Self::MEM_NOTE_STAGE),
-            BTreeMap::new(),
-        )?;
+        self.exec(&format!("::rename {} -> mem_note", Self::MEM_NOTE_STAGE))?;
         Ok(())
     }
 
@@ -334,11 +291,7 @@ impl GraphIndex {
     /// [`tests::the_stage_literal_matches_the_constant`] is what keeps the two
     /// spellings from drifting.
     fn mem_note_stage_row_count(&self) -> AppResult<usize> {
-        let rows = self.run(
-            "?[note_id] := *mem_note_v32{note_id}",
-            BTreeMap::new(),
-            ScriptMutability::Immutable,
-        )?;
+        let rows = self.query("?[note_id] := *mem_note_v32{note_id}")?;
         Ok(rows.rows.len())
     }
 
@@ -570,12 +523,10 @@ impl GraphIndex {
     /// [`QuarantineReview`]'s docs for why bounding a count with this token would
     /// hand one to the model-facing caller and make the capability meaningless.
     pub fn mem_quarantined_notes(&self, _review: QuarantineReview) -> AppResult<Vec<MemNote>> {
-        let rows = self.run(
+        let rows = self.query(
             "?[note_id, session_id, text, ts_ms, pinned, quarantine] := \
                 *mem_note{note_id, session_id, text, ts_ms, pinned, tainted, quarantine}, \
                 tainted == true",
-            BTreeMap::new(),
-            ScriptMutability::Immutable,
         )?;
         let mut notes: Vec<MemNote> = rows
             .rows
@@ -644,11 +595,7 @@ impl GraphIndex {
     ///   argument bounding the sibling is about the *values*; a count is already
     ///   published to the model on purpose, and locked decision 22 wants it to be.
     pub fn mem_quarantined_count(&self) -> AppResult<usize> {
-        let rows = self.run(
-            "?[note_id] := *mem_note{note_id, tainted}, tainted == true",
-            BTreeMap::new(),
-            ScriptMutability::Immutable,
-        )?;
+        let rows = self.query("?[note_id] := *mem_note{note_id, tainted}, tainted == true")?;
         Ok(rows.rows.len())
     }
 }
@@ -712,9 +659,9 @@ fn decode_quarantine(raw: &str, note_id: &str) -> Option<NoteQuarantine> {
 
 // ── Migration-test fixture scripts (#48) ───────────────────────────────────
 //
-// `graph/index.rs`'s migration tests need to build a PRE-C2 store and an
-// interrupted-swap store, which means running DDL and writes that name the
-// relation. They lived in that file, which made the module docs' "every
+// The parent's migration tests (`graph/index/memory.rs`) need to build a PRE-C2
+// store and an interrupted-swap store, which means running DDL and writes that
+// name the relation. They lived in that file, which made the module docs' "every
 // statement naming the relation lives here" claim false by four.
 //
 // None of them can read a row, so none could ever bypass the quarantine filter
@@ -842,9 +789,10 @@ mod tests {
     /// exactly the same reason, and unlike guard 4's subject this guard scans
     /// EVERY match in the file — including one sitting in its own doc comment.
     ///
-    /// Scoped to `SELF` on purpose. `graph/index.rs` has two legitimate
-    /// interpolated atoms over other relations (`usage_stat`'s row count, the
-    /// session migration's read), and banning the shape there would be wrong.
+    /// Scoped to `SELF` on purpose. The parent tree has two legitimate
+    /// interpolated atoms over other relations (`usage_stat`'s row count in
+    /// `index/usage.rs`, the per-relation count in `index.rs`'s `stats`), and
+    /// banning the shape there would be wrong.
     /// Banning it *here* is not: this file has exactly one relation to talk
     /// about, so an interpolated name in it is either this relation or a
     /// mistake, and both want the author to stop and write the name out.
@@ -898,8 +846,8 @@ mod tests {
     ///    to check: that the filter still *works*. That is behaviour, and
     ///    behaviour is pinned by a behavioural test — see
     ///    `quarantined_notes_are_hidden_from_reads_until_promoted` in
-    ///    `graph/index.rs`. A source scan asserting that its own file contains
-    ///    some substring is satisfied by its own error message.
+    ///    `graph/index/memory.rs`. A source scan asserting that its own file
+    ///    contains some substring is satisfied by its own error message.
     /// 4. **Every match here must be a real query** — the file's house rule,
     ///    made executable (#48). Guard 3 counts occurrences and cannot tell
     ///    prose from code; when it shipped, `atom()`'s own doc comment spelled

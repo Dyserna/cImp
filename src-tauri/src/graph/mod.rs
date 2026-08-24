@@ -71,6 +71,10 @@ pub use mcp::{
 // test, not by the graph's consumers.
 #[cfg(test)]
 pub use mcp::UNKNOWN_SOURCE;
+// V42 R26: the parameter object `GraphService::run_graph_tool` takes. Named here
+// rather than left inside the private `mcp` module because the loopback
+// `/graph_run` route — the one caller of `run_graph_tool` — has to build one.
+pub(crate) use mcp::ToolCall;
 pub use memory::{SessionUsageDetail, UsageSnapshot};
 pub use model::*;
 pub use service::{EmbedderProbe, GraphService, GraphStatus, LangCensus, RebuildOrigin};

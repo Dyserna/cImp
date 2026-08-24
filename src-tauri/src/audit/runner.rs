@@ -511,12 +511,13 @@ impl AuditState {
     /// the busy check + `scanning` state transition under the lock, followed by
     /// the first `audit-status` emit.
     ///
-    /// On success returns `(to_run, root, global_timeout, cancel, sandbox)` —
-    /// the enabled+applicable subset to launch, the scan root, the resolved
-    /// global wall-clock budget, this scan's cancel token, and the V33
-    /// OS-sandbox config — leaving the runner in the `scanning` state with its
-    /// chips already emitted. The caller's only remaining job is to drive
-    /// `run(..)` (spawned or awaited) which clears `scanning` when it finishes.
+    /// On success returns `(to_run, ctx)` — the enabled+applicable subset to
+    /// launch, plus the [`RunCtx`] every frame of the spawn chain runs under
+    /// (the scan root, the resolved global wall-clock budget, this scan's cancel
+    /// token, and the V33 OS-sandbox config) — leaving the runner in the
+    /// `scanning` state with its chips already emitted. The caller's only
+    /// remaining job is to drive `run(..)` (spawned or awaited) which clears
+    /// `scanning` when it finishes.
     ///
     /// The sandbox config is resolved HERE, once, from the same settings
     /// snapshot everything else in this scan comes from: a scan that started
@@ -528,20 +529,10 @@ impl AuditState {
     /// MCP surface are registered unconditionally, so the graph/offload gating
     /// discipline applies), no tool of this category is enabled, or a scan of
     /// *either* category is already in flight (one scan at a time, globally).
-    #[allow(clippy::type_complexity)]
     fn begin_scan(
         self: &Arc<Self>,
         category: Category,
-    ) -> Result<
-        (
-            Vec<RunnableAudit>,
-            PathBuf,
-            Duration,
-            CancellationToken,
-            crate::sandbox::SandboxCfg,
-        ),
-        String,
-    > {
+    ) -> Result<(Vec<RunnableAudit>, RunCtx), String> {
         let settings = self.settings.current();
         let sandbox = crate::sandbox::SandboxCfg::from_settings(&settings);
         // V38: resolved from the SAME settings snapshot as everything else in
@@ -637,10 +628,12 @@ impl AuditState {
 
         Ok((
             to_run,
-            root,
-            Duration::from_secs(global_timeout),
-            cancel,
-            sandbox,
+            RunCtx {
+                root,
+                timeout: Duration::from_secs(global_timeout),
+                cancel,
+                sandbox,
+            },
         ))
     }
 
@@ -651,22 +644,13 @@ impl AuditState {
     /// enabled. Returns immediately; work runs on a background task and streams
     /// progress via `audit-status`.
     pub fn start_scan(self: &Arc<Self>, category: Category) -> Result<(), String> {
-        let (to_run, root, global_timeout, cancel, sandbox) = self.begin_scan(category)?;
+        let (to_run, ctx) = self.begin_scan(category)?;
         let this = self.clone();
         tauri::async_runtime::spawn(async move {
             // V30 Phase C: `Initiator::Gui` — nobody is awaiting this scan, so
             // its completion is exactly the kind of fact the session-push bus
             // exists for.
-            this.run(
-                to_run,
-                root,
-                category,
-                global_timeout,
-                cancel,
-                Initiator::Gui,
-                sandbox,
-            )
-            .await;
+            this.run(to_run, category, Initiator::Gui, ctx).await;
         });
         Ok(())
     }
@@ -691,21 +675,13 @@ impl AuditState {
         self: &Arc<Self>,
         category: Category,
     ) -> Result<AuditSnapshot, String> {
-        let (to_run, root, global_timeout, cancel, sandbox) = self.begin_scan(category)?;
+        let (to_run, ctx) = self.begin_scan(category)?;
         // V30 Phase C: `Initiator::Agent` — the snapshot returned below IS the
         // caller's tool result, so this path never pushes (it would duplicate
         // the report into the very session that asked for it).
         Ok(self
             .clone()
-            .run(
-                to_run,
-                root,
-                category,
-                global_timeout,
-                cancel,
-                Initiator::Agent,
-                sandbox,
-            )
+            .run(to_run, category, Initiator::Agent, ctx)
             .await)
     }
 
@@ -845,29 +821,29 @@ impl AuditState {
     /// awaiting caller ([`run_scan_and_wait`](Self::run_scan_and_wait)) reads
     /// *this* scan's result — never the state of a next scan that squeezes in
     /// after the flag clears. The fire-and-forget path drops it.
-    #[allow(clippy::too_many_arguments)]
     async fn run(
         self: Arc<Self>,
         tools: Vec<RunnableAudit>,
-        root: PathBuf,
         category: Category,
-        global_timeout: Duration,
-        cancel: CancellationToken,
         initiator: Initiator,
-        sandbox: crate::sandbox::SandboxCfg,
+        // V42 R26: the scan's own context, exactly as `begin_scan` resolved it.
+        // `ctx.timeout` is still the GLOBAL budget here — the per-tool narrowing
+        // is the `effective_tool_timeout` line below, and it happens once, in the
+        // frame that builds each tool's own context.
+        ctx: RunCtx,
     ) -> AuditSnapshot {
         // V30: wall clock for the completion push's duration floor. Started
         // here (not in `begin_scan`) so it measures the scan itself, not the
         // census walk and settings sync that precede it.
         let started = Instant::now();
-        let git_repo = root.join(".git").exists();
+        let git_repo = ctx.root.join(".git").exists();
         let mut handles = Vec::new();
 
         for tool in tools {
             // Per-tool timeout override (`None` = the global
             // `code_audit.timeout_secs`). A build-style tool
             // (`dotnet-analyzers`) wants a longer budget than a linter.
-            let timeout = effective_tool_timeout(tool.timeout_secs, global_timeout);
+            let timeout = effective_tool_timeout(tool.timeout_secs, ctx.timeout);
             // V38 Phase F — tier 2: nothing to resolve, because nothing is
             // spawned. The branch is HERE rather than inside `run_one` because
             // resolution is the whole of what the two tiers do differently
@@ -882,8 +858,8 @@ impl AuditState {
                     ts.resolved = None;
                 });
                 let this = self.clone();
-                let cancel = cancel.clone();
-                let root = root.clone();
+                let cancel = ctx.cancel.clone();
+                let root = ctx.root.clone();
                 handles.push(tauri::async_runtime::spawn(async move {
                     this.run_one_provider(tool, provider, root, timeout, cancel)
                         .await;
@@ -894,7 +870,7 @@ impl AuditState {
             // genuinely differ: cImp resolves a bare command name for a tool it
             // shipped, and never for one it did not (decision 7). See
             // [`resolve_runnable`].
-            match resolve_runnable(&tool, &root) {
+            match resolve_runnable(&tool, &ctx.root) {
                 Err((status, error)) => {
                     self.patch_tool(&tool.key, |ts| {
                         ts.status = status;
@@ -910,12 +886,14 @@ impl AuditState {
                         ts.resolved = Some(shown);
                     });
                     let this = self.clone();
-                    let cancel = cancel.clone();
-                    let root = root.clone();
-                    let sandbox = sandbox.clone();
+                    // This tool's own context: the scan's, with the global
+                    // budget narrowed to the per-tool one resolved above.
+                    let ctx = RunCtx {
+                        timeout,
+                        ..ctx.clone()
+                    };
                     handles.push(tauri::async_runtime::spawn(async move {
-                        this.run_one(tool, resolved, root, git_repo, timeout, cancel, sandbox)
-                            .await;
+                        this.run_one(tool, resolved, git_repo, ctx).await;
                     }));
                 }
             }
@@ -944,7 +922,7 @@ impl AuditState {
             &snap,
             category,
             initiator,
-            cancel.is_cancelled(),
+            ctx.cancel.is_cancelled(),
             started.elapsed().as_millis() as u64,
         );
         snap
@@ -1146,18 +1124,18 @@ impl AuditState {
     /// argv), and a manifest is data. The one branch left is the coverage pass,
     /// which is a fact about `osv-scanner` specifically rather than about
     /// built-ins in general.
-    #[allow(clippy::too_many_arguments)]
     async fn run_one(
         self: Arc<Self>,
         tool: RunnableAudit,
         resolved: PathBuf,
-        root: PathBuf,
         git_repo: bool,
-        timeout: Duration,
-        cancel: CancellationToken,
-        sandbox: crate::sandbox::SandboxCfg,
+        // V42 R26: this tool's context — the scan's, with `timeout` already
+        // narrowed to this tool's budget by `run`.
+        ctx: RunCtx,
     ) {
         let started = Instant::now();
+        let root = ctx.root.as_path();
+        let timeout = ctx.timeout;
         // What the sandbox lane and the activity row call this run. For a
         // built-in that is its command name (`audit:semgrep`), which is what
         // those rows have said since V33 and what a user grepping them expects;
@@ -1167,7 +1145,7 @@ impl AuditState {
             Transport::ReportFile => Some(temp_report_path(&subject)),
             Transport::Stdout => None,
         };
-        let argv = tool.full_argv(&root, report_path.as_deref(), git_repo);
+        let argv = tool.full_argv(root, report_path.as_deref(), git_repo);
 
         // V33: a report-file tool writes its SARIF to the absolute path that is
         // already inside `argv`; the sandbox has to be able to let it. Derived
@@ -1187,23 +1165,19 @@ impl AuditState {
         // a `GrantRow` — only the row is withheld.
         let seam = crate::sandbox::audit_seam(&subject);
         let select = tool.runtime_select();
-        let boundary_expected = sandbox.enabled && tool.sandbox != SandboxReq::Unsupported;
+        let boundary_expected = ctx.sandbox.enabled && tool.sandbox != SandboxReq::Unsupported;
         let rows = crate::plugins::posture::screen_extra_grants(
             &seam,
-            &root,
+            root,
             &tool.extra_grants,
             boundary_expected,
         );
-        crate::plugins::posture::runtime_canary(&seam, &root, &subject, &select, &resolved);
+        crate::plugins::posture::runtime_canary(&seam, root, &subject, &select, &resolved);
 
         let cap = spawn_and_capture(
             &resolved,
             &argv,
             &tool.env,
-            &root,
-            timeout,
-            &cancel,
-            &sandbox,
             &subject,
             &SpawnPosture {
                 full_dirs,
@@ -1211,6 +1185,7 @@ impl AuditState {
                 runtime: select,
                 sandbox_req: tool.sandbox,
             },
+            &ctx,
         )
         .await;
         let duration_ms = started.elapsed().as_millis() as u64;
@@ -1242,7 +1217,7 @@ impl AuditState {
             sarif_truncated,
             &cap.stdout,
             &cap.stderr,
-            &root,
+            root,
             timeout,
         );
 
@@ -1252,7 +1227,7 @@ impl AuditState {
         // no other tool emits them.
         let scanned_artifacts = if tool.key.is_builtin("osv-scanner") && status == ToolStatus::Done
         {
-            parsers::sarif_scanned_artifacts(&sarif, &root)
+            parsers::sarif_scanned_artifacts(&sarif, root)
         } else {
             Vec::new()
         };
@@ -1273,7 +1248,7 @@ impl AuditState {
 
         record_audit_run(
             &subject,
-            &root,
+            root,
             findings_count,
             duration_ms,
             status,
@@ -2082,6 +2057,54 @@ impl Default for SpawnPosture {
     }
 }
 
+/// **What the scan gives every frame of the spawn chain**, in one owned value.
+///
+/// V42 R26: [`begin_scan`](AuditState::begin_scan) resolves these four together,
+/// from ONE settings snapshot, and every frame below it needed all four —
+/// [`run`](AuditState::run) → [`run_one`](AuditState::run_one) →
+/// [`spawn_and_capture`] → [`spawn_sandboxed`] each took them as four separate
+/// arguments and each carried an `#[allow(clippy::too_many_arguments)]` to say
+/// so. The complement of [`SpawnPosture`]: that struct is what ONE TOOL asks of
+/// the OS boundary, this is what THE SCAN hands to every tool.
+///
+/// Plumbing only — no field has a default, none may be omitted, and the values
+/// are the same ones the frames already threaded. Two of them narrow as they go
+/// down, both deliberately and both in exactly one place:
+///
+/// * `timeout` is the resolved GLOBAL budget at `run`, and `run` narrows it per
+///   tool through [`effective_tool_timeout`] before building the frame below;
+/// * `sandbox` is the scan's resolved config, and [`spawn_and_capture`] swaps in
+///   the disabled twin for a tool whose manifest declared itself unsandboxable
+///   (see `plugins::posture::unsupported_cfg`). Folding that swap into the
+///   context is the point: the frame below must never be handed the declared
+///   config while this one runs against the override.
+#[derive(Clone)]
+struct RunCtx {
+    /// The scan root — the child's cwd, the sandbox's granted project dir, and
+    /// the root every Events row is filed under.
+    root: PathBuf,
+    /// The wall-clock budget for this frame's work (see the narrowing note).
+    timeout: Duration,
+    /// This scan's cancel token. Both tiers honour it; the sandboxed path
+    /// bridges it onto a [`crate::sandbox::CancelFlag`].
+    cancel: CancellationToken,
+    /// The V33 OS-sandbox config, resolved once per scan (see the narrowing
+    /// note).
+    sandbox: crate::sandbox::SandboxCfg,
+}
+
+impl RunCtx {
+    /// This context with `sandbox` replaced — the ONE narrowing
+    /// [`spawn_and_capture`] applies, kept as a named operation so the swap
+    /// cannot be done by shadowing a local and then forgetting to pass it on.
+    fn with_sandbox(&self, sandbox: crate::sandbox::SandboxCfg) -> Self {
+        Self {
+            sandbox,
+            ..self.clone()
+        }
+    }
+}
+
 /// Spawn `resolved` with `argv` (cwd = `root`, `env` forced, console-suppressed
 /// on Windows), capturing stdout/stderr on their own tasks so a killed child
 /// still yields what it printed. Honors the per-tool `timeout` and the scan
@@ -2092,18 +2115,19 @@ impl Default for SpawnPosture {
 /// the lane distinguishes a scanner from a `run_command` or a `run_check`.
 /// V38: `posture` carries what a plugin manifest DECLARED about the boundary —
 /// see [`SpawnPosture`] and the three arms below.
-#[allow(clippy::too_many_arguments)]
 async fn spawn_and_capture(
     resolved: &Path,
     argv: &[String],
     env: &[(String, String)],
-    root: &Path,
-    timeout: Duration,
-    cancel: &CancellationToken,
-    sandbox: &crate::sandbox::SandboxCfg,
     tool_name: &str,
     posture: &SpawnPosture,
+    // V42 R26: the scan root, this tool's timeout, the scan's cancel token and
+    // the resolved sandbox config, threaded as one value — see [`RunCtx`].
+    ctx: &RunCtx,
 ) -> Capture {
+    let root = ctx.root.as_path();
+    let timeout = ctx.timeout;
+    let cancel = &ctx.cancel;
     let seam = crate::sandbox::audit_seam(tool_name);
     let subject = crate::sandbox::program_subject(resolved);
 
@@ -2124,9 +2148,24 @@ async fn spawn_and_capture(
     // config and discarding the plan would make the same run, plus durable
     // changes to the user's machine on a tool's behalf.
     let declared_unsupported = posture.sandbox_req == SandboxReq::Unsupported;
-    let unsupported_cfg =
-        crate::plugins::posture::unsupported_cfg(&seam, root, &subject, posture.sandbox_req);
-    let sandbox = unsupported_cfg.as_ref().unwrap_or(sandbox);
+    // V42 R26: folded into the CONTEXT rather than shadowing a bare `sandbox`
+    // argument, so `spawn_sandboxed` below cannot be handed the declared config
+    // while this frame runs against the disabled twin. Everything else in the
+    // context is unchanged by the swap.
+    let overridden;
+    let ctx = match crate::plugins::posture::unsupported_cfg(
+        &seam,
+        root,
+        &subject,
+        posture.sandbox_req,
+    ) {
+        Some(cfg) => {
+            overridden = ctx.with_sandbox(cfg);
+            &overridden
+        }
+        None => ctx,
+    };
+    let sandbox = &ctx.sandbox;
 
     // Only composed when the sandbox is on — `plan` discards it otherwise, and
     // the plain path below keeps its historical inherit-and-force environment.
@@ -2195,10 +2234,7 @@ async fn spawn_and_capture(
     };
     #[cfg(windows)]
     if let crate::sandbox::Plan::Sandboxed(prepared) = &plan {
-        return spawn_sandboxed(
-            prepared, resolved, argv, env, &base_env, root, timeout, cancel, sandbox, &seam,
-        )
-        .await;
+        return spawn_sandboxed(prepared, resolved, argv, env, &base_env, &seam, ctx).await;
     }
     if let crate::sandbox::Plan::Plain(reason) = &plan {
         // V38: `required` means never run unprotected — including when the
@@ -2375,21 +2411,24 @@ async fn spawn_and_capture(
 /// which returns as soon as the engine has terminated the child and drained
 /// its pipes.
 #[cfg(windows)]
-#[allow(clippy::too_many_arguments)]
 async fn spawn_sandboxed(
     prepared: &crate::sandbox::windows::Prepared,
     resolved: &Path,
     argv: &[String],
     env: &[(String, String)],
     base_env: &[(&str, std::ffi::OsString)],
-    root: &Path,
-    timeout: Duration,
-    cancel: &CancellationToken,
-    sandbox: &crate::sandbox::SandboxCfg,
     seam: &str,
+    // V42 R26: the caller's context, already carrying the EFFECTIVE sandbox
+    // config for this tool (see [`RunCtx::with_sandbox`]).
+    ctx: &RunCtx,
 ) -> Capture {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc as StdArc;
+
+    let root = ctx.root.as_path();
+    let timeout = ctx.timeout;
+    let cancel = &ctx.cancel;
+    let sandbox = &ctx.sandbox;
 
     let mut child_env = crate::sandbox::child_env::ChildEnv::from_base(base_env);
     child_env.overlay(env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
@@ -3952,14 +3991,16 @@ mod tests {
             &prog,
             &argv,
             &[],
-            &std::env::temp_dir(),
-            Duration::from_secs(30),
-            &cancel,
-            &crate::sandbox::SandboxCfg::disabled(),
             "test-required",
             &SpawnPosture {
                 sandbox_req: SandboxReq::Required,
                 ..SpawnPosture::default()
+            },
+            &RunCtx {
+                root: std::env::temp_dir(),
+                timeout: Duration::from_secs(30),
+                cancel: cancel.clone(),
+                sandbox: crate::sandbox::SandboxCfg::disabled(),
             },
         )
         .await;
@@ -3985,14 +4026,16 @@ mod tests {
             &prog,
             &argv,
             &[],
-            &std::env::temp_dir(),
-            Duration::from_millis(300),
-            &cancel,
-            &crate::sandbox::SandboxCfg::disabled(),
             "test-unsupported",
             &SpawnPosture {
                 sandbox_req: SandboxReq::Unsupported,
                 ..SpawnPosture::default()
+            },
+            &RunCtx {
+                root: std::env::temp_dir(),
+                timeout: Duration::from_millis(300),
+                cancel: cancel.clone(),
+                sandbox: crate::sandbox::SandboxCfg::disabled(),
             },
         )
         .await;
@@ -4026,16 +4069,18 @@ mod tests {
             &prog,
             &argv,
             &[],
-            &std::env::temp_dir(),
-            Duration::from_millis(300),
-            &cancel,
-            // Deliberately UNsandboxed: this asserts the timeout/kill contract, and
-            // routing it through the AppContainer would ACL-stamp the developer's
-            // real toolchain dirs as a side effect of running the suite (the
-            // `run_command` precedent).
-            &crate::sandbox::SandboxCfg::disabled(),
             "test-sleeper",
             &SpawnPosture::default(),
+            &RunCtx {
+                root: std::env::temp_dir(),
+                timeout: Duration::from_millis(300),
+                cancel: cancel.clone(),
+                // Deliberately UNsandboxed: this asserts the timeout/kill
+                // contract, and routing it through the AppContainer would
+                // ACL-stamp the developer's real toolchain dirs as a side effect
+                // of running the suite (the `run_command` precedent).
+                sandbox: crate::sandbox::SandboxCfg::disabled(),
+            },
         )
         .await;
         // Returns promptly (child killed), not after the ~30s sleep.
@@ -4064,12 +4109,14 @@ mod tests {
             &prog,
             &argv,
             &[],
-            &std::env::temp_dir(),
-            Duration::from_secs(60),
-            &cancel,
-            &crate::sandbox::SandboxCfg::disabled(),
             "test-sleeper",
             &SpawnPosture::default(),
+            &RunCtx {
+                root: std::env::temp_dir(),
+                timeout: Duration::from_secs(60),
+                cancel: cancel.clone(),
+                sandbox: crate::sandbox::SandboxCfg::disabled(),
+            },
         )
         .await;
         assert!(
@@ -4232,12 +4279,14 @@ mod tests {
             Path::new("cimp-definitely-not-a-real-binary-xyz"),
             &[],
             &[],
-            &std::env::temp_dir(),
-            Duration::from_secs(5),
-            &cancel,
-            &crate::sandbox::SandboxCfg::disabled(),
             "test-missing",
             &SpawnPosture::default(),
+            &RunCtx {
+                root: std::env::temp_dir(),
+                timeout: Duration::from_secs(5),
+                cancel: cancel.clone(),
+                sandbox: crate::sandbox::SandboxCfg::disabled(),
+            },
         )
         .await;
         assert!(matches!(cap.outcome, Outcome::SpawnError(_)));

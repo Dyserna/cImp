@@ -1804,32 +1804,34 @@ mod tests {
             gated_by: "offload/agent.rs::latch_gate on LatchRoute::Native",
         },
         DispatchSite {
-            file: "graph/mcp.rs",
-            src: include_str!("../graph/mcp.rs"),
+            file: "graph/mcp/tools.rs",
+            src: include_str!("../graph/mcp/tools.rs"),
             func: "pub fn run_tool(",
             forms: &[Form::MatchOnName],
             gated_by: "loopback /graph_run's gate on LatchRoute::Native",
         },
         DispatchSite {
-            file: "graph/mcp.rs",
-            src: include_str!("../graph/mcp.rs"),
+            file: "graph/mcp/tools.rs",
+            src: include_str!("../graph/mcp/tools.rs"),
             func: "pub(crate) async fn dispatch_recorded(",
             forms: &[Form::NameEquals],
             gated_by: "loopback /graph_run's gate on LatchRoute::Native",
         },
         DispatchSite {
-            file: "graph/mcp.rs",
-            src: include_str!("../graph/mcp.rs"),
-            func: "pub async fn handle_call(",
+            // V42 R8 (#119): `run_check` / `run_command` were special-cased in
+            // `graph::mcp::handle_call` AND `GraphService::run_graph_tool`, and
+            // both entry points had a row here. They are routed in ONE function
+            // now, so one row reads the whole surface — the union this scan
+            // builds is unchanged, and `fn_body` panics rather than skipping if
+            // the function moves again. Both entry points still gate, and both
+            // gates are named below: a missing row here is a containment defect
+            // against whichever of them the call arrived on.
+            file: "graph/mcp/checks_tools.rs",
+            src: include_str!("../graph/mcp/checks_tools.rs"),
+            func: "pub(crate) async fn dispatch_rootless(",
             forms: &[Form::NameEquals],
-            gated_by: "graph/mcp.rs::headless_refusal (the headless MCP child)",
-        },
-        DispatchSite {
-            file: "graph/service.rs",
-            src: include_str!("../graph/service.rs"),
-            func: "pub async fn run_graph_tool(",
-            forms: &[Form::NameEquals],
-            gated_by: "loopback /graph_run's gate on LatchRoute::Native",
+            gated_by: "graph/mcp/tools.rs::headless_refusal (the headless MCP child) and \
+                       loopback /graph_run's gate on LatchRoute::Native (the warm route)",
         },
         DispatchSite {
             // V42 R4 (#115) split the loopback routes by family; the naming

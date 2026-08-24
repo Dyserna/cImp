@@ -170,3 +170,108 @@ describe('settings draft sync', () => {
     expect(adopted).toBe(2);
   });
 });
+
+/// ── The gate's OTHER half: every push of the draft must register ─────────
+///
+/// The tests above pin the mechanism. This one pins the WIRING, because the
+/// mechanism protects nothing that does not call it — and #129's extraction
+/// audit found exactly that hole: `commitGraphIgnore` pushed the whole draft
+/// through `applySettings` without `beginPush()`, so a broadcast landing
+/// mid-push could replace the draft and take the ignore rows the user had just
+/// typed with it (they are edited IN PLACE through `ArrayEditor`'s bind, so
+/// there is no second copy to restore them from).
+///
+/// A comment saying "register your push" is the kind of contract this codebase
+/// has repeatedly re-learned gets violated by someone who never read it, so the
+/// rule is enforced here instead: in `SettingsApp.svelte`, every top-level
+/// function that calls `applySettings` must also call `draftSync.beginPush()`,
+/// with one named exemption below.
+///
+/// Read through Vite's own glob rather than `node:fs` — the app's tsconfig has
+/// no node types, and the emptiness assertions below fail loudly if this ever
+/// resolves to the wrong tree.
+const WINDOW_SOURCES = import.meta.glob(['/src/SettingsApp.svelte'], {
+  query: '?raw',
+  import: 'default',
+  eager: true,
+}) as Record<string, string>;
+
+/**
+ * The one sanctioned unregistered push, with the reason it is one.
+ *
+ * `resetSettingsToDefaults` does not push the DRAFT — it pushes
+ * `defaultSettings()` and never assigns `snapshot`, deliberately letting the
+ * echo bring the draft to defaults. Registering it would not help and would
+ * mislead: the gate suppresses broadcasts so the draft can win, and here there
+ * is no draft that should win. Making the reset gate-safe means having it
+ * assign `snapshot` as `patch()` does, which is a behaviour change to the
+ * reset, not a wiring fix — filed rather than smuggled in.
+ *
+ * Adding a row here is a review decision, not a formality.
+ */
+const UNREGISTERED_PUSHES = new Map<string, string>([
+  [
+    'resetSettingsToDefaults',
+    'pushes defaultSettings(), not the draft, and never assigns snapshot — the echo is meant to replace the draft',
+  ],
+]);
+
+/** Every top-level `function name(…) { … }` block in the component's script. */
+function topLevelFunctions(src: string): Map<string, string> {
+  const out = new Map<string, string>();
+  // Top-level declarations sit at two-space indent and close on a line that is
+  // exactly `  }`; every nested closer is indented further.
+  const re = /^ {2}(?:async )?function (\w+)[\s\S]*?^ {2}\}$/gm;
+  for (const m of src.matchAll(re)) out.set(m[1], m[0]);
+  return out;
+}
+
+describe('every settings push registers with the draft-sync gate', () => {
+  const path = '/src/SettingsApp.svelte';
+  const src = WINDOW_SOURCES[path];
+
+  test('the settings window source is actually in the scan', () => {
+    expect(src, `${path} did not resolve — the scan is looking at the wrong tree`).toBeTypeOf(
+      'string',
+    );
+    expect(src).toContain('draftSync.beginPush()');
+  });
+
+  test('every function that calls applySettings also opens a push window', () => {
+    const fns = topLevelFunctions(src);
+    // Under-parse guard: a regex that matched nothing would make this test
+    // pass vacuously, which is the failure mode of every source scan.
+    expect(fns.has('patch'), `parsed ${fns.size} top-level functions: ${[...fns.keys()]}`).toBe(
+      true,
+    );
+
+    const pushers = [...fns].filter(([, body]) => /\bapplySettings\(/.test(body));
+    // `patch`, `applyMcpRegistry`, `commitGraphIgnore`, `resetSettingsToDefaults`.
+    expect(pushers.length).toBeGreaterThanOrEqual(4);
+
+    const unregistered = pushers
+      .filter(([, body]) => !body.includes('draftSync.beginPush()'))
+      .map(([name]) => name);
+    expect(unregistered.filter((n) => !UNREGISTERED_PUSHES.has(n))).toEqual([]);
+  });
+
+  test('commitGraphIgnore in particular takes the gate (#129)', () => {
+    const body = topLevelFunctions(src).get('commitGraphIgnore');
+    expect(body, 'commitGraphIgnore is no longer a top-level function of the window').toBeTypeOf(
+      'string',
+    );
+    expect(body).toContain('draftSync.beginPush()');
+    // …and settles it in either direction, or the gate wedges shut.
+    expect(body).toMatch(/\.finally\(settled\)/);
+  });
+
+  test('the exemption list has no stale rows', () => {
+    const fns = topLevelFunctions(src);
+    for (const [name] of UNREGISTERED_PUSHES) {
+      const body = fns.get(name);
+      expect(body, `${name} is exempted but no longer exists`).toBeTypeOf('string');
+      expect(body).toMatch(/\bapplySettings\(/);
+      expect(body).not.toContain('draftSync.beginPush()');
+    }
+  });
+});

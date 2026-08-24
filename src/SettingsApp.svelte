@@ -145,9 +145,21 @@
   // ArrayEditor's bind), and the backend save happens on commit boundaries
   // (blur/Enter/row-remove) — the same edit-vs-commit split the MCP servers
   // editor uses, so per-keystroke saves can't fire an index resync per char.
+  //
+  // #129: this push takes the SAME draftSync gate as `patch()` and
+  // `applyMcpRegistry()`. It is a wholesale push of the LOCAL DRAFT, so a
+  // `settings-changed` broadcast landing while it is in flight could replace
+  // that draft — and because the rows are edited IN PLACE through
+  // `ArrayEditor`'s bind, what such a replacement discards is the ignore list
+  // the user just typed, with the next `patch()` then cloning the regressed
+  // draft and pushing it wholesale. That is the lost-update race `draftSync`
+  // exists to close, and this was the one push in the window not registered
+  // with it. Settling in `.finally` matches `patch()`: the gate must reopen in
+  // either direction, or it wedges shut for the life of the window.
   function commitGraphIgnore(): void {
     if (!snapshot) return;
-    void applySettings($state.snapshot(snapshot));
+    const settled = draftSync.beginPush();
+    void applySettings($state.snapshot(snapshot)).finally(settled);
   }
   // "Add file…" / "Add folder…": native picker → project-relative glob,
   // appended and committed in one step. Cancel (null) changes nothing.

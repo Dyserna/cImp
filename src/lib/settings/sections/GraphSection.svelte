@@ -2,20 +2,20 @@
   /// Settings → Code Intelligence (#129 (c)) — the code graph, semantic search,
   /// token efficiency and the graph visualiser, behind four sub-tabs.
   ///
-  /// **`commitGraphIgnore` is parent-routed, and here is the audit the issue
-  /// asked for.** It is the window's ONE direct `applySettings` caller: the
+  /// **`commitGraphIgnore` is parent-routed.** It is the window's ONE
+  /// `applySettings` caller that pushes the local draft outside `patch()`: the
   /// ignore list is edited in place through `ArrayEditor`'s bind and pushed on
   /// commit boundaries (blur / Enter / row-remove) rather than per keystroke,
   /// because a per-keystroke push fires a graph index resync per character. It
   /// stays in `SettingsApp` — it needs `snapshot` and the store, and this
   /// component has neither — and reaches this section as `oncommitignore`.
   ///
-  /// Recorded while auditing it, NOT changed here: that push does not register
-  /// with `draftSync.beginPush()`, which every `patch()` does. A
-  /// `settings-changed` broadcast landing during the push can therefore replace
-  /// the draft — the lost-update race draftSync exists to close. Making it take
-  /// the gate is a behaviour change, so it is reported rather than smuggled
-  /// into a refactor.
+  /// The audit this refactor asked for found that push UNGATED: it did not
+  /// register with `draftSync.beginPush()`, so a `settings-changed` broadcast
+  /// landing during it could replace the draft and discard the rows the user
+  /// had just typed. FIXED in #129 as its own commit, deliberately separate
+  /// from the extraction: it takes the same gate as `patch()` now, and
+  /// `draftSync.test.ts` pins that every push of the draft does.
   ///
   /// Everything else here writes through `patch()`.
   import { harnesses } from '../../harness';

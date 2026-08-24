@@ -712,53 +712,11 @@ pub(super) const FIXTURE_PUT_STAGE: &str =
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
+    use crate::rustsrc::{source_files, src_root};
 
     /// This module's own file — the one place in `src/` a note query may
     /// appear. Slash-separated, matching what [`source_files`] produces.
     const SELF: &str = "graph/index/notes.rs";
-
-    /// The source tree, resolved from the manifest rather than the process cwd
-    /// so the scan gives the same answer from any working directory (verified
-    /// by running the suite from `C:\`).
-    fn src_root() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
-    }
-
-    /// Every `.rs` file under `src/`, as `(relative-slash-path, contents)`.
-    /// Panics on a missing or unreadable tree: a scan that silently returns
-    /// nothing is indistinguishable from a green suite.
-    fn source_files() -> Vec<(String, String)> {
-        fn walk(dir: &Path, root: &Path, out: &mut Vec<(String, String)>) {
-            let entries = std::fs::read_dir(dir)
-                .unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()));
-            for e in entries.flatten() {
-                let p = e.path();
-                if p.is_dir() {
-                    walk(&p, root, out);
-                } else if p.extension().is_some_and(|x| x == "rs") {
-                    let text = std::fs::read_to_string(&p)
-                        .unwrap_or_else(|e| panic!("cannot read {}: {e}", p.display()));
-                    let rel = p
-                        .strip_prefix(root)
-                        .unwrap_or(&p)
-                        .to_string_lossy()
-                        .replace('\\', "/");
-                    out.push((rel, text));
-                }
-            }
-        }
-        let root = src_root();
-        assert!(
-            root.is_dir(),
-            "the source tree is missing at {} — this scan cannot run",
-            root.display()
-        );
-        let mut out = Vec::new();
-        walk(&root, &root, &mut out);
-        out.sort();
-        out
-    }
 
     /// A datalog atom over the note relation, in **either** CozoScript spelling:
     /// the named form (`{a, b}`) this codebase uses and the positional form

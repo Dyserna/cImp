@@ -34,13 +34,10 @@
     AiToolTabConfig,
     HarnessStatus,
     Settings,
-    ShellTabConfig,
-    TabConfig,
   } from './lib/settings/types';
   import {
     defaultSettings,
     findTab,
-    findTabIndex,
     CONTROL_READ_ADVISOR,
     controlBlocked,
     // V32 / #48 F-27: the ONE list of spawn-baked injection features, read by
@@ -53,18 +50,15 @@
     harnessRow,
     setHarnessExt,
   } from './lib/settings/types';
-  import type { HarnessInfo, SettingFieldView } from './lib/harness';
+  import type { HarnessInfo } from './lib/harness';
   import {
-    findHarnessByTabId,
     harnesses,
     harnessLabels,
     harnessLabelsProse,
-    harnessLoadState,
     labelForTabId,
     loadHarnesses,
     reservedAiTabIds,
   } from './lib/harness';
-  import HarnessExtForm from './lib/settings/HarnessExtForm.svelte';
   import { contentClear, contentOpenFolder, setEnabledAiTabs } from './lib/ipc';
   import { listSttModels, listInputDevices } from './lib/stt';
   import {
@@ -119,6 +113,7 @@
   import AudioSection from './lib/settings/sections/AudioSection.svelte';
   import SttSection from './lib/settings/sections/SttSection.svelte';
   import ThemeSection from './lib/settings/sections/ThemeSection.svelte';
+  import TabsSection from './lib/settings/sections/TabsSection.svelte';
   import ToolPluginsSection from './lib/settings/sections/ToolPluginsSection.svelte';
   import AboutSection from './lib/settings/sections/AboutSection.svelte';
   import ChecksSection from './lib/settings/sections/ChecksSection.svelte';
@@ -131,7 +126,6 @@
   import NumberField from './lib/settings/NumberField.svelte';
   import SelectField from './lib/settings/SelectField.svelte';
   import Toggle from './lib/settings/Toggle.svelte';
-  import TabSettingsSection from './lib/settings/TabSettingsSection.svelte';
   import TuiTitleBar from './lib/TuiTitleBar.svelte';
   import { pickFile, EXECUTABLE_EXTENSIONS } from './lib/settings/pickFile';
   // V37 Phase D: the MCP-servers section's body (contract C8), now inside the
@@ -1664,23 +1658,6 @@
     }
   }
 
-  /// Replace the AI-tab entry at `id` in the snapshot. Used by the
-  /// TabSettingsSection's bound setter; the array shape forces the
-  /// find-by-id lookup at write time.
-  function patchAiTab(id: string, value: AiToolTabConfig) {
-    // The value came in via a $bindable() prop spread from the child
-    // (TabSettingsSection). The spread copies own keys but leaves nested
-    // children as $state proxy references. Snapshotting here flattens
-    // those to plain JS so structuredClone in the store subscriber and
-    // Tauri's IPC serializer don't choke. See the DataCloneError that
-    // surfaced when wiring the per-tab Terminal palette dropdown.
-    const plain = $state.snapshot(value) as AiToolTabConfig;
-    patch((s) => {
-      const idx = findTabIndex(s, id);
-      if (idx < 0) return;
-      s.tabs[idx] = plain;
-    });
-  }
 
   // Restart-affecting subset: command + args + cwd + env + the custom-provider
   // flag (it synthesizes the harness's provider env at launch). Since issue
@@ -1797,11 +1774,6 @@
     if (spawnStaleTabs.length === 0) injectionAppBaseline = injectionAppShape(snapshot);
   }
 
-  /// Tabs visible in the Tabs section, in their stored order. Filtered
-  /// view of `snapshot.tabs` so the template can render AI tabs and Shell
-  /// tabs differently. Empty array when settings haven't loaded yet.
-  const tabEntries = $derived<TabConfig[]>(snapshot?.tabs ?? []);
-
   /// Resolved theme default for the waveform color, used as the picker's
   /// displayed value when `avatar.waveform.color` is empty (the "follow
   /// theme" sentinel). Re-evaluates whenever `ui.theme` changes — the
@@ -1830,34 +1802,6 @@
     );
     if (!ok) return;
     void applySettings(defaultSettings());
-  }
-
-
-  function aiTabAt(id: string): AiToolTabConfig | null {
-    return aiTabFromSnapshot(id);
-  }
-
-  function shellSummary(t: ShellTabConfig): string {
-    const args = t.args.length > 0 ? ' ' + t.args.join(' ') : '';
-    return `${t.command}${args}`;
-  }
-
-  /// Replace the Shell-tab entry's notification config in the snapshot.
-  /// Inline-editable in the Settings window (M4) — notifications apply
-  /// live, no restart needed, so the existing settings broadcast flow is
-  /// all we need. Spawn-affecting fields (command/args/cwd) are read-only
-  /// here; the user changes them via the tab bar's right-click → Configure.
-  function patchShellNotifications(
-    id: string,
-    next: ShellTabConfig['notifications'],
-  ) {
-    patch((s) => {
-      const idx = findTabIndex(s, id);
-      if (idx < 0) return;
-      const entry = s.tabs[idx];
-      if (entry.kind !== 'shell') return;
-      s.tabs[idx] = { ...entry, notifications: next };
-    });
   }
 
   // Browse for an external-tool executable and store its path (Settings →
@@ -1975,42 +1919,6 @@
     return p.split(/[/\\]/).pop() ?? p;
   }
 </script>
-
-<!-- V40 Phase B (locked decision 6) — one harness's DECLARED settings.
-     A snippet rather than a copy per section: the sections that host it are
-     per TAB, what it renders is per HARNESS, and this window should not be
-     where those two get confused. A harness that declares no fields renders
-     nothing, with no work here. -->
-<!-- V40 review F-2/F-3: what a block that renders per harness shows while the
-     roster is not in. `loadHarnesses` retries and reports, so the two states are
-     distinguishable and the failed one offers the retry rather than leaving the
-     window permanently missing its per-harness controls with no explanation. -->
-{#snippet rosterPending()}
-  {#if $harnessLoadState === 'failed'}
-    <div class="roster-error" role="status">
-      <span
-        >The harness registry could not be read, so the per-harness controls are
-        hidden. Nothing is lost — your settings are untouched.</span
-      >
-      <button type="button" onclick={() => void loadHarnesses()}>Try again</button>
-    </div>
-  {:else}
-    <small class="hint">Loading the harness registry…</small>
-  {/if}
-{/snippet}
-
-{#snippet harnessSettingsFor(harnessId: string, filter: (f: SettingFieldView) => boolean = () => true)}
-  {#if snapshot}
-    {#each $harnesses.filter((h) => h.id === harnessId) as h (h.id)}
-      <HarnessExtForm
-        harness={h}
-        snapshot={snapshot}
-        patch={(id, key, value) => patch((s) => setHarnessExt(s, id, key, value))}
-        {filter}
-      />
-    {/each}
-  {/if}
-{/snippet}
 
 
 {#if useCustomTitleBar}
@@ -2505,294 +2413,19 @@
           </label>
         </section>
       {:else if activeSection === 'tabs'}
-        {@const shellEntries = tabEntries.filter((e) => e.kind === 'shell')}
-        {@const enabledAiTabs = snapshot.enabled_ai_tabs}
-        {@const lastChecked = enabledAiTabs.length === 1 ? enabledAiTabs[0] : null}
-        <section>
-          <h2>Tabs</h2>
-          <fieldset class="ai-tabs-radio">
-            <legend>AI tabs enabled</legend>
-            <small class="hint">
-              Pick which AI-tool tabs to keep. Toggling a checkbox opens
-              or closes the matching tab (the closed tab's PTY is killed
-              and its scrollback dropped). At least one tab must remain
-              checked.
-            </small>
-            <!-- V40 review F-2: not before the roster is in. These are
-                 DESTRUCTIVE controls (a tick kills a PTY), and until the
-                 registry answers there is no label to put on them. -->
-            {#if !rosterReady}
-              {@render rosterPending()}
-            {:else}
-            <div class="radio-row">
-              <!-- V40 Phase F (locked decision 7): one checkbox per RESERVED
-                   tab id the registry declares, in its canonical order. It was
-                   three hand-written boxes, so a third harness's tabs could not
-                   be turned on at all without editing this file. -->
-              {#each aiTabIds as aiTabId (aiTabId)}
-                <label>
-                  <input
-                    type="checkbox"
-                    name="ai-tabs-enabled"
-                    value={aiTabId}
-                    checked={enabledAiTabs.includes(aiTabId)}
-                    disabled={lastChecked === aiTabId}
-                    onchange={(e) =>
-                      void toggleAiTabEnabled(
-                        aiTabId,
-                        (e.currentTarget as HTMLInputElement).checked,
-                      )}
-                  />
-                  {labelForTabId($harnesses, aiTabId)}
-                </label>
-              {/each}
-            </div>
-            {/if}
-            {#if aiTabsError}
-              <small class="error">{aiTabsError}</small>
-            {/if}
-          </fieldset>
-          <Toggle
-            checked={snapshot.ui.tool_activity_tab}
-            onchange={(next) => patch((s) => (s.ui.tool_activity_tab = next))}
-          >
-            Show the <strong>Tools</strong> tab
-          </Toggle>
-          <small class="hint">
-            One place to watch tool usage: a unified feed of code-intelligence
-            graph calls and offload requests, plus the graph/offload tool
-            reference lists.
-          </small>
-          <Toggle
-            checked={snapshot.ui.events_tab}
-            onchange={(next) => patch((s) => (s.ui.events_tab = next))}
-          >
-            Show the <strong>Events</strong> tab
-          </Toggle>
-          <small class="hint">
-            The same recorded activity, read as events: every row says which
-            tab and which session it came from, and the feed filters by kind,
-            source/screen and tab. Independent of the Tools tab — turning one
-            off leaves the other alone.
-          </small>
-          <Toggle
-            checked={snapshot.preview_allow_remote}
-            onchange={(next) => patch((s) => (s.preview_allow_remote = next))}
-          >
-            Allow <strong>Preview</strong> tabs to load remote URLs
-          </Toggle>
-          <small class="hint">
-            Off (default) restricts Preview-tab navigation to localhost and
-            private-network (RFC&nbsp;1918) hosts — the tab is meant for your
-            own dev servers. On lets a Preview tab load any http(s) URL in its
-            embedded webview.
-          </small>
-          <div class="sub-tabs" role="tablist" aria-label="Tabs sub-sections">
-            <!-- V40 Phase F: one sub-tab per reserved AI tab id, from the
-                 registry (locked decision 7). Three hand-written buttons
-                 before, each naming a tab id and a product. -->
-            {#if rosterReady}
-              {#each aiTabIds as aiTabId (aiTabId)}
-                <button
-                  type="button"
-                  role="tab"
-                  class:active={tabsSubSection === aiTabId}
-                  aria-selected={tabsSubSection === aiTabId}
-                  onclick={() => (tabsSubSection = aiTabId)}
-                >
-                  {labelForTabId($harnesses, aiTabId)}
-                </button>
-              {/each}
-            {/if}
-            <button
-              type="button"
-              role="tab"
-              class:active={tabsSubSection === 'shells'}
-              aria-selected={tabsSubSection === 'shells'}
-              onclick={() => (tabsSubSection = 'shells')}
-            >
-              Shells
-              {#if shellEntries.length > 0}
-                <span class="sub-tab-count">{shellEntries.length}</span>
-              {/if}
-            </button>
-          </div>
-
-          {#if !rosterReady && tabsSubSection !== 'shells'}
-            {@render rosterPending()}
-          {:else if rosterReady && aiTabIds.includes(tabsSubSection)}
-            <!--
-              V40 Phase F (locked decision 7): ONE body for every reserved AI
-              tab, instead of a `{:else if}` per tab id. The two facts that used
-              to be spelled per branch are registry lookups now:
-
-              * the harness's declared settings render under its FIRST reserved
-                tab, because they are the harness's and not the tab's — with
-                ONE declared exception (issue #109): the rows a plugin marks
-                `provider_tab` describe the custom-provider variant, so they
-                render on THAT tab's page instead, next to the tab they
-                configure. A reserved tab that is neither gets a pointer rather
-                than a second copy of the form;
-              * every name comes from the descriptor, so a harness added over
-                IPC arrives with its own heading and no markup here.
-            -->
-            {@const harness = findHarnessByTabId($harnesses, tabsSubSection)}
-            {@const live = aiTabAt(tabsSubSection)}
-            <!--
-              Where a declared field renders: its harness's custom-provider tab
-              if it is marked `provider_tab` AND such a tab exists, otherwise
-              the harness's first reserved tab. The fallback is deliberate — a
-              harness that declares provider rows and no provider tab shows them
-              rather than hiding them (no shipped harness does).
-            -->
-            {@const fieldHome = (f: SettingFieldView) =>
-              f.provider_tab && harness?.provider_tab_id
-                ? harness.provider_tab_id
-                : (harness?.tab_ids[0] ?? '')}
-            {@const ownsForm =
-              harness?.tab_ids[0] === tabsSubSection ||
-              harness?.provider_tab_id === tabsSubSection}
-            <div id="tab-section-{tabsSubSection}">
-              {#if live}
-                <TabSettingsSection
-                  tabId={tabsSubSection}
-                  displayName={labelForTabId($harnesses, tabsSubSection)}
-                  bind:settings={
-                    () => live,
-                    (v) => patchAiTab(tabsSubSection, v)
-                  }
-                  defaults={tabDefaults[tabsSubSection] ?? null}
-                  restartRequired={restartRequired[tabsSubSection] ?? false}
-                  onchange={() => {}}
-                  onrestart={() => restartTab(tabsSubSection)}
-                />
-              {:else}
-                <small class="hint top"
-                  >{labelForTabId($harnesses, tabsSubSection)} tab is disabled — tick the
-                  checkbox above to enable it.</small
-                >
-              {/if}
-              {#if harness && ownsForm}
-                {@render harnessSettingsFor(
-                  harness.id,
-                  (f) => fieldHome(f) === tabsSubSection,
-                )}
-              {:else if harness}
-                <small class="hint top">
-                  This tab's custom-provider values (and everything else this
-                  harness declares) are {harness.label}'s own settings — see
-                  <strong>Tabs → {labelForTabId($harnesses, harness.tab_ids[0])}</strong>.
-                </small>
-              {/if}
-            </div>
-          {:else}
-            <small class="hint top">
-              Shell tabs in their stored order. Each row shows notification
-              text — edit command / args / cwd via right-click → Configure
-              on the tab bar.
-            </small>
-            {#if shellEntries.length === 0}
-              <small class="hint top">No shell tabs configured.</small>
-            {:else}
-              <div class="tabs-grid">
-                {#each shellEntries as entry (entry.id)}
-                  {#if entry.kind === 'shell'}
-                    <details id="tab-section-{entry.id}">
-                      <summary>
-                        {entry.name}
-                        <span class="kind-badge shell">Shell</span>
-                        {#if entry.builtin}
-                          <span class="builtin-tag">builtin</span>
-                        {/if}
-                      </summary>
-                      <div class="shell-edit">
-                        <label>
-                          <span>Command</span>
-                          <input type="text" value={shellSummary(entry)} disabled readonly />
-                          <small class="hint">
-                            To change the command, args, or working directory,
-                            right-click the tab in the tab bar and choose
-                            Configure…
-                          </small>
-                        </label>
-                        <div class="shell-notif-row">
-                          <label class="row-toggle">
-                            <input
-                              type="checkbox"
-                              checked={entry.notifications.error.enabled}
-                              onchange={(e) =>
-                                patchShellNotifications(entry.id, {
-                                  ...entry.notifications,
-                                  error: {
-                                    ...entry.notifications.error,
-                                    enabled: (e.currentTarget as HTMLInputElement)
-                                      .checked,
-                                  },
-                                })}
-                            />
-                            <span>Error notification</span>
-                          </label>
-                          <input
-                            type="text"
-                            value={entry.notifications.error.text}
-                            disabled={!entry.notifications.error.enabled}
-                            oninput={(e) =>
-                              patchShellNotifications(entry.id, {
-                                ...entry.notifications,
-                                error: {
-                                  ...entry.notifications.error,
-                                  text: (e.currentTarget as HTMLInputElement).value,
-                                },
-                              })}
-                          />
-                          <small class="hint">
-                            Spoken when this tab errors while you're on a different
-                            tab.
-                          </small>
-                        </div>
-                        <div class="shell-notif-row">
-                          <label class="row-toggle">
-                            <input
-                              type="checkbox"
-                              checked={entry.notifications.exited.enabled}
-                              onchange={(e) =>
-                                patchShellNotifications(entry.id, {
-                                  ...entry.notifications,
-                                  exited: {
-                                    ...entry.notifications.exited,
-                                    enabled: (e.currentTarget as HTMLInputElement)
-                                      .checked,
-                                  },
-                                })}
-                            />
-                            <span>Exited notification</span>
-                          </label>
-                          <input
-                            type="text"
-                            value={entry.notifications.exited.text}
-                            disabled={!entry.notifications.exited.enabled}
-                            oninput={(e) =>
-                              patchShellNotifications(entry.id, {
-                                ...entry.notifications,
-                                exited: {
-                                  ...entry.notifications.exited,
-                                  text: (e.currentTarget as HTMLInputElement).value,
-                                },
-                              })}
-                          />
-                          <small class="hint">
-                            Spoken when this shell exits while you're on a different
-                            tab. Use <code>{'{code}'}</code> to insert the exit code.
-                          </small>
-                        </div>
-                      </div>
-                    </details>
-                  {/if}
-                {/each}
-              </div>
-            {/if}
-          {/if}
-        </section>
+        <TabsSection
+          {snapshot}
+          {patch}
+          {aiTabIds}
+          {rosterReady}
+          {tabDefaults}
+          {restartRequired}
+          {aiTabsError}
+          subSection={tabsSubSection}
+          onsubsection={(id) => (tabsSubSection = id as TabsSubSection)}
+          onrestart={(tab) => void restartTab(tab)}
+          ontoggleenabled={(id, enable) => void toggleAiTabEnabled(id, enable)}
+        />
       {:else if activeSection === 'shortcuts'}
         <ShortcutsSection {snapshot} {patch} />
       {:else if activeSection === 'compose'}
@@ -5285,139 +4918,6 @@
     display: flex;
     gap: var(--space-2);
     margin-top: var(--space-3);
-  }
-  /* V40 review F-3: the roster-load failure banner. Same weight as a field
-     error — it explains why a block is missing, and carries the retry. */
-  .roster-error {
-    display: flex;
-    align-items: center;
-    gap: var(--space-2);
-    flex-wrap: wrap;
-    color: var(--text-danger-soft);
-    font-size: var(--font-size-xs);
-  }
-  .ai-tabs-radio {
-    border: 1px solid var(--border-subtle);
-    border-radius: var(--radius-md);
-    padding: var(--space-3) var(--space-4);
-    margin: 0 0 var(--space-4) 0;
-    background: var(--surface-1);
-  }
-  .ai-tabs-radio legend {
-    padding: 0 var(--space-2);
-    font-size: var(--font-size-sm);
-    font-weight: 500;
-    color: var(--text-primary);
-  }
-  .ai-tabs-radio .hint {
-    display: block;
-    margin: 0 0 var(--space-3) 0;
-    color: var(--text-quiet);
-  }
-  .ai-tabs-radio .radio-row {
-    display: flex;
-    flex-wrap: wrap;
-    gap: var(--space-4);
-  }
-  .ai-tabs-radio .radio-row label {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    font-size: var(--font-size-sm);
-    cursor: pointer;
-  }
-  .tabs-grid {
-    display: flex;
-    flex-direction: column;
-    gap: 10px;
-    margin-top: var(--space-2);
-  }
-  .kind-badge {
-    display: inline-block;
-    font-size: 9px;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    padding: 1px 6px;
-    border-radius: var(--radius-pill);
-    margin-left: 6px;
-    vertical-align: middle;
-    font-weight: 600;
-  }
-  .kind-badge.shell {
-    background: var(--surface-success);
-    border: 1px solid var(--text-success-bright);
-    color: var(--text-success);
-  }
-  .builtin-tag {
-    display: inline-block;
-    font-size: 9px;
-    font-weight: var(--font-weight-medium);
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    color: var(--text-tertiary);
-    border: 1px solid var(--border-default);
-    padding: 1px 6px;
-    border-radius: var(--radius-pill);
-    margin-left: 6px;
-    vertical-align: middle;
-  }
-  .shell-edit {
-    padding: var(--space-3) 14px;
-    display: flex;
-    flex-direction: column;
-    gap: var(--space-3);
-  }
-  .shell-edit label {
-    display: flex;
-    flex-direction: column;
-    gap: var(--space-1);
-    font-size: var(--font-size-sm);
-    color: var(--text-quiet);
-  }
-  .shell-edit input[type="text"] {
-    background: var(--surface-sunken);
-    border: 1px solid var(--border-default);
-    color: var(--text-primary);
-    padding: 6px var(--space-2);
-    border-radius: var(--radius-md);
-    font-family: Consolas, Menlo, monospace;
-    font-size: var(--font-size-md);
-    transition: border-color var(--motion-fast) var(--easing-standard);
-  }
-  .shell-edit input[type="text"]:focus {
-    outline: none;
-    border-color: var(--accent);
-  }
-  .shell-edit input[disabled] {
-    color: var(--text-tertiary);
-    background: var(--surface-deep);
-  }
-  .shell-edit code {
-    background: var(--surface-1);
-    padding: 1px var(--space-1);
-    border-radius: var(--radius-sm);
-    font-size: var(--font-size-xs);
-  }
-  /* V1.11 per-slot notification row: enabled checkbox above a text
-     input. The disabled-text style mirrors `.shell-edit input[disabled]`
-     so a toggled-off slot reads as visually quiet without the
-     readonly-Command "this is informational" feel. */
-  .shell-edit .shell-notif-row {
-    display: flex;
-    flex-direction: column;
-    gap: var(--space-1);
-  }
-  .shell-edit .row-toggle {
-    flex-direction: row;
-    align-items: center;
-    gap: 6px;
-    cursor: pointer;
-  }
-  .shell-edit .row-toggle input[type="checkbox"] {
-    margin: 0;
-  }
-  .shell-edit .shell-notif-row > input[type="text"]:disabled {
-    opacity: 0.5;
   }
 
 

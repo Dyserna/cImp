@@ -26,8 +26,8 @@ use crate::mcp_stdio::tool_error;
 use crate::offload::toolclass::{classify, CallGuards, ToolClass, WriteTaint};
 
 use super::checks_tools::{
-    command_tool_names, commands_advertised, run_check_spec_from, run_check_tool,
-    run_command_spec_from, run_command_tool,
+    command_tool_names, commands_advertised, dispatch_rootless, run_check_spec_from,
+    run_command_spec_from,
 };
 use super::{
     activity_response, current_settings, db_subdir, find_graph_root, headless_project_root,
@@ -445,46 +445,29 @@ pub async fn handle_call(
         ));
     }
 
-    // `run_check` needs a project root but NOT a built code graph (V12 Phase
-    // A: checks are independent of the graph feature). Resolve root the same
-    // way graph tools do when a graph.db already exists (so the two features
-    // agree on "the project root" in a mixed setup), else fall back to the
-    // working directory itself — never require opening an index for this tool.
-    if name == "run_check" {
-        let root = headless_project_root(&cwd, &sub);
-        return match run_check_tool(
-            &root,
-            &settings,
-            source,
-            &args,
-            crate::activity::Attribution::from_child_argv(tab),
-        )
-        .await
-        {
-            Ok(text) => Ok(json!({ "content": [{ "type": "text", "text": text }] })),
-            Err(msg) => Ok(tool_error(&msg)),
-        };
-    }
-
-    // V38 F-3: same shape, same reasons — a registered command tool needs a
-    // project root and no index. It sits below `headless_refusal` for the same
-    // reason `run_check` does, and more sharply: this one spawns a binary the
-    // model named by tool id, which is the definition of LOCAL-CAPABILITY.
-    if name == "run_command" {
-        let root = headless_project_root(&cwd, &sub);
-        return match run_command_tool(
-            &root,
-            &settings,
-            consumer,
-            source,
-            &args,
-            crate::activity::Attribution::from_child_argv(tab),
-        )
-        .await
-        {
-            Ok(text) => Ok(json!({ "content": [{ "type": "text", "text": text }] })),
-            Err(msg) => Ok(tool_error(&msg)),
-        };
+    // `run_check` (V12 Phase A) and `run_command` (V38 F-3) need a project root
+    // but NOT a built code graph, so they are answered before the index open
+    // below — and, both of them, BELOW `headless_refusal`: one runs the
+    // project's configured commands and the other spawns a binary the model
+    // named by tool id, which is the definition of LOCAL-CAPABILITY. The routing
+    // lives in [`dispatch_rootless`], shared with the warm loopback route; the
+    // root resolver is this path's own, because this path has no app to ask
+    // (#104).
+    if let Some(result) = dispatch_rootless(
+        name,
+        || headless_project_root(&cwd, &sub),
+        &settings,
+        consumer,
+        source,
+        &args,
+        &crate::activity::Attribution::from_child_argv(tab),
+    )
+    .await
+    {
+        return Ok(match result {
+            Ok(text) => json!({ "content": [{ "type": "text", "text": text }] }),
+            Err(msg) => tool_error(&msg),
+        });
     }
 
     let (root, idx) = match open_project_index(&cwd, &sub) {

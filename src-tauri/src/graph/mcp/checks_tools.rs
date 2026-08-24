@@ -216,6 +216,53 @@ pub(super) fn run_command_spec_from(names: &[String]) -> GraphToolSpec {
     }
 }
 
+/// **Dispatch the two rootless tools**, or `None` when `name` is neither.
+///
+/// `run_check` (V12 Phase A) and `run_command` (V38 F-3) need a project ROOT and
+/// no built code graph, so both entry points that serve them — the headless MCP
+/// child (`mcp::tools::handle_call`) and the warm loopback route
+/// (`GraphService::run_graph_tool`) — special-cased the same two names before
+/// they opened an index. Three things differed between those copies, and every
+/// one of them is a parameter here rather than a merged behaviour:
+///
+/// * **the root.** `resolve_root` is a closure, not a `&Path`, for both reasons
+///   it has to be. The two callers resolve differently and deliberately: the
+///   headless path takes [`super::headless_project_root`]'s marker walk because
+///   there is no app to ask (#104), the warm path takes
+///   [`super::warm_project_root`] because the route already resolved the calling
+///   tab's project. And neither may pay an ancestor walk for a `graph_*` call
+///   that never reaches this arm.
+/// * **`source` and `tab`.** Attribution is the caller's fact, not this
+///   function's: a headless child derives both from its own argv, the loopback
+///   is handed the calling tab's.
+/// * **`consumer`.** Only `run_command` reads it (its per-consumer exposure
+///   switch), and it is threaded rather than derived so the warm path answers
+///   out of the APP's live settings — which is what makes unchecking the box
+///   take effect on a running tab instead of at its next restart.
+///
+/// Routing them in one place is also what the class-table scanner reads now:
+/// `offload::toolclass`'s `DISPATCH_SITES` had a row for each entry point and
+/// has one for this function, because there is one function.
+pub(crate) async fn dispatch_rootless(
+    name: &str,
+    resolve_root: impl FnOnce() -> PathBuf,
+    settings: &crate::settings::Settings,
+    consumer: &str,
+    source: &str,
+    args: &Value,
+    tab: &crate::activity::Attribution,
+) -> Option<Result<String, String>> {
+    if name == "run_check" {
+        return Some(run_check_tool(&resolve_root(), settings, source, args, tab.clone()).await);
+    }
+    if name == "run_command" {
+        return Some(
+            run_command_tool(&resolve_root(), settings, consumer, source, args, tab.clone()).await,
+        );
+    }
+    None
+}
+
 /// Dispatch `run_command` on the harness surface: run the named registry entry
 /// at the project root and record the call, in the same shape and the same lane
 /// as [`run_check_tool`].
@@ -225,7 +272,7 @@ pub(super) fn run_command_spec_from(names: &[String]) -> GraphToolSpec {
 /// use for. `ActivityKind::Graph` and the `Graph` screen are the lane both share
 /// (they are the same MCP surface); nothing about a command run is graph-shaped
 /// except where it is served from.
-pub(crate) async fn run_command_tool(
+async fn run_command_tool(
     root: &Path,
     settings: &crate::settings::Settings,
     consumer: &str,
@@ -311,7 +358,7 @@ async fn run_command_inner(
 /// (V12 Phase A: the checks feature must not require the graph). Records the
 /// call in the activity ring itself, in the same shape, so it still shows up
 /// in the monitor tab.
-pub(crate) async fn run_check_tool(
+async fn run_check_tool(
     root: &Path,
     settings: &crate::settings::Settings,
     source: &str,

@@ -27,7 +27,7 @@ pub use tools::{
     handle_call, lean_filter, offload_query, semantic_code_spec, semantic_spec, tool_specs,
     tools_for, LEAN_HIDDEN,
 };
-pub(crate) use checks_tools::{run_check_tool, run_command_tool};
+pub(crate) use checks_tools::dispatch_rootless;
 pub(crate) use tools::dispatch_recorded;
 
 use std::path::{Path, PathBuf};
@@ -115,6 +115,25 @@ fn headless_project_root(cwd: &Path, sub: &str) -> PathBuf {
         .map(|p| p.root)
         .or_else(|| find_graph_root(cwd, sub))
         .unwrap_or_else(|| cwd.to_path_buf())
+}
+
+/// The project root for a call arriving on a **warm app-side** route — an
+/// existing `graph.db` above `cwd`, else `cwd` itself.
+///
+/// Deliberately NOT [`headless_project_root`]'s marker walk. The routes that
+/// reach here resolved the calling tab's project first (through
+/// `discovery::external_project_root`, which can consult the tab's configured
+/// directory), so a second, different walk here would be free to disagree with
+/// the answer the caller already has; the headless child has no app to ask,
+/// which is why it does walk. Naming both puts the difference in one place as a
+/// documented choice instead of two copies of an expression.
+///
+/// Shared by `GraphService::run_graph_tool` and `GraphService::graph_root_key`,
+/// which MUST agree: the loopback writes its unattributed-write row at gate
+/// time, before dispatch has resolved anything, and two resolutions would file
+/// one call under two projects (#48 F-16).
+pub(crate) fn warm_project_root(cwd: &Path, sub: &str) -> PathBuf {
+    find_graph_root(cwd, sub).unwrap_or_else(|| cwd.to_path_buf())
 }
 
 /// Walk up from `start` looking for an ancestor containing `<sub>/graph.db`.

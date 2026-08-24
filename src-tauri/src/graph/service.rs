@@ -716,23 +716,28 @@ impl GraphService {
         // scope, so an OpenCode tab's graph/context calls don't read as Claude's.
         let source = super::mcp::source_for_consumer(consumer);
 
-        // `run_check` (V12 Phase A) needs a project root but not a built code
-        // graph — resolve root the same way graph tools do when a graph.db
-        // exists, else fall back to `cwd` itself, and skip opening an index
-        // entirely (same rationale as `mcp::handle_call`'s special case).
-        if name == "run_check" {
-            let root = super::mcp::find_graph_root(cwd, &sub).unwrap_or_else(|| cwd.to_path_buf());
-            return super::mcp::run_check_tool(&root, &settings, source, args, tab).await;
-        }
-        // V38 F-3: the warm twin of `handle_call`'s arm. This is the path a tab
-        // actually takes when the app is up (the child proxies `tools/call`
-        // here), so the exposure switch and the registry are read from the APP's
-        // live settings — which is what makes unchecking the box take effect on
-        // a running tab instead of at its next restart.
-        if name == "run_command" {
-            let root = super::mcp::find_graph_root(cwd, &sub).unwrap_or_else(|| cwd.to_path_buf());
-            return super::mcp::run_command_tool(&root, &settings, consumer, source, args, tab)
-                .await;
+        // `run_check` (V12 Phase A) and `run_command` (V38 F-3) need a project
+        // root but not a built code graph, so they are answered before the index
+        // open below. This is the warm twin of `mcp::handle_call`'s arm — the
+        // path a tab actually takes when the app is up (the child proxies
+        // `tools/call` here) — so the exposure switch and the registry are read
+        // from the APP's live settings, which is what makes unchecking the box
+        // take effect on a running tab instead of at its next restart. Both the
+        // routing (`mcp::dispatch_rootless`) and this route's root resolution
+        // (`mcp::warm_project_root`) are named, so the headless path and this one
+        // share what they agree on and state where they differ.
+        if let Some(result) = super::mcp::dispatch_rootless(
+            name,
+            || super::mcp::warm_project_root(cwd, &sub),
+            &settings,
+            consumer,
+            source,
+            args,
+            &tab,
+        )
+        .await
+        {
+            return result;
         }
 
         let root = super::mcp::find_graph_root(cwd, &sub)
@@ -756,9 +761,10 @@ impl GraphService {
     }
 
     /// The activity `root_key` a call from `cwd` will be recorded under — the
-    /// SAME resolution [`Self::run_graph_tool`] uses (`find_graph_root`, falling
-    /// back to `cwd`), exposed so a caller that must record a row *before*
-    /// dispatch cannot name a different project than the dispatch will.
+    /// SAME resolution [`Self::run_graph_tool`] uses, and now literally the same
+    /// function (`mcp::warm_project_root`), exposed so a caller that must record
+    /// a row *before* dispatch cannot name a different project than the dispatch
+    /// will.
     ///
     /// #48 F-16: added for `loopback::handle_graph_run`, which writes the
     /// unattributed-write quarantine row at gate time — before `run_graph_tool`
@@ -768,8 +774,7 @@ impl GraphService {
     /// so the loopback cannot reach `find_graph_root` itself; this is the seam.
     pub fn graph_root_key(&self, cwd: &Path) -> String {
         let sub = self.db_subdir();
-        let root = super::mcp::find_graph_root(cwd, &sub).unwrap_or_else(|| cwd.to_path_buf());
-        crate::activity::root_key(&root)
+        crate::activity::root_key(&super::mcp::warm_project_root(cwd, &sub))
     }
 
     /// Get (opening + caching if needed) the warm index for `root`.

@@ -1617,6 +1617,41 @@ pub async fn offload_query(roots: &[PathBuf], name: &str, args: &Value) -> Resul
 
 // ── result formatting (compact, token-bounded text for the model) ────────
 
+/// The shared shape of every `fmt_*` row renderer above and below: an
+/// empty-set sentence, at most `max_rows` rendered rows, and a `… (+N more)`
+/// tail when the set was longer — optionally under a fixed header line.
+///
+/// Nine copies of those eight lines lived in this section. The only parts that
+/// ever differed are the three the caller passes, and every string among them
+/// is asserted verbatim by a test, so they stay spelled out at their own call
+/// site rather than being derived here. `header` is `None` for the renderers
+/// whose result is bare rows; the two that label their block pass their line
+/// WITHOUT its trailing newline (an empty set answers with `empty` alone, never
+/// with a header over nothing).
+///
+/// `fmt_recent_changes` and `fmt_affected_tests` are deliberately not routed
+/// through this: each does real work before rendering (a clock read, a count in
+/// the header) that an empty set must not pay for.
+fn fmt_rows<T>(
+    rows: &[T],
+    max_rows: usize,
+    empty: &str,
+    header: Option<&str>,
+    row: impl Fn(&T) -> String,
+) -> String {
+    if rows.is_empty() {
+        return empty.to_string();
+    }
+    let mut lines: Vec<String> = rows.iter().take(max_rows).map(row).collect();
+    if rows.len() > max_rows {
+        lines.push(format!("… (+{} more)", rows.len() - max_rows));
+    }
+    match header {
+        Some(h) => format!("{h}\n{}", lines.join("\n")),
+        None => lines.join("\n"),
+    }
+}
+
 /// The symbol-row renderer for `graph_find_symbol` / `graph_outline` /
 /// `graph_callers` / `graph_callees` — and, incidentally, for `graph_snippet`'s
 /// two ancillary listings (the ambiguous-name disambiguation and the
@@ -1649,29 +1684,18 @@ pub async fn offload_query(roots: &[PathBuf], name: &str, args: &Value) -> Resul
 /// and the Code Intelligence UI, the read advisor and auto-injection still
 /// render it — a human looking at their own repo is not the threat model.
 fn fmt_symbols(syms: &[SymbolHit], max_rows: usize) -> String {
-    if syms.is_empty() {
-        return "No matching symbols.".to_string();
-    }
-    let mut lines: Vec<String> = syms
-        .iter()
-        .take(max_rows)
-        .map(|s| {
-            let tag = if s.is_test { " [test]" } else { "" };
-            format!(
-                "{} ({}) — {}:{}{}{}",
-                s.name,
-                s.kind,
-                s.file,
-                s.start_line,
-                tag,
-                conf_badge(s.confidence)
-            )
-        })
-        .collect();
-    if syms.len() > max_rows {
-        lines.push(format!("… (+{} more)", syms.len() - max_rows));
-    }
-    lines.join("\n")
+    fmt_rows(syms, max_rows, "No matching symbols.", None, |s| {
+        let tag = if s.is_test { " [test]" } else { "" };
+        format!(
+            "{} ({}) — {}:{}{}{}",
+            s.name,
+            s.kind,
+            s.file,
+            s.start_line,
+            tag,
+            conf_badge(s.confidence)
+        )
+    })
 }
 
 /// A ` [inferred]` / ` [ambiguous]` / ` [extracted]` badge for a row's V15
@@ -1682,42 +1706,23 @@ fn conf_badge(c: Option<crate::graph::model::Confidence>) -> String {
 }
 
 fn fmt_dead_exports(syms: &[SymbolHit], max_rows: usize) -> String {
-    if syms.is_empty() {
-        return "No candidate dead exports found.".to_string();
-    }
-    let mut lines: Vec<String> = syms
-        .iter()
-        .take(max_rows)
-        .map(|s| format!("{} ({}) — {}:{}", s.name, s.kind, s.file, s.start_line))
-        .collect();
-    if syms.len() > max_rows {
-        lines.push(format!("… (+{} more)", syms.len() - max_rows));
-    }
-    format!(
-        "Candidate unused public symbols (may include false positives — dynamic dispatch, external API, macros/reflection):\n{}",
-        lines.join("\n")
+    fmt_rows(
+        syms,
+        max_rows,
+        "No candidate dead exports found.",
+        Some("Candidate unused public symbols (may include false positives — dynamic dispatch, external API, macros/reflection):"),
+        |s| format!("{} ({}) — {}:{}", s.name, s.kind, s.file, s.start_line),
     )
 }
 
 fn fmt_cycles(cycles: &[Vec<String>], max_rows: usize) -> String {
-    if cycles.is_empty() {
-        return "No import cycles found.".to_string();
-    }
-    let mut lines: Vec<String> = cycles
-        .iter()
-        .take(max_rows)
-        .map(|c| {
-            let mut s = c.join(" → ");
-            if let Some(first) = c.first() {
-                s.push_str(&format!(" → {first}"));
-            }
-            s
-        })
-        .collect();
-    if cycles.len() > max_rows {
-        lines.push(format!("… (+{} more)", cycles.len() - max_rows));
-    }
-    lines.join("\n")
+    fmt_rows(cycles, max_rows, "No import cycles found.", None, |c| {
+        let mut s = c.join(" → ");
+        if let Some(first) = c.first() {
+            s.push_str(&format!(" → {first}"));
+        }
+        s
+    })
 }
 
 /// Render `graph_recent_changes` rows (churn-ranked, most-touched first) as
@@ -1749,109 +1754,64 @@ fn fmt_recent_changes(rows: &[crate::graph::gitmeta::FileChurn], max_rows: usize
 }
 
 fn fmt_working_set(ws: &[WorkingSetEntry], max_rows: usize) -> String {
-    if ws.is_empty() {
-        return "No files touched in this session yet.".to_string();
-    }
-    let mut lines: Vec<String> = ws
-        .iter()
-        .take(max_rows)
-        .map(|e| {
+    fmt_rows(
+        ws,
+        max_rows,
+        "No files touched in this session yet.",
+        Some("Current session working set (most active first):"),
+        |e| {
             let syms = if e.top_symbols.is_empty() {
                 String::new()
             } else {
                 format!("  [{}]", e.top_symbols.join(", "))
             };
             format!("{} — {}× (last {}){}", e.path, e.touches, e.last_kind, syms)
-        })
-        .collect();
-    if ws.len() > max_rows {
-        lines.push(format!("… (+{} more)", ws.len() - max_rows));
-    }
-    format!(
-        "Current session working set (most active first):\n{}",
-        lines.join("\n")
+        },
     )
 }
 
 fn fmt_notes(notes: &[MemNote], max_rows: usize) -> String {
-    if notes.is_empty() {
-        return "No notes recorded for this session.".to_string();
-    }
-    let mut lines: Vec<String> = notes
-        .iter()
-        .take(max_rows)
-        .map(|n| format!("{}{}", if n.pinned { "📌 " } else { "• " }, n.text))
-        .collect();
-    if notes.len() > max_rows {
-        lines.push(format!("… (+{} more)", notes.len() - max_rows));
-    }
-    lines.join("\n")
+    fmt_rows(
+        notes,
+        max_rows,
+        "No notes recorded for this session.",
+        None,
+        |n| format!("{}{}", if n.pinned { "📌 " } else { "• " }, n.text),
+    )
 }
 
 /// V12 Phase E: render project facts (pinned first, then newest — the order
 /// [`crate::graph::index::GraphIndex::list_project_facts`] already returns them in).
 fn fmt_facts(facts: &[ProjectFact], max_rows: usize) -> String {
-    if facts.is_empty() {
-        return "No project facts recorded yet.".to_string();
-    }
-    let mut lines: Vec<String> = facts
-        .iter()
-        .take(max_rows)
-        .map(|f| format!("{}{}", if f.pinned { "📌 " } else { "• " }, f.text))
-        .collect();
-    if facts.len() > max_rows {
-        lines.push(format!("… (+{} more)", facts.len() - max_rows));
-    }
-    lines.join("\n")
+    fmt_rows(
+        facts,
+        max_rows,
+        "No project facts recorded yet.",
+        None,
+        |f| format!("{}{}", if f.pinned { "📌 " } else { "• " }, f.text),
+    )
 }
 
 fn fmt_refs(refs: &[RefHit], max_rows: usize) -> String {
-    if refs.is_empty() {
-        return "No references.".to_string();
-    }
-    let mut lines: Vec<String> = refs
-        .iter()
-        .take(max_rows)
-        .map(|r| {
-            format!(
-                "{}:{}:{}{}",
-                r.file,
-                r.line,
-                r.col,
-                conf_badge(Some(r.confidence))
-            )
-        })
-        .collect();
-    if refs.len() > max_rows {
-        lines.push(format!("… (+{} more)", refs.len() - max_rows));
-    }
-    lines.join("\n")
+    fmt_rows(refs, max_rows, "No references.", None, |r| {
+        format!(
+            "{}:{}:{}{}",
+            r.file,
+            r.line,
+            r.col,
+            conf_badge(Some(r.confidence))
+        )
+    })
 }
 
 fn fmt_docs(docs: &[DocHit], max_rows: usize) -> String {
-    if docs.is_empty() {
-        return "No documentation matches.".to_string();
-    }
-    let mut lines: Vec<String> = docs
-        .iter()
-        .take(max_rows)
-        .map(|d| format!("{} [{}]: {}", d.source_path, d.anchor, d.snippet))
-        .collect();
-    if docs.len() > max_rows {
-        lines.push(format!("… (+{} more)", docs.len() - max_rows));
-    }
-    lines.join("\n")
+    fmt_rows(docs, max_rows, "No documentation matches.", None, |d| {
+        format!("{} [{}]: {}", d.source_path, d.anchor, d.snippet)
+    })
 }
 
 fn fmt_list(items: &[String], max_rows: usize) -> String {
-    if items.is_empty() {
-        return "No results.".to_string();
-    }
-    let mut lines: Vec<String> = items.iter().take(max_rows).cloned().collect();
-    if items.len() > max_rows {
-        lines.push(format!("… (+{} more)", items.len() - max_rows));
-    }
-    lines.join("\n")
+    fmt_rows(items, max_rows, "No results.", None, |i| i.clone())
 }
 
 /// Open the existing graph store for the project containing `start`, resolving

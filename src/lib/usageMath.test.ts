@@ -23,6 +23,7 @@ import {
   costRowState,
   costOverrideForIdx,
   isEmptyDetailRow,
+  isActiveSessionIn,
   decideUsageApply,
   costGrandTotal,
   originShareLine,
@@ -383,6 +384,27 @@ describe('isEmptyDetailRow (V24 Phase C — vanished-session guard)', () => {
     // an agent-less row with a real timestamp shouldn't be a real session.
     expect(isEmptyDetailRow({ agent: H1, started_ms: 0 })).toBe(false);
     expect(isEmptyDetailRow({ agent: '', started_ms: 1 })).toBe(false);
+  });
+});
+
+describe('isActiveSessionIn (#130 — the one live-session predicate)', () => {
+  test('a session named in the list is live', () => {
+    expect(isActiveSessionIn(['a', 'b'], 'b')).toBe(true);
+  });
+  test('a session the list does not name is not', () => {
+    expect(isActiveSessionIn(['a'], 'b')).toBe(false);
+  });
+  test('no snapshot yet (undefined ids) answers false, it does not throw', () => {
+    // The Overview owns the snapshot and the Memory section is told about it;
+    // before the first `graph_usage` lands BOTH readers hold nothing, and the
+    // label they drive must read `last session`, not crash the view.
+    expect(isActiveSessionIn(undefined, 'a')).toBe(false);
+    expect(isActiveSessionIn([], 'a')).toBe(false);
+  });
+  test('an absent session id is never live, whatever the list says', () => {
+    expect(isActiveSessionIn(['a'], null)).toBe(false);
+    expect(isActiveSessionIn(['a'], undefined)).toBe(false);
+    expect(isActiveSessionIn([''], '')).toBe(false);
   });
 });
 

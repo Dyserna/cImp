@@ -396,6 +396,25 @@ export function isEmptyDetailRow(row: { agent: string; started_ms: number }): bo
   return row.agent === '' && row.started_ms === 0;
 }
 
+/// Whether a session is actually live right now, per a `UsageSnapshot`'s
+/// `active_session_ids` (open tab ∪ recency). A fresh empty session has
+/// recorded nothing yet, so `usage.current` / `memory.current_session` still
+/// point at the PREVIOUS session — the live card and the Working-set label say
+/// "last session" then instead of claiming it's this one.
+///
+/// A free function rather than a closure over the snapshot because #130 put
+/// the snapshot in `codeIntel/UsageOverview.svelte` while the Memory section,
+/// which asks the same question of the same list, stayed in
+/// `CodeIntelligenceView.svelte`. Two call sites, one predicate: absent ids
+/// answer false, exactly as the `usage?.active_session_ids ?? []` spelling
+/// they both replaced did.
+export function isActiveSessionIn(
+  ids: readonly string[] | undefined,
+  sid?: string | null,
+): boolean {
+  return !!sid && (ids ?? []).includes(sid);
+}
+
 /// What the Overview poll should do with an arriving `graph_usage`
 /// snapshot, given whether the PREVIOUS tick was already in the
 /// store-error state. Pure so the "empty is not absent" rule is testable

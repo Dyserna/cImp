@@ -767,22 +767,43 @@ pub(crate) const HOOK_TOOL_COMPACTION: &str = "hook_compaction";
 /// executor is a whole peer harness.
 const DELEGATE_TOOL: &str = "delegate_task";
 
-/// The taint decision `POST /delegate` takes before any tab is touched — the
-/// [`hook_admit`] shape, for the same two reasons: a handler cannot reach the
-/// capability without passing through it, and the decision is testable without
-/// a `TcpStream` or an `AppHandle`.
+/// The taint decision the three `/context/*` hook routes, the pre-mutation
+/// checkpoint and `POST /delegate` take before they reach capability, as one
+/// function taking its dependencies as arguments — the [`audit_admit`] shape,
+/// for the same two reasons: a handler cannot reach capability without passing
+/// through it, and the decision is testable without a `TcpStream` or an
+/// `AppHandle` (this crate has no `tauri::test` mock — see
+/// [`latch_state_reply`]).
 ///
-/// `Err(refusal)` means *this conversation may not delegate*. Unlike a hook,
-/// the refusal is returned to the caller verbatim: this IS a tool call the
-/// model made, so the model is the right audience for the reason — the same
-/// treatment `/run` gives a refused `offload_task`.
+/// **The `route` is the only difference between the two callers**, and it is
+/// the difference that matters: a hook does not move the latch
+/// ([`LatchRoute::Hook`]), an elective delegation does
+/// ([`LatchRoute::Delegation`]). V42 R22 (#115) folded two byte-identical
+/// copies of this body — and two copies of the provenance note below — into
+/// one; [`hook_admit`] and [`delegate_admit`] are this function with their
+/// route filled in, and they keep their names because the handlers' call sites
+/// are what `tests::every_loopback_route_declares_what_it_does_about_the_latch`
+/// reads.
 ///
-/// [`LatchRegistry::gate`] writes the `Screen::LatchRefusal` row, so the
-/// refusal has its user-visible consumer without this function minting one.
-fn delegate_admit(
+/// `Err(refusal)` means *this conversation may not have this*, and the two
+/// callers answer it differently. A hook's caller answers with the route's own
+/// fail-safe reply — empty text, or a `pass` verdict — and never with the
+/// refusal string: these are hooks, and a hook that returns an error perturbs
+/// the turn it was supposed to be invisible to. `/delegate` returns the refusal
+/// VERBATIM: that one IS a tool call the model made, so the model is the right
+/// audience for the reason — the same treatment `/run` gives a refused
+/// `offload_task`. Neither is silent: [`LatchRegistry::gate`] writes the
+/// [`Screen::LatchRefusal`](outbound::Screen) row (once per scope) that gives
+/// the refusal a user-visible consumer.
+///
+/// `agent` is caller-asserted, exactly as `consumer` is on `/graph_run`. It
+/// selects which agent's key the scope is built under and nothing else; F-4
+/// (`(consumer, tab)` is a verified pair on no route) is unchanged here, not
+/// worked around.
+fn admit(
     reg: &LatchRegistry,
-    // The class-table identity to gate under — always `DELEGATE_TOOL`.
-    // Passed rather than hardcoded, exactly as `hook_admit` takes its `tool`:
+    route: LatchRoute,
+    // The class-table identity to gate under. Passed rather than hardcoded:
     // the name a route gates under has to be readable AT the route, or "which
     // boundary is this handler behind" becomes a question you answer by
     // following a call.
@@ -795,48 +816,68 @@ fn delegate_admit(
     let scoping = scope_of(agent, tab);
     let scope = scoping.scope();
     let policy = policy_of(scope);
-    // `CallProvenance::http()`, like the hooks and unlike `/run`: this is a
+    // `CallProvenance::http()`, not `internal()` and unlike `/run`: this is a
     // POST from a local process holding a launch token that anything running as
     // this user can read, so it is never evidence that cImp itself decided the
     // call (#45's reasoning for the beacon route). It reaches no row today —
-    // provenance is read only for an admitted EXTERNAL call and this name is
-    // LOCAL-CAPABILITY — but stating it is how the wrong origin avoids being
+    // provenance is read only when an admitted call is EXTERNAL, and no name
+    // gated here is — but stating it is how the wrong origin avoids being
     // inherited later.
-    reg.gate(
-        scope,
-        LatchRoute::Delegation,
-        tool,
-        policy,
-        CallProvenance::http(),
-    )
-    .map(|_| ())
+    reg.gate(scope, route, tool, policy, CallProvenance::http())
+        .map(|_| ())
 }
 
-/// The taint decision the three `/context/*` hook routes take before they reach
-/// [`crate::graph::GraphService`], as one function taking its dependencies as
-/// arguments — the [`audit_admit`] shape, for the same two reasons: a handler
-/// cannot reach capability without passing through it, and the decision is
-/// testable without a `TcpStream` or an `AppHandle` (this crate has no
-/// `tauri::test` mock — see [`latch_state_reply`]).
-///
-/// `Err(refusal)` means *this conversation may not have this*. Every caller
-/// answers it with the route's own fail-safe reply — empty text, or a `pass`
-/// verdict — and never with the refusal string: these are hooks, and a hook
-/// that returns an error perturbs the turn it was supposed to be invisible to.
-/// The refusal is not silent even so: [`LatchRegistry::gate`] writes the
-/// [`Screen::LatchRefusal`](outbound::Screen) row (once per scope) that gives
-/// it a user-visible consumer.
-///
-/// `agent` is caller-asserted, exactly as `consumer` is on `/graph_run`. It
-/// selects which agent's key the scope is built under and nothing else; F-4
-/// (`(consumer, tab)` is a verified pair on no route) is unchanged here, not
-/// worked around.
+/// [`admit`] on [`LatchRoute::Hook`] — the gate the `/context/*` routes and the
+/// pre-mutation checkpoint take. A hook is not an elective call, so it does not
+/// move the latch.
+fn hook_admit(
+    reg: &LatchRegistry,
+    tool: &'static str,
+    agent: &'static str,
+    tab: Option<&str>,
+    scope_of: impl FnOnce(&'static str, Option<&str>) -> LatchScoping,
+    policy_of: impl FnOnce(Option<&LatchScope>) -> GatePolicy,
+) -> Result<(), &'static str> {
+    admit(
+        reg,
+        LatchRoute::Hook,
+        tool,
+        agent,
+        tab,
+        scope_of,
+        policy_of,
+    )
+}
+
+/// [`admit`] on [`LatchRoute::Delegation`] — the gate `POST /delegate` takes
+/// before any tab is touched. The call is elective, so it MOVES the latch;
+/// that is the whole difference from [`hook_admit`], and
+/// `tests::the_delegation_route_both_refuses_and_latches` is what holds it.
+fn delegate_admit(
+    reg: &LatchRegistry,
+    tool: &'static str,
+    agent: &'static str,
+    tab: Option<&str>,
+    scope_of: impl FnOnce(&'static str, Option<&str>) -> LatchScoping,
+    policy_of: impl FnOnce(Option<&LatchScope>) -> GatePolicy,
+) -> Result<(), &'static str> {
+    admit(
+        reg,
+        LatchRoute::Delegation,
+        tool,
+        agent,
+        tab,
+        scope_of,
+        policy_of,
+    )
+}
+
 /// **The hook gate, as one call a plugin can make** (V40 Phase C).
 ///
 /// [`hook_admit`]'s signature names `LatchRegistry`, `LatchScoping`,
 /// `LatchScope` and `GatePolicy` — four private types, three of them closures'
-/// arguments. That is the right shape for the callers inside this file and the
-/// wrong one for a plugin route: the latch model is core's, and a harness's
+/// arguments. That is the right shape for the callers inside this module and
+/// the wrong one for a plugin route: the latch model is core's, and a harness's
 /// ingress must be able to ask "may this hook run?" without being handed the
 /// machinery that answers.
 ///
@@ -858,33 +899,6 @@ pub(crate) fn hook_gate_admits(
         |scope| GatePolicy::resolve(settings, scope),
     )
     .is_ok()
-}
-
-fn hook_admit(
-    reg: &LatchRegistry,
-    tool: &'static str,
-    agent: &'static str,
-    tab: Option<&str>,
-    scope_of: impl FnOnce(&'static str, Option<&str>) -> LatchScoping,
-    policy_of: impl FnOnce(Option<&LatchScope>) -> GatePolicy,
-) -> Result<(), &'static str> {
-    let scoping = scope_of(agent, tab);
-    let scope = scoping.scope();
-    let policy = policy_of(scope);
-    // `CallProvenance::http()`, not `internal()`: this is a POST from a local
-    // process, and the launch token is readable by anything running as this
-    // user, so it is never evidence that cImp itself decided the call (#45's
-    // reasoning for the beacon route). It reaches no row today — provenance is
-    // read only when an admitted call is EXTERNAL, and no name gated here is —
-    // but stating it by omission is how the wrong origin gets inherited later.
-    reg.gate(
-        scope,
-        LatchRoute::Hook,
-        tool,
-        policy,
-        CallProvenance::http(),
-    )
-    .map(|_| ())
 }
 
 /// The agent key a hook body's caller-asserted `agent` resolves to. Absent ⇒
@@ -1083,6 +1097,69 @@ fn bad_request(msg: &str) -> RunResult {
         text: None,
         error: Some(msg.to_string()),
     }
+}
+
+/// Decode a route's JSON body, or answer **400 in that route's own shape**.
+///
+/// The `match serde_json::from_slice … Err(e) => return write_json(.., 400, ..)`
+/// preamble was written out at every body-taking route. V42 R22 (#115) folded
+/// it here — but NOT the reply, which is why `refusal` is a parameter: the
+/// 400 bodies are NOT one shape, and every one of them is read by something
+/// (the two MCP children, the hook shims, the generated OpenCode plugin, the
+/// delegating harness's child). The pushed `/session/*` routes send no parse
+/// detail at all ([`bad_request`]), `/delegate` answers in its own result
+/// type, and the rest split between [`bad_body_result`] and
+/// [`bad_body_json`]. `tests::every_bad_body_reply_keeps_its_own_bytes` pins
+/// each one's bytes, because nothing else did.
+///
+/// `Ok(None)` means **the route is already answered** and the handler must
+/// return — the same `?`-propagating write the preamble did, one frame in.
+async fn decode<T, B>(
+    stream: &mut TcpStream,
+    req: &Request,
+    refusal: impl FnOnce(serde_json::Error) -> B,
+) -> AppResult<Option<T>>
+where
+    T: serde::de::DeserializeOwned,
+    B: Serialize,
+{
+    match serde_json::from_slice::<T>(&req.body) {
+        Ok(body) => Ok(Some(body)),
+        Err(e) => {
+            write_json(stream, 400, &refusal(e)).await?;
+            Ok(None)
+        }
+    }
+}
+
+/// The 400 body the task-shaped routes send for an unparseable request — the
+/// NDJSON pair, `/mcp/call`, the two `/latch/*` routes and `/session/hello`:
+/// a [`RunResult`] whose `error` names the parse failure, so the keys come out
+/// in the struct's declared order (`{"ok":false,"error":…}`).
+fn bad_body_result(e: serde_json::Error) -> RunResult {
+    RunResult {
+        ok: false,
+        text: None,
+        error: Some(format!("bad request body: {e}")),
+    }
+}
+
+/// The 400 body the hook routes send — `/context/*`,
+/// `/workbench/tool_checkpoint`, `/activity/contract_drift`: the same two
+/// fields as [`bad_body_result`], built as a bare object rather than through
+/// the struct.
+///
+/// **Kept as its own function even though the bytes coincide today.** They
+/// coincide because `serde_json` resolves with `preserve_order` in this tree
+/// (a transitive feature, not something either route chose), which makes a
+/// `Map` insertion-ordered; without it these keys would sort and this reply
+/// would come out `error` first while [`bad_body_result`]'s would not. Each
+/// route keeps building the body it has always built rather than depending on
+/// that resolution, and
+/// `tests::every_bad_body_reply_keeps_its_own_bytes` is what would notice it
+/// changing.
+fn bad_body_json(e: serde_json::Error) -> serde_json::Value {
+    serde_json::json!({ "ok": false, "error": format!("bad request body: {e}") })
 }
 
 /// [`claim_discovery_report`] against a caller-owned ledger, so the key-space

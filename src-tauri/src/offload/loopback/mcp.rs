@@ -68,16 +68,8 @@ pub(super) async fn handle_mcp_call(
     app: &AppHandle,
     req: &Request,
 ) -> AppResult<()> {
-    let body: McpCallBody = match serde_json::from_slice(&req.body) {
-        Ok(b) => b,
-        Err(e) => {
-            let r = RunResult {
-                ok: false,
-                text: None,
-                error: Some(format!("bad request body: {e}")),
-            };
-            return write_json(stream, 400, &r).await;
-        }
+    let Some(body) = decode::<McpCallBody, _>(stream, req, bad_body_result).await? else {
+        return Ok(());
     };
     // V40 review H-1: the GRANT and the LATCH KEY are resolved together, here,
     // before anything is charged or gated — `proxy_identity` folds an in-app

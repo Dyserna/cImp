@@ -84,16 +84,8 @@ pub(super) async fn handle_latch_beacon(
     app: &AppHandle,
     req: &Request,
 ) -> AppResult<()> {
-    let body: LatchBeaconBody = match serde_json::from_slice(&req.body) {
-        Ok(b) => b,
-        Err(e) => {
-            let r = RunResult {
-                ok: false,
-                text: None,
-                error: Some(format!("bad request body: {e}")),
-            };
-            return write_json(stream, 400, &r).await;
-        }
+    let Some(body) = decode::<LatchBeaconBody, _>(stream, req, bad_body_result).await? else {
+        return Ok(());
     };
     let agent =
         crate::graph::source_for_consumer(body.consumer.as_deref().unwrap_or(crate::harness::DEFAULT_HARNESS.token()));
@@ -397,16 +389,8 @@ pub(super) async fn handle_latch_state(
     app: &AppHandle,
     req: &Request,
 ) -> AppResult<()> {
-    let body: LatchStateBody = match serde_json::from_slice(&req.body) {
-        Ok(b) => b,
-        Err(e) => {
-            let r = RunResult {
-                ok: false,
-                text: None,
-                error: Some(format!("bad request body: {e}")),
-            };
-            return write_json(stream, 400, &r).await;
-        }
+    let Some(body) = decode::<LatchStateBody, _>(stream, req, bad_body_result).await? else {
+        return Ok(());
     };
     let agent = wire_agent(LATCH_STATE_ROUTE, body.consumer.as_deref());
     let settings = live_settings(app);

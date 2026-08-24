@@ -203,16 +203,8 @@ pub(crate) fn contract_drift_row(
 /// decision 42 moved the bound, not the protocol.
 pub(super) async fn handle_contract_drift(stream: &mut TcpStream, req: &Request) -> AppResult<()> {
     let ok = serde_json::json!({ "ok": true });
-    let body: ContractDriftBody = match serde_json::from_slice(&req.body) {
-        Ok(b) => b,
-        Err(e) => {
-            return write_json(
-                stream,
-                400,
-                &serde_json::json!({ "ok": false, "error": format!("bad request body: {e}") }),
-            )
-            .await;
-        }
+    let Some(body) = decode::<ContractDriftBody, _>(stream, req, bad_body_json).await? else {
+        return Ok(());
     };
     if let Some(record) = contract_drift_row(&body, claim_contract_drift) {
         crate::activity::record_bg(record);

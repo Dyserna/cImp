@@ -322,18 +322,10 @@ pub(super) fn audit_admit(
 /// 200 — the child renders them as a readable tool error, mirroring
 /// [`handle_graph_run`]. Only a malformed body is a 400.
 pub(super) async fn handle_audit_run(stream: &mut TcpStream, app: &AppHandle, req: &Request) -> AppResult<()> {
-    let body: AuditRunBody = match serde_json::from_slice(&req.body) {
-        Ok(b) => b,
-        Err(e) => {
-            // Malformed body / unknown category → 400 (the child treats any
-            // non-200 as a hard failure), mirroring `handle_graph_run`.
-            let r = RunResult {
-                ok: false,
-                text: None,
-                error: Some(format!("bad request body: {e}")),
-            };
-            return write_json(stream, 400, &r).await;
-        }
+    // Malformed body / unknown category → 400 (the child treats any
+    // non-200 as a hard failure), mirroring `handle_graph_run`.
+    let Some(body) = decode::<AuditRunBody, _>(stream, req, bad_body_result).await? else {
+        return Ok(());
     };
     let category = body.category;
 

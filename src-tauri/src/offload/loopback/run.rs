@@ -101,16 +101,8 @@ pub(super) async fn handle_run(
     app: &AppHandle,
     req: &Request,
 ) -> AppResult<()> {
-    let body: RunBody = match serde_json::from_slice(&req.body) {
-        Ok(b) => b,
-        Err(e) => {
-            let r = RunResult {
-                ok: false,
-                text: None,
-                error: Some(format!("bad request body: {e}")),
-            };
-            return write_json(stream, 400, &r).await;
-        }
+    let Some(body) = decode::<RunBody, _>(stream, req, bad_body_result).await? else {
+        return Ok(());
     };
     if body.instructions.trim().is_empty() {
         let r = RunResult {

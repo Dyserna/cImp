@@ -51,7 +51,7 @@ pub(super) struct DelegateResult {
 }
 
 impl DelegateResult {
-    fn failed(msg: String) -> Self {
+    pub(super) fn failed(msg: String) -> Self {
         Self {
             ok: false,
             text: None,
@@ -81,12 +81,12 @@ pub(super) async fn handle_delegate(
     app: &AppHandle,
     req: &Request,
 ) -> AppResult<()> {
-    let body: DelegateBody = match serde_json::from_slice(&req.body) {
-        Ok(b) => b,
-        Err(e) => {
-            let r = DelegateResult::failed(format!("bad request body: {e}"));
-            return write_json(stream, 400, &r).await;
-        }
+    let Some(body) = decode::<DelegateBody, _>(stream, req, |e| {
+        DelegateResult::failed(format!("bad request body: {e}"))
+    })
+    .await?
+    else {
+        return Ok(());
     };
     if body.task.trim().is_empty() {
         let r = DelegateResult::failed("`task` must be non-empty".into());

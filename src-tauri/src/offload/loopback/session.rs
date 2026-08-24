@@ -194,16 +194,8 @@ pub(super) async fn handle_session_hello(
     app: &AppHandle,
     req: &Request,
 ) -> AppResult<()> {
-    let body: SessionHelloBody = match serde_json::from_slice(&req.body) {
-        Ok(b) => b,
-        Err(e) => {
-            let r = RunResult {
-                ok: false,
-                text: None,
-                error: Some(format!("bad request body: {e}")),
-            };
-            return write_json(stream, 400, &r).await;
-        }
+    let Some(body) = decode::<SessionHelloBody, _>(stream, req, bad_body_result).await? else {
+        return Ok(());
     };
     let agent = crate::graph::source_for_consumer(body.agent.as_deref().unwrap_or(crate::harness::DEFAULT_HARNESS.token()));
     let tab = body.tab.as_deref().map(str::trim).unwrap_or("");
@@ -404,20 +396,17 @@ pub(super) async fn handle_harness_output(
     req: &Request,
     started: bool,
 ) -> AppResult<()> {
-    let ok = RunResult {
-        ok: true,
-        text: None,
-        error: None,
+    // `_body`: this route's whole payload is the identity plus the boundary,
+    // and the boundary is the dispatch arm's own `started` argument.
+    let Some((agent, tab, _body)) = push_admit::<HarnessOutputBody>(stream, app, req, |b| {
+        (b.agent.as_deref(), b.tab.as_deref())
+    })
+    .await?
+    else {
+        return Ok(());
     };
-    let Ok(body) = serde_json::from_slice::<HarnessOutputBody>(&req.body) else {
-        return write_json(stream, 400, &bad_request("bad request body")).await;
-    };
-    if let Some((agent, tab)) =
-        session_push_identity(app, body.agent.as_deref(), body.tab.as_deref())
-    {
-        harness_output_core(app, agent, &tab, started);
-    }
-    write_json(stream, 200, &ok).await
+    harness_output_core(app, agent, &tab, started);
+    push_ok(stream).await
 }
 
 /// Apply one pushed turn boundary — the `harness.output_*` core.
@@ -458,20 +447,15 @@ pub(super) async fn handle_subagents_active(
     app: &AppHandle,
     req: &Request,
 ) -> AppResult<()> {
-    let ok = RunResult {
-        ok: true,
-        text: None,
-        error: None,
+    let Some((agent, tab, body)) = push_admit::<SubagentsActiveBody>(stream, app, req, |b| {
+        (b.agent.as_deref(), b.tab.as_deref())
+    })
+    .await?
+    else {
+        return Ok(());
     };
-    let Ok(body) = serde_json::from_slice::<SubagentsActiveBody>(&req.body) else {
-        return write_json(stream, 400, &bad_request("bad request body")).await;
-    };
-    if let Some((agent, tab)) =
-        session_push_identity(app, body.agent.as_deref(), body.tab.as_deref())
-    {
-        subagents_active_core(app, agent, &tab, body.active);
-    }
-    write_json(stream, 200, &ok).await
+    subagents_active_core(app, agent, &tab, body.active);
+    push_ok(stream).await
 }
 
 /// Apply one pushed sub-agent-count edge — the `subagents.active` core.
@@ -680,26 +664,73 @@ pub(super) fn session_push_identity(
     Some((agent, tab.to_string()))
 }
 
+/// **The envelope every pushed `/session/*` route has**: decode the body in
+/// this family's 400 shape, then resolve ONE identity through
+/// [`session_push_identity`].
+///
+/// `Ok(None)` means the route is **already answered** — either the 400 a body
+/// that will not parse gets, or the same 200 an identity-less or unconfigured
+/// tab has always got, written here without anything being called. Both are
+/// terminal and both are byte-for-byte the reply each handler wrote before
+/// V42 R22 (#115) folded five copies of this preamble into one.
+///
+/// The CORE is deliberately NOT called here. The five differ in arity and one
+/// of them is `async`; more to the point, a handler that names its own core in
+/// its own body is what
+/// `tests::both_transports_of_a_capability_call_one_core` and the containment
+/// enumeration read, and a route must not be able to claim a core it reaches
+/// only through a shared wrapper.
+///
+/// `identity` rather than a trait over the five body types: it is one line per
+/// call site against five impl blocks, and it keeps the two fields the
+/// envelope reads visible AT the route.
+async fn push_admit<T: serde::de::DeserializeOwned>(
+    stream: &mut TcpStream,
+    app: &AppHandle,
+    req: &Request,
+    identity: impl FnOnce(&T) -> (Option<&str>, Option<&str>),
+) -> AppResult<Option<(&'static str, String, T)>> {
+    let Some(body) = decode::<T, _>(stream, req, |_| bad_request("bad request body")).await?
+    else {
+        return Ok(None);
+    };
+    let (agent, tab) = identity(&body);
+    let Some((agent, tab)) = session_push_identity(app, agent, tab) else {
+        push_ok(stream).await?;
+        return Ok(None);
+    };
+    Ok(Some((agent, tab, body)))
+}
+
+/// The 200 every pushed `/session/*` route answers with, spelled once.
+async fn push_ok(stream: &mut TcpStream) -> AppResult<()> {
+    write_json(
+        stream,
+        200,
+        &RunResult {
+            ok: true,
+            text: None,
+            error: None,
+        },
+    )
+    .await
+}
+
 /// `POST /session/assistant_text` — one complete assistant message, spoken.
 pub(super) async fn handle_session_assistant_text(
     stream: &mut TcpStream,
     app: &AppHandle,
     req: &Request,
 ) -> AppResult<()> {
-    let ok = RunResult {
-        ok: true,
-        text: None,
-        error: None,
+    let Some((agent, tab, body)) = push_admit::<SessionAssistantTextBody>(stream, app, req, |b| {
+        (b.agent.as_deref(), b.tab.as_deref())
+    })
+    .await?
+    else {
+        return Ok(());
     };
-    let Ok(body) = serde_json::from_slice::<SessionAssistantTextBody>(&req.body) else {
-        return write_json(stream, 400, &bad_request("bad request body")).await;
-    };
-    if let Some((agent, tab)) =
-        session_push_identity(app, body.agent.as_deref(), body.tab.as_deref())
-    {
-        assistant_text_core(app, agent, &tab, &body.text).await;
-    }
-    write_json(stream, 200, &ok).await
+    assistant_text_core(app, agent, &tab, &body.text).await;
+    push_ok(stream).await
 }
 
 /// `POST /session/tool_result` — one tool result's size, recorded.
@@ -708,28 +739,23 @@ pub(super) async fn handle_session_tool_result(
     app: &AppHandle,
     req: &Request,
 ) -> AppResult<()> {
-    let ok = RunResult {
-        ok: true,
-        text: None,
-        error: None,
+    let Some((agent, tab, body)) = push_admit::<SessionToolResultBody>(stream, app, req, |b| {
+        (b.agent.as_deref(), b.tab.as_deref())
+    })
+    .await?
+    else {
+        return Ok(());
     };
-    let Ok(body) = serde_json::from_slice::<SessionToolResultBody>(&req.body) else {
-        return write_json(stream, 400, &bad_request("bad request body")).await;
-    };
-    if let Some((agent, tab)) =
-        session_push_identity(app, body.agent.as_deref(), body.tab.as_deref())
-    {
-        tool_result_core(
-            app,
-            agent,
-            &tab,
-            body.cwd.as_deref(),
-            body.session_id.as_deref().unwrap_or(""),
-            body.tool.as_deref().map(bounded_tool_name),
-            body.chars,
-        );
-    }
-    write_json(stream, 200, &ok).await
+    tool_result_core(
+        app,
+        agent,
+        &tab,
+        body.cwd.as_deref(),
+        body.session_id.as_deref().unwrap_or(""),
+        body.tool.as_deref().map(bounded_tool_name),
+        body.chars,
+    );
+    push_ok(stream).await
 }
 
 /// `POST /session/subagent` — one sub-agent lifecycle edge.
@@ -738,18 +764,13 @@ pub(super) async fn handle_session_subagent(
     app: &AppHandle,
     req: &Request,
 ) -> AppResult<()> {
-    let ok = RunResult {
-        ok: true,
-        text: None,
-        error: None,
+    let Some((agent, tab, body)) = push_admit::<SessionSubagentBody>(stream, app, req, |b| {
+        (b.agent.as_deref(), b.tab.as_deref())
+    })
+    .await?
+    else {
+        return Ok(());
     };
-    let Ok(body) = serde_json::from_slice::<SessionSubagentBody>(&req.body) else {
-        return write_json(stream, 400, &bad_request("bad request body")).await;
-    };
-    if let Some((agent, tab)) =
-        session_push_identity(app, body.agent.as_deref(), body.tab.as_deref())
-    {
-        subagent_core(app, agent, &tab, &body.agent_id, body.active);
-    }
-    write_json(stream, 200, &ok).await
+    subagent_core(app, agent, &tab, &body.agent_id, body.active);
+    push_ok(stream).await
 }

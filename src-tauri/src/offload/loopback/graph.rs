@@ -48,16 +48,8 @@ pub(super) struct GraphRunBody {
 /// and return its text. The `GraphService` is resolved from managed state at
 /// request time, so this is robust against the graph-vs-loopback startup order.
 pub(super) async fn handle_graph_run(stream: &mut TcpStream, app: &AppHandle, req: &Request) -> AppResult<()> {
-    let body: GraphRunBody = match serde_json::from_slice(&req.body) {
-        Ok(b) => b,
-        Err(e) => {
-            let r = RunResult {
-                ok: false,
-                text: None,
-                error: Some(format!("bad request body: {e}")),
-            };
-            return write_json(stream, 400, &r).await;
-        }
+    let Some(body) = decode::<GraphRunBody, _>(stream, req, bad_body_result).await? else {
+        return Ok(());
     };
     let graph = match app.try_state::<Arc<crate::graph::GraphService>>() {
         Some(g) => g.inner().clone(),

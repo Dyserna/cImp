@@ -112,16 +112,8 @@ pub(super) async fn handle_context_retrieve(
     app: &AppHandle,
     req: &Request,
 ) -> AppResult<()> {
-    let body: ContextRetrieveBody = match serde_json::from_slice(&req.body) {
-        Ok(b) => b,
-        Err(e) => {
-            return write_json(
-                stream,
-                400,
-                &serde_json::json!({ "ok": false, "error": format!("bad request body: {e}") }),
-            )
-            .await;
-        }
+    let Some(body) = decode::<ContextRetrieveBody, _>(stream, req, bad_body_json).await? else {
+        return Ok(());
     };
     let answer = context_retrieve_core(app, &body).await;
     write_json(stream, 200, &answer).await
@@ -543,16 +535,8 @@ pub(super) async fn handle_tool_checkpoint(
     app: &AppHandle,
     req: &Request,
 ) -> AppResult<()> {
-    let body: ToolCheckpointBody = match serde_json::from_slice(&req.body) {
-        Ok(b) => b,
-        Err(e) => {
-            return write_json(
-                stream,
-                400,
-                &serde_json::json!({ "ok": false, "error": format!("bad request body: {e}") }),
-            )
-            .await;
-        }
+    let Some(body) = decode::<ToolCheckpointBody, _>(stream, req, bad_body_json).await? else {
+        return Ok(());
     };
     let Some(tool) = body
         .tool
@@ -707,16 +691,8 @@ pub(super) async fn handle_context_compaction(
     app: &AppHandle,
     req: &Request,
 ) -> AppResult<()> {
-    let body: ContextCompactionBody = match serde_json::from_slice(&req.body) {
-        Ok(b) => b,
-        Err(e) => {
-            return write_json(
-                stream,
-                400,
-                &serde_json::json!({ "ok": false, "error": format!("bad request body: {e}") }),
-            )
-            .await;
-        }
+    let Some(body) = decode::<ContextCompactionBody, _>(stream, req, bad_body_json).await? else {
+        return Ok(());
     };
     let empty = serde_json::json!({ "ok": true, "text": "" });
     let settings = live_settings(app);
@@ -806,16 +782,8 @@ pub(super) async fn handle_should_read(
     req: &Request,
 ) -> AppResult<()> {
     let pass = serde_json::json!({ "ok": true, "verdict": "pass" });
-    let body: ShouldReadBody = match serde_json::from_slice(&req.body) {
-        Ok(b) => b,
-        Err(e) => {
-            return write_json(
-                stream,
-                400,
-                &serde_json::json!({ "ok": false, "error": format!("bad request body: {e}") }),
-            )
-            .await;
-        }
+    let Some(body) = decode::<ShouldReadBody, _>(stream, req, bad_body_json).await? else {
+        return Ok(());
     };
     let settings = live_settings(app);
     if hook_admit(
@@ -1014,16 +982,8 @@ pub(super) fn admitted_hook_root(roots: &[PathBuf], requested: Option<&str>) -> 
 /// route's treatment.
 pub(super) async fn handle_post_edit(stream: &mut TcpStream, app: &AppHandle, req: &Request) -> AppResult<()> {
     let empty = serde_json::json!({ "ok": true, "text": "" });
-    let body: ContextPostEditBody = match serde_json::from_slice(&req.body) {
-        Ok(b) => b,
-        Err(e) => {
-            return write_json(
-                stream,
-                400,
-                &serde_json::json!({ "ok": false, "error": format!("bad request body: {e}") }),
-            )
-            .await;
-        }
+    let Some(body) = decode::<ContextPostEditBody, _>(stream, req, bad_body_json).await? else {
+        return Ok(());
     };
     let settings = live_settings(app);
     if hook_admit(

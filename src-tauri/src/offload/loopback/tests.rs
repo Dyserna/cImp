@@ -7616,6 +7616,70 @@ fn route_const_named(src: &str, path: &str) -> Option<String> {
     })
 }
 
+/// **Every 400 body a route sends for an unparseable request, pinned.**
+///
+/// V42 R22 (#115) folded the decode-body-or-400 preamble into [`decode`],
+/// whose `refusal` parameter exists because these replies are NOT one shape:
+/// the pushed `/session/*` routes send no parse detail at all, `/delegate`
+/// sends its own result type, and the hook routes build a bare object where
+/// the task-shaped routes build a [`RunResult`]. The children and shims that
+/// read them (`offload::mcp`, `audit::mcp::run_via_loopback`, the generated
+/// OpenCode plugin, the Claude hook shims) parse what they are sent, and
+/// nothing pinned these bytes before — a route's 400 path needs a `TcpStream`
+/// to reach — so they are pinned here, at the builders.
+///
+/// **Why the first two coincide today, and why they are still two functions.**
+/// `serde_json` is built with `preserve_order` in this tree (it is in the lock
+/// file's dependency list, pulled in transitively), so `json!` emits its keys
+/// in insertion order and the bare object happens to agree with the struct.
+/// Without that feature a `Map` is a `BTreeMap` and the same object would come
+/// out `error` first. That is a transitive build detail, not something either
+/// route decided — so each keeps building the body it always built, and this
+/// test is what would notice if the resolution changed underneath them.
+///
+/// The serde wording is deliberately not pinned; what is pinned is the
+/// envelope: which fields, in which order, with which prefix.
+#[test]
+fn every_bad_body_reply_keeps_its_own_bytes() {
+    let parse_error = || {
+        serde_json::from_slice::<serde_json::Value>(b"{").expect_err("an unparseable body")
+    };
+    let detail = serde_json::to_string(&format!("bad request body: {}", parse_error()))
+        .expect("a JSON string");
+    let with_detail = format!("{{\"ok\":false,\"error\":{detail}}}");
+
+    // 1. The task-shaped routes: `/run`, `/graph_run`, `/audit/run`,
+    //    `/mcp/call`, `/latch/beacon`, `/latch/state`, `/session/hello`.
+    assert_eq!(
+        serde_json::to_string(&bad_body_result(parse_error())).expect("serializes"),
+        with_detail
+    );
+
+    // 2. The hook routes: `/context/*`, `/workbench/tool_checkpoint`,
+    //    `/activity/contract_drift`.
+    assert_eq!(
+        serde_json::to_string(&bad_body_json(parse_error())).expect("serializes"),
+        with_detail
+    );
+
+    // 3. The pushed `/session/*` routes: no parse detail reaches the caller.
+    assert_eq!(
+        serde_json::to_string(&bad_request("bad request body")).expect("serializes"),
+        r#"{"ok":false,"error":"bad request body"}"#
+    );
+
+    // 4. `/delegate`, which answers in its own result type — the model reads
+    //    this one as a tool result, so every absent field stays absent.
+    assert_eq!(
+        serde_json::to_string(&DelegateResult::failed(format!(
+            "bad request body: {}",
+            parse_error()
+        )))
+        .expect("serializes"),
+        with_detail
+    );
+}
+
 /// **The scanners see every file the routes are in.**
 ///
 /// [`ROUTE_SOURCES`] is what every source-scanning test below reads, and it is

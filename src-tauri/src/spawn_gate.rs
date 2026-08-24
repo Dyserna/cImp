@@ -175,9 +175,8 @@ pub fn exclusive() -> ExclusiveSpawnWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rustsrc::{code_of, test_regions};
+    use crate::rustsrc::{code_of, source_files, test_regions};
     use std::collections::{BTreeMap, BTreeSet};
-    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
     use std::sync::Arc;
@@ -384,46 +383,6 @@ mod tests {
             "`reqwest::Response::status()` on the llama-server health probe.",
         ),
     ];
-
-    /// `<repo>/src-tauri/src`, resolved from the manifest rather than the cwd
-    /// so the answer does not depend on where the test runner started.
-    fn src_root() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
-    }
-
-    /// Every `.rs` file under `src/` as `(slash-relative path, source)`, with
-    /// `\r` already stripped.
-    fn source_files() -> Vec<(String, String)> {
-        fn walk(dir: &Path, root: &Path, out: &mut Vec<(String, String)>) {
-            let entries = std::fs::read_dir(dir)
-                .unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()));
-            for e in entries.flatten() {
-                let p = e.path();
-                if p.is_dir() {
-                    walk(&p, root, out);
-                } else if p.extension().is_some_and(|x| x == "rs") {
-                    let text = std::fs::read_to_string(&p)
-                        .unwrap_or_else(|e| panic!("cannot read {}: {e}", p.display()));
-                    let rel = p
-                        .strip_prefix(root)
-                        .unwrap_or(&p)
-                        .to_string_lossy()
-                        .replace('\\', "/");
-                    out.push((rel, text.replace('\r', "")));
-                }
-            }
-        }
-        let mut out = Vec::new();
-        walk(&src_root(), &src_root(), &mut out);
-        assert!(
-            out.len() > 100,
-            "the source walk found only {} files — a walk that reads nothing finds no ungated \
-             spawn and passes, which is the one outcome this scan may never have",
-            out.len()
-        );
-        out.sort();
-        out
-    }
 
     /// One needle occurrence in production (non-`#[cfg(test)]`) code.
     struct Hit {

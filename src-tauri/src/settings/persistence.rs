@@ -50,7 +50,7 @@ use crate::settings::migration;
 use crate::settings::schema::{
     default_ai_tab, default_events_tab, default_graph_monitor_tab,
     default_shell_1_tab, default_tool_activity_tab, default_workbench_tab,
-    starter_prompt_templates, AiTabId, HarnessVersions, LayoutNodePersisted, LlmPricingModel,
+    starter_prompt_templates, AiTabId, HarnessVersions, LlmPricingModel,
     McpCategory, McpServerConfig, PromptTemplate, RemoteBackendTemplate, ServerCommandTemplate,
     Settings, TabConfig,
     CODE_AUDIT_TAB_ID, CODE_QUALITY_TAB_ID, EVENTS_TAB_ID, GRAPH_MONITOR_TAB_ID,
@@ -298,7 +298,13 @@ pub fn load(default_shell: &ShellSpec, launch_cwd: &Path) -> LoadOutcome {
     // value is not a repair of the GLOBAL file, and `load_global` has already
     // healed that one on disk.
     settings.normalize_harness_settings();
-    let repaired = integrity_check(&mut settings);
+    // V42 Phase B: the layout step of the integrity check needs the project's
+    // UI-hidden tab set, so a hidden tab isn't re-placed as an orphan in the
+    // tree the main window is about to render. Read from the same per-project
+    // `.cimp/ui_state.json` the frontend writes it to; a missing or unreadable
+    // file reads as "nothing hidden" (see `read_hidden_tabs`).
+    let hidden_tabs = crate::ipc::ui_state::read_hidden_tabs(launch_cwd);
+    let repaired = integrity_check_with_hidden(&mut settings, &hidden_tabs);
 
     // Re-point bundled avatar videos at the loaded theme. Existing installs
     // had absolute paths frozen to the seed-time theme written into their
@@ -3011,6 +3017,20 @@ fn ai_builtin_ids() -> Vec<&'static str> {
 /// repaired by forcing it back to `[claude]` so the user always boots
 /// with at least one AI tab.
 pub fn integrity_check(settings: &mut Settings) -> bool {
+    integrity_check_with_hidden(settings, &HashSet::new())
+}
+
+/// [`integrity_check`] plus the project's UI-hidden tab set, which only the
+/// layout step (5) reads.
+///
+/// Two callers, deliberately different: [`load`] passes the real set, because
+/// the layout it repairs is the one the main window is about to render and a
+/// hidden tab must not come back as an orphan. The GLOBAL baseline is checked
+/// with an empty set — the hidden set is per-PROJECT state (it lives in the
+/// project's `.cimp/ui_state.json`), so a layout stripped by it belongs in the
+/// project overlay, which is exactly where the settings-vs-baseline diff puts
+/// a value that differs between the two sides.
+pub fn integrity_check_with_hidden(settings: &mut Settings, hidden: &HashSet<String>) -> bool {
     let mut changed = false;
 
     // 0. Empty enabled_ai_tabs is invalid — repair to the FIRST REGISTERED
@@ -3148,88 +3168,34 @@ pub fn integrity_check(settings: &mut Settings) -> bool {
     }
 
 
-    // 5. Backend layout sanity. The frontend owns the deep integrity
-    //    walk (orphan placement, empty-pane collapse) — it has the tree
-    //    helpers. The backend's job here is just to keep the file
-    //    deserializable and stop a hand-edit from referring to dead tab
-    //    ids: drop tab_ids that don't exist, and clear invalid
-    //    `focused_pane_id` so the frontend's leftmost-leaf fallback
-    //    kicks in.
+    // 5. Layout integrity — the WHOLE walk, not a shallow scrub.
+    //
+    //    V42 Phase B moved `validateAndRepairLayout` here from the frontend.
+    //    Until then this step dropped dead tab ids and reset an invalid
+    //    `focused_pane_id`, and left orphan placement, tree-wide dedupe, ratio
+    //    clamping and empty-pane collapse to the frontend — so the tree the
+    //    backend handed out was one it knew to be incomplete, and every
+    //    consumer outside the main window (`layout_focused_active_tab_id`, the
+    //    post-repair save, this function's own `changed` result) saw that
+    //    shape. `settings::layout` now owns all six rules; see its module docs
+    //    for what each one does and why the order matters.
     if let Some(layout) = settings.layout.as_mut() {
-        let valid_ids: HashSet<&str> = settings.tabs.iter().map(|t| t.id()).collect();
-        let mut pane_ids: HashSet<String> = HashSet::new();
-        if filter_layout_tab_ids(&mut layout.tree, &valid_ids, &mut pane_ids) {
+        let valid_ids: Vec<&str> = settings.tabs.iter().map(|t| t.id()).collect();
+        if crate::settings::layout::repair(layout, &valid_ids, hidden) {
             changed = true;
-            tracing::warn!("integrity: dropped unknown tab ids from layout");
-        }
-        if !pane_ids.contains(&layout.focused_pane_id) {
-            // Pick the leftmost-leaf pane id as a deterministic fallback.
-            if let Some(replacement) = leftmost_pane_id(&layout.tree) {
-                if layout.focused_pane_id != replacement {
-                    tracing::warn!(
-                        previous = %layout.focused_pane_id,
-                        new = %replacement,
-                        "integrity: focused_pane_id no longer exists; reset to leftmost leaf"
-                    );
-                    layout.focused_pane_id = replacement;
-                    changed = true;
-                }
-            }
+            tracing::warn!("integrity: repaired the persisted layout tree");
         }
     }
 
     changed
 }
 
-/// Walk the layout tree, dropping any `tab_ids` entries that aren't in
-/// `valid_ids` (and clearing `active_tab_id` if it was dropped or no
-/// longer matches a remaining id). Records every encountered pane id in
-/// `pane_ids` so the caller can validate `focused_pane_id` afterwards.
-/// Returns `true` if anything was changed.
-fn filter_layout_tab_ids(
-    node: &mut LayoutNodePersisted,
-    valid_ids: &HashSet<&str>,
-    pane_ids: &mut HashSet<String>,
-) -> bool {
-    match node {
-        LayoutNodePersisted::Pane {
-            id,
-            tab_ids,
-            active_tab_id,
-        } => {
-            pane_ids.insert(id.clone());
-            let before = tab_ids.len();
-            tab_ids.retain(|t| valid_ids.contains(t.as_str()));
-            let mut changed = tab_ids.len() != before;
-            if let Some(active) = active_tab_id.as_deref() {
-                if !tab_ids.iter().any(|t| t == active) {
-                    *active_tab_id = tab_ids.first().cloned();
-                    changed = true;
-                }
-            }
-            changed
-        }
-        LayoutNodePersisted::Split { first, second, .. } => {
-            let mut changed = filter_layout_tab_ids(first, valid_ids, pane_ids);
-            changed |= filter_layout_tab_ids(second, valid_ids, pane_ids);
-            changed
-        }
-    }
-}
-
-/// Pane id of the leftmost leaf in `node`. Used as the deterministic
-/// fallback when `focused_pane_id` no longer maps to an existing pane.
-fn leftmost_pane_id(node: &LayoutNodePersisted) -> Option<String> {
-    match node {
-        LayoutNodePersisted::Pane { id, .. } => Some(id.clone()),
-        LayoutNodePersisted::Split { first, .. } => leftmost_pane_id(first),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::settings::schema::{CLAUDE_LOCAL_TAB_ID, CLAUDE_TAB_ID, OPENCODE_TAB_ID};
+    use crate::settings::schema::{
+        LayoutNodePersisted, CLAUDE_LOCAL_TAB_ID, CLAUDE_TAB_ID, OPENCODE_TAB_ID,
+    };
     use std::path::PathBuf;
 
     fn fake_default_shell() -> ShellSpec {
@@ -3636,10 +3602,15 @@ mod tests {
             .filter(|id| *id != EVENTS_TAB_ID)
             .collect();
         assert_eq!(after, user_tabs, "existing tabs survive, in order");
-        // …and the layout still names them all: a materialized tab must not
-        // cost the user the arrangement they had.
+        // …and the layout still names them all, in order: a materialized tab
+        // must not cost the user the arrangement they had. Since V42 Phase B
+        // the freshly-materialized tab is APPENDED here too, by the layout
+        // step's orphan placement — before that the backend left it out of the
+        // tree and the frontend's boot-time repair placed it a moment later.
+        let mut expected = user_tabs.clone();
+        expected.push(EVENTS_TAB_ID.to_string());
         match &s.layout.as_ref().unwrap().tree {
-            LayoutNodePersisted::Pane { tab_ids, .. } => assert_eq!(*tab_ids, user_tabs),
+            LayoutNodePersisted::Pane { tab_ids, .. } => assert_eq!(*tab_ids, expected),
             other => panic!("layout tree was rewritten: {other:?}"),
         }
     }

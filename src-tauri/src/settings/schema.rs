@@ -174,6 +174,8 @@ fn pricing_generation_none() -> u32 {
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub struct Settings {
     /// On-disk schema version. Stamped at `CURRENT_SCHEMA_VERSION`
     /// on fresh installs and by the v1.9→v1.10 migration. Defaulted via
@@ -281,6 +283,11 @@ pub struct Settings {
     /// overlay, which is where users actually set it. A model-supplied
     /// `run_check` tool call only *selects* a `CheckDef` by name — the command
     /// itself is never model-supplied.
+    // HAND-KEPT SEAM: `CheckDef`/`ParserKind` mirror `crate::checks`, NOT this
+    // file, so V42 Phase E left them hand-written in `types.ts` (and left
+    // `checks::tests`' mirror tripwire pointing at them). The generated file
+    // therefore names the hand-kept type through an inline type-only import.
+    #[cfg_attr(test, ts(type = "import('../types').CheckDef[]"))]
     pub checks: Vec<crate::checks::CheckDef>,
     /// V22 Phase D: when `true`, validated auto-detection proposals are applied
     /// automatically the first time a project's code graph finishes indexing
@@ -332,6 +339,11 @@ pub struct Settings {
     /// integrity check forces `[claude]` if it deserializes empty, and
     /// the runtime IPC rejects an empty value. Default is `[claude]` so
     /// a fresh install starts with the subscription Claude tab only.
+    // HAND-KEPT SEAM: `AiTabId`'s (de)serialize is hand-written (a bare id
+    // string, refused unless a descriptor claims it), so no derive expresses
+    // it. The frontend's `AiTabId` is that same bare string; this points at
+    // its declaration rather than restating the alias here.
+    #[cfg_attr(test, ts(type = "import('../../tabs/types').AiTabId[]"))]
     pub enabled_ai_tabs: Vec<AiTabId>,
     /// File-logger configuration. The tracing subscriber writes daily
     /// rolling files into `<portable-root>/logs/`; the level field drives
@@ -395,14 +407,17 @@ pub struct Settings {
     /// scalar write simply overwrites the earlier one; no array-replace pitfall
     /// applies), so a project remembers its own dev-server URL without any
     /// bespoke read/write path. `None` until the first Preview tab is created
-    /// or navigated.
+    /// or navigated — the toolbar then falls back to `lib/preview/policy.ts`'s
+    /// `DEFAULT_PREVIEW_URL`.
     pub preview_last_url: Option<String>,
     /// V14 Phase F: global gate on the Preview tab's navigation policy — when
     /// `false` (the default), `preview::is_allowed_preview_host` only allows
     /// localhost/127.0.0.1/RFC-1918 hosts; navigation to anything else opens
     /// in the system browser instead. Opt-in per the milestone's design: a
     /// Preview tab is a dev-server surface, not a general (and
-    /// prompt-injectable) browsing pane beside the agent tabs.
+    /// prompt-injectable) browsing pane beside the agent tabs. The toolbar
+    /// pre-flights the same rule in `lib/preview/policy.ts`'s
+    /// `isAllowedPreviewHost` before it calls the backend at all.
     pub preview_allow_remote: bool,
     /// Provider/model token-price table ($ per million tokens) backing the
     /// Code Intelligence tab's per-session cost popup. App-wide like
@@ -530,6 +545,8 @@ impl Default for Settings {
 /// declaring them early costs nothing and keeps the on-disk shape stable.
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 #[serde(default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub struct DelegationSettings {
     /// Lock the worker tab's keyboard for the duration of a delegation
     /// (`ReadOnlySource::Driven`), then release it.
@@ -611,6 +628,8 @@ impl Default for DelegationSettings {
 /// execute.
 #[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
 #[serde(default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub struct ToolPluginsSettings {
     /// Per-plugin state, keyed `name@version` (`loader::LoadedPlugin::key`).
     pub plugins: BTreeMap<String, PluginState>,
@@ -641,6 +660,8 @@ pub struct ToolPluginsSettings {
 /// diff out of nothing.
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 #[serde(default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub struct PluginState {
     /// Master switch for every tool this plugin declares. Disabling it disables
     /// them **as a unit** without touching their own `enabled` flags, so
@@ -669,6 +690,8 @@ impl Default for PluginState {
 /// keeps a project overlay from pinning a copy of a machine fact.
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 #[serde(default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub struct ToolState {
     pub enabled: bool,
     /// Wall-clock override in seconds; `None` = the manifest's value, then the
@@ -829,6 +852,8 @@ fn object_entries(v: Option<&serde_json::Value>, what: &str) -> Vec<(String, ser
 /// their `Capability` rows already say which harness they are about.
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 #[serde(default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub struct HarnessVersions {
     /// Outcome of the E1 spike (PreToolUse deny `permissionDecisionReason`
     /// reaches the model): `"unverified" | "pass" | "fail"`. `"fail"` hard
@@ -874,6 +899,8 @@ impl Default for HarnessVersions {
 /// no fix pointer; a `"pass"` with failures is a silenced break).
 #[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
 #[serde(default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub struct AutoVerify {
     /// The `claude_last_seen` value this run was made against. Compared by
     /// equality with the current one — a record for an older version says
@@ -905,6 +932,8 @@ impl AutoVerify {
 /// One failing capability inside an [`AutoVerify`] record.
 #[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
 #[serde(default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub struct AutoVerifyFailure {
     /// The `harness::contract::Capability::id` — the join key the Advisor
     /// notice, the gate and the registry all speak.
@@ -952,6 +981,8 @@ pub struct AutoVerifyFailure {
 /// upgraded for is the failure this exists to prevent.
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub struct HarnessSettings {
     /// V38 F-3: advertise the `run_command` MCP tool — the registry's runnable
     /// `command`-kind entries under one tool with a `tool` enum — to this
@@ -1010,8 +1041,17 @@ pub struct HarnessSettings {
     pub auto_verify: Option<AutoVerify>,
     /// This harness's OWN settings — the plugin's `settings_schema()` fields,
     /// stored opaquely. See the type docs.
+    // `Record<string, unknown>` rather than ts-rs' `JsonValue` shadow type:
+    // the window renders `ext` from the plugin's declaration and names no key,
+    // and a `JsonValue` alias would drag a second generated file in for
+    // nothing. Matches what the mirror said before V42 Phase E.
+    #[cfg_attr(test, ts(type = "Record<string, unknown>"))]
     pub ext: BTreeMap<String, serde_json::Value>,
     /// Anything else the file carried. See *Unknown keys survive* above.
+    // Absent from the mirror before V42 Phase E and deliberately still absent:
+    // the flattened catch-all is a round-trip mechanism, not a frontend-
+    // readable field.
+    #[cfg_attr(test, ts(skip))]
     #[serde(flatten)]
     pub unknown: serde_json::Map<String, serde_json::Value>,
 }
@@ -1312,6 +1352,8 @@ pub fn access_for_test(pairs: &[(&str, bool)]) -> BTreeMap<String, McpAccess> {
 /// that could have carried it from the start.
 #[derive(Clone, Copy, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
 #[serde(default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub struct McpAccess {
     /// Expose this server's tools to this harness, proxied through its
     /// per-session `cimp-offload --consumer <id>` child. Off by default: a new
@@ -1328,13 +1370,16 @@ pub struct McpAccess {
 /// uniqueness is enforced, the popup just lists rows in order.
 #[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq)]
 #[serde(default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub struct LlmPricingModel {
     pub provider: String,
     pub model: String,
     /// V16 Feature 8: transcript model-id prefix this row auto-matches
     /// (e.g. `"claude-opus-4-8"` matches both the bare alias and dated
     /// snapshots). Longest matching prefix wins; empty = manual-pick only
-    /// (the row still appears in the cost popup's dropdown).
+    /// (the row still appears in the cost popup's dropdown). The frontend
+    /// resolves the match in `usageMath.ts`'s `matchPricing`.
     pub model_prefix: String,
     /// $/MTok for uncached input tokens.
     pub input: f64,
@@ -1359,6 +1404,8 @@ pub struct LlmPricingModel {
 /// BOTH fields is what "suppressed" means — see `advisor::evaluate`.
 #[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
 #[serde(default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub struct DismissedRule {
     pub rule_id: String,
     pub signature: String,
@@ -1373,6 +1420,8 @@ pub struct DismissedRule {
 /// `advisor::evaluate`.
 #[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
 #[serde(default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub struct AppliedRule {
     pub rule_id: String,
     pub root: String,
@@ -1384,6 +1433,8 @@ pub struct AppliedRule {
 /// the live filter and `retention` drives the startup cleanup pass.
 #[derive(Clone, Copy, Serialize, Deserialize, Debug, Default)]
 #[serde(default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub struct LoggingSettings {
     pub level: LogLevel,
     pub retention: LogRetention,
@@ -1398,6 +1449,8 @@ pub struct LoggingSettings {
 /// subdirectory.
 #[derive(Clone, Copy, Serialize, Deserialize, Debug)]
 #[serde(default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub struct ContentCaptureSettings {
     pub enabled: bool,
     pub retention: LogRetention,
@@ -1417,6 +1470,8 @@ impl Default for ContentCaptureSettings {
 /// environment variable, when set, overrides this at startup.
 #[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub enum LogLevel {
     Trace,
     Debug,
@@ -1443,6 +1498,8 @@ impl LogLevel {
 /// against each file's mtime in `logging::run_cleanup`.
 #[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub enum LogRetention {
     Daily,
     #[default]
@@ -1761,6 +1818,8 @@ fn warn_backend_name_collision(name: &str, tab: &str) {
 
 #[derive(Clone, Serialize, Deserialize, Debug, Default)]
 #[serde(default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub struct SessionState {
     pub active_tab_id: Option<String>,
 }
@@ -1770,7 +1829,14 @@ pub struct SessionState {
 /// `'split' | 'pane'` shape, so serialize/deserialize is identity work
 /// across the IPC boundary.
 #[derive(Clone, Serialize, Deserialize, Debug)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub struct LayoutPersisted {
+    // HAND-KEPT SEAM (V42 Phase E, locked decision 7): the frontend's
+    // `LayoutNode` union stays authoritative — the layout engine constructs
+    // and rewrites those nodes, while `LayoutNodePersisted` only round-trips
+    // them. Pointing at it keeps ONE union in the codebase instead of two.
+    #[cfg_attr(test, ts(type = "import('../../layout/types').LayoutNode"))]
     pub tree: LayoutNodePersisted,
     pub focused_pane_id: String,
 }
@@ -1811,12 +1877,16 @@ pub enum SplitDirection {
 /// preset, since restoring a preset is "set up panes this way" and focus
 /// follows the user's next click.
 #[derive(Clone, Serialize, Deserialize, Debug)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub struct LayoutPreset {
     pub name: String,
     /// RFC 3339 / ISO 8601 timestamp (UTC, second precision). Used to
     /// order the popover's "Recent presets" list. Renames do not refresh
     /// this — it remains the original creation time.
     pub created_at: String,
+    // HAND-KEPT SEAM: see `LayoutPersisted::tree`.
+    #[cfg_attr(test, ts(type = "import('../../layout/types').LayoutNode"))]
     pub tree: LayoutNodePersisted,
 }
 
@@ -1877,6 +1947,8 @@ where
 /// drive an embedded child webview instead, see `crate::preview`).
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub enum TabConfig {
     AiTool(AiToolTabConfig),
     Shell(ShellTabConfig),
@@ -1927,6 +1999,8 @@ impl TabConfig {
 
 #[derive(Clone, Serialize, Deserialize, Debug, Default)]
 #[serde(default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "AiToolTabFields", export_to = "settings.ts"))]
 pub struct AiToolTabConfig {
     pub id: String,
     pub builtin: bool,
@@ -1963,6 +2037,11 @@ pub struct AiToolTabConfig {
     /// inherit the global `terminal.background`; `Some(Disabled)` means
     /// opt out (theme bg only); `Some(Custom(cfg))` replaces the global
     /// background wholesale for this tab.
+    // HAND-KEPT SEAM: `BackgroundOverride`'s (de)serialize is hand-written
+    // (the literal `"disabled"` string OR a full config object), which no
+    // derive expresses. `types.ts` derives its `BackgroundOverrideWire` alias
+    // FROM this field, so the two cannot drift.
+    #[cfg_attr(test, ts(type = "\"disabled\" | TerminalBackgroundSettings | null"))]
     pub background_override: Option<BackgroundOverride>,
     /// V1.4-07: when `true`, the launch-time env composition synthesizes
     /// `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` (and `ANTHROPIC_MODEL`
@@ -2041,6 +2120,8 @@ pub struct AiToolTabConfig {
 /// action, on that tab.
 #[derive(Clone, Copy, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub enum DelegationRole {
     /// Not a delegation target. The default.
     #[default]
@@ -2063,6 +2144,8 @@ pub enum DelegationRole {
 /// into the offload backend list. Phase C reads them.
 #[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
 #[serde(default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub struct DelegationBackend {
     /// The name the requesting harness sees (`lan-worker-2`), NEVER the tab
     /// name — decision 3's facade half is only a facade if the tab does not
@@ -2081,6 +2164,8 @@ pub struct DelegationBackend {
 
 #[derive(Clone, Serialize, Deserialize, Debug, Default)]
 #[serde(default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "ShellTabFields", export_to = "settings.ts"))]
 pub struct ShellTabConfig {
     pub id: String,
     pub builtin: bool,
@@ -2096,6 +2181,11 @@ pub struct ShellTabConfig {
     pub theme_override: Option<TerminalThemeSettings>,
     /// V1.4-02 per-tab background override (three-state). See
     /// `AiToolTabConfig::background_override`.
+    // HAND-KEPT SEAM: `BackgroundOverride`'s (de)serialize is hand-written
+    // (the literal `"disabled"` string OR a full config object), which no
+    // derive expresses. `types.ts` derives its `BackgroundOverrideWire` alias
+    // FROM this field, so the two cannot drift.
+    #[cfg_attr(test, ts(type = "\"disabled\" | TerminalBackgroundSettings | null"))]
     pub background_override: Option<BackgroundOverride>,
 }
 
@@ -2106,6 +2196,8 @@ pub struct ShellTabConfig {
 /// tab id, reading `url`/`device_width`/`auto_reload` from here.
 #[derive(Clone, Serialize, Deserialize, Debug, Default)]
 #[serde(default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "PreviewTabFields", export_to = "settings.ts"))]
 pub struct PreviewTabConfig {
     pub id: String,
     /// Always `false` in practice — Preview has no reserved/builtin instance
@@ -2143,6 +2235,8 @@ pub struct PreviewTabConfig {
 /// block — old settings files round-trip with both fields empty.
 #[derive(Clone, Serialize, Deserialize, Debug, Default)]
 #[serde(default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub struct ExternalToolsSettings {
     /// Override for the `rustnet` tool; empty = resolve via ebin → PATH.
     pub rustnet: String,
@@ -2163,6 +2257,8 @@ pub struct ExternalToolsSettings {
 /// additions ride the v23→v24 pure version stamp.
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub struct CodeAuditSettings {
     /// Master switch. Off = no "Code audit" section in the Tool Activity tab
     /// (its reserved tab was retired in schema v27), no scanning, no
@@ -2252,6 +2348,8 @@ impl CodeAuditSettings {
 /// configured MCP servers' `env` maps, mirroring `ClaudeLocalSettings`.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub struct OffloadSettings {
     /// Master switch. Off = no server, no `--mcp-config` injection into
     /// Claude tabs, `offload_task` not exposed.
@@ -2631,6 +2729,8 @@ pub struct OffloadSettings {
 /// which cannot name a flag that no longer exists.
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 #[serde(default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub struct InjectionSettings {
     /// **L1 — the global master** (spec decision 16's `injection_protection`).
     /// Default `true`. Off = pre-V32 behaviour at every layer at once.
@@ -2774,6 +2874,8 @@ impl std::fmt::Debug for OffloadSettings {
 /// session config OpenCode receives via `OPENCODE_CONFIG_CONTENT`.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub struct LocalProviderBlock {
     /// OpenAI-compatible base URL, ending in `/v1`
     /// (e.g. `http://127.0.0.1:8080/v1`). Host + port come from `--host`
@@ -2871,6 +2973,8 @@ impl Default for OffloadSettings {
 /// hand-rolled impl from silently omitting a future field.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub struct GraphSettings {
     /// Master switch. Off = no indexing, no `graph_*` tools, no monitor tab.
     pub enabled: bool,
@@ -3377,6 +3481,8 @@ impl Default for GraphSettings {
 /// snapshot trigger reads.
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
 #[serde(default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub struct WorkbenchSettings {
     /// Master switch: the reserved Workbench tab exists. Off = no tab, no
     /// fs-batch event/broadcast, no checkpoint scheduling.
@@ -3447,6 +3553,8 @@ pub struct WorkbenchSettings {
 /// times.
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Default)]
 #[serde(default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub struct SandboxSettings {
     /// Master switch for the OS sandbox layer (decision 17).
     ///
@@ -3524,6 +3632,8 @@ impl Default for WorkbenchSettings {
 /// survives across backends and app restarts.
 #[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq)]
 #[serde(default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub struct ServerCommandTemplate {
     /// User-facing label, unique within the list (the UI enforces uniqueness).
     pub name: String,
@@ -3537,6 +3647,8 @@ pub struct ServerCommandTemplate {
 /// may be a real bearer secret, so the hand-rolled `Debug` below redacts it.
 #[derive(Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub struct RemoteBackendTemplate {
     /// User-facing label, unique within the list (the UI enforces uniqueness).
     pub name: String,
@@ -3569,6 +3681,8 @@ impl std::fmt::Debug for RemoteBackendTemplate {
 /// settings diff deterministic and maps cleanly to the UI's key/value rows.
 #[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq)]
 #[serde(default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub struct CommandEnvVar {
     pub key: String,
     pub value: String,
@@ -3580,6 +3694,8 @@ pub struct CommandEnvVar {
 /// visible/editable in Settings rather than buried in code.
 #[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq)]
 #[serde(default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub struct CommandPolicy {
     /// Program this policy hardens, matched against the allowlisted command by
     /// file-stem, case-insensitively (so `git` covers `git` and `git.exe`).
@@ -3722,6 +3838,8 @@ pub fn merge_readonly_preset(allowlist: &mut Vec<String>, policies: &mut Vec<Com
 /// MCP servers installed.
 #[derive(Clone, Copy, Serialize, Deserialize, Debug)]
 #[serde(default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub struct OffloadToolToggles {
     /// Bounded line/byte reads within an `allowed_root`.
     pub read_file: bool,
@@ -3766,6 +3884,8 @@ impl Default for OffloadToolToggles {
 /// declared is treated as untrusted, not as cImp's own.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub enum McpOrigin {
     /// A server cImp itself manages (reserved; see #41).
     Internal,
@@ -3789,6 +3909,8 @@ pub enum McpOrigin {
 /// rule for both advertisement and dispatch.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub struct McpCategory {
     /// Unique, user-chosen. This IS the category's id: renaming a category
     /// creates a new identity, and any activation entry keyed by the old name
@@ -3829,6 +3951,8 @@ impl Default for McpCategory {
 /// inherited-vs-overridden and offer a revert (delete the key).
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub struct McpActivation {
     /// Per-category overrides, keyed by [`McpCategory::name`].
     pub categories: BTreeMap<String, bool>,
@@ -3852,6 +3976,8 @@ pub struct McpActivation {
 // must join the comparison without anyone remembering to.
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub struct McpServerConfig {
     /// Display + namespacing prefix (e.g. `ddg`, `git`). Tools are
     /// exposed to the model as `<name>__<tool>`.
@@ -4017,6 +4143,8 @@ pub const WEB_DOCS_TOOLS: &[&str] = &["duckduckgo", "fetch", "context7"];
 /// real reasoning; Claude's `tier` hint on `offload_task` biases the choice.
 #[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub enum BackendTier {
     /// Small/fast backend (e.g. an 8 GB LAN box): trivial, single-pass,
     /// small-context offloads only.
@@ -4033,6 +4161,8 @@ pub enum BackendTier {
 /// cloud backends.
 #[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
 #[serde(tag = "mode", rename_all = "lowercase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub enum ToolScope {
     /// Every tool in the pool (Local + trusted LAN default).
     #[default]
@@ -4091,6 +4221,8 @@ impl ToolScope {
 /// `Debug` on [`OffloadBackend`] redacts **both** variants' `auth_token`.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub enum OffloadBackendKind {
     /// cImp owns the process: the V8-01 `server_command` + `autostart` +
     /// the read-only Offload server dashboard (Tool Activity tab) with
@@ -4221,6 +4353,8 @@ impl OffloadBackendKind {
 /// V8-02: one backend in the offload pool.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub struct OffloadBackend {
     /// Display + routing-log name (e.g. `main`, `lan-3070`, `cloud`).
     pub name: String,
@@ -4451,6 +4585,8 @@ impl OffloadSettings {
 /// without losing the user's text. On next save the file is rewritten
 /// in the new shape.
 #[derive(Clone, Serialize, Debug, Default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub struct NotificationSlot {
     pub enabled: bool,
     pub text: String,
@@ -4507,6 +4643,8 @@ impl<'de> Deserialize<'de> for NotificationSlot {
 
 #[derive(Clone, Serialize, Deserialize, Debug, Default)]
 #[serde(default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub struct AiNotificationConfig {
     pub idle: NotificationSlot,
     pub awaiting_permission: NotificationSlot,
@@ -4523,6 +4661,8 @@ pub struct AiNotificationConfig {
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub struct ShellNotificationConfig {
     pub error: NotificationSlot,
     /// `{code}` placeholder is interpolated with the actual exit code in M4.
@@ -4810,6 +4950,8 @@ pub fn default_shell_1_tab(default_shell: &ShellSpec) -> TabConfig {
 /// longer consulted for device selection.
 #[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub enum ProcessingDevice {
     #[default]
     Gpu,
@@ -4818,6 +4960,8 @@ pub enum ProcessingDevice {
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub struct TtsSettings {
     /// Master enable for the whole TTS feature. When false, the Kokoro ONNX
     /// model is **unloaded** (freeing CPU/GPU memory) and no synthesis runs;
@@ -4863,6 +5007,8 @@ impl Default for TtsSettings {
 /// needs a `ggml-*.bin` model present under `models/` to actually transcribe.
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub struct SttSettings {
     /// Master enable for the whole STT feature (record button + PTT).
     pub enabled: bool,
@@ -4886,6 +5032,8 @@ pub struct SttSettings {
 
 #[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub enum SttButtonMode {
     Toggle,
     Hold,
@@ -4912,6 +5060,8 @@ impl Default for SttSettings {
 /// accept `#RRGGBB` hex, so these must be 6-digit hex strings.
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub struct SelectionHighlightSettings {
     /// Master toggle. When false, the gesture still speaks the selection
     /// (chunked, so large/multi-line selections work) but paints no highlight.
@@ -4949,6 +5099,8 @@ impl Default for SelectionHighlightSettings {
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub struct AvatarSettings {
     pub visible: bool,
     /// Which renderer drives the avatar. `Media` (default) shows the
@@ -5002,6 +5154,8 @@ impl Default for AvatarSettings {
 /// `manifest.json` under `<root>/sprites/<set>/`.
 #[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub enum AvatarKind {
     Media,
     /// Default render mode: the animated pixel-art mascot. The default set is
@@ -5018,6 +5172,8 @@ pub enum AvatarKind {
 /// the name to a URL.
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub struct SpriteSettings {
     pub set: String,
 }
@@ -5032,6 +5188,8 @@ impl Default for SpriteSettings {
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub struct AvatarSize {
     pub width_px: u32,
     pub height_px: u32,
@@ -5052,6 +5210,8 @@ impl Default for AvatarSize {
 /// scalar `margin_px` field, which applied a single value to both axes.
 #[derive(Clone, Copy, Serialize, Deserialize, Debug)]
 #[serde(default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub struct AvatarMargin {
     pub x_px: u32,
     pub y_px: u32,
@@ -5065,6 +5225,8 @@ impl Default for AvatarMargin {
 
 #[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub enum AvatarPosition {
     #[default]
     TopRight,
@@ -5075,6 +5237,8 @@ pub enum AvatarPosition {
 
 #[derive(Clone, Serialize, Deserialize, Debug, Default)]
 #[serde(default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub struct AvatarImages {
     pub idle: Option<PathBuf>,
     pub listening: Option<PathBuf>,
@@ -5085,6 +5249,8 @@ pub struct AvatarImages {
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub struct TransitionSettings {
     pub path: Option<PathBuf>,
     pub duration_ms: u32,
@@ -5104,6 +5270,8 @@ impl Default for TransitionSettings {
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub struct WaveformSettings {
     /// Hex color the waveform stroke and the avatar's outline use. Empty
     /// string means "follow the active UI theme" — the frontend resolves
@@ -5134,6 +5302,8 @@ impl Default for WaveformSettings {
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub struct DisplaySettings {
     pub terminal_font_family: String,
     pub terminal_font_size: u32,
@@ -5150,6 +5320,8 @@ impl Default for DisplaySettings {
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub struct BehaviorSettings {
     pub auto_speak: bool,
     pub fallback_silent: bool,
@@ -5223,6 +5395,8 @@ impl Default for BehaviorSettings {
 /// Backward-compatible via serde-default — no migration bump.
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub struct UsageSettings {
     /// Overall on/off for the inline usage widget.
     pub enabled: bool,
@@ -5268,6 +5442,8 @@ impl Default for UsageSettings {
 /// the right of the Claude usage meter. Backward-compatible via serde-default.
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub struct SystemStatsSettings {
     /// Overall on/off for the system-monitor panel.
     pub enabled: bool,
@@ -5302,6 +5478,8 @@ impl Default for SystemStatsSettings {
 // harness without a status line declares nothing.
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub struct UiSettings {
     /// Active UI chrome theme. `"tui"` is the built-in ratatui-style theme
     /// (custom title bar, square borders, Gruvbox surfaces) — hardcoded in
@@ -5345,7 +5523,8 @@ pub struct UiSettings {
     /// is LATCHED but not contaminated — the tab strip's taint badge and the
     /// frame the pane draws around that tab's content. Rendered and validated
     /// frontend-side only (invalid values fall back to this default there,
-    /// like `tui_accent`); the default mirrors the TUI theme's `--warning`,
+    /// like `tui_accent`, in `latch.ts`'s `taintColor`); the default mirrors
+    /// the TUI theme's `--warning`,
     /// which is what the badge wore before the color became configurable.
     /// Additive with the struct-level `#[serde(default)]` — no migration.
     pub latched_color: String,
@@ -5378,6 +5557,8 @@ pub const DEFAULT_TUI_ACCENT: &str = "#7aa2f7";
 /// Claude session meter, `system_stats` = CPU/GPU/network panel.
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub enum StatusBarComponent {
     Usage,
     SystemStats,
@@ -5388,6 +5569,8 @@ pub enum StatusBarComponent {
 /// right — it "stays where you drop it" — and is reset to 0 for every
 /// slot whenever the component order changes.
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub struct StatusBarSlot {
     pub component: StatusBarComponent,
     #[serde(default)]
@@ -5401,6 +5584,8 @@ pub struct StatusBarSlot {
 /// Settings → Bottom bar.
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 #[serde(default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub struct StatusBarLayout {
     pub items: Vec<StatusBarSlot>,
 }
@@ -5427,6 +5612,8 @@ impl Default for StatusBarLayout {
 /// Distinct from `ui`, which themes the cimp chrome.
 #[derive(Clone, Serialize, Deserialize, Debug, Default)]
 #[serde(default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub struct TerminalSettings {
     pub theme: TerminalThemeSettings,
     /// V1.4-02 background configuration. Image, color, and the
@@ -5452,6 +5639,8 @@ pub struct TerminalSettings {
 /// custom map over the bundled "Default" theme.
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub struct TerminalThemeSettings {
     pub name: String,
     pub custom: Option<HashMap<String, String>>,
@@ -5478,6 +5667,8 @@ impl Default for TerminalThemeSettings {
 /// fast path with no transparency cost.
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub struct TerminalBackgroundSettings {
     /// Absolute path to the background image. `None` means "no image".
     /// Invalid paths surface a settings error and resolve to the
@@ -5547,6 +5738,8 @@ impl Default for TerminalBackgroundSettings {
 /// `BackgroundPresetConfig` makes the "presets don't contain presets"
 /// invariant structural rather than runtime-enforced).
 #[derive(Clone, Serialize, Deserialize, Debug)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "BackgroundPresetWire", export_to = "settings.ts"))]
 pub struct BackgroundPreset {
     pub name: String,
     pub config: BackgroundPresetConfig,
@@ -5561,6 +5754,8 @@ pub struct BackgroundPreset {
 /// `TerminalBackgroundSettings.presets`.
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "BackgroundPresetConfigWire", export_to = "settings.ts"))]
 pub struct BackgroundPresetConfig {
     pub image: Option<PathBuf>,
     pub color: Option<String>,
@@ -5625,6 +5820,8 @@ impl From<BackgroundPresetConfig> for TerminalBackgroundSettings {
 /// frontend; `Cover` and `Contain` map directly to their CSS values.
 #[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub enum BackgroundSize {
     #[default]
     Cover,
@@ -5683,6 +5880,8 @@ impl<'de> Deserialize<'de> for BackgroundOverride {
 /// doing yesterday" continuity without ballooning disk usage.
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub struct ScrollbackSettings {
     pub ring_bytes: usize,
     pub persist: bool,
@@ -5701,6 +5900,8 @@ impl Default for ScrollbackSettings {
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub struct ComposeSettings {
     pub min_height_px: u32,
     pub max_height_px: u32,
@@ -5728,6 +5929,8 @@ impl Default for ComposeSettings {
 /// shadowing it by name).
 #[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq)]
 #[serde(default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub struct PromptTemplate {
     pub name: String,
     pub body: String,
@@ -5801,6 +6004,8 @@ pub fn resolve_prompt_templates(
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub struct ShortcutSettings {
     pub open_compose: Option<String>,
     /// V14 Phase A: open compose (like `open_compose`) AND immediately open
@@ -5899,12 +6104,16 @@ impl Default for ShortcutSettings {
 /// old file's leftover `instructions` key is simply ignored on load.
 #[derive(Clone, Serialize, Deserialize, Debug, Default)]
 #[serde(default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub struct TtsInjection {
     pub enabled: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub struct ProcessingSettings {
     pub stability_timeout_ms: u32,
     pub max_hold_ms: u32,
@@ -6373,11 +6582,25 @@ mod tests {
 
     // ── V23 Phase A: Code Audit settings ──────────────────────────────────
 
-    /// The TS mirror embedded at compile time so a Rust-side wire change that
-    /// isn't reflected in `types.ts` fails `cargo test` rather than shipping as
-    /// silent Rust↔TS drift (V16/V22 tripwire pattern). Path is relative to this
-    /// file (`src-tauri/src/settings/`), up to the repo root.
-    const AUDIT_TS_TYPES: &str = include_str!("../../../src/lib/settings/types.ts");
+    // ── RETIRED by V42 Phase E ──────────────────────────────────────────
+    //
+    // `AUDIT_TS_TYPES` and the two field-name scans it fed —
+    // `code_audit_field_names_mirrored_in_types_ts` and
+    // `tool_plugins_field_names_mirrored_in_types_ts` — both asked "does every
+    // wire key of this struct appear in `src/lib/settings/types.ts`?".
+    //
+    // `types.ts` no longer declares these types. `settings::codegen` emits
+    // them into `src/lib/settings/generated/settings.ts` FROM THIS FILE during
+    // `cargo test`, and CI regenerates and diffs the result — so a Rust field
+    // that reached the wire reached the TypeScript in the same run. Keeping
+    // the scans would be asserting that a generator generated.
+    //
+    // This is the one class of `include_str!` tripwire the refactoring
+    // survey's "re-point, never delete" rule does not cover; its § 4 entry
+    // carries the amendment. Every scan over a type that is still HAND-written
+    // was re-pointed instead: `checks::tests`' `CheckDef`/`ParserKind` mirror,
+    // `harness::health`'s panel-field scan, `sandbox::tabs`' `tabs: false`
+    // defaults check, and `settings::frontend_mirrors`' value constants.
 
     /// The fourteen audit-tool wire ids the FRONTEND still keys off, and the
     /// mirror that keeps them true.
@@ -6416,36 +6639,6 @@ mod tests {
                  chip that never lights"
             );
         }
-    }
-
-    #[test]
-    fn code_audit_field_names_mirrored_in_types_ts() {
-        // Serialize a fully-populated CodeAuditSettings and assert each JSON key
-        // appears in types.ts, so any field added on the Rust side must also
-        // land in the TS interface. The per-tool array is gone (schema v34):
-        // what a tool is configured with lives in `tool_plugins` now, and its
-        // own mirror is `tool_plugins_field_names_mirrored_in_types_ts`.
-        let s = CodeAuditSettings {
-            enabled: true,
-            timeout_secs: 600,
-            quality_auto_select: true,
-            expose_offload: true,
-        };
-        let top = serde_json::to_value(&s).expect("CodeAuditSettings serializes");
-        for key in top.as_object().expect("object").keys() {
-            assert!(
-                AUDIT_TS_TYPES.contains(&format!("{key}:")),
-                "CodeAuditSettings field `{key}` is missing from the TS `CodeAuditSettings` \
-                 interface in src/lib/settings/types.ts",
-            );
-        }
-        // …and the field that LEFT must be gone from the mirror too, or the
-        // frontend would keep reading an array the backend no longer writes.
-        assert!(
-            !AUDIT_TS_TYPES.contains("tools: AuditToolConfig[]"),
-            "src/lib/settings/types.ts still declares `code_audit.tools`, which schema v34 \
-             moved into `tool_plugins`"
-        );
     }
 
     /// **V39 Phase A: the new fields need no migration step.** A settings file
@@ -7495,50 +7688,5 @@ mod tests {
         assert!(cfg.plugins["a@1"].enabled);
         assert!(cfg.plugins["a@1"].tools["t"].enabled);
         assert_eq!(cfg.plugins["a@1"].tools["t"].timeout_secs, None);
-    }
-
-    /// The Rust↔TS mirror, the `check_def_field_names_mirrored_in_types_ts`
-    /// convention: every wire key of the container must exist in the TS
-    /// interfaces, so a field added on one side cannot quietly skip the other.
-    #[test]
-    fn tool_plugins_field_names_mirrored_in_types_ts() {
-        const TS_TYPES: &str = include_str!("../../../src/lib/settings/types.ts");
-        let mut tools = BTreeMap::new();
-        tools.insert("t".to_string(), ToolState::default());
-        let cfg = ToolPluginsSettings {
-            plugins: BTreeMap::from([("a@1".to_string(), PluginState { enabled: true, tools })]),
-            project_paths: BTreeMap::from([("root".to_string(), BTreeMap::new())]),
-            global_paths: BTreeMap::new(),
-        };
-        let value = serde_json::to_value(&cfg).expect("serializes");
-        let mut keys: Vec<String> = value
-            .as_object()
-            .expect("an object")
-            .keys()
-            .cloned()
-            .collect();
-        for k in value["plugins"]["a@1"].as_object().expect("plugin state").keys() {
-            keys.push(k.clone());
-        }
-        for k in value["plugins"]["a@1"]["tools"]["t"]
-            .as_object()
-            .expect("tool state")
-            .keys()
-        {
-            keys.push(k.clone());
-        }
-        for key in keys {
-            assert!(
-                TS_TYPES.contains(&format!("{key}:")),
-                "`tool_plugins` wire field `{key}` is missing from src/lib/settings/types.ts \
-                 (ToolPluginsSettings / PluginState / ToolState) — add it to keep the mirror \
-                 in sync",
-            );
-        }
-        // The container itself must be reachable from the Settings interface.
-        assert!(
-            TS_TYPES.contains("tool_plugins: ToolPluginsSettings;"),
-            "src/lib/settings/types.ts must carry `tool_plugins` on `Settings`"
-        );
     }
 }

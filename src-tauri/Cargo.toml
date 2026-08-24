@@ -427,6 +427,7 @@ filetime = "0.2"
 # no Cargo.lock entries: `test-util` pulls no new crates, and `tokio` is already
 # a dependency of this package.
 tokio = { version = "1", features = ["test-util"] }
+ts-rs = { version = "12.0.1", features = ["serde-json-impl"] }
 
 [profile.release]
 codegen-units = 1

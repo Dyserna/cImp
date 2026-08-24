@@ -868,24 +868,36 @@ fn load_global(default_shell: &ShellSpec) -> (Settings, Option<u64>) {
 /// "corrupt" sends them looking for the wrong problem. The quarantine file says
 /// so too: `.outdated.` rather than `.corrupted.`.
 ///
-/// **If the move fails, nothing is overwritten.** The corrupt path reseeds
-/// regardless (its bytes are unreadable anyway); here the bytes are the user's
-/// readable settings, so a failed move means we hand back defaults for this
-/// session and leave the file exactly where it is. It stays loud on every launch
-/// rather than becoming quiet and gone once.
+/// **If the move fails, nothing is overwritten — and nothing may overwrite it
+/// later either.** The corrupt path reseeds regardless (its bytes are unreadable
+/// anyway); here the bytes are the user's readable settings, so a failed move
+/// means we hand back defaults for this session and leave the file exactly where
+/// it is. It stays loud on every launch rather than becoming quiet and gone once.
+///
+/// Returning defaults is not by itself enough to keep that promise, which is
+/// what the V42 tranche-2 review (T2-1) found: those defaults become the live
+/// `Settings`, and the very next thing that saves the global file —
+/// `load`'s own post-repair [`save_global`], a Settings-window edit, one of the
+/// out-of-band writers — would write them straight over the one copy of the
+/// user's settings that still exists. So the failure LATCHES the path
+/// ([`preserve_unquarantinable_global`]) and [`save_to`] refuses it for the rest
+/// of the session. The user loses this session's setting changes; they do not
+/// lose the file the app could not read.
 fn reseed_below_floor(path: &Path, value: &Value, default_shell: &ShellSpec) -> Option<Settings> {
     if !migration::below_global_floor(value) {
         return None;
     }
     let stated = migration::stated_schema_version(value);
     let Some(quarantine) = migration::quarantine_outdated_file(path) else {
+        preserve_unquarantinable_global(path);
         tracing::error!(
             ?stated,
             floor = migration::MIN_GLOBAL_SCHEMA_VERSION,
             path = %path.display(),
             "settings: the global settings file was written by a version of cImp too old for \
              this build to upgrade, AND it could not be moved aside — running on defaults for \
-             this session and leaving the file untouched rather than overwriting it"
+             this session, leaving the file untouched, and refusing every write to it until it \
+             can be quarantined (so nothing overwrites the only copy of these settings)"
         );
         return Some(seeded_defaults(default_shell));
     };
@@ -899,11 +911,55 @@ fn reseed_below_floor(path: &Path, value: &Value, default_shell: &ShellSpec) -> 
          NOT been deleted: it was moved aside intact to the quarantine path below, and fresh \
          defaults were written in its place"
     );
+    // The file is safely aside, so this path is writable again — and must be
+    // released before the write below, which goes through the same guard.
+    release_preserved_global(path);
     let s = seeded_defaults(default_shell);
     if let Err(e) = save_to(path, &s) {
         tracing::warn!(error = %e, path = %path.display(), "settings: write global defaults after quarantine failed");
     }
     Some(s)
+}
+
+/// The global settings file this session has promised not to overwrite, if any.
+///
+/// Set by [`reseed_below_floor`] when a below-floor file could not be moved
+/// aside, and read by [`save_to`], which then refuses. One slot because there is
+/// one global file; a path rather than a flag so the refusal is aimed at the
+/// file we actually failed to preserve and nothing else.
+///
+/// **Session-scoped, and deliberately not self-healing.** Nothing re-attempts
+/// the quarantine on a later write: the move failed for a reason (a lock, a
+/// permission, a full disk) and retrying it inside the save path would mean
+/// moving the user's file aside at an arbitrary moment to make room for a write
+/// they never connected to it. The next launch is where the retry belongs — it
+/// re-reads the file, re-reaches the same verdict, and either succeeds or says
+/// so again. That is the "loud on every launch" posture the floor was built
+/// with, extended to the writes.
+static PRESERVED_GLOBAL: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+/// Refuse every later write to `path` for the rest of this session.
+fn preserve_unquarantinable_global(path: &Path) {
+    if let Ok(mut slot) = PRESERVED_GLOBAL.lock() {
+        *slot = Some(path.to_path_buf());
+    }
+}
+
+/// `path` is safely aside (or was never at risk) — writes to it are allowed.
+fn release_preserved_global(path: &Path) {
+    if let Ok(mut slot) = PRESERVED_GLOBAL.lock() {
+        if slot.as_deref() == Some(path) {
+            *slot = None;
+        }
+    }
+}
+
+/// Whether `path` is the file this session refuses to overwrite.
+fn is_preserved_global(path: &Path) -> bool {
+    PRESERVED_GLOBAL
+        .lock()
+        .ok()
+        .is_some_and(|slot| slot.as_deref() == Some(path))
 }
 
 /// Read and parse the custom overlay file as a generic `Value`. Returns
@@ -2281,7 +2337,27 @@ pub fn save_global(settings: &Settings) -> AppResult<()> {
     save_to(&path, settings)
 }
 
+/// Write `settings` to `path` — the ONE write path for the global settings
+/// file, which is why the below-floor refusal lives here rather than at each of
+/// its callers (V42 tranche-2 review, T2-1).
 fn save_to(path: &Path, settings: &Settings) -> AppResult<()> {
+    if is_preserved_global(path) {
+        // Loud on every attempt, not once: each refusal is a save the user
+        // believes happened, and the only thing that clears the condition is
+        // the next launch getting the file moved aside.
+        tracing::error!(
+            path = %path.display(),
+            "settings: refusing to write the global settings file — it is a below-floor file \
+             this build could not migrate AND could not move aside, so writing would destroy \
+             the only copy of it. Move it somewhere safe by hand (or free whatever holds it) \
+             and relaunch; changes made this session are not being saved"
+        );
+        return Err(AppError::Settings(format!(
+            "refusing to overwrite {}: it is an unmigratable settings file that could not be \
+             quarantined, and it is the only copy",
+            path.display()
+        )));
+    }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(AppError::Io)?;
     }
@@ -4264,6 +4340,20 @@ mod tests {
         }
     }
 
+    /// Whether `save_global` still writes through [`save_to`] — where the
+    /// preserved-file refusal lives, and therefore the reason one guard covers
+    /// every writer of the global file. Structural because `save_global`
+    /// resolves its own path from the running exe and cannot be called here.
+    /// Newline-agnostic: CI checks this tree out with CRLF.
+    fn save_global_goes_through_save_to() -> bool {
+        let src = include_str!("persistence.rs");
+        let start = src
+            .find("pub fn save_global(")
+            .expect("`save_global` is gone — re-point this helper");
+        let body = &src[start..];
+        body[..body.find("\n}").unwrap_or(body.len())].contains("save_to(")
+    }
+
     /// **A file too old to migrate is set aside, not read.**
     ///
     /// Both below-floor shapes at once — an old stamp, and (the case that needed
@@ -4324,6 +4414,77 @@ mod tests {
                 "seeded defaults, not a bare `Settings::default()`"
             );
         }
+    }
+
+    /// **A below-floor file that could not be moved aside is not overwritten
+    /// LATER either** (V42 tranche-2 review, T2-1).
+    ///
+    /// The move-failed branch already returned defaults without writing, which
+    /// looks like the whole promise and is only half of it: those defaults
+    /// become the live `Settings`, and the next thing that saves the global file
+    /// — `load`'s own post-repair `save_global`, a Settings-window edit, an
+    /// out-of-band writer — used to write them straight over the user's one
+    /// remaining copy. The refusal has to outlive the branch, so the branch
+    /// latches the path and every later `save_to` of it fails loudly.
+    ///
+    /// Making the move actually fail is the fiddly part: a DIRECTORY at the name
+    /// `move_settings_file_aside` aims for defeats both its rename and its
+    /// copy fallback. The name carries a unix-second timestamp, so a small
+    /// window of them is blocked rather than one.
+    #[test]
+    fn a_below_floor_global_that_could_not_be_quarantined_is_never_written_over() {
+        let dir = FloorDir::new("floor_stuck");
+        let path = dir.settings_json();
+        let original = b"{\"schema_version\": 20, \"tabs\": []}\n".to_vec();
+        fs::write(&path, &original).unwrap();
+        let value: Value = serde_json::from_slice(&original).unwrap();
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        for ts in now - 1..=now + 4 {
+            fs::create_dir_all(dir.0.join(format!("settings.json.outdated.{ts}.bak"))).unwrap();
+        }
+
+        let reseeded = reseed_below_floor(&path, &value, &floor_shell())
+            .expect("a below-floor file is handled here whether or not the move works");
+        assert!(
+            !reseeded.tabs.is_empty(),
+            "the session still gets seeded defaults to run on"
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            original,
+            "the move failed, so the user's file must still be exactly where it was"
+        );
+
+        // The half this test exists for: the NEXT save must not undo that.
+        let err = save_to(&path, &reseeded)
+            .expect_err("writing the preserved file must be refused, not silently done");
+        assert!(
+            err.to_string().contains("refusing to overwrite"),
+            "the refusal must say what it refused and why: {err}"
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            original,
+            "and it must actually still be the user's bytes on disk"
+        );
+        // Every global writer funnels through `save_to` — `save_global`, the
+        // machine-scope write-through, the two out-of-band table writers — so
+        // pinning the refusal there covers all of them at once.
+        assert!(
+            save_global_goes_through_save_to(),
+            "save_global must go through `save_to`, which is where the refusal lives"
+        );
+
+        // The latch is aimed at ONE file, not at saving in general: a different
+        // path is unaffected, and the file is writable again once it is aside.
+        let other = dir.0.join("elsewhere.json");
+        save_to(&other, &reseeded).expect("an unrelated settings file still saves");
+        release_preserved_global(&path);
+        save_to(&path, &reseeded).expect("released, the path is writable again");
     }
 
     /// The floor retires steps; it does not stop the ladder. A file **at** the

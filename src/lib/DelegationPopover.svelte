@@ -7,8 +7,11 @@
   // the Remote-offload knobs, and a live "driven" state with a working
   // Take over.
   //
-  // Modelled on `TaintMenu.svelte`, deliberately: same fixed-position anchor
-  // with a viewport clamp, same deferred mousedown + Escape dismissal, same
+  // Modelled on `TaintMenu.svelte`, deliberately. The fixed-position anchor
+  // with a viewport clamp and the deferred mousedown + Escape dismissal were a
+  // verbatim copy of it until #128; both now come from the one implementation
+  // in `anchoredPopover.ts`, so this file is a copy of nothing. What remains
+  // shared by convention is the
   // "derive state from the store, never snapshot it at click time" rule — a
   // radio rendered from a click-time copy would show the pre-click value right
   // after the user's own write landed. Every value below arrives as a prop that
@@ -22,6 +25,7 @@
   // Manual tabs of one harness. The Remote-offload KNOBS are ordinary per-tab
   // fields and ride the ordinary settings save.
   import { onMount } from 'svelte';
+  import { clampToViewport, dismissOn } from './anchoredPopover';
   import {
     delegationTakeOver,
     tabSetDelegationBackend,
@@ -90,17 +94,9 @@
   // svelte-ignore state_referenced_locally
   let posY = $state(y);
   $effect(() => {
-    const wantX = x;
-    const wantY = y;
-    if (!menuEl) {
-      posX = wantX;
-      posY = wantY;
-      return;
-    }
-    const rect = menuEl.getBoundingClientRect();
-    const margin = 4;
-    posX = Math.max(margin, Math.min(wantX, window.innerWidth - rect.width - margin));
-    posY = Math.max(margin, Math.min(wantY, window.innerHeight - rect.height - margin));
+    const at = clampToViewport(menuEl, x, y);
+    posX = at.x;
+    posY = at.y;
   });
 
   const glyph = $derived(
@@ -224,31 +220,9 @@
     }
   }
 
-  function onWindowMouseDown(e: MouseEvent): void {
-    const target = e.target as Node | null;
-    if (target && menuEl && menuEl.contains(target)) return;
-    onDismiss();
-  }
-
-  function onWindowKeyDown(e: KeyboardEvent): void {
-    if (e.key === 'Escape') {
-      e.preventDefault();
-      onDismiss();
-    }
-  }
-
-  onMount(() => {
-    // Defer by a tick so the click that opened the popover doesn't close it.
-    const id = setTimeout(() => {
-      window.addEventListener('mousedown', onWindowMouseDown);
-    }, 0);
-    window.addEventListener('keydown', onWindowKeyDown);
-    return () => {
-      clearTimeout(id);
-      window.removeEventListener('mousedown', onWindowMouseDown);
-      window.removeEventListener('keydown', onWindowKeyDown);
-    };
-  });
+  // Escape / click-outside dismissal, deferred-subscribe and containment
+  // check included — see `anchoredPopover.ts`.
+  onMount(() => dismissOn(() => menuEl, () => onDismiss()));
 </script>
 
 <div

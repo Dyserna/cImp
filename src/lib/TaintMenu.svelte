@@ -45,7 +45,8 @@
   // true under H-2 and is not any more, so it is gone — a security surface that
   // tells the user the wrong escape hatch is worse than one that says nothing.
   //
-  // Positioning / dismissal mirror TabContextMenu: fixed at the click coords,
+  // Positioning / dismissal are shared with TabContextMenu and
+  // DelegationPopover (`anchoredPopover.ts`): fixed at the click coords,
   // clamped into the viewport, dismissed by Escape or a mousedown outside.
   //
   // V32 Phase G added a fourth thing above the actions: which injection
@@ -77,6 +78,7 @@
   //     deliberately no `set_injection_override` IPC (`ipc/commands.rs`): a
   //     side-channel write would race the full-object save.
   import { onMount } from 'svelte';
+  import { clampToViewport, dismissOn } from './anchoredPopover';
   import {
     applyLatchOverride,
     applyTabInjectionOverrides,
@@ -164,17 +166,9 @@
   // svelte-ignore state_referenced_locally
   let posY = $state(y);
   $effect(() => {
-    const wantX = x;
-    const wantY = y;
-    if (!menuEl) {
-      posX = wantX;
-      posY = wantY;
-      return;
-    }
-    const rect = menuEl.getBoundingClientRect();
-    const margin = 4;
-    posX = Math.max(margin, Math.min(wantX, window.innerWidth - rect.width - margin));
-    posY = Math.max(margin, Math.min(wantY, window.innerHeight - rect.height - margin));
+    const at = clampToViewport(menuEl, x, y);
+    posX = at.x;
+    posY = at.y;
   });
 
   /// Step 5d: null unless the latch is holding memory writes independently of
@@ -290,31 +284,9 @@
     }
   }
 
-  function onWindowMouseDown(e: MouseEvent): void {
-    const target = e.target as Node | null;
-    if (target && menuEl && menuEl.contains(target)) return;
-    onDismiss();
-  }
-
-  function onWindowKeyDown(e: KeyboardEvent): void {
-    if (e.key === 'Escape') {
-      e.preventDefault();
-      onDismiss();
-    }
-  }
-
-  onMount(() => {
-    // Defer by a tick so the click that opened the popover doesn't close it.
-    const id = setTimeout(() => {
-      window.addEventListener('mousedown', onWindowMouseDown);
-    }, 0);
-    window.addEventListener('keydown', onWindowKeyDown);
-    return () => {
-      clearTimeout(id);
-      window.removeEventListener('mousedown', onWindowMouseDown);
-      window.removeEventListener('keydown', onWindowKeyDown);
-    };
-  });
+  // Escape / click-outside dismissal, deferred-subscribe and containment
+  // check included — see `anchoredPopover.ts`.
+  onMount(() => dismissOn(() => menuEl, () => onDismiss()));
 </script>
 
 <div

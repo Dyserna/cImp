@@ -40,28 +40,65 @@ pub enum NotificationEvent {
     Exited,
 }
 
+/// Which per-tab notification slot a tab kind speaks a given event from.
+///
+/// The names are the slot fields on a tab's `notifications` config, not the
+/// events: [`NotificationEvent::AwaitingQuestion`] fires the `question` slot,
+/// and `Error` is a slot BOTH kinds have — which is the whole reason the matrix
+/// and the slot lookup have to agree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Slot {
+    Idle,
+    AwaitingPermission,
+    Question,
+    Error,
+    Exited,
+}
+
+/// **The (TabKind × NotificationEvent) matrix — the one copy.** AI tabs get the
+/// v1.1 trio plus the question slot; Shell tabs get `Error` and `Exited`.
+///
+/// `Some(slot)` is "this kind announces this event, from THIS slot"; `None` is
+/// "it does not". R24 folded two encodings of this table into one: `allowed_for`
+/// answered the first half and `notification_text` re-derived the second from a
+/// parallel match over `(TabConfig, event)`, so the pair could disagree about a
+/// (kind, event) cell — and the shape of the disagreement is a notification that
+/// passes the gate and then renders empty, or worse, one that renders from a
+/// slot the gate never authorised.
+///
+/// Exhaustive over both axes rather than falling through, so a new event or a
+/// new tab kind has to be answered here rather than defaulting to silence.
+fn slot_for(kind: &TabKind, event: NotificationEvent) -> Option<Slot> {
+    match (kind, event) {
+        (TabKind::AiTool, NotificationEvent::Idle) => Some(Slot::Idle),
+        (TabKind::AiTool, NotificationEvent::AwaitingPermission) => Some(Slot::AwaitingPermission),
+        (TabKind::AiTool, NotificationEvent::AwaitingQuestion) => Some(Slot::Question),
+        (TabKind::AiTool, NotificationEvent::Error) => Some(Slot::Error),
+        // AI tabs run no subprocess of their own to exit.
+        (TabKind::AiTool, NotificationEvent::Exited) => None,
+        (TabKind::Shell, NotificationEvent::Error) => Some(Slot::Error),
+        (TabKind::Shell, NotificationEvent::Exited) => Some(Slot::Exited),
+        (TabKind::Shell, NotificationEvent::Idle) => None,
+        (TabKind::Shell, NotificationEvent::AwaitingPermission) => None,
+        (TabKind::Shell, NotificationEvent::AwaitingQuestion) => None,
+        // V14 Phase F: Preview tabs run no subprocess and speak no output —
+        // none of these edges are reachable for one, but the matrix stays
+        // explicit (like every other kind here) rather than falling through.
+        (TabKind::Preview, _) => None,
+    }
+}
+
 /// Per-kind allowlist of notification triggers. AI tabs get the v1.1 trio;
 /// Shell tabs get only `Error` and the new `Exited`. Defense-in-depth: the
 /// upstream code already won't generate Idle/AwaitingPermission for Shell
 /// tabs (the avatar machine's per-kind gating in Phase 4 makes those edges
 /// unreachable), but the explicit gate makes the rule grep-able.
+///
+/// A thin wrapper over [`slot_for`] since R24 — "is this kind allowed to
+/// announce this event" is exactly "does it have a slot to announce it from",
+/// and the two used to be written out separately.
 fn allowed_for(kind: &TabKind, event: NotificationEvent) -> bool {
-    match (kind, event) {
-        (TabKind::AiTool, NotificationEvent::Idle) => true,
-        (TabKind::AiTool, NotificationEvent::AwaitingPermission) => true,
-        (TabKind::AiTool, NotificationEvent::AwaitingQuestion) => true,
-        (TabKind::AiTool, NotificationEvent::Error) => true,
-        (TabKind::AiTool, NotificationEvent::Exited) => false,
-        (TabKind::Shell, NotificationEvent::Error) => true,
-        (TabKind::Shell, NotificationEvent::Exited) => true,
-        (TabKind::Shell, NotificationEvent::Idle) => false,
-        (TabKind::Shell, NotificationEvent::AwaitingPermission) => false,
-        (TabKind::Shell, NotificationEvent::AwaitingQuestion) => false,
-        // V14 Phase F: Preview tabs run no subprocess and speak no output —
-        // none of these edges are reachable for one, but the allowlist stays
-        // explicit (like every other kind here) rather than falling through.
-        (TabKind::Preview, _) => false,
-    }
+    slot_for(kind, event).is_some()
 }
 
 #[derive(Clone, Debug)]
@@ -712,26 +749,33 @@ fn notification_text(
     // pair. Disabled or empty-text slots both fall through to the
     // empty-string suppression path in the caller, so the firing
     // contract is unchanged.
-    let slot: &NotificationSlot = match (entry, event) {
-        (TabConfig::AiTool(c), NotificationEvent::Idle) => &c.notifications.idle,
-        (TabConfig::AiTool(c), NotificationEvent::AwaitingPermission) => {
-            &c.notifications.awaiting_permission
-        }
-        (TabConfig::AiTool(c), NotificationEvent::AwaitingQuestion) => &c.notifications.question,
-        (TabConfig::AiTool(c), NotificationEvent::Error) => &c.notifications.error,
-        // AI tabs don't fire Exited; defensive empty.
-        (TabConfig::AiTool(_), NotificationEvent::Exited) => return String::new(),
-        (TabConfig::Shell(c), NotificationEvent::Error) => &c.notifications.error,
-        (TabConfig::Shell(c), NotificationEvent::Exited) => &c.notifications.exited,
-        // Shell tabs don't fire Idle / AwaitingPermission / AwaitingQuestion;
-        // defensive empty.
-        (TabConfig::Shell(_), NotificationEvent::Idle)
-        | (TabConfig::Shell(_), NotificationEvent::AwaitingPermission)
-        | (TabConfig::Shell(_), NotificationEvent::AwaitingQuestion) => return String::new(),
+    //
+    // WHICH slot is [`slot_for`]'s answer — the same matrix `allowed_for`
+    // consults, asked once (R24). What is left here is not a second copy of it
+    // but the projection it cannot express: where a given slot LIVES in a given
+    // tab config. The defensive arms below are unreachable through `slot_for`,
+    // which never hands an AI tab an `Exited` slot nor a Shell tab an `Idle`
+    // one; they are what keeps this match total.
+    let Some(slot) = slot_for(&tab.kind(), event) else {
+        return String::new();
+    };
+    let slot: &NotificationSlot = match entry {
+        TabConfig::AiTool(c) => match slot {
+            Slot::Idle => &c.notifications.idle,
+            Slot::AwaitingPermission => &c.notifications.awaiting_permission,
+            Slot::Question => &c.notifications.question,
+            Slot::Error => &c.notifications.error,
+            Slot::Exited => return String::new(),
+        },
+        TabConfig::Shell(c) => match slot {
+            Slot::Error => &c.notifications.error,
+            Slot::Exited => &c.notifications.exited,
+            Slot::Idle | Slot::AwaitingPermission | Slot::Question => return String::new(),
+        },
         // V14 Phase F: Preview tabs never reach `allowed_for` with a `true`
-        // result (see its `(TabKind::Preview, _) => false` arm), so this
+        // result (see `slot_for`'s `(TabKind::Preview, _) => None` arm), so this
         // function is never called for one in practice — defensive empty.
-        (TabConfig::Preview(_), _) => return String::new(),
+        TabConfig::Preview(_) => return String::new(),
     };
 
     if !slot.enabled {
@@ -956,6 +1000,60 @@ mod tests {
     fn dedup_handles_empty_queue() {
         let out = dedup_per_tab(&[]);
         assert!(out.is_empty());
+    }
+
+    /// **R24's pin.** `slot_for` is the only copy of the (TabKind × Event)
+    /// matrix now, but `notification_text` still projects its answer onto the
+    /// tab's config — "where does this slot LIVE" is a different question, and
+    /// the two halves can still fall out of step in the one direction that
+    /// matters: a cell the matrix ALLOWS whose projection answers with an empty
+    /// string. That is a notification which passes the gate and then says
+    /// nothing, and it is exactly the silent failure two separately-written
+    /// matrices could produce.
+    ///
+    /// Checked in both directions over the seeded tabs, whose slots
+    /// `settings::schema::notifications`' own test pins as enabled with text.
+    #[test]
+    fn every_allowed_cell_speaks_and_every_denied_one_stays_silent() {
+        const EVENTS: [NotificationEvent; 5] = [
+            NotificationEvent::Idle,
+            NotificationEvent::AwaitingPermission,
+            NotificationEvent::AwaitingQuestion,
+            NotificationEvent::Error,
+            NotificationEvent::Exited,
+        ];
+        let mut settings = crate::settings::Settings::default();
+        // One tab of each kind that CAN announce, seeded exactly as a fresh
+        // install seeds them — `Settings::default()` itself carries no tabs.
+        settings
+            .tabs
+            .push(crate::settings::default_ai_tab(crate::settings::ai_tab_id(
+                "claude",
+            )));
+        settings.tabs.push(crate::settings::default_workbench_tab());
+        let mut spoke = 0;
+        for cfg in &settings.tabs {
+            let tab = TabId::from_str(cfg.id());
+            for event in EVENTS {
+                let text = notification_text(&settings, &tab, event, Some(0));
+                if allowed_for(&tab.kind(), event) {
+                    spoke += 1;
+                    assert!(
+                        !text.is_empty(),
+                        "{} allows {event:?} but has no slot to speak it from",
+                        cfg.id()
+                    );
+                } else {
+                    assert!(
+                        text.is_empty(),
+                        "{} spoke a {event:?} the matrix does not allow it",
+                        cfg.id()
+                    );
+                }
+            }
+        }
+        // Both kinds' rows were actually exercised, not vacuously passed.
+        assert!(spoke >= 6, "the seeded tabs covered only {spoke} allowed cells");
     }
 
     #[test]

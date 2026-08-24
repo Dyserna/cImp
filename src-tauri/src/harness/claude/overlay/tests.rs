@@ -1,9 +1,125 @@
-//! Claude's `--settings` overlay: the statusline block, every hook entry and
-//! its gate, the `permissions.deny` rows, and the CHP hello that declares what
-//! the overlay wired. Driven through `harness::claude::overlay::build_pre_args`,
-//! which is what a Claude tab's spawn composes.
+//! `harness::claude::overlay`'s unit tests — what a Claude tab is told at
+//! spawn, asserted on the artifact [`build_pre_args`] emits.
+//!
+//! 39 of these arrived from `tabs::config`'s test module in #132's second pass.
+//! Every one of them reached the overlay only through `build_pre_args` and
+//! touched no `tabs::config` item, which is what made them this file's tests
+//! rather than that one's. Tests that drive the same artifact through
+//! `build_launch_spec` / `build_ai_tool_spec` / `compose_ai_env` /
+//! `spawn_inject_sig`, and every assertion that spans BOTH harnesses' emitters,
+//! deliberately stayed with the composition they exercise.
 
 use super::*;
+use crate::harness::fixtures::*;
+
+/// The one hook object inside `hooks[<event>][idx]`, so an assertion names
+/// the entry it is about rather than a chain of indices.
+fn hook_entry(overlay: &serde_json::Value, event: &str, idx: usize) -> serde_json::Value {
+    overlay["hooks"][event][idx]["hooks"][0].clone()
+}
+
+/// Whether the overlay wired the AUTO-CHECK `PostToolUse` group — the one
+/// on `Edit|Write|MultiEdit` pointing at `/claude/hook/post_tool_use`.
+///
+/// Distinguishes it from V35 Phase L's sibling group on the same event
+/// (matcher `""`, route `/claude/hook/post_tool_use_result`), which is a
+/// different capability with a different gate.
+fn post_tool_use_has_auto_check(overlay: &serde_json::Value) -> bool {
+    overlay["hooks"]["PostToolUse"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|g| {
+            g["matcher"] == "Edit|Write|MultiEdit"
+                && g["hooks"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|h| {
+                        h["url"]
+                            .as_str()
+                            .is_some_and(|u| u.ends_with(claude_hook::ROUTE_POST_TOOL_USE))
+                    })
+        })
+}
+
+// ── V35 Phase J: the emitted `type: "http"` overlay ─────────────────────
+
+/// The maxed-out overlay, with every gate on — the shape a live spawn
+/// produces. Returns `(hooks, every http hook object in it)`.
+fn maxed_overlay() -> (serde_json::Value, Vec<serde_json::Value>) {
+    let mut settings = Settings::default();
+    settings.set_ext("claude", "statusline", serde_json::json!(true));
+    settings.workbench.checkpoints = true;
+    settings.graph.enabled = true;
+    settings.graph.context_injection = true;
+    settings.graph.compaction_context = true;
+    settings.graph.read_advisor = true;
+    settings.graph.read_advisor_shell = true;
+    settings.graph.auto_check = true;
+    settings.checks = vec![crate::checks::CheckDef {
+        name: "cargo".to_string(),
+        cmd: "cargo check".to_string(),
+        ..Default::default()
+    }];
+    let args = build_pre_args(&claude_cfg(), &settings, "claude", Some(&hook_endpoint()));
+    let overlay = settings_overlay(&args).expect("overlay present");
+    let hooks = overlay["hooks"].clone();
+    let mut http = Vec::new();
+    for (_event, entries) in hooks.as_object().expect("hooks object") {
+        for entry in entries.as_array().cloned().unwrap_or_default() {
+            for h in entry["hooks"].as_array().cloned().unwrap_or_default() {
+                if h["type"] == "http" {
+                    http.push(h);
+                }
+            }
+        }
+    }
+    (hooks, http)
+}
+
+// ── V28 (issue #13): per-tab MCP identity ─────────────────────────────
+
+/// The `cimp-offload` child's argv, for whichever Claude tab id is given.
+fn claude_offload_argv(settings: &Settings, tab: &str) -> Vec<String> {
+    let args = build_pre_args(&claude_cfg(), settings, tab, Some(&hook_endpoint()));
+    let i = args
+        .iter()
+        .position(|a| a == "--mcp-config")
+        .expect("--mcp-config present");
+    let cfg: serde_json::Value = serde_json::from_str(&args[i + 1]).unwrap();
+    cfg["mcpServers"]["cimp-offload"]["args"]
+        .as_array()
+        .expect("args array")
+        .iter()
+        .map(|v| v.as_str().expect("string arg").to_string())
+        .collect()
+}
+
+/// **Every tool the pre-mutation matcher names must be one the checkpoint
+/// core will accept.**
+///
+/// Moved here from `checkpoint_beacon.rs` when that shim was deleted
+/// (2026-08-17); the matcher it guards lives in this file, so this is where
+/// it belongs. The matcher and `tools::CLAUDE_NATIVE_TABLE` are still edited
+/// separately, and a matcher naming a tool with no `mutates_fs: true` row now
+/// costs more than it used to: the entry's handler blocks the tool call, so a
+/// mismatch means a call held for a checkpoint the core immediately declines
+/// — a silently dead seam with a latency bill.
+///
+/// The reverse direction is deliberately NOT asserted: `run_command` is
+/// mutating and is not a Claude tool at all, so the table is legitimately
+/// wider than the matcher.
+#[test]
+fn every_matched_claude_tool_is_classified_as_mutating() {
+    for tool in CLAUDE_MUTATING_TOOL_MATCHER.split('|') {
+        assert!(
+            crate::harness::claude::tools::claude_native_mutates_fs(tool),
+            "`{tool}` is in the PreToolUse matcher but has no `mutates_fs: true` row — \
+                 every matched call would be held for a checkpoint the core refuses"
+        );
+    }
+}
 
 #[test]
 fn injects_statusline_overlay_for_claude_when_enabled() {
@@ -895,37 +1011,6 @@ fn the_session_start_hello_declares_what_the_overlay_actually_wired() {
     assert!(!raw.contains('\n') && !raw.contains('\r'));
 }
 
-/// The loopback bearer token reaches the Claude child's ENVIRONMENT, and is
-/// **not** a literal in the overlay.
-///
-/// Both halves matter and they fail differently: without the env var every
-/// hook 401s silently (an unlisted/unset `allowedEnvVars` name substitutes
-/// to the empty string), and with a literal in the overlay the token would
-/// sit in an argv value, which is the most casually readable thing on the
-/// machine.
-#[test]
-fn the_hook_token_rides_the_environment_and_never_the_overlay() {
-    let mut settings = Settings::default();
-    settings.graph.enabled = true;
-    settings.graph.context_injection = true;
-    let ep = hook_endpoint();
-    let env = compose_ai_env(&claude_cfg(), &settings, "claude", Some(&ep));
-    assert_eq!(
-        env.get("CIMP_HOOK_TOKEN").map(String::as_str),
-        Some(ep.token.as_str()),
-        "the harness substitutes `$CIMP_HOOK_TOKEN` from its own environment"
-    );
-    let args = build_pre_args(&claude_cfg(), &settings, "claude", Some(&ep));
-    let raw = settings_overlay(&args).expect("overlay present").to_string();
-    assert!(
-        !raw.contains(&ep.token),
-        "the token must never appear in the `--settings` argv value: {raw}"
-    );
-    // An OpenCode tab gets no such variable — its plugin carries its own.
-    let oc = compose_ai_env(&opencode_cfg(), &settings, "opencode", Some(&ep));
-    assert!(!oc.contains_key("CIMP_HOOK_TOKEN"));
-}
-
 /// With no loopback endpoint, NO http hook is emitted — an http hook has a
 /// baked URL and there is nothing to point it at.
 ///
@@ -1181,4 +1266,238 @@ fn the_checkpoint_beacon_is_gated_on_checkpoints_and_a_live_loopback() {
     s.workbench.checkpoints = true;
     assert!(!s.loopback_needed());
     assert!(pre_tool_matchers(&s).is_empty());
+}
+
+#[test]
+fn injects_offload_mcp_config_for_claude_when_enabled() {
+    let mut settings = Settings::default();
+    settings.offload.enabled = true;
+    let args = build_pre_args(&claude_cfg(), &settings, "claude", Some(&hook_endpoint()));
+
+    let i = args
+        .iter()
+        .position(|a| a == "--mcp-config")
+        .expect("--mcp-config present");
+    let cfg: serde_json::Value = serde_json::from_str(&args[i + 1]).unwrap();
+    assert_eq!(
+        cfg["mcpServers"]["cimp-offload"]["args"][0],
+        "--offload-mcp"
+    );
+}
+
+#[test]
+fn claude_mcp_child_carries_its_own_tab_id() {
+    // V28: the per-tab MCP child is told WHICH tab it serves, so the app can
+    // resolve that tab's current session instead of "the most recent Claude
+    // session" — the whole point of the milestone. Two Claude tabs on one
+    // project must bake DIFFERENT ids.
+    let mut settings = Settings::default();
+    settings.graph.enabled = true;
+    for tab in ["claude", "claude-local"] {
+        let argv = claude_offload_argv(&settings, tab);
+        assert!(
+            argv.windows(2).any(|w| w == ["--tab", tab]),
+            "tab {tab} argv: {argv:?}"
+        );
+    }
+    assert_ne!(
+        claude_offload_argv(&settings, "claude"),
+        claude_offload_argv(&settings, "claude-local"),
+        "two Claude tabs must not spawn identical MCP children"
+    );
+}
+
+#[test]
+fn tab_id_rides_every_claude_mcp_gate() {
+    // `--tab` is unconditional on the `cimp-offload` entry: whichever gate
+    // caused the entry to be injected (offload / graph), the identity must
+    // ride along. A gate that shipped it only sometimes would silently fall
+    // back to the shared-scope bug.
+    let with_offload = {
+        let mut s = Settings::default();
+        s.offload.enabled = true;
+        s
+    };
+    let with_graph = {
+        let mut s = Settings::default();
+        s.graph.enabled = true;
+        s
+    };
+    let with_both = {
+        let mut s = Settings::default();
+        s.offload.enabled = true;
+        s.graph.enabled = true;
+        s
+    };
+    for settings in [with_offload, with_graph, with_both] {
+        let argv = claude_offload_argv(&settings, "claude");
+        assert_eq!(argv[0], "--offload-mcp", "{argv:?}");
+        assert!(
+            argv.windows(2).any(|w| w == ["--tab", "claude"]),
+            "{argv:?}"
+        );
+    }
+}
+
+/// **V37 Phase F flipped this test.** It used to assert that a Claude tab
+/// with offload and graph off got no `--mcp-config` at all. The
+/// `cimp-offload` child is now injected into every AI tab — that is the
+/// whole phase — so the assertion that survives is about the CHILD'S
+/// SURFACE, not the overlay's presence: the entry is there, carrying only
+/// `--offload-mcp --tab <id>`, and what it advertises is decided live.
+#[test]
+fn offload_child_is_injected_even_with_every_feature_disabled() {
+    let settings = Settings::default(); // offload + graph off by default
+    let args = build_pre_args(&claude_cfg(), &settings, "claude", Some(&hook_endpoint()));
+    let i = args
+        .iter()
+        .position(|a| a == "--mcp-config")
+        .expect("V37 Phase F: the proxy child rides every AI tab");
+    let cfg: serde_json::Value = serde_json::from_str(&args[i + 1]).unwrap();
+    assert_eq!(
+        cfg["mcpServers"]["cimp-offload"]["args"],
+        serde_json::json!(["--offload-mcp", "--tab", "claude"]),
+        "nothing enabled ⇒ the bare child argv"
+    );
+    assert!(
+        cfg["mcpServers"]["cimp-code-audit"].is_null(),
+        "the audit child is still gated — Phase F changed one server, not two"
+    );
+}
+
+#[test]
+fn graph_enabled_alone_injects_mcp_config() {
+    // V9-01: the graph tools ride the same `--offload-mcp` child, so the
+    // MCP config must be injected when graph is on even if offload is off.
+    let mut settings = Settings::default();
+    settings.offload.enabled = false;
+    settings.graph.enabled = true;
+    let args = build_pre_args(&claude_cfg(), &settings, "claude", Some(&hook_endpoint()));
+
+    let i = args
+        .iter()
+        .position(|a| a == "--mcp-config")
+        .expect("--mcp-config present when graph is enabled");
+    let cfg: serde_json::Value = serde_json::from_str(&args[i + 1]).unwrap();
+    assert_eq!(
+        cfg["mcpServers"]["cimp-offload"]["args"][0],
+        "--offload-mcp"
+    );
+}
+
+#[test]
+fn claude_exposed_mcp_server_alone_injects_mcp_config() {
+    // A server exposed to Claude Code rides the same `--offload-mcp` child,
+    // so the MCP config must be injected even with offload + graph both off.
+    let mut settings = Settings::default();
+    settings.offload.enabled = false;
+    settings.graph.enabled = false;
+    settings.offload.mcp_servers = vec![crate::settings::McpServerConfig {
+        name: "duckduckgo".to_string(),
+        url: "http://host:1/mcp".to_string(),
+        access: crate::settings::access_for_test(&[("claude", true)]),
+        offload_access: false,
+        ..Default::default()
+    }];
+    let args = build_pre_args(&claude_cfg(), &settings, "claude", Some(&hook_endpoint()));
+    assert!(
+        args.iter().any(|a| a == "--mcp-config"),
+        "--mcp-config present when a server is exposed to Claude Code"
+    );
+}
+
+#[test]
+fn code_audit_enabled_alone_injects_code_audit_server() {
+    // V26: Code Audit rides its own `--code-audit-mcp` child, so the server
+    // must appear in `--mcp-config` when the feature is on even with offload
+    // + graph both off. With the default `expose_claude` true, no other
+    // server is present — the audit server stands alone in the map.
+    let mut settings = Settings::default();
+    settings.offload.enabled = false;
+    settings.graph.enabled = false;
+    settings.code_audit.enabled = true;
+    let args = build_pre_args(&claude_cfg(), &settings, "claude", Some(&hook_endpoint()));
+
+    let i = args
+        .iter()
+        .position(|a| a == "--mcp-config")
+        .expect("--mcp-config present when Code Audit is enabled");
+    let cfg: serde_json::Value = serde_json::from_str(&args[i + 1]).unwrap();
+    assert_eq!(
+        cfg["mcpServers"]["cimp-code-audit"]["args"][0],
+        "--code-audit-mcp"
+    );
+    // V37 Phase F: the offload child no longer rides a gate at all, so it
+    // is present here too. The audit server does NOT stand alone any more;
+    // what this test still pins is that Code Audit's own gate puts ITS entry
+    // in the same overlay.
+    assert_eq!(
+        cfg["mcpServers"]["cimp-offload"]["args"][0],
+        "--offload-mcp",
+        "V37 Phase F: the proxy child rides every AI tab"
+    );
+}
+
+#[test]
+fn code_audit_server_absent_when_feature_disabled() {
+    // The master switch off ⇒ no audit server even though `expose_claude`
+    // defaults true. V37 Phase F: the overlay itself is still emitted (the
+    // unconditional proxy child lives in it), so the assertion is about the
+    // audit KEY, not about `--mcp-config`.
+    let mut settings = Settings::default();
+    settings.code_audit.enabled = false;
+    assert!(settings.harness_row_of("claude").expose_code_audit, "default is opted-in");
+    let args = build_pre_args(&claude_cfg(), &settings, "claude", Some(&hook_endpoint()));
+    let i = args.iter().position(|a| a == "--mcp-config").unwrap();
+    let cfg: serde_json::Value = serde_json::from_str(&args[i + 1]).unwrap();
+    assert!(cfg["mcpServers"]["cimp-code-audit"].is_null());
+}
+
+#[test]
+fn code_audit_server_absent_when_expose_claude_off() {
+    // Feature on but the Claude consumer opted out ⇒ the audit server is not
+    // advertised to Claude. V37 Phase F: the overlay still carries the
+    // unconditional proxy child, so this asserts the audit key's absence.
+    let mut settings = Settings::default();
+    settings.code_audit.enabled = true;
+    settings.harness_row("claude").expose_code_audit = false;
+    let args = build_pre_args(&claude_cfg(), &settings, "claude", Some(&hook_endpoint()));
+    let i = args.iter().position(|a| a == "--mcp-config").unwrap();
+    let cfg: serde_json::Value = serde_json::from_str(&args[i + 1]).unwrap();
+    assert!(
+        cfg["mcpServers"]["cimp-code-audit"].is_null(),
+        "the audit server must not be injected when its consumer opted out"
+    );
+}
+
+#[test]
+fn code_audit_and_offload_share_one_mcp_config() {
+    // Both gates on ⇒ both servers ride a single `--mcp-config` overlay.
+    let mut settings = Settings::default();
+    settings.offload.enabled = true;
+    settings.code_audit.enabled = true;
+    let args = build_pre_args(&claude_cfg(), &settings, "claude", Some(&hook_endpoint()));
+    let count = args.iter().filter(|a| *a == "--mcp-config").count();
+    assert_eq!(count, 1, "exactly one --mcp-config carries both servers");
+    let i = args.iter().position(|a| a == "--mcp-config").unwrap();
+    let cfg: serde_json::Value = serde_json::from_str(&args[i + 1]).unwrap();
+    assert_eq!(
+        cfg["mcpServers"]["cimp-offload"]["args"][0],
+        "--offload-mcp"
+    );
+    assert_eq!(
+        cfg["mcpServers"]["cimp-code-audit"]["args"][0],
+        "--code-audit-mcp"
+    );
+}
+
+#[test]
+fn offload_injection_is_claude_only() {
+    let mut settings = Settings::default();
+    settings.offload.enabled = true;
+    let args = build_pre_args(&opencode_cfg(), &settings, "opencode", Some(&hook_endpoint()));
+    assert!(
+        args.is_empty(),
+        "opencode must get no pre-args, got: {args:?}"
+    );
 }

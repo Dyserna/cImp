@@ -96,6 +96,10 @@ pub mod capture;
 pub mod chp;
 pub mod claude;
 pub mod contract;
+/// Spawn-artifact fixtures shared by `tabs::config`'s tests and the emitters'
+/// own (#132) — test-only, and `pub(crate)` for exactly that reason.
+#[cfg(test)]
+pub(crate) mod fixtures;
 pub mod health;
 pub mod info;
 pub mod ingress;

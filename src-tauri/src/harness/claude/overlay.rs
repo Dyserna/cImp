@@ -880,32 +880,13 @@ pub(crate) fn build_pre_args(
     args
 }
 
+/// The module's unit tests, in a sibling file (#132). They are the emitted
+/// artifact's own tests now: 39 of them moved here from `tabs::config`'s test
+/// module, where they had asserted on this file's `--settings` / `--mcp-config`
+/// output while reaching it only through [`build_pre_args`]. What stayed there
+/// is what `tabs::config` decides — the spawn signature, the guidance addendum,
+/// the tab environment — and the fixtures both sides need are
+/// [`crate::harness::fixtures`], so nothing is duplicated.
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// **Every tool the pre-mutation matcher names must be one the checkpoint
-    /// core will accept.**
-    ///
-    /// Moved here from `checkpoint_beacon.rs` when that shim was deleted
-    /// (2026-08-17); the matcher it guards lives in this file, so this is where
-    /// it belongs. The matcher and `tools::CLAUDE_NATIVE_TABLE` are still edited
-    /// separately, and a matcher naming a tool with no `mutates_fs: true` row now
-    /// costs more than it used to: the entry's handler blocks the tool call, so a
-    /// mismatch means a call held for a checkpoint the core immediately declines
-    /// — a silently dead seam with a latency bill.
-    ///
-    /// The reverse direction is deliberately NOT asserted: `run_command` is
-    /// mutating and is not a Claude tool at all, so the table is legitimately
-    /// wider than the matcher.
-    #[test]
-    fn every_matched_claude_tool_is_classified_as_mutating() {
-        for tool in CLAUDE_MUTATING_TOOL_MATCHER.split('|') {
-            assert!(
-                crate::harness::claude::tools::claude_native_mutates_fs(tool),
-                "`{tool}` is in the PreToolUse matcher but has no `mutates_fs: true` row — \
-                 every matched call would be held for a checkpoint the core refuses"
-            );
-        }
-    }
-}
+#[path = "overlay/tests.rs"]
+mod tests;

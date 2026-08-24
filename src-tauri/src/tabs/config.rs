@@ -29,8 +29,10 @@ use crate::error::{AppError, AppResult};
 // V35 Phase K: the two generated harness artifacts moved into `harness/`, one
 // directory per harness (design § 4). What stays here is what is cImp's — when
 // a tab spawns, and what a setting means; what left is how each harness is
-// told. The tests below still drive both through `build_launch_spec`, so they
-// stayed with the composition they assert on.
+// told. #132 finished the move on the test side too: the tests that reached an
+// emitted artifact ONLY through its harness's emitter are with the emitter now,
+// and what this module's own tests still drive through `build_launch_spec` /
+// `compose_ai_env` / `spawn_inject_sig` is the composition they assert on.
 use crate::pty::{resolve_command, PtyLaunchSpec};
 use crate::settings::{AiToolTabConfig, Settings, TabConfig};
 use crate::state::TabId;

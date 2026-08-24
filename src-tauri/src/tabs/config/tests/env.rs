@@ -410,3 +410,34 @@ fn every_default_ai_tab_carries_a_harness_on_every_platform() {
     }
     assert_eq!(seen, 3, "this test read nothing useful");
 }
+
+/// The loopback bearer token reaches the Claude child's ENVIRONMENT, and is
+/// **not** a literal in the overlay.
+///
+/// Both halves matter and they fail differently: without the env var every
+/// hook 401s silently (an unlisted/unset `allowedEnvVars` name substitutes
+/// to the empty string), and with a literal in the overlay the token would
+/// sit in an argv value, which is the most casually readable thing on the
+/// machine.
+#[test]
+fn the_hook_token_rides_the_environment_and_never_the_overlay() {
+    let mut settings = Settings::default();
+    settings.graph.enabled = true;
+    settings.graph.context_injection = true;
+    let ep = hook_endpoint();
+    let env = compose_ai_env(&claude_cfg(), &settings, "claude", Some(&ep));
+    assert_eq!(
+        env.get("CIMP_HOOK_TOKEN").map(String::as_str),
+        Some(ep.token.as_str()),
+        "the harness substitutes `$CIMP_HOOK_TOKEN` from its own environment"
+    );
+    let args = build_pre_args(&claude_cfg(), &settings, "claude", Some(&ep));
+    let raw = settings_overlay(&args).expect("overlay present").to_string();
+    assert!(
+        !raw.contains(&ep.token),
+        "the token must never appear in the `--settings` argv value: {raw}"
+    );
+    // An OpenCode tab gets no such variable — its plugin carries its own.
+    let oc = compose_ai_env(&opencode_cfg(), &settings, "opencode", Some(&ep));
+    assert!(!oc.contains_key("CIMP_HOOK_TOKEN"));
+}

@@ -126,7 +126,7 @@
   import { facadeBackends } from './lib/delegation';
   import type { AiTabId } from './lib/tabs/types';
   import { SPRITE_SETS } from './lib/avatarConfig';
-  import { version as appVersion } from '../package.json';
+  import AboutSection from './lib/settings/sections/AboutSection.svelte';
   import NumberField from './lib/settings/NumberField.svelte';
   import SelectField from './lib/settings/SelectField.svelte';
   import Toggle from './lib/settings/Toggle.svelte';
@@ -1411,7 +1411,6 @@
     { id: 'advanced', label: 'Advanced' },
     { id: 'about', label: 'About' },
   ];
-  const REPO_URL = 'https://github.com/Dyserna/cImp';
 
   // Shortcut rows rendered as loops — the numbered tab slots and the pane
   // actions are 16 near-identical <label> rows otherwise. Every key is a
@@ -7843,23 +7842,7 @@
           </button>
         </section>
       {:else if activeSection === 'about'}
-        <section class="about-section">
-          <h2>About</h2>
-          <dl class="about-list">
-            <dt>Author</dt>
-            <dd>Amir Amashe</dd>
-
-            <dt>Version</dt>
-            <dd><code>{appVersion}</code></dd>
-
-            <dt>Repository</dt>
-            <dd>
-              <a href={REPO_URL} target="_blank" rel="noopener noreferrer">
-                {REPO_URL}
-              </a>
-            </dd>
-          </dl>
-        </section>
+        <AboutSection />
       {/if}
       </div>
     </div>
@@ -8906,48 +8889,6 @@
     opacity: 0.5;
   }
 
-  /* About page: a small definition list keyed by Author / Version /
-     Repository. Two-column grid (label | value) so the values line up
-     even with mixed key lengths. */
-  .about-list {
-    display: grid;
-    grid-template-columns: max-content 1fr;
-    column-gap: var(--space-4);
-    row-gap: var(--space-3);
-    margin: 0;
-    padding: 0;
-  }
-  .about-list dt {
-    color: var(--text-quiet-strong);
-    font-size: var(--font-size-sm);
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-    font-weight: 600;
-    padding-top: 2px;
-  }
-  .about-list dd {
-    margin: 0;
-    color: var(--text-primary);
-    font-size: var(--font-size-md);
-    word-break: break-all;
-  }
-  .about-list dd code {
-    background: var(--surface-deep);
-    border: 1px solid var(--border-subtle);
-    padding: 1px var(--space-2);
-    border-radius: var(--radius-sm);
-    font-family: Consolas, Menlo, monospace;
-    font-size: var(--font-size-sm);
-  }
-  .about-list dd a {
-    color: var(--accent-purple);
-    text-decoration: none;
-    transition: color var(--motion-fast) var(--easing-standard);
-  }
-  .about-list dd a:hover {
-    color: var(--accent-bright);
-    text-decoration: underline;
-  }
 
   /* Narrow window: collapse sidebar to a horizontal strip on top so the
      content area still gets full width. The Settings window can resize

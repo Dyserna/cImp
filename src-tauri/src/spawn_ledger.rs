@@ -592,7 +592,7 @@ mod tests {
         //    gates on it (R11), and resolved from the manifest rather than the
         //    cwd so it answers the same from any working directory.
         let all = crate::rustsrc::source_files();
-        match audit_against(&all, &expected) {
+        match audit_against(all, &expected) {
             Ok(n) => assert!(n > 0, "the tree walk counted zero spawns"),
             Err(problems) => panic!(
                 "spawn ledger mismatch against the {} source files under src/:\n  {}",

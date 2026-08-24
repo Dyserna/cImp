@@ -69,6 +69,10 @@ pub(crate) fn src_root() -> PathBuf {
 /// Every `.rs` file under [`src_root`], as `(slash-relative path, contents)` —
 /// sorted, `\r`-normalised, dot-directories skipped, guarded against vacuity.
 ///
+/// Walked ONCE per process and borrowed thereafter — see [`RS_SOURCE_FILES`].
+/// [`source_files_ext`] below is deliberately NOT memoized: a bespoke extension
+/// set has one caller, and the walk it does is that caller's alone.
+///
 /// # Why this is one function and not five (R11)
 ///
 /// Five copies of this walk existed — in `harness::layering`, `spawn_gate`,
@@ -94,9 +98,24 @@ pub(crate) fn src_root() -> PathBuf {
 ///
 /// Sorting is the fourth, minor one: four of the five sorted and `spawn_ledger`
 /// did not, which made its failure messages depend on directory order.
-pub(crate) fn source_files() -> Vec<(String, String)> {
-    source_files_ext(&["rs"])
+pub(crate) fn source_files() -> &'static [(String, String)] {
+    &RS_SOURCE_FILES
 }
+
+/// The memo behind [`source_files`].
+///
+/// The `.rs` answer is IDENTICAL for every caller — same root, same extension
+/// set, same process — and roughly fifteen scanners ask for it in one `cargo
+/// test` run, each paying ~250 file reads plus a sort for a tree that cannot
+/// have changed since the binary was built. Computed once, borrowed after.
+///
+/// One consequence worth knowing: [`MIN_SOURCE_FILES`]'s vacuity assert now
+/// fires inside this initializer, so a broken walk panics with its own message
+/// in whichever test touches it FIRST, and every later test reports a poisoned
+/// `LazyLock` instead. The diagnosis is in the first failure; the rest are
+/// echoes of it.
+static RS_SOURCE_FILES: std::sync::LazyLock<Vec<(String, String)>> =
+    std::sync::LazyLock::new(|| source_files_ext(&["rs"]));
 
 /// [`source_files`] over a caller-chosen extension set.
 ///
@@ -725,9 +744,17 @@ mod tests {
             "paths must be `src/`-relative with forward slashes: that is how the allowlists \
              in `harness::layering` and the ledger rows in `spawn_ledger` are written"
         );
-        let mut sorted = files.clone();
+        let mut sorted = files.to_vec();
         sorted.sort();
         assert_eq!(files, sorted, "the walk must be sorted");
+
+        // ...and it is walked once. Fifteen scanners ask for this in one
+        // `cargo test` run; the answer cannot change inside a process, so
+        // they share one. Same backing allocation = the memo is live.
+        assert!(
+            std::ptr::eq(files.as_ptr(), source_files().as_ptr()),
+            "the crate walk is re-reading ~250 files for every caller"
+        );
 
         let widened = source_files_ext(&["rs", "css"]);
         assert!(

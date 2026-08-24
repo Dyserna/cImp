@@ -28,7 +28,6 @@
     graphFactAdd,
     graphContextPreview,
     graphPath,
-    graphArchitecture,
     quarantineReason,
     onGraphStatus,
     onGraphAnalyses,
@@ -40,7 +39,6 @@
     type RetrieveResult,
     type PathResult,
     type PathNodeRow,
-    type ArchResult,
     type SessionInfo,
   } from './graph';
   import { isActiveSessionIn } from './usageMath';
@@ -55,6 +53,7 @@
   import { isAppViewVisible, onAppViewShown } from './appViewVisibility';
   import SectionNav from './SectionNav.svelte';
   import UsageOverview from './codeIntel/UsageOverview.svelte';
+  import ArchitectureSection from './codeIntel/ArchitectureSection.svelte';
   import { loadViewSection } from './viewSection';
   import { harnesses } from './harness';
 
@@ -217,24 +216,6 @@
   // A file node's `label` is just its path; a symbol node shows name + loc + kind.
   function pathNodeText(n: PathNodeRow): string {
     return n.kind === 'file' ? n.file : `${n.label} (${n.file}:${n.line}) [${n.kind}]`;
-  }
-
-  // V15 Feature 2: the "Architecture" section — god nodes, subsystems,
-  // surprising (cross-subsystem) edges. Heuristic, advisory only.
-  let arch = $state<ArchResult | null>(null);
-  let archBusy = $state(false);
-  let archError = $state<string | null>(null);
-
-  async function runArchitecture(): Promise<void> {
-    archBusy = true;
-    archError = null;
-    try {
-      arch = await graphArchitecture();
-    } catch (e) {
-      archError = String(e);
-    } finally {
-      archBusy = false;
-    }
   }
 
   // Memory (Phase C): per-project session/action memory. Fetched while the
@@ -696,6 +677,8 @@
     bind:this={overview}
     onActiveSessions={(ids) => (activeSessionIds = ids)}
   />
+
+  <ArchitectureSection active={section === 'architecture'} />
 
   {#if section === 'memory'}
     {#if quarantined.length > 0}
@@ -1181,84 +1164,6 @@
           {/if}
         {/if}
       </section>
-    </div>
-  {:else if section === 'architecture'}
-    <div class="arch-sec">
-      <p class="caveat">
-        Heuristic system-shape overview — hub degree + label-propagation
-        clustering. Advisory, not authoritative; verify before acting on it.
-      </p>
-      <div class="actions">
-        <button onclick={runArchitecture} disabled={archBusy}>
-          {archBusy ? 'Analyzing…' : 'Recompute'}
-        </button>
-      </div>
-
-      {#if archError}
-        <p class="error">{archError}</p>
-      {/if}
-
-      {#if arch}
-        <section class="card">
-          <div class="history-head">God nodes <span class="muted">({arch.god_nodes.length})</span></div>
-          <p class="caveat">Hubs the system flows through.</p>
-          {#if arch.god_nodes.length === 0}
-            <p class="placeholder">No standout hubs found.</p>
-          {:else}
-            <div class="rows">
-              {#each arch.god_nodes as g (g.id)}
-                <div class="arow god">
-                  <span class="aname">{g.label}</span>
-                  <span class="akind">{g.kind}</span>
-                  <span class="aloc">{g.file}</span>
-                  <span class="muted">degree {g.degree}</span>
-                </div>
-              {/each}
-            </div>
-          {/if}
-        </section>
-
-        <section class="card">
-          <div class="history-head">Subsystems <span class="muted">({arch.subsystems.length})</span></div>
-          {#if arch.subsystems.length === 0}
-            <p class="placeholder">Single cohesive module — no distinct subsystems detected.</p>
-          {:else}
-            <div class="subsys-list">
-              {#each arch.subsystems as s (s.name)}
-                <details class="subsys">
-                  <summary>{s.name} — {s.size} file{s.size === 1 ? '' : 's'} · hub {s.hub}</summary>
-                  <div class="subsys-files">
-                    {#each s.files as f (f)}
-                      <div class="aloc">{f}</div>
-                    {/each}
-                  </div>
-                </details>
-              {/each}
-            </div>
-          {/if}
-        </section>
-
-        <section class="card">
-          <div class="history-head">
-            Surprising connections <span class="muted">({arch.surprising.length})</span>
-          </div>
-          <p class="caveat">
-            Candidate accidental coupling — heuristic, verify before acting.
-          </p>
-          {#if arch.surprising.length === 0}
-            <p class="placeholder">No cross-subsystem surprises found.</p>
-          {:else}
-            <div class="rows">
-              {#each arch.surprising as s, i (s.from + ':' + s.to + ':' + i)}
-                <div class="arow surprising">
-                  <span class="aname">{s.from_subsystem} ✗ {s.to_subsystem}</span>
-                  <span class="aloc">{s.from} ──{s.kind}──▶ {s.to}</span>
-                </div>
-              {/each}
-            </div>
-          {/if}
-        </section>
-      {/if}
     </div>
   {/if}
 
@@ -1784,13 +1689,6 @@
   .arow.dep {
     grid-template-columns: 1fr 6rem 2fr auto auto;
   }
-  .arow.god {
-    grid-template-columns: 1fr 6rem 2fr auto;
-  }
-  .arow.surprising {
-    grid-template-columns: 1fr 2fr;
-    white-space: normal;
-  }
 
   /* ── V15 Feature 1: Trace path ─────────────────────────────────────────── */
   .path-in {
@@ -1825,27 +1723,5 @@
     opacity: 0.75;
     font-size: 11px;
     font-family: monospace;
-  }
-
-  /* ── V15 Feature 2: Architecture ───────────────────────────────────────── */
-  .subsys-list {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-  }
-  .subsys {
-    border-bottom: 1px solid var(--border-faint, #2a2a2a);
-    padding: 4px 2px;
-    font-size: 12px;
-  }
-  .subsys summary {
-    cursor: pointer;
-    font-weight: 600;
-  }
-  .subsys-files {
-    margin: 6px 0 4px 1.2em;
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
   }
 </style>

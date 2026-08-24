@@ -948,6 +948,18 @@ impl<'a> TabService<'a> {
     /// registry AND sends `TabRenameRequested`, and doing both for an unchanged
     /// name would make every Configure-dialog OK look like a rename to every
     /// subscriber.
+    ///
+    /// Takes the lifecycle serializer for the whole body, like every other
+    /// mutating method here and exactly as the command did before the fold.
+    /// Without it, a `close_tab` interleaving between the "settings still holds
+    /// a Shell entry for this tab" check and the `mutate` makes the closure's
+    /// re-check find nothing and drop the edit on the floor — and the user is
+    /// told `Ok`. The `which::which` probe inside `validate_inputs` runs under
+    /// the lock deliberately: the alternative is validating outside it and
+    /// re-checking inside, which buys a shorter hold on a path the user drives
+    /// one dialog at a time, at the cost of a second copy of the checks. The
+    /// probe is bounded (one PATH resolution) and lifecycle commands are not
+    /// concurrent in practice, so the whole body stays inside.
     #[allow(clippy::too_many_arguments)]
     pub async fn reconfigure_shell(
         &self,
@@ -962,6 +974,7 @@ impl<'a> TabService<'a> {
         theme_override: Option<crate::settings::TerminalThemeSettings>,
         background_override: Option<crate::settings::BackgroundOverride>,
     ) -> Result<(), TabLifecycleError> {
+        let _serializer = self.serializer.lock().await;
         if !matches!(tab.kind(), TabKind::Shell) {
             return Err(TabLifecycleError::WrongKind);
         }
@@ -1910,5 +1923,46 @@ mod tests {
                 .shell_tab_config(&TabId::Shell("shell-nope".to_string())),
             Err(TabLifecycleError::TabNotFound { .. })
         ));
+    }
+
+    /// **`reconfigure_shell` serializes against the other lifecycle commands.**
+    ///
+    /// The struct's documented invariant — "held for the whole of every
+    /// mutating method" — is the reason a `close_tab` cannot land between this
+    /// method's "settings still holds a Shell entry" check and its `mutate`,
+    /// where the closure's re-check would silently drop the edit and still
+    /// return `Ok`. Nothing else observes that hold, so it is pinned directly:
+    /// while the serializer is held elsewhere the call must not make progress,
+    /// and it must complete once the holder lets go.
+    #[tokio::test]
+    async fn reconfigure_shell_waits_on_the_lifecycle_serializer() {
+        let fx = Fixture::new();
+        let seed = TabId::Shell("shell-seed".to_string());
+        let guard = fx.serializer.lock().await;
+
+        let svc = fx.service();
+        let call = svc.reconfigure_shell(
+            seed.clone(),
+            "Reconfigured".to_string(),
+            a_real_command(),
+            String::new(),
+            None,
+            HashMap::new(),
+            "err".to_string(),
+            "exit".to_string(),
+            None,
+            None,
+        );
+        tokio::pin!(call);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(150), &mut call)
+                .await
+                .is_err(),
+            "reconfigure_shell ran without the lifecycle serializer"
+        );
+
+        drop(guard);
+        call.await.expect("reconfigure once the serializer is free");
+        assert!(fx.tab_names().contains(&"Reconfigured".to_string()));
     }
 }

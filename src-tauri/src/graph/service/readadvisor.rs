@@ -552,8 +552,9 @@ impl GraphService {
                     if first_read_eligible(&fin) {
                         match idx.get_digest(&rel, &cur_hash) {
                             Ok(Some(digest)) => {
-                                let text =
-                                    crate::graph::context::first_read_advice(&rel, &content, &digest);
+                                let text = crate::graph::context::first_read_advice(
+                                    &rel, &content, &digest,
+                                );
                                 let displaced = content.chars().count() as u64;
                                 let request = format!(
                                     "agent read of `{rel}` (huge non-code — digest substituted, first-read)"

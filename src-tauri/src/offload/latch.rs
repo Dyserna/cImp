@@ -36,7 +36,12 @@ use serde::Serialize;
 use tauri::{AppHandle, Manager};
 use tracing::{info, warn};
 
-use super::loopback::{bounded_id, live_settings};
+// V42 review (dropped-at-cap): these two used to come from `super::loopback` —
+// a back-edge from the module V42 R3 (#114) extracted to the module it was
+// extracted from, and the reason this file could not be read as sitting below
+// the router. Both live in `offload` itself now; neither was ever about
+// routing.
+use super::{bounded_id, live_settings};
 use super::outbound::{self, Budget};
 use super::toolclass::{self, Latch, ProxyGate, ToolClass, WriteTaint};
 

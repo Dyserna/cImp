@@ -63,16 +63,42 @@ fn declares(line: &str, sig: &str) -> bool {
         // through.
         return true;
     }
-    let rest = match line.strip_prefix("pub") {
-        None => return false,
+    past_visibility(line).starts_with(sig)
+}
+
+/// `line` with a leading visibility modifier stripped: `pub`, `pub(crate)`,
+/// `pub(super)`, `pub(in some::path)`. Returns `line` unchanged when there is
+/// none.
+///
+/// Column 0 is not negotiable and nothing is trimmed: everything these scans
+/// assert about is a TOP-LEVEL item, and the column-0 `}` terminator
+/// [`fn_body`] relies on is sound only for one.
+fn past_visibility(line: &str) -> &str {
+    match line.strip_prefix("pub") {
+        None => line,
         Some(tail) => tail
             .strip_prefix('(')
             .and_then(|t| t.split_once(") "))
             .map(|(_scope, after)| after)
             .or_else(|| tail.strip_prefix(' '))
             .unwrap_or(tail),
-    };
-    rest.starts_with(sig)
+    }
+}
+
+/// The module named by a top-level `mod NAME;` declaration, whatever
+/// visibility it wears.
+///
+/// V42 review, RV-7. [`the_source_scanners_read_every_route_file`] scraped
+/// `mod.rs` with a bare `strip_prefix("mod ")`, so a family file declared
+/// `pub(crate) mod x;` was invisible to it — and invisible on BOTH sides of
+/// the join it feeds: such a file would be missing from the scrape AND from
+/// `ROUTE_SOURCES`, the two shortened lists would agree, and the one test
+/// whose job is to notice an unscanned route file would be green about exactly
+/// that.
+fn mod_name(line: &str) -> Option<&str> {
+    past_visibility(line)
+        .strip_prefix("mod ")?
+        .strip_suffix(';')
 }
 
 /// [`fn_body`] over a LIST of files: the one that declares `sig` is found
@@ -100,15 +126,66 @@ fn fn_body_in(files: &[(&'static str, &'static str)], sig: &str) -> String {
     fn_body(src, sig)
 }
 
-/// The files in `files` whose source contains `needle`, for the scans whose
+/// The files in `files` whose **code** contains `needle`, for the scans whose
 /// assertion is about PRESENCE somewhere in the surface rather than about one
 /// item's body.
+///
+/// V42 review, RV-9. This searched the raw source, so a doc comment naming the
+/// signature or the header was enough to satisfy it — and both call sites are
+/// security assertions ("the exec roots derive from the app, never from a
+/// request body"; "the tab-identity headers are actually matched"). A scan a
+/// comment can satisfy is a scan that keeps passing after the code it names is
+/// deleted.
+///
+/// [`crate::rustsrc::uncommented`], not `code_of`: one of the two needles IS a
+/// string literal (`"x-cimp-tab" =>`, a match arm on a header name), and the
+/// strong pass blanks it — which would have replaced "a comment can satisfy
+/// this" with "nothing can", the same vacuity wearing the opposite face.
 fn files_containing(files: &[(&'static str, &'static str)], needle: &str) -> Vec<&'static str> {
     files
         .iter()
-        .filter(|(_, src)| src.contains(needle))
+        .filter(|(rel, src)| crate::rustsrc::uncommented(rel, src).contains(needle))
         .map(|(file, _)| *file)
         .collect()
+}
+
+/// The control for [`files_containing`] (V42 review, RV-9), permanent rather
+/// than a plant-and-revert: the inputs are synthetic, so this asserts the
+/// property directly instead of asserting that today's production text happens
+/// to have it.
+#[test]
+fn files_containing_reads_code_and_not_prose() {
+    let needle = "fn hook_exec_roots(app: &AppHandle";
+    let commented = format!("// {needle}, settings: &S) -> Vec<PathBuf>\nfn other() {{}}\n");
+    let real = format!("{needle}, settings: &S) -> Vec<PathBuf> {{\n}}\n");
+
+    // The control's own premise: the RAW text does contain the needle, which
+    // is precisely what the pre-RV-9 `src.contains(needle)` matched. If this
+    // ever stops holding, the assertion below is passing on nothing.
+    assert!(
+        commented.contains(needle),
+        "the commented fixture must still contain the needle as raw text"
+    );
+
+    assert!(
+        files_containing(&[("prose.rs", Box::leak(commented.into_boxed_str()))], needle)
+            .is_empty(),
+        "a doc/line comment satisfied a scan whose whole assertion is that the CODE does it"
+    );
+    assert_eq!(
+        files_containing(&[("real.rs", Box::leak(real.into_boxed_str()))], needle),
+        vec!["real.rs"],
+        "the scan stopped seeing a real declaration"
+    );
+
+    // …and the deliberate scope limit: a needle that IS a literal must still
+    // be found, because the header scan below looks for a match arm.
+    const ARM: &str = "match h { \"x-cimp-tab\" => 1, _ => 0 };\n";
+    assert_eq!(
+        files_containing(&[("arm.rs", ARM)], "\"x-cimp-tab\" =>"),
+        vec!["arm.rs"],
+        "blanking string literals would make the header scan match nothing at all"
+    );
 }
 
 
@@ -1611,7 +1688,7 @@ fn the_discovery_report_never_reaches_the_hook_shims_path() {
     // the `?` that proves an endpoint resolved. V42 R2 (#114) moved the
     // resolver to `offload/discovery.rs`; the scan follows the code.
     let src = include_str!("../discovery.rs");
-    let resolver = top_level_fn(src, "pub fn proxy_base_for(");
+    let resolver = fn_body(src, "pub fn proxy_base_for(");
     let after_q = resolver.find("let d = d?;").expect("the `?` is the guard");
     let report = resolver
         .find("report_skipped_to_app(")
@@ -1621,7 +1698,7 @@ fn the_discovery_report_never_reaches_the_hook_shims_path() {
         "reporting before the `?` would fire with no endpoint to report to"
     );
     assert!(
-        !top_level_fn(src, "pub fn read_discovery_for(").contains("report_skipped_to_app"),
+        !fn_body(src, "pub fn read_discovery_for(").contains("report_skipped_to_app"),
         "a report inside `read_discovery_for` is a write and a wait inside every \
          fire-and-forget caller of it — the shape the deleted beacon shims could \
          not survive, and the reason this resolver stays silent"
@@ -1690,29 +1767,6 @@ fn wait_for_request(seen: &Arc<Mutex<Vec<String>>>, n: usize) -> Option<String> 
     None
 }
 
-/// The source text of one top-level `fn`, signature to closing brace — the
-/// non-`async` twin of [`handler_body`], with the same CRLF normalisation
-/// and the same "a `}` in column 0 ends it" rule.
-fn top_level_fn(src: &str, sig: &str) -> String {
-    let mut out = String::new();
-    let mut inside = false;
-    for line in src.lines() {
-        if !inside {
-            if !declares(line, sig) {
-                continue;
-            }
-            inside = true;
-        }
-        out.push_str(line);
-        out.push('\n');
-        if line == "}" {
-            break;
-        }
-    }
-    assert!(!out.is_empty(), "no top-level `{sig}`");
-    assert!(out.ends_with("}\n"), "`{sig}` was not terminated");
-    out
-}
 
 /// A port on the loopback interface that nothing is listening on: bound,
 /// read, and released before the test uses the number. A `connect` to it is
@@ -7689,10 +7743,45 @@ fn every_bad_body_reply_keeps_its_own_bytes() {
 /// declarations and the list itself, in both directions.
 #[test]
 fn the_source_scanners_read_every_route_file() {
+    // V42 review RV-7: the scrape reads THROUGH the visibility modifier. It
+    // used to be `strip_prefix("mod ")`, which sees `mod x;` and nothing else
+    // — and the file it could not see would be missing from `ROUTE_SOURCES`
+    // too, so the join below would compare two equally-short lists and pass.
+    // These are the spellings a family file can legitimately be declared with;
+    // each must be seen.
+    for spelling in [
+        "mod probe;",
+        "pub mod probe;",
+        "pub(crate) mod probe;",
+        "pub(super) mod probe;",
+        "pub(in crate::offload) mod probe;",
+    ] {
+        assert_eq!(
+            mod_name(spelling),
+            Some("probe"),
+            "`{spelling}` is invisible to the scrape — a route file declared that way \
+             would be scanned by nobody with this test green"
+        );
+    }
+    // …and it stays a TOP-LEVEL declaration scrape: prose, a nested `mod`, an
+    // inline module and a lookalike identifier are all not one.
+    for not_a_route_file in [
+        "// mod probe;",
+        "    mod probe;",
+        "mod probe {",
+        "use foo::mod_probe;",
+    ] {
+        assert_eq!(
+            mod_name(not_a_route_file),
+            None,
+            "`{not_a_route_file}` was read as a route-file declaration"
+        );
+    }
+
     let dispatch = include_str!("mod.rs");
     let mut declared: Vec<String> = dispatch
         .lines()
-        .filter_map(|l| l.strip_prefix("mod ")?.strip_suffix(';'))
+        .filter_map(mod_name)
         .filter(|m| *m != "tests")
         .map(|m| format!("offload/loopback/{m}.rs"))
         .collect();
@@ -7755,6 +7844,12 @@ fn handler_body(name: &str) -> String {
 /// [`handler_body`] for any top-level item, given its exact opening text —
 /// so a non-`async` helper (or a shared core, V35 Phase J) can be scanned by
 /// the same rules.
+///
+/// V42 review (dropped-at-cap): there used to be a second, byte-identical
+/// copy of this called `top_level_fn`, described as "the non-`async` twin".
+/// It never was one — the signature is a parameter, so `async` is just part
+/// of the text — and two copies of a scanner primitive is one copy that can be
+/// hardened while the other quietly is not. There is one.
 fn fn_body(src: &str, sig: &str) -> String {
     let mut out = String::new();
     let mut inside = false;

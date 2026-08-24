@@ -109,6 +109,14 @@ use self::mcp::*;
 use self::delegate::*;
 pub use self::events::*;
 
+// V42 review (dropped-at-cap): `bounded_id`, its bound, and `live_settings`
+// moved UP to `offload` — `offload::latch` imported them from here, which was a
+// back-edge from the module V42 R3 (#114) extracted to the module it was
+// extracted from. Re-exported so the family files' `use super::*` and
+// `harness::claude::hook`'s `use crate::offload::loopback::{..}` still resolve.
+pub(crate) use super::{bounded_id, live_settings, BEACON_TOOL_MAX};
+
+
 /// A per-launch random bearer token (two v4 UUIDs of entropy, hex). Avoids
 /// pulling a separate RNG crate — `uuid` is already a dependency.
 fn make_token() -> String {
@@ -705,20 +713,6 @@ async fn handle_conn(
 /// worker wedged" (see `mcp.rs`), so this must stay well under that idle window.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 
-/// V32 Phase G: read the app's live settings from managed state.
-///
-/// Every gated loopback handler already holds an `AppHandle`; this is the one
-/// place that turns it into a `Settings`, so a handler cannot accidentally
-/// resolve the hierarchy against a different snapshot than its neighbour. The
-/// fallback is `Settings::default()` — all protection ON — because a request
-/// arriving before managed state is up must not be the moment containment
-/// silently lapses.
-pub(crate) fn live_settings(app: &AppHandle) -> crate::settings::Settings {
-    app.try_state::<crate::ipc::AppState>()
-        .map(|s| s.settings.current())
-        .unwrap_or_default()
-}
-
 // ── #48, finding M-7: the three `/context/*` hook routes' taint gate ───────
 //
 // The finding: `/context/post_edit`, `/context/should_read` and
@@ -1136,12 +1130,15 @@ where
 /// NDJSON pair, `/mcp/call`, the two `/latch/*` routes and `/session/hello`:
 /// a [`RunResult`] whose `error` names the parse failure, so the keys come out
 /// in the struct's declared order (`{"ok":false,"error":…}`).
+///
+/// V42 review (dropped-at-cap): this used to build the `RunResult` itself,
+/// re-spelling [`bad_request`]'s three fields one function above it. Two
+/// literals of one envelope is how a field added to `RunResult` reaches one
+/// 400 body and not the other. The DIFFERENCE between them - this one carries
+/// the parse detail, `bad_request` deliberately does not - is the message, and
+/// that is all this adds.
 fn bad_body_result(e: serde_json::Error) -> RunResult {
-    RunResult {
-        ok: false,
-        text: None,
-        error: Some(format!("bad request body: {e}")),
-    }
+    bad_request(&format!("bad request body: {e}"))
 }
 
 /// The 400 body the hook routes send — `/context/*`,

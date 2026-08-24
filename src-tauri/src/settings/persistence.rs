@@ -203,7 +203,7 @@ pub fn load(default_shell: &ShellSpec, launch_cwd: &Path) -> LoadOutcome {
         let from = migration::stated_schema_version(&v)
             .or(global_stated)
             .unwrap_or(crate::settings::schema::CURRENT_SCHEMA_VERSION as u64);
-        if migration::migrate_overlay(&mut v, from, default_shell) {
+        if migration::migrate_overlay(&mut v, from) {
             tracing::info!(
                 path = %overlay_path.display(),
                 from,
@@ -779,7 +779,7 @@ fn load_global(default_shell: &ShellSpec) -> (Settings, Option<u64>) {
 
     // Migrate the global file in place. Backup is named after the global
     // file, which is the source of truth for the global baseline shape.
-    let migrated = match migration::migrate_if_needed(&mut value, &path, default_shell) {
+    let migrated = match migration::migrate_if_needed(&mut value, &path) {
         Ok(b) => b,
         Err(e) => {
             tracing::error!(

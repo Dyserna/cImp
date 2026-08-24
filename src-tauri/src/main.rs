@@ -39,17 +39,19 @@ mod sysmon;
 mod tabs;
 mod theming;
 mod tts;
+/// R16 (V42): the startup wiring `main`'s `setup` hook used to hold inline.
+mod wiring;
 mod workbench;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, RwLock};
 
-use tauri::{AppHandle, Emitter, Manager, WindowEvent};
+use tauri::{Manager, WindowEvent};
 use tokio::sync::{broadcast, mpsc, Mutex as TokioMutex};
-use tracing::{info, warn};
+use tracing::info;
 
-use crate::audio::{spawn_amplitude_streamer, AudioOutput};
+use crate::audio::AudioOutput;
 use crate::ipc::commands::{
     acknowledge_error, activity_clear, activity_delete, activity_detail, activity_list,
     advisor_dismiss, advisor_mark_applied, ai_tool_tab_defaults, checks_apply_proposals,
@@ -105,16 +107,13 @@ use crate::preview::{
     preview_set_rect, preview_show, preview_update_config,
 };
 use crate::settings::{
-    LayoutNodePersisted, LayoutPersisted, LogLevel, LogRetention, Settings, SettingsHandle,
-    TabConfig,
+    LayoutNodePersisted, LayoutPersisted, LogLevel, Settings, TabConfig,
 };
-use crate::state::{
-    spawn_state_manager, ReadOnlyTabs, StateEvent, StateManagerWiring, StateSignal, TabId, TabKind,
-    TabMeta,
-};
+use crate::state::{ReadOnlyTabs, StateEvent, StateSignal, TabId, TabKind, TabMeta};
 use crate::stt::SttHandle;
 use crate::tabs::{TabRegistry, TabRegistryHandle};
-use crate::tts::{spawn_tts_worker, ActiveTab, AiTtsSuppressed, SpeakSession, TtsRequest};
+use crate::tts::{ActiveTab, AiTtsSuppressed, SpeakSession, TtsRequest};
+use crate::wiring::Wiring;
 
 /// Usage text for `cimp --help`. Lists the drop-in forwarding contract and the
 /// service flags so an agent probing the CLI learns the surface instead of
@@ -252,7 +251,20 @@ fn resolve_consumer(args: &[String], in_app_ok: bool) -> Result<&'static str, St
     }
 }
 
-fn main() {
+/// Every GUI-free entry point `cimp` has, in dispatch order — `true` means the
+/// process has done its job and [`main`] must return without launching anything.
+///
+/// R16 (V42): lifted out of `main()` unchanged. Each block still explains why it
+/// is handled before any Tauri/audio/settings init, and the ORDER is the order
+/// it always was: `--help`/`--version` first (an agent probing an unknown CLI
+/// must never open a window), then the harness probes, then plugin-registered
+/// subcommands, then the retired hook-flag tombstones, then the two MCP
+/// children.
+///
+/// `args` is `std::env::args().skip(1)`, collected ONCE by the caller and reused
+/// as the launch path's `extra_args` — the three separate collects this used to
+/// do all read the same immutable argv.
+fn run_subcommand(args: &[String]) -> bool {
     // `--help`/`--version` guard: agents reflexively probe unknown CLIs with
     // `cimp --help`, and before this guard every such invocation fell through
     // to the full GUI launch — each probe opened a real window (observed with
@@ -263,18 +275,17 @@ fn main() {
     // declares `accepts_passthrough_argv`, and forwards unrecognized args to
     // that harness's tabs (V40 locked decision 26).
     {
-        let early: Vec<String> = std::env::args().skip(1).collect();
-        let wants_help = early.iter().any(|a| a == "--help" || a == "-h")
-            || early.first().is_some_and(|a| a == "help");
+        let wants_help = args.iter().any(|a| a == "--help" || a == "-h")
+            || args.first().is_some_and(|a| a == "help");
         if wants_help {
             attach_parent_console();
             println!("{}", help_text());
-            return;
+            return true;
         }
-        if early.iter().any(|a| a == "--version" || a == "-V") {
+        if args.iter().any(|a| a == "--version" || a == "-V") {
             attach_parent_console();
             println!("cimp {}", env!("CARGO_PKG_VERSION"));
-            return;
+            return true;
         }
         // V35 Phase D: the L2 harness live probe. Drives the INSTALLED Claude
         // Code / OpenCode CLIs and reports one line per capability from the
@@ -289,9 +300,9 @@ fn main() {
         // session to tail) and `transition` (upstream improved) are never
         // failures — milestone locked decision 8, which is what keeps this from
         // becoming the version tripwire that cried wolf.
-        if early.iter().any(|a| a == "--harness-canary") {
+        if args.iter().any(|a| a == "--harness-canary") {
             attach_parent_console();
-            std::process::exit(harness::probe::run(&early));
+            std::process::exit(harness::probe::run(args));
         }
         // V35 Phase H: the capture corpus's manual trigger. Same probes, same
         // GUI-free reasoning as above — and deliberately a SECOND command
@@ -301,9 +312,9 @@ fn main() {
         // filed, and it files one whether or not anything drifted (a failing
         // run goes to a marked sibling directory, so the last known-good
         // capture — the thing you would diff against — survives).
-        if early.iter().any(|a| a == "--harness-capture") {
+        if args.iter().any(|a| a == "--harness-capture") {
             attach_parent_console();
-            std::process::exit(harness::capture::run(&early));
+            std::process::exit(harness::capture::run(args));
         }
     }
 
@@ -317,10 +328,9 @@ fn main() {
     // subsystem too — inherited stdio pipes stay usable, only console
     // allocation is suppressed.
     {
-        let argv: Vec<String> = std::env::args().skip(1).collect();
-        if let Some(sub) = harness::registry::subcommand_for(&argv) {
+        if let Some(sub) = harness::registry::subcommand_for(args) {
             (sub.run)();
-            return;
+            return true;
         }
     }
 
@@ -373,13 +383,10 @@ fn main() {
         "--taint-beacon",
         "--checkpoint-beacon",
     ];
-    if std::env::args()
-        .skip(1)
-        .any(|a| RETIRED_HOOK_FLAGS.contains(&a.as_str()))
-    {
+    if args.iter().any(|a| RETIRED_HOOK_FLAGS.contains(&a.as_str())) {
         let mut sink = String::new();
         let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut sink);
-        return;
+        return true;
     }
 
     // V8-01 offload MCP server: a host agent invokes `cimp --offload-mcp`
@@ -392,11 +399,8 @@ fn main() {
     // V19: an optional `--consumer <name>` (default `claude`, or `opencode`)
     // selects which per-consumer MCP-server set the app proxies to this child.
     //
-    // Collected once — shared by the two MCP-child checks below and the normal
-    // launch path's `extra_args`.
-    let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--offload-mcp") {
-        let consumer = match resolve_consumer(&args, true) {
+        let consumer = match resolve_consumer(args, true) {
             Ok(c) => c,
             Err(msg) => {
                 eprintln!("{msg}");
@@ -421,7 +425,7 @@ fn main() {
         // Absent on a hand-run child ⇒ no channel declaration.
         let channel_push = args.iter().any(|a| a == "--channel-push");
         offload::mcp::run(consumer, tab, channel_push);
-        return;
+        return true;
     }
 
     // V26 code-audit MCP server: a host agent invokes `cimp --code-audit-mcp`
@@ -434,7 +438,7 @@ fn main() {
     // the same optional `--consumer <name>` (default `claude`); the app's
     // loopback re-checks that consumer's expose toggle on every run.
     if args.iter().any(|a| a == "--code-audit-mcp") {
-        let consumer = match resolve_consumer(&args, false) {
+        let consumer = match resolve_consumer(args, false) {
             Ok(c) => c,
             Err(msg) => {
                 eprintln!("{msg}");
@@ -451,6 +455,16 @@ fn main() {
             .and_then(|i| args.get(i + 1))
             .map(String::as_str);
         audit::mcp::run(consumer, tab);
+        return true;
+    }
+    false
+}
+
+fn main() {
+    // Collected once — the GUI-free dispatch above and the launch path's
+    // `extra_args` below read the SAME argv.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if run_subcommand(&args) {
         return;
     }
 
@@ -652,10 +666,31 @@ fn main() {
     );
     let tabs_handle: TabRegistryHandle = Arc::new(TokioMutex::new(registry));
 
-    // Clone the TTS sender once for the notification manager — AppState
-    // gets the original. Both producers race to put work on the same mpsc;
-    // the worker filters/synthesizes serially.
-    let tts_tx_for_notifications = tts_tx.clone();
+    // R16 (V42): the 22 consecutive `let x_for_y = h.clone()` aliases that used
+    // to sit between here and `tauri::Builder::default()` are these fields. Every
+    // one of them existed to give a `move` closure its own copy of a handle
+    // `AppState` also holds — including the TTS sender, which the notification
+    // manager and `AppState` both produce onto (the worker filters and
+    // synthesizes serially, so the race is fine and is the design).
+    let wiring = Wiring {
+        settings: settings_handle.clone(),
+        state_events: state_event_tx.clone(),
+        state_signals: state_tx.clone(),
+        state_rx: state_rx_slot.clone(),
+        tts_tx: tts_tx.clone(),
+        tts_rx: tts_rx_slot.clone(),
+        stt_runtime: stt_runtime_slot.clone(),
+        audio: audio_slot.clone(),
+        input_lengths: input_lengths.clone(),
+        read_only: read_only_tabs.clone(),
+        tab_activity: tab_activity.clone(),
+        tab_metas: tab_metas.clone(),
+        initial_active: initial_active.clone(),
+        tts_active: tts_active.clone(),
+        speak_session: speak_session.clone(),
+        ai_tts_suppressed: ai_tts_suppressed.clone(),
+        window_title,
+    };
 
     let state = AppState {
         stt: stt_handle,
@@ -679,29 +714,6 @@ fn main() {
         lifecycle_serializer: Arc::new(TokioMutex::new(())),
     };
 
-    let tts_rx_for_setup = tts_rx_slot.clone();
-    let state_rx_for_setup = state_rx_slot.clone();
-    let state_events_for_setup = state_event_tx.clone();
-    let state_events_for_notifications = state_event_tx.clone();
-    let audio_state_tx = state_tx.clone();
-    let input_lengths_for_setup = input_lengths.clone();
-    let read_only_for_setup = read_only_tabs.clone();
-    let tab_activity_for_setup = tab_activity.clone();
-    let settings_for_setup = settings_handle.clone();
-    let settings_for_notifications = settings_handle.clone();
-    let tts_active_for_setup = tts_active.clone();
-    let tts_active_for_notifications = tts_active.clone();
-    let speak_session_for_setup = speak_session.clone();
-    let ai_tts_suppressed_for_tts = ai_tts_suppressed.clone();
-    let ai_tts_suppressed_for_state = ai_tts_suppressed.clone();
-    let initial_active_for_state = initial_active.clone();
-    let initial_active_for_tts = initial_active.clone();
-    let initial_active_for_notifications = initial_active.clone();
-    let stt_runtime_for_setup = stt_runtime_slot.clone();
-    let settings_for_stt = settings_handle.clone();
-    let settings_for_offload = settings_handle.clone();
-    let settings_for_graph = settings_handle.clone();
-    let settings_for_workbench = settings_handle.clone();
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
@@ -725,383 +737,36 @@ fn main() {
         // inside `.setup()`.
         .manage(preview::PreviewRegistry::default())
         .setup(move |app| {
-            // Recover a poisoned guard rather than `.ok()` skipping it: silently
-            // not spawning the state manager would leave the whole avatar /
-            // permission state machine dead with no diagnostic.
-            if let Some(rx) = state_rx_for_setup
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .take()
-            {
-                spawn_state_manager(
-                    app.handle().clone(),
-                    rx,
-                    StateManagerWiring {
-                        state_events: state_events_for_setup.clone(),
-                        input_lengths: input_lengths_for_setup.clone(),
-                        activity: tab_activity_for_setup.clone(),
-                        tab_metas: tab_metas.clone(),
-                        initial_active: initial_active_for_state,
-                        ai_tts_suppressed: ai_tts_suppressed_for_state.clone(),
-                    },
-                );
-            }
-            if let Some(rx) = tts_rx_for_setup
-                .lock()
-                .ok()
-                .and_then(|mut g| g.take())
-            {
-                init_tts_pipeline(
-                    app.handle().clone(),
-                    rx,
-                    audio_state_tx.clone(),
-                    settings_for_setup.clone(),
-                    audio_slot.clone(),
-                    tts_active_for_setup.clone(),
-                    initial_active_for_tts,
-                    speak_session_for_setup.clone(),
-                    ai_tts_suppressed_for_tts.clone(),
-                );
-                // Notification manager piggybacks on the audio output we
-                // just built. If audio init failed above, audio_slot is
-                // None and we skip — without audio there's nothing to
-                // play and nothing to wait on.
-                if let Some(audio) = audio_slot
-                    .read()
-                    .ok()
-                    .and_then(|g| g.as_ref().cloned())
-                {
-                    notifications::spawn_notification_manager(
-                        state_events_for_notifications.subscribe(),
-                        audio,
-                        tts_tx_for_notifications.clone(),
-                        settings_for_notifications.clone(),
-                        tts_active_for_notifications.clone(),
-                        initial_active_for_notifications,
-                    );
-                }
-            }
-            // V6-01 STT: spawn the capture + transcription threads. The
-            // engine is constructed lazily on the first recording, so a
-            // missing model never blocks launch — it surfaces as an `error`
-            // state on the first record attempt instead.
-            if let Some(rt) = stt_runtime_for_setup
-                .lock()
-                .ok()
-                .and_then(|mut g| g.take())
-            {
-                stt::spawn(app.handle().clone(), settings_for_stt.clone(), rt);
-            }
-
-            // V8-01 offload: construct the supervisor (needs the
-            // AppHandle for `offload-state` events) and manage it as its
-            // own state. With `enabled` + `autostart`, kick off a
-            // non-blocking start; otherwise it stays Stopped/Disabled and
-            // the user starts it from Settings (or it's lazy on first
-            // offload). Fail-soft: a bad command surfaces as an Error
-            // status, never blocks launch.
+            // ── The block ORDER below is load-bearing ────────────────────────
             //
-            // V30 Phase C: the block yields the session-push bus
-            // (`OffloadService::push_registry`) so the producers constructed
-            // further down — the graph service and the audit runner — can
-            // announce their long-running completions into channel-armed
-            // sessions. Only the send half travels; nothing holds the service
-            // itself, so no Arc cycle.
-            let (push_registry, mcp_host) = {
-                let supervisor = crate::offload::OffloadSupervisor::new(
-                    app.handle().clone(),
-                    settings_for_offload.clone(),
-                );
-                app.manage(supervisor.clone());
+            // R16 (V42): this closure was ~380 lines inline. Each call is one of
+            // its blocks, in the order it ran them, and the reasons that order
+            // exists are recorded on the reason itself rather than implied by
+            // adjacency. See `crate::wiring`'s module docs.
 
-                // V8-03: the app-side offload service — owns the warm pool,
-                // the global concurrency gate, the router, and the MCP host.
-                // Managed unconditionally so the IPC + loopback can reach it;
-                // the heavy machinery (warm host, loopback endpoint, health
-                // watch) only spins up when offload is enabled.
-                let service = crate::offload::OffloadService::new(
-                    app.handle().clone(),
-                    settings_for_offload.clone(),
-                    supervisor.clone(),
-                );
-                app.manage(service.clone());
-
-                // The offload runtime (autostart, warm host, loopback discovery
-                // endpoint, health watch, metrics poller) is started by a
-                // single idempotent helper. `started` guards against a double
-                // start — both the launch path and the runtime-enable watcher
-                // below call it, but the loopback binds a port and the pollers
-                // spawn tasks, so it must run at most once.
-                let offload_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                // Start the runtime (loopback + warm host) when ANY feature
-                // whose out-of-process children dial back in needs it: offload
-                // enabled, an MCP server exposed to Claude Code/OpenCode, the
-                // graph (its tools ride the injected cimp-offload server and
-                // the hook shims), or Code Audit exposed to a stdio consumer
-                // (`cimp --code-audit-mcp` proxies to `/audit/run`). Gating on
-                // offload alone stranded audit-only/graph-only projects with
-                // "cImp is not running" tool errors.
-                if settings_for_offload.current().loopback_needed()
-                    && !offload_started.swap(true, std::sync::atomic::Ordering::SeqCst)
-                {
-                    start_offload_runtime(
-                        app.handle().clone(),
-                        service.clone(),
-                        supervisor.clone(),
-                    );
-                }
-                // V8: a user who launches with offload disabled and enables it
-                // later in Settings must still get the loopback discovery
-                // endpoint (without it, MCP children can't connect back). Same
-                // for adding a Claude-Code-exposed MCP server while offload is
-                // off. Watch for either transition and start once.
-                // (Disabling at runtime leaves the runtime up but harmless —
-                // `OffloadService::run` is gated on `enabled` and refuses; a
-                // full teardown happens on the next relaunch.)
-                {
-                    let svc = service.clone();
-                    let sup = supervisor.clone();
-                    let app_handle = app.handle().clone();
-                    let watch = settings_for_offload.clone();
-                    let started = offload_started.clone();
-                    tauri::async_runtime::spawn(async move {
-                        let mut rx = watch.subscribe();
-                        loop {
-                            // H2-R1 (2026-08-05 review): a LAGGED receiver has
-                            // DROPPED frames, and one of them can be the very
-                            // false→true `loopback_needed` edge this task
-                            // exists to catch — leaving the runtime unstarted
-                            // while newly-spawned tabs inject hooks against
-                            // `current()`, self-healing only on the next
-                            // settings save. So Lagged is treated as "changed,
-                            // re-check" and re-reads the authoritative current
-                            // settings (the standard tokio broadcast pattern),
-                            // instead of `continue`-ing past the edge.
-                            let s = match rx.recv().await {
-                                Ok(s) => s,
-                                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                                    warn!(
-                                        dropped = n,
-                                        "offload: settings broadcast lagged — re-checking current settings"
-                                    );
-                                    watch.current()
-                                }
-                                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                            };
-                            // Start-once / never-stop stays monotonic: the
-                            // atomic swap is the only gate, so a replayed or
-                            // re-read `true` after a start is a no-op, and a
-                            // `false` never tears the runtime down.
-                            if s.loopback_needed()
-                                && !started.swap(true, std::sync::atomic::Ordering::SeqCst)
-                            {
-                                info!("offload: MCP host needed at runtime — starting offload runtime");
-                                start_offload_runtime(
-                                    app_handle.clone(),
-                                    svc.clone(),
-                                    sup.clone(),
-                                );
-                            }
-                        }
-                    });
-                }
-                // V30 Phase C: hand the push bus to the producers below.
-                // V38 Phase F: and the MCP host, for the audit runner's tier-2
-                // provider tools.
-                (service.push_registry(), service.mcp_host())
-            };
-
-            // V13 Phase A: the Workbench service (fs-batch broadcast today;
-            // checkpoint scheduling and worktree bookkeeping in later phases).
-            // Managed unconditionally, before the graph service below, since
-            // `GraphService::reindex_paths` looks it up via `AppHandle::state`
-            // on every watcher batch — construct it first so that lookup never
-            // races an empty state table during startup.
-            {
-                let workbench_service = crate::workbench::WorkbenchService::new(
-                    app.handle().clone(),
-                    settings_for_workbench.clone(),
-                );
-                // V13 Phase D D3: reconcile git's worktree bookkeeping once at
-                // startup (a worktree directory the user deleted out-of-band
-                // since the last run). Best-effort/fire-and-forget — see
-                // `worktree_prune_at_startup`'s doc comment; never blocks launch.
-                if let Ok(root) = std::env::current_dir() {
-                    let svc = workbench_service.clone();
-                    tauri::async_runtime::spawn(async move {
-                        svc.worktree_prune_at_startup(&root).await;
-                    });
-                }
-                app.manage(workbench_service);
-            }
-
-            // V9-01 code knowledge graph: the app-owned graph service that
-            // builds `<root>/<db_subdir>/graph.db` so the `graph_*` MCP tools
-            // have data to read. Managed unconditionally (the IPC reaches it
-            // either way); a full build only runs when the feature is enabled.
-            // Like the supervisor, it's fail-soft — a build error surfaces as
-            // an `error` status, never blocks launch.
-            {
-                let graph_service = crate::graph::GraphService::new(
-                    app.handle().clone(),
-                    settings_for_graph.clone(),
-                    // V30 Phase C: announce expensive full index builds.
-                    Some(push_registry.clone()),
-                );
-                app.manage(graph_service.clone());
-
-                // V23 Code Audit: the concurrent scan runner. Managed
-                // unconditionally (the IPC reaches it either way); a scan only
-                // runs when the user triggers one from the enabled tab. Root =
-                // the launch project directory every scan runs against.
-                {
-                    let audit_root =
-                        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-                    let audit_state = crate::audit::AuditState::new(
-                        app.handle().clone(),
-                        settings_for_graph.clone(),
-                        audit_root,
-                        // V30 Phase C: announce GUI-initiated scan completions.
-                        Some(push_registry.clone()),
-                        // V38 Phase F: the warm MCP host, for tier-2 provider
-                        // tools. The host and not the service — the runner needs
-                        // exactly one thing from that layer and holding the
-                        // service would be a cycle.
-                        Some(mcp_host.clone()),
-                    );
-                    // V26: publish the runner as the process global BEFORE
-                    // `manage` moves it — this is how the offload worker's native
-                    // audit tools (which run outside any Tauri command context)
-                    // reach the state. The managed `Arc` and the global point at
-                    // the same runner.
-                    crate::audit::set_global(audit_state.clone());
-                    app.manage(audit_state);
-                }
-
-                // V38 Phase A: discover drop-in tool plugins from
-                // `<exe-dir>/plugins/`. Managed unconditionally (the settings
-                // section reads it either way) and published as the process
-                // global BEFORE `manage` moves the handle — the audit seam's
-                // reason, unchanged: Phase C/D's consumers run outside any
-                // Tauri command context and cannot reach a managed state.
-                //
-                // The scan itself is off the setup thread: it walks a directory
-                // and reads every file in it, and nothing on the startup path
-                // needs the result synchronously — the store starts empty and
-                // the settings pane reads whatever is there when it mounts.
-                {
-                    let plugin_store = crate::plugins::PluginStore::new();
-                    crate::plugins::set_global(plugin_store.clone());
-                    app.manage(plugin_store.clone());
-                    tauri::async_runtime::spawn_blocking(move || {
-                        plugin_store.rescan();
-                    });
-                }
-
-                // Build the launch project's graph in the background on startup
-                // so a session opened immediately after launch finds an index.
-                // Runtime enable (false→true) also kicks one build via the
-                // settings watcher below.
-                if settings_for_graph.current().graph.enabled {
-                    if let Ok(root) = std::env::current_dir() {
-                        // Startup housekeeping — never a session push.
-                        graph_service
-                            .spawn_rebuild(root.clone(), crate::graph::RebuildOrigin::Automatic);
-                        // Phase D: keep the index live as files change.
-                        graph_service.start_watch(root);
-                    }
-                }
-                {
-                    let svc = graph_service.clone();
-                    let watch = settings_for_graph.clone();
-                    tauri::async_runtime::spawn(async move {
-                        let mut rx = watch.subscribe();
-                        let mut was_enabled = watch.current().graph.enabled;
-                        loop {
-                            match rx.recv().await {
-                                Ok(s) => {
-                                    let now = s.graph.enabled;
-                                    if now && !was_enabled {
-                                        if let Ok(root) = std::env::current_dir() {
-                                            info!("graph: enabled at runtime — building index");
-                                            // Side effect of a settings save, not
-                                            // a rebuild request — no push.
-                                            svc.spawn_rebuild(
-                                                root.clone(),
-                                                crate::graph::RebuildOrigin::Automatic,
-                                            );
-                                            svc.start_watch(root);
-                                        }
-                                    }
-                                    was_enabled = now;
-                                }
-                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                            }
-                        }
-                    });
-                }
-            }
-
-            spawn_settings_broadcast(
-                app.handle().clone(),
-                settings_for_setup.clone(),
-                read_only_for_setup.clone(),
-            );
-
-            // V32 Phase C3 (locked decision 13): keep the detection data fresh
-            // — a debounced launch check plus a periodic due-ness poll, per
-            // component, against a curated manifest. Spawned unconditionally,
-            // and gated INSIDE the tick rather than here (#46): the task
-            // re-reads settings every tick, so the Phase G L1 master switch and
-            // the per-component modes both take effect at the next tick with no
-            // restart, and a tick under a disabled master (or with both
-            // components `off`) returns before touching the network or the
-            // disk. A spawn-time gate would have made protection a spawn-baked
-            // setting for no gain. Deliberately NOT gated on `offload.enabled`
-            // — detection guards content that reaches Claude/OpenCode tabs
-            // through the proxy too, so its data must stay current whatever the
-            // worker is doing.
-            offload::detection::updater::spawn_scheduler(settings_for_setup.clone());
-
-            // V35 Phase F, trigger (b): if the installed Claude Code moved
-            // while cImp was closed — the common case, since the CLI
-            // self-updates on its own schedule — nothing observed the change,
-            // so the in-session trigger cannot fire. Run the canaries once now
-            // and let a clean result advance `claude_last_verified` by itself.
-            // Cheap and self-gating: two string comparisons against a
-            // mtime-cached read, no thread at all when the versions already
-            // match, and the work itself is a detached OS thread so startup
-            // never waits on it.
-            harness::verify::spawn_startup_check();
-
-            // Apply the project-derived window title. The hardcoded
-            // "cImp" from tauri.conf.json is what the OS sees before
-            // this fires; this overwrite happens during setup so the
-            // user only briefly sees the bare default.
-            if let Some(win) = app.get_webview_window("main") {
-                if let Err(e) = win.set_title(&window_title) {
-                    warn!(error = %e, "set_title for main window failed");
-                }
-            }
-
-            // V1.4-04 D.6: orphan-prune the scrollback dir so files
-            // for tabs deleted between sessions don't accumulate. We
-            // ask the registry for its sanitized known IDs (matches
-            // exactly what `pty::scrollback::scrollback_file_for`
-            // writes).
-            {
-                let app_handle = app.handle().clone();
-                tauri::async_runtime::spawn(async move {
-                    let state = app_handle.state::<AppState>();
-                    let registry = state.tabs.lock().await;
-                    let known = registry.known_scrollback_ids();
-                    drop(registry);
-                    crate::pty::scrollback::prune_orphans(&known);
-                });
-            }
+            // First, so that a failure anywhere below still leaves the avatar /
+            // permission state machine running.
+            wiring.wire_state_manager(app);
+            wiring.wire_tts_and_notifications(app);
+            wiring.wire_stt(app);
+            // Yields the session-push bus and the warm MCP host that the graph
+            // service and the audit runner are constructed with below (V30 Phase
+            // C, V38 Phase F), so it has to precede them.
+            let offload = wiring.wire_offload(app);
+            // The Workbench service is managed unconditionally and BEFORE the
+            // graph service below, since `GraphService::reindex_paths` looks it up
+            // via `AppHandle::state` on every watcher batch — construct it first
+            // so that lookup never races an empty state table during startup.
+            wiring.wire_workbench(app);
+            wiring.wire_graph(app, &offload);
+            wiring.wire_settings_broadcast(app);
+            wiring.wire_detection_updater();
+            wiring.wire_harness_verify();
+            wiring.wire_window_title(app);
+            wiring.wire_scrollback_prune(app);
             Ok(())
         })
+
         .invoke_handler(tauri::generate_handler![
             pty_start,
             pty_restart,
@@ -1385,46 +1050,6 @@ fn main() {
         .expect("failed to launch tauri app");
 }
 
-/// Start the offload runtime: autostart opted-in Local backends, warm the MCP
-/// host, spawn the health watch + metrics poller, and bring up the loopback
-/// discovery endpoint. Call at most once (guarded by the caller) — the loopback
-/// binds a port and the pollers spawn long-lived tasks.
-fn start_offload_runtime(
-    app_handle: tauri::AppHandle,
-    service: std::sync::Arc<crate::offload::OffloadService>,
-    supervisor: std::sync::Arc<crate::offload::OffloadSupervisor>,
-) {
-    // V8-02: autostart every Local backend that opted in.
-    tauri::async_runtime::spawn(async move {
-        supervisor.autostart_all().await;
-    });
-    // V8-03: warm the MCP host, start the loopback endpoint (writes the
-    // discovery files), and watch backend health so `/events` →
-    // `tools/list_changed` tracks up/down.
-    tauri::async_runtime::spawn(async move {
-        service.warm_host().await;
-        service.spawn_health_watch();
-        // V37 C6: the MCP health checker — its own cadence, and it never
-        // reconciles (see `spawn_mcp_health_watch`).
-        service.spawn_mcp_health_watch();
-        service.spawn_metrics_poller();
-        // The launch root rides the discovery entry so MCP children spawned
-        // by a DIFFERENT project's agent can't misroute to this instance
-        // (per-instance `.cimp-discovery/<pid>.json`; see loopback.rs).
-        let root = app_handle.state::<AppState>().launch.cwd.clone();
-        match crate::offload::loopback::Loopback::start(service.clone(), app_handle.clone(), &root)
-            .await
-        {
-            Ok(lb) => {
-                app_handle.manage(lb);
-            }
-            Err(e) => {
-                warn!(error = %e, "offload: loopback endpoint failed to start")
-            }
-        }
-    });
-}
-
 /// Resolve the project label used in the OS window title. Walks up
 /// from `cwd` looking for a `.git` entry (directory or file — submodules
 /// and worktrees use a `.git` file pointing at the parent's gitdir).
@@ -1520,96 +1145,6 @@ fn build_tab_metas_from_settings(settings: &Settings) -> Vec<TabMeta> {
 // Wiring function called once from setup: every argument is a distinct handle
 // or channel end the pipeline owns, with no natural grouping.
 #[allow(clippy::too_many_arguments)]
-fn init_tts_pipeline(
-    app: AppHandle,
-    tts_rx: mpsc::Receiver<TtsRequest>,
-    state_signals: mpsc::Sender<StateSignal>,
-    settings: SettingsHandle,
-    audio_slot: Arc<RwLock<Option<Arc<AudioOutput>>>>,
-    active: ActiveTab,
-    initial_active: TabId,
-    speak_session: SpeakSession,
-    ai_tts_suppressed: AiTtsSuppressed,
-) {
-    let audio = match AudioOutput::new(state_signals.clone(), settings.clone(), active.clone()) {
-        Ok(a) => Arc::new(a),
-        Err(e) => {
-            warn!(error = %e, "audio output unavailable; TTS will be silent");
-            let _ = state_signals.try_send(StateSignal::AudioError {
-                tab: initial_active.clone(),
-            });
-            drop(tts_rx);
-            return;
-        }
-    };
-
-    if let Ok(mut slot) = audio_slot.write() {
-        *slot = Some(audio.clone());
-    }
-
-    spawn_amplitude_streamer(app, audio.clone());
-
-    // The worker owns the engine lifecycle now: it loads the Kokoro model when
-    // `tts.enabled` is on (and reloads/unloads it as that toggles), so this
-    // setup no longer constructs the engine eagerly. (`initial_active` above
-    // labels the audio-error signal.)
-    spawn_tts_worker(
-        audio,
-        tts_rx,
-        state_signals,
-        settings,
-        active,
-        speak_session,
-        ai_tts_suppressed,
-    );
-}
-
-fn spawn_settings_broadcast(app: AppHandle, settings: SettingsHandle, read_only: ReadOnlyTabs) {
-    tauri::async_runtime::spawn(async move {
-        let mut rx = settings.subscribe();
-        let initial = settings.current();
-        let mut current_log_level = initial.logging.level;
-        let mut current_retention: LogRetention = initial.logging.retention;
-        let mut current_content_enabled = initial.logging.content_capture.enabled;
-        let mut current_content_retention: LogRetention = initial.logging.content_capture.retention;
-        let _ = app.emit("settings-changed", initial);
-        loop {
-            match rx.recv().await {
-                Ok(s) => {
-                    // V39 Phase A: `read_only` is a persisted per-tab field, so
-                    // it can move through the Settings window, a project-overlay
-                    // switch or a hand edit as well as through
-                    // `tab_set_read_only`. Re-syncing here keeps the runtime map
-                    // `pty_write` enforces from becoming a second source of
-                    // truth that drifts from the file.
-                    read_only.sync_users(user_read_only_tabs(&s));
-                    if s.logging.level != current_log_level {
-                        current_log_level = s.logging.level;
-                        logging::set_level(current_log_level);
-                    }
-                    if s.logging.retention != current_retention {
-                        current_retention = s.logging.retention;
-                        logging::run_cleanup(current_retention);
-                    }
-                    if s.logging.content_capture.enabled != current_content_enabled {
-                        current_content_enabled = s.logging.content_capture.enabled;
-                        content::set_enabled(current_content_enabled);
-                    }
-                    if s.logging.content_capture.retention != current_content_retention {
-                        current_content_retention = s.logging.content_capture.retention;
-                        content::run_cleanup(current_content_retention);
-                    }
-                    let _ = app.emit::<Settings>("settings-changed", s);
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    warn!(skipped = n, "settings broadcast lagged");
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-            }
-        }
-    });
-}
-
 #[cfg(test)]
 mod consumer_flag_tests {
     use super::*;

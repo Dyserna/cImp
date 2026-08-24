@@ -11,19 +11,22 @@
 //!
 //! # The order is load-bearing and stays literal
 //!
-//! [`Wiring::wire_workbench`] runs **before** [`Wiring::wire_graph`] because
-//! `GraphService::reindex_paths` looks the workbench service up through
-//! `AppHandle::state` on every watcher batch — construct it first and that
-//! lookup can never race an empty state table during startup. The reason is
-//! spelled at the call site in `main`, where a reordering has to delete it to
-//! happen.
+//! [`Wiring::wire_workbench`] runs **first of the three service blocks**,
+//! because both of the others are CONSTRUCTED with the service it yields: the
+//! graph service fans every watcher batch out to it, and the offload service
+//! takes the in-app worker's pre-mutation checkpoint through it. Until V42
+//! Phase A2 both of those were `AppHandle::state` lookups, which is what made
+//! the order a race against an empty state table rather than a hand-off; now a
+//! wrong order is a compile error, and the reason is still spelled at the call
+//! site in `main`.
 //!
 //! Two more orderings that are not obvious from the names:
 //! [`Wiring::wire_offload`] must precede [`Wiring::wire_graph`] because it
-//! yields the session-push bus and the warm MCP host that the graph service and
-//! the audit runner are constructed with (V30 Phase C, V38 Phase F), and the
-//! state manager is wired first so that a failure anywhere later still leaves
-//! the avatar/permission state machine running.
+//! yields the session-push bus, the warm MCP host and the supervisor that the
+//! graph service and the audit runner are constructed with (V30 Phase C, V38
+//! Phase F, V42 Phase A2), and the state manager is wired first so that a
+//! failure anywhere later still leaves the avatar/permission state machine
+//! running.
 //!
 //! # What is NOT here
 //!
@@ -89,6 +92,14 @@ pub struct Wiring {
     pub ai_tts_suppressed: AiTtsSuppressed,
     /// `"<project> - cImp"`, applied to the main window during `setup`.
     pub window_title: String,
+    /// V42 Phase A2: `AppState`'s registry handle, launch directory and
+    /// invocation args — the three [`CoreHost`](crate::service::host::CoreHost)
+    /// fields `Wiring` did not already carry. They are here so [`Self::core`]
+    /// can mint the value the offload layer used to look up through an
+    /// `AppHandle`.
+    pub tabs: crate::tabs::TabRegistryHandle,
+    pub launch_cwd: std::path::PathBuf,
+    pub invocation_args: Arc<Vec<String>>,
 }
 
 /// What [`Wiring::wire_offload`] hands the producers wired after it.
@@ -113,6 +124,30 @@ pub struct OffloadHandoff {
 }
 
 impl Wiring {
+    /// The handles the headless core runs on, over this app.
+    ///
+    /// **The one place an `AppHandle` becomes a
+    /// [`CoreHost`](crate::service::host::CoreHost)** — which is the whole
+    /// point of V42 Phase A2: the offload supervisor, the offload service and
+    /// (through them) the delegation engine used to each resolve `AppState`
+    /// out of the managed-state table at the moment they needed it. They are
+    /// handed it here instead, once, at the composition root.
+    fn core(&self, app: &App) -> crate::service::host::CoreHost {
+        crate::service::host::CoreHost {
+            events: Arc::new(crate::service::sink::TauriEventSink::new(
+                app.handle().clone(),
+            )),
+            settings: self.settings.clone(),
+            tabs: self.tabs.clone(),
+            read_only: self.read_only.clone(),
+            tab_activity: self.tab_activity.clone(),
+            input_lengths: self.input_lengths.clone(),
+            tts_segments: self.tts_tx.clone(),
+            state_signals: self.state_signals.clone(),
+            launch_cwd: self.launch_cwd.clone(),
+            invocation_args: self.invocation_args.clone(),
+        }
+    }
     /// Spawn the state-manager task.
     pub fn wire_state_manager(&self, app: &App) {
         // Recover a poisoned guard rather than `.ok()` skipping it: silently
@@ -218,9 +253,13 @@ impl Wiring {
     /// the user starts it from Settings (or it's lazy on first
     /// offload). Fail-soft: a bad command surfaces as an Error
     /// status, never blocks launch.
-    pub fn wire_offload(&self, app: &App) -> OffloadHandoff {
-        let supervisor =
-            crate::offload::OffloadSupervisor::new(app.handle().clone(), self.settings.clone());
+    pub fn wire_offload(
+        &self,
+        app: &App,
+        workbench: &Arc<crate::workbench::WorkbenchService>,
+    ) -> OffloadHandoff {
+        let core = self.core(app);
+        let supervisor = crate::offload::OffloadSupervisor::new(core.clone());
         app.manage(supervisor.clone());
 
         // V8-03: the app-side offload service — owns the warm pool,
@@ -229,9 +268,12 @@ impl Wiring {
         // the heavy machinery (warm host, loopback endpoint, health
         // watch) only spins up when offload is enabled.
         let service = crate::offload::OffloadService::new(
-            app.handle().clone(),
-            self.settings.clone(),
+            core,
             supervisor.clone(),
+            // V42 Phase A2: the in-app worker's pre-mutation checkpoint, as a
+            // constructor dependency instead of an `AppHandle::try_state` at
+            // tool-call time. This is why `wire_workbench` runs first.
+            Some(workbench.clone()),
         );
         app.manage(service.clone());
 
@@ -253,7 +295,12 @@ impl Wiring {
         if self.settings.current().loopback_needed()
             && !offload_started.swap(true, std::sync::atomic::Ordering::SeqCst)
         {
-            start_offload_runtime(app.handle().clone(), service.clone(), supervisor.clone());
+            start_offload_runtime(
+                app.handle().clone(),
+                self.core(app),
+                service.clone(),
+                supervisor.clone(),
+            );
         }
         // V8: a user who launches with offload disabled and enables it
         // later in Settings must still get the loopback discovery
@@ -267,6 +314,7 @@ impl Wiring {
             let svc = service.clone();
             let sup = supervisor.clone();
             let app_handle = app.handle().clone();
+            let watch_core = self.core(app);
             let watch = self.settings.clone();
             let started = offload_started.clone();
             tauri::async_runtime::spawn(async move {
@@ -301,7 +349,12 @@ impl Wiring {
                         && !started.swap(true, std::sync::atomic::Ordering::SeqCst)
                     {
                         info!("offload: MCP host needed at runtime — starting offload runtime");
-                        start_offload_runtime(app_handle.clone(), svc.clone(), sup.clone());
+                        start_offload_runtime(
+                            app_handle.clone(),
+                            watch_core.clone(),
+                            svc.clone(),
+                            sup.clone(),
+                        );
                     }
                 }
             });
@@ -324,10 +377,11 @@ impl Wiring {
     /// Managed unconditionally, and **before** [`Self::wire_graph`] — see the
     /// module docs and the call site.
     ///
-    /// V42 Phase A2: hands the service back, because `wire_graph` now
-    /// *constructs* the graph service with it rather than leaving it to find
-    /// one in the managed-state table on every watcher batch. That is what
-    /// makes the ordering above a hand-off instead of a race.
+    /// V42 Phase A2: hands the service back, because `wire_graph` and
+    /// `wire_offload` now *construct* their services with it rather than
+    /// leaving each to find one in the managed-state table at use time. That is
+    /// what makes the ordering above a hand-off instead of a race — and why
+    /// this block moved to the front.
     pub fn wire_workbench(&self, app: &App) -> Arc<crate::workbench::WorkbenchService> {
         let workbench_service = crate::workbench::WorkbenchService::new(
             std::sync::Arc::new(crate::service::sink::TauriEventSink::new(
@@ -590,6 +644,7 @@ impl Wiring {
 /// binds a port and the pollers spawn long-lived tasks.
 fn start_offload_runtime(
     app_handle: AppHandle,
+    core: crate::service::host::CoreHost,
     service: Arc<crate::offload::OffloadService>,
     supervisor: Arc<crate::offload::OffloadSupervisor>,
 ) {
@@ -610,9 +665,16 @@ fn start_offload_runtime(
         // The launch root rides the discovery entry so MCP children spawned
         // by a DIFFERENT project's agent can't misroute to this instance
         // (per-instance `.cimp-discovery/<pid>.json`; see loopback.rs).
-        let root = app_handle.state::<crate::ipc::AppState>().launch.cwd.clone();
-        match crate::offload::loopback::Loopback::start(service.clone(), app_handle.clone(), &root)
-            .await
+        // V42 Phase A2: read off the injected handles rather than re-resolved
+        // from the managed-state table — the same value, one fewer lookup.
+        let root = core.launch_cwd.clone();
+        match crate::offload::loopback::Loopback::start(
+            service.clone(),
+            app_handle.clone(),
+            core,
+            &root,
+        )
+        .await
         {
             Ok(lb) => {
                 app_handle.manage(lb);

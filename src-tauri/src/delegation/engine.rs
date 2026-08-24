@@ -42,9 +42,9 @@
 
 use std::time::Duration;
 
-use tauri::{AppHandle, Emitter, Manager};
-
 use crate::harness::contract::{self, CAP_DELEGATION_WORKER};
+use crate::service::host::CoreHost;
+use crate::service::sink::EventSinkExt;
 use crate::settings::{Settings, TabConfig};
 use crate::state::TabId;
 
@@ -102,10 +102,10 @@ pub struct DelegationChanged {
 
 /// Publish the current in-flight set. Called on every transition, and cheap
 /// enough to be called on the prompt edges too.
-pub(crate) fn publish(app: &AppHandle) {
-    let _ = app.emit(
+pub(crate) fn publish(host: &CoreHost) {
+    let _ = host.events.emit(
         EVENT_DELEGATION_CHANGED,
-        DelegationChanged {
+        &DelegationChanged {
             in_flight: super::statuses(),
         },
     );
@@ -397,13 +397,10 @@ fn busy_reason(
 /// busy-ness makes the router prefer a backend that can start now and fall back
 /// to this one only when there is nothing else — which is exactly what it does
 /// with a full llama-server.
-pub async fn worker_busy(app: &AppHandle, worker: &TabId) -> bool {
-    let Some(state) = app.try_state::<crate::ipc::AppState>() else {
-        return true;
-    };
-    let flags = state.tab_activity.flags(worker);
+pub async fn worker_busy(host: &CoreHost, worker: &TabId) -> bool {
+    let flags = host.tab_activity.flags(worker);
     let pending = {
-        let map = state
+        let map = host
             .input_lengths
             .read()
             .unwrap_or_else(|e| e.into_inner());
@@ -432,26 +429,23 @@ pub async fn worker_busy(app: &AppHandle, worker: &TabId) -> bool {
 /// `Err` carries the reason, unchanged from the one `drive` would refuse with,
 /// so a backend that is "down" in the pool and a delegation that is refused at
 /// preflight tell the user the same story.
-pub async fn worker_ready(app: &AppHandle, worker: &TabId) -> Result<(), String> {
-    let Some(state) = app.try_state::<crate::ipc::AppState>() else {
-        return Err("cImp's tab layer is not running, so no tab can be driven".to_string());
-    };
-    let settings = state.settings.current();
+pub async fn worker_ready(host: &CoreHost, worker: &TabId) -> Result<(), String> {
+    let settings = host.settings.current();
     if let Some(reason) = gate_reason(&settings) {
         return Err(reason);
     }
     let agent = worker_agent(&settings, worker)?;
     let worker_name = {
-        let registry = state.tabs.lock().await;
+        let registry = host.tabs.lock().await;
         registry
             .name_of(worker)
             .unwrap_or_else(|| worker.as_str().to_string())
     };
     let alive = {
-        let registry = state.tabs.lock().await;
+        let registry = host.tabs.lock().await;
         registry.is_started(worker).await
     };
-    worker_process(alive, state.tab_activity.flags(worker).exited, &worker_name)?;
+    worker_process(alive, host.tab_activity.flags(worker).exited, &worker_name)?;
     worker_profile(agent, &worker_name)?;
     worker_completion_source(agent, worker, &worker_name)
 }
@@ -496,12 +490,12 @@ pub(crate) async fn watch_for_driver_gone<F: std::future::Future>(
 /// path with a client behind it makes**, so the cancel handling is written
 /// once.
 pub async fn drive_watching(
-    app: &AppHandle,
+    host: &CoreHost,
     req: DriveRequest,
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<Reply, DelegationError> {
     let worker = req.worker.clone();
-    watch_for_driver_gone(&worker, cancel, drive(app, req)).await
+    watch_for_driver_gone(&worker, cancel, drive(host, req)).await
 }
 
 /// **Drive one worker tab and return its answer.**
@@ -510,13 +504,8 @@ pub async fn drive_watching(
 /// one terminal `delegation` Events row, plus one `start` row for a delegation
 /// that actually started. A refusal mints only `refused` — nothing was locked,
 /// nothing was typed, so a `start` row would be a lie.
-pub async fn drive(app: &AppHandle, req: DriveRequest) -> Result<Reply, DelegationError> {
-    let Some(state) = app.try_state::<crate::ipc::AppState>() else {
-        return Err(refuse(
-            "cImp's tab layer is not running, so no tab can be driven",
-        ));
-    };
-    let settings = state.settings.current();
+pub async fn drive(host: &CoreHost, req: DriveRequest) -> Result<Reply, DelegationError> {
+    let settings = host.settings.current();
 
     // ── preflight (locked decision 12), in order, each failure named ────────
     //
@@ -550,7 +539,7 @@ pub async fn drive(app: &AppHandle, req: DriveRequest) -> Result<Reply, Delegati
         return Err(e);
     };
     let driver_name = {
-        let registry = state.tabs.lock().await;
+        let registry = host.tabs.lock().await;
         registry
             .name_of(&driver)
             .unwrap_or_else(|| driver.as_str().to_string())
@@ -577,7 +566,7 @@ pub async fn drive(app: &AppHandle, req: DriveRequest) -> Result<Reply, Delegati
         Err(reason) => return Err(deny(reason)),
     };
     let worker_name = {
-        let registry = state.tabs.lock().await;
+        let registry = host.tabs.lock().await;
         registry
             .name_of(&req.worker)
             .unwrap_or_else(|| req.worker.as_str().to_string())
@@ -587,10 +576,10 @@ pub async fn drive(app: &AppHandle, req: DriveRequest) -> Result<Reply, Delegati
     //    write: a refusal that surfaced from the write has already engaged the
     //    lock and minted a `start` row for a delegation that never began.
     let alive = {
-        let registry = state.tabs.lock().await;
+        let registry = host.tabs.lock().await;
         registry.is_started(&req.worker).await
     };
-    let flags = state.tab_activity.flags(&req.worker);
+    let flags = host.tab_activity.flags(&req.worker);
     if let Err(reason) = worker_process(alive, flags.exited, &worker_name) {
         return Err(deny(reason));
     }
@@ -643,7 +632,7 @@ pub async fn drive(app: &AppHandle, req: DriveRequest) -> Result<Reply, Delegati
     //     user's name.) One rule, shared with the router's free-slot question —
     //     see `busy_reason`.
     let pending = {
-        let map = state
+        let map = host
             .input_lengths
             .read()
             .unwrap_or_else(|e| e.into_inner());
@@ -699,9 +688,9 @@ pub async fn drive(app: &AppHandle, req: DriveRequest) -> Result<Reply, Delegati
     if auto_lock {
         // BEFORE the write (locked decision 12 + the "user types during the
         // paste window" failure mode): the window is closed by ordering.
-        state.read_only.set_driven(&req.worker, Some(driver.clone()));
+        host.read_only.set_driven(&req.worker, Some(driver.clone()));
     }
-    publish(app);
+    publish(host);
     record_row(
         transition::START,
         &worker_name,
@@ -715,8 +704,7 @@ pub async fn drive(app: &AppHandle, req: DriveRequest) -> Result<Reply, Delegati
     );
 
     let outcome = run_flight(
-        app,
-        &state,
+        host,
         &req.worker,
         &worker_name,
         &typed,
@@ -731,11 +719,11 @@ pub async fn drive(app: &AppHandle, req: DriveRequest) -> Result<Reply, Delegati
         // Clears ONLY the engine's lock: a `User` lock the tab already carried
         // survives (Phase A keeps the two sources side by side for exactly
         // this).
-        state.read_only.set_driven(&req.worker, None);
+        host.read_only.set_driven(&req.worker, None);
     }
     let started_ms = now;
     release(&req.worker);
-    publish(app);
+    publish(host);
 
     match outcome {
         Ok((raw, submit_ms)) => {
@@ -813,10 +801,8 @@ pub async fn drive(app: &AppHandle, req: DriveRequest) -> Result<Reply, Delegati
 ///
 /// Returns the raw completion text and the submit timestamp, so the caller can
 /// report flight time measured from the request rather than from the claim.
-#[allow(clippy::too_many_arguments)]
 async fn run_flight(
-    app: &AppHandle,
-    state: &crate::ipc::AppState,
+    host: &CoreHost,
     worker: &TabId,
     worker_name: &str,
     typed: &str,
@@ -829,8 +815,8 @@ async fn run_flight(
     mark_submitted(worker, submit_ms);
 
     // The ONE input pipeline (the V39 cross-module invariant): the same
-    // `write_through_pipeline` `pty_write` runs — the unsent-input counters and
-    // the `UserSubmit` signal — reached without the read-only check, which is
+    // `PtyService::write_through` `pty_write` runs — the unsent-input counters
+    // and the `UserSubmit` signal — reached without the read-only check, which is
     // the only thing the engine bypasses and only because it holds the lock
     // itself. (It also listed the V20 echo-suppression bookkeeping until #113
     // deleted that subsystem; nothing consumed it.)
@@ -840,13 +826,10 @@ async fn run_flight(
     // letting the pipeline infer the submit from them raised `UserSubmit` one
     // write early — clearing the worker's prompt mirror and zeroing its input
     // counter for a turn that had not started.
-    if let Err(e) = crate::ipc::commands::write_through_pipeline(
-        state,
-        worker,
-        paste,
-        crate::ipc::commands::Submit::No,
-    )
-    .await
+    if let Err(e) = host
+        .pty()
+        .write_through(worker, paste, crate::service::pty::Submit::No)
+        .await
     {
         return Err(DelegationError::WorkerExited(format!(
             "could not type into worker tab `{worker_name}`: {e}"
@@ -857,13 +840,10 @@ async fn run_flight(
     // it has not finished ingesting.
     tokio::time::sleep(Duration::from_millis(profile.settle_ms)).await;
     let submit = String::from_utf8_lossy(profile.submit).into_owned();
-    if let Err(e) = crate::ipc::commands::write_through_pipeline(
-        state,
-        worker,
-        submit,
-        crate::ipc::commands::Submit::Yes,
-    )
-    .await
+    if let Err(e) = host
+        .pty()
+        .write_through(worker, submit, crate::service::pty::Submit::Yes)
+        .await
     {
         return Err(DelegationError::WorkerExited(format!(
             "could not submit the turn on worker tab `{worker_name}`: {e}"
@@ -881,7 +861,7 @@ async fn run_flight(
                 // Leave nothing relaxed behind us; `drive`'s `set_driven(None)`
                 // clears it too, but the two must agree even if this path is
                 // reached first.
-                state.read_only.set_prompt_relaxed(worker, false);
+                host.read_only.set_prompt_relaxed(worker, false);
             }
             // Decision 6's own words, and the ONE string this outcome has: the
             // driver reads it as its tool result and the `takeover` row
@@ -903,7 +883,7 @@ async fn run_flight(
         // closes while waiting" row says.
         if is_driver_gone(worker) {
             if relaxed && auto_lock {
-                state.read_only.set_prompt_relaxed(worker, false);
+                host.read_only.set_prompt_relaxed(worker, false);
             }
             return Err(DelegationError::DriverGone(format!(
                 "the caller went away while tab `{worker_name}` was working — cImp stopped \
@@ -916,7 +896,7 @@ async fn run_flight(
         // being closed (which drops the mirror row entirely, so the mirror's
         // answer becomes indistinguishable from a healthy idle tab — see
         // `note_worker_gone`).
-        let flags = state.tab_activity.flags(worker);
+        let flags = host.tab_activity.flags(worker);
         if flags.exited {
             return Err(DelegationError::WorkerExited(format!(
                 "worker tab `{worker_name}` exited while the task was running"
@@ -943,14 +923,14 @@ async fn run_flight(
             // user can answer could not be answered, and the flight ran to its
             // deadline reporting "worker awaiting permission". It also dropped
             // the driver identity the banner and Take over read.
-            state.read_only.set_prompt_relaxed(worker, awaiting);
+            host.read_only.set_prompt_relaxed(worker, awaiting);
             // The signal has a consumer: the lock re-engages on the falling
             // edge. A relaxation nobody re-engages would be a delegation that
             // silently gave the keyboard back for the rest of its run.
             relaxed = awaiting;
         }
         if changed {
-            publish(app);
+            publish(host);
         }
 
         if let Some(text) = take_completion(worker) {
@@ -1242,13 +1222,18 @@ mod tests {
 
     /// **The paste is not a submit; the submit is** (V39 review L-1).
     ///
-    /// `write_through_pipeline` used to infer it from the bytes, and the
-    /// engine's paste is full of newlines — a multi-line request is one
-    /// bracketed paste — so `UserSubmit` fired one write early, clearing the
-    /// worker's prompt mirror and zeroing its input counter for a turn that had
-    /// not started. Asserted on the source because the pipeline needs a running
-    /// `AppState`, and what must hold is a property of the CALL SITES: there
-    /// are exactly two, and they disagree about this argument.
+    /// `write_through` used to infer it from the bytes, and the engine's paste
+    /// is full of newlines — a multi-line request is one bracketed paste — so
+    /// `UserSubmit` fired one write early, clearing the worker's prompt mirror
+    /// and zeroing its input counter for a turn that had not started. Asserted
+    /// on the source because what must hold is a property of the CALL SITES:
+    /// there are exactly two, and they disagree about this argument.
+    ///
+    /// V42 Phase A2 re-pointed the needle. The call used to be
+    /// `crate::ipc::commands::write_through_pipeline(state, ..)` — a one-line
+    /// adapter at the wire boundary, because the engine had no handles of its
+    /// own; it is `host.pty().write_through(..)` now. Same pipeline, same two
+    /// sites, and this scan is red until the needle follows them (probed).
     #[test]
     fn the_paste_is_written_as_not_a_submit_and_the_submit_as_one() {
         let src = include_str!("engine.rs").replace('\r', "");
@@ -1266,7 +1251,7 @@ mod tests {
             body.push_str(&src[at..]);
         }
         let calls: Vec<&str> = body
-            .split("write_through_pipeline(")
+            .split(".write_through(")
             .skip(1)
             .map(|rest| &rest[..rest.len().min(220)])
             .collect();
@@ -1477,7 +1462,7 @@ mod tests {
         }
         let writes: Vec<&str> = body
             .lines()
-            .filter(|l| l.contains("write_through_pipeline(") && !l.trim_start().starts_with("//"))
+            .filter(|l| l.contains(".write_through(") && !l.trim_start().starts_with("//"))
             .collect();
         assert_eq!(
             writes.len(),

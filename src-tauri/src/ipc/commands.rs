@@ -114,27 +114,15 @@ pub async fn pty_get_scrollback(state: State<'_, AppState>, tab: TabId) -> AppRe
     pty_service(&state).scrollback(tab).await
 }
 
-/// Whether a write submits the turn. Re-exported from
-/// [`service::pty`](crate::service::pty) so the delegation engine keeps naming
-/// it beside the pipeline it calls.
-pub(crate) use crate::service::pty::Submit;
-
-/// The delegation engine's door into the input pipeline.
-///
-/// Kept at this boundary, and kept taking `&AppState`, on purpose: the engine
-/// resolves its own state through `AppHandle::state::<AppState>()`, which is
-/// V42 Phase A2's cluster to unpick, not A1's. One line here means the engine's
-/// two call sites — and the source-scanned property that they disagree about
-/// `Submit` — are untouched by the mechanical wrap. When A2 injects the
-/// engine's handles, this adapter goes with it.
-pub(crate) async fn write_through_pipeline(
-    state: &AppState,
-    tab: &TabId,
-    input: String,
-    submit: Submit,
-) -> AppResult<()> {
-    pty_service(state).write_through(tab, input, submit).await
-}
+// V42 Phase A2: `write_through_pipeline` used to sit here — a one-line adapter
+// giving the delegation engine a door into the input pipeline over `&AppState`,
+// because the engine had no handles of its own and resolved everything through
+// `AppHandle::state::<AppState>()`. A2 gave it a
+// [`CoreHost`](crate::service::host::CoreHost), so the engine calls
+// `host.pty().write_through(..)` directly and the adapter — and the `Submit`
+// re-export that existed to be named beside it — are gone. The pipeline, its
+// two call sites and the source-scanned property that they disagree about
+// `Submit` are unchanged; only the spelling the scanners look for moved.
 
 /// Deliver one chunk of keyboard input to a tab's PTY. See
 /// [`PtyService::write`] for the read-only enforcement point and the terminal-

@@ -60,6 +60,7 @@ pub mod checks;
 pub mod delegation;
 pub mod graph;
 pub mod harness;
+pub mod host;
 pub mod layout;
 pub mod offload;
 pub mod preview;

@@ -190,6 +190,31 @@ impl<'a> OffloadServiceUseCases<'a> {
     pub fn server_metrics(&self) -> Vec<BackendDashboard> {
         self.service.server_metrics()
     }
+
+    /// Rescan `<exe-dir>/plugins/` and announce that the native tool surface
+    /// may have moved — the manual **Rescan** action (V38 decision 8).
+    ///
+    /// **The two steps are one use case, and the second is the whole point.** A
+    /// rescan can add, remove or rename every `check`-kind tool `run_check`
+    /// advertises, and it writes no settings — so without the ask, nothing
+    /// would tell a live session its tool list moved. It is only an ASK: the
+    /// pulse gate compares the surface fingerprint and stays silent when
+    /// nothing actually changed, which is why this call is unconditional here
+    /// and conditional there.
+    ///
+    /// V42 Phase A2. A1 left this at the wire boundary and said why: the rule
+    /// needs an [`OffloadService`], whose constructor took an `AppHandle`. It
+    /// does not any more.
+    pub async fn rescan_plugins(
+        &self,
+        store: Arc<crate::plugins::PluginStore>,
+    ) -> AppResult<Arc<crate::plugins::PluginSet>> {
+        // On the blocking pool because it walks a directory and reads every
+        // file in it (`audit_refresh_census`'s precedent).
+        let set = crate::service::on_blocking_pool(move || store.rescan()).await?;
+        self.service.signal_native_change();
+        Ok(set)
+    }
 }
 
 // ── V21 / V40 Phase E: derive a harness's local-provider block ────────────
@@ -406,6 +431,94 @@ pub fn updates_allowed(settings: &Settings) -> AppResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::service::host::testing::core_host;
+    use crate::settings::SettingsHandle;
+
+    /// A supervisor and a service over throwaway handles — **no Tauri app**.
+    ///
+    /// The fixture A1-3 could not write: both constructors took an `AppHandle`,
+    /// so the status surface these two use cases expose was reachable only by
+    /// opening the Offload pane in the running app. V42 Phase A2 replaced the
+    /// handle with a [`CoreHost`](crate::service::host::CoreHost).
+    ///
+    /// The `_core` fields are held, not ignored: they own the receiving ends of
+    /// the host's two channels (see `service::host::testing`).
+    struct OffloadFixture {
+        _core: crate::service::host::testing::TestCore,
+        _scratch: std::path::PathBuf,
+        supervisor: Arc<OffloadSupervisor>,
+        service: Arc<OffloadService>,
+    }
+
+    impl Drop for OffloadFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self._scratch);
+        }
+    }
+
+    impl OffloadFixture {
+        fn new(settings: Settings) -> Self {
+            let scratch =
+                std::env::temp_dir().join(format!("cimp-offloadsvc-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&scratch).expect("scratch dir");
+            let handle = SettingsHandle::new(settings.clone(), settings, scratch.clone());
+            let core = core_host(handle);
+            let supervisor = OffloadSupervisor::new(core.host.clone());
+            let service = OffloadService::new(core.host.clone(), supervisor.clone(), None);
+            Self {
+                _core: core,
+                _scratch: scratch,
+                supervisor,
+                service,
+            }
+        }
+    }
+
+    /// **Previously "user opens the Offload pane".** The two status use cases
+    /// the dashboard polls, answered by services built on the stack.
+    ///
+    /// What is pinned is the pair of answers that differ by one setting: the
+    /// supervisor reports `Disabled` rather than `Stopped` when offload is off
+    /// — the distinction the pane renders as "switched off" versus "not running
+    /// yet", and the one a user reads before deciding whether to press Start —
+    /// and the service's aggregate reports the configured global cap with
+    /// nothing in flight and no queue.
+    #[tokio::test]
+    async fn the_offload_status_surfaces_answer_without_a_tauri_app() {
+        let mut off = Settings::default();
+        off.offload.enabled = false;
+        let fixture = OffloadFixture::new(off);
+        assert_eq!(
+            OffloadServerUseCases::new(&fixture.supervisor)
+                .primary_state()
+                .await,
+            OffloadState::Disabled,
+            "offload off must read as Disabled, not as Stopped"
+        );
+
+        let mut on = Settings::default();
+        on.offload.enabled = true;
+        on.offload.global_concurrency = Some(3);
+        let fixture = OffloadFixture::new(on);
+        assert_eq!(
+            OffloadServerUseCases::new(&fixture.supervisor)
+                .primary_state()
+                .await,
+            OffloadState::Stopped,
+            "enabled but unstarted must read as Stopped"
+        );
+
+        let status = OffloadServiceUseCases::new(&fixture.service)
+            .aggregate_state()
+            .await;
+        assert_eq!(status.global_cap, 3, "the explicit override sizes the gate");
+        assert_eq!(status.global_in_flight, 0);
+        assert_eq!(status.queue_depth, 0);
+        assert!(
+            status.mcp_servers.is_empty(),
+            "nothing was warmed, so no server can be healthy"
+        );
+    }
 
     #[test]
     fn an_empty_test_box_asks_the_canned_question() {

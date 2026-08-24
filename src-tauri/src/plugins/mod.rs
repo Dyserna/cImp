@@ -178,28 +178,20 @@ pub fn plugins_project_key(state: State<'_, crate::AppState>) -> String {
 /// On a blocking hop because it walks a directory and reads every file in it;
 /// `audit_refresh_census`'s precedent.
 ///
-/// **Left as a direct call** (V42 Phase A), and this one is a deferral rather
-/// than a "nothing to test". The rule worth pinning is the last line — a rescan
-/// writes no settings, so without `signal_native_change` nothing would tell a
-/// live session its `run_check` tool list moved — but asserting it needs an
-/// [`OffloadService`](crate::offload::OffloadService), whose constructor takes
-/// an `AppHandle`. Wrapping this before Phase A2 injects that handle would move
-/// two lines and leave the rule exactly as unassertable as it is now.
+/// V42 Phase A2: **a wrapper at last.** A1 left this a direct call, and said
+/// why: the rule worth pinning — a rescan writes no settings, so without the
+/// pulse ask nothing would tell a live session its `run_check` tool list moved
+/// — needs an [`OffloadService`](crate::offload::OffloadService), whose
+/// constructor took an `AppHandle`. It does not any more, so the two steps sit
+/// together in the use case, where the rescan and the ask cannot be separated
+/// by an edit to the wire boundary. See
+/// [`OffloadServiceUseCases::rescan_plugins`](crate::service::offload::OffloadServiceUseCases::rescan_plugins).
 #[tauri::command]
 pub async fn plugins_rescan(
     state: State<'_, Arc<PluginStore>>,
     offload: State<'_, Arc<crate::offload::OffloadService>>,
 ) -> Result<Arc<PluginSet>, crate::error::AppError> {
-    let store = state.inner().clone();
-    let service = offload.inner().clone();
-    let set = tauri::async_runtime::spawn_blocking(move || store.rescan())
+    crate::service::offload::OffloadServiceUseCases::new(&offload)
+        .rescan_plugins(state.inner().clone())
         .await
-        .map_err(|e| crate::error::AppError::Ipc(format!("plugin rescan task failed: {e}")))?;
-    // V38 Phase F: a rescan can add, remove or rename every `check`-kind tool
-    // `run_check` advertises, and it writes no settings — so nothing else would
-    // tell a live session its tool list moved. Only an ASK: the pulse gate
-    // compares the native surface fingerprint and stays silent when the rescan
-    // found the same plugins it already had.
-    service.signal_native_change();
-    Ok(set)
 }

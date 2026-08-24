@@ -124,14 +124,14 @@ impl HarnessTabBackend {
     /// *why* a facade is down (`supervisor::statuses`) asks the engine itself,
     /// so keeping a second copy here would be a cache of a sentence that is free
     /// to recompute.
-    pub async fn refresh_ready(&self, app: &tauri::AppHandle) -> bool {
+    pub async fn refresh_ready(&self, core: &crate::service::host::CoreHost) -> bool {
         // Asked on the same probe, so the router sees one consistent picture of
         // the tab rather than a readiness from now and a busy-ness from before.
         self.busy.store(
-            crate::delegation::worker_busy(app, &self.tab).await,
+            crate::delegation::worker_busy(core, &self.tab).await,
             Ordering::Relaxed,
         );
-        match crate::delegation::worker_ready(app, &self.tab).await {
+        match crate::delegation::worker_ready(core, &self.tab).await {
             Ok(()) => {
                 self.ready.store(true, Ordering::Relaxed);
                 true

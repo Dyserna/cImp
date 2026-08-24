@@ -152,6 +152,7 @@ impl Loopback {
     pub async fn start(
         service: Arc<OffloadService>,
         app: AppHandle,
+        core: crate::service::host::CoreHost,
         root: &Path,
     ) -> AppResult<Arc<Self>> {
         let listener = TcpListener::bind(("127.0.0.1", 0))
@@ -190,9 +191,10 @@ impl Loopback {
                     Ok((stream, _peer)) => {
                         let svc = service.clone();
                         let app = app.clone();
+                        let core = core.clone();
                         let tok = accept_token.clone();
                         tauri::async_runtime::spawn(async move {
-                            if let Err(e) = handle_conn(stream, svc, app, tok).await {
+                            if let Err(e) = handle_conn(stream, svc, app, core, tok).await {
                                 debug!(error = %e, "offload loopback: connection ended");
                             }
                         });
@@ -604,6 +606,7 @@ async fn handle_conn(
     mut stream: TcpStream,
     service: Arc<OffloadService>,
     app: AppHandle,
+    core: crate::service::host::CoreHost,
     token: String,
 ) -> AppResult<()> {
     // Cap how long we'll wait for a complete request: a half-open or idle
@@ -673,7 +676,7 @@ async fn handle_conn(
         //
         // The app owns the tabs, so this is the only way in — the child has no
         // self-contained fallback and says so rather than inventing one.
-        ("POST", "/delegate") => handle_delegate(&mut stream, &app, &req).await,
+        ("POST", "/delegate") => handle_delegate(&mut stream, &app, &core, &req).await,
         ("POST", "/mcp/list") => handle_mcp_list(&mut stream, &service, &req).await,
         ("POST", "/mcp/call") => handle_mcp_call(&mut stream, &service, &app, &req).await,
         ("GET", "/describe") => {

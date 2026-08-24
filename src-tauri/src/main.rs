@@ -693,6 +693,12 @@ fn main() {
         speak_session: speak_session.clone(),
         ai_tts_suppressed: ai_tts_suppressed.clone(),
         window_title,
+        // V42 Phase A2: the three `CoreHost` fields `Wiring` did not already
+        // carry. Same handles `AppState` gets below — the offload layer used to
+        // reach them by looking `AppState` itself up through an `AppHandle`.
+        tabs: tabs_handle.clone(),
+        launch_cwd: launch_cwd.clone(),
+        invocation_args: Arc::new(extra_args.clone()),
     };
 
     let state = AppState {
@@ -752,16 +758,19 @@ fn main() {
             wiring.wire_state_manager(app);
             wiring.wire_tts_and_notifications(app);
             wiring.wire_stt(app);
-            // Yields the session-push bus and the warm MCP host that the graph
-            // service and the audit runner are constructed with below (V30 Phase
-            // C, V38 Phase F), so it has to precede them.
-            let offload = wiring.wire_offload(app);
-            // The Workbench service is managed unconditionally and BEFORE the
-            // graph service below, which is CONSTRUCTED with it (V42 Phase A2 —
-            // `GraphService::reindex_paths` used to look it up via
-            // `AppHandle::state` on every watcher batch, which is what made the
-            // order a race rather than a hand-off).
+            // The Workbench service is managed unconditionally and FIRST of the
+            // three, because the two below are CONSTRUCTED with it (V42 Phase
+            // A2): `GraphService::reindex_paths` fans every watcher batch out
+            // to it, and the offload service takes the in-app worker's
+            // pre-mutation checkpoint through it. Both used to look it up via
+            // `AppHandle::state` at use time, which is what made this order a
+            // race against an empty state table rather than a hand-off.
             let workbench = wiring.wire_workbench(app);
+            // Yields the session-push bus, the warm MCP host and the supervisor
+            // that the graph service and the audit runner are constructed with
+            // below (V30 Phase C, V38 Phase F, V42 Phase A2), so it has to
+            // precede them.
+            let offload = wiring.wire_offload(app, &workbench);
             wiring.wire_graph(app, &offload, &workbench);
             wiring.wire_settings_broadcast(app);
             wiring.wire_detection_updater();

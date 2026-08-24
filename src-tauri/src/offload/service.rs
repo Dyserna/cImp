@@ -27,7 +27,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
-use tauri::{AppHandle, Emitter, Manager};
+use crate::service::host::CoreHost;
+use crate::service::sink::EventSinkExt;
 use tokio::sync::{broadcast, mpsc, Mutex as TokioMutex, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -171,8 +172,17 @@ pub struct OffloadService {
     /// session pushes. Separate from `change_tx` on purpose — that broadcast
     /// stays the un-addressed capability pulse every subscriber gets.
     pushes: Arc<PushRegistry>,
-    /// For emitting the `offload-server-metrics` dashboard event.
-    app: AppHandle,
+    /// V42 Phase A2: the handles this service runs on, instead of the
+    /// `AppHandle` it used to reach three things through — the
+    /// `offload-server-metrics` emit, the delegation engine (the facade
+    /// backend's drive and its readiness question) and, one frame down,
+    /// `AppState`.
+    core: CoreHost,
+    /// V42 Phase A2: the Workbench service the in-app worker takes its
+    /// pre-mutation checkpoint through. `None` = no checkpoint, which is
+    /// exactly what the `try_state` miss it replaces meant; it is wired
+    /// unconditionally in the app.
+    workbench: Option<Arc<crate::workbench::WorkbenchService>>,
     /// Latest per-backend dashboard snapshot (initial fill for the IPC; the
     /// poller pushes live ones via the event). One row per enabled backend,
     /// Local first then Remote.
@@ -684,11 +694,16 @@ impl OffloadService {
     /// Construct the service. Sizes the global gate from config (or the
     /// explicit `global_concurrency` override) and wires the MCP host's
     /// change channel into the service's own.
+    ///
+    /// V42 Phase A2: takes the core's handles and the Workbench service rather
+    /// than an `AppHandle` to look them up with, so a service is constructible
+    /// without a Tauri app.
     pub fn new(
-        app: AppHandle,
-        settings: SettingsHandle,
+        core: CoreHost,
         supervisor: Arc<OffloadSupervisor>,
+        workbench: Option<Arc<crate::workbench::WorkbenchService>>,
     ) -> Arc<Self> {
+        let settings = core.settings.clone();
         let cur = settings.current();
         let snap = cur.offload.clone();
         let global_cap = compute_global_cap(&cur);
@@ -724,7 +739,8 @@ impl OffloadService {
             change_tx,
             pulse_tx,
             pushes: PushRegistry::new(),
-            app,
+            core,
+            workbench,
             latest_metrics: StdMutex::new(Vec::new()),
             cap_reconcile_lock: TokioMutex::new(()),
             host_reconcile_lock: TokioMutex::new(()),
@@ -1696,7 +1712,7 @@ impl OffloadService {
             profile,
         } = call;
         let reply = crate::delegation::drive_watching(
-            &self.app,
+            &self.core,
             crate::delegation::DriveRequest {
                 worker: facade.tab().clone(),
                 driver: tab.map(crate::state::TabId::from_str),
@@ -1904,17 +1920,17 @@ impl OffloadService {
         // before `run_command` (the only routed tool with `mutates_fs: true`).
         // The root is `cwd` — the CALLING session's directory when it forwarded
         // one, which is the repo whose shadow repo must hold the rewind point,
-        // not the app's launch dir. `try_state` because the service is
-        // constructed unconditionally at startup but this code also runs in
-        // contexts (tests) where it is not registered; `None` there simply
-        // means "no checkpoint", never a failed tool call.
+        // not the app's launch dir. V42 Phase A2: a constructor dependency,
+        // `Option` because a service built without one (a test) simply takes no
+        // checkpoint — never a failed tool call, which is what the `try_state`
+        // miss it replaces also meant.
         let checkpoint = self
-            .app
-            .try_state::<std::sync::Arc<crate::workbench::WorkbenchService>>()
+            .workbench
+            .as_ref()
             .map(|w| tools::ToolCheckpoint {
                 root: cwd.clone(),
                 tab: tab.map(str::to_string),
-                workbench: w.inner().clone(),
+                workbench: w.clone(),
             });
         let ctx = ToolCtx::new(
             roots,
@@ -2158,7 +2174,7 @@ impl OffloadService {
                 }
             }
         };
-        let ready = handle.refresh_ready(&self.app).await;
+        let ready = handle.refresh_ready(&self.core).await;
         Some(PoolEntry {
             name: b.name.clone(),
             base_url: handle.base_url(),
@@ -2592,7 +2608,7 @@ impl OffloadService {
                 // exist, which is within one tick of startup.
                 let ready = match self.harness_pool.lock().await.get(&b.name) {
                     Some(h) => h.is_ready(),
-                    None => crate::delegation::worker_ready(&self.app, &tab_id)
+                    None => crate::delegation::worker_ready(&self.core, &tab_id)
                         .await
                         .is_ok(),
                 };
@@ -2662,7 +2678,7 @@ impl OffloadService {
                 }
 
                 *this.latest_metrics.lock().unwrap() = rows.clone();
-                let _ = this.app.emit("offload-server-metrics", &rows);
+                let _ = this.core.events.emit("offload-server-metrics", &rows);
             }
         });
     }

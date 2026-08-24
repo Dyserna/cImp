@@ -79,6 +79,7 @@ impl DelegateResult {
 pub(super) async fn handle_delegate(
     stream: &mut TcpStream,
     app: &AppHandle,
+    core: &crate::service::host::CoreHost,
     req: &Request,
 ) -> AppResult<()> {
     let Some(body) = decode::<DelegateBody, _>(stream, req, |e| {
@@ -173,7 +174,7 @@ pub(super) async fn handle_delegate(
     };
     let reply = {
         let (mut rd, _wr) = stream.split();
-        let flight = crate::delegation::drive_watching(app, drive_req, &cancel);
+        let flight = crate::delegation::drive_watching(core, drive_req, &cancel);
         tokio::pin!(flight);
         loop {
             let mut probe = [0u8; 1];

@@ -25,7 +25,8 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use serde::Serialize;
-use tauri::{AppHandle, Emitter};
+use crate::service::host::CoreHost;
+use crate::service::sink::{EventSink, EventSinkExt};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Child;
 use tokio::sync::{oneshot, Mutex as TokioMutex, RwLock};
@@ -250,7 +251,12 @@ pub struct OffloadSupervisor {
     /// event + legacy single-status IPC).
     state: RwLock<OffloadState>,
     settings: SettingsHandle,
-    app: AppHandle,
+    /// V42 Phase A2: the handles this supervisor runs on, instead of the
+    /// `AppHandle` it used to look two of them up through. Three uses: the
+    /// `offload-state` emit, the per-backend log fanout, and the facade
+    /// backend's readiness question (`delegation::worker_ready`), which used to
+    /// be `AppHandle::state::<AppState>()` one frame further down.
+    core: CoreHost,
     /// Per-backend captured stdout/stderr ring buffer (keyed by backend
     /// name), powering the read-only Settings log panel. Cleared on each
     /// (re)start so the panel shows the fresh model-load output. `Arc` so the
@@ -301,7 +307,12 @@ fn local_auth_token(b: &OffloadBackend) -> String {
 }
 
 impl OffloadSupervisor {
-    pub fn new(app: AppHandle, settings: SettingsHandle) -> Arc<Self> {
+    /// V42 Phase A2: takes the core's handles rather than an `AppHandle`, which
+    /// is what makes a supervisor constructible in a test. `settings` is the
+    /// one it reads on nearly every method, so it keeps its own field rather
+    /// than being spelled `self.host.settings` two hundred times.
+    pub fn new(core: CoreHost) -> Arc<Self> {
+        let settings = core.settings.clone();
         let initial = if settings.current().offload.enabled {
             OffloadState::Stopped
         } else {
@@ -311,7 +322,7 @@ impl OffloadSupervisor {
             running: TokioMutex::new(HashMap::new()),
             state: RwLock::new(initial),
             settings,
-            app,
+            core,
             logs: Arc::new(StdMutex::new(HashMap::new())),
         })
     }
@@ -500,7 +511,7 @@ impl OffloadSupervisor {
             // pins that rather than leaving it to the reader.
             OffloadBackendKind::HarnessTab { tab } => {
                 let tab_id = crate::state::TabId::from_str(tab);
-                let verdict = crate::delegation::worker_ready(&self.app, &tab_id).await;
+                let verdict = crate::delegation::worker_ready(&self.core, &tab_id).await;
                 let driven = crate::delegation::is_driven(&tab_id);
                 BackendStatus {
                     name: b.name.clone(),
@@ -524,7 +535,7 @@ impl OffloadSupervisor {
 
     async fn set_state(&self, new: OffloadState) {
         *self.state.write().await = new.clone();
-        if let Err(e) = self.app.emit("offload-state", &new) {
+        if let Err(e) = self.core.events.emit("offload-state", &new) {
             warn!(error = %e, "offload: emit offload-state failed");
         }
     }
@@ -613,7 +624,7 @@ impl OffloadSupervisor {
         let cmd = ServerCommand::parse(&command)?;
         // Fresh capture buffer per (re)start so the panel shows this load.
         self.logs.lock().unwrap().remove(name);
-        let (child, exited) = spawn_child(&cmd, &self.app, name, self.logs.clone())?;
+        let (child, exited) = spawn_child(&cmd, &self.core.events, name, self.logs.clone())?;
         // V33 Phase E: the probe credential comes from the backend's CONFIGURED
         // `auth_token`. A `command_override` edits the launch command for one
         // start and is deliberately not a credential *editor*: a configured
@@ -1126,7 +1137,7 @@ async fn probe_remote(
 /// the supervisor is dropped.
 fn spawn_child(
     cmd: &ServerCommand,
-    app: &AppHandle,
+    events: &Arc<dyn EventSink>,
     backend: &str,
     logs: Arc<StdMutex<HashMap<String, VecDeque<String>>>>,
 ) -> AppResult<(Child, oneshot::Receiver<()>)> {
@@ -1165,12 +1176,12 @@ fn spawn_child(
     let (exited_tx, exited_rx) = oneshot::channel();
     let mut exited_tx = Some(exited_tx);
     if let Some(out) = child.stdout.take() {
-        let app = app.clone();
+        let events = events.clone();
         let backend = backend.to_string();
         let logs = logs.clone();
         let tx = exited_tx.take();
         tauri::async_runtime::spawn(async move {
-            log_stream(out, "stdout", app, backend, logs).await;
+            log_stream(out, "stdout", events, backend, logs).await;
             // A dropped receiver (nobody is watching) is not an error.
             if let Some(tx) = tx {
                 let _ = tx.send(());
@@ -1181,7 +1192,7 @@ fn spawn_child(
         tauri::async_runtime::spawn(log_stream(
             err,
             "stderr",
-            app.clone(),
+            events.clone(),
             backend.to_string(),
             logs,
         ));
@@ -1197,7 +1208,7 @@ fn spawn_child(
 async fn log_stream<R>(
     reader: R,
     label: &'static str,
-    app: AppHandle,
+    events: Arc<dyn EventSink>,
     backend: String,
     logs: Arc<StdMutex<HashMap<String, VecDeque<String>>>>,
 ) where
@@ -1216,9 +1227,9 @@ async fn log_stream<R>(
             }
         }
         // Push live to the read-only panel (best-effort).
-        let _ = app.emit(
+        let _ = events.emit(
             "offload-server-output",
-            ServerLogLine {
+            &ServerLogLine {
                 backend: backend.clone(),
                 line,
             },

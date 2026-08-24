@@ -127,6 +127,8 @@
   import type { AiTabId } from './lib/tabs/types';
   import { SPRITE_SETS } from './lib/avatarConfig';
   import AboutSection from './lib/settings/sections/AboutSection.svelte';
+  import ChecksSection from './lib/settings/sections/ChecksSection.svelte';
+  import McpSection from './lib/settings/sections/McpSection.svelte';
   import NumberField from './lib/settings/NumberField.svelte';
   import SelectField from './lib/settings/SelectField.svelte';
   import Toggle from './lib/settings/Toggle.svelte';
@@ -136,10 +138,10 @@
   import TuiTitleBar from './lib/TuiTitleBar.svelte';
   import CustomThemeEditor from './lib/settings/CustomThemeEditor.svelte';
   import BackgroundConfigEditor from './lib/settings/BackgroundConfigEditor.svelte';
-  import ChecksEditor from './lib/settings/ChecksEditor.svelte';
   import { formatDetect } from './lib/settings/codeAudit';
-  // V37 Phase D: the MCP-servers section's body, extracted (contract C8).
-  import McpManagementEditor from './lib/settings/McpManagementEditor.svelte';
+  // V37 Phase D: the MCP-servers section's body (contract C8), now inside the
+  // section component #129 (c) extracted. The registry type stays here because
+  // the two persistence callbacks below are still this window's.
   import type { McpRegistry } from './lib/settings/mcpEditor';
   import {
     AUDIT_PLUGIN_KEY,
@@ -5674,32 +5676,14 @@
           </label>
         </section>
       {:else if activeSection === 'mcp'}
-        <section>
-          <h2>MCP servers</h2>
-          <small class="hint top">
-            Model Context Protocol servers cImp connects to and keeps warm. Each
-            server's read-class tools (web search, fetch, docs, …) can be exposed
-            to <strong>{harnessNamesProse}</strong> and/or to the
-            <strong>offload worker</strong> — per server, below.
-            Write/destructive tools are filtered out. Exposing a server to a
-            harness works whether or not offload is enabled.
-          </small>
-          <!-- V37 Phase D (contract C8): the body of this section is
-               `McpManagementEditor` — registry, categories, per-project
-               activation and health chips. The two callbacks are the whole
-               contract between it and this file, which owns `snapshot`. -->
-          <McpManagementEditor
-            servers={snapshot.offload.mcp_servers}
-            categories={snapshot.offload.mcp_categories}
-            activation={snapshot.offload.mcp_activation}
-            health={serviceStatus?.mcp_servers ?? []}
-            healthIntervalSecs={snapshot.offload.mcp_health_interval_secs}
-            onedit={setMcpRegistry}
-            onapply={applyMcpRegistry}
-            onhealthinterval={(secs) =>
-              patch((s) => (s.offload.mcp_health_interval_secs = secs))}
-          />
-        </section>
+        <McpSection
+          {snapshot}
+          {patch}
+          {harnessNamesProse}
+          health={serviceStatus?.mcp_servers ?? []}
+          onedit={setMcpRegistry}
+          onapply={applyMcpRegistry}
+        />
       {:else if activeSection === 'graph'}
         <section>
           <h2>Code Intelligence</h2>
@@ -6365,58 +6349,7 @@
           {/if}
         </section>
       {:else if activeSection === 'checks'}
-        <section>
-          <h2>Checks</h2>
-          <small class="hint">
-            Project checker commands the <code>run_check</code> tool exposes to
-            {harnessNamesProse}, and the offload worker — a build, typecheck, lint, or test run
-            turned into bounded, deduplicated diagnostics instead of a raw dump.
-            Configured per project; changes land in this project's
-            <code>.cimp/config.json</code> overlay.
-          </small>
-          <ChecksEditor
-            checks={snapshot.checks}
-            allowRemoteWorker={snapshot.checks_allow_remote_worker}
-            onchange={(next) => patch((s) => (s.checks = next))}
-          />
-
-          <!-- F-12's opt-in (`checks_allow_remote_worker`). Deliberately the same
-               shape, heading and tone as Code Intelligence → Code graph →
-               "Offload worker access" (`graph.allow_remote_worker_access`): per
-               project, global across backends, denied by default. It sits in THIS
-               section because the setting lives at the settings root beside
-               `checks`, not inside `graph` — and because the commands it governs
-               are the ones listed right above. Until this landed, the setting
-               existed only in Rust and was reachable only by hand-editing
-               `.cimp/config.json`.
-
-               OWED TO THE RUST LANE (F-18's fifth site, second half): the
-               `run_check` refusal in `offload/backend_gate.rs` sends the user to
-               a Code-Intelligence sub-tab named Checks, which has never existed
-               — Checks is a top-level section, a SIBLING of Code Intelligence.
-               The real path is "Settings → Checks → Offload worker access", i.e.
-               this heading. Unaffected by F-18's restructure and still wrong;
-               not corrected here because the string is Rust-side and this pass
-               may not edit `src-tauri/`. -->
-          <h3>Offload worker access</h3>
-          <Toggle
-            checked={snapshot.checks_allow_remote_worker}
-            onchange={(next) => patch((s) => (s.checks_allow_remote_worker = next))}
-          >
-            Allow a <strong>remote</strong> offload worker to run these checks
-          </Toggle>
-          <small class="hint">
-            ⚠ <strong>Runs commands on this machine:</strong> the local offload
-            worker can always run these checks. A <strong>remote</strong> backend —
-            a box on your LAN or a public cloud API — cannot, unless you tick this.
-            Ticking it lets that remote choose which of the checks above runs here,
-            against your working tree, and hands it their output, which quotes your
-            source. Denied by default; leave it off unless you trust the remote.
-            An AI tab session's own <code>run_check</code> is
-            unaffected — this governs the offload worker only. Applies from the
-            worker's next call; no tab restart needed.
-          </small>
-        </section>
+        <ChecksSection {snapshot} {patch} {harnessNamesProse} />
       {:else if activeSection === 'code-audit'}
         <section>
           <h2>Code Audit</h2>

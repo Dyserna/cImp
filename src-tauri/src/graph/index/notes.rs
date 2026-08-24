@@ -98,12 +98,12 @@ use std::collections::{BTreeMap, HashSet};
 
 use cozo::{DataValue, Num, ScriptMutability};
 
-use crate::error::{AppError, AppResult};
+use crate::error::AppResult;
 use crate::graph::memory::{MemNote, NoteQuarantine, QuarantineReview};
 use crate::graph::secrets::ScreenedNote;
 use crate::offload::toolclass::WriteTaint;
 
-use super::{cell_bool, cell_i64, cell_str, GraphIndex};
+use super::{cell_bool, cell_i64, cell_str, GraphIndex, StageAndSwap};
 
 // ── Delete scripts used by `graph/index.rs`'s transaction cascades ─────────
 //
@@ -200,13 +200,14 @@ impl GraphIndex {
     /// meaningfully triage. The compensating control for unauditable memory is
     /// the delivery-time spotlighting envelope, which wraps clean notes too.
     ///
-    /// Mechanically identical to [`Self::migrate_usage_stat_origin`] — see that
-    /// method for why the crash-safe stage-and-swap is shaped this way (CozoDB
-    /// autocommits each script, so a naive remove→create→put loses data if the
-    /// process dies mid-sequence). Called from the writable [`Self::open`]
-    /// migration path only; `open_existing` consumers are read-only and are
-    /// protected instead by the [`super::GRAPH_SCHEMA_VERSION`] gate, which refuses a
-    /// store whose `mem_note` has not been migrated yet.
+    /// Runs [`GraphIndex::stage_and_swap`], the engine `usage_stat`'s V24
+    /// migration runs too — see it for why the crash-safe sequence is shaped
+    /// this way (CozoDB autocommits each script, so a naive remove→create→put
+    /// loses data if the process dies mid-sequence). Called from the writable
+    /// [`Self::open`] migration path only; `open_existing` consumers are
+    /// read-only and are protected instead by the
+    /// [`super::GRAPH_SCHEMA_VERSION`] gate, which refuses a store whose
+    /// `mem_note` has not been migrated yet.
     pub(super) fn migrate_mem_note_tainted(&self) -> AppResult<()> {
         self.migrate_mem_note_shape(
             "tainted",
@@ -235,74 +236,32 @@ impl GraphIndex {
         self.migrate_mem_note_shape("quarantine", READ_C2, &[DataValue::Str("".into())])
     }
 
-    /// The stage-and-swap engine both `mem_note` migrations run: read the old
-    /// shape with `read_script`, append `defaults` for the columns being added,
-    /// stage the result in the CURRENT shape, verify the row count, then swap.
-    ///
-    /// One engine rather than two copies because the crash-safety is the subtle
-    /// part (CozoDB autocommits each script, so a naive remove→create→put loses
-    /// data if the process dies mid-sequence), and a second hand-rolled copy of
-    /// it is a second chance to get the abort path wrong. `added_column` is the
-    /// idempotence probe: present ⇒ this migration already ran.
-    ///
-    /// The recovery branch is shared too, and deliberately: [`Self::MEM_NOTE_STAGE`]
-    /// always holds the *current* shape, whichever migration built it, so
-    /// whichever one runs first may adopt it. What must never happen is adopting
-    /// `mem_note` over a populated stage — that is the direction that loses notes.
+    /// The per-relation half of `mem_note`'s stage-and-swap migration: the two
+    /// historical shapes it can start from, the defaults for the columns being
+    /// added, and the two statements that have to name the relation as a
+    /// literal in this file (its stage row count and its promote). The
+    /// crash-safety, and the recovery branch both migrations share, are
+    /// [`GraphIndex::stage_and_swap`]'s — see it for why the sequence is shaped
+    /// this way (V42 R12 folded the second hand-written copy of it into the
+    /// first). `added_column` is the idempotence probe: present ⇒ this
+    /// migration already ran.
     fn migrate_mem_note_shape(
         &self,
         added_column: &str,
         read_script: &str,
         defaults: &[DataValue],
     ) -> AppResult<()> {
-        let existing = self.existing_relations()?;
-        // Recovery: a leftover stage means a prior migration was interrupted
-        // after the stage was durably populated. Adopt the stage over whatever
-        // `mem_note` currently is — never the reverse, so no notes are lost.
-        if existing.contains(Self::MEM_NOTE_STAGE) {
-            return self.promote_mem_note_stage();
-        }
-        if !existing.contains("mem_note") {
-            return Ok(());
-        }
-        if self.relation_has_column("mem_note", added_column)? {
-            return Ok(());
-        }
-        let rows = self.run(read_script, BTreeMap::new(), ScriptMutability::Immutable)?;
-        let expected = rows.rows.len();
-        let migrated: Vec<DataValue> = rows
-            .rows
-            .into_iter()
-            .map(|mut r| {
-                r.extend(defaults.iter().cloned());
-                DataValue::List(r)
-            })
-            .collect();
-        if migrated.is_empty() {
-            self.run_mut(
-                &Self::mem_note_create_ddl(Self::MEM_NOTE_STAGE),
-                BTreeMap::new(),
-            )?;
-        } else {
-            let mut p = BTreeMap::new();
-            p.insert("rows".to_string(), DataValue::List(migrated));
-            self.run_mut(
-                &format!(
-                    "?[note_id, session_id, text, ts_ms, pinned, tainted, quarantine] <- $rows\n{}",
-                    Self::mem_note_create_ddl(Self::MEM_NOTE_STAGE)
-                ),
-                p,
-            )?;
-        }
-        // Verify the stage captured every old row before dropping the original.
-        let staged = self.mem_note_stage_row_count()?;
-        if staged != expected {
-            self.run_mut(&format!("::remove {}", Self::MEM_NOTE_STAGE), BTreeMap::new())?;
-            return Err(AppError::Graph(format!(
-                "mem_note migration stage captured {staged} of {expected} rows; aborting"
-            )));
-        }
-        self.promote_mem_note_stage()
+        self.stage_and_swap(StageAndSwap {
+            live: "mem_note",
+            stage: Self::MEM_NOTE_STAGE,
+            added_column,
+            read_script,
+            defaults,
+            stage_columns: "note_id, session_id, text, ts_ms, pinned, tainted, quarantine",
+            stage_ddl: &Self::mem_note_create_ddl(Self::MEM_NOTE_STAGE),
+            count_stage: &|| self.mem_note_stage_row_count(),
+            promote: &|| self.promote_mem_note_stage(),
+        })
     }
 
     /// Promote a fully-populated [`Self::MEM_NOTE_STAGE`] to `mem_note`.

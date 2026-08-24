@@ -294,6 +294,44 @@ pub struct GraphIndex {
     schema_reset: AtomicBool,
 }
 
+/// One relation's crash-safe **stage-and-swap** migration, as data — the
+/// arguments [`GraphIndex::stage_and_swap`] needs that differ between the two
+/// relations that run one (`usage_stat`'s V24 `origin`, `mem_note`'s V32
+/// `tainted`/`quarantine`).
+///
+/// A struct rather than nine positional parameters because six of the nine are
+/// `&str` and a transposed pair would compile: `live`/`stage` swapped promotes
+/// the live relation over an empty stage, which is the one direction that loses
+/// rows.
+struct StageAndSwap<'a> {
+    /// The live relation being migrated, named for the idempotence probe, the
+    /// "nothing to migrate" check and the abort message.
+    live: &'a str,
+    /// The staging relation. Its presence on open means "a prior migration was
+    /// interrupted after the stage was durably populated — adopt me".
+    stage: &'a str,
+    /// The column the migration adds. Present on `live` ⇒ already migrated.
+    added_column: &'a str,
+    /// Reads every row in the OLD shape. Historical by definition, so it is
+    /// spelled out by the caller rather than derived from the current DDL.
+    read_script: &'a str,
+    /// Appended to each old row, in the current shape's column order.
+    defaults: &'a [DataValue],
+    /// The CURRENT shape's column list, for the stage's `?[…] <- $rows` head.
+    stage_columns: &'a str,
+    /// The stage's `:create` DDL, already rendered for [`Self::stage`]. Shared
+    /// with the live relation's own definition at every call site, so the two
+    /// shapes cannot drift.
+    stage_ddl: &'a str,
+    /// Counts the rows the stage captured. A closure because the caller may
+    /// need the relation named as a literal rather than interpolated — which is
+    /// exactly `mem_note`'s constraint (`graph/index/notes.rs`'s house rule).
+    count_stage: &'a dyn Fn() -> AppResult<usize>,
+    /// Promotes a fully-populated stage over `live`. A closure for
+    /// [`Self::count_stage`]'s reason: the two statements name the relation.
+    promote: &'a dyn Fn() -> AppResult<()>,
+}
+
 impl GraphIndex {
     /// Hard cap on the number of nodes [`Self::transitive`] returns. Exposed so
     /// callers can detect when a result hit the cap (len == `TRANSITIVE_LIMIT`)
@@ -3114,6 +3152,119 @@ reach[x] := reach[z], calls[x, z]"#
             .run_script(script, params, m)
             .map_err(|e| AppError::Graph(format!("query failed: {e}")))
     }
+
+    /// The crash-safe **stage-and-swap** engine every memory-relation shape
+    /// migration runs: read the old shape with [`StageAndSwap::read_script`],
+    /// append the new columns' [`StageAndSwap::defaults`], build a
+    /// fully-populated CURRENT-shape stage, verify its row count, then swap.
+    ///
+    /// # Why it is shaped this way
+    ///
+    /// CozoDB autocommits each script, so a naive read → `::remove` → `:create`
+    /// → `:put` sequence has a window where a kill after the remove loses the
+    /// whole relation. Instead the old relation stays the source of truth until
+    /// a fully-populated new-shape STAGE is durable and verified; only then is
+    /// the original dropped and the stage promoted. The stage is built with a
+    /// single atomic `:create … <- $rows`, so it is never partial — its mere
+    /// presence on a later open (the recovery branch) means the migrated data is
+    /// safe and should be adopted, even though `ensure_memory_relations` runs
+    /// first on open and may have recreated the live relation empty in the
+    /// meantime. A short copy means something went wrong: the suspect stage is
+    /// dropped and the call fails loudly rather than promoting it over the
+    /// still-intact live data.
+    ///
+    /// # Why one engine (V42 R12)
+    ///
+    /// `usage_stat`'s V24 migration and `mem_note`'s V32 one were separate
+    /// hand-written copies of the sequence above — the second one's own doc said
+    /// "mechanically identical to" the first, which is a comment where a
+    /// function belongs. The crash-safety is the subtle part, and a second copy
+    /// of it is a second chance to get the abort path wrong. What stays per
+    /// relation is only data: its historical shapes, its defaults, and the two
+    /// closures whose statements have to name the relation as a literal.
+    ///
+    /// The recovery branch is shared too, and deliberately: the stage always
+    /// holds the *current* shape, whichever migration built it, so whichever one
+    /// runs first may adopt it. What must never happen is adopting the live
+    /// relation over a populated stage — that is the direction that loses rows.
+    fn stage_and_swap(&self, m: StageAndSwap<'_>) -> AppResult<()> {
+        let existing = self.existing_relations()?;
+        // Recovery: a leftover stage means a prior migration was interrupted
+        // after the stage was durably populated (possibly mid-swap, after the
+        // live relation was dropped and recreated empty by
+        // `ensure_memory_relations`). Adopt the stage over whatever the live
+        // relation currently is — never the reverse, so no rows are lost.
+        if existing.contains(m.stage) {
+            return (m.promote)();
+        }
+        if !existing.contains(m.live) {
+            return Ok(());
+        }
+        if self.relation_has_column(m.live, m.added_column)? {
+            return Ok(());
+        }
+        // Forward migration. Read every old-shape row, then build a
+        // fully-populated new-shape stage, verify it captured every row, and
+        // only THEN drop the original and promote the stage.
+        let rows = self.run(m.read_script, BTreeMap::new(), ScriptMutability::Immutable)?;
+        let expected = rows.rows.len();
+        let migrated: Vec<DataValue> = rows
+            .rows
+            .into_iter()
+            .map(|mut r| {
+                r.extend(m.defaults.iter().cloned());
+                DataValue::List(r)
+            })
+            .collect();
+        // Build the stage as a single atomic create-and-populate so it is either
+        // absent or complete — the invariant the recovery branch relies on. An
+        // empty source has no rows to lose, so create the stage empty in that
+        // case (avoids feeding `<- $rows` an empty list).
+        if migrated.is_empty() {
+            self.run_mut(m.stage_ddl, BTreeMap::new())?;
+        } else {
+            let mut p = BTreeMap::new();
+            p.insert("rows".to_string(), DataValue::List(migrated));
+            self.run_mut(
+                &format!("?[{}] <- $rows\n{}", m.stage_columns, m.stage_ddl),
+                p,
+            )?;
+        }
+        // Verify the stage captured every old row before dropping the original.
+        let staged = (m.count_stage)()?;
+        if staged != expected {
+            self.run_mut(&format!("::remove {}", m.stage), BTreeMap::new())?;
+            return Err(AppError::Graph(format!(
+                "{} migration stage captured {staged} of {expected} rows; aborting",
+                m.live
+            )));
+        }
+        (m.promote)()
+    }
+
+    /// Whether the on-disk relation `rel` carries column `col`. Introspects via
+    /// `::columns` (its column-name header is `column`), failing loudly if that
+    /// shape ever changes rather than mis-migrating. [`Self::stage_and_swap`]'s
+    /// idempotence probe, so both the V24 `usage_stat` and V32 `mem_note`
+    /// migrations can detect "already migrated" and calling either is safe.
+    fn relation_has_column(&self, rel: &str, col_name: &str) -> AppResult<bool> {
+        let rows = self.run(
+            &format!("::columns {rel}"),
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )?;
+        let col = rows
+            .headers
+            .iter()
+            .position(|h| h == "column")
+            .ok_or_else(|| {
+                AppError::Graph("::columns result has no 'column' column".to_string())
+            })?;
+        Ok(rows
+            .rows
+            .iter()
+            .any(|r| r.get(col).map(dv_string).as_deref() == Some(col_name)))
+    }
 }
 
 // ── V10 session / action memory ──────────────────────────────────────────
@@ -3238,84 +3389,26 @@ impl GraphIndex {
     /// from the writable [`Self::open`] migration path; NOT a `RELATIONS` reset
     /// (that never touches memory relations).
     ///
-    /// Crash-safe stage-and-swap: CozoDB autocommits each script, so a naive
-    /// read → `::remove` → `:create` → `:put` sequence has a window where a kill
-    /// after the remove loses all usage history. Instead the old relation stays
-    /// the source of truth until a fully-populated new-shape STAGE
-    /// ([`Self::USAGE_STAT_STAGE`]) is durable and verified; only then is the
-    /// original dropped and the stage promoted. The stage is built with a single
-    /// atomic `:create … <- $rows`, so it is never partial — its mere presence
-    /// on a later open (the recovery branch) means the migrated data is safe and
-    /// should be adopted, even though `ensure_memory_relations` runs first on
-    /// open and may have recreated `usage_stat` empty in the meantime.
+    /// The crash-safety is [`Self::stage_and_swap`]'s — see it for why the
+    /// sequence is shaped this way. Everything below is what is specific to this
+    /// relation: which columns the old shape had, and what the new one defaults
+    /// to.
     fn migrate_usage_stat_origin(&self) -> AppResult<()> {
-        let existing = self.existing_relations()?;
-        // Recovery: a leftover stage means a prior migration was interrupted
-        // after the stage was durably populated (possibly mid-swap, after
-        // `usage_stat` was dropped and recreated empty by
-        // `ensure_memory_relations`). Adopt the stage over whatever `usage_stat`
-        // currently is — never the reverse, so no rows are lost.
-        if existing.contains(Self::USAGE_STAT_STAGE) {
-            return self.promote_usage_stat_stage();
-        }
-        if !existing.contains("usage_stat") {
-            return Ok(());
-        }
-        if self.usage_stat_has_origin()? {
-            return Ok(());
-        }
-        // Forward migration. Read every old-shape row (no `origin`), then build a
-        // fully-populated new-shape stage, verify it captured every row, and only
-        // THEN drop the original and promote the stage.
-        let rows = self.run(
-            "?[session_id, seq, kind, model, msg_id, in_tok, out_tok, cache_read, cache_make, tool, chars, ts_ms] := \
+        self.stage_and_swap(StageAndSwap {
+            live: "usage_stat",
+            stage: Self::USAGE_STAT_STAGE,
+            added_column: "origin",
+            read_script:
+                "?[session_id, seq, kind, model, msg_id, in_tok, out_tok, cache_read, cache_make, tool, chars, ts_ms] := \
                 *usage_stat{session_id, seq, kind, model, msg_id, in_tok, out_tok, cache_read, cache_make, tool, chars, ts_ms}",
-            BTreeMap::new(),
-            ScriptMutability::Immutable,
-        )?;
-        let expected = rows.rows.len();
-        let migrated: Vec<DataValue> = rows
-            .rows
-            .into_iter()
-            .map(|mut r| {
-                r.push(DataValue::Str("session".into()));
-                DataValue::List(r)
-            })
-            .collect();
-        // Build the stage as a single atomic create-and-populate so it is either
-        // absent or complete — the invariant the recovery branch relies on. An
-        // empty source has no rows to lose, so create the stage empty in that
-        // case (avoids feeding `<- $rows` an empty list).
-        if migrated.is_empty() {
-            self.run_mut(
-                &Self::usage_stat_create_ddl(Self::USAGE_STAT_STAGE),
-                BTreeMap::new(),
-            )?;
-        } else {
-            let mut p = BTreeMap::new();
-            p.insert("rows".to_string(), DataValue::List(migrated));
-            self.run_mut(
-                &format!(
-                    "?[session_id, seq, kind, model, msg_id, in_tok, out_tok, cache_read, cache_make, tool, chars, ts_ms, origin] <- $rows\n{}",
-                    Self::usage_stat_create_ddl(Self::USAGE_STAT_STAGE)
-                ),
-                p,
-            )?;
-        }
-        // Verify the stage captured every old row before dropping the original.
-        // A short copy means something went wrong; drop the suspect stage and
-        // fail loudly rather than promote it over the still-intact live data.
-        let staged = self.usage_stat_row_count(Self::USAGE_STAT_STAGE)?;
-        if staged != expected {
-            self.run_mut(
-                &format!("::remove {}", Self::USAGE_STAT_STAGE),
-                BTreeMap::new(),
-            )?;
-            return Err(AppError::Graph(format!(
-                "usage_stat migration stage captured {staged} of {expected} rows; aborting"
-            )));
-        }
-        self.promote_usage_stat_stage()
+            defaults: &[DataValue::Str("session".into())],
+            stage_columns:
+                "session_id, seq, kind, model, msg_id, in_tok, out_tok, cache_read, cache_make, \
+                 tool, chars, ts_ms, origin",
+            stage_ddl: &Self::usage_stat_create_ddl(Self::USAGE_STAT_STAGE),
+            count_stage: &|| self.usage_stat_row_count(Self::USAGE_STAT_STAGE),
+            promote: &|| self.promote_usage_stat_stage(),
+        })
     }
 
     /// Promote a fully-populated migration stage ([`Self::USAGE_STAT_STAGE`]) to
@@ -3351,32 +3444,15 @@ impl GraphIndex {
 
     /// Whether the on-disk `usage_stat` relation carries the V24 `origin`
     /// column.
+    ///
+    /// Test-only since V42 R12: the migration itself asks
+    /// [`Self::relation_has_column`] through [`StageAndSwap::added_column`], so
+    /// what is left here is the assertion the two migration tests make about a
+    /// migrated store. Kept (rather than inlined into them) so those tests read
+    /// exactly as they did before the engine was folded.
+    #[cfg(test)]
     fn usage_stat_has_origin(&self) -> AppResult<bool> {
         self.relation_has_column("usage_stat", "origin")
-    }
-
-    /// Whether the on-disk relation `rel` carries column `col`. Introspects via
-    /// `::columns` (its column-name header is `column`), failing loudly if that
-    /// shape ever changes rather than mis-migrating. Shared by the V24
-    /// `usage_stat` and V32 `mem_note` migrations — both must be able to detect
-    /// "already migrated" so that calling them is always safe.
-    fn relation_has_column(&self, rel: &str, col_name: &str) -> AppResult<bool> {
-        let rows = self.run(
-            &format!("::columns {rel}"),
-            BTreeMap::new(),
-            ScriptMutability::Immutable,
-        )?;
-        let col = rows
-            .headers
-            .iter()
-            .position(|h| h == "column")
-            .ok_or_else(|| {
-                AppError::Graph("::columns result has no 'column' column".to_string())
-            })?;
-        Ok(rows
-            .rows
-            .iter()
-            .any(|r| r.get(col).map(dv_string).as_deref() == Some(col_name)))
     }
 
     /// Append one memory event for `session_id`, upserting the session's

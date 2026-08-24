@@ -57,7 +57,7 @@
 
 <button
   type="button"
-  class="status-button sandbox"
+  class="status-button status-badge sandbox"
   class:sandbox-on={chip.on}
   class:sandbox-off={!chip.on}
   class:inert={chip.inert}
@@ -72,29 +72,16 @@
 </button>
 
 <style>
-  /* Same grammar as `InjectionBadge` — deliberately duplicated rather than
-     shared through a global class, because these are the only two files that
-     wear it and a status-bar-wide `.status-button` already exists in several
-     components with slightly different padding. */
+  /* Same grammar as `InjectionBadge`, and since #128 literally the same rules:
+     both badges wear `.status-button.status-badge` from `src/app.css`. The
+     older note here said the duplication was deliberate because the
+     status-bar-wide `.status-button` had "slightly different padding" — that
+     difference is exactly what the `.status-badge` modifier now names.
+
+     Shell + focus ring therefore live in `src/app.css`. The colour stays here
+     because it is the badge's meaning, not its shape. */
   .status-button {
-    appearance: none;
-    background: transparent;
-    border: 1px solid transparent;
     color: var(--awaiting);
-    cursor: pointer;
-    height: 22px;
-    padding: 0 8px;
-    border-radius: var(--radius-pill);
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    justify-content: center;
-    line-height: 1;
-    font-size: 11px;
-    transition:
-      background var(--motion-fast) var(--easing-standard),
-      color var(--motion-fast) var(--easing-standard),
-      border-color var(--motion-fast) var(--easing-standard);
   }
   .sandbox-on {
     color: var(--success);
@@ -111,10 +98,6 @@
   }
   .status-button:hover {
     background: var(--surface-3);
-  }
-  .status-button:focus-visible {
-    outline: 2px solid var(--accent);
-    outline-offset: 2px;
   }
   .glyph {
     font-size: 12px;

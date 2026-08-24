@@ -49,3 +49,59 @@ body {
   background-color: rgba(255, 255, 255, 0.42);
   background-clip: padding-box;
 }
+
+/* Status-bar controls — the shell every button in `src/lib/status/` wears.
+   Two shapes, one rule pair:
+
+     .status-button                 fixed-width icon square (glyph only)
+     .status-button.status-badge    label pill that sizes to its text
+
+   This lives in the app-chrome sheet rather than `theme.css` (tokens only,
+   isolation policy at theme.css:20) because it is structure, not palette —
+   and the themes already restyle `.status-button` from outside any component
+   (`html[data-theme="…"] .status-button { … !important }` in
+   `themes/<id>/theme.css` and `src-tauri/src/theming/tui_theme.css`), so the
+   class has always been a global contract. (Spelling the themes directory
+   with a placeholder rather than a glob is not style: a literal `*` followed
+   by `/` closes this comment, and lightningcss then fails the production
+   build on the wreckage.)
+
+   Components keep ONLY their state modifiers (`:hover` variants, pressed,
+   disabled, and per-component deltas). Svelte appends its scoping class to a
+   single-selector rule, so a component's `.status-button` is (0,2,0) against
+   this file's (0,1,0) and always wins; the themes' `!important` overrides win
+   over both, exactly as before. */
+.status-button {
+  appearance: none;
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  width: 26px;
+  height: 22px;
+  border-radius: var(--radius-pill);
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
+  transition:
+    background var(--motion-fast) var(--easing-standard),
+    color var(--motion-fast) var(--easing-standard),
+    border-color var(--motion-fast) var(--easing-standard);
+}
+
+/* Badge shape: text, not a glyph, so it sizes to content and carries the
+   smaller chrome font. Colour is deliberately NOT set here — a badge's
+   colour is its meaning (posture, count), which each component owns. */
+.status-button.status-badge {
+  width: auto;
+  padding: 0 8px;
+  gap: 4px;
+  font-size: 11px;
+}
+
+.status-button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}

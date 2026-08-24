@@ -114,7 +114,9 @@ pub use self::events::*;
 // back-edge from the module V42 R3 (#114) extracted to the module it was
 // extracted from. Re-exported so the family files' `use super::*` and
 // `harness::claude::hook`'s `use crate::offload::loopback::{..}` still resolve.
-pub(crate) use super::{bounded_id, live_settings, BEACON_TOOL_MAX};
+pub(crate) use super::{bounded_id, live_settings};
+#[cfg(test)]
+pub(crate) use super::BEACON_TOOL_MAX;
 
 
 /// A per-launch random bearer token (two v4 UUIDs of entropy, hex). Avoids

@@ -8,8 +8,8 @@ use crate::error::{AppError, AppResult};
 use crate::ipc::windows::{open_or_focus_settings, SETTINGS_LABEL};
 use crate::ipc::AppState;
 use crate::pty::PtyHost;
-use crate::service::on_blocking_pool as run_on_blocking_pool;
 use crate::service::pty::PtyService;
+use crate::service::audio::AudioService;
 use crate::service::checks::{ApplySummary, ChecksService, ChecksSuggestion};
 use crate::service::settings::SettingsService;
 use crate::service::sink::{OutputSink, TauriEventSink};
@@ -722,22 +722,24 @@ fn is_automatic_terminal_response(input: &str) -> bool {
         .all(|&b| b.is_ascii_digit() || b == b';' || b == b'?')
 }
 
+/// Build the speech use cases over this app's handles. One place, so the five
+/// TTS commands cannot drift in what they hand them.
+fn audio_service(state: &AppState) -> AudioService<'_> {
+    AudioService::new(
+        &state.tabs,
+        &state.tts_segments,
+        &state.speak_session,
+        &state.ai_tts_suppressed,
+        &state.audio,
+    )
+}
+
 /// Debug: synthesize and play `text` directly through the TTS worker, skipping
 /// the processor. Routed as if it came from the active tab so the worker's
-/// filter doesn't drop it.
+/// filter doesn't drop it. See [`AudioService::test`].
 #[tauri::command]
 pub async fn tts_test(state: State<'_, AppState>, text: String) -> AppResult<()> {
-    let active = state.tabs.lock().await.active();
-    state
-        .tts_segments
-        .send(crate::tts::TtsRequest::Synthesize {
-            tab: active,
-            text,
-            suppressible: false,
-        })
-        .await
-        .map_err(|e| AppError::Tts(format!("tts_test send: {e}")))?;
-    Ok(())
+    audio_service(&state).test(text).await
 }
 
 /// Read arbitrary text aloud through the TTS worker, skipping the
@@ -748,20 +750,7 @@ pub async fn tts_test(state: State<'_, AppState>, text: String) -> AppResult<()>
 /// but a backend skip keeps an empty synthesis off the worker.
 #[tauri::command]
 pub async fn tts_speak(state: State<'_, AppState>, text: String) -> AppResult<()> {
-    if text.trim().is_empty() {
-        return Ok(());
-    }
-    let active = state.tabs.lock().await.active();
-    state
-        .tts_segments
-        .send(crate::tts::TtsRequest::Synthesize {
-            tab: active,
-            text,
-            suppressible: false,
-        })
-        .await
-        .map_err(|e| AppError::Tts(format!("tts_speak send: {e}")))?;
-    Ok(())
+    audio_service(&state).speak(text).await
 }
 
 /// Read a terminal selection aloud as a read-along: `chunks` are the
@@ -778,31 +767,9 @@ pub async fn tts_speak_selection(
     session: u64,
     chunks: Vec<String>,
 ) -> AppResult<()> {
-    if chunks.is_empty() {
-        return Ok(());
-    }
-    // Resolve the active tab FIRST (this awaits the registry lock), then arm
-    // the session cell immediately before the send with no await in between.
-    // Storing the session before the `.lock().await` left a window in which a
-    // concurrent `tts_stop` (Esc) could zero the cell and then this command
-    // would still proceed to send — racing the stop. With the store moved
-    // after the await, an Esc that lands before this point simply means the
-    // worker sees a superseding/zeroed cell and abandons, and one that lands
-    // after is a clean supersede. The worker re-checks `speak_session` both
-    // before and after each chunk's synthesis, so a stop during the read still
-    // cancels the remaining chunks.
-    let active = state.tabs.lock().await.active();
-    state.speak_session.store(session, Ordering::SeqCst);
-    state
-        .tts_segments
-        .send(crate::tts::TtsRequest::SpeakSelection {
-            tab: active,
-            session,
-            chunks,
-        })
+    audio_service(&state)
+        .speak_selection(session, chunks)
         .await
-        .map_err(|e| AppError::Tts(format!("tts_speak_selection send: {e}")))?;
-    Ok(())
 }
 
 /// Stop all TTS playback immediately and cancel any in-flight selection read.
@@ -812,21 +779,7 @@ pub async fn tts_speak_selection(
 /// same Esc.
 #[tauri::command]
 pub async fn tts_stop(state: State<'_, AppState>) -> AppResult<()> {
-    state.speak_session.store(0, Ordering::SeqCst);
-    // Suppress the rest of the current AI-output burst's tagged segments
-    // (those still queued or yet to arrive) until the next `HarnessOutputStarted`
-    // clears the flag. Notifications and selection reads are unaffected — they
-    // ride other request variants the worker doesn't gate on this flag.
-    state.ai_tts_suppressed.store(true, Ordering::SeqCst);
-    // Recover the guard even if the lock is poisoned: this is the Esc
-    // emergency-stop, so it must never silently no-op and leave audio playing
-    // with no way to stop it from the UI. `into_inner` hands back the guard;
-    // the data behind it (an `Option<AudioOutput>` handle) is not left in a
-    // broken state by a panicking writer.
-    let audio = state.audio.read().unwrap_or_else(|e| e.into_inner());
-    if let Some(audio) = audio.as_ref().cloned() {
-        audio.stop_all();
-    }
+    audio_service(&state).stop();
     Ok(())
 }
 
@@ -836,12 +789,7 @@ pub async fn tts_stop(state: State<'_, AppState>) -> AppResult<()> {
 /// only the audio sink is paused.
 #[tauri::command]
 pub async fn tts_set_paused(state: State<'_, AppState>, paused: bool) -> AppResult<()> {
-    // Recover a poisoned guard rather than swallowing it — a no-op pause/resume
-    // would leave the transport controls dead with no signal why.
-    let audio = state.audio.read().unwrap_or_else(|e| e.into_inner());
-    if let Some(audio) = audio.as_ref().cloned() {
-        audio.set_paused(paused);
-    }
+    audio_service(&state).set_paused(paused);
     Ok(())
 }
 
@@ -852,6 +800,13 @@ pub async fn tts_set_paused(state: State<'_, AppState>, paused: bool) -> AppResu
 // the `stt-state` / `stt-transcription` events, not these return values.
 
 /// Open the input device and begin capturing. No-op if already recording.
+///
+/// **Left as a direct call** (V42 Phase A): the body is one post to the capture
+/// thread on the handle Tauri injected. There is no argument to shape, no
+/// ordering to get right and no return value — everything the user sees comes
+/// back as an `stt-state` / `stt-transcription` event, so a service in front of
+/// this would have nothing to assert. Same for the two commands below and for
+/// the two `stt_list_*` readers.
 #[tauri::command]
 pub async fn stt_start_recording(state: State<'_, AppState>) -> AppResult<()> {
     state.stt.start();
@@ -860,6 +815,8 @@ pub async fn stt_start_recording(state: State<'_, AppState>) -> AppResult<()> {
 
 /// Stop capturing and hand the recording to the transcription worker. The
 /// transcript arrives later via the `stt-transcription` event.
+///
+/// **Left as a direct call**, for [`stt_start_recording`]'s reason.
 #[tauri::command]
 pub async fn stt_stop_recording(state: State<'_, AppState>) -> AppResult<()> {
     state.stt.stop();
@@ -867,6 +824,8 @@ pub async fn stt_stop_recording(state: State<'_, AppState>) -> AppResult<()> {
 }
 
 /// Stop capturing and discard the buffer (no transcription).
+///
+/// **Left as a direct call**, for [`stt_start_recording`]'s reason.
 #[tauri::command]
 pub async fn stt_cancel(state: State<'_, AppState>) -> AppResult<()> {
     state.stt.cancel();
@@ -875,6 +834,10 @@ pub async fn stt_cancel(state: State<'_, AppState>) -> AppResult<()> {
 
 /// List the `ggml-*.bin` Whisper models present under `models/` for the
 /// settings dropdown.
+///
+/// **Left as a direct call**, for [`stt_start_recording`]'s reason: the body is
+/// one call on a free function in [`crate::stt`], which a test can already
+/// reach.
 #[tauri::command]
 pub async fn stt_list_models() -> AppResult<Vec<String>> {
     crate::stt::list_models()
@@ -882,6 +845,8 @@ pub async fn stt_list_models() -> AppResult<Vec<String>> {
 
 /// List cpal input device names for the settings device picker. The frontend
 /// prepends a "System default" entry (which maps to an empty `input_device`).
+///
+/// **Left as a direct call**, for [`stt_list_models`]'s reason.
 #[tauri::command]
 pub async fn stt_list_input_devices() -> AppResult<Vec<String>> {
     crate::stt::list_input_devices()
@@ -905,14 +870,7 @@ pub async fn harness_usage(harness: String) -> AppResult<HarnessUsage> {
 pub async fn get_system_stats(
     state: State<'_, AppState>,
 ) -> AppResult<crate::sysmon::SystemStatsSnapshot> {
-    // `sample()` blocks: it does a synchronous sysinfo refresh (incl.
-    // `networks.refresh(true)`, which re-scans every interface) plus NVML
-    // device queries. Run it on the blocking pool so the 1 Hz poll doesn't
-    // stall other IPC futures on the async reactor thread.
-    let sysmon = state.sysmon.clone();
-    tauri::async_runtime::spawn_blocking(move || sysmon.sample())
-        .await
-        .map_err(|e| AppError::Ipc(format!("system stats join: {e}")))
+    crate::service::view::system_stats(state.sysmon.clone()).await
 }
 
 #[tauri::command]
@@ -1687,16 +1645,13 @@ pub async fn activity_detail(id: u64) -> AppResult<Option<crate::activity::Activ
 /// Delete one activity entry (persists immediately).
 #[tauri::command]
 pub async fn activity_delete(id: u64) -> AppResult<()> {
-    run_on_blocking_pool(move || {
-        crate::activity::delete(id);
-    })
-    .await
+    crate::service::view::activity_delete(id).await
 }
 
 /// Clear the whole activity history (persists immediately).
 #[tauri::command]
 pub async fn activity_clear() -> AppResult<()> {
-    run_on_blocking_pool(crate::activity::clear).await
+    crate::service::view::activity_clear().await
 }
 
 /// V10 (Analyses): candidate unused public symbols — public/exported defs with
@@ -2474,23 +2429,12 @@ pub async fn content_clear() -> AppResult<u32> {
     Ok(crate::content::delete_all())
 }
 
+/// The voice names the settings picker offers. See
+/// [`service::audio::voices`](crate::service::audio::voices) for why a missing
+/// voice directory is an empty list rather than an error.
 #[tauri::command]
 pub async fn list_voices() -> AppResult<Vec<String>> {
-    use std::collections::BTreeSet;
-    let mut out = BTreeSet::<String>::new();
-    let dir = crate::tts::model_dir()?.join("voices");
-    if let Ok(read) = std::fs::read_dir(&dir) {
-        for entry in read.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("bin") {
-                continue;
-            }
-            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                out.insert(stem.to_string());
-            }
-        }
-    }
-    Ok(out.into_iter().collect())
+    crate::service::audio::voices()
 }
 
 #[tauri::command]

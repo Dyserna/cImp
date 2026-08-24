@@ -39,6 +39,7 @@
 //! increment, not a prototype — but it is deliberately not the whole surface.
 
 pub mod audit;
+pub mod audio;
 pub mod checks;
 pub mod graph;
 pub mod harness;

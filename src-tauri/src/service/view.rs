@@ -22,8 +22,10 @@
 //! re-read with it in mind: the win is in modules where Rust becomes the ONLY
 //! implementation, not in modules where it becomes a second one.
 
+use std::sync::Arc;
+
 use crate::activity::{ActivityEntry, ActivityRecord};
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 use crate::service::on_blocking_pool;
 
 /// The unified tool-activity feed (graph calls + offload runs), newest first,
@@ -37,6 +39,44 @@ pub async fn activity_since(since_ts: Option<u64>) -> AppResult<Vec<ActivityEntr
 /// aged out) between the list poll and the click.
 pub async fn activity_detail(id: u64) -> AppResult<Option<ActivityRecord>> {
     on_blocking_pool(move || crate::activity::detail(id)).await
+}
+
+/// Delete one activity row (the detail popup's Delete).
+///
+/// The store reports whether the row was still there; the caller does not want
+/// to know. An id that is already gone is a successful delete, because either
+/// way the row the user was looking at is not there any more — so the boolean
+/// is dropped rather than turned into an error the popup would have to explain.
+pub async fn activity_delete(id: u64) -> AppResult<()> {
+    on_blocking_pool(move || {
+        let _existed = crate::activity::delete(id);
+    })
+    .await
+}
+
+/// Delete every activity row (the Events tab's Clear).
+pub async fn activity_clear() -> AppResult<()> {
+    on_blocking_pool(crate::activity::clear).await
+}
+
+/// One system-monitor sample (CPU / memory / GPU / network) for the bottom-bar
+/// panel, taken off the async reactor.
+///
+/// `sample()` blocks: it does a synchronous sysinfo refresh — including
+/// `networks.refresh(true)`, which re-scans every interface — plus NVML device
+/// queries. The frontend polls this on `system_stats.poll_interval_secs`
+/// (default 1 s), so doing it on a runtime worker would park that worker once a
+/// second and stall every other IPC queued behind it.
+///
+/// Takes the handle by value rather than by reference: the sample runs on
+/// another thread, so it needs an owned `Arc` and there is nothing for a
+/// borrowing service to save.
+pub async fn system_stats(
+    sysmon: Arc<crate::sysmon::SystemStatsState>,
+) -> AppResult<crate::sysmon::SystemStatsSnapshot> {
+    tokio::task::spawn_blocking(move || sysmon.sample())
+        .await
+        .map_err(|e| AppError::Ipc(format!("system stats join: {e}")))
 }
 
 #[cfg(test)]

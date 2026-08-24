@@ -13,6 +13,12 @@ use crate::service::pty::PtyService;
 use crate::service::checks::{ApplySummary, ChecksService, ChecksSuggestion};
 use crate::service::settings::SettingsService;
 use crate::service::sink::{OutputSink, TauriEventSink};
+use crate::service::graph::{
+    ArchResult, CodeIntelService, DeadExportRow, ImpactResult, PathResult, VizFileStatusRow,
+    VizGraphResult,
+};
+use crate::service::harness::{HarnessService, HarnessStatus, HarnessUsage};
+use crate::service::usage::{AdvisorRules, AdvisorSnapshot, UsageService};
 use crate::service::workbench::WorkbenchUseCases;
 use crate::settings::{AiToolTabConfig, Settings, TabConfig};
 use crate::state::{ReadOnlySource, StateSignal, TabId, TabKind};
@@ -881,132 +887,14 @@ pub async fn stt_list_input_devices() -> AppResult<Vec<String>> {
 }
 
 /// **One harness's usage reading** for the bottom-bar tracker (V40 Phase D,
-/// locked decision 19). Local read, never the network.
-///
-/// This was `get_claude_usage`, a command named after a harness that answered
-/// a payload with `five_hour` / `seven_day` fields in it. It now takes the
-/// harness and answers three distinguishable states, which is the whole point:
-///
-/// * `source: None` — **this harness has no usage source at all.** OpenCode.
-///   A UI must render that as absence; rendering it as a harness at 0% would be
-///   a number nobody reported (global principle 5). It says nothing about
-///   whether the harness RECORDS turns — see `token_kinds`/`origins` below.
-/// * `source: Some(..), reading: None` — it has one, and nothing has been
-///   reported yet (no tab of that harness has pushed, or the last push aged
-///   out).
-/// * `source: Some(..), reading: Some(..)` — the declared windows that have a
-///   reading, in declared order, plus the live context block.
-///
-/// Beside those three, and **independent of them**, the answer carries the
-/// declared shape of a RECORDED turn: `token_kinds` and `origins`. V40 Phase G
-/// split the two questions, because they had different answers all along —
-/// OpenCode reports no quota and no context window (`source: None`) and still
-/// writes real per-turn token rows with a parent/child lane split. Nesting the
-/// declaration under `source` meant the Usage donut could not label an OpenCode
-/// session's lanes at all. Both lists are EMPTY for a harness that declares no
-/// turn shape.
-///
-/// An unregistered harness id is an error, not an empty reading: a widget
-/// polling for a harness that does not exist is a bug, and answering it with
-/// "nothing to show" would hide it forever.
+/// locked decision 19). Local read, never the network. See
+/// [`service::harness::usage`](crate::service::harness::usage) for the three
+/// distinguishable source states, for why the declared turn shape sits BESIDE
+/// them rather than inside them, and for why an unregistered harness id is an
+/// error rather than an empty reading.
 #[tauri::command]
 pub async fn harness_usage(harness: String) -> AppResult<HarnessUsage> {
-    let id = crate::harness::HarnessId::from_id(&harness).ok_or_else(|| {
-        crate::error::AppError::Ipc(format!(
-            "unknown harness `{harness}` — registered: {}",
-            crate::harness::registry::harness_ids().join(", ")
-        ))
-    })?;
-    let plugin = id.plugin();
-    let source = plugin.and_then(|p| p.usage_source());
-    let shape = plugin.and_then(|p| p.turn_usage_shape());
-    Ok(HarnessUsage {
-        source: source.map(|s| UsageSourceInfo {
-            windows: s
-                .windows()
-                .iter()
-                .map(|w| DeclaredWindow {
-                    id: w.id,
-                    label: w.label,
-                    short: w.short,
-                    description: w.description,
-                })
-                .collect(),
-        }),
-        token_kinds: shape
-            .map(|s| {
-                s.token_kinds
-                    .iter()
-                    .map(|k| DeclaredLabel { id: k.id, label: k.label })
-                    .collect()
-            })
-            .unwrap_or_default(),
-        origins: shape
-            .map(|s| {
-                s.origins
-                    .iter()
-                    .map(|o| DeclaredOrigin { id: o.id, label: o.label, subagent: o.subagent })
-                    .collect()
-            })
-            .unwrap_or_default(),
-        reading: source.and_then(|s| s.read()),
-    })
-}
-
-/// The answer [`harness_usage`] gives. See its docs for the three source
-/// states and for why the turn shape sits BESIDE them, not inside them.
-#[derive(serde::Serialize)]
-pub struct HarnessUsage {
-    /// What this harness's quota source *can* report — `None` when it has none.
-    pub source: Option<UsageSourceInfo>,
-    /// The billing categories this harness reports a RECORDED turn's tokens
-    /// under, in declared order. Empty when it records no turns.
-    pub token_kinds: Vec<DeclaredLabel>,
-    /// The lanes a recorded turn can be attributed to, in declared order —
-    /// what the Usage donut labels its rings with. Empty when it records no
-    /// turns.
-    pub origins: Vec<DeclaredOrigin>,
-    /// What the quota source reports right now.
-    pub reading: Option<crate::harness::plugin::UsageReading>,
-}
-
-/// The declared shape of a QUOTA source: which windows it can report.
-///
-/// Sent alongside the reading rather than mirrored in the frontend, so a
-/// harness with three quota windows (or one, or none) needs no UI change —
-/// locked decision 19. V40 Phase G moved `token_kinds` / `origins` OUT of here:
-/// they describe a stored turn, not a quota reading, and a harness can have
-/// either without the other.
-#[derive(serde::Serialize)]
-pub struct UsageSourceInfo {
-    pub windows: Vec<DeclaredWindow>,
-}
-
-/// One declared quota window, without a reading.
-#[derive(serde::Serialize)]
-pub struct DeclaredWindow {
-    pub id: &'static str,
-    pub label: &'static str,
-    pub short: &'static str,
-    pub description: &'static str,
-}
-
-/// A declared id with the label a UI renders for it (token categories).
-#[derive(serde::Serialize)]
-pub struct DeclaredLabel {
-    pub id: &'static str,
-    pub label: &'static str,
-}
-
-/// One declared turn lane. Carries `subagent` because that is what tells a UI
-/// which lane gets the fan-out treatment (the outlined bar, the "A" badge)
-/// without recognising the word `"agent"` — the literal locked decision 19
-/// exists to delete.
-#[derive(serde::Serialize)]
-pub struct DeclaredOrigin {
-    pub id: &'static str,
-    pub label: &'static str,
-    pub subagent: bool,
+    crate::service::harness::usage(&harness)
 }
 
 /// Sample the system-monitor stats (CPU / memory / GPU / network) for the
@@ -1771,20 +1659,34 @@ pub async fn checks_validate_pattern(pattern: String) -> Result<(), String> {
 }
 
 /// Resolve an optional `root` IPC argument to a project directory: the given
-/// path when non-blank, else the app's launch directory. Shared by the graph
-/// commands so the fallback lives in one place.
-/// Resolve an optional `root` IPC argument to a project directory: the given
-/// path when non-blank, else the app's launch directory. Shared by the graph
-/// commands so the fallback lives in one place — the service layer needs the
-/// same answer, so the rule itself is [`crate::service::project_root`] and this
-/// is its name at the wire boundary.
+/// path when non-blank, else the app's launch directory — the rule itself is
+/// [`crate::service::project_root`], and this is its name at the wire boundary.
+///
+/// It was the graph commands' shared fallback; those resolve inside
+/// [`CodeIntelService`] now, so what is left here are the two compose-template
+/// commands that documented themselves as "mirroring `graph_rebuild`" and still
+/// do. (The duplicated first paragraph this replaces was a copy-paste from the
+/// A1 settings run.)
 fn resolve_graph_root(root: Option<String>) -> AppResult<std::path::PathBuf> {
     crate::service::project_root(root)
+}
+
+/// Build the code-graph use cases over this app's handle. One place, so no
+/// command can drift in what it hands them.
+fn code_intel_service(
+    service: &std::sync::Arc<crate::graph::GraphService>,
+) -> CodeIntelService<'_> {
+    CodeIntelService::new(service)
 }
 
 /// V9-01: known per-root code-graph status (idle/building/ready/error + row
 /// counts). The initial fill for the graph status surface; live transitions
 /// arrive via the `graph-status` event. Empty before the first build.
+///
+/// **Left as a direct call** (V42 Phase A): the whole body is one accessor on
+/// the handle Tauri already injected — no argument shaping, no ordering, no
+/// error mapping. Wrapping it would add a hop that says nothing
+/// `GraphService::statuses` does not.
 #[tauri::command]
 pub async fn graph_status(
     service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
@@ -1797,104 +1699,42 @@ pub async fn graph_status(
 /// immediately — the build runs on a worker thread and reports progress via
 /// the `graph-status` event. A no-op when a build for that root is already in
 /// flight. The store must be built before the `graph_*` MCP tools have data.
+/// See [`CodeIntelService::rebuild`].
 #[tauri::command]
 pub async fn graph_rebuild(
     service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
     root: Option<String>,
 ) -> AppResult<()> {
-    let root = match root {
-        Some(r) if !r.trim().is_empty() => std::path::PathBuf::from(r),
-        _ => std::env::current_dir().map_err(|e| AppError::Settings(format!("cwd: {e}")))?,
-    };
-    // A user clicked Rebuild — the one graph path allowed to announce itself on
-    // the V30 session-push bus (and only if it also runs long enough to matter).
-    service.spawn_rebuild(root, crate::graph::RebuildOrigin::User);
-    Ok(())
+    code_intel_service(&service).rebuild(root)
 }
 
 /// Open a native file/folder picker for the Settings "Ignore" editor and
-/// return a gitignore-style glob for the selection: project-relative and
-/// anchored with a leading `/` when the pick lies under a known graph root
-/// (longest root wins), with a trailing `/` for folders. `None` when the user
-/// cancels. A pick outside every root falls back to the absolute path
-/// (forward slashes) — it won't match anything, but it lands visibly in the
-/// editor where the user can correct it, rather than being silently dropped.
+/// return a gitignore-style glob for the selection. `None` when the user
+/// cancels. See [`CodeIntelService::ignore_pick`].
 #[tauri::command]
 pub async fn graph_ignore_pick(
     service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
     folder: bool,
 ) -> AppResult<Option<String>> {
-    let start = std::env::current_dir().ok();
-    // rfd's sync dialog blocks its thread (native message pump) — keep it off
-    // the async runtime's core threads.
-    let picked = tauri::async_runtime::spawn_blocking(move || {
-        let mut d = rfd::FileDialog::new().set_title(if folder {
-            "Choose a folder for the graph to ignore"
-        } else {
-            "Choose a file for the graph to ignore"
-        });
-        if let Some(s) = start {
-            d = d.set_directory(s);
-        }
-        if folder {
-            d.pick_folder()
-        } else {
-            d.pick_file()
-        }
-    })
-    .await
-    .map_err(|e| AppError::Settings(format!("picker task: {e}")))?;
-    let Some(path) = picked else { return Ok(None) };
-
-    let mut roots: Vec<std::path::PathBuf> = service
-        .statuses()
-        .iter()
-        .map(|s| std::path::PathBuf::from(&s.root))
-        .collect();
-    // The launch dir is the primary project even before its first build.
-    if let Ok(cwd) = std::env::current_dir() {
-        roots.push(cwd);
-    }
-    Ok(Some(to_ignore_glob(&path, folder, &roots)))
-}
-
-/// Turn a picked absolute path into the `graph.ignore` glob `graph_ignore_pick`
-/// returns (see its doc for the shape). Split out for testability.
-fn to_ignore_glob(path: &std::path::Path, is_dir: bool, roots: &[std::path::PathBuf]) -> String {
-    // Longest matching root wins so a nested root maps to the shorter rel.
-    let rel = roots
-        .iter()
-        .filter(|r| path.starts_with(r))
-        .max_by_key(|r| r.components().count())
-        .and_then(|r| path.strip_prefix(r).ok());
-    let mut glob = match rel {
-        // Leading `/` anchors to the project root: the user picked THIS
-        // `docs/`, not every directory named `docs` at any depth.
-        Some(rel) => format!("/{}", rel.to_string_lossy().replace('\\', "/")),
-        None => path.to_string_lossy().replace('\\', "/"),
-    };
-    if is_dir && !glob.ends_with('/') {
-        glob.push('/');
-    }
-    glob
+    code_intel_service(&service).ignore_pick(folder).await
 }
 
 /// V9-01 Phase G: force a full re-embed of the project's doc chunks (drops the
 /// vector store, then backfills). The "Rebuild embeddings" action; no-op when
-/// semantic search is off. `root` defaults to the launch directory.
+/// semantic search is off. See [`CodeIntelService::rebuild_embeddings`].
 #[tauri::command]
 pub async fn graph_rebuild_embeddings(
     service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
     root: Option<String>,
 ) -> AppResult<()> {
-    let root = resolve_graph_root(root)?;
-    service.spawn_rebuild_embeddings(root);
-    Ok(())
+    code_intel_service(&service).rebuild_embeddings(root)
 }
 
 /// V9-01: probe the configured embedding endpoint on demand (the monitor tab's
 /// "Test connection" action). Returns reachability + the live vector dimension
 /// or the exact connection error, without running a full embed backfill.
+///
+/// **Left as a direct call**, for [`graph_status`]'s reason.
 #[tauri::command]
 pub async fn graph_test_embedder(
     service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
@@ -1903,45 +1743,15 @@ pub async fn graph_test_embedder(
 }
 
 /// V9-01: recent graph tool calls (cloud Claude + offload worker), newest
-/// first. The store is process-wide across every indexed root; pass
-/// `scoped: true` (with an optional `root`, default the launch directory) to
-/// filter to one project's calls — the Graph View pulse feed uses this so
-/// another project's activity can't light up same-named nodes here.
-///
-/// The persistent activity store also holds offload runs; this endpoint keeps
-/// its historical contract of graph calls only (the pulse feed maps
-/// tool/target onto graph nodes). The Tool Activity tab uses
-/// [`activity_list`] and sees everything.
-/// `since_ts` (optional) trims the response to entries newer than the
-/// caller's high-water mark, so the 1.5–2s pollers aren't re-serializing
-/// hundreds of unchanged rows every tick. All store calls run on the
-/// blocking pool: the first access loads the JSONL mirror from disk, and
-/// mutations rewrite it — neither belongs on a tokio worker thread.
+/// first. See [`service::graph::history`](crate::service::graph::history) for
+/// the scoping rule and why every store call runs on the blocking pool.
 #[tauri::command]
 pub async fn graph_history(
     root: Option<String>,
     scoped: Option<bool>,
     since_ts: Option<u64>,
 ) -> AppResult<Vec<crate::activity::ActivityEntry>> {
-    let key = if scoped.unwrap_or(false) {
-        Some(crate::activity::root_key(&resolve_graph_root(root)?))
-    } else {
-        None
-    };
-    run_on_blocking_pool(move || {
-        let mut calls: Vec<_> = crate::activity::snapshot_since(since_ts.unwrap_or(0))
-            .into_iter()
-            .filter(|c| c.kind == crate::activity::ActivityKind::Graph.as_str())
-            .collect();
-        if let Some(key) = key {
-            // #104 item 5: NOT `==`. The store holds rows this project wrote
-            // before the key spelling was unified, so a raw compare drops half
-            // of one project's history.
-            calls.retain(|c| crate::activity::root_key_eq(&c.root, &key));
-        }
-        calls
-    })
-    .await
+    crate::service::graph::history(root, scoped, since_ts).await
 }
 
 /// The unified tool-activity feed (graph calls + offload runs), newest first,
@@ -1989,171 +1799,46 @@ pub async fn activity_clear() -> AppResult<()> {
     run_on_blocking_pool(crate::activity::clear).await
 }
 
-/// V10: one candidate dead export (unused public symbol) for the Analyses tab.
-#[derive(serde::Serialize)]
-pub struct DeadExportRow {
-    pub name: String,
-    pub kind: String,
-    pub file: String,
-    pub line: u32,
-    pub signature: String,
-}
-
 /// V10 (Analyses): candidate unused public symbols — public/exported defs with
 /// no reference and no inbound call edge. Candidates only; the UI states the
 /// false-positive caveat (dynamic dispatch, external API, macros/reflection).
 /// `root` defaults to the launch directory. On-demand (no background schedule).
+/// See [`CodeIntelService::dead_exports`].
 #[tauri::command]
 pub async fn graph_dead_exports(
     service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
     root: Option<String>,
 ) -> AppResult<Vec<DeadExportRow>> {
-    let root = resolve_graph_root(root)?;
-    let hits = service.dead_exports(&root)?;
-    Ok(hits
-        .into_iter()
-        .map(|s| DeadExportRow {
-            name: s.name,
-            kind: s.kind,
-            file: s.file,
-            line: s.start_line,
-            signature: s.signature,
-        })
-        .collect())
+    code_intel_service(&service).dead_exports(root)
 }
 
 /// V10 (Analyses): import cycles between files (each a loop of ≥ 2 files that
 /// transitively import one another). `root` defaults to the launch directory.
+/// See [`CodeIntelService::cycles`].
 #[tauri::command]
 pub async fn graph_cycles(
     service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
     root: Option<String>,
 ) -> AppResult<Vec<Vec<String>>> {
-    let root = resolve_graph_root(root)?;
-    service.import_cycles(&root)
+    code_intel_service(&service).cycles(root)
 }
 
-/// V12 Phase B (Analyses): one symbol changed since `HEAD` (the working-tree
-/// diff's root set).
-#[derive(serde::Serialize)]
-pub struct ChangedSymbolRow {
-    pub name: String,
-    pub kind: String,
-    pub file: String,
-    pub line: u32,
-}
-
-/// V12 Phase B (Analyses): one transitive dependent of a changed symbol.
-#[derive(serde::Serialize)]
-pub struct DependentRow {
-    pub name: String,
-    pub kind: String,
-    pub file: String,
-    pub line: u32,
-    pub depth: u32,
-    pub approx: bool,
-    /// V15 Feature 3: weakest edge confidence along the discovery chain
-    /// (`extracted`/`inferred`/`ambiguous`).
-    pub confidence: String,
-}
-
-/// V12 Phase B (Analyses): the working-tree diff's blast radius — the
-/// changed symbols, their transitive dependents, and any changed files the
-/// graph doesn't index (docs/configs/etc.).
-#[derive(serde::Serialize)]
-pub struct ImpactResult {
-    pub changed: Vec<ChangedSymbolRow>,
-    pub dependents: Vec<DependentRow>,
-    pub unindexed: Vec<String>,
-}
-
-/// V12 Phase B (Analyses): "what does my current working-tree change
-/// affect?" — diff mode only (the `symbols`-scoped mode is MCP-tool only,
-/// where an agent supplies explicit roots). `root` defaults to the launch
-/// directory. Errors with a "requires git" message when `root` isn't a git
-/// repository (see `AppError::NotAGitRepo`).
+/// V12 Phase B (Analyses): "what does my current working-tree change affect?" —
+/// diff mode only (the `symbols`-scoped mode is MCP-tool only, where an agent
+/// supplies explicit roots). `root` defaults to the launch directory. Errors
+/// with a "requires git" message when `root` isn't a git repository (see
+/// `AppError::NotAGitRepo`). See [`CodeIntelService::impact`].
 #[tauri::command]
 pub async fn graph_impact(
     service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
     root: Option<String>,
 ) -> AppResult<ImpactResult> {
-    let root = resolve_graph_root(root)?;
-    let report = service.impact(&root)?;
-    Ok(ImpactResult {
-        changed: report
-            .changed
-            .into_iter()
-            .map(|s| ChangedSymbolRow {
-                name: s.name,
-                kind: s.kind,
-                file: s.file,
-                line: s.start_line,
-            })
-            .collect(),
-        dependents: report
-            .dependents
-            .into_iter()
-            .map(|d| DependentRow {
-                name: d.symbol.name,
-                kind: d.symbol.kind,
-                file: d.symbol.file,
-                line: d.symbol.start_line,
-                depth: d.depth,
-                approx: d.approx,
-                confidence: d.confidence.tag().to_string(),
-            })
-            .collect(),
-        unindexed: report.unindexed,
-    })
-}
-
-// ── V15 Feature 1: path tracing ──────────────────────────────────────────
-
-/// One node on a traced path, serialized for the Code Intelligence tab.
-#[derive(serde::Serialize)]
-pub struct PathNodeRow {
-    pub id: String,
-    pub label: String,
-    pub file: String,
-    pub line: u32,
-    pub kind: String,
-    pub edge_to_next: Option<String>,
-    pub confidence: Option<String>,
-}
-
-/// The result of a `graph_path` trace. `found=false` means no path within the
-/// hop bound (or an unresolvable endpoint).
-#[derive(serde::Serialize)]
-pub struct PathResult {
-    pub found: bool,
-    pub nodes: Vec<PathNodeRow>,
-    pub hops: usize,
-    pub equal_alternatives: u64,
-}
-
-fn parse_path_kinds(kinds: Option<Vec<String>>) -> Vec<crate::graph::EdgeKind> {
-    use crate::graph::EdgeKind;
-    let all = || vec![EdgeKind::Call, EdgeKind::Import, EdgeKind::Contains];
-    let Some(ks) = kinds else { return all() };
-    let mut out = Vec::new();
-    for k in ks {
-        match k.trim().to_ascii_lowercase().as_str() {
-            "call" => out.push(EdgeKind::Call),
-            "import" => out.push(EdgeKind::Import),
-            "contains" => out.push(EdgeKind::Contains),
-            _ => {}
-        }
-    }
-    if out.is_empty() {
-        all()
-    } else {
-        out
-    }
+    code_intel_service(&service).impact(root)
 }
 
 /// V15 Feature 1 (Architecture): trace the shortest path between two entities
 /// through the call/import/containment graph. `root` defaults to the launch
-/// directory.
+/// directory. See [`CodeIntelService::path`].
 #[tauri::command]
 pub async fn graph_path(
     service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
@@ -2163,287 +1848,83 @@ pub async fn graph_path(
     kinds: Option<Vec<String>>,
     symmetric: Option<bool>,
 ) -> AppResult<PathResult> {
-    let root = resolve_graph_root(root)?;
-    let kinds = parse_path_kinds(kinds);
-    let hit = service.shortest_path(
-        &root,
-        from.trim(),
-        to.trim(),
-        &kinds,
-        symmetric.unwrap_or(false),
-    )?;
-    Ok(match hit {
-        Some(h) => PathResult {
-            found: true,
-            nodes: h
-                .nodes
-                .into_iter()
-                .map(|n| PathNodeRow {
-                    id: n.id,
-                    label: n.label,
-                    file: n.file,
-                    line: n.line,
-                    kind: n.kind,
-                    edge_to_next: n.edge_to_next,
-                    confidence: n.confidence.map(|c| c.tag().to_string()),
-                })
-                .collect(),
-            hops: h.hops,
-            equal_alternatives: h.equal_alternatives,
-        },
-        None => PathResult {
-            found: false,
-            nodes: Vec::new(),
-            hops: 0,
-            equal_alternatives: 0,
-        },
-    })
-}
-
-// ── V15 Feature 2: architecture overview ─────────────────────────────────
-
-#[derive(serde::Serialize)]
-pub struct GodNodeRow {
-    pub id: String,
-    pub label: String,
-    pub file: String,
-    pub kind: String,
-    pub degree: u64,
-}
-
-#[derive(serde::Serialize)]
-pub struct SubsystemRow {
-    pub name: String,
-    pub size: usize,
-    pub files: Vec<String>,
-    pub hub: String,
-}
-
-#[derive(serde::Serialize)]
-pub struct SurprisingRow {
-    pub from: String,
-    pub to: String,
-    pub kind: String,
-    pub from_subsystem: String,
-    pub to_subsystem: String,
-}
-
-#[derive(serde::Serialize)]
-pub struct ArchResult {
-    pub god_nodes: Vec<GodNodeRow>,
-    pub subsystems: Vec<SubsystemRow>,
-    pub surprising: Vec<SurprisingRow>,
+    code_intel_service(&service).path(root, &from, &to, kinds, symmetric)
 }
 
 /// V15 Feature 2 (Architecture): the system-shape overview — god nodes,
 /// subsystems, and surprising cross-subsystem edges. `root` defaults to the
-/// launch directory.
+/// launch directory. See [`CodeIntelService::architecture`].
 #[tauri::command]
 pub async fn graph_architecture(
     service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
     root: Option<String>,
 ) -> AppResult<ArchResult> {
-    let root = resolve_graph_root(root)?;
-    let r = service.architecture(&root)?;
-    Ok(ArchResult {
-        god_nodes: r
-            .god_nodes
-            .into_iter()
-            .map(|g| GodNodeRow {
-                id: g.id,
-                label: g.label,
-                file: g.file,
-                kind: g.kind,
-                degree: g.degree,
-            })
-            .collect(),
-        subsystems: r
-            .subsystems
-            .into_iter()
-            .map(|s| SubsystemRow {
-                name: s.name,
-                size: s.size,
-                files: s.files,
-                hub: s.hub,
-            })
-            .collect(),
-        surprising: r
-            .surprising
-            .into_iter()
-            .map(|e| SurprisingRow {
-                from: e.from,
-                to: e.to,
-                kind: e.kind,
-                from_subsystem: e.from_subsystem,
-                to_subsystem: e.to_subsystem,
-            })
-            .collect(),
-    })
-}
-
-// ── V15 Feature 4: Graph View snapshot ───────────────────────────────────
-
-#[derive(serde::Serialize)]
-pub struct VizNodeRow {
-    pub id: String,
-    pub label: String,
-    pub file: String,
-    pub kind: String,
-    pub degree: u64,
-    pub subsystem: String,
-}
-
-#[derive(serde::Serialize)]
-pub struct VizEdgeRow {
-    pub src: String,
-    pub dst: String,
-    pub kind: String,
-    pub confidence: String,
-    /// `false` = over the per-node drawn quota: listed/highlighted by the
-    /// frontend but not rendered as an ambient line.
-    pub drawn: bool,
-}
-
-#[derive(serde::Serialize)]
-pub struct VizGraphResult {
-    pub nodes: Vec<VizNodeRow>,
-    pub edges: Vec<VizEdgeRow>,
+    code_intel_service(&service).architecture(root)
 }
 
 /// V15 Feature 4 (Graph View): a bounded {nodes, edges} subgraph for the live
 /// visualization (Tool Activity → Graph view). `root` defaults to the launch
-/// directory.
+/// directory. See [`CodeIntelService::viz_snapshot`].
 #[tauri::command]
 pub async fn graph_viz_snapshot(
     service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
     root: Option<String>,
 ) -> AppResult<VizGraphResult> {
-    let root = resolve_graph_root(root)?;
-    let g = service.viz_snapshot(&root)?;
-    Ok(VizGraphResult {
-        nodes: g
-            .nodes
-            .into_iter()
-            .map(|n| VizNodeRow {
-                id: n.id,
-                label: n.label,
-                file: n.file,
-                kind: n.kind,
-                degree: n.degree,
-                subsystem: n.subsystem,
-            })
-            .collect(),
-        edges: g
-            .edges
-            .into_iter()
-            .map(|e| VizEdgeRow {
-                src: e.src,
-                dst: e.dst,
-                kind: e.kind,
-                confidence: e.confidence,
-                drawn: e.drawn,
-            })
-            .collect(),
-    })
-}
-
-/// Per-file Graph View presence (Workbench ⌖ button state).
-#[derive(serde::Serialize)]
-pub struct VizFileStatusRow {
-    pub path: String,
-    /// The file exists in the graph index at all.
-    pub indexed: bool,
-    /// Rolled-up file-level call/import degree (0 = nothing to jump to).
-    pub degree: u64,
+    code_intel_service(&service).viz_snapshot(root)
 }
 
 /// Workbench ⌖ support: per-file Graph View presence for a batch of
 /// repo-relative paths — the jump button disables for unindexed or
-/// connection-less files. `root` defaults to the launch directory.
+/// connection-less files. `root` defaults to the launch directory. See
+/// [`CodeIntelService::viz_file_status`].
 #[tauri::command]
 pub async fn graph_viz_file_status(
     service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
     root: Option<String>,
     paths: Vec<String>,
 ) -> AppResult<Vec<VizFileStatusRow>> {
-    let root = resolve_graph_root(root)?;
-    Ok(service
-        .viz_file_status(&root, &paths)?
-        .into_iter()
-        .map(|s| VizFileStatusRow {
-            path: s.path,
-            indexed: s.indexed,
-            degree: s.degree,
-        })
-        .collect())
+    code_intel_service(&service).viz_file_status(root, &paths)
 }
 
 /// Workbench ⌖ support: the 1-hop FILE ego of `path` regardless of the
-/// snapshot's top-N-by-degree cut — the Graph View injects it temporarily
-/// when a jump targets a file the rendered snapshot dropped. `root` defaults
-/// to the launch directory.
+/// snapshot's top-N-by-degree cut — the Graph View injects it temporarily when a
+/// jump targets a file the rendered snapshot dropped. `root` defaults to the
+/// launch directory. See [`CodeIntelService::viz_ego`].
 #[tauri::command]
 pub async fn graph_viz_ego(
     service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
     root: Option<String>,
     path: String,
 ) -> AppResult<VizGraphResult> {
-    let root = resolve_graph_root(root)?;
-    let g = service.viz_ego(&root, &path)?;
-    Ok(VizGraphResult {
-        nodes: g
-            .nodes
-            .into_iter()
-            .map(|n| VizNodeRow {
-                id: n.id,
-                label: n.label,
-                file: n.file,
-                kind: n.kind,
-                degree: n.degree,
-                subsystem: n.subsystem,
-            })
-            .collect(),
-        edges: g
-            .edges
-            .into_iter()
-            .map(|e| VizEdgeRow {
-                src: e.src,
-                dst: e.dst,
-                kind: e.kind,
-                confidence: e.confidence,
-                drawn: e.drawn,
-            })
-            .collect(),
-    })
+    code_intel_service(&service).viz_ego(root, &path)
 }
 
 /// V10 (Memory): the project's session/action memory — current session, its
 /// working set, notes (pinned + current-session), and the recent-sessions list.
-/// `root` defaults to the launch directory.
+/// `root` defaults to the launch directory. See [`CodeIntelService::memory`].
 #[tauri::command]
 pub async fn graph_memory(
     service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
     root: Option<String>,
 ) -> AppResult<crate::graph::MemorySnapshot> {
-    let root = resolve_graph_root(root)?;
-    Ok(service.memory_snapshot(&root))
+    code_intel_service(&service).memory(root)
 }
 
 /// V10 (Memory): clear one session's memory (`session` = its id) or the whole
-/// project's memory (`session` omitted). `root` defaults to the launch directory.
+/// project's memory (`session` omitted). `root` defaults to the launch
+/// directory. See [`CodeIntelService::memory_clear`].
 #[tauri::command]
 pub async fn graph_memory_clear(
     service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
     root: Option<String>,
     session: Option<String>,
 ) -> AppResult<()> {
-    let root = resolve_graph_root(root)?;
-    let session = session.filter(|s| !s.trim().is_empty());
-    service.mem_clear(&root, session.as_deref())
+    code_intel_service(&service).memory_clear(root, session)
 }
 
 /// V10 (Memory): pin/unpin a note (pinned notes survive session eviction and
-/// show project-wide). `root` defaults to the launch directory.
+/// show project-wide). `root` defaults to the launch directory. See
+/// [`CodeIntelService::note_set_pinned`].
 #[tauri::command]
 pub async fn graph_note_set_pinned(
     service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
@@ -2451,19 +1932,13 @@ pub async fn graph_note_set_pinned(
     note_id: String,
     pinned: bool,
 ) -> AppResult<()> {
-    let root = resolve_graph_root(root)?;
-    service.mem_set_note_pinned(&root, &note_id, pinned)
+    code_intel_service(&service).note_set_pinned(root, &note_id, pinned)
 }
 
 /// V32 Phase C2 (Memory): resolve one QUARANTINED note — `action` is
-/// `"promote"` (clear the taint; the note becomes ordinary memory, pinned state
-/// preserved) or `"discard"` (delete it). `root` defaults to the launch
-/// directory.
-///
-/// Shaped like [`graph_fact_update`] rather than as two commands: the two
-/// actions are the two halves of one review decision, always rendered side by
-/// side, and an unknown `action` is rejected here rather than silently ignored —
-/// a typo must not read as "reviewed, nothing happened" on a security control.
+/// `"promote"` or `"discard"`. `root` defaults to the launch directory. See
+/// [`CodeIntelService::note_review`] for why an unknown action is rejected
+/// rather than ignored.
 #[tauri::command]
 pub async fn graph_note_review(
     service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
@@ -2471,29 +1946,23 @@ pub async fn graph_note_review(
     note_id: String,
     action: String,
 ) -> AppResult<()> {
-    let root = resolve_graph_root(root)?;
-    match action.as_str() {
-        "promote" => service.mem_promote_note(&root, &note_id),
-        "discard" => service.mem_delete_note(&root, &note_id),
-        other => Err(AppError::Graph(format!(
-            "unknown note review action `{other}` (expected \"promote\" or \"discard\")"
-        ))),
-    }
+    code_intel_service(&service).note_review(root, &note_id, &action)
 }
 
 /// V12 Phase E (Memory): the project's durable facts (pinned first, then
 /// newest), excluding archived ones. `root` defaults to the launch directory.
+/// See [`CodeIntelService::facts`].
 #[tauri::command]
 pub async fn graph_facts(
     service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
     root: Option<String>,
 ) -> AppResult<Vec<crate::graph::ProjectFact>> {
-    let root = resolve_graph_root(root)?;
-    Ok(service.list_project_facts(&root, false, 200))
+    code_intel_service(&service).facts(root)
 }
 
 /// V12 Phase E (Memory): pin / unpin / archive / delete one project fact.
-/// `root` defaults to the launch directory.
+/// `root` defaults to the launch directory. See
+/// [`CodeIntelService::fact_update`].
 #[tauri::command]
 pub async fn graph_fact_update(
     service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
@@ -2501,21 +1970,12 @@ pub async fn graph_fact_update(
     id: String,
     action: String,
 ) -> AppResult<()> {
-    let root = resolve_graph_root(root)?;
-    match action.as_str() {
-        "pin" => service.set_fact_pinned(&root, &id, true),
-        "unpin" => service.set_fact_pinned(&root, &id, false),
-        "archive" => service.set_fact_archived(&root, &id, true),
-        "delete" => service.delete_fact(&root, &id),
-        other => Err(crate::error::AppError::Graph(format!(
-            "unknown fact action: {other} (expected pin|unpin|archive|delete)"
-        ))),
-    }
+    code_intel_service(&service).fact_update(root, &id, &action)
 }
 
 /// V12 Phase E (Memory): manually add a project fact from the Facts UI's "add
-/// fact" input (recorded with `source_session = "manual"`). `root` defaults
-/// to the launch directory.
+/// fact" input (recorded with `source_session = "manual"`). `root` defaults to
+/// the launch directory. See [`CodeIntelService::fact_add`].
 #[tauri::command]
 pub async fn graph_fact_add(
     service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
@@ -2523,84 +1983,58 @@ pub async fn graph_fact_add(
     text: String,
     pin: Option<bool>,
 ) -> AppResult<()> {
-    let root = resolve_graph_root(root)?;
-    service.add_project_fact_manual(&root, &text, pin.unwrap_or(false))
+    code_intel_service(&service).fact_add(root, &text, pin)
 }
 
 /// V10 (Context): preview what context injection WOULD prepend for `prompt`,
 /// bypassing the `context_injection` toggle (so the user can tune before
 /// enabling). Requires the graph to be enabled. `root` defaults to the launch
-/// directory; no `session_id` (the preview isn't tied to a live session).
+/// directory; no `session_id` (the preview isn't tied to a live session). See
+/// [`CodeIntelService::context_preview`].
 #[tauri::command]
 pub async fn graph_context_preview(
     service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
     prompt: String,
     root: Option<String>,
 ) -> AppResult<crate::graph::RetrieveResult> {
-    let root = resolve_graph_root(root)?;
-    Ok(service.retrieve_context(&root, &prompt, None))
+    code_intel_service(&service).context_preview(&prompt, root)
 }
 
 // ── V14 Phase D/D2: Usage section (token X-ray) + budget-tuning advisor ───
 
+/// Build the Usage/Advisor use cases over this app's handle. One place, so no
+/// command can drift in what it hands them.
+fn usage_service(service: &std::sync::Arc<crate::graph::GraphService>) -> UsageService<'_> {
+    UsageService::new(service)
+}
+
 /// V14 Phase D: the Usage section's full payload for `root` — the current
-/// session's per-turn series + top-tools ranking, every known session's
-/// totals row, and the effectiveness counters. `root` defaults to the launch
-/// directory.
+/// session's per-turn series + top-tools ranking, every known session's totals
+/// row, and the effectiveness counters. `root` defaults to the launch
+/// directory. See [`UsageService::snapshot`], which also says why the pass runs
+/// on the blocking pool. This is the wire boundary only: it names the offload
+/// pool, whose local-task count `GraphService` cannot fill.
 #[tauri::command]
 pub async fn graph_usage(
     graph: State<'_, std::sync::Arc<crate::graph::GraphService>>,
     offload: State<'_, std::sync::Arc<crate::offload::OffloadService>>,
     root: Option<String>,
 ) -> AppResult<crate::graph::UsageSnapshot> {
-    let root = resolve_graph_root(root)?;
-    // `usage_snapshot` is a multi-query Cozo pass measured in seconds against a
-    // large store, and the Overview polls it on a timer — so it runs on the
-    // blocking pool. Left on a runtime worker it parked one for the whole pass
-    // and every other IPC queued behind it, which is what made switching tabs
-    // feel sluggish while the dashboard was open.
-    let graph = graph.inner().clone();
-    let offload = offload.inner().clone();
-    run_on_blocking_pool(move || {
-        let mut snap = graph.usage_snapshot(&root);
-        // Offload local-task count: completed runs (not still `"running"`) on
-        // `local` backends only — "N tasks served locally" per the milestone's
-        // Effectiveness panel, distinct from a run still in flight. GraphService
-        // has no dependency on OffloadService, so this is filled in here rather
-        // than inside `usage_snapshot`.
-        snap.offload_local_tasks = offload
-            .server_metrics()
-            .into_iter()
-            .filter(|b| b.kind == "local")
-            .flat_map(|b| b.metrics.runs)
-            .filter(|r| r.outcome != "running")
-            .count() as u64;
-        // V17 Phase E: the advertised tool-surface size (both consumers), measured
-        // post-`lean_tools`-filter from live settings — another cross-cutting field
-        // GraphService can't fill (it depends on settings, not the index).
-        snap.surface = crate::graph::surface_stats();
-        snap
-    })
-    .await
+    usage_service(&graph).snapshot(root, offload.inner().clone()).await
 }
 
 /// V24 Phase B: full drill-in detail for ONE session under `root` — its totals
 /// row, per-turn series, top-tools ranking, and per-model token totals with the
-/// session/agent origin split. Unlike `graph_usage` (which only surfaces the
-/// current session at full detail), this works for any session id, so the Usage
-/// card can render a clicked historical session. An unknown session id returns
-/// an empty detail (no error, no panic). `root` defaults to the launch
-/// directory.
+/// session/agent origin split. An unknown session id returns an empty detail
+/// (no error, no panic). `root` defaults to the launch directory. See
+/// [`UsageService::session_detail`].
 #[tauri::command]
 pub async fn graph_session_usage(
     graph: State<'_, std::sync::Arc<crate::graph::GraphService>>,
     root: Option<String>,
     session_id: String,
 ) -> AppResult<crate::graph::SessionUsageDetail> {
-    let root = resolve_graph_root(root)?;
-    // Same store-pass cost profile as `graph_usage` — off the runtime workers.
-    let graph = graph.inner().clone();
-    run_on_blocking_pool(move || graph.session_usage_detail(&root, &session_id)).await
+    usage_service(&graph).session_detail(root, session_id).await
 }
 
 /// V34: which session the tab keyed `tab` is currently working in, or `null`
@@ -2613,6 +2047,9 @@ pub async fn graph_session_usage(
 /// project with a co-tenant (V28 decision 4a), a tab that has not started, or a
 /// non-agent tab; the caller falls back to its previous behaviour rather than
 /// showing a session it cannot attribute.
+///
+/// **Left as a direct call** (V42 Phase A), for [`graph_status`]'s reason: the
+/// whole body is one accessor on the handle Tauri already injected.
 #[tauri::command]
 pub async fn graph_tab_session(
     graph: State<'_, std::sync::Arc<crate::graph::GraphService>>,
@@ -2621,339 +2058,17 @@ pub async fn graph_tab_session(
     Ok(graph.live_session_for_any_agent(&tab))
 }
 
-/// V14 Phase D2: the `graph_usage_advice` response. Wraps `advisor::evaluate`'s
-/// `Vec<Proposal>` with a `collecting` flag — NOT part of the milestone's
-/// literal `Vec<Proposal>` pseudocode, added because the Advisor card (D2.4)
-/// needs to distinguish "no data yet" from "checked, all healthy", and a
-/// bare `Vec<Proposal>` can't carry that distinction on its own.
-#[derive(serde::Serialize)]
-pub struct AdvisorSnapshot {
-    pub proposals: Vec<crate::advisor::Proposal>,
-    pub collecting: bool,
-}
-
-/// Count calls to any `graph::LEAN_HIDDEN` tool in `activity` within the
-/// trailing `window_ms` ending at `now_ms` — the `hideable_tool_calls` signal
-/// feeding `surface.lean.v1`. Zero ⇒ the lean-surface rule may fire.
-/// `now_ms.saturating_sub(window_ms)` is the inclusive cutoff, so entries older
-/// than the window (including ancient residue in the count-capped ring) don't
-/// count. Free function so the window semantics stay unit-testable apart from
-/// the IPC command.
-fn count_hideable_tool_calls(
-    activity: &[crate::activity::ActivityEntry],
-    now_ms: u64,
-    window_ms: u64,
-) -> u64 {
-    let cutoff = now_ms.saturating_sub(window_ms);
-    activity
-        .iter()
-        .filter(|e| e.ts_ms >= cutoff && crate::graph::LEAN_HIDDEN.contains(&e.tool.as_str()))
-        .count() as u64
-}
-
-/// Every registered harness's [`crate::advisor::DriftSignals`], for one advisor
-/// poll (V40 Phase C, locked decision 23).
-///
-/// The version half — `last_seen`, `last_verified`, `auto_verify` — is genuinely
-/// per harness: it comes out of `Settings::harness[<id>]`, which Phase B made a
-/// map, so a second harness gets a real `drift.version.v1` path for the first
-/// time.
-///
-/// **The SESSION half is per harness too since V40 Phase D** (locked decision
-/// 20). It used to be filled for the default harness only, with zeros for every
-/// other, because the queries behind it had one agent literal inside them —
-/// `drift.usage_fields_gone.v1` therefore never tripped its sample floor for a
-/// second harness, and a rule that cannot fire looks exactly like a rule that
-/// found nothing. `sessions` / `tokenless_sessions` now come from
-/// `GraphIndex::tokenless_sessions(agent)` run once per registered harness, and
-/// `subagent_drift` from the Activity rows each plugin declares it files
-/// (`drift_report_tools`). A harness whose reader files no drift reports gets an
-/// empty list — the truth, rather than a zero-fill that looks like one.
-fn harness_drift_signals(
-    sessions: &std::collections::BTreeMap<crate::harness::HarnessId, (u64, u64)>,
-    subagent_drift: &std::collections::BTreeMap<crate::harness::HarnessId, Vec<String>>,
-) -> crate::advisor::HarnessDriftSignals {
-    let map = crate::settings::read_global_harness_map();
-    crate::harness::registry::all()
-        .map(|id| {
-            let row = map
-                .get(id.token())
-                .cloned()
-                .unwrap_or_else(|| crate::settings::read_global_harness_settings(id));
-            let (sessions, tokenless_sessions) = sessions.get(&id).copied().unwrap_or((0, 0));
-            (
-                id,
-                crate::advisor::DriftSignals {
-                    last_seen: row.last_seen,
-                    last_verified: row.last_verified,
-                    auto_verify: row.auto_verify,
-                    sessions,
-                    tokenless_sessions,
-                    subagent_drift: subagent_drift.get(&id).cloned().unwrap_or_default(),
-                },
-            )
-        })
-        .collect()
-}
-
 /// V14 Phase D2: the budget-tuning advisor's current proposals for `root`.
-/// Assembled fresh on every call from `GraphService`'s D2.1 signal getters —
-/// cheap (bounded Datalog queries + a small in-memory scan), no caching
-/// needed. `root` defaults to the launch directory.
+/// `root` defaults to the launch directory. See [`UsageService::advice`] for
+/// the ~25 signals it assembles and why the whole pass runs off the runtime
+/// workers.
 #[tauri::command]
 pub async fn graph_usage_advice(
     state: State<'_, AppState>,
     graph: State<'_, std::sync::Arc<crate::graph::GraphService>>,
     root: Option<String>,
 ) -> AppResult<AdvisorSnapshot> {
-    let root = resolve_graph_root(root)?;
-    let settings = state.settings.current();
-    // A dozen bounded Datalog queries against the same single-connection store,
-    // on the Overview's poll cadence — off the runtime workers, same reasoning
-    // as `graph_usage`. The body is a plain sync fn (rather than an inline
-    // closure) so it stays readable and its `root`/`settings` stay owned.
-    let graph = graph.inner().clone();
-    run_on_blocking_pool(move || advisor_snapshot_blocking(&graph, root, settings)).await
-}
-
-/// The blocking body of [`graph_usage_advice`] — every signal read plus the
-/// `advisor::evaluate` call. Split out only so the command can hand it to
-/// [`run_on_blocking_pool`]; `root` and `settings` are owned because the
-/// closure that carries them must be `'static`.
-fn advisor_snapshot_blocking(
-    graph: &crate::graph::GraphService,
-    root: std::path::PathBuf,
-    settings: crate::settings::Settings,
-) -> AdvisorSnapshot {
-    let (injection_follow_rate, injection_follow_samples) = match graph.injection_follow_rate(&root)
-    {
-        Some((r, n)) => (Some(r), n),
-        None => (None, 0),
-    };
-    let (budget_maxed_rate, budget_maxed_samples) = match graph.budget_maxed_rate(&root) {
-        Some((r, n)) => (Some(r), n),
-        None => (None, 0),
-    };
-    let (advisor_reread_rate, advisor_reread_samples) = match graph.advisor_reread_rate(&root) {
-        Some((r, n)) => (Some(r), n),
-        None => (None, 0),
-    };
-    let session_count = graph.advisor_session_count(&root);
-
-    // V16 drift signals. `harness_versions` is read from the physical global
-    // file (not the live merged settings) so background writes — the tap
-    // noting a version mid-run — are visible without a restart (mtime-cached,
-    // so the 2s poll doesn't re-parse the file every tick).
-    let hv = crate::settings::read_global_harness_versions();
-    // `remind_count` (drift.read_hook_silent.v1) is the same total-remind-rows
-    // count `advisor_reread_rate` just scanned for — reuse its sample count
-    // instead of a second identical Datalog scan.
-    let remind_count = advisor_reread_samples;
-    let (large_reread_pairs, sessions_by_harness) = graph.drift_db_signals(&root);
-    // One clone of the activity ring serves both the bypass-rate signal and
-    // the contract-drift filter.
-    let activity = crate::activity::snapshot();
-    let (bypass_rate, bypass_samples) = match graph.bypass_rate(&activity) {
-        Some((r, n)) => (Some(r), n),
-        None => (None, 0),
-    };
-    let since = crate::activity::process_start_ms();
-    let contract_drift: Vec<String> = activity
-        .iter()
-        .filter(|e| e.source == "harness" && e.tool == "contract_drift" && e.ts_ms >= since)
-        .map(|e| e.target.clone())
-        .collect();
-    // V17.1: sub-agent transcript-contract drift reports filed by a harness's
-    // own reader — same channel discipline as the `contract_drift` events
-    // above. V40 Phase D: attributed to the harness that files them, which each
-    // plugin declares (`drift_report_tools`), because the rule that reads them
-    // runs per harness. A harness whose reader files none has an empty list —
-    // which is the truth, not a zero-fill.
-    let subagent_drift_by_harness: std::collections::BTreeMap<crate::harness::HarnessId, Vec<String>> =
-        crate::harness::registry::all()
-            .map(|h| {
-                let tools = h.plugin().map(|p| p.drift_report_tools()).unwrap_or(&[]);
-                let rows = activity
-                    .iter()
-                    .filter(|e| {
-                        e.source == "harness"
-                            && e.ts_ms >= since
-                            && tools.contains(&e.tool.as_str())
-                    })
-                    .map(|e| e.target.clone())
-                    .collect();
-                (h, rows)
-            })
-            .collect();
-
-    // V17 Phase E signals: RECENT calls to any lean-hidden tool in the Activity
-    // ring (zero ⇒ the lean-surface rule may fire) and the measured advertised
-    // surface size for its rationale. Unlike the drift filters above, this uses
-    // a trailing recency window rather than process-start `since`: the ring is
-    // count-capped (GRAPH_CAP/OFFLOAD_CAP), so an all-time scan would let one
-    // cold-tail call weeks ago suppress the suggestion forever, while
-    // process-start would flip a tool to "unused" minutes after every restart.
-    let hideable_tool_calls = count_hideable_tool_calls(
-        &activity,
-        crate::activity::now_ms(),
-        crate::advisor::HIDEABLE_RECENCY_WINDOW_MS,
-    );
-    let surface_chars = crate::graph::surface_stats().mcp_chars as u64;
-
-    // V17 Phase F1/F2 signals. Redundant re-read pairs per session over the
-    // last 10 sessions, sized by the current advisor line floor. `e1_pass` is
-    // STRICTLY the "pass" status (trimmed/lowercased) — NOT "the
-    // `claude.hook.pretooluse_deny` gate is not blocking"
-    // (`harness::contract::gate`, which passes `"unverified"` as well), so an
-    // "unverified" E1 (the default) never auto-graduates a hook we've never
-    // proven works. V35 Phase E retired the gate helper this used to be
-    // contrasted with and left this check untouched.
-    let (redundant_reads_per_session, redundant_read_sessions) = match graph
-        .redundant_read_candidates(&root, settings.graph.read_advisor_min_lines, 10)
-    {
-        Some((pairs, sessions)) if sessions > 0 => (Some(pairs as f64 / sessions as f64), sessions),
-        _ => (None, 0),
-    };
-    let e1_pass = hv.e1_status.trim().eq_ignore_ascii_case("pass");
-
-    // V32 Phase C3: the detection updater's three canaries (a newer bundle
-    // offered, a bundle refused, a channel that has been unreachable for a week
-    // — #46 split the last one out of the second). Read from its in-memory
-    // state cache — no disk and no clock, so this is safe on the advice poll's
-    // cadence — and unlike every other signal here they are not per-root: the
-    // detection data is process-wide, so the same card shows in whichever
-    // project the user happens to have open.
-    let (detection_updates, detection_update_failures, detection_update_stalled) =
-        crate::offload::detection::updater::advisor_signals();
-    // #48/D-2: the fourth detection canary, and the only one about the data on
-    // disk rather than the channel — the signature layer switched on with
-    // nothing to match against. Reads the cached compile report (no disk, no
-    // clock) and resolves the layer's own switch through the injection
-    // hierarchy, so a layer the user turned off says nothing.
-    let detection_signature_down = crate::offload::detection::signature::advisor_signal(&settings);
-    // #48/U-4: the fifth — a rule file the USER wrote that does not compile.
-    // Its own signal rather than a widening of the one above, because the two
-    // are different states (skipped file vs. disarmed layer) with different
-    // fixes; the updater suppresses this one while that one is up.
-    let detection_local_rules_broken =
-        crate::offload::detection::updater::broken_local_rules(&settings);
-    // #48/M-11: the sixth — the live rule directory is SHORT of files a
-    // rollback could not put back. Deliberately not gated on the detection
-    // switch: the files are missing from disk whether or not the layer is
-    // currently screening with them, and a user who switches detection back on
-    // must not silently get a short set.
-    let detection_rules_incomplete = crate::offload::detection::updater::rules_incomplete();
-
-    // Apply-cooldown records are stored per (rule, root) — hand `evaluate`
-    // only THIS root's, so an Apply in one project never mutes another
-    // (whose own session count may be far lower). Both this filter and the
-    // writer (`advisor_mark_applied`) derive the string from
-    // `resolve_graph_root`, so the forms compare equal.
-    let root_str = root.to_string_lossy().to_string();
-    let applied: Vec<crate::settings::AppliedRule> = settings
-        .advisor_applied
-        .iter()
-        .filter(|a| crate::activity::root_key_eq(&a.root, &root_str))
-        .cloned()
-        .collect();
-
-    let sig = crate::advisor::Signals {
-        injection_follow_rate,
-        injection_follow_samples,
-        advisor_reread_rate,
-        advisor_reread_samples,
-        budget_maxed_rate,
-        budget_maxed_samples,
-        session_count,
-        graph: settings.graph.clone(),
-        dismissed: settings.advisor_dismissed.clone(),
-        applied,
-        // V40 Phase C, locked decision 23: ONE ROW PER REGISTERED HARNESS,
-        // read from the same fresh physical-global snapshot (the auto-verify
-        // worker writes the version half out of band, so a record a second old
-        // must be visible to the very next 2 s advisor poll without a restart).
-        //
-        // Phase B moved the storage into `harness[<id>]` and left a note here
-        // saying the reader still took the DEFAULT harness's row because every
-        // V16 rule was written around Claude's payload shapes. The rules are
-        // per-harness now, so this is the whole map.
-        harness: harness_drift_signals(&sessions_by_harness, &subagent_drift_by_harness),
-        remind_count,
-        large_reread_pairs,
-        contract_drift,
-        bypass_rate,
-        bypass_samples,
-        hideable_tool_calls,
-        surface_chars,
-        redundant_reads_per_session,
-        redundant_read_sessions,
-        e1_pass,
-        detection_updates,
-        detection_update_failures,
-        detection_update_stalled,
-        detection_signature_down,
-        detection_local_rules_broken,
-        detection_rules_incomplete,
-    };
-    let proposals = crate::advisor::evaluate(&sig);
-    // "Collecting" = nothing has cleared the cold-start floor yet: not
-    // enough sessions, OR neither of the two independent sample counts
-    // (injections / reminders) has cleared its own rule's floor. Distinct
-    // from "cleared the floor, rates are just healthy" (empty proposals,
-    // `collecting = false`). V16: drift canaries carry their OWN floors and
-    // can fire below the tuning floor (a version bump is a fact, not a
-    // statistic) — a non-empty proposal list must therefore always render,
-    // so `collecting` yields to it.
-    let collecting = proposals.is_empty()
-        && (session_count < crate::advisor::MIN_SESSIONS
-            || (injection_follow_samples < crate::advisor::MIN_INJECTIONS
-                && advisor_reread_samples < crate::advisor::MIN_REMINDS));
-    AdvisorSnapshot {
-        proposals,
-        collecting,
-    }
-}
-
-/// The Settings window's harness payload: the raw spike/version record plus
-/// the **computed** gate verdicts (V35 Phase E).
-///
-/// `capability_gates` is a list of self-describing records rather than one
-/// bespoke boolean per feature, and that is the whole point: before Phase E the
-/// window received `e1_status` and re-implemented the fail-closed reading of it
-/// in TypeScript (`harnessStatusBlocks`), so a change to the rule had to be
-/// made twice or the toggle and the installed hook would disagree. Adding a
-/// second bespoke flag here would have recreated exactly that. Phase G's
-/// *Harness health* panel renders this same list.
-#[derive(serde::Serialize)]
-pub struct HarnessStatus {
-    /// Fresh read of the physical global `harness_versions`.
-    pub versions: crate::settings::HarnessVersions,
-    /// Every gated capability's verdict, keyed by capability id — the same
-    /// query `tabs/config.rs` asks before installing the hook.
-    pub capability_gates: Vec<crate::harness::contract::Gate>,
-    /// V35 Phase G: the whole *Harness health* read-model — every registry row
-    /// with its tier, contract sentence, degradation, coverage marks, TCB
-    /// controls, gate verdict and last check result, grouped by harness and
-    /// ordered riskiest-tier-first.
-    ///
-    /// Served from THIS command rather than a sibling: it is the same fresh
-    /// `harness_versions` read and the same `contract::gates` call the payload
-    /// already makes, the command is called on Settings open (and while a run
-    /// is in flight) rather than on any hot path, and a second command would
-    /// mean two round trips that could disagree about the versions they were
-    /// computed against.
-    pub harness_health: Vec<crate::harness::health::HarnessHealth>,
-    /// A verify run is happening right now, so *Run checks now* is a no-op and
-    /// the panel should keep polling.
-    pub verify_in_flight: bool,
-    /// V40 Phase F (locked decision 27): the gated capability ids, keyed by the
-    /// neutral CONTROL each one gates (`harness::contract::GATED_CONTROLS`).
-    ///
-    /// The window used to hold one of these ids — a harness-namespaced hook
-    /// name — as a TypeScript constant so it could join on it. It looks the id
-    /// up here now, so a gate whose capability belongs to a harness reaches the
-    /// frontend as data rather than as a second spelling.
-    pub gated_controls: std::collections::BTreeMap<&'static str, &'static str>,
+    usage_service(&graph).advice(&state.settings, root).await
 }
 
 /// **Every registered harness, as the window sees it** (V40 Phase F, locked
@@ -2973,129 +2088,60 @@ pub struct HarnessStatus {
 /// doc comment said it would — the declared fields are one more column of the
 /// same row, and two commands would have meant two round trips the window had
 /// to keep in step.
+///
+/// **Left as a direct call** (V42 Phase A): the whole body is one call on a
+/// `'static` table — no handle, no argument shaping, nothing a service could
+/// hold.
 #[tauri::command]
 pub async fn harness_list() -> AppResult<Vec<crate::harness::info::HarnessInfo>> {
     Ok(crate::harness::info::harness_list())
 }
 
-/// V16 Feature 1: the harness version + contract-verification state, read
-/// from the physical global `settings.json` (fresh — background writers
-/// bypass the live settings snapshot).
-///
-/// V35 Phase E: the gates are computed against the live settings with the FRESH
-/// `harness_versions` layered in, so a hand-recorded spike outcome disables the
-/// toggle without an app restart — the reason this command exists at all.
-#[tauri::command]
-pub async fn harness_versions_get(state: State<'_, AppState>) -> AppResult<HarnessStatus> {
-    let versions = crate::settings::read_global_harness_versions();
-    let mut settings = state.settings.current();
-    settings.harness_versions = versions.clone();
-    // V40 Phase B: the versions, the auto-verify records and the recorded spike
-    // outcomes all live in `harness` now, and all three are written out of band
-    // — so the panel has to be computed against a FRESH read of that map for
-    // exactly the reason it already was for `harness_versions`.
-    settings.harness = crate::settings::read_global_harness_map();
-    Ok(HarnessStatus {
-        capability_gates: crate::harness::contract::gates(&settings),
-        // V35 Phase G: computed against the SAME fresh-versions settings as the
-        // gates, so the panel's headers, its gate badges and its last-verified
-        // dates are one consistent reading rather than three.
-        harness_health: crate::harness::health::health(&settings),
-        verify_in_flight: crate::harness::verify::in_flight(),
-        versions,
-        gated_controls: crate::harness::contract::GATED_CONTROLS
-            .iter()
-            .copied()
-            .collect(),
-    })
+/// Build the harness-administration use cases over this app's handle. One
+/// place, so no command can drift in what it hands them.
+fn harness_service(state: &AppState) -> HarnessService<'_> {
+    HarnessService::new(&state.settings)
 }
 
-/// V35 Phase G: the *Harness health* panel's one action — run this harness's
-/// L1 canaries and L2 probes now.
-///
-/// Returns whether a run STARTED. `false` means one was already in flight (a
-/// second click, or an automatic run triggered by a version change) and this
-/// request was dropped rather than queued; the panel shows the in-flight state
-/// either way and re-reads `harness_versions_get` when it clears.
-///
-/// Fire-and-forget by construction: the work spawns a blocking OS thread that
-/// drives child processes for up to 90s, so the command returns as soon as the
-/// thread is up. The result arrives through the payload above — for Claude via
-/// the Phase F record (the same write path the automatic run uses), for every
-/// harness via the in-memory run summary.
+/// V16 Feature 1: the harness version + contract-verification state, read from
+/// the physical global `settings.json` (fresh — background writers bypass the
+/// live settings snapshot). See [`HarnessService::versions`] for the three
+/// different freshness contracts this cluster deliberately keeps apart.
+#[tauri::command]
+pub async fn harness_versions_get(state: State<'_, AppState>) -> AppResult<HarnessStatus> {
+    harness_service(&state).versions()
+}
+
+/// V35 Phase G: the *Harness health* panel's one action — run this harness's L1
+/// canaries and L2 probes now. Returns whether a run STARTED. See
+/// [`service::harness::run_checks`](crate::service::harness::run_checks).
 #[tauri::command]
 pub async fn harness_run_checks(harness: String) -> AppResult<bool> {
-    // Resolved through the probe's own token table rather than a `match` here:
-    // the panel renders `HarnessHealth::harness`, which IS that table's output,
-    // so round-tripping through it is what keeps the button pointed at the
-    // harness whose header it sits under.
-    let h = crate::harness::probe::harness_from_name(harness.trim()).ok_or_else(|| {
-        AppError::Ipc(format!(
-            "harness_run_checks: {harness:?} is not a harness that can be run"
-        ))
-    })?;
-    Ok(crate::harness::verify::run_now(h))
+    crate::service::harness::run_checks(&harness)
 }
 
 /// V16 Feature 1: the Advisor card's "Mark verified" action — stamp the
-/// currently-seen version of `harness` as the last-verified one (the user just
-/// re-ran the MAINTENANCE.md contract checks). Also mirrors the change into the
-/// live settings so the open Settings window sees it without a restart.
-///
-/// **V40 Phase B: it takes a harness.** It used to write `claude_last_verified`
-/// with no argument at all, so the OpenCode row of the health panel had no
-/// action that could ever clear it. `None` is the DEFAULT harness — the
-/// documented wire-compatibility default (locked decision 22), which keeps the
-/// existing frontend call site working unchanged until Phase F passes the id
-/// the button sits under.
+/// currently-seen version of `harness` as the last-verified one. `None` is the
+/// DEFAULT harness (locked decision 22's wire-compatibility default). See
+/// [`HarnessService::mark_verified`].
 #[tauri::command]
 pub async fn harness_mark_verified(
     state: State<'_, AppState>,
     harness: Option<String>,
 ) -> AppResult<()> {
-    let id = match harness.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        Some(name) => crate::harness::HarnessId::from_id(name).ok_or_else(|| {
-            AppError::Ipc(format!("harness_mark_verified: {name:?} is not a harness"))
-        })?,
-        None => crate::harness::DEFAULT_HARNESS,
-    };
-    let after = crate::settings::mutate_global_harness(id, |row| {
-        row.last_verified = row.last_seen.clone();
-    })?;
-    let key = id.token().to_string();
-    state.settings.mutate(move |cur| {
-        cur.harness.insert(key.clone(), after.clone());
-    });
-    Ok(())
+    harness_service(&state).mark_verified(harness)
 }
 
 /// **The model-visible text one tab's harness receives**, keyed by slot (V40
-/// Phase E, locked decision 24).
-///
-/// The compose overlay is the first consumer: it appends one instruction line
-/// after the `[image] <path>` lines it types into the tab, and that line used to
-/// be a literal in `compose/attachments.ts` — a string the model reads that
-/// nothing in the backend inventory could see, and that no harness could
-/// influence. It comes over this command now.
-///
-/// `tab` is a tab id; a tab that runs no registered harness (or an unknown id)
-/// gets the NEUTRAL rendering, which is a real answer rather than a failure —
-/// the same posture `instructions::all_for` takes.
+/// Phase E, locked decision 24). A tab that runs no registered harness (or an
+/// unknown id) gets the NEUTRAL rendering, which is a real answer rather than a
+/// failure. See [`HarnessService::instructions`].
 #[tauri::command]
 pub async fn harness_instructions(
     state: State<'_, AppState>,
     tab: Option<String>,
 ) -> AppResult<std::collections::BTreeMap<String, String>> {
-    let settings = state.settings.current();
-    let harness = tab
-        .as_deref()
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-        .and_then(|t| crate::tabs::tab_harness_by_id(&settings, t));
-    Ok(crate::harness::instructions::all_for(harness)
-        .iter()
-        .map(|i| (i.slot.id().to_string(), i.text.to_string()))
-        .collect())
+    harness_service(&state).instructions(tab)
 }
 
 /// **The advisor's rule reference** (V40 Phase F, locked decision 23).
@@ -3103,59 +2149,31 @@ pub async fn harness_instructions(
 /// The Code Intelligence panel used to hold this table as a hard-coded tooltip
 /// — a restatement of thresholds `advisor.rs` owns, with one harness's
 /// mechanisms named in it for rules that fire per registered harness. It
-/// renders this instead.
-///
-/// `'static` data; the window fetches it once when the panel first opens.
+/// renders this instead. See
+/// [`service::usage::rules`](crate::service::usage::rules).
 #[tauri::command]
 pub async fn advisor_rules() -> AppResult<AdvisorRules> {
-    Ok(AdvisorRules {
-        rules: crate::advisor::RULE_REFERENCE.to_vec(),
-        footer: crate::advisor::RULE_REFERENCE_FOOTER,
-    })
-}
-
-/// The answer [`advisor_rules`] gives.
-#[derive(serde::Serialize)]
-pub struct AdvisorRules {
-    /// One row per rule, in the order the reference lists them.
-    pub rules: Vec<crate::advisor::RuleReference>,
-    /// The one sentence that is about the panel rather than about a rule.
-    pub footer: &'static str,
+    Ok(crate::service::usage::rules())
 }
 
 /// V14 Phase D2: dismiss one advisor proposal (`rule_id` + its coarse rate
-/// `signature`, both echoed from the `Proposal` the user clicked Dismiss
-/// on). Persisted in `Settings.advisor_dismissed`; a materially changed rate
-/// (a different signature bucket) re-fires the proposal even for the same
-/// `rule_id`. Idempotent — dismissing the same pair twice is a no-op.
+/// `signature`, both echoed from the `Proposal` the user clicked Dismiss on).
+/// Idempotent — dismissing the same pair twice is a no-op. See
+/// [`service::usage::dismiss`](crate::service::usage::dismiss).
 #[tauri::command]
 pub async fn advisor_dismiss(
     state: State<'_, AppState>,
     rule_id: String,
     signature: String,
 ) -> AppResult<()> {
-    state.settings.mutate(move |cur| {
-        let already = cur
-            .advisor_dismissed
-            .iter()
-            .any(|d| d.rule_id == rule_id && d.signature == signature);
-        if !already {
-            cur.advisor_dismissed
-                .push(crate::settings::DismissedRule { rule_id, signature });
-        }
-    });
-    Ok(())
+    crate::service::usage::dismiss(&state.settings, rule_id, signature)
 }
 
-/// Record that the user APPLIED an advisor proposal, starting the rule's
-/// Apply cooldown (`advisor::APPLY_COOLDOWN_SESSIONS` sessions of quiet so
-/// fresh post-change data can accumulate before the rule re-evaluates — the
-/// rates are cumulative, and an immediate re-proposal would be judging the
-/// OLD value's data). Captures the root's session count server-side at call
-/// time; one record per (rule, root), re-applying replaces it. Called by
-/// the Advisor card's Apply right after the `settings_update` that writes
-/// the proposed value — the settings write itself stays the ordinary path
-/// (never silent self-modification).
+/// Record that the user APPLIED an advisor proposal, starting the rule's Apply
+/// cooldown. Called by the Advisor card's Apply right after the
+/// `settings_update` that writes the proposed value — the settings write itself
+/// stays the ordinary path (never silent self-modification). See
+/// [`UsageService::mark_applied`].
 #[tauri::command]
 pub async fn advisor_mark_applied(
     state: State<'_, AppState>,
@@ -3163,21 +2181,7 @@ pub async fn advisor_mark_applied(
     root: Option<String>,
     rule_id: String,
 ) -> AppResult<()> {
-    let root = resolve_graph_root(root)?;
-    let session_count = graph.advisor_session_count(&root);
-    let root_str = root.to_string_lossy().to_string();
-    state.settings.mutate(move |cur| {
-        cur.advisor_applied
-            .retain(|a| {
-                !(a.rule_id == rule_id && crate::activity::root_key_eq(&a.root, &root_str))
-            });
-        cur.advisor_applied.push(crate::settings::AppliedRule {
-            rule_id,
-            root: root_str,
-            session_count,
-        });
-    });
-    Ok(())
+    usage_service(&graph).mark_applied(&state.settings, root, rule_id)
 }
 
 /// Build the Workbench use cases over this app's handle. One place, so no
@@ -3493,6 +2497,9 @@ pub fn workbench_worktree_check_status(
 
 /// V9-01: pause/resume the graph's incremental fs-watcher re-indexing. Paused
 /// = file changes are ignored until resumed (a manual rebuild still works).
+///
+/// **Left as a direct call** (V42 Phase A), for [`graph_status`]'s reason: the
+/// whole body is one accessor on the handle Tauri already injected.
 #[tauri::command]
 pub async fn graph_set_watch_paused(
     service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
@@ -3505,21 +2512,22 @@ pub async fn graph_set_watch_paused(
 /// buttons — every language present on disk with its file count and
 /// green/yellow/red classification (indexed / supported-but-off / unsupported).
 /// `root` defaults to the launch directory. Walks the tree fresh each call, so
-/// the frontend calls it on tab open and after a rebuild, not on a poll.
+/// the frontend calls it on tab open and after a rebuild, not on a poll. See
+/// [`CodeIntelService::language_census`].
 #[tauri::command]
 pub async fn graph_language_census(
     service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
     root: Option<String>,
 ) -> AppResult<Vec<crate::graph::LangCensus>> {
-    let root = resolve_graph_root(root)?;
-    Ok(service.language_census(&root))
+    code_intel_service(&service).language_census(root)
 }
 
 /// V9-02: add or remove a language from the code graph's index set. Adds/removes
 /// the tag in `GraphSettings.languages` (persisted), then kicks a full rebuild
-/// so the change takes effect — indexing new files (and embedding them when
-/// semantic search is on) or dropping the removed language's rows. Rejects
-/// unsupported tags. `root` defaults to the launch directory.
+/// so the change takes effect. Rejects unsupported tags. `root` defaults to the
+/// launch directory. See [`CodeIntelService::set_language_enabled`] — this is
+/// the wire boundary only: it names the settings handle the toggle writes
+/// through.
 #[tauri::command]
 pub async fn graph_set_language_enabled(
     state: State<'_, AppState>,
@@ -3528,37 +2536,7 @@ pub async fn graph_set_language_enabled(
     enabled: bool,
     root: Option<String>,
 ) -> AppResult<()> {
-    let tag = lang.trim().to_ascii_lowercase();
-    if crate::graph::Lang::from_tag(&tag) == crate::graph::Lang::Other {
-        return Err(AppError::Settings(format!(
-            "unsupported graph language: {lang}"
-        )));
-    }
-    // Skip the mutate + full rebuild when the desired state already holds
-    // (re-enabling an already-present language, or disabling an absent one).
-    // A redundant rebuild re-indexes/re-embeds the whole project for nothing.
-    let already = state
-        .settings
-        .current()
-        .graph
-        .languages
-        .iter()
-        .any(|l| l == &tag);
-    if enabled == already {
-        return Ok(());
-    }
-    state.settings.mutate(move |cur| {
-        let langs = &mut cur.graph.languages;
-        if enabled {
-            langs.push(tag);
-        } else {
-            langs.retain(|l| l != &tag);
-        }
-    });
-    let root = resolve_graph_root(root)?;
-    // A Settings language toggle is a user action, like Rebuild.
-    service.spawn_rebuild(root, crate::graph::RebuildOrigin::User);
-    Ok(())
+    code_intel_service(&service).set_language_enabled(&state.settings, &lang, enabled, root)
 }
 
 /// Open `<portable-root>/logs/content/` in the host file manager. Creates the
@@ -3775,75 +2753,6 @@ mod tests {
     use super::read_only_refusal;
     use crate::settings::Settings;
     use crate::state::{ReadOnlySource, TabId};
-
-    /// **"No quota source" and "records no turns" are two answers, and this
-    /// command gives both** (V40 Phase G, locked decision 19).
-    ///
-    /// The regression this pins is the one the phase exists to remove: the
-    /// declared token categories and turn lanes used to hang off `source`, so a
-    /// harness that reports no quota was also declared to record no turns — and
-    /// the Usage donut had no labels for its sessions' lanes. Live-verify 14
-    /// reads the FIRST half of this (a harness answering *no usage source*, not
-    /// a widget at 0%), so both halves are asserted together.
-    ///
-    /// Names no product: the two harnesses are picked out of the registry by
-    /// what they DECLARE, which is what locked decision 10(a) asks of core.
-    #[tokio::test]
-    async fn harness_usage_reports_a_turn_shape_independently_of_a_quota_source() {
-        let mut quota_only = 0usize;
-        let mut turns_without_quota = 0usize;
-        for id in crate::harness::registry::all() {
-            let answer = super::harness_usage(id.token().to_string())
-                .await
-                .expect("a registered harness answers");
-            let plugin = id.plugin();
-            let has_source = plugin.and_then(|p| p.usage_source()).is_some();
-            let has_shape = plugin.and_then(|p| p.turn_usage_shape()).is_some();
-            assert_eq!(
-                answer.source.is_some(),
-                has_source,
-                "{id}: the `source` half must mirror the declaration exactly"
-            );
-            assert_eq!(
-                !answer.origins.is_empty(),
-                has_shape,
-                "{id}: the lanes must arrive whenever a turn shape is declared"
-            );
-            assert_eq!(
-                !answer.token_kinds.is_empty(),
-                has_shape,
-                "{id}: the categories must arrive whenever a turn shape is declared"
-            );
-            if has_source {
-                quota_only += 1;
-                // The quota half carries WINDOWS and nothing else now.
-                assert!(!answer.source.as_ref().unwrap().windows.is_empty());
-            }
-            if has_shape && !has_source {
-                turns_without_quota += 1;
-                // Exactly the case that was unrepresentable: no quota widget at
-                // all, and still a labelled lane split for its stored rows.
-                assert!(answer.reading.is_none(), "{id}: no source can produce no reading");
-                assert!(
-                    answer.origins.iter().any(|o| o.subagent),
-                    "{id}: it rolls a child session's spend up, so it declares the lane"
-                );
-            }
-        }
-        assert!(quota_only > 0, "no harness declares a quota source at all");
-        assert!(
-            turns_without_quota > 0,
-            "no harness records turns without reporting quota — if that becomes true, this \
-             command's independence has no live example and the two fields can silently \
-             re-couple"
-        );
-    }
-
-    /// An unregistered harness id REJECTS rather than answering an empty shape.
-    #[tokio::test]
-    async fn harness_usage_rejects_an_unregistered_harness() {
-        assert!(super::harness_usage("not-a-harness".to_string()).await.is_err());
-    }
 
     /// **The facade knobs are a NARROW write** (V39 review M-10).
     ///
@@ -4165,34 +3074,6 @@ mod tests {
         }
     }
 
-    /// `graph_ignore_pick`'s glob shaping: root-relative + `/`-anchored with
-    /// forward slashes, trailing `/` for folders, longest root wins, and an
-    /// out-of-root pick falls back to the absolute path. Built with `join` so
-    /// the separators are the platform's, like a real picker result.
-    #[test]
-    fn to_ignore_glob_relativizes_and_anchors() {
-        let root = std::env::temp_dir().join("ckg-pick-proj");
-        let nested = root.join("nested");
-        let roots = vec![root.clone(), nested.clone()];
-
-        let file = root.join("src").join("a.rs");
-        assert_eq!(super::to_ignore_glob(&file, false, &roots), "/src/a.rs");
-
-        let dir = root.join("docs").join("gen");
-        assert_eq!(super::to_ignore_glob(&dir, true, &roots), "/docs/gen/");
-
-        // Under BOTH roots → the longer (nested) one wins.
-        let in_nested = nested.join("x.md");
-        assert_eq!(super::to_ignore_glob(&in_nested, false, &roots), "/x.md");
-
-        // Outside every root → absolute fallback with forward slashes.
-        let outside = std::env::temp_dir().join("ckg-pick-other").join("f.txt");
-        assert_eq!(
-            super::to_ignore_glob(&outside, false, &roots),
-            outside.to_string_lossy().replace('\\', "/")
-        );
-    }
-
     #[test]
     fn focus_events_are_auto() {
         assert!(auto_reply("\x1b[I"));
@@ -4227,70 +3108,5 @@ mod tests {
         assert!(!auto_reply("\t"));
         assert!(!auto_reply("\x1b"));
         assert!(!auto_reply("\x1bf"));
-    }
-
-    // ── V17 Phase E — hideable_tool_calls recency window ────────────────────
-    use super::count_hideable_tool_calls;
-    use crate::activity::{ActivityEntry, ActivityKind};
-    use crate::advisor::HIDEABLE_RECENCY_WINDOW_MS;
-
-    fn hidden_call(ts_ms: u64) -> ActivityEntry {
-        // `graph_cycles` is one of graph::LEAN_HIDDEN.
-        ActivityEntry::new(
-            ActivityKind::Graph,
-            ts_ms,
-            "root".to_string(),
-            // An opaque source tag: this test is about the RECENCY window, and
-            // `ActivityEntry::source` is a persisted free string (locked
-            // decision 29). Asking the registry keeps it a real one without
-            // hard-coding which harness happens to be first.
-            crate::harness::DEFAULT_HARNESS.token().to_string(),
-            "graph_cycles".to_string(),
-            "target".to_string(),
-            0,
-            0,
-            true,
-            crate::activity::Attribution::Unattributed,
-            None,
-            None,
-            None,
-        )
-    }
-
-    #[test]
-    fn hideable_call_inside_window_counts() {
-        let now = 1_000_000_000_000;
-        // One day inside the trailing window.
-        let recent = now - (HIDEABLE_RECENCY_WINDOW_MS - 24 * 60 * 60 * 1000);
-        let activity = vec![hidden_call(recent)];
-        assert_eq!(
-            count_hideable_tool_calls(&activity, now, HIDEABLE_RECENCY_WINDOW_MS),
-            1
-        );
-    }
-
-    #[test]
-    fn hideable_call_outside_window_is_ignored() {
-        let now = 1_000_000_000_000;
-        // One day OLDER than the window edge — a cold-tail call from long ago
-        // must not suppress the lean suggestion.
-        let ancient = now - (HIDEABLE_RECENCY_WINDOW_MS + 24 * 60 * 60 * 1000);
-        let activity = vec![hidden_call(ancient)];
-        assert_eq!(
-            count_hideable_tool_calls(&activity, now, HIDEABLE_RECENCY_WINDOW_MS),
-            0
-        );
-    }
-
-    #[test]
-    fn non_hidden_tool_never_counts() {
-        let now = 1_000_000_000_000;
-        // A workhorse tool inside the window still doesn't count.
-        let mut e = hidden_call(now - 1000);
-        e.tool = "graph_find_symbol".to_string();
-        assert_eq!(
-            count_hideable_tool_calls(&[e], now, HIDEABLE_RECENCY_WINDOW_MS),
-            0
-        );
     }
 }

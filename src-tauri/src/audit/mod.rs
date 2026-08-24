@@ -83,74 +83,19 @@ pub struct AuditDetectResult {
 /// command never mutates the stored path. Always returns `Ok`: a not-found tool
 /// is a normal result (`found = false`), not an error.
 ///
-/// # What it searches for, and why that is not the run-time rule
-///
-/// With an empty `path` the probe searches `ebin` → `PATH` for the name
-/// [`crate::plugins::registry::probe_command_name`] derives — for EVERY tool,
-/// including a user plugin's. That is wider than
-/// `EffectiveTool::resolves_by_name`, which stays exactly as it was: run time
-/// still requires a stored path for a user plugin (decision 7/10), and nothing
-/// about a Detect click makes a path-less tool runnable.
-///
-/// The two differ because they answer different questions. Run time asks "may
-/// cImp spawn a binary the user never pointed it at?" — no. Detect asks "is
-/// this tool on this machine?", pressed by the user, about one tool, with the
-/// answer shown to them. Gating the second on the first made Detect report "not
-/// found on PATH or ebin" for every starter-pack tool without ever looking,
-/// which was untrue as well as useless.
-///
-/// The write half lives in the Settings pane on purpose: the probe reports, and
-/// the found path becomes configuration through the same UI act that a Browse…
-/// would have been. Keeping this command settings-read-only is what lets it be
-/// called freely without a click ever silently changing what a scan launches.
-///
-/// `tool_key` is the registry key (`cimp-audit@1/gitleaks`, or a user plugin's
-/// `name@version/tool-id`), and `path` is the LIVE value from the Settings
-/// input — passed explicitly so a just-typed value cannot race the
-/// fire-and-forget `settings_update` push. `None` falls back to what the
-/// registry resolved for this project.
-///
-/// # Why this takes a key rather than an id
-///
-/// Before V38 it took an `AuditToolId`, because the only tools with a Detect
-/// button were the fourteen built-in scanners. They are registry entries now,
-/// beside whatever the user dropped in the plugins folder, and the button lives
-/// in the Tool Plugins pane where both populations are configured. A key is what
-/// that pane has.
+/// See [`AuditService::detect`](crate::service::audit::AuditService::detect) for
+/// the ladder it searches, why that is deliberately WIDER than the run-time
+/// rule, and why the write half lives in the Settings pane. This is the wire
+/// boundary only: it names the project root the registry join is scoped to.
 #[tauri::command]
 pub async fn audit_detect_tool(
     state: State<'_, AppState>,
     tool_key: String,
     path: Option<String>,
 ) -> AppResult<AuditDetectResult> {
-    let settings = state.settings.current();
-    let root = state.launch.cwd.clone();
-    let tool = crate::plugins::registry::effective_tools(
-        &crate::plugins::snapshot_or_scan(),
-        &settings.tool_plugins,
-        Some(&root),
-    )
-    .into_iter()
-    .find(|t| t.tool_key == tool_key);
-    let Some(tool) = tool else {
-        return Ok(AuditDetectResult {
-            found: false,
-            path: None,
-            version: None,
-            error: Some(format!(
-                "no registered tool `{tool_key}` — the plugin that declared it may have been \
-                 removed; press Rescan"
-            )),
-        });
-    };
-    let override_path = path.or_else(|| tool.path.clone()).unwrap_or_default();
-    Ok(detect_tool(
-        &override_path,
-        tool.probe_name().as_deref(),
-        tool.manifest.project_local_bin.as_deref(),
-        Some(&root),
-    )
-    .await)
+    crate::service::audit::AuditService::new(&state.settings)
+        .detect(&state.launch.cwd, &tool_key, path)
+        .await
 }
 
 /// Resolve a tool's binary to an on-disk path, for the DETECT probe.
@@ -238,7 +183,15 @@ fn project_local_candidates(name: &str) -> Vec<String> {
 /// `State`. `override_path` is the tool's configured `path` (empty = resolve via
 /// project-local `node_modules/.bin` then ebin → PATH); `root` scopes the
 /// project-local lookup (`None` = skip it).
-async fn detect_tool(
+///
+/// **This is where the `--version` spawn lives, and it stays here** (V42 Phase
+/// A). The registry join that used to sit in front of it moved to
+/// [`crate::service::audit`], but the `Command::new` did not: it is a row in
+/// [`crate::spawn_ledger`]'s `CORE_LEDGER` keyed on `audit/mod.rs` +
+/// `detect_tool`, and that ledger's exhaustiveness tripwire scans this file's
+/// compile-time text. Moving the spawn would have moved a security ledger row
+/// for no gain.
+pub(crate) async fn detect_tool(
     override_path: &str,
     command: Option<&str>,
     project_local_bin: Option<&str>,
@@ -361,6 +314,10 @@ fn parse_version(stdout: &[u8], stderr: &[u8]) -> Option<String> {
 /// [`AUDIT_STATUS_EVENT`] event and can be re-fetched with [`audit_snapshot`].
 /// Rejected (a typed error the UI surfaces) when a scan is already in flight
 /// (one at a time globally, either category) or no tool of `category` is enabled.
+///
+/// **Left as a direct call** (V42 Phase A): the whole body is one call on the
+/// runner Tauri already injected — no argument shaping, no ordering, nothing a
+/// test could exercise that `AuditState::start_scan`'s own do not.
 #[tauri::command]
 pub async fn audit_start_scan(
     state: State<'_, Arc<AuditState>>,
@@ -371,6 +328,8 @@ pub async fn audit_start_scan(
 
 /// V23 Phase B: cancel the in-flight scan (kills the running tool children;
 /// already-completed tools keep their findings). Errors when none is running.
+///
+/// **Left as a direct call**, for [`audit_start_scan`]'s reason.
 #[tauri::command]
 pub async fn audit_cancel_scan(state: State<'_, Arc<AuditState>>) -> AppResult<()> {
     state.cancel_scan().map_err(AppError::Audit)
@@ -379,6 +338,8 @@ pub async fn audit_cancel_scan(state: State<'_, Arc<AuditState>>) -> AppResult<(
 /// V23 Phase B: the full (uncapped) runner snapshot — what the Code audit
 /// view (Tool Activity tab) reads on mount and to fetch the complete findings
 /// set after a truncated event.
+///
+/// **Left as a direct call**, for [`audit_start_scan`]'s reason.
 #[tauri::command]
 pub fn audit_snapshot(state: State<'_, Arc<AuditState>>) -> AuditSnapshot {
     state.snapshot()
@@ -394,6 +355,8 @@ pub fn audit_snapshot(state: State<'_, Arc<AuditState>>) -> AuditSnapshot {
 /// invisible until a scan started running it. Read-only and cheap: the CACHED
 /// census (never a walk — [`audit_refresh_census`] owns that), the live settings
 /// snapshot, and the in-memory registry join.
+///
+/// **Left as a direct call**, for [`audit_start_scan`]'s reason.
 #[tauri::command]
 pub fn audit_effective_roster(
     state: State<'_, Arc<AuditState>>,
@@ -406,15 +369,10 @@ pub fn audit_effective_roster(
 /// apply quality auto-selection when it's on, and return the full snapshot —
 /// so tab mount and the Settings section know applicability (chip gating,
 /// "not applicable" hints, auto-selected checkboxes) before the first scan.
-/// The walk is bounded but can take a couple of seconds cold, hence the
-/// blocking-task hop. No-op passthrough while the feature is disabled or a
-/// scan is in flight.
+/// See [`service::audit::refresh_census`](crate::service::audit::refresh_census).
 #[tauri::command]
 pub async fn audit_refresh_census(state: State<'_, Arc<AuditState>>) -> AppResult<AuditSnapshot> {
-    let audit = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || audit.refresh_census())
-        .await
-        .map_err(|e| AppError::Audit(format!("census task failed: {e}")))
+    crate::service::audit::refresh_census(state.inner().clone()).await
 }
 
 // ── The audit-tool scope actions retired in V38 Phase E ─────────────────────

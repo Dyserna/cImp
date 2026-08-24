@@ -45,6 +45,11 @@ mod watcher;
 pub use builder::parse_file;
 pub use context::{est_tokens, RetrieveResult};
 pub use index::GraphIndex;
+// V42 Phase A: `VizGraph` joined the list for the rule stated below — the
+// Graph View use cases (`service::graph`) name it by qualified path, because
+// `viz_snapshot` and `viz_ego` answer the same wire shape from it and the
+// mapping is written once. Its nested `VizNode`/`VizEdge` stay structural.
+pub use index::VizGraph;
 pub use memory::{MemorySnapshot, ProjectFact, UsageEvent};
 // V14 Phase D: only `UsageSnapshot` itself is named by qualified path outside
 // this module (the `graph_usage` IPC handler's return type). Its nested

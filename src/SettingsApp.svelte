@@ -127,6 +127,8 @@
   import type { AiTabId } from './lib/tabs/types';
   import { SPRITE_SETS } from './lib/avatarConfig';
   import { version as appVersion } from '../package.json';
+  import NumberField from './lib/settings/NumberField.svelte';
+  import SelectField from './lib/settings/SelectField.svelte';
   import Toggle from './lib/settings/Toggle.svelte';
   import ShortcutCapture from './lib/settings/ShortcutCapture.svelte';
   import TabSettingsSection from './lib/settings/TabSettingsSection.svelte';
@@ -2453,35 +2455,31 @@
             memory — no AI output is spoken while disabled. (To keep the model
             loaded but silence playback, use <em>Mute</em> instead.)
           </small>
-          <label>
-            <span>Process on</span>
-            <select
-              value={snapshot.tts.device}
-              disabled={!snapshot.tts.enabled}
-              onchange={(e) => patch((s) => (s.tts.device = (e.currentTarget as HTMLSelectElement).value as ProcessingDevice))}
-            >
-              <option value="gpu">GPU (fall back to CPU)</option>
-              <option value="cpu">CPU</option>
-            </select>
-          </label>
+          <SelectField
+            label="Process on"
+            value={snapshot.tts.device}
+            disabled={!snapshot.tts.enabled}
+            onchange={(next) => patch((s) => (s.tts.device = next as ProcessingDevice))}
+          >
+            <option value="gpu">GPU (fall back to CPU)</option>
+            <option value="cpu">CPU</option>
+          </SelectField>
           <small class="hint">
             Where Kokoro runs. <strong>GPU</strong> uses the graphics card and
             automatically falls back to CPU if none is available;
             <strong>CPU</strong> forces CPU. Switching reloads the model on the
             new device — no restart needed.
           </small>
-          <label>
-            <span>Voice</span>
-            <select
-              value={snapshot.tts.voice}
-              disabled={!snapshot.tts.enabled}
-              onchange={(e) => patch((s) => (s.tts.voice = (e.currentTarget as HTMLSelectElement).value))}
-            >
-              {#each voices as v}
-                <option value={v}>{v}</option>
-              {/each}
-            </select>
-          </label>
+          <SelectField
+            label="Voice"
+            value={snapshot.tts.voice}
+            disabled={!snapshot.tts.enabled}
+            onchange={(next) => patch((s) => (s.tts.voice = next))}
+          >
+            {#each voices as v}
+              <option value={v}>{v}</option>
+            {/each}
+          </SelectField>
           <label>
             <span>Speed: {snapshot.tts.speed.toFixed(2)}×</span>
             <input
@@ -2547,18 +2545,15 @@
             exit) only fire for background tabs. Turn on to hear them for the
             tab you're currently looking at as well.
           </small>
-          <label>
-            <span>Announce idle only after working for … seconds</span>
-            <input
-              type="number"
-              min="0"
-              max="3600"
-              step="10"
-              value={snapshot.behavior.idle_announce_min_working_secs}
-              onchange={(e) =>
-                patch((s) => (s.behavior.idle_announce_min_working_secs = Math.max(0, Math.round(+(e.currentTarget as HTMLInputElement).value || 0))))}
-            />
-          </label>
+          <NumberField
+            label="Announce idle only after working for … seconds"
+            min="0"
+            max="3600"
+            step="10"
+            value={snapshot.behavior.idle_announce_min_working_secs}
+            onchange={(next) =>
+              patch((s) => (s.behavior.idle_announce_min_working_secs = Math.max(0, Math.round(+next || 0))))}
+          />
           <small class="hint">
             An idle announcement is skipped when the tab worked for less than
             this. 0 announces every idle. Permission, question and error
@@ -2672,30 +2667,24 @@
             chops mid-sentence; decrease if reactions feel sluggish.
           </small>
           <div class="row">
-            <label>
-              <span>Stability timeout (ms)</span>
-              <input
-                type="number"
-                min="0"
-                max="2000"
-                step="10"
-                value={snapshot.processing.stability_timeout_ms}
-                onchange={(e) =>
-                  patch((s) => (s.processing.stability_timeout_ms = Math.max(0, +(e.currentTarget as HTMLInputElement).value)))}
-              />
-            </label>
-            <label>
-              <span>Max hold (ms)</span>
-              <input
-                type="number"
-                min="50"
-                max="5000"
-                step="50"
-                value={snapshot.processing.max_hold_ms}
-                onchange={(e) =>
-                  patch((s) => (s.processing.max_hold_ms = Math.max(50, +(e.currentTarget as HTMLInputElement).value)))}
-              />
-            </label>
+            <NumberField
+              label="Stability timeout (ms)"
+              min="0"
+              max="2000"
+              step="10"
+              value={snapshot.processing.stability_timeout_ms}
+              onchange={(next) =>
+                patch((s) => (s.processing.stability_timeout_ms = Math.max(0, +next)))}
+            />
+            <NumberField
+              label="Max hold (ms)"
+              min="50"
+              max="5000"
+              step="50"
+              value={snapshot.processing.max_hold_ms}
+              onchange={(next) =>
+                patch((s) => (s.processing.max_hold_ms = Math.max(50, +next)))}
+            />
           </div>
         </section>
       {:else if activeSection === 'stt'}
@@ -2716,20 +2705,18 @@
             push-to-talk shortcut. Requires a model in the <code>models/</code> folder.
           </small>
 
-          <label>
-            <span>Model</span>
-            <select
-              value={snapshot.stt.model_file}
-              onchange={(e) => patch((s) => (s.stt.model_file = (e.currentTarget as HTMLSelectElement).value))}
-            >
-              {#if !sttModels.includes(snapshot.stt.model_file)}
-                <option value={snapshot.stt.model_file}>{snapshot.stt.model_file} (missing)</option>
-              {/if}
-              {#each sttModels as m}
-                <option value={m}>{m}</option>
-              {/each}
-            </select>
-          </label>
+          <SelectField
+            label="Model"
+            value={snapshot.stt.model_file}
+            onchange={(next) => patch((s) => (s.stt.model_file = next))}
+          >
+            {#if !sttModels.includes(snapshot.stt.model_file)}
+              <option value={snapshot.stt.model_file}>{snapshot.stt.model_file} (missing)</option>
+            {/if}
+            {#each sttModels as m}
+              <option value={m}>{m}</option>
+            {/each}
+          </SelectField>
           {#if !sttModels.includes(snapshot.stt.model_file)}
             <small class="hint warn">
               Model <code>{snapshot.stt.model_file}</code> isn't in the
@@ -2745,52 +2732,46 @@
             </small>
           {/if}
 
-          <label>
-            <span>Process on</span>
-            <select
-              value={snapshot.stt.device}
-              onchange={(e) => patch((s) => (s.stt.device = (e.currentTarget as HTMLSelectElement).value as ProcessingDevice))}
-            >
-              <option value="gpu">GPU (fall back to CPU)</option>
-              <option value="cpu">CPU</option>
-            </select>
-          </label>
+          <SelectField
+            label="Process on"
+            value={snapshot.stt.device}
+            onchange={(next) => patch((s) => (s.stt.device = next as ProcessingDevice))}
+          >
+            <option value="gpu">GPU (fall back to CPU)</option>
+            <option value="cpu">CPU</option>
+          </SelectField>
           <small class="hint">
             Where Whisper runs. <strong>GPU</strong> uses the graphics card and
             automatically falls back to CPU if none is available;
             <strong>CPU</strong> forces CPU. Takes effect on your next recording.
           </small>
 
-          <label>
-            <span>Input device</span>
-            <select
-              value={snapshot.stt.input_device}
-              onchange={(e) => patch((s) => (s.stt.input_device = (e.currentTarget as HTMLSelectElement).value))}
-            >
-              <option value="">System default</option>
-              {#if snapshot.stt.input_device && !inputDevices.includes(snapshot.stt.input_device)}
-                <option value={snapshot.stt.input_device}>{snapshot.stt.input_device} (not found)</option>
-              {/if}
-              {#each inputDevices as d}
-                <option value={d}>{d}</option>
-              {/each}
-            </select>
-          </label>
+          <SelectField
+            label="Input device"
+            value={snapshot.stt.input_device}
+            onchange={(next) => patch((s) => (s.stt.input_device = next))}
+          >
+            <option value="">System default</option>
+            {#if snapshot.stt.input_device && !inputDevices.includes(snapshot.stt.input_device)}
+              <option value={snapshot.stt.input_device}>{snapshot.stt.input_device} (not found)</option>
+            {/if}
+            {#each inputDevices as d}
+              <option value={d}>{d}</option>
+            {/each}
+          </SelectField>
 
-          <label>
-            <span>Language</span>
-            <select
-              value={snapshot.stt.language}
-              onchange={(e) => patch((s) => (s.stt.language = (e.currentTarget as HTMLSelectElement).value))}
-            >
-              {#if !STT_LANGUAGES.some((l) => l.code === snapshot!.stt.language)}
-                <option value={snapshot.stt.language}>{snapshot.stt.language}</option>
-              {/if}
-              {#each STT_LANGUAGES as l}
-                <option value={l.code}>{l.label}</option>
-              {/each}
-            </select>
-          </label>
+          <SelectField
+            label="Language"
+            value={snapshot.stt.language}
+            onchange={(next) => patch((s) => (s.stt.language = next))}
+          >
+            {#if !STT_LANGUAGES.some((l) => l.code === snapshot!.stt.language)}
+              <option value={snapshot.stt.language}>{snapshot.stt.language}</option>
+            {/if}
+            {#each STT_LANGUAGES as l}
+              <option value={l.code}>{l.label}</option>
+            {/each}
+          </SelectField>
 
           <Toggle
             label="Translate to English"
@@ -2801,17 +2782,15 @@
             Transcribe non-English speech as English instead of verbatim.
           </small>
 
-          <label>
-            <span>Record button mode</span>
-            <select
-              value={snapshot.stt.button_mode}
-              onchange={(e) =>
-                patch((s) => (s.stt.button_mode = (e.currentTarget as HTMLSelectElement).value as 'toggle' | 'hold'))}
-            >
-              <option value="toggle">Toggle (click to start / stop)</option>
-              <option value="hold">Hold (press and hold to record)</option>
-            </select>
-          </label>
+          <SelectField
+            label="Record button mode"
+            value={snapshot.stt.button_mode}
+            onchange={(next) =>
+              patch((s) => (s.stt.button_mode = next as 'toggle' | 'hold'))}
+          >
+            <option value="toggle">Toggle (click to start / stop)</option>
+            <option value="hold">Hold (press and hold to record)</option>
+          </SelectField>
 
           <small class="hint">
             The push-to-talk shortcut (hold to record) lives in
@@ -2827,33 +2806,28 @@
             checked={snapshot.avatar.visible}
             onchange={(next) => patch((s) => (s.avatar.visible = next))}
           />
-          <label>
-            <span>Type</span>
-            <select
-              value={snapshot.avatar.kind}
-              onchange={(e) =>
-                patch((s) => (s.avatar.kind = (e.currentTarget as HTMLSelectElement).value as Settings['avatar']['kind']))}
-            >
-              <option value="media">Picture / Video</option>
-              <option value="sprite">Animated sprites</option>
-            </select>
-          </label>
+          <SelectField
+            label="Type"
+            value={snapshot.avatar.kind}
+            onchange={(next) =>
+              patch((s) => (s.avatar.kind = next as Settings['avatar']['kind']))}
+          >
+            <option value="media">Picture / Video</option>
+            <option value="sprite">Animated sprites</option>
+          </SelectField>
           {#if snapshot.avatar.kind === 'sprite'}
-            <label>
-              <span>Sprite set</span>
-              <select
-                value={snapshot.avatar.sprite.set}
-                onchange={(e) =>
-                  patch((s) => (s.avatar.sprite.set = (e.currentTarget as HTMLSelectElement).value))}
-              >
-                <!-- V40 Phase F: the bundled sets are named once, in
-                     `avatarConfig.ts` (locked decision 29 rules them brand
-                     assets, not harness identity). -->
-                {#each SPRITE_SETS as set (set.id)}
-                  <option value={set.id}>{set.label}</option>
-                {/each}
-              </select>
-            </label>
+            <SelectField
+              label="Sprite set"
+              value={snapshot.avatar.sprite.set}
+              onchange={(next) => patch((s) => (s.avatar.sprite.set = next))}
+            >
+              <!-- V40 Phase F: the bundled sets are named once, in
+                   `avatarConfig.ts` (locked decision 29 rules them brand
+                   assets, not harness identity). -->
+              {#each SPRITE_SETS as set (set.id)}
+                <option value={set.id}>{set.label}</option>
+              {/each}
+            </SelectField>
             <small class="hint">
               Frame-animated pixel-art mascot. Each state (Idle, Listening,
               Thinking, Speaking, Error) maps to a set of animations from the
@@ -2861,66 +2835,52 @@
               transition options below are ignored in this mode.
             </small>
           {/if}
-          <label>
-            <span>Position</span>
-            <select
-              value={snapshot.avatar.position}
-              onchange={(e) =>
-                patch((s) => (s.avatar.position = (e.currentTarget as HTMLSelectElement).value as Settings['avatar']['position']))}
-            >
-              <option value="top-right">Top Right</option>
-              <option value="top-left">Top Left</option>
-              <option value="bottom-right">Bottom Right</option>
-              <option value="bottom-left">Bottom Left</option>
-            </select>
-          </label>
+          <SelectField
+            label="Position"
+            value={snapshot.avatar.position}
+            onchange={(next) =>
+              patch((s) => (s.avatar.position = next as Settings['avatar']['position']))}
+          >
+            <option value="top-right">Top Right</option>
+            <option value="top-left">Top Left</option>
+            <option value="bottom-right">Bottom Right</option>
+            <option value="bottom-left">Bottom Left</option>
+          </SelectField>
           <div class="row">
-            <label>
-              <span>Width (px)</span>
-              <input
-                type="number"
-                min="50"
-                max="1200"
-                value={snapshot.avatar.size.width_px}
-                onchange={(e) =>
-                  patch((s) => (s.avatar.size.width_px = Math.max(50, +(e.currentTarget as HTMLInputElement).value)))}
-              />
-            </label>
-            <label>
-              <span>Height (px)</span>
-              <input
-                type="number"
-                min="50"
-                max="1200"
-                value={snapshot.avatar.size.height_px}
-                onchange={(e) =>
-                  patch((s) => (s.avatar.size.height_px = Math.max(50, +(e.currentTarget as HTMLInputElement).value)))}
-              />
-            </label>
+            <NumberField
+              label="Width (px)"
+              min="50"
+              max="1200"
+              value={snapshot.avatar.size.width_px}
+              onchange={(next) =>
+                patch((s) => (s.avatar.size.width_px = Math.max(50, +next)))}
+            />
+            <NumberField
+              label="Height (px)"
+              min="50"
+              max="1200"
+              value={snapshot.avatar.size.height_px}
+              onchange={(next) =>
+                patch((s) => (s.avatar.size.height_px = Math.max(50, +next)))}
+            />
           </div>
           <div class="row">
-            <label>
-              <span>Margin X (px)</span>
-              <input
-                type="number"
-                min="0"
-                max="200"
-                value={snapshot.avatar.margin.x_px}
-                onchange={(e) =>
-                  patch((s) => (s.avatar.margin.x_px = Math.max(0, +(e.currentTarget as HTMLInputElement).value)))}
-              />
-            </label>
-            <label>
-              <span>Margin Y (px)</span>
-              <input
-                type="number"
-                min="0"
-                max="200"
-                value={snapshot.avatar.margin.y_px}
-                onchange={(e) =>
-                  patch((s) => (s.avatar.margin.y_px = Math.max(0, +(e.currentTarget as HTMLInputElement).value)))}
-              />
-            </label>
+            <NumberField
+              label="Margin X (px)"
+              min="0"
+              max="200"
+              value={snapshot.avatar.margin.x_px}
+              onchange={(next) =>
+                patch((s) => (s.avatar.margin.x_px = Math.max(0, +next)))}
+            />
+            <NumberField
+              label="Margin Y (px)"
+              min="0"
+              max="200"
+              value={snapshot.avatar.margin.y_px}
+              onchange={(next) =>
+                patch((s) => (s.avatar.margin.y_px = Math.max(0, +next)))}
+            />
           </div>
           <label>
             <span>Opacity: {Math.round(snapshot.avatar.opacity * 100)}%</span>
@@ -2975,18 +2935,15 @@
             </button>
           </div>
           <small class="hint">An empty path disables transitions (states snap directly).</small>
-          <label>
-            <span>Duration (ms)</span>
-            <input
-              type="number"
-              min="0"
-              max="5000"
-              step="50"
-              value={snapshot.avatar.transition.duration_ms}
-              onchange={(e) =>
-                patch((s) => (s.avatar.transition.duration_ms = Math.max(0, +(e.currentTarget as HTMLInputElement).value)))}
-            />
-          </label>
+          <NumberField
+            label="Duration (ms)"
+            min="0"
+            max="5000"
+            step="50"
+            value={snapshot.avatar.transition.duration_ms}
+            onchange={(next) =>
+              patch((s) => (s.avatar.transition.duration_ms = Math.max(0, +next)))}
+          />
           {/if}
         </section>
 
@@ -3060,30 +3017,28 @@
             Governs the cImp chrome — tab bar, status bar, dialogs.
             Distinct from the terminal palette below.
           </small>
-          <label>
-            <span>Theme</span>
-            <select
-              value={snapshot.ui.theme}
-              onchange={(e) => {
-                const theme = (e.currentTarget as HTMLSelectElement).value;
-                patch((s) => {
-                  s.ui.theme = theme;
-                  // Pair the terminal palette to the chosen theme. Skipped for
-                  // a user "Custom" palette so a hand-tuned palette isn't lost
-                  // on a theme switch.
-                  const paired = pairedPalette(theme);
-                  if (paired && s.terminal.theme.name !== 'Custom') {
-                    s.terminal.theme.name = paired;
-                    s.terminal.theme.custom = null;
-                  }
-                });
-              }}
-            >
-              {#each $themeRegistry as t}
-                <option value={t.id}>{t.name}</option>
-              {/each}
-            </select>
-          </label>
+          <SelectField
+            label="Theme"
+            value={snapshot.ui.theme}
+            onchange={(next) => {
+              const theme = next;
+              patch((s) => {
+                s.ui.theme = theme;
+                // Pair the terminal palette to the chosen theme. Skipped for
+                // a user "Custom" palette so a hand-tuned palette isn't lost
+                // on a theme switch.
+                const paired = pairedPalette(theme);
+                if (paired && s.terminal.theme.name !== 'Custom') {
+                  s.terminal.theme.name = paired;
+                  s.terminal.theme.custom = null;
+                }
+              });
+            }}
+          >
+            {#each $themeRegistry as t}
+              <option value={t.id}>{t.name}</option>
+            {/each}
+          </SelectField>
 
           {#if snapshot.ui.theme === TUI_THEME_ID}
             <!-- Accent picker — TUI-only: the built-in theme derives its whole
@@ -3327,21 +3282,18 @@
             the Configure Tab dialog. Color, opacity, blur, size, position,
             and tint always preview live.
           </small>
-          <label>
-            <span>Scrollback kept across renderer switches (lines)</span>
-            <input
-              type="number"
-              min="0"
-              value={snapshot.terminal.background.snapshot_lines}
-              onchange={(e) =>
-                patch((s) => {
-                  const n = Number((e.currentTarget as HTMLInputElement).value);
-                  s.terminal.background.snapshot_lines = Number.isFinite(n)
-                    ? Math.max(0, Math.floor(n))
-                    : 2000;
-                })}
-            />
-          </label>
+          <NumberField
+            label="Scrollback kept across renderer switches (lines)"
+            min="0"
+            value={snapshot.terminal.background.snapshot_lines}
+            onchange={(next) =>
+              patch((s) => {
+                const n = Number(next);
+                s.terminal.background.snapshot_lines = Number.isFinite(n)
+                  ? Math.max(0, Math.floor(n))
+                  : 2000;
+              })}
+          />
           <small class="hint">
             Rows re-painted when a background change switches the terminal
             renderer (WebGL ↔ DOM). Higher keeps more history through the
@@ -3359,17 +3311,14 @@
                 patch((s) => (s.display.terminal_font_family = (e.currentTarget as HTMLInputElement).value))}
             />
           </label>
-          <label>
-            <span>Terminal font size (px)</span>
-            <input
-              type="number"
-              min="8"
-              max="48"
-              value={snapshot.display.terminal_font_size}
-              onchange={(e) =>
-                patch((s) => (s.display.terminal_font_size = Math.max(8, +(e.currentTarget as HTMLInputElement).value)))}
-            />
-          </label>
+          <NumberField
+            label="Terminal font size (px)"
+            min="8"
+            max="48"
+            value={snapshot.display.terminal_font_size}
+            onchange={(next) =>
+              patch((s) => (s.display.terminal_font_size = Math.max(8, +next)))}
+          />
         </section>
 
         <section>
@@ -3378,28 +3327,22 @@
             Sizing of the multi-line compose box that opens for prompts.
           </small>
           <div class="row">
-            <label>
-              <span>Min height (px)</span>
-              <input
-                type="number"
-                min="40"
-                max="400"
-                value={snapshot.compose.min_height_px}
-                onchange={(e) =>
-                  patch((s) => (s.compose.min_height_px = Math.max(40, +(e.currentTarget as HTMLInputElement).value)))}
-              />
-            </label>
-            <label>
-              <span>Max height (px)</span>
-              <input
-                type="number"
-                min="60"
-                max="800"
-                value={snapshot.compose.max_height_px}
-                onchange={(e) =>
-                  patch((s) => (s.compose.max_height_px = Math.max(60, +(e.currentTarget as HTMLInputElement).value)))}
-              />
-            </label>
+            <NumberField
+              label="Min height (px)"
+              min="40"
+              max="400"
+              value={snapshot.compose.min_height_px}
+              onchange={(next) =>
+                patch((s) => (s.compose.min_height_px = Math.max(40, +next)))}
+            />
+            <NumberField
+              label="Max height (px)"
+              min="60"
+              max="800"
+              value={snapshot.compose.max_height_px}
+              onchange={(next) =>
+                patch((s) => (s.compose.max_height_px = Math.max(60, +next)))}
+            />
           </div>
         </section>
 
@@ -3471,19 +3414,16 @@
             disabled={!snapshot.usage.enabled}
             onchange={(next) => patch((s) => (s.usage.show_reset_clock = next))}
           />
-          <label>
-            <span>Poll interval (seconds)</span>
-            <input
-              type="number"
-              min="15"
-              max="3600"
-              step="15"
-              disabled={!snapshot.usage.enabled}
-              value={snapshot.usage.poll_interval_secs}
-              onchange={(e) =>
-                patch((s) => (s.usage.poll_interval_secs = Math.max(15, +(e.currentTarget as HTMLInputElement).value)))}
-            />
-          </label>
+          <NumberField
+            label="Poll interval (seconds)"
+            min="15"
+            max="3600"
+            step="15"
+            value={snapshot.usage.poll_interval_secs}
+            disabled={!snapshot.usage.enabled}
+            onchange={(next) =>
+              patch((s) => (s.usage.poll_interval_secs = Math.max(15, +next)))}
+          />
           <small class="hint">
             How often the widget re-reads the status line's latest report (a
             local read — no network). Minimum 15s; the countdown ticks every
@@ -3536,18 +3476,15 @@
             disabled={!snapshot.system_stats.enabled}
             onchange={(next) => patch((s) => (s.system_stats.show_network = next))}
           />
-          <label>
-            <span>Poll interval (seconds)</span>
-            <input
-              type="number"
-              min="1"
-              max="60"
-              disabled={!snapshot.system_stats.enabled}
-              value={snapshot.system_stats.poll_interval_secs}
-              onchange={(e) =>
-                patch((s) => (s.system_stats.poll_interval_secs = Math.max(1, +(e.currentTarget as HTMLInputElement).value)))}
-            />
-          </label>
+          <NumberField
+            label="Poll interval (seconds)"
+            min="1"
+            max="60"
+            value={snapshot.system_stats.poll_interval_secs}
+            disabled={!snapshot.system_stats.enabled}
+            onchange={(next) =>
+              patch((s) => (s.system_stats.poll_interval_secs = Math.max(1, +next)))}
+          />
           <small class="hint">
             How often CPU / GPU / network are sampled. The graphs update at this
             rate.
@@ -4589,23 +4526,21 @@
                     </span>
                   </label>
                 {/if}
-                <label>
-                  <span>Declared context (tokens, when /props is absent)</span>
-                  <input
-                    type="number"
-                    min="0"
-                    value={backend.declared_context ?? ''}
-                    oninput={(e) =>
-                      updateBackend(i, (b) => {
-                        const v = (e.currentTarget as HTMLInputElement).value;
-                        const n = +v;
-                        // Empty / non-numeric → null (use /props), never NaN.
-                        b.declared_context =
-                          v === '' || Number.isNaN(n) ? null : Math.max(0, n);
-                      })}
-                    placeholder="e.g. 16000"
-                  />
-                </label>
+                <NumberField
+                  label="Declared context (tokens, when /props is absent)"
+                  min="0"
+                  placeholder="e.g. 16000"
+                  value={backend.declared_context ?? ''}
+                  event="input"
+                  onchange={(next) =>
+                    updateBackend(i, (b) => {
+                      const v = next;
+                      const n = +v;
+                      // Empty / non-numeric → null (use /props), never NaN.
+                      b.declared_context =
+                        v === '' || Number.isNaN(n) ? null : Math.max(0, n);
+                    })}
+                />
                 <label>
                   <span>Declared model name (when /props is absent)</span>
                   <input
@@ -4625,24 +4560,24 @@
               {/if}
 
               <hr class="card-divider lg" />
-              <label>
-                <span>Tool scope</span>
-                <select
-                  value={scopeMode(backend.tool_scope)}
-                  onchange={(e) => setScopeMode(i, (e.currentTarget as HTMLSelectElement).value as 'all' | 'web')}
-                  disabled={scopeMode(backend.tool_scope) === 'custom'}
-                >
-                  <option value="all">All tools</option>
-                  <option value="web">Web/docs only (deny local files, code, commands, git)</option>
-                  {#if scopeMode(backend.tool_scope) === 'custom'}
-                    <option value="custom">Custom (edit in settings.json)</option>
-                  {/if}
-                </select>
-                <small class="hint">
-                  Cloud backends default to web/docs only so local file contents
-                  never leave the machine. Widen a cloud backend only with intent.
-                </small>
-              </label>
+              <SelectField
+                label="Tool scope"
+                value={scopeMode(backend.tool_scope)}
+                disabled={scopeMode(backend.tool_scope) === 'custom'}
+                onchange={(next) => setScopeMode(i, next as 'all' | 'web')}
+              >
+                <option value="all">All tools</option>
+                <option value="web">Web/docs only (deny local files, code, commands, git)</option>
+                {#if scopeMode(backend.tool_scope) === 'custom'}
+                  <option value="custom">Custom (edit in settings.json)</option>
+                {/if}
+                {#snippet after()}
+                  <small class="hint">
+                    Cloud backends default to web/docs only so local file contents
+                    never leave the machine. Widen a cloud backend only with intent.
+                  </small>
+                {/snippet}
+              </SelectField>
 
               {#if backend.kind.type === 'local'}
                 <hr class="card-divider" />
@@ -4736,121 +4671,107 @@
 
           <hr class="card-divider lg" />
           <h3>Limits</h3>
-          <label>
-            <span>Working-budget high-water (%)</span>
-            <input
-              type="number"
-              min="10"
-              max="100"
-              value={snapshot.offload.budget_high_water_pct}
-              onchange={(e) =>
-                patch(
-                  (s) =>
-                    (s.offload.budget_high_water_pct = Math.min(
-                      100,
-                      Math.max(10, +(e.currentTarget as HTMLInputElement).value || 10),
-                    )),
-                )}
-            />
+          <NumberField
+            label="Working-budget high-water (%)"
+            min="10"
+            max="100"
+            value={snapshot.offload.budget_high_water_pct}
+            onchange={(next) =>
+              patch(
+                (s) =>
+                  (s.offload.budget_high_water_pct = Math.min(
+                    100,
+                    Math.max(10, +next || 10),
+                  )),
+              )}
+          >
             <small class="hint">
               Fraction of the per-slot window the loop works against,
               reserving the rest for reasoning + the answer (~80%).
             </small>
-          </label>
-          <label>
-            <span>Per-tool-result token cap</span>
-            <input
-              type="number"
-              min="256"
-              value={snapshot.offload.per_tool_result_token_cap}
-              onchange={(e) =>
-                patch(
-                  (s) =>
-                    (s.offload.per_tool_result_token_cap = Math.max(
-                      256,
-                      +(e.currentTarget as HTMLInputElement).value || 256,
-                    )),
-                )}
-            />
-          </label>
-          <label>
-            <span>Max steps</span>
-            <input
-              type="number"
-              min="1"
-              value={snapshot.offload.max_steps}
-              onchange={(e) =>
-                patch(
-                  (s) =>
-                    (s.offload.max_steps = Math.max(
-                      1,
-                      +(e.currentTarget as HTMLInputElement).value || 1,
-                    )),
-                )}
-            />
-          </label>
-          <label>
-            <span>Per-task timeout (seconds)</span>
-            <input
-              type="number"
-              min="30"
-              value={snapshot.offload.offload_timeout_secs}
-              onchange={(e) =>
-                patch(
-                  (s) =>
-                    (s.offload.offload_timeout_secs = Math.max(
-                      30,
-                      +(e.currentTarget as HTMLInputElement).value || 30,
-                    )),
-                )}
-            />
+          </NumberField>
+          <NumberField
+            label="Per-tool-result token cap"
+            min="256"
+            value={snapshot.offload.per_tool_result_token_cap}
+            onchange={(next) =>
+              patch(
+                (s) =>
+                  (s.offload.per_tool_result_token_cap = Math.max(
+                    256,
+                    +next || 256,
+                  )),
+              )}
+          />
+          <NumberField
+            label="Max steps"
+            min="1"
+            value={snapshot.offload.max_steps}
+            onchange={(next) =>
+              patch(
+                (s) =>
+                  (s.offload.max_steps = Math.max(
+                    1,
+                    +next || 1,
+                  )),
+              )}
+          />
+          <NumberField
+            label="Per-task timeout (seconds)"
+            min="30"
+            value={snapshot.offload.offload_timeout_secs}
+            onchange={(next) =>
+              patch(
+                (s) =>
+                  (s.offload.offload_timeout_secs = Math.max(
+                    30,
+                    +next || 30,
+                  )),
+              )}
+          >
             <small class="hint">Bounds each offload, including the wait for a free slot.</small>
-          </label>
-          <label>
-            <span>Max queue depth (blank = unlimited)</span>
-            <input
-              type="number"
-              min="0"
-              placeholder="unlimited"
-              value={snapshot.offload.max_queue_depth ?? ''}
-              onchange={(e) => {
-                const raw = (e.currentTarget as HTMLInputElement).value.trim();
-                const n = Math.floor(+raw);
-                patch(
-                  (s) =>
-                    (s.offload.max_queue_depth =
-                      raw === '' || !Number.isFinite(n) || n <= 0 ? null : n),
-                );
-              }}
-            />
+          </NumberField>
+          <NumberField
+            label="Max queue depth (blank = unlimited)"
+            min="0"
+            placeholder="unlimited"
+            value={snapshot.offload.max_queue_depth ?? ''}
+            onchange={(next) => {
+              const raw = next.trim();
+              const n = Math.floor(+raw);
+              patch(
+                (s) =>
+                  (s.offload.max_queue_depth =
+                    raw === '' || !Number.isFinite(n) || n <= 0 ? null : n),
+              );
+            }}
+          >
             <small class="hint">
               When every slot is busy and this many tasks are already waiting,
               new offloads are rejected immediately instead of queuing. Blank
               keeps the unbounded queue (each waits up to the timeout above).
             </small>
-          </label>
-          <label>
-            <span>Global concurrency (blank = auto)</span>
-            <input
-              type="number"
-              min="1"
-              placeholder="auto"
-              value={snapshot.offload.global_concurrency ?? ''}
-              onchange={(e) => {
-                const raw = (e.currentTarget as HTMLInputElement).value.trim();
-                const n = Math.floor(+raw);
-                patch(
-                  (s) =>
-                    (s.offload.global_concurrency =
-                      raw === '' || !Number.isFinite(n) || n <= 0 ? null : n),
-                );
-              }}
-            />
+          </NumberField>
+          <NumberField
+            label="Global concurrency (blank = auto)"
+            min="1"
+            placeholder="auto"
+            value={snapshot.offload.global_concurrency ?? ''}
+            onchange={(next) => {
+              const raw = next.trim();
+              const n = Math.floor(+raw);
+              patch(
+                (s) =>
+                  (s.offload.global_concurrency =
+                    raw === '' || !Number.isFinite(n) || n <= 0 ? null : n),
+              );
+            }}
+          >
             <small class="hint">
               Cap on offload tasks in flight across the whole app. Blank
               auto-sizes from the summed per-backend slot counts.
             </small>
-          </label>
+          </NumberField>
           <!--
             F-18: the injection controls used to sit right here, at the bottom
             of this sub-tab. This is where anyone who remembers that, or who
@@ -5115,23 +5036,21 @@
             writable throughout; the banner and the glyph still say it is being
             driven.
           </small>
-          <label>
-            <span>Default timeout (seconds)</span>
-            <input
-              type="number"
-              min="1"
-              max="86400"
-              step="1"
-              value={snapshot.delegation.default_timeout_s}
-              onchange={(e) =>
-                patch(
-                  (s) =>
-                    (s.delegation.default_timeout_s = Math.max(
-                      1,
-                      Math.round(+(e.currentTarget as HTMLInputElement).value || 600),
-                    )),
-                )}
-            />
+          <NumberField
+            label="Default timeout (seconds)"
+            min="1"
+            max="86400"
+            step="1"
+            value={snapshot.delegation.default_timeout_s}
+            onchange={(next) =>
+              patch(
+                (s) =>
+                  (s.delegation.default_timeout_s = Math.max(
+                    1,
+                    Math.round(+next || 600),
+                  )),
+              )}
+          >
             <small class="hint">
               How long cImp waits for a worker's reply when the caller named no
               timeout of its own. On expiry the asking tab is told
@@ -5140,7 +5059,7 @@
               A standing permission prompt buys one bounded extension, so a run
               waiting on you does not expire while you walk over to it.
             </small>
-          </label>
+          </NumberField>
           {/if}
 
           <hr class="card-divider lg" />
@@ -5317,49 +5236,45 @@
             </div>
           {/each}
 
-          <label>
-            <span>External fetch budget — calls (0 = unlimited)</span>
-            <input
-              type="number"
-              min="0"
-              value={snapshot.offload.external_fetch_max_calls}
-              onchange={(e) =>
-                patch(
-                  (s) =>
-                    (s.offload.external_fetch_max_calls = Math.max(
-                      0,
-                      Math.floor(+(e.currentTarget as HTMLInputElement).value) || 0,
-                    )),
-                )}
-            />
+          <NumberField
+            label="External fetch budget — calls (0 = unlimited)"
+            min="0"
+            value={snapshot.offload.external_fetch_max_calls}
+            onchange={(next) =>
+              patch(
+                (s) =>
+                  (s.offload.external_fetch_max_calls = Math.max(
+                    0,
+                    Math.floor(+next) || 0,
+                  )),
+              )}
+          >
             <small class="hint">
               How many external (web / MCP-server) tool calls one offload task —
               or one AI tab session — may make before further ones
               are refused. Generous by design: it stops runaway fetch loops and
               bulk data staging, not research.
             </small>
-          </label>
-          <label>
-            <span>External fetch budget — bytes (0 = unlimited)</span>
-            <input
-              type="number"
-              min="0"
-              value={snapshot.offload.external_fetch_max_bytes}
-              onchange={(e) =>
-                patch(
-                  (s) =>
-                    (s.offload.external_fetch_max_bytes = Math.max(
-                      0,
-                      Math.floor(+(e.currentTarget as HTMLInputElement).value) || 0,
-                    )),
-                )}
-            />
+          </NumberField>
+          <NumberField
+            label="External fetch budget — bytes (0 = unlimited)"
+            min="0"
+            value={snapshot.offload.external_fetch_max_bytes}
+            onchange={(next) =>
+              patch(
+                (s) =>
+                  (s.offload.external_fetch_max_bytes = Math.max(
+                    0,
+                    Math.floor(+next) || 0,
+                  )),
+              )}
+          >
             <small class="hint">
               Cumulative bytes of external content one task/session may pull.
               Exhausting either budget refuses further external calls and writes
               one flagged row to Tools → Activities.
             </small>
-          </label>
+          </NumberField>
 
           <h3>Native web tools</h3>
           <small class="hint top">
@@ -5538,29 +5453,27 @@
               <code>models/CHECKSUMS.txt</code>.
             </small>
           {/if}
-          <label>
-            <span>Classifier threshold (0–1)</span>
-            <input
-              type="number"
-              min="0"
-              max="1"
-              step="0.01"
-              value={snapshot.offload.detection_classifier_threshold}
-              onchange={(e) =>
-                patch(
-                  (s) =>
-                    (s.offload.detection_classifier_threshold = Math.min(
-                      1,
-                      Math.max(0, +(e.currentTarget as HTMLInputElement).value || 0),
-                    )),
-                )}
-            />
+          <NumberField
+            label="Classifier threshold (0–1)"
+            min="0"
+            max="1"
+            step="0.01"
+            value={snapshot.offload.detection_classifier_threshold}
+            onchange={(next) =>
+              patch(
+                (s) =>
+                  (s.offload.detection_classifier_threshold = Math.min(
+                    1,
+                    Math.max(0, +next || 0),
+                  )),
+              )}
+          >
             <small class="hint">
               Probability at or above which the classifier flags a result. Lower
               catches more and warns more often; 0.9 is the conservative default,
               because a header on every page trains the model to ignore it.
             </small>
-          </label>
+          </NumberField>
 
           <h4>Detection updates</h4>
           <small class="hint top">
@@ -5613,22 +5526,20 @@
                     {/if}
                   </span>
                 </div>
-                <label>
-                  <span>Update mode</span>
-                  <select
-                    value={snapshot.offload.detection_update_rules_mode}
-                    onchange={(e) => {
-                      const v = (e.currentTarget as HTMLSelectElement).value;
-                      patch((s) => {
-                        s.offload.detection_update_rules_mode = v;
-                      });
-                    }}
-                  >
-                    <option value="off">Off — never check</option>
-                    <option value="check">Check only — tell me, change nothing</option>
-                    <option value="auto">Auto — validate and apply</option>
-                  </select>
-                </label>
+                <SelectField
+                  label="Update mode"
+                  value={snapshot.offload.detection_update_rules_mode}
+                  onchange={(next) => {
+                    const v = next;
+                    patch((s) => {
+                      s.offload.detection_update_rules_mode = v;
+                    });
+                  }}
+                >
+                  <option value="off">Off — never check</option>
+                  <option value="check">Check only — tell me, change nothing</option>
+                  <option value="auto">Auto — validate and apply</option>
+                </SelectField>
                 <!--
                   #48: all three are gated on the resolved detection feature,
                   not only on `detectionBusy`. The IPC commands refuse too — a
@@ -5720,29 +5631,27 @@
               Manifest: <code>{detection.updater.manifest_url}</code>
             </small>
           {/if}
-          <label>
-            <span>Check interval (hours)</span>
-            <input
-              type="number"
-              min="1"
-              max="720"
-              step="1"
-              value={snapshot.offload.detection_update_interval_hours}
-              onchange={(e) =>
-                patch(
-                  (s) =>
-                    (s.offload.detection_update_interval_hours = Math.max(
-                      1,
-                      Math.round(+(e.currentTarget as HTMLInputElement).value || 24),
-                    )),
-                )}
-            />
+          <NumberField
+            label="Check interval (hours)"
+            min="1"
+            max="720"
+            step="1"
+            value={snapshot.offload.detection_update_interval_hours}
+            onchange={(next) =>
+              patch(
+                (s) =>
+                  (s.offload.detection_update_interval_hours = Math.max(
+                    1,
+                    Math.round(+next || 24),
+                  )),
+              )}
+          >
             <small class="hint">
               Also checked once shortly after launch, and skipped if the last
               check was inside this window — a restart does not re-download.
               Floored at 1 hour.
             </small>
-          </label>
+          </NumberField>
           <label>
             <span>Manifest URL override</span>
             <input
@@ -5903,38 +5812,32 @@
               checked={snapshot.graph.index_docs}
               onchange={(next) => patch((s) => (s.graph.index_docs = next))}
             />
-            <label>
-              <span>Max file size (bytes)</span>
-              <input
-                type="number"
-                min="1024"
-                value={snapshot.graph.max_file_bytes}
-                onchange={(e) =>
-                  patch(
-                    (s) =>
-                      (s.graph.max_file_bytes = Math.max(
-                        1024,
-                        Number((e.currentTarget as HTMLInputElement).value) || 1048576,
-                      )),
-                  )}
-              />
-            </label>
-            <label>
-              <span>Watcher debounce (ms)</span>
-              <input
-                type="number"
-                min="50"
-                value={snapshot.graph.watch_debounce_ms}
-                onchange={(e) =>
-                  patch(
-                    (s) =>
-                      (s.graph.watch_debounce_ms = Math.max(
-                        50,
-                        Number((e.currentTarget as HTMLInputElement).value) || 300,
-                      )),
-                  )}
-              />
-            </label>
+            <NumberField
+              label="Max file size (bytes)"
+              min="1024"
+              value={snapshot.graph.max_file_bytes}
+              onchange={(next) =>
+                patch(
+                  (s) =>
+                    (s.graph.max_file_bytes = Math.max(
+                      1024,
+                      Number(next) || 1048576,
+                    )),
+                )}
+            />
+            <NumberField
+              label="Watcher debounce (ms)"
+              min="50"
+              value={snapshot.graph.watch_debounce_ms}
+              onchange={(next) =>
+                patch(
+                  (s) =>
+                    (s.graph.watch_debounce_ms = Math.max(
+                      50,
+                      Number(next) || 300,
+                    )),
+                )}
+            />
 
             <h3>Ignored files & folders</h3>
             <small class="hint">
@@ -5983,55 +5886,46 @@
               (Tools tab).
               Edge confidence (extracted/inferred/ambiguous) is always on.
             </small>
-            <label>
-              <span>Path tracing max hops (1–32)</span>
-              <input
-                type="number"
-                min="1"
-                max="32"
-                value={snapshot.graph.path_max_hops}
-                onchange={(e) =>
-                  patch(
-                    (s) =>
-                      (s.graph.path_max_hops = Math.min(
-                        32,
-                        Math.max(1, Number((e.currentTarget as HTMLInputElement).value) || 8),
-                      )),
-                  )}
-              />
-            </label>
-            <label>
-              <span>Max subsystems reported</span>
-              <input
-                type="number"
-                min="1"
-                value={snapshot.graph.arch_max_communities}
-                onchange={(e) =>
-                  patch(
-                    (s) =>
-                      (s.graph.arch_max_communities = Math.max(
-                        1,
-                        Number((e.currentTarget as HTMLInputElement).value) || 12,
-                      )),
-                  )}
-              />
-            </label>
-            <label>
-              <span>Minimum subsystem size</span>
-              <input
-                type="number"
-                min="1"
-                value={snapshot.graph.arch_min_community_size}
-                onchange={(e) =>
-                  patch(
-                    (s) =>
-                      (s.graph.arch_min_community_size = Math.max(
-                        1,
-                        Number((e.currentTarget as HTMLInputElement).value) || 3,
-                      )),
-                  )}
-              />
-            </label>
+            <NumberField
+              label="Path tracing max hops (1–32)"
+              min="1"
+              max="32"
+              value={snapshot.graph.path_max_hops}
+              onchange={(next) =>
+                patch(
+                  (s) =>
+                    (s.graph.path_max_hops = Math.min(
+                      32,
+                      Math.max(1, Number(next) || 8),
+                    )),
+                )}
+            />
+            <NumberField
+              label="Max subsystems reported"
+              min="1"
+              value={snapshot.graph.arch_max_communities}
+              onchange={(next) =>
+                patch(
+                  (s) =>
+                    (s.graph.arch_max_communities = Math.max(
+                      1,
+                      Number(next) || 12,
+                    )),
+                )}
+            />
+            <NumberField
+              label="Minimum subsystem size"
+              min="1"
+              value={snapshot.graph.arch_min_community_size}
+              onchange={(next) =>
+                patch(
+                  (s) =>
+                    (s.graph.arch_min_community_size = Math.max(
+                      1,
+                      Number(next) || 3,
+                    )),
+                )}
+            />
 
             <h3>Offload worker access</h3>
             <Toggle
@@ -6119,38 +6013,32 @@
                     )}
                 />
               </label>
-              <label>
-                <span>Embedding dimensions (0 = auto-probe)</span>
-                <input
-                  type="number"
-                  min="0"
-                  value={snapshot.graph.embedding_dims}
-                  onchange={(e) =>
-                    patch(
-                      (s) =>
-                        (s.graph.embedding_dims = Math.max(
-                          0,
-                          Number((e.currentTarget as HTMLInputElement).value) || 0,
-                        )),
-                    )}
-                />
-              </label>
-              <label>
-                <span>Embedding max tokens (0 = auto-detect)</span>
-                <input
-                  type="number"
-                  min="0"
-                  value={snapshot.graph.embedding_max_tokens}
-                  onchange={(e) =>
-                    patch(
-                      (s) =>
-                        (s.graph.embedding_max_tokens = Math.max(
-                          0,
-                          Number((e.currentTarget as HTMLInputElement).value) || 0,
-                        )),
-                    )}
-                />
-              </label>
+              <NumberField
+                label="Embedding dimensions (0 = auto-probe)"
+                min="0"
+                value={snapshot.graph.embedding_dims}
+                onchange={(next) =>
+                  patch(
+                    (s) =>
+                      (s.graph.embedding_dims = Math.max(
+                        0,
+                        Number(next) || 0,
+                      )),
+                  )}
+              />
+              <NumberField
+                label="Embedding max tokens (0 = auto-detect)"
+                min="0"
+                value={snapshot.graph.embedding_max_tokens}
+                onchange={(next) =>
+                  patch(
+                    (s) =>
+                      (s.graph.embedding_max_tokens = Math.max(
+                        0,
+                        Number(next) || 0,
+                      )),
+                  )}
+              />
               <small class="hint">
                 0 = auto-detect from the server (a <code>llama-server</code>
                 reports its context window on <code>/props</code>). Longer texts
@@ -6178,73 +6066,61 @@
               Intelligence tab.
             </small>
             {#if snapshot.graph.context_injection}
-              <label>
-                <span>Per-file budget (chars)</span>
-                <input
-                  type="number"
-                  min="100"
-                  value={snapshot.graph.context_per_file_chars}
-                  onchange={(e) =>
-                    patch(
-                      (s) =>
-                        (s.graph.context_per_file_chars = Math.max(
-                          100,
-                          Number((e.currentTarget as HTMLInputElement).value) || 800,
-                        )),
-                    )}
-                />
-              </label>
-              <label>
-                <span>Per-turn budget (chars)</span>
-                <input
-                  type="number"
-                  min="500"
-                  value={snapshot.graph.context_turn_budget_chars}
-                  onchange={(e) =>
-                    patch(
-                      (s) =>
-                        (s.graph.context_turn_budget_chars = Math.max(
-                          500,
-                          Number((e.currentTarget as HTMLInputElement).value) || 6000,
-                        )),
-                    )}
-                />
-              </label>
-              <label>
-                <span>Min relevance score (skip below)</span>
-                <input
-                  type="number"
-                  min="0"
-                  value={snapshot.graph.context_min_score}
-                  onchange={(e) =>
-                    patch((s) => {
-                      // 0 is a valid value (no threshold), so keep it — a bare
-                      // `|| 3` would treat the falsy 0 as "unset" and revert it.
-                      const n = Number((e.currentTarget as HTMLInputElement).value);
-                      s.graph.context_min_score = Number.isFinite(n) ? Math.max(0, n) : 3;
-                    })}
-                />
-              </label>
+              <NumberField
+                label="Per-file budget (chars)"
+                min="100"
+                value={snapshot.graph.context_per_file_chars}
+                onchange={(next) =>
+                  patch(
+                    (s) =>
+                      (s.graph.context_per_file_chars = Math.max(
+                        100,
+                        Number(next) || 800,
+                      )),
+                  )}
+              />
+              <NumberField
+                label="Per-turn budget (chars)"
+                min="500"
+                value={snapshot.graph.context_turn_budget_chars}
+                onchange={(next) =>
+                  patch(
+                    (s) =>
+                      (s.graph.context_turn_budget_chars = Math.max(
+                        500,
+                        Number(next) || 6000,
+                      )),
+                  )}
+              />
+              <NumberField
+                label="Min relevance score (skip below)"
+                min="0"
+                value={snapshot.graph.context_min_score}
+                onchange={(next) =>
+                  patch((s) => {
+                    // 0 is a valid value (no threshold), so keep it — a bare
+                    // `|| 3` would treat the falsy 0 as "unset" and revert it.
+                    const n = Number(next);
+                    s.graph.context_min_score = Number.isFinite(n) ? Math.max(0, n) : 3;
+                  })}
+              />
               <Toggle
                 label="Rank session-hot files first (from Memory)"
                 checked={snapshot.graph.context_include_session}
                 onchange={(next) => patch((s) => (s.graph.context_include_session = next))}
               />
-              <label>
-                <span>Dedup TTL (turns, 0 = re-inject every turn)</span>
-                <input
-                  type="number"
-                  min="0"
-                  value={snapshot.graph.context_dedup_ttl_turns}
-                  onchange={(e) =>
-                    patch((s) => {
-                      // 0 is a valid value (dedup off), so keep it — a bare
-                      // `|| 10` would treat the falsy 0 as "unset" and revert it.
-                      const n = Number((e.currentTarget as HTMLInputElement).value);
-                      s.graph.context_dedup_ttl_turns = Number.isFinite(n) ? Math.max(0, n) : 10;
-                    })}
-                />
-              </label>
+              <NumberField
+                label="Dedup TTL (turns, 0 = re-inject every turn)"
+                min="0"
+                value={snapshot.graph.context_dedup_ttl_turns}
+                onchange={(next) =>
+                  patch((s) => {
+                    // 0 is a valid value (dedup off), so keep it — a bare
+                    // `|| 10` would treat the falsy 0 as "unset" and revert it.
+                    const n = Number(next);
+                    s.graph.context_dedup_ttl_turns = Number.isFinite(n) ? Math.max(0, n) : 10;
+                  })}
+              />
               <small class="hint">
                 A file injected in full is demoted to a one-line "unchanged"
                 reminder on later turns until it changes or this many turns pass.
@@ -6293,57 +6169,43 @@
               </small>
             {/if}
             {#if snapshot.graph.read_advisor && !e1Blocked}
-              <label>
-                <span>Min file size to advise (lines)</span>
-                <input
-                  type="number"
-                  min="0"
-                  value={snapshot.graph.read_advisor_min_lines}
-                  onchange={(e) =>
-                    patch(
-                      (s) =>
-                        (s.graph.read_advisor_min_lines = Math.max(
-                          0,
-                          Number((e.currentTarget as HTMLInputElement).value) || 300,
-                        )),
-                    )}
-                />
-              </label>
+              <NumberField
+                label="Min file size to advise (lines)"
+                min="0"
+                value={snapshot.graph.read_advisor_min_lines}
+                onchange={(next) =>
+                  patch(
+                    (s) =>
+                      (s.graph.read_advisor_min_lines = Math.max(
+                        0,
+                        Number(next) || 300,
+                      )),
+                  )}
+              />
               <small class="hint">
                 Files with fewer lines than this always pass — a small file is
                 cheap to re-read; the reminder isn't worth it.
               </small>
-              <label>
-                <span>Reminder mode</span>
-                <select
-                  value={snapshot.graph.read_advisor_mode}
-                  onchange={(e) =>
-                    patch(
-                      (s) =>
-                        (s.graph.read_advisor_mode = (
-                          e.currentTarget as HTMLSelectElement
-                        ).value),
-                    )}
-                >
-                  <option value="advise">Advise — outline reminder only</option>
-                  <option value="substitute">Substitute — outline + most relevant symbol body</option>
-                </select>
-              </label>
-              <label>
-                <span>Trust TTL (retrieve turns, 0 = whole session)</span>
-                <input
-                  type="number"
-                  min="0"
-                  value={snapshot.graph.read_advisor_ttl_turns}
-                  onchange={(e) =>
-                    patch((s) => {
-                      // 0 is a valid value (TTL off), so keep it — a bare
-                      // `|| 0` happens to coincide here, but stay explicit.
-                      const n = Number((e.currentTarget as HTMLInputElement).value);
-                      s.graph.read_advisor_ttl_turns = Number.isFinite(n) ? Math.max(0, n) : 0;
-                    })}
-                />
-              </label>
+              <SelectField
+                label="Reminder mode"
+                value={snapshot.graph.read_advisor_mode}
+                onchange={(next) => patch((s) => (s.graph.read_advisor_mode = next))}
+              >
+                <option value="advise">Advise — outline reminder only</option>
+                <option value="substitute">Substitute — outline + most relevant symbol body</option>
+              </SelectField>
+              <NumberField
+                label="Trust TTL (retrieve turns, 0 = whole session)"
+                min="0"
+                value={snapshot.graph.read_advisor_ttl_turns}
+                onchange={(next) =>
+                  patch((s) => {
+                    // 0 is a valid value (TTL off), so keep it — a bare
+                    // `|| 0` happens to coincide here, but stay explicit.
+                    const n = Number(next);
+                    s.graph.read_advisor_ttl_turns = Number.isFinite(n) ? Math.max(0, n) : 0;
+                  })}
+              />
               <small class="hint">
                 After this many retrieval turns since the advisor last saw the
                 file read in full, a <code>Read</code> passes again — bounds how
@@ -6377,21 +6239,18 @@
                 runs untouched. Installs a second hook matcher — re-launch the
                 tab to pick it up.
               </small>
-              <label>
-                <span>First-read digest tier (KiB, 0 = off)</span>
-                <input
-                  type="number"
-                  min="0"
-                  value={snapshot.graph.read_advisor_first_read_kb}
-                  onchange={(e) =>
-                    patch((s) => {
-                      const n = Number((e.currentTarget as HTMLInputElement).value);
-                      s.graph.read_advisor_first_read_kb = Number.isFinite(n)
-                        ? Math.max(0, Math.trunc(n))
-                        : 0;
-                    })}
-                />
-              </label>
+              <NumberField
+                label="First-read digest tier (KiB, 0 = off)"
+                min="0"
+                value={snapshot.graph.read_advisor_first_read_kb}
+                onchange={(next) =>
+                  patch((s) => {
+                    const n = Number(next);
+                    s.graph.read_advisor_first_read_kb = Number.isFinite(n)
+                      ? Math.max(0, Math.trunc(n))
+                      : 0;
+                  })}
+              />
               <small class="hint">
                 Answer the <em>first</em> read of a large non-code file (log,
                 lockfile, generated JSON, data dump) at or above this size with the
@@ -6433,22 +6292,19 @@
               path.
             </small>
             {#if snapshot.graph.graph_viz}
-              <label>
-                <span>Max rendered nodes</span>
-                <input
-                  type="number"
-                  min="50"
-                  value={snapshot.graph.graph_viz_max_nodes}
-                  onchange={(e) =>
-                    patch(
-                      (s) =>
-                        (s.graph.graph_viz_max_nodes = Math.max(
-                          50,
-                          Number((e.currentTarget as HTMLInputElement).value) || 1500,
-                        )),
-                    )}
-                />
-              </label>
+              <NumberField
+                label="Max rendered nodes"
+                min="50"
+                value={snapshot.graph.graph_viz_max_nodes}
+                onchange={(next) =>
+                  patch(
+                    (s) =>
+                      (s.graph.graph_viz_max_nodes = Math.max(
+                        50,
+                        Number(next) || 1500,
+                      )),
+                  )}
+              />
               <h3>Graph view tuning</h3>
               <small class="hint">
                 Multipliers on the built-in layout/appearance (1.0 = default;
@@ -6465,24 +6321,21 @@
                 { key: 'graph_viz_cluster_spacing', label: 'Spacing between folders', max: 50 },
                 { key: 'graph_viz_cluster_strength', label: 'Folder grouping tightness', max: 5 },
               ] as knob (knob.key)}
-                <label>
-                  <span>{knob.label}</span>
-                  <input
-                    type="number"
-                    min="0.2"
-                    max={knob.max}
-                    step="0.1"
-                    value={(snapshot.graph as unknown as Record<string, number>)[knob.key]}
-                    onchange={(e) =>
-                      patch(
-                        (s) =>
-                          ((s.graph as unknown as Record<string, number>)[knob.key] = Math.min(
-                            knob.max,
-                            Math.max(0.2, Number((e.currentTarget as HTMLInputElement).value) || 1),
-                          )),
-                      )}
-                  />
-                </label>
+                <NumberField
+                  label={knob.label}
+                  min="0.2"
+                  max={knob.max}
+                  step="0.1"
+                  value={(snapshot.graph as unknown as Record<string, number>)[knob.key]}
+                  onchange={(next) =>
+                    patch(
+                      (s) =>
+                        ((s.graph as unknown as Record<string, number>)[knob.key] = Math.min(
+                          knob.max,
+                          Math.max(0.2, Number(next) || 1),
+                        )),
+                    )}
+                />
               {/each}
               <div class="row">
                 <label>
@@ -6588,20 +6441,18 @@
           />
 
           <h3>Scan settings</h3>
-          <label>
-            <span>Per-tool timeout (seconds)</span>
-            <input
-              type="number"
-              min="1"
-              value={snapshot.code_audit.timeout_secs}
-              oninput={(e) =>
-                patch((s) => {
-                  const v = Number((e.currentTarget as HTMLInputElement).value);
-                  if (Number.isFinite(v) && v >= 1)
-                    s.code_audit.timeout_secs = Math.floor(v);
-                })}
-            />
-          </label>
+          <NumberField
+            label="Per-tool timeout (seconds)"
+            min="1"
+            value={snapshot.code_audit.timeout_secs}
+            event="input"
+            onchange={(next) =>
+              patch((s) => {
+                const v = Number(next);
+                if (Number.isFinite(v) && v >= 1)
+                  s.code_audit.timeout_secs = Math.floor(v);
+              })}
+          />
 
           <h3>Quality tool selection</h3>
           <small class="hint">
@@ -7748,79 +7599,67 @@
             graph) — if context injection is off, restart the tab after enabling
             this.
           </small>
-          <label>
-            <span>Max checkpoints kept</span>
-            <input
-              type="number"
-              min="1"
-              disabled={!snapshot.workbench.checkpoints}
-              value={snapshot.workbench.checkpoint_max}
-              onchange={(e) =>
-                patch(
-                  (s) =>
-                    (s.workbench.checkpoint_max = Math.max(
-                      1,
-                      Number((e.currentTarget as HTMLInputElement).value) || 100,
-                    )),
-                )}
-            />
-          </label>
-          <label>
-            <span>Max checkpoint age (days)</span>
-            <input
-              type="number"
-              min="1"
-              disabled={!snapshot.workbench.checkpoints}
-              value={snapshot.workbench.checkpoint_max_age_days}
-              onchange={(e) =>
-                patch(
-                  (s) =>
-                    (s.workbench.checkpoint_max_age_days = Math.max(
-                      1,
-                      Number((e.currentTarget as HTMLInputElement).value) || 7,
-                    )),
-                )}
-            />
-          </label>
+          <NumberField
+            label="Max checkpoints kept"
+            min="1"
+            value={snapshot.workbench.checkpoint_max}
+            disabled={!snapshot.workbench.checkpoints}
+            onchange={(next) =>
+              patch(
+                (s) =>
+                  (s.workbench.checkpoint_max = Math.max(
+                    1,
+                    Number(next) || 100,
+                  )),
+              )}
+          />
+          <NumberField
+            label="Max checkpoint age (days)"
+            min="1"
+            value={snapshot.workbench.checkpoint_max_age_days}
+            disabled={!snapshot.workbench.checkpoints}
+            onchange={(next) =>
+              patch(
+                (s) =>
+                  (s.workbench.checkpoint_max_age_days = Math.max(
+                    1,
+                    Number(next) || 7,
+                  )),
+              )}
+          />
           <small class="hint">
             The burst trigger fires an "activity" checkpoint when a shell tab
             or other non-hooked flow touches several files at once — the
             fallback that covers what the per-prompt trigger can't see.
           </small>
-          <label>
-            <span>Burst trigger: files changed</span>
-            <input
-              type="number"
-              min="1"
-              disabled={!snapshot.workbench.checkpoints}
-              value={snapshot.workbench.checkpoint_burst_files}
-              onchange={(e) =>
-                patch(
-                  (s) =>
-                    (s.workbench.checkpoint_burst_files = Math.max(
-                      1,
-                      Number((e.currentTarget as HTMLInputElement).value) || 5,
-                    )),
-                )}
-            />
-          </label>
-          <label>
-            <span>Burst trigger: time window (seconds)</span>
-            <input
-              type="number"
-              min="1"
-              disabled={!snapshot.workbench.checkpoints}
-              value={snapshot.workbench.checkpoint_burst_window_s}
-              onchange={(e) =>
-                patch(
-                  (s) =>
-                    (s.workbench.checkpoint_burst_window_s = Math.max(
-                      1,
-                      Number((e.currentTarget as HTMLInputElement).value) || 60,
-                    )),
-                )}
-            />
-          </label>
+          <NumberField
+            label="Burst trigger: files changed"
+            min="1"
+            value={snapshot.workbench.checkpoint_burst_files}
+            disabled={!snapshot.workbench.checkpoints}
+            onchange={(next) =>
+              patch(
+                (s) =>
+                  (s.workbench.checkpoint_burst_files = Math.max(
+                    1,
+                    Number(next) || 5,
+                  )),
+              )}
+          />
+          <NumberField
+            label="Burst trigger: time window (seconds)"
+            min="1"
+            value={snapshot.workbench.checkpoint_burst_window_s}
+            disabled={!snapshot.workbench.checkpoints}
+            onchange={(next) =>
+              patch(
+                (s) =>
+                  (s.workbench.checkpoint_burst_window_s = Math.max(
+                    1,
+                    Number(next) || 60,
+                  )),
+              )}
+          />
           <small class="hint">
             The minimum gap is enforced per AI tab, not per project: with two
             tabs open on one project, each tab's prompt can still take its own
@@ -7829,23 +7668,20 @@
             working tree do interleave their checkpoints, so restoring one
             tab's checkpoint can roll back the other's work.
           </small>
-          <label>
-            <span>Minimum gap between snapshots, per tab (seconds)</span>
-            <input
-              type="number"
-              min="1"
-              disabled={!snapshot.workbench.checkpoints}
-              value={snapshot.workbench.checkpoint_min_gap_s}
-              onchange={(e) =>
-                patch(
-                  (s) =>
-                    (s.workbench.checkpoint_min_gap_s = Math.max(
-                      1,
-                      Number((e.currentTarget as HTMLInputElement).value) || 120,
-                    )),
-                )}
-            />
-          </label>
+          <NumberField
+            label="Minimum gap between snapshots, per tab (seconds)"
+            min="1"
+            value={snapshot.workbench.checkpoint_min_gap_s}
+            disabled={!snapshot.workbench.checkpoints}
+            onchange={(next) =>
+              patch(
+                (s) =>
+                  (s.workbench.checkpoint_min_gap_s = Math.max(
+                    1,
+                    Number(next) || 120,
+                  )),
+              )}
+          />
         </section>
       {:else if activeSection === 'advanced'}
         <section>
@@ -7856,48 +7692,42 @@
             <code>RUST_LOG</code> env var, when set at launch, overrides
             this until you change it here.
           </small>
-          <label>
-            <span>Log level</span>
-            <select
-              value={snapshot.logging.level}
-              onchange={(e) =>
-                patch(
-                  (s) =>
-                    (s.logging.level = (
-                      e.currentTarget as HTMLSelectElement
-                    ).value as Settings['logging']['level']),
-                )}
-            >
-              <option value="trace">Trace</option>
-              <option value="debug">Debug</option>
-              <option value="info">Info</option>
-              <option value="warn">Warn</option>
-              <option value="error">Error</option>
-            </select>
-          </label>
-          <label>
-            <span>Retention</span>
-            <select
-              value={snapshot.logging.retention}
-              onchange={(e) =>
-                patch(
-                  (s) =>
-                    (s.logging.retention = (
-                      e.currentTarget as HTMLSelectElement
-                    ).value as Settings['logging']['retention']),
-                )}
-            >
-              <option value="daily">Daily (keep 1 day)</option>
-              <option value="weekly">Weekly (keep 7 days)</option>
-              <option value="monthly">Monthly (keep 30 days)</option>
-              <option value="never">Never (keep everything)</option>
-            </select>
-            <small class="hint">
-              Cleanup runs at launch and whenever this setting changes.
-              Files older than the window are deleted; the active day's log
-              is always kept.
-            </small>
-          </label>
+          <SelectField
+            label="Log level"
+            value={snapshot.logging.level}
+            onchange={(next) =>
+              patch(
+                (s) =>
+                  (s.logging.level = next as Settings['logging']['level']),
+              )}
+          >
+            <option value="trace">Trace</option>
+            <option value="debug">Debug</option>
+            <option value="info">Info</option>
+            <option value="warn">Warn</option>
+            <option value="error">Error</option>
+          </SelectField>
+          <SelectField
+            label="Retention"
+            value={snapshot.logging.retention}
+            onchange={(next) =>
+              patch(
+                (s) =>
+                  (s.logging.retention = next as Settings['logging']['retention']),
+              )}
+          >
+            <option value="daily">Daily (keep 1 day)</option>
+            <option value="weekly">Weekly (keep 7 days)</option>
+            <option value="monthly">Monthly (keep 30 days)</option>
+            <option value="never">Never (keep everything)</option>
+            {#snippet after()}
+              <small class="hint">
+                Cleanup runs at launch and whenever this setting changes.
+                Files older than the window are deleted; the active day's log
+                is always kept.
+              </small>
+            {/snippet}
+          </SelectField>
 
           <h3>Content capture</h3>
           <small class="hint top">
@@ -7911,24 +7741,20 @@
             checked={snapshot.logging.content_capture.enabled}
             onchange={(next) => patch((s) => (s.logging.content_capture.enabled = next))}
           />
-          <label>
-            <span>Retention</span>
-            <select
-              value={snapshot.logging.content_capture.retention}
-              onchange={(e) =>
-                patch(
-                  (s) =>
-                    (s.logging.content_capture.retention = (
-                      e.currentTarget as HTMLSelectElement
-                    ).value as Settings['logging']['content_capture']['retention']),
-                )}
-            >
-              <option value="daily">Daily (keep 1 day)</option>
-              <option value="weekly">Weekly (keep 7 days)</option>
-              <option value="monthly">Monthly (keep 30 days)</option>
-              <option value="never">Never (keep everything)</option>
-            </select>
-          </label>
+          <SelectField
+            label="Retention"
+            value={snapshot.logging.content_capture.retention}
+            onchange={(next) =>
+              patch(
+                (s) =>
+                  (s.logging.content_capture.retention = next as Settings['logging']['content_capture']['retention']),
+              )}
+          >
+            <option value="daily">Daily (keep 1 day)</option>
+            <option value="weekly">Weekly (keep 7 days)</option>
+            <option value="monthly">Monthly (keep 30 days)</option>
+            <option value="never">Never (keep everything)</option>
+          </SelectField>
           <div class="content-actions">
             <button
               type="button"
@@ -7966,22 +7792,19 @@
             Each tab's PTY output is kept in an in-memory ring buffer so
             re-opened panes and restarts can replay history.
           </small>
-          <label>
-            <span>Ring buffer size (bytes per tab)</span>
-            <input
-              type="number"
-              min="4096"
-              value={snapshot.terminal.scrollback.ring_bytes}
-              onchange={(e) =>
-                patch(
-                  (s) =>
-                    (s.terminal.scrollback.ring_bytes = Math.max(
-                      4096,
-                      Number((e.currentTarget as HTMLInputElement).value) || 262144,
-                    )),
-                )}
-            />
-          </label>
+          <NumberField
+            label="Ring buffer size (bytes per tab)"
+            min="4096"
+            value={snapshot.terminal.scrollback.ring_bytes}
+            onchange={(next) =>
+              patch(
+                (s) =>
+                  (s.terminal.scrollback.ring_bytes = Math.max(
+                    4096,
+                    Number(next) || 262144,
+                  )),
+              )}
+          />
           <Toggle
             label="Save scrollback to disk on exit"
             checked={snapshot.terminal.scrollback.persist}

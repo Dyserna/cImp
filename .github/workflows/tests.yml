@@ -129,6 +129,25 @@ jobs:
         # `--locked` so CI tests the committed Cargo.lock resolution.
         run: cargo test --locked --bin cimp
 
+      # V42 Phase E — the settings types and defaults are GENERATED.
+      # `settings::codegen` writes src/lib/settings/generated/{settings.ts,
+      # defaults.json} during the `cargo test` above, from
+      # src-tauri/src/settings/schema.rs via ts-rs. Both are committed, and the
+      # frontend imports them, so a schema change whose regenerated output was
+      # not committed would ship a stale mirror — the exact drift this phase
+      # deleted the hand-written one to end.
+      #
+      # This step is the consumer of that signal: it fails the run when what
+      # the suite just regenerated differs from what is in the tree. The
+      # generation itself is silent by design (`write_if_changed`), so without
+      # a diff check here nothing would ever notice.
+      #
+      # Byte-exact on purpose, on BOTH runners: `.gitattributes` marks the
+      # directory `-text`, so neither this Windows checkout (autocrlf=true) nor
+      # the Linux one below translates line endings, and ts-rs emits LF.
+      - name: Generated settings bindings are up to date
+        run: git diff --exit-code -- src/lib/settings/generated
+
       # Code review 2026-08-08, finding O-1. The suite has `#[ignore]`d tests and
       # CI ran NONE of them, so the only *executable* guards for the Phase H
       # gate-cache race (#48, H-1 and M-15) — every other test in that file greps
@@ -402,3 +421,10 @@ jobs:
           export LIBCLANG_PATH="$(dirname "$(find /usr/lib/llvm-* -name libclang.so 2>/dev/null | sort | tail -1)")"
           echo "LIBCLANG_PATH=$LIBCLANG_PATH"
           cargo test --locked --bin cimp
+
+      # The Linux half of the V42 Phase E check (see the Windows job's note).
+      # This copy is the one that would catch a platform-dependent generator:
+      # a line ending, a path separator in a `#[ts(type = "import('…')")]`
+      # seam, or a HashMap iteration order that happens to be stable on one OS.
+      - name: Generated settings bindings are up to date
+        run: git diff --exit-code -- src/lib/settings/generated

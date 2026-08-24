@@ -21,10 +21,12 @@
 //! [`ServerMetrics`] snapshot to the frontend.
 
 use std::collections::{HashMap, VecDeque};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde_json::Value;
+
+use crate::activity::now_ms;
 
 /// Cap on the retained request history (newest first).
 const HISTORY_CAP: usize = 50;
@@ -503,14 +505,6 @@ fn parse_metrics(text: Option<&str>) -> ParsedMetrics {
         }
     }
     out
-}
-
-/// Current wall-clock as epoch millis (formatted on the frontend).
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

@@ -3,8 +3,8 @@
   // dialogs in App.svelte; renders only when the dialog discriminator
   // is 'save-layout'. Defaults the name to "Layout {N}" where N is
   // one more than the existing preset count.
-  import { onMount } from 'svelte';
   import { closeDialog, dialogState } from './store';
+  import ModalShell from './ModalShell.svelte';
   import { settings } from '../settings/store';
   import { saveCurrentLayoutAsPreset } from '../layout/presets';
   import { errorMessage } from '../errors';
@@ -73,102 +73,61 @@
     }
     await performSave();
   }
-
-  function onKeyDown(e: KeyboardEvent): void {
-    if (!isOpen) return;
-    if (e.key === 'Escape') {
-      e.preventDefault();
-      cancel();
-    } else if (
-      e.key === 'Enter' &&
-      (e.target as HTMLElement)?.tagName !== 'BUTTON'
-    ) {
-      e.preventDefault();
-      void handleSubmit();
-    }
-  }
-
-  onMount(() => {
-    window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
-  });
 </script>
 
-{#if isOpen}
-  <div class="backdrop" onclick={cancel} role="presentation"></div>
-  <div class="card" role="dialog" aria-label="Save layout">
-    <h2>Save current layout</h2>
-    <label class="field">
-      <span class="label">Name</span>
-      <input
-        type="text"
-        bind:this={inputEl}
-        bind:value={name}
-        oninput={() => {
-          confirmingOverwrite = false;
-          error = null;
-        }}
-        disabled={busy}
-      />
-    </label>
-    {#if confirmingOverwrite && nameExists}
-      <div class="confirm">
-        A preset named “{name.trim()}” already exists. Save again to
-        overwrite, or change the name.
-      </div>
-    {/if}
-    {#if error}
-      <div class="error">{error}</div>
-    {/if}
-    <div class="actions">
-      <button type="button" class="cancel" onclick={cancel} disabled={busy}>
-        Cancel
-      </button>
-      <button
-        type="button"
-        class="primary"
-        onclick={handleSubmit}
-        disabled={busy}
-      >
-        {#if busy}
-          Saving…
-        {:else if confirmingOverwrite && nameExists}
-          Overwrite
-        {:else}
-          Save
-        {/if}
-      </button>
+<ModalShell
+  open={isOpen}
+  label="Save layout"
+  title="Save current layout"
+  width={360}
+  onCancel={cancel}
+  onEscape={cancel}
+  onEnter={() => void handleSubmit()}
+>
+  <label class="field">
+    <span class="label">Name</span>
+    <input
+      type="text"
+      bind:this={inputEl}
+      bind:value={name}
+      oninput={() => {
+        confirmingOverwrite = false;
+        error = null;
+      }}
+      disabled={busy}
+    />
+  </label>
+  {#if confirmingOverwrite && nameExists}
+    <div class="confirm">
+      A preset named “{name.trim()}” already exists. Save again to
+      overwrite, or change the name.
     </div>
-  </div>
-{/if}
+  {/if}
+  {#if error}
+    <div class="error">{error}</div>
+  {/if}
+  {#snippet actions()}
+    <button type="button" class="cancel" onclick={cancel} disabled={busy}>
+      Cancel
+    </button>
+    <button
+      type="button"
+      class="primary"
+      onclick={handleSubmit}
+      disabled={busy}
+    >
+      {#if busy}
+        Saving…
+      {:else if confirmingOverwrite && nameExists}
+        Overwrite
+      {:else}
+        Save
+      {/if}
+    </button>
+  {/snippet}
+</ModalShell>
 
 <style>
-  .backdrop {
-    position: fixed;
-    inset: 0;
-    background: rgba(0, 0, 0, 0.5);
-    z-index: 100;
-  }
-  .card {
-    position: fixed;
-    top: 50%;
-    left: 50%;
-    transform: translate(-50%, -50%);
-    background: var(--surface-3);
-    border: 1px solid var(--border-subtle);
-    border-radius: var(--radius-lg);
-    padding: 20px var(--space-5);
-    width: 360px;
-    max-width: calc(100vw - 40px);
-    color: var(--text-primary);
-    z-index: 101;
-    box-shadow: var(--shadow-lg);
-  }
-  h2 {
-    margin: 0 0 var(--space-4);
-    font-size: 16px;
-    font-weight: 600;
-  }
   .field {
     display: block;
     margin-bottom: var(--space-3);
@@ -193,26 +152,6 @@
   input[type='text']:focus {
     outline: none;
     border-color: var(--accent);
-  }
-  .actions {
-    display: flex;
-    justify-content: flex-end;
-    gap: var(--space-2);
-    margin-top: var(--space-4);
-  }
-  .actions button {
-    padding: 6px var(--space-4);
-    border-radius: var(--radius-md);
-    cursor: pointer;
-    font-size: var(--font-size-md);
-    border: 1px solid var(--border-default);
-    transition:
-      background var(--motion-fast) var(--easing-standard),
-      border-color var(--motion-fast) var(--easing-standard);
-  }
-  .actions button:focus-visible {
-    outline: 2px solid var(--accent);
-    outline-offset: 2px;
   }
   .cancel {
     background: var(--surface-4);

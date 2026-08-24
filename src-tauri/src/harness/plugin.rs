@@ -1165,7 +1165,7 @@ pub trait HarnessPlugin: Sync + Send {
         _cfg: &AiToolTabConfig,
         _settings: &Settings,
         _tab: &str,
-        _endpoint: Option<&crate::offload::loopback::Discovery>,
+        _endpoint: Option<&crate::offload::discovery::Discovery>,
     ) -> Vec<String> {
         Vec::new()
     }
@@ -1200,7 +1200,7 @@ pub trait HarnessPlugin: Sync + Send {
         _cfg: &AiToolTabConfig,
         _settings: &Settings,
         _tab: &str,
-        _endpoint: Option<&crate::offload::loopback::Discovery>,
+        _endpoint: Option<&crate::offload::discovery::Discovery>,
         _env: &mut HashMap<String, String>,
     ) {
     }

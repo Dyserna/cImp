@@ -280,13 +280,15 @@ gaps before trusting a green tick:
 | Workflow | Runs | Covers |
 |---|---|---|
 | `clippy.yml` | `cargo clippy --locked --all-targets --features tts-webgpu -- -D warnings` (after `npm install` + `npm run build`, which tauri-build needs for `frontendDist`) | Lints default **and** the shipped TTS GPU path. Floating stable toolchain by design — a new-lint failure after a rustc release is the point, not a regression. |
-| `tests.yml` | `npx vitest run` then `cargo test --locked --bin cimp` | Both suites, default features. `--bin cimp` is mandatory: the crate has **no lib target**, so `--lib` fails. `#[ignore]`d model-backed smokes are skipped (no Kokoro/Whisper blobs on the runner). |
+| `tests.yml` | `npx vitest run`, `npm run check`, `npm run build`, then `cargo test --locked --bin cimp` (Windows **and** Linux jobs) | Both suites plus the frontend's **type** layer and its **CSS** layer, default features. `--bin cimp` is mandatory: the crate has **no lib target**, so `--lib` fails. `#[ignore]`d model-backed smokes are skipped (no Kokoro/Whisper blobs on the runner). `vitest` and `svelte-check` run on the Windows job only — Node-only, cannot differ by OS. `npm run build` runs on both because tauri-build needs the bundle, and it is a gate in its own right: `vite build` runs lightningcss and rejects CSS `svelte-check` accepts. Also fails when the committed `src/lib/settings/generated` bindings differ from what `cargo test` regenerated, **or** when the generator wrote a file nobody committed. |
 | `release.yml` | tag-triggered `tauri build --features stt-vulkan,tts-webgpu` (Windows + Linux) | The only job that compiles `stt-vulkan` or produces a shippable artifact. ~40 min. |
 
 **Not covered by any workflow** — re-verify these by hand:
 
-- **MSRV.** Nothing compiles on 1.88; every job runs floating stable. Accepted
-  gap (2026-08-05); a `rust-version`-breaking dep surfaces only on a 1.88 box.
+- **MSRV.** Nothing compiles on the declared `rust-version` (1.89 since the
+  V42 review, for `std::fs::File::lock`); every job runs floating stable.
+  Accepted gap (2026-08-05); a `rust-version`-breaking dep surfaces only on a
+  box actually running that toolchain.
 - **`tts-cuda` / `stt-cuda`.** Need the CUDA toolkit; `tts-cuda` is also
   mutually exclusive with the feature clippy lints. Hand-verified only.
 - **`stt-vulkan` lint.** Needs the Vulkan SDK + Ninja, so only `release.yml`

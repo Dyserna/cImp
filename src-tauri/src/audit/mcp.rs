@@ -41,9 +41,8 @@ use super::runnable::ToolKey;
 use super::runner::{AuditSnapshot, AuditState, ToolStatus};
 use crate::checks::Severity;
 use crate::mcp_stdio::tool_error;
-use crate::offload::loopback::{
-    forget_resolved_discovery, parse_result_line, proxy_base_for, ChildIdentity,
-};
+use crate::offload::discovery::{forget_resolved_discovery, proxy_base_for, ChildIdentity};
+use crate::offload::loopback::parse_result_line;
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
 const SERVER_NAME: &str = "cimp-code-audit";

@@ -9,11 +9,15 @@
 //! walk + parse + store) off the async runtime on a dedicated thread so a
 //! large repo never blocks Tauri's workers.
 //!
-//! What it does *not* do yet: the live fs-watcher (Phase D — incremental
-//! re-index on change) and the warm loopback query path (the MCP child still
-//! opens the db read-only itself). A rebuild is therefore explicit: it runs
+//! Phase D's live fs-watcher SHIPPED: [`start_watch`](GraphService::start_watch)
+//! runs one debounced `notify` watcher per root and feeds batches to
+//! [`reindex_paths`](GraphService::reindex_paths), so an edited file is
+//! re-indexed without a rebuild. Full rebuilds remain explicit on top of that:
 //! once on startup for the launch root when the feature is enabled, and again
 //! whenever the `graph_rebuild` IPC is invoked.
+//!
+//! What it still does *not* do: the warm loopback query path — the MCP child
+//! opens the db read-only itself (`super::mcp`).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};

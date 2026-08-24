@@ -383,7 +383,7 @@ const CORE_CAPABILITIES: &[Capability] = &[
         ],
         wired_in: &[
             "src-tauri/src/harness/claude/hook.rs",
-            "src-tauri/src/offload/loopback.rs",
+            "src-tauri/src/offload/loopback/context.rs",
             "src-tauri/src/harness/claude/overlay.rs",
         ],
         degradation: Degradation::Silent,
@@ -424,7 +424,7 @@ const CORE_CAPABILITIES: &[Capability] = &[
         ],
         wired_in: &[
             "src-tauri/src/harness/claude/hook.rs",
-            "src-tauri/src/offload/loopback.rs",
+            "src-tauri/src/offload/loopback/context.rs",
             "src-tauri/src/harness/claude/overlay.rs",
         ],
         degradation: Degradation::Silent,
@@ -471,7 +471,7 @@ const CORE_CAPABILITIES: &[Capability] = &[
         ],
         wired_in: &[
             "src-tauri/src/harness/claude/hook.rs",
-            "src-tauri/src/offload/loopback.rs",
+            "src-tauri/src/offload/loopback/context.rs",
             "src-tauri/src/harness/claude/overlay.rs",
         ],
         degradation: Degradation::FailClosed,
@@ -511,7 +511,7 @@ const CORE_CAPABILITIES: &[Capability] = &[
         ],
         wired_in: &[
             "src-tauri/src/harness/claude/hook.rs",
-            "src-tauri/src/offload/loopback.rs",
+            "src-tauri/src/offload/loopback/context.rs",
             "src-tauri/src/harness/claude/overlay.rs",
         ],
         degradation: Degradation::Silent,
@@ -564,7 +564,7 @@ const CORE_CAPABILITIES: &[Capability] = &[
         ],
         wired_in: &[
             "src-tauri/src/harness/claude/hook.rs",
-            "src-tauri/src/offload/loopback.rs",
+            "src-tauri/src/offload/loopback/activity_edges.rs",
             "src-tauri/src/harness/claude/overlay.rs",
         ],
         degradation: Degradation::Fallback {
@@ -633,7 +633,7 @@ const CORE_CAPABILITIES: &[Capability] = &[
         ],
         wired_in: &[
             "src-tauri/src/harness/claude/hook.rs",
-            "src-tauri/src/offload/loopback.rs",
+            "src-tauri/src/offload/loopback/latch_routes.rs",
             "src-tauri/src/harness/claude/overlay.rs",
         ],
         degradation: Degradation::Silent,
@@ -690,7 +690,7 @@ const CORE_CAPABILITIES: &[Capability] = &[
         ],
         wired_in: &[
             "src-tauri/src/harness/claude/hook.rs",
-            "src-tauri/src/offload/loopback.rs",
+            "src-tauri/src/offload/loopback/context.rs",
             "src-tauri/src/harness/claude/overlay.rs",
         ],
         degradation: Degradation::Silent,
@@ -801,7 +801,7 @@ const CORE_CAPABILITIES: &[Capability] = &[
         wired_in: &[
             "src-tauri/src/harness/claude/hook.rs",
             "src-tauri/src/harness/claude/overlay.rs",
-            "src-tauri/src/offload/loopback.rs",
+            "src-tauri/src/offload/loopback/session.rs",
             "src-tauri/src/notifications/manager.rs",
             "src-tauri/src/tts/prose.rs",
         ],
@@ -861,7 +861,7 @@ const CORE_CAPABILITIES: &[Capability] = &[
         wired_in: &[
             "src-tauri/src/harness/claude/hook.rs",
             "src-tauri/src/harness/claude/overlay.rs",
-            "src-tauri/src/offload/loopback.rs",
+            "src-tauri/src/offload/loopback/session.rs",
         ],
         degradation: Degradation::Fallback {
             to: "claude.transcript.tool_result",
@@ -910,7 +910,7 @@ const CORE_CAPABILITIES: &[Capability] = &[
         wired_in: &[
             "src-tauri/src/harness/claude/hook.rs",
             "src-tauri/src/harness/claude/overlay.rs",
-            "src-tauri/src/offload/loopback.rs",
+            "src-tauri/src/offload/loopback/session.rs",
         ],
         degradation: Degradation::Fallback {
             to: "claude.transcript.subagents",
@@ -1559,7 +1559,7 @@ const CORE_CAPABILITIES: &[Capability] = &[
             // JavaScript, and since Phase M it is a line in a JavaScript FILE —
             // which is the point of the move. Open this one, not the emitter.
             "src-tauri/src/harness/opencode/templates/plugin.js",
-            "src-tauri/src/offload/loopback.rs",
+            "src-tauri/src/offload/loopback/mod.rs",
         ],
         degradation: Degradation::Silent,
         user_effect: "cImp's OpenCode plugin is not loaded — tool-call blocking, tool activity and session reporting for OpenCode tabs stop.",

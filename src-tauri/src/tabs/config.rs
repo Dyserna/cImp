@@ -103,7 +103,7 @@ fn build_ai_tool_spec(
     // harness will substitute it). `read_own_discovery` is pid-keyed — never the
     // shared last-writer-wins file a sibling instance may have overwritten —
     // exactly as `write_opencode_plugin` reads it for the same reason.
-    let endpoint = crate::offload::loopback::read_own_discovery();
+    let endpoint = crate::offload::discovery::read_own_discovery();
     // V40 Phase A: which harness this tab is, resolved ONCE, here — the
     // function that already knew. Everything harness-specific below is asked of
     // its plugin; `None` is a tab whose command matches no registered harness,
@@ -223,7 +223,7 @@ fn ai_working_dir(cfg: &AiToolTabConfig, launch_cwd: &Path) -> std::path::PathBu
 /// request bodies carry a `cwd`, but that is the child's claim about itself,
 /// and the row's whole purpose is to be trustworthy after an incident. A tab id
 /// is config-derived and already validated against this same settings snapshot
-/// (`loopback::is_configured_tab`), so resolving the root *from the tab* keeps
+/// (`latch::is_configured_tab`), so resolving the root *from the tab* keeps
 /// the row's project attribution as trustworthy as its tab attribution.
 ///
 /// `None` for an id that names no configured AI tab — including a Shell or
@@ -299,7 +299,7 @@ pub(crate) fn harness_tab_dirs(
 /// would be typed into with OpenCode's paste profile. Every one of its callers
 /// now propagates the `None`.
 ///
-/// **V33 C5 (F-4) is why one spelling matters.** `loopback::is_configured_tab`
+/// **V33 C5 (F-4) is why one spelling matters.** `latch::is_configured_tab`
 /// verifies a caller's asserted `(consumer, tab)` pair against this, so a tab
 /// classified one way at spawn and another way at verification would be launched
 /// with hooks whose `--tab` its own beacons could not key. Classifying both ends
@@ -875,7 +875,7 @@ fn compose_ai_env(
     cfg: &AiToolTabConfig,
     settings: &Settings,
     tab: &str,
-    endpoint: Option<&crate::offload::loopback::Discovery>,
+    endpoint: Option<&crate::offload::discovery::Discovery>,
 ) -> HashMap<String, String> {
     let mut env: HashMap<String, String> = HashMap::new();
     // Everything harness-specific — the hook bearer token, the injected config
@@ -992,8 +992,8 @@ mod tests {
     /// other input to `build_pre_args` is one: the emitted overlay has to be
     /// assertable byte for byte, and a test that read the live discovery file
     /// would pass or fail depending on whether a cImp happened to be running.
-    fn hook_endpoint() -> crate::offload::loopback::Discovery {
-        crate::offload::loopback::Discovery {
+    fn hook_endpoint() -> crate::offload::discovery::Discovery {
+        crate::offload::discovery::Discovery {
             port: 41999,
             token: "test-loopback-token".to_string(),
             pid: 0,
@@ -2278,10 +2278,17 @@ mod tests {
             !hooks.to_string().contains("terminalSequence"),
             "the overlay must never mention it: {hooks}"
         );
+        // V42 R2 (#114) split the loopback module and R4 (#115) split its route
+        // surface again; the scan follows every file both produced, or the
+        // needle could just move next door.
         for (file, src) in [
             ("harness/claude/hook.rs", include_str!("../harness/claude/hook.rs")),
-            ("offload/loopback.rs", include_str!("../offload/loopback.rs")),
-        ] {
+            ("offload/discovery.rs", include_str!("../offload/discovery.rs")),
+            ("offload/latch.rs", include_str!("../offload/latch.rs")),
+        ]
+        .into_iter()
+        .chain(crate::offload::loopback::ROUTE_SOURCES.iter().copied())
+        {
             // The needle is the JSON KEY form, so the prose and the assertions
             // that name the field (including this one) are not false positives —
             // what is forbidden is writing it into an emitted object.

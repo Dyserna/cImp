@@ -34,8 +34,6 @@
 //! compiled. [`PerHarness`] is sized by the registry, so the same mistake is a
 //! type error.
 
-use std::collections::BTreeMap;
-
 use super::plugin::HarnessPlugin;
 
 // ── the id ──────────────────────────────────────────────────────────────────
@@ -181,7 +179,6 @@ impl std::fmt::Display for HarnessId {
 /// feature only one harness has today is still a *feature*, and the next
 /// harness that grows one must get it by saying so.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // consumers land in phases B/D — the declarations are Phase A's
 pub enum HarnessFeature {
     /// Per-turn token/quota accounting cImp can read (Claude's transcript
     /// `message.usage`). Mounts the session-usage panels.
@@ -280,7 +277,6 @@ pub struct HarnessDescriptor {
     /// because the DECLARATION is what those phases consume — a feature
     /// inferred from `id == "claude"` later is the thing this milestone exists
     /// to prevent.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub features: &'static [HarnessFeature],
     /// The code half. See [`HarnessPlugin`].
     pub plugin: &'static dyn HarnessPlugin,
@@ -638,7 +634,11 @@ impl<T> PerHarness<T> {
     }
 
     /// This harness's slot, mutably. `None` for [`HarnessId::ANY`].
-    #[allow(dead_code)] // the writers land with the settings map in Phase B
+    ///
+    /// Written by `McpHost::surface_fingerprint`, which fills one digest per
+    /// registered harness. It carried an `#[allow(dead_code)]` naming Phase B
+    /// as the arrival of its writers; Phase B arrived, and the allow outlived
+    /// its reason (survey defect D7).
     pub fn get_mut(&mut self, id: HarnessId) -> Option<&mut T> {
         id.ordinal().map(move |i| &mut self.0[i])
     }
@@ -662,26 +662,6 @@ impl<T> std::ops::Index<usize> for PerHarness<T> {
     type Output = T;
     fn index(&self, i: usize) -> &T {
         &self.0[i]
-    }
-}
-
-#[allow(dead_code)] // production reads go through `get`; this is for tests/ledgers
-impl<T> std::ops::IndexMut<usize> for PerHarness<T> {
-    fn index_mut(&mut self, i: usize) -> &mut T {
-        &mut self.0[i]
-    }
-}
-
-impl<T: serde::Serialize> PerHarness<T> {
-    /// The wire form: a map keyed by harness id, in registry order.
-    ///
-    /// Used where a payload has to name its keys (the `harness_list` mirror,
-    /// the spawn-signature map). A `BTreeMap` rather than the array, because a
-    /// positional array on the wire is the exact defect locked decision 8 is
-    /// about.
-    #[allow(dead_code)] // lands with the spawn-sig map in Phase B
-    pub fn as_map(&self) -> BTreeMap<&'static str, &T> {
-        self.iter().filter_map(|(h, v)| h.id().map(|i| (i, v))).collect()
     }
 }
 

@@ -30,7 +30,6 @@ use crate::settings::{BackendTier, ToolScope};
 use super::Backend;
 
 /// A remote OpenAI-compatible backend (LAN or cloud).
-#[allow(dead_code)] // some fields feed the warm-pool followup (see impl note)
 pub struct RemoteBackend {
     name: String,
     base_url: String,
@@ -62,13 +61,17 @@ pub struct RemoteBackend {
     client: reqwest::Client,
 }
 
-// Several accessors (`acquire_slot`, `per_slot_budget`, `client`,
-// `poll_until_ready`, …) complete the `Backend` seam for the warm-pool
+// Several accessors (`per_slot_budget`, `client`, `poll_until_ready`,
+// `is_cloud`, `mark_stopped`) complete the `Backend` seam for the warm-pool
 // target design (V8-01 open decision), where the long-lived app holds
 // `RemoteBackend` instances and runs the agent loop against them. The
 // current per-call child uses inline probing instead, so those are not yet
 // wired — kept here so V8-02's followup is additive, not a rewrite.
-#[allow(dead_code)]
+//
+// #113: the `#[allow(dead_code)]` that said this used to sit on the whole
+// `impl`, so anything that went dead LATER was covered by it silently. It now
+// sits on exactly the five methods named above — the compiler's own list — and
+// a sixth going unused warns.
 impl RemoteBackend {
     /// Build a remote backend. `slots` is the declared parallel capacity
     /// (≥1). Does not contact the endpoint — call [`Self::health_check`]
@@ -107,6 +110,7 @@ impl RemoteBackend {
         })
     }
 
+    #[allow(dead_code)] // V8-02 warm-pool seam, see the impl note above
     pub fn is_cloud(&self) -> bool {
         self.is_cloud
     }
@@ -159,6 +163,7 @@ impl RemoteBackend {
     /// Poll `/health` until ready or `timeout` elapses, then read `/props`
     /// once to cache `n_ctx` (best-effort — cloud endpoints may not expose
     /// it, in which case `declared_context` is used).
+    #[allow(dead_code)] // V8-02 warm-pool seam, see the impl note above
     pub async fn poll_until_ready(&self, timeout: Duration) -> AppResult<()> {
         let deadline = Instant::now() + timeout;
         loop {
@@ -258,6 +263,7 @@ impl RemoteBackend {
     }
 
     /// The shared HTTP client (reused for the agent loop's chat calls).
+    #[allow(dead_code)] // V8-02 warm-pool seam, see the impl note above
     pub fn client(&self) -> &reqwest::Client {
         &self.client
     }
@@ -269,6 +275,7 @@ impl RemoteBackend {
     /// it can't see a `--kv-unified` there (the Local backend corrects for that
     /// from its parsed command); a remote unified-KV server should be given a
     /// per-slot `declared_context` instead.
+    #[cfg_attr(not(test), allow(dead_code))] // its test is the only caller today
     pub fn per_slot_budget(&self, high_water_pct: u8) -> Option<u32> {
         let n = self.n_ctx()?;
         Some(n.saturating_mul(high_water_pct.min(100) as u32) / 100)
@@ -288,6 +295,7 @@ impl RemoteBackend {
         }
     }
 
+    #[allow(dead_code)] // V8-02 warm-pool seam, see the impl note above
     pub fn mark_stopped(&self) {
         self.ready.store(false, Ordering::Relaxed);
     }

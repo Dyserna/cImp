@@ -43,7 +43,9 @@
 pub mod agent;
 pub mod backend_gate;
 pub mod detection;
+pub mod discovery;
 pub mod harness_tab;
+pub mod latch;
 pub mod loopback;
 pub mod mcp;
 pub mod mcp_host;
@@ -78,7 +80,6 @@ use crate::settings::{BackendTier, ToolScope};
 /// `name`/`tier` round out the seam for the warm-pool target design (the
 /// router currently reads these from config via [`router::BackendView`]),
 /// so they're allowed to be unused today.
-#[allow(dead_code)]
 pub trait Backend: Send + Sync {
     /// Stable display/routing name (`main`, `lan-3070`, `cloud`).
     fn name(&self) -> &str;
@@ -107,4 +108,63 @@ pub trait Backend: Send + Sync {
     /// This backend's allow-list over the global tool pool — the surface
     /// of tools that may be placed in the `tools` array sent to its model.
     fn tool_scope(&self) -> &ToolScope;
+}
+
+// -- Helpers the whole subsystem shares --------------------------------------
+//
+// V42 review (dropped-at-cap): both of these lived in `offload::loopback` and
+// were imported by `offload::latch` — a BACK-EDGE, since V42 R3 (#114) pulled
+// latch OUT of loopback precisely so the containment state machine would not be
+// a routing concern. Neither helper is about routing: one bounds a
+// caller-supplied string, the other turns an `AppHandle` into a `Settings`.
+// They belong to the module above both, so `latch` depends on its parent and
+// nothing depends sideways. `loopback` re-exports them for the `use super::*`
+// its family files do.
+
+/// The upper bound on a caller-supplied tool name before it reaches an activity
+/// row, a log line or the TTS surface (#48). Long enough for every real
+/// harness tool name (`WebFetch`, `websearch`) with room to spare.
+pub(crate) const BEACON_TOOL_MAX: usize = 64;
+
+/// One caller-supplied identifier, bounded before it reaches an activity row —
+/// the truncation half of `bounded_tool`, shared rather than re-spelled.
+///
+/// Its second caller is `record_discovery_skipped`'s `Unrecognized` arm (#48
+/// F-32): a tab id that names no configured tab is an arbitrary unbounded string
+/// from a request body, and putting it in a row verbatim would let a caller
+/// choose how many bytes of a capped feed one report occupies. **Only ever
+/// applied AFTER classification** — truncating first could fold a long invented
+/// id onto a configured one, which would turn a bound into a forgery primitive.
+///
+/// Its third and fourth callers are #48 F-39 and F-37 (locked decision 42), the
+/// same string half of the same class: `LatchScoping::attribution`'s
+/// `Unrecognized` arm — reached by `/graph_run` and `/mcp/call`, and likewise
+/// only after `latch_scope` classified the full id — and `contract_drift_row`,
+/// where the shim name and the session id a hook shim reports are both
+/// arbitrary strings that reach a row.
+///
+/// Truncated by **chars**, not bytes, so a multi-byte id cannot be cut
+/// mid-codepoint. Control-sequence hygiene is a separate concern with its own
+/// owner (Phase D, at the surfaces that render); this only bounds length.
+pub(crate) fn bounded_id(raw: &str) -> String {
+    let mut out: String = raw.chars().take(BEACON_TOOL_MAX).collect();
+    if raw.chars().nth(BEACON_TOOL_MAX).is_some() {
+        out.push('…');
+    }
+    out
+}
+
+/// V32 Phase G: read the app's live settings from managed state.
+///
+/// Every gated loopback handler already holds an `AppHandle`; this is the one
+/// place that turns it into a `Settings`, so a handler cannot accidentally
+/// resolve the hierarchy against a different snapshot than its neighbour. The
+/// fallback is `Settings::default()` — all protection ON — because a request
+/// arriving before managed state is up must not be the moment containment
+/// silently lapses.
+pub(crate) fn live_settings(app: &tauri::AppHandle) -> crate::settings::Settings {
+    use tauri::Manager;
+    app.try_state::<crate::ipc::AppState>()
+        .map(|s| s.settings.current())
+        .unwrap_or_default()
 }

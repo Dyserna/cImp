@@ -41,7 +41,6 @@ mod theming;
 mod tts;
 mod workbench;
 
-use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, RwLock};
@@ -99,6 +98,7 @@ use crate::ipc::tab_lifecycle::{
     default_shell_spec, get_shell_tab_config, open_note_tab, open_tool_tab, reconfigure_shell_tab,
     rename_tab, set_enabled_ai_tabs,
 };
+use crate::ipc::ui_state::{ui_state_get, ui_state_set};
 use crate::ipc::{AppState, LaunchContext};
 use crate::preview::{
     preview_capture, preview_close, preview_hide, preview_navigate, preview_open, preview_reload,
@@ -668,8 +668,6 @@ fn main() {
         tts_segments: tts_tx,
         speak_session: speak_session.clone(),
         ai_tts_suppressed: ai_tts_suppressed.clone(),
-        user_typed_tts: Arc::new(Mutex::new(HashSet::new())),
-        user_input_buf: Arc::new(Mutex::new(HashMap::new())),
         state_signals: state_tx.clone(),
         input_lengths: input_lengths.clone(),
         read_only: read_only_tabs.clone(),
@@ -1175,6 +1173,8 @@ fn main() {
             open_note_tab,
             read_note,
             write_note,
+            ui_state_get,
+            ui_state_set,
             set_window_square_corners,
             save_layout,
             save_layout_preset,

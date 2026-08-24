@@ -1338,7 +1338,7 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    color: var(--fg);
+    color: var(--text-primary);
   }
   .eserver.none,
   .ecategory.none {

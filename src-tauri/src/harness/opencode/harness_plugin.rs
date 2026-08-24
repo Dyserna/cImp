@@ -151,7 +151,7 @@ impl HarnessPlugin for OpenCodePlugin {
         cfg: &AiToolTabConfig,
         settings: &Settings,
         tab: &str,
-        _endpoint: Option<&crate::offload::loopback::Discovery>,
+        _endpoint: Option<&crate::offload::discovery::Discovery>,
         env: &mut HashMap<String, String>,
     ) {
         // V19: OpenCode launch env. Now that the renderer is fullscreen (no

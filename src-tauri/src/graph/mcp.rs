@@ -907,7 +907,7 @@ pub async fn handle_call(
 /// a shell — Claude's own `Write` tool reaches every file involved. What it takes
 /// is TWO writes rather than one, and #48 finding F-26 corrects the sentence that
 /// used to claim otherwise: discovery reads **two** stores, and
-/// `loopback::select_discovery` prefers them in this order —
+/// `discovery::select_discovery` prefers them in this order —
 ///
 /// 1. `<portable_root>/.cimp-discovery/<pid>.json`, per instance: among the
 ///    entries whose `root` is an ancestor of the child's cwd, the DEEPEST root
@@ -922,7 +922,7 @@ pub async fn handle_call(
 /// well-formed entry naming a deeper root and a dead port, which yielded
 /// `Transport` — and **locked decision 30 (#48 F-11) closed it**: each step above
 /// now requires the candidate to answer a token-authenticated `GET /health`
-/// (`loopback::responds`), so a dead planted entry is skipped and the real
+/// (`discovery::responds`), so a dead planted entry is skipped and the real
 /// instance serves the call
 /// (`loopback::tests::a_deeper_entry_outranks_the_running_instance_only_while_it_answers`).
 /// The remaining cost is one write **plus a listener**, which is a cost increase
@@ -3401,7 +3401,7 @@ fn confine_to_root(root: &Path, rel: &str) -> Result<PathBuf, String> {
 /// working directory.
 ///
 /// #104: that cwd is the sub-agent's shell cwd, not a project. The app-side
-/// routes resolve theirs through `loopback::external_project_root`, which can
+/// routes resolve theirs through `discovery::external_project_root`, which can
 /// also consult the calling tab's configured directory; here there is no app to
 /// ask, so the answer is the marker walk alone
 /// ([`crate::fsutil::find_project_root`] — `.git` beats an existing `<sub>`,

@@ -25,7 +25,8 @@
   import GraphView from './GraphView.svelte';
   import CodeAuditView from './CodeAuditView.svelte';
   import { graphReveal } from './graphReveal';
-  import { loadViewSection, saveViewSection } from './viewSection';
+  import SectionNav from './SectionNav.svelte';
+  import { loadViewSection } from './viewSection';
 
   // Reference list of the graph_* MCP tools the code graph exposes to AI tabs
   // (and the offload worker) while the graph is enabled. Mirrors the
@@ -43,6 +44,8 @@
     { name: 'graph_transitive', desc: 'Transitive call chain for a symbol — everything it reaches (callees) or that reaches it (callers).', example: 'What does runOffloadTest transitively call?' },
     { name: 'graph_search_docs', desc: 'Keyword search over docs and doc-comments; returns matching snippets.', example: "Search the docs for 'warm pool'." },
     { name: 'graph_struct_search', desc: 'Find code by AST shape via a tree-sitter query (not text).', example: 'Find every .unwrap() in the Rust code.' },
+    { name: 'graph_path', desc: 'Shortest path between two code entities through call/import/containment edges — how does X reach Y. Each hop shows its edge kind and confidence; says so plainly when there is no path instead of inventing one.', example: 'How does the auth handler reach the connection pool?' },
+    { name: 'graph_architecture', desc: 'A once-per-project map of the system’s shape: god nodes (the highest-degree hubs everything flows through), subsystems (cohesive file communities), and surprising connections (candidate accidental coupling). Topology only; clustering is heuristic, so treat subsystem boundaries as advisory.', example: 'What does this codebase look like architecturally?' },
     { name: 'graph_semantic_docs', desc: 'Meaning-based (embedding) search over docs — only when Semantic search is enabled.', example: 'Find docs about how offload timeouts are handled.' },
     { name: 'graph_semantic_code', desc: 'Meaning-based (embedding) search over symbol bodies — only when "Embed code bodies" is enabled. Returns file:line/kind/signature/distance, never the body; pair with graph_snippet.', example: 'Find code that retries a failed network request.' },
     { name: 'graph_dead_exports', desc: 'Candidate unused public symbols (no reference, no inbound call). Candidates only — may include false positives.', example: 'List candidate dead exports.' },
@@ -90,7 +93,6 @@
   let section = $state<Section>(
     loadViewSection('tool-activity', SECTIONS.map((s) => s.id), 'offload-server'),
   );
-  $effect(() => saveViewSection('tool-activity', section));
 
   // Unlike the other sections, the Graph view keeps an expensive laid-out
   // force simulation, so it is NOT destroyed on a section switch: mounted
@@ -128,16 +130,11 @@
     <h2>Tools</h2>
   </header>
 
-  <nav class="sections">
-    {#each SECTIONS as s (s.id)}
-      <button
-        type="button"
-        class="seg"
-        class:active={section === s.id}
-        onclick={() => (section = s.id)}
-      >{s.label}</button>
-    {/each}
-  </nav>
+  <SectionNav
+    view="tool-activity"
+    sections={SECTIONS}
+    bind:section
+  />
 
   {#if !$settings.graph.enabled && !$settings.offload.enabled && !$settings.code_audit.enabled}
     <div class="feature-note">
@@ -248,35 +245,6 @@
   header h2 {
     margin: 0;
     font-size: 15px;
-  }
-  /* Segmented section nav under the header (matches CodeIntelligenceView). */
-  nav.sections {
-    display: flex;
-    gap: 4px;
-    margin-bottom: 14px;
-    border-bottom: 1px solid var(--border-subtle, #333);
-    padding-bottom: 8px;
-    flex-wrap: wrap;
-  }
-  .seg {
-    padding: 4px 12px;
-    border-radius: 6px;
-    border: 1px solid transparent;
-    background: transparent;
-    color: var(--text-primary, #ddd);
-    font-size: 12px;
-    cursor: pointer;
-    opacity: 0.7;
-  }
-  .seg:hover {
-    background: rgba(255, 255, 255, 0.06);
-    opacity: 1;
-  }
-  .seg.active {
-    background: var(--accent, #3b6ea5);
-    color: var(--accent-fg, #fff);
-    opacity: 1;
-    border-color: var(--accent, #3b6ea5);
   }
   .feature-note {
     border: 1px solid var(--border-warning, rgba(227, 179, 65, 0.5));

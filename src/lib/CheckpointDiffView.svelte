@@ -45,7 +45,7 @@
   // per-file fetch: the whole parsed diff arrives in one
   // `workbench_checkpoint_diff` call and is rendered as-is, unified only.
   import type { FileStatus, FileDiff } from './workbench';
-  import { pairHunkLines, wordDiff } from './diffWords';
+  import HunkBody from './diff/HunkBody.svelte';
 
   // `fetchFull` (optional) powers the per-file "diff ↔ full file" toggle: it
   // fetches the SAME diff with a huge unified context (whole file as one
@@ -172,23 +172,7 @@
                   <div class="hunk">
                     <div class="hunk-header">{hunk.header}</div>
                     <div class="hunk-body">
-                      {#each pairHunkLines(hunk.lines) as group, gi (gi)}
-                        {#if group.type === 'ctx'}
-                          <div class="line ctx"><span class="marker"> </span><span class="text">{group.text}</span></div>
-                        {:else if group.type === 'del'}
-                          <div class="line del"><span class="marker">-</span><span class="text">{group.text}</span></div>
-                        {:else if group.type === 'add'}
-                          <div class="line add"><span class="marker">+</span><span class="text">{group.text}</span></div>
-                        {:else}
-                          {@const wd = wordDiff(group.oldText, group.newText)}
-                          <div class="line del">
-                            <span class="marker">-</span><span class="text">{#each wd.left as p, pi (pi)}<span class:hl={p.kind === 'del'}>{p.text}</span>{/each}</span>
-                          </div>
-                          <div class="line add">
-                            <span class="marker">+</span><span class="text">{#each wd.right as p, pi (pi)}<span class:hl={p.kind === 'add'}>{p.text}</span>{/each}</span>
-                          </div>
-                        {/if}
-                      {/each}
+                      <HunkBody lines={hunk.lines} />
                     </div>
                   </div>
                 {/each}
@@ -338,24 +322,5 @@
     border-radius: var(--radius-sm);
     overflow: hidden;
     border: 1px solid var(--border-faint);
-  }
-  .line {
-    display: flex;
-    gap: 6px;
-    padding: 0 6px;
-    white-space: pre-wrap;
-    word-break: break-all;
-  }
-  .line .marker {
-    flex: 0 0 auto;
-    opacity: 0.5;
-    user-select: none;
-  }
-  .line.ctx { color: var(--text-secondary); }
-  .line.del { background: var(--surface-danger-faint); color: var(--text-danger-pastel); }
-  .line.add { background: var(--surface-success); color: var(--text-success); }
-  .line .text :global(span.hl) {
-    background: rgba(255, 255, 255, 0.18);
-    border-radius: 2px;
   }
 </style>

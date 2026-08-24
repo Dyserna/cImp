@@ -4,10 +4,16 @@ version = "0.53.0-rc.10"
 description = "A terminal for AI coding agents, with TTS, avatar, and compose overlay"
 authors = ["Amir Amashe"]
 edition = "2021"
-rust-version = "1.88"
+# 1.89 since the V42 review (RV-5): `std::fs::File::lock` / `try_lock` — the
+# cross-process advisory lock `ipc::ui_state` takes around its
+# read-modify-write — stabilised there. Preferred to adding an `fs2`/`fs4`-style
+# dependency for one call: the same primitive (flock on Unix, LockFileEx on
+# Windows), no new supply-chain surface, no license to review. Note the declared
+# MSRV is not verified by CI — see the header of .github/workflows/tests.yml.
+rust-version = "1.89"
 # Resolver v3 = v2's feature rules PLUS cargo's MSRV-aware dependency
 # resolution: `cargo update` / `cargo add` will not pick a dependency version
-# whose own `rust-version` exceeds ours (1.88 above). Edition 2021 defaults to
+# whose own `rust-version` exceeds ours (1.89 above). Edition 2021 defaults to
 # resolver "2", under which MSRV-awareness is INACTIVE — a bare `cargo update`
 # could silently pull an MSRV-breaking release of an MSRV-sensitive crate
 # (e.g. `ignore`) and only fail at compile time. Requires cargo 1.84+.
@@ -427,6 +433,7 @@ filetime = "0.2"
 # no Cargo.lock entries: `test-util` pulls no new crates, and `tokio` is already
 # a dependency of this package.
 tokio = { version = "1", features = ["test-util"] }
+ts-rs = { version = "12.0.1", features = ["serde-json-impl"] }
 
 [profile.release]
 codegen-units = 1

@@ -240,7 +240,7 @@ fn spawn_heartbeat(ctx: OobContext, root: PathBuf, hb: Arc<TapHeartbeat>) {
 ///    the ranking within one 200 ms poll.
 /// 2. The old rule marked it live immediately, and `mark_live_session` repoints
 ///    the registry entry keyed by this tab id.
-/// 3. `loopback::TabLatch::observe` reads that entry, sees a **changed** session
+/// 3. `latch::TabLatch::observe` reads that entry, sees a **changed** session
 ///    id, and treats it as a new conversation: `latch = Open`, `budget.reset()`,
 ///    `latch_flagged = false` — and, until H-2, **`contaminated = false`**. It
 ///    is called from all three state paths (`gate`, `beacon`, `view_for`), so

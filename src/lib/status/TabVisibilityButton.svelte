@@ -90,34 +90,15 @@
     position: relative;
     display: inline-flex;
   }
+  /* Shell + focus ring: `.status-button` in `src/app.css`. Only the delta is
+     local: the hidden-count pip is absolutely positioned against this button. */
   .status-button {
-    appearance: none;
-    background: transparent;
-    border: 1px solid transparent;
-    color: var(--text-secondary);
-    cursor: pointer;
-    width: 26px;
-    height: 22px;
-    border-radius: var(--radius-pill);
-    padding: 0;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    line-height: 1;
     position: relative;
-    transition:
-      background var(--motion-fast) var(--easing-standard),
-      color var(--motion-fast) var(--easing-standard),
-      border-color var(--motion-fast) var(--easing-standard);
   }
   .status-button:hover,
   .status-button.active {
     background: var(--surface-3);
     color: var(--text-primary);
-  }
-  .status-button:focus-visible {
-    outline: 2px solid var(--accent);
-    outline-offset: 2px;
   }
   .glyph {
     font-size: 14px;

@@ -54,7 +54,7 @@
 
 <button
   type="button"
-  class="status-button injection"
+  class="status-button status-badge injection"
   class:master-on={chip.on}
   class:master-off={!chip.on}
   class:unknown={chip.degraded || chip.note === 'unknown'}
@@ -70,25 +70,10 @@
 </button>
 
 <style>
+  /* Shell + focus ring: `.status-button.status-badge` in `src/app.css`. The
+     colour stays here because it is the badge's meaning, not its shape. */
   .status-button {
-    appearance: none;
-    background: transparent;
-    border: 1px solid transparent;
     color: var(--awaiting);
-    cursor: pointer;
-    height: 22px;
-    padding: 0 8px;
-    border-radius: var(--radius-pill);
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    justify-content: center;
-    line-height: 1;
-    font-size: 11px;
-    transition:
-      background var(--motion-fast) var(--easing-standard),
-      color var(--motion-fast) var(--easing-standard),
-      border-color var(--motion-fast) var(--easing-standard);
   }
   /* V39: on and off are both permanent states now, so both need a colour that
      says which one you are looking at without reading the word. */
@@ -117,10 +102,6 @@
   }
   .status-button:hover {
     background: var(--surface-3);
-  }
-  .status-button:focus-visible {
-    outline: 2px solid var(--accent);
-    outline-offset: 2px;
   }
   .glyph {
     font-size: 12px;

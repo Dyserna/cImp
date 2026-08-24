@@ -741,9 +741,61 @@ mod tests {
     /// `include_str!` tripwire as `contract::tests::
     /// the_gated_capability_ids_reach_the_frontend`: a rename here fails the
     /// Rust build instead of silently rendering `undefined`.
+    ///
+    /// **V42 Phase E RE-POINTED this scan, deliberately rather than retiring
+    /// it.** The phase generated the `settings/schema.rs` tree into
+    /// `src/lib/settings/generated/settings.ts` and deleted the hand-written
+    /// mirror of THOSE types — but the health payload is `harness::health`'s,
+    /// not `schema.rs`', and it is still hand-mirrored in `types.ts`. Only
+    /// `auto_verify` moved (it is a `HarnessSettings` field, so it is
+    /// generated now), so the scan reads BOTH files: retiring it would have
+    /// dropped a live tripwire over eleven still-hand-written names on the
+    /// strength of a codegen that does not cover them.
+    ///
+    /// **V42 review (dropped-at-cap) NARROWED the generated half.** The
+    /// re-point was `concat!(types.ts, generated/settings.ts)` and a plain
+    /// `.contains`, which put ~1,900 lines of generated PROSE behind every
+    /// needle: `auto_verify` is satisfied by the sentence
+    /// "`claude_auto_verify` had no OpenCode twin at all" in a doc comment
+    /// thirty lines above the field, and would keep being satisfied by it
+    /// after the field was renamed. A tripwire whose needle can be met by
+    /// commentary is a tripwire that fires when nobody trips it and stays
+    /// quiet when somebody does. The generated half is now sliced to the one
+    /// declaration that carries the field, and the needle is the DECLARATION
+    /// form (`name: `), not the bare name.
     #[test]
     fn the_health_field_names_reach_the_frontend() {
-        const TS_TYPES: &str = include_str!("../../../src/lib/settings/types.ts");
+        /// The hand-written mirror — `harness::health`'s own payload types,
+        /// which no generator covers.
+        const HAND_WRITTEN: &str = include_str!("../../../src/lib/settings/types.ts");
+        /// The generated bindings, read only through [`generated_block`].
+        const GENERATED: &str =
+            include_str!("../../../src/lib/settings/generated/settings.ts");
+
+        /// One `export type <name> = …;` block out of the generated bindings,
+        /// signature to terminator — so a needle cannot be answered by the
+        /// prose around a different type.
+        fn generated_block<'a>(name: &str) -> &'a str {
+            let decl = format!("export type {name} = ");
+            let at = GENERATED
+                .find(&decl)
+                .unwrap_or_else(|| panic!("`{decl}` is not in the generated bindings"));
+            let body = &GENERATED[at + decl.len()..];
+            let end = body
+                .find(";\n")
+                .unwrap_or_else(|| panic!("`{decl}` is never terminated"));
+            &body[..end]
+        }
+
+        /// Whether `block` DECLARES `field`, rather than merely mentioning it.
+        /// ts-rs emits one field per line inside a block, so a declaration is
+        /// a trimmed line opening `field: `.
+        fn declares_field(block: &str, field: &str) -> bool {
+            block
+                .lines()
+                .any(|l| l.trim_start().starts_with(&format!("{field}: ")))
+        }
+
         for field in [
             "harness_health",
             "user_effect",
@@ -755,7 +807,6 @@ mod tests {
             "user_message",
             "wired_in",
             "last_run",
-            "auto_verify",
             // V35 Phase I — the CHP staleness report and its three display
             // fields. `note` is the sentence the panel renders verbatim; a
             // frontend that re-derived it from `seen_chp`/`expected` would be a
@@ -765,13 +816,45 @@ mod tests {
             "expected",
         ] {
             assert!(
-                TS_TYPES.contains(field),
+                HAND_WRITTEN.contains(field),
                 "`{field}` is served by the Harness health payload but is not spelled in \
                  src/lib/settings/types.ts — the panel reads this exact name"
             );
         }
+
+        // `auto_verify` is the one name V42 Phase E moved into the generated
+        // bindings: it is a `HarnessSettings` field now. Checked against THAT
+        // declaration only.
+        let harness_settings = generated_block("HarnessSettings");
         assert!(
-            TS_TYPES.contains(&format!("'{OUTCOME_NO_FAILURE}'")),
+            declares_field(harness_settings, "auto_verify"),
+            "`auto_verify` is served by the Harness health payload but `HarnessSettings` \
+             does not declare it — the panel reads this exact name"
+        );
+        // The control for the narrowing, permanent because the prose it rules
+        // out is really in the file. `claude_auto_verify` appears in TWO doc
+        // comments (`HarnessSettings`' own and `HarnessVersions`', both
+        // recounting V40 Phase B), neither inside the declaration — so the
+        // retired whole-file `.contains("auto_verify")` was satisfied by
+        // commentary alone and would have stayed green through a rename of the
+        // field it was watching.
+        assert!(
+            GENERATED
+                .split("export type HarnessSettings = ")
+                .next()
+                .expect("the text before the declaration")
+                .contains("auto_verify"),
+            "the control's premise is gone — the generated prose OUTSIDE the declaration \
+             used to satisfy the old whole-file needle on its own"
+        );
+        assert!(
+            !declares_field(harness_settings, "claude_auto_verify"),
+            "a doc-comment mention read as a field declaration; the narrowing is not \
+             narrowing anything"
+        );
+
+        assert!(
+            HAND_WRITTEN.contains(&format!("'{OUTCOME_NO_FAILURE}'")),
             "the `{OUTCOME_NO_FAILURE}` outcome token must be spelled in types.ts — the panel \
              renders it differently from a real pass on purpose"
         );

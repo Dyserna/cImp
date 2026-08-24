@@ -1,0 +1,629 @@
+{
+  "schema_version": 38,
+  "tts": {
+    "enabled": true,
+    "device": "gpu",
+    "voice": "af_heart",
+    "speed": 1.0,
+    "volume": 1.0,
+    "mute": false,
+    "selection_highlight": {
+      "enabled": true,
+      "unread_fg": "#000000",
+      "unread_fg_custom": true,
+      "unread_bg": "#ff5555",
+      "unread_bg_custom": true,
+      "reading_fg": "#000000",
+      "reading_fg_custom": true,
+      "reading_bg": "#f1fa8c",
+      "reading_bg_custom": true
+    },
+    "show_selection_controls": true
+  },
+  "stt": {
+    "enabled": true,
+    "device": "gpu",
+    "model_file": "ggml-small.bin",
+    "language": "auto",
+    "input_device": "",
+    "button_mode": "toggle",
+    "translate_to_english": false
+  },
+  "avatar": {
+    "visible": true,
+    "kind": "sprite",
+    "size": {
+      "width_px": 140,
+      "height_px": 140
+    },
+    "position": "top-right",
+    "margin": {
+      "x_px": 21,
+      "y_px": 0
+    },
+    "opacity": 0.5,
+    "show_border": false,
+    "images": {
+      "idle": null,
+      "listening": null,
+      "thinking": null,
+      "speaking": null,
+      "error": null
+    },
+    "sprite": {
+      "set": "impSprites"
+    },
+    "transition": {
+      "path": "/avatar/Transition.mp4",
+      "duration_ms": 400
+    },
+    "waveform": {
+      "visible": false,
+      "color": "",
+      "line_width": 2.0,
+      "glow_intensity": 0.6,
+      "opacity": 0.85
+    }
+  },
+  "display": {
+    "terminal_font_family": "Consolas, Menlo, \"DejaVu Sans Mono\", monospace",
+    "terminal_font_size": 14
+  },
+  "behavior": {
+    "auto_speak": true,
+    "fallback_silent": true,
+    "announcements_enabled": true,
+    "follow_avatar": false,
+    "announce_focused_tab": false,
+    "idle_announce_min_working_secs": 120,
+    "speak_background_tabs": false,
+    "copy_on_select": true,
+    "paste_on_right_click": true,
+    "speak_selection_on_right_click": true
+  },
+  "usage": {
+    "enabled": true,
+    "show_bar": true,
+    "show_percentage": true,
+    "show_countdown": true,
+    "show_reset_clock": true,
+    "poll_interval_secs": 60
+  },
+  "system_stats": {
+    "enabled": true,
+    "poll_interval_secs": 1,
+    "show_cpu": true,
+    "show_memory": true,
+    "show_gpu": true,
+    "show_gpu_temp": true,
+    "show_network": true
+  },
+  "compose": {
+    "min_height_px": 80,
+    "max_height_px": 300
+  },
+  "shortcuts": {
+    "open_compose": "Alt+Enter",
+    "open_compose_picker": "Alt+/",
+    "submit_compose": "Enter",
+    "cancel_compose": "Escape",
+    "open_settings": "Ctrl+,",
+    "switch_to_tab_1": "Ctrl+1",
+    "switch_to_tab_2": "Ctrl+2",
+    "switch_to_tab_3": "Ctrl+3",
+    "switch_to_tab_4": "Ctrl+4",
+    "switch_to_tab_5": "Ctrl+5",
+    "switch_to_tab_6": "Ctrl+6",
+    "switch_to_tab_7": "Ctrl+7",
+    "switch_to_tab_8": "Ctrl+8",
+    "switch_to_tab_9": "Ctrl+9",
+    "new_shell_tab": "Ctrl+T",
+    "close_tab": "Ctrl+W",
+    "focus_pane_left": "Ctrl+Alt+Left",
+    "focus_pane_right": "Ctrl+Alt+Right",
+    "focus_pane_up": "Ctrl+Alt+Up",
+    "focus_pane_down": "Ctrl+Alt+Down",
+    "split_pane_horizontal": "Ctrl+\\",
+    "split_pane_vertical": "Alt+\\",
+    "close_pane": "Ctrl+Alt+W",
+    "push_to_talk": "Ctrl+Shift",
+    "speak_selection": "Ctrl+Alt+S"
+  },
+  "tabs": [],
+  "processing": {
+    "stability_timeout_ms": 200,
+    "max_hold_ms": 500
+  },
+  "session": {
+    "active_tab_id": null
+  },
+  "layout": null,
+  "layout_presets": [],
+  "ui": {
+    "theme": "tui",
+    "tui_accent": "#7aa2f7",
+    "status_bar": {
+      "items": [
+        {
+          "component": "usage",
+          "gap": 0
+        },
+        {
+          "component": "system_stats",
+          "gap": 0
+        }
+      ]
+    },
+    "tool_activity_tab": true,
+    "events_tab": true,
+    "latched_color": "#fabd2f",
+    "contaminated_color": "#fb4934"
+  },
+  "terminal": {
+    "theme": {
+      "name": "OpenCode Grey",
+      "custom": null
+    },
+    "background": {
+      "image": null,
+      "color": null,
+      "opacity": 0.4,
+      "blur": 0,
+      "size": "cover",
+      "position": "center",
+      "snapshot_lines": 2000,
+      "presets": [],
+      "preview_category_flips": true
+    },
+    "scrollback": {
+      "ring_bytes": 262144,
+      "persist": true,
+      "restore_on_launch": true
+    }
+  },
+  "external_tools": {
+    "rustnet": "",
+    "broot": ""
+  },
+  "offload": {
+    "enabled": false,
+    "autostart": false,
+    "inject_guidance": true,
+    "server_command": "",
+    "tools": {
+      "read_file": true,
+      "list_dir": true,
+      "code_search": true,
+      "run_command": true,
+      "run_check": true
+    },
+    "allowed_roots": [],
+    "command_allowlist": [],
+    "command_policies": [
+      {
+        "program": "git",
+        "denied_flags": [
+          "-c",
+          "-C",
+          "--config-env",
+          "--exec-path",
+          "--git-dir",
+          "--work-tree",
+          "--upload-pack",
+          "--receive-pack",
+          "--namespace",
+          "--super-prefix",
+          "--attr-source"
+        ],
+        "denied_subcommands": [
+          "config"
+        ],
+        "allowed_subcommands": [],
+        "env": [
+          {
+            "key": "GIT_PAGER",
+            "value": "cat"
+          },
+          {
+            "key": "PAGER",
+            "value": "cat"
+          },
+          {
+            "key": "GIT_SSH_COMMAND",
+            "value": ""
+          },
+          {
+            "key": "GIT_TERMINAL_PROMPT",
+            "value": "0"
+          },
+          {
+            "key": "GIT_CONFIG_NOSYSTEM",
+            "value": "1"
+          },
+          {
+            "key": "GIT_CONFIG_GLOBAL",
+            "value": "/dev/null"
+          }
+        ]
+      }
+    ],
+    "mcp_servers": [],
+    "mcp_categories": [],
+    "mcp_activation": {
+      "categories": {},
+      "servers": {}
+    },
+    "mcp_health_interval_secs": 60,
+    "backends": [],
+    "server_command_templates": [],
+    "remote_backend_templates": [],
+    "budget_high_water_pct": 80,
+    "per_tool_result_token_cap": 8000,
+    "max_steps": 16,
+    "offload_timeout_secs": 300,
+    "global_concurrency": null,
+    "max_queue_depth": null,
+    "escalate_partial": true,
+    "session_push": false,
+    "external_fetch_max_calls": 40,
+    "external_fetch_max_bytes": 4194304,
+    "detection_signature_enabled": true,
+    "detection_classifier_enabled": true,
+    "detection_classifier_threshold": 0.9,
+    "detection_update_rules_mode": "auto",
+    "detection_update_interval_hours": 24,
+    "detection_update_manifest_url": "",
+    "native_web_visibility": "sensor",
+    "injection": {
+      "protection": true,
+      "taint_latch_enabled": true,
+      "spotlighting_enabled": true,
+      "detection_enabled": true,
+      "ssrf_guard_enabled": true,
+      "fetch_budgets_enabled": true,
+      "canary_enabled": true,
+      "memory_quarantine_enabled": true,
+      "consumer_hygiene_enabled": true,
+      "tool_steering_enabled": true,
+      "terminal_escape_hygiene_enabled": true,
+      "worker": {
+        "taint_latch": "inherit",
+        "spotlighting": "inherit",
+        "detection": "inherit",
+        "ssrf_guard": "inherit",
+        "fetch_budgets": "inherit",
+        "canary": "inherit"
+      }
+    }
+  },
+  "graph": {
+    "enabled": false,
+    "languages": [
+      "rust",
+      "typescript",
+      "javascript",
+      "python",
+      "markdown",
+      "go",
+      "java",
+      "c",
+      "cpp",
+      "csharp",
+      "php",
+      "bash",
+      "scala",
+      "ocaml",
+      "ruby",
+      "haskell",
+      "kotlin",
+      "swift",
+      "sql",
+      "erlang",
+      "r",
+      "perl",
+      "ada"
+    ],
+    "ignore": [],
+    "index_docs": true,
+    "max_file_bytes": 1048576,
+    "watch_debounce_ms": 300,
+    "max_rows_per_query": 100,
+    "max_snippet_bytes": 2000,
+    "max_body_bytes": 16384,
+    "db_subdir": ".cimp",
+    "allow_remote_worker_access": false,
+    "semantic_search": false,
+    "embedding_endpoint": "",
+    "embedding_auth_token": "",
+    "embedding_model": "",
+    "embedding_dims": 0,
+    "embed_code_bodies": false,
+    "embedding_batch": 32,
+    "embedding_max_tokens": 0,
+    "semantic_code_max_chunks": 20000,
+    "context_injection": false,
+    "context_per_file_chars": 800,
+    "context_turn_budget_chars": 6000,
+    "context_include_session": true,
+    "context_min_score": 3,
+    "repo_map_budget_chars": 4000,
+    "repo_map_on_session_start": false,
+    "context_dedup_ttl_turns": 10,
+    "compaction_context": true,
+    "read_advisor": false,
+    "read_advisor_min_lines": 300,
+    "read_advisor_mode": "advise",
+    "read_advisor_ttl_turns": 0,
+    "read_advisor_diffs": true,
+    "read_advisor_shell": true,
+    "read_advisor_first_read_kb": 0,
+    "lean_tools": false,
+    "context_llm_digests": false,
+    "memory_distillation": false,
+    "promote_pinned_facts": false,
+    "auto_check": false,
+    "auto_check_debounce_s": 5,
+    "auto_impact_min_dependents": 10,
+    "analyses_auto": true,
+    "path_max_hops": 8,
+    "arch_max_communities": 12,
+    "arch_min_community_size": 3,
+    "graph_viz": false,
+    "graph_viz_max_nodes": 1500,
+    "graph_viz_node_scale": 1.0,
+    "graph_viz_dir_scale": 1.0,
+    "graph_viz_edge_width": 1.0,
+    "graph_viz_node_spacing": 1.0,
+    "graph_viz_cluster_spacing": 1.0,
+    "graph_viz_cluster_strength": 1.0,
+    "graph_viz_color_call": "#4fb3ff",
+    "graph_viz_color_import": "#ff8a3d",
+    "usage_color_in": "#58a6ff",
+    "usage_color_cache": "#d2a8ff",
+    "usage_color_out": "#3fb950",
+    "usage_color_tool": "#f0c674",
+    "usage_color_write": "#e3738d",
+    "usage_lane_colors": {}
+  },
+  "workbench": {
+    "enabled": true,
+    "checkpoints": false,
+    "checkpoint_max": 100,
+    "checkpoint_max_age_days": 7,
+    "checkpoint_burst_files": 5,
+    "checkpoint_burst_window_s": 60,
+    "checkpoint_min_gap_s": 120
+  },
+  "sandbox": {
+    "enabled": false,
+    "tabs": false,
+    "allow_network": false,
+    "extra_grant_dirs": []
+  },
+  "delegation": {
+    "auto_read_only": true,
+    "default_timeout_s": 600,
+    "max_depth": 1
+  },
+  "checks": [],
+  "checks_auto_configure": false,
+  "checks_suggestion_dismissed": false,
+  "checks_allow_remote_worker": false,
+  "enabled_ai_tabs": [
+    "claude"
+  ],
+  "logging": {
+    "level": "info",
+    "retention": "weekly",
+    "content_capture": {
+      "enabled": false,
+      "retention": "weekly"
+    }
+  },
+  "prompt_templates": [],
+  "templates_seeded": false,
+  "pricing_seeded_generation": 1,
+  "advisor_dismissed": [],
+  "advisor_applied": [],
+  "preview_last_url": null,
+  "preview_allow_remote": false,
+  "llm_pricing": [
+    {
+      "provider": "Anthropic",
+      "model": "Claude Fable 5",
+      "model_prefix": "claude-fable-5",
+      "input": 10.0,
+      "cache_write": 20.0,
+      "cache_read": 1.0,
+      "output": 50.0
+    },
+    {
+      "provider": "Anthropic",
+      "model": "Claude Opus 5",
+      "model_prefix": "claude-opus-5",
+      "input": 5.0,
+      "cache_write": 10.0,
+      "cache_read": 0.5,
+      "output": 25.0
+    },
+    {
+      "provider": "Anthropic",
+      "model": "Claude Opus 4.8",
+      "model_prefix": "claude-opus-4-8",
+      "input": 5.0,
+      "cache_write": 10.0,
+      "cache_read": 0.5,
+      "output": 25.0
+    },
+    {
+      "provider": "Anthropic",
+      "model": "Claude Opus 4.7",
+      "model_prefix": "claude-opus-4-7",
+      "input": 5.0,
+      "cache_write": 10.0,
+      "cache_read": 0.5,
+      "output": 25.0
+    },
+    {
+      "provider": "Anthropic",
+      "model": "Claude Opus 4.6",
+      "model_prefix": "claude-opus-4-6",
+      "input": 5.0,
+      "cache_write": 10.0,
+      "cache_read": 0.5,
+      "output": 25.0
+    },
+    {
+      "provider": "Anthropic",
+      "model": "Claude Sonnet 5",
+      "model_prefix": "claude-sonnet-5",
+      "input": 3.0,
+      "cache_write": 6.0,
+      "cache_read": 0.3,
+      "output": 15.0
+    },
+    {
+      "provider": "Anthropic",
+      "model": "Claude Sonnet 4.6",
+      "model_prefix": "claude-sonnet-4-6",
+      "input": 3.0,
+      "cache_write": 6.0,
+      "cache_read": 0.3,
+      "output": 15.0
+    },
+    {
+      "provider": "Anthropic",
+      "model": "Claude Haiku 4.5",
+      "model_prefix": "claude-haiku-4-5",
+      "input": 1.0,
+      "cache_write": 2.0,
+      "cache_read": 0.1,
+      "output": 5.0
+    },
+    {
+      "provider": "Copilot",
+      "model": "Claude Sonnet 5 (promo)",
+      "model_prefix": "",
+      "input": 2.0,
+      "cache_write": 2.5,
+      "cache_read": 0.2,
+      "output": 10.0
+    },
+    {
+      "provider": "Copilot",
+      "model": "Claude Sonnet 4.6",
+      "model_prefix": "",
+      "input": 3.0,
+      "cache_write": 3.75,
+      "cache_read": 0.3,
+      "output": 15.0
+    },
+    {
+      "provider": "Copilot",
+      "model": "Claude Opus 4.8",
+      "model_prefix": "",
+      "input": 5.0,
+      "cache_write": 6.25,
+      "cache_read": 0.5,
+      "output": 25.0
+    },
+    {
+      "provider": "Copilot",
+      "model": "Claude Haiku 4.5",
+      "model_prefix": "",
+      "input": 1.0,
+      "cache_write": 1.25,
+      "cache_read": 0.1,
+      "output": 5.0
+    },
+    {
+      "provider": "Copilot",
+      "model": "GPT-5 mini",
+      "model_prefix": "",
+      "input": 0.25,
+      "cache_write": 0.25,
+      "cache_read": 0.025,
+      "output": 2.0
+    },
+    {
+      "provider": "Copilot",
+      "model": "GPT-5.4",
+      "model_prefix": "",
+      "input": 2.5,
+      "cache_write": 2.5,
+      "cache_read": 0.25,
+      "output": 15.0
+    },
+    {
+      "provider": "Copilot",
+      "model": "GPT-5.5",
+      "model_prefix": "",
+      "input": 5.0,
+      "cache_write": 5.0,
+      "cache_read": 0.5,
+      "output": 30.0
+    },
+    {
+      "provider": "Copilot",
+      "model": "Gemini 2.5 Pro",
+      "model_prefix": "",
+      "input": 1.25,
+      "cache_write": 1.25,
+      "cache_read": 0.31,
+      "output": 10.0
+    },
+    {
+      "provider": "Copilot",
+      "model": "Gemini 3.5 Flash",
+      "model_prefix": "",
+      "input": 1.5,
+      "cache_write": 1.5,
+      "cache_read": 0.38,
+      "output": 9.0
+    }
+  ],
+  "harness_versions": {
+    "e1_status": "unverified",
+    "d0_status": "unverified"
+  },
+  "harness": {
+    "claude": {
+      "expose_commands": true,
+      "expose_code_audit": true,
+      "last_seen": "",
+      "last_verified": "",
+      "input_profile_status": "unverified",
+      "auto_verify": null,
+      "ext": {
+        "local.auth_token": "sk-dummy",
+        "local.base_url": "http://localhost:4000",
+        "local.model_alias": "",
+        "statusline": true
+      }
+    },
+    "opencode": {
+      "expose_commands": true,
+      "expose_code_audit": true,
+      "last_seen": "",
+      "last_verified": "",
+      "input_profile_status": "unverified",
+      "auto_verify": null,
+      "ext": {
+        "native_gate": true,
+        "provider": null,
+        "provider_auto": false
+      }
+    }
+  },
+  "code_audit": {
+    "enabled": false,
+    "timeout_secs": 600,
+    "quality_auto_select": true,
+    "expose_offload": true
+  },
+  "tool_plugins": {
+    "plugins": {},
+    "project_paths": {},
+    "global_paths": {}
+  }
+}

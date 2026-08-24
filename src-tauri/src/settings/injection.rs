@@ -681,6 +681,18 @@ pub const APP_SCOPE_KEY: &str = "app";
 /// two recognized words move a cell.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(into = "String")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(
+    test,
+    // `rename_all`: ts-rs cannot read the wire words off `#[serde(into =
+    // "String")]` + the hand-written `Deserialize` below, so the three
+    // lowercase spellings are restated here. HAND-KEPT SEAM.
+    ts(
+        rename = "InjectionOverride",
+        rename_all = "lowercase",
+        export_to = "settings.ts"
+    )
+)]
 pub enum Override {
     /// Take the app-wide L2 value.
     #[default]
@@ -761,6 +773,8 @@ impl From<Override> for String {
 /// prevent.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub struct TabInjectionOverrides {
     pub(in crate::settings) taint_latch: Override,
     pub(in crate::settings) spotlighting: Override,
@@ -859,6 +873,8 @@ impl TabInjectionOverrides {
 /// [`InjectionSettings`] because the worker has no tab config to hang it off.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub struct WorkerInjectionOverrides {
     pub(in crate::settings) taint_latch: Override,
     pub(in crate::settings) spotlighting: Override,

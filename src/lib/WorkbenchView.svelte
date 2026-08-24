@@ -21,7 +21,8 @@
   import { settings } from './settings/store';
   import { WORKBENCH_TAB_ID } from './tabs/types';
   import { onAppViewShown } from './appViewVisibility';
-  import { loadViewSection, saveViewSection } from './viewSection';
+  import SectionNav from './SectionNav.svelte';
+  import { loadViewSection } from './viewSection';
   import DiffView from './DiffView.svelte';
   import TimelineView from './TimelineView.svelte';
   import WorktreesView from './WorktreesView.svelte';
@@ -43,7 +44,6 @@
   let section = $state<Section>(
     loadViewSection('workbench', SECTIONS.map((s) => s.id), 'diff'),
   );
-  $effect(() => saveViewSection('workbench', section));
 
   // A Sessions-card "commits" click (Code Intelligence tab) reveals this tab
   // AND must land on the Session-commits section — switch on every new
@@ -121,16 +121,11 @@
     <h2>Workbench</h2>
   </header>
 
-  <nav class="sections">
-    {#each SECTIONS as s (s.id)}
-      <button
-        type="button"
-        class="seg"
-        class:active={section === s.id}
-        onclick={() => (section = s.id)}
-      >{s.label}</button>
-    {/each}
-  </nav>
+  <SectionNav
+    view="workbench"
+    sections={SECTIONS}
+    bind:section
+  />
 
   {#if statusError}
     <p class="banner err">Couldn't check git status: {statusError}</p>
@@ -202,34 +197,6 @@
   header h2 {
     margin: 0;
     font-size: 15px;
-  }
-  nav.sections {
-    display: flex;
-    gap: 4px;
-    margin-bottom: 14px;
-    border-bottom: 1px solid var(--border-subtle, #333);
-    padding-bottom: 8px;
-    flex-wrap: wrap;
-  }
-  .seg {
-    padding: 4px 12px;
-    border-radius: 6px;
-    border: 1px solid transparent;
-    background: transparent;
-    color: var(--text-primary, #ddd);
-    font-size: 12px;
-    cursor: pointer;
-    opacity: 0.7;
-  }
-  .seg:hover {
-    background: rgba(255, 255, 255, 0.06);
-    opacity: 1;
-  }
-  .seg.active {
-    background: var(--accent, #3b6ea5);
-    color: var(--accent-fg, #fff);
-    opacity: 1;
-    border-color: var(--accent, #3b6ea5);
   }
   .banner {
     margin: 0 0 14px;

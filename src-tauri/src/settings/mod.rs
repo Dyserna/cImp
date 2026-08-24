@@ -11,6 +11,10 @@
 //! global. See `persistence` for details.
 
 mod broadcaster;
+/// V42 Phase E: generates the frontend's settings types + defaults from this
+/// schema. Test-cfg only — see the module docs.
+#[cfg(test)]
+mod codegen;
 /// V32 Phase G (locked decision 16): the three-level injection-protection
 /// enable hierarchy and the ONE resolver every enforcement site calls. Public
 /// because half the crate's V32 code depends on it — and because "no

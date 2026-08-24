@@ -41,6 +41,16 @@ const ALLOWLIST: { file: string; reason: string }[] = [
       'identity. Same rule Rust applies to `settings/schema.rs`.',
   },
   {
+    file: 'lib/settings/generated/settings.ts',
+    reason:
+      'GENERATED, not written: V42 Phase E emits it from `src-tauri/src/settings/schema.rs` via ' +
+      'ts-rs, doc comments included. Every name it carries is one the Rust IDENTITY_ALLOWLIST ' +
+      'already rules on for that file (persisted wire forms, plus the prose beside them); nothing ' +
+      'here is a second declaration, and nothing here is rendered to a user. Editing the file is ' +
+      'pointless — CI regenerates it and diffs — so the fix for a name that should not be in it ' +
+      'is to change the Rust doc comment.',
+  },
+  {
     file: 'lib/avatarConfig.ts',
     reason:
       'A BRAND ASSET, ruled so by locked decision 29: a mascot sprite set depends on no ' +

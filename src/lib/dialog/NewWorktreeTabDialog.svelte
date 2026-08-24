@@ -7,8 +7,8 @@
   //
   // Mounted once in App.svelte alongside the other modal dialogs; renders
   // only when the dialog store's discriminator is 'new-worktree-tab'.
-  import { onMount } from 'svelte';
   import { closeDialog, dialogState } from './store';
+  import ModalShell from './ModalShell.svelte';
   import { createAiTabInWorktree, type TabLifecycleError } from '../ipc';
   import { cancelPlacement, requestTabIntoPane } from '../layout/store';
   import { bumpWorkbenchWorktreesVersion } from '../workbench';
@@ -71,90 +71,53 @@
       busy = false;
     }
   }
-
-  function onKeyDown(e: KeyboardEvent): void {
-    if (!isOpen) return;
-    if (e.key === 'Escape') {
-      e.preventDefault();
-      cancel();
-    } else if (e.key === 'Enter' && (e.target as HTMLElement)?.tagName !== 'BUTTON') {
-      e.preventDefault();
-      void submit();
-    }
-  }
-
-  onMount(() => {
-    window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
-  });
 </script>
 
-{#if isOpen}
-  <div class="backdrop" onclick={cancel} role="presentation"></div>
-  <div class="card" role="dialog" aria-label="New tab in worktree">
-    <h2>New tab in worktree</h2>
-    <p class="note">
-      Creates an isolated git worktree + branch (<code>cimp/&lt;name&gt;</code>)
-      cut from the current branch's <code>HEAD</code>, then opens a tab there.
-      Uncommitted changes in the main working tree are NOT included — the
-      worktree starts from the last commit.
+<ModalShell
+  open={isOpen}
+  label="New tab in worktree"
+  title="New tab in worktree"
+  width={420}
+  titleGap="md"
+  onCancel={cancel}
+  onEscape={cancel}
+  onEnter={() => void submit()}
+>
+  <p class="note">
+    Creates an isolated git worktree + branch (<code>cimp/&lt;name&gt;</code>)
+    cut from the current branch's <code>HEAD</code>, then opens a tab there.
+    Uncommitted changes in the main working tree are NOT included — the
+    worktree starts from the last commit.
+  </p>
+  <label class="field">
+    <span>Name</span>
+    <!-- svelte-ignore a11y_autofocus -->
+    <input
+      type="text"
+      bind:value={slug}
+      placeholder="fix-login-bug"
+      autofocus
+      disabled={busy}
+    />
+  </label>
+  {#if trimmed.length > 0 && !slugValid}
+    <p class="msg err">
+      Letters, digits, '-', and '_' only, starting with a letter or digit
+      (max 60 characters).
     </p>
-    <label class="field">
-      <span>Name</span>
-      <!-- svelte-ignore a11y_autofocus -->
-      <input
-        type="text"
-        bind:value={slug}
-        placeholder="fix-login-bug"
-        autofocus
-        disabled={busy}
-      />
-    </label>
-    {#if trimmed.length > 0 && !slugValid}
-      <p class="msg err">
-        Letters, digits, '-', and '_' only, starting with a letter or digit
-        (max 60 characters).
-      </p>
-    {/if}
-    {#if error}
-      <p class="msg err">{error}</p>
-    {/if}
-    <div class="actions">
-      <button type="button" class="cancel" onclick={cancel} disabled={busy}>Cancel</button>
-      <button type="button" class="primary" onclick={submit} disabled={busy || !slugValid}>
-        {busy ? 'Creating…' : 'Create'}
-      </button>
-    </div>
-  </div>
-{/if}
+  {/if}
+  {#if error}
+    <p class="msg err">{error}</p>
+  {/if}
+  {#snippet actions()}
+    <button type="button" class="cancel" onclick={cancel} disabled={busy}>Cancel</button>
+    <button type="button" class="primary" onclick={submit} disabled={busy || !slugValid}>
+      {busy ? 'Creating…' : 'Create'}
+    </button>
+  {/snippet}
+</ModalShell>
 
 <style>
-  .backdrop {
-    position: fixed;
-    inset: 0;
-    background: rgba(0, 0, 0, 0.5);
-    z-index: 100;
-  }
-  .card {
-    position: fixed;
-    top: 50%;
-    left: 50%;
-    transform: translate(-50%, -50%);
-    background: var(--surface-3);
-    border: 1px solid var(--border-subtle);
-    border-radius: var(--radius-lg);
-    padding: 20px var(--space-5);
-    width: 420px;
-    max-width: calc(100vw - 40px);
-    color: var(--text-primary);
-    z-index: 101;
-    box-shadow: var(--shadow-lg);
-  }
-  h2 {
-    margin: 0 0 var(--space-3);
-    font-size: 16px;
-    font-weight: 600;
-  }
   .note {
     margin: 0 0 var(--space-3);
     font-size: var(--font-size-sm);
@@ -189,26 +152,6 @@
   }
   .msg.err {
     color: var(--text-danger-soft);
-  }
-  .actions {
-    display: flex;
-    justify-content: flex-end;
-    gap: var(--space-2);
-    margin-top: var(--space-4);
-  }
-  .actions button {
-    padding: 6px var(--space-4);
-    border-radius: var(--radius-md);
-    cursor: pointer;
-    font-size: var(--font-size-md);
-    border: 1px solid var(--border-default);
-    transition:
-      background var(--motion-fast) var(--easing-standard),
-      border-color var(--motion-fast) var(--easing-standard);
-  }
-  .actions button:focus-visible {
-    outline: 2px solid var(--accent);
-    outline-offset: 2px;
   }
   .cancel {
     background: var(--surface-4);

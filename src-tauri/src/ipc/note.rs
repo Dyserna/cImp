@@ -19,13 +19,11 @@ use std::path::{Path, PathBuf};
 use tauri::State;
 
 use crate::error::{AppError, AppResult};
+// The per-project cImp data directory (holds `config.json`, `graph.db`, and
+// now the note). This was a private literal re-spelled here; the V42 review
+// folded the three copies into one — see [`crate::fsutil::CIMP_DIR_NAME`].
+use crate::fsutil::CIMP_DIR_NAME;
 use crate::ipc::AppState;
-
-/// The per-project cImp data directory (holds `config.json`, `graph.db`, and
-/// now the note). Mirrors `settings::persistence`'s private constant — kept a
-/// literal here rather than shared to avoid coupling this module to the
-/// settings internals.
-const CIMP_DIR_NAME: &str = ".cimp";
 
 /// The scratchpad file name inside `.cimp/`.
 const NOTE_FILE_NAME: &str = "cimp.note.txt";

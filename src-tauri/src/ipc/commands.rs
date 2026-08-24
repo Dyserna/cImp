@@ -36,7 +36,6 @@ pub async fn pty_start(
     let cwd = state.launch.cwd.clone();
     let invocation_args = state.launch.extra_args.clone();
     let tts_tx = state.tts_segments.clone();
-    let user_typed = state.user_typed_tts.clone();
     let settings = state.settings.clone();
     let restore_on_launch = settings.current().terminal.scrollback.restore_on_launch;
 
@@ -56,7 +55,6 @@ pub async fn pty_start(
                 &cwd,
                 &invocation_args,
                 tts_tx,
-                user_typed,
                 settings,
                 start_gen,
             )
@@ -113,7 +111,6 @@ pub async fn pty_restart(
     let cwd = state.launch.cwd.clone();
     let invocation_args = state.launch.extra_args.clone();
     let tts_tx = state.tts_segments.clone();
-    let user_typed = state.user_typed_tts.clone();
     let settings = state.settings.clone();
     // V39 review HIGH-3 + R-5: re-seed the activity mirror for the fresh
     // subprocess, BEFORE it is spawned.
@@ -142,7 +139,6 @@ pub async fn pty_restart(
             &cwd,
             &invocation_args,
             tts_tx,
-            user_typed,
             settings,
             start_gen,
         )
@@ -305,37 +301,6 @@ pub(crate) async fn write_through_pipeline(
     submit: Submit,
 ) -> AppResult<()> {
     let tab = tab.clone();
-    // Pre-register any TTS markers in the user's input so they don't fire
-    // when echoed back by the TUI. Content-based; no per-tab scoping needed.
-    // The set stores whitespace-normalized content so a width-driven echo
-    // rewrap still matches.
-    let typed_tags = extract_tts_contents(&input);
-    if !typed_tags.is_empty() {
-        if let Ok(mut set) = state.user_typed_tts.lock() {
-            for content in typed_tags {
-                let key = crate::processing::normalize_for_dedup(&content);
-                if !key.is_empty() {
-                    set.insert(key);
-                }
-            }
-            // V0.6+ bound: drop the set when it grows past a generous cap.
-            // Each entry is a normalized `[[TTS]]…[[/TTS]]` body that the
-            // user typed or pasted; a long-lived session that pastes many
-            // such blocks would otherwise leak a few hundred MB. Clearing
-            // is a wider net than LRU eviction (a tiny window where an
-            // echo could slip through) but doesn't pull a new dep, and
-            // the worst-case symptom is one extra spoken segment.
-            const USER_TYPED_TTS_CAP: usize = 4096;
-            if set.len() > USER_TYPED_TTS_CAP {
-                set.clear();
-            }
-        }
-    }
-
-    // Accumulate the user's plain typed line and, on Enter, register its
-    // sentences too. Unlike the `[[TTS]]`-marker path above, this is what
-    // suppresses the *unmarked* question echo in "speak all output" mode.
-    note_typed_input(&state.user_input_buf, &state.user_typed_tts, &tab, &input);
 
     // Take the registry lock once at the top so the keystroke / submit
     // counter updates and the final write run inside the same critical
@@ -833,103 +798,6 @@ fn is_automatic_terminal_response(input: &str) -> bool {
     bytes[2..bytes.len() - 1]
         .iter()
         .all(|&b| b.is_ascii_digit() || b == b';' || b == b'?')
-}
-
-/// Accumulate the user's typed input per tab and, on Enter, fold its
-/// sentences into the shared echo-suppression set so "speak all output"
-/// mode doesn't read the question back when the TUI echoes it. Mirrors the
-/// line editing `apply_input_delta` already understands (backspace, kill-line,
-/// kill-word). ESC-led writes (arrow keys, function keys, bracketed paste) are
-/// skipped wholesale, exactly like the length counter — so a pasted question
-/// isn't captured, which is an accepted gap.
-fn note_typed_input(
-    buf_map: &std::sync::Mutex<std::collections::HashMap<TabId, String>>,
-    user_typed: &std::sync::Mutex<std::collections::HashSet<String>>,
-    tab: &TabId,
-    input: &str,
-) {
-    if input.starts_with('\x1b') {
-        return;
-    }
-    let Ok(mut map) = buf_map.lock() else {
-        return;
-    };
-    let buf = map.entry(tab.clone()).or_default();
-    for c in input.chars() {
-        match c {
-            '\r' | '\n' => {
-                register_echo_sentences(user_typed, buf);
-                buf.clear();
-            }
-            // Backspace / DEL.
-            '\x08' | '\x7f' => {
-                buf.pop();
-            }
-            // Ctrl-U (kill line) / Ctrl-C (abandon).
-            '\x15' | '\x03' => buf.clear(),
-            // Ctrl-W (kill previous word).
-            '\x17' => {
-                while buf.ends_with(' ') {
-                    buf.pop();
-                }
-                while !buf.is_empty() && !buf.ends_with(' ') {
-                    buf.pop();
-                }
-            }
-            c if c.is_control() => {}
-            c => buf.push(c),
-        }
-    }
-    // Bound a line that's never submitted (e.g. user keeps typing, hits Esc).
-    if buf.len() > 8192 {
-        buf.clear();
-    }
-}
-
-/// Register each sentence of `text` (whitespace-normalized) in the echo
-/// set. Empty input is a no-op. Caps the set like the marker path does.
-fn register_echo_sentences(
-    user_typed: &std::sync::Mutex<std::collections::HashSet<String>>,
-    text: &str,
-) {
-    if text.trim().is_empty() {
-        return;
-    }
-    let Ok(mut set) = user_typed.lock() else {
-        return;
-    };
-    for sentence in crate::processing::segment_sentences(text) {
-        let key = crate::processing::normalize_for_dedup(&sentence);
-        if !key.is_empty() {
-            set.insert(key);
-        }
-    }
-    const USER_TYPED_TTS_CAP: usize = 4096;
-    if set.len() > USER_TYPED_TTS_CAP {
-        set.clear();
-    }
-}
-
-fn extract_tts_contents(input: &str) -> Vec<String> {
-    const OPEN: &str = "[[TTS]]";
-    const CLOSE: &str = "[[/TTS]]";
-    let mut out = Vec::new();
-    let mut i = 0;
-    while let Some(open) = input[i..].find(OPEN) {
-        let content_start = i + open + OPEN.len();
-        let after = &input[content_start..];
-        match after.find(CLOSE) {
-            Some(close_rel) => {
-                let content = after[..close_rel].to_string();
-                if !content.is_empty() {
-                    out.push(content);
-                }
-                i = content_start + close_rel + CLOSE.len();
-            }
-            None => break,
-        }
-    }
-    out
 }
 
 /// Debug: synthesize and play `text` directly through the TTS worker, skipping
@@ -2130,14 +1998,14 @@ pub async fn detection_open_rules_folder() -> AppResult<()> {
 /// the harness has already proved is *observed* on this poll rather than
 /// whenever the model next calls a cImp tool. That matters only for a tab whose
 /// user armed the one-shot contamination clear by restoring a checkpoint — see
-/// `loopback::TabLatch::awaiting_session_clear`. It grants nothing the next
+/// `latch::TabLatch::awaiting_session_clear`. It grants nothing the next
 /// gated call would not have granted anyway; it only decides when the same fact
 /// becomes visible.
 #[tauri::command]
 pub async fn latch_status(
     app: tauri::AppHandle,
-) -> AppResult<Vec<crate::offload::loopback::LatchStatus>> {
-    Ok(crate::offload::loopback::latch_snapshot(&app))
+) -> AppResult<Vec<crate::offload::latch::LatchStatus>> {
+    Ok(crate::offload::latch::latch_snapshot(&app))
 }
 
 /// V32 Phase G (locked decision 16): the RESOLVED state of every injection
@@ -2176,7 +2044,7 @@ pub async fn injection_status(state: State<'_, AppState>) -> AppResult<serde_jso
 /// **This is the only path that can release a contamination flag**, and since
 /// decision 15's 2026-08-10 amendment `"unlatch"` releases one too (restoring
 /// FULL access is the user's verdict; `"flip_local"` is a workflow step and
-/// keeps the flag). See `loopback::TabLatch::contaminated` for why a click in
+/// keeps the flag). See `latch::TabLatch::contaminated` for why a click in
 /// this app's own UI is a legitimate trust root where a transcript file is not.
 ///
 /// Errors carry a human-readable reason (unknown action, no latch to move, an
@@ -2193,8 +2061,8 @@ pub async fn latch_override(
     tab: String,
     consumer: String,
     action: String,
-) -> AppResult<crate::offload::loopback::LatchView> {
-    crate::offload::loopback::apply_latch_override(&app, &consumer, &tab, &action)
+) -> AppResult<crate::offload::latch::LatchView> {
+    crate::offload::latch::apply_latch_override(&app, &consumer, &tab, &action)
         .map_err(AppError::Offload)
 }
 

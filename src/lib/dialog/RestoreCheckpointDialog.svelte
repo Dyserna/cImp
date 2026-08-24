@@ -11,6 +11,7 @@
   // case is silently losing untracked new work, so keeping it is the
   // default and deleting it requires an explicit, visible opt-in.
   import { closeDialog, dialogState } from './store';
+  import ModalShell from './ModalShell.svelte';
   import {
     workbenchCheckpointDiff,
     workbenchRestore,
@@ -85,105 +86,83 @@
   }
 </script>
 
-{#if isOpen}
-  <div class="backdrop" onclick={cancel} role="presentation"></div>
-  <div class="card" role="dialog" aria-label="Restore checkpoint">
-    <h2>Restore checkpoint {checkpointId}</h2>
+<!-- No `onEscape`: this dialog has never answered Escape, and #128 is not the
+     place to add a way out of a confirmation. -->
+<ModalShell
+  open={isOpen}
+  label="Restore checkpoint"
+  title={`Restore checkpoint ${checkpointId}`}
+  width={480}
+  fit="scroll"
+  titleGap="md"
+  onCancel={cancel}
+>
+  {#if done}
+    <p class="done">
+      Restored. {done.changed} file{done.changed === 1 ? '' : 's'} changed{done.deleted > 0
+        ? `, ${done.deleted} deleted`
+        : ''}. A safety checkpoint of the state right before this restore was
+      taken automatically — you can undo this from the Timeline.
+    </p>
+  {:else}
+    <p class="note">
+      A checkpoint of the CURRENT state is taken automatically before restoring,
+      so this is always undoable. This never touches your own git repository —
+      only the working files themselves.
+    </p>
 
-    {#if done}
-      <p class="done">
-        Restored. {done.changed} file{done.changed === 1 ? '' : 's'} changed{done.deleted > 0
-          ? `, ${done.deleted} deleted`
-          : ''}. A safety checkpoint of the state right before this restore was
-        taken automatically — you can undo this from the Timeline.
-      </p>
-      <div class="actions">
-        <button type="button" class="primary" onclick={closeDialog}>Close</button>
-      </div>
+    {#if loading}
+      <p class="msg">Checking what this restore would touch…</p>
+    {:else if loadError}
+      <p class="msg err">Couldn't preview this restore: {loadError}</p>
     {:else}
-      <p class="note">
-        A checkpoint of the CURRENT state is taken automatically before restoring,
-        so this is always undoable. This never touches your own git repository —
-        only the working files themselves.
-      </p>
-
-      {#if loading}
-        <p class="msg">Checking what this restore would touch…</p>
-      {:else if loadError}
-        <p class="msg err">Couldn't preview this restore: {loadError}</p>
-      {:else}
-        {#if willChange.length > 0}
-          <div class="file-group">
-            <h3>Will be changed or recreated ({willChange.length})</h3>
-            <ul>
-              {#each willChange as path (path)}<li>{path}</li>{/each}
-            </ul>
-          </div>
-        {/if}
-        {#if createdSince.length > 0}
-          <div class="file-group">
-            <h3>Created since this checkpoint ({createdSince.length})</h3>
-            <ul>
-              {#each createdSince as path (path)}<li>{path}</li>{/each}
-            </ul>
-          </div>
-        {/if}
-        {#if willChange.length === 0 && createdSince.length === 0}
-          <p class="msg">No difference from the current working tree.</p>
-        {/if}
-
-        <label class="checkbox">
-          <input type="checkbox" bind:checked={deleteNew} disabled={createdSince.length === 0} />
-          <span
-            >Delete files created since this checkpoint ({createdSince.length})
-            — unchecked keeps them</span
-          >
-        </label>
+      {#if willChange.length > 0}
+        <div class="file-group">
+          <h3>Will be changed or recreated ({willChange.length})</h3>
+          <ul>
+            {#each willChange as path (path)}<li>{path}</li>{/each}
+          </ul>
+        </div>
+      {/if}
+      {#if createdSince.length > 0}
+        <div class="file-group">
+          <h3>Created since this checkpoint ({createdSince.length})</h3>
+          <ul>
+            {#each createdSince as path (path)}<li>{path}</li>{/each}
+          </ul>
+        </div>
+      {/if}
+      {#if willChange.length === 0 && createdSince.length === 0}
+        <p class="msg">No difference from the current working tree.</p>
       {/if}
 
-      {#if restoreError}
-        <p class="msg err">{restoreError}</p>
-      {/if}
-
-      <div class="actions">
-        <button type="button" class="cancel" onclick={cancel} disabled={busy}>Cancel</button>
-        <button type="button" class="primary" onclick={confirmRestore} disabled={busy || loading}>
-          {busy ? 'Restoring…' : 'Restore'}
-        </button>
-      </div>
+      <label class="checkbox">
+        <input type="checkbox" bind:checked={deleteNew} disabled={createdSince.length === 0} />
+        <span
+          >Delete files created since this checkpoint ({createdSince.length})
+          — unchecked keeps them</span
+        >
+      </label>
     {/if}
-  </div>
-{/if}
+
+    {#if restoreError}
+      <p class="msg err">{restoreError}</p>
+    {/if}
+  {/if}
+
+  {#snippet actions()}
+    {#if done}
+      <button type="button" class="primary" onclick={closeDialog}>Close</button>
+    {:else}
+      <button type="button" class="cancel" onclick={cancel} disabled={busy}>Cancel</button>
+      <button type="button" class="primary" onclick={confirmRestore} disabled={busy || loading}>
+        {busy ? 'Restoring…' : 'Restore'}
+      </button>
+    {/if}
+  {/snippet}
+</ModalShell>
 
 <style>
-  .backdrop {
-    position: fixed;
-    inset: 0;
-    background: rgba(0, 0, 0, 0.5);
-    z-index: 100;
-  }
-  .card {
-    position: fixed;
-    top: 50%;
-    left: 50%;
-    transform: translate(-50%, -50%);
-    background: var(--surface-3);
-    border: 1px solid var(--border-subtle);
-    border-radius: var(--radius-lg);
-    padding: 20px var(--space-5);
-    width: 480px;
-    max-width: calc(100vw - 40px);
-    max-height: calc(100vh - 80px);
-    overflow-y: auto;
-    color: var(--text-primary);
-    z-index: 101;
-    box-shadow: var(--shadow-lg);
-  }
-  h2 {
-    margin: 0 0 var(--space-3);
-    font-size: 16px;
-    font-weight: 600;
-  }
   h3 {
     margin: 0 0 4px;
     font-size: var(--font-size-sm);
@@ -242,26 +221,6 @@
   }
   .checkbox input {
     margin-top: 2px;
-  }
-  .actions {
-    display: flex;
-    justify-content: flex-end;
-    gap: var(--space-2);
-    margin-top: var(--space-4);
-  }
-  .actions button {
-    padding: 6px var(--space-4);
-    border-radius: var(--radius-md);
-    cursor: pointer;
-    font-size: var(--font-size-md);
-    border: 1px solid var(--border-default);
-    transition:
-      background var(--motion-fast) var(--easing-standard),
-      border-color var(--motion-fast) var(--easing-standard);
-  }
-  .actions button:focus-visible {
-    outline: 2px solid var(--accent);
-    outline-offset: 2px;
   }
   .cancel {
     background: var(--surface-4);

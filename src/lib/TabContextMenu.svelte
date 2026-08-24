@@ -22,6 +22,7 @@
   //
   // Click outside or Escape dismisses without firing.
   import { onMount } from 'svelte';
+  import { clampToViewport, dismissOn } from './anchoredPopover';
   import { get } from 'svelte/store';
   import {
     closeFocusedPane,
@@ -99,26 +100,16 @@
   let submenuOpen = $state(false);
   let layoutsOpen = $state(false);
 
-  // Clamp the menu into the viewport: opened at the raw cursor coords it would
-  // overflow off-screen (and be unreachable) near the right/bottom edges.
-  // Seeded from the open coords; the $effect below re-clamps on any change.
+  // Seeded from the open coords; the $effect below re-clamps on any change
+  // (x/y are read positionally, so a reposition is a dependency).
   // svelte-ignore state_referenced_locally
   let posX = $state(x);
   // svelte-ignore state_referenced_locally
   let posY = $state(y);
   $effect(() => {
-    // Re-read x/y so a reposition re-clamps.
-    const wantX = x;
-    const wantY = y;
-    if (!menuEl) {
-      posX = wantX;
-      posY = wantY;
-      return;
-    }
-    const rect = menuEl.getBoundingClientRect();
-    const margin = 4;
-    posX = Math.max(margin, Math.min(wantX, window.innerWidth - rect.width - margin));
-    posY = Math.max(margin, Math.min(wantY, window.innerHeight - rect.height - margin));
+    const at = clampToViewport(menuEl, x, y);
+    posX = at.x;
+    posY = at.y;
   });
 
   // Top 5 layout presets, most-recent first. ISO 8601 `created_at`
@@ -157,23 +148,6 @@
   // into and the menu entry is disabled.
   const closeable = layoutSnapshot.tree.type !== 'pane';
 
-  function onWindowMouseDown(e: MouseEvent): void {
-    // Only dismiss when the click started outside the menu. Without
-    // this check, mousedown on a menu entry unmounts the menu before
-    // its click event fires, so none of the entries ever trigger their
-    // action.
-    const target = e.target as Node | null;
-    if (target && menuEl && menuEl.contains(target)) return;
-    onDismiss();
-  }
-
-  function onWindowKeyDown(e: KeyboardEvent): void {
-    if (e.key === 'Escape') {
-      e.preventDefault();
-      onDismiss();
-    }
-  }
-
   function fire(action: (() => void) | undefined) {
     return (e: MouseEvent) => {
       if (!action) return;
@@ -205,19 +179,10 @@
     void restoreLayoutPreset(name);
   }
 
-  onMount(() => {
-    // Defer the click listener by a tick so the right-click that opened
-    // the menu doesn't immediately dismiss it.
-    const id = setTimeout(() => {
-      window.addEventListener('mousedown', onWindowMouseDown);
-    }, 0);
-    window.addEventListener('keydown', onWindowKeyDown);
-    return () => {
-      clearTimeout(id);
-      window.removeEventListener('mousedown', onWindowMouseDown);
-      window.removeEventListener('keydown', onWindowKeyDown);
-    };
-  });
+  // Escape / click-outside dismissal. The containment check is `contains`, so
+  // the hover submenus rendered inside `.menu` are inside it too — see
+  // `anchoredPopover.ts`.
+  onMount(() => dismissOn(() => menuEl, () => onDismiss()));
 </script>
 
 <div

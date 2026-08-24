@@ -96,7 +96,7 @@ impl HarnessPlugin for ClaudePlugin {
         cfg: &AiToolTabConfig,
         settings: &Settings,
         tab: &str,
-        endpoint: Option<&crate::offload::loopback::Discovery>,
+        endpoint: Option<&crate::offload::discovery::Discovery>,
     ) -> Vec<String> {
         super::overlay::build_pre_args(cfg, settings, tab, endpoint)
     }
@@ -115,7 +115,7 @@ impl HarnessPlugin for ClaudePlugin {
         cfg: &AiToolTabConfig,
         settings: &Settings,
         _tab: &str,
-        endpoint: Option<&crate::offload::loopback::Discovery>,
+        endpoint: Option<&crate::offload::discovery::Discovery>,
         env: &mut HashMap<String, String>,
     ) {
         // ── V35 Phase J: the bearer token for Claude's `type: "http"` hooks ──

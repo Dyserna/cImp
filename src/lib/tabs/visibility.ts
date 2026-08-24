@@ -4,9 +4,11 @@
 // panes take over the freed space — but unlike a real close, the tab stays
 // in the tabs store and its PTY / backend feed keeps running. Un-hiding
 // re-inserts the tab into the focused pane and activates it, so its
-// still-live content is immediately visible. The hidden set lives in
-// localStorage rather than settings because it's a per-machine *view*
-// preference, deliberately decoupled from whether a feature is enabled.
+// still-live content is immediately visible. The hidden set is a *view*
+// preference, deliberately decoupled from whether a feature is enabled, so it
+// is not part of settings; since V42 Phase C it lives in the per-project
+// `.cimp/ui_state.json` (see `../uiState.ts`) rather than in localStorage —
+// hiding a tab in one checkout no longer hides it in every checkout.
 //
 // Invariant: a tab is hidden ⇔ it is absent from the layout tree (while
 // still present in the tabs store). Everything that renders or indexes
@@ -19,15 +21,14 @@ import {
   restoreTabToLayout,
   setFocusedPaneActiveTab,
 } from '../layout/store';
+import { HIDDEN_TABS_KEY, getUiValue, setUiValue } from '../uiState';
 import { switchTab } from './state';
 import { tabMeta } from './store';
 import type { TabId } from './types';
 
-const STORAGE_KEY = 'cimp.hidden-tabs.v1';
-
 function load(): ReadonlySet<TabId> {
   try {
-    const raw = localStorage.getItem(STORAGE_KEY);
+    const raw = getUiValue(HIDDEN_TABS_KEY);
     if (!raw) return new Set();
     const arr: unknown = JSON.parse(raw);
     return new Set(
@@ -39,11 +40,7 @@ function load(): ReadonlySet<TabId> {
 }
 
 function persist(set: ReadonlySet<TabId>): void {
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify([...set]));
-  } catch {
-    // A quota/serialization failure loses persistence, never breaks the UI.
-  }
+  setUiValue(HIDDEN_TABS_KEY, JSON.stringify([...set]));
 }
 
 /// The hidden tab ids. Subscribed by the popover (checkbox state + count
@@ -51,7 +48,30 @@ function persist(set: ReadonlySet<TabId>): void {
 /// lifecycle hook via `forgetHiddenTab`; any that predate that hook are
 /// harmless — the popover lists only live tabs and the restore path checks
 /// the tabs store before touching the layout.
-export const hiddenTabs: Writable<ReadonlySet<TabId>> = writable(load());
+///
+/// Starts EMPTY and is filled by [`hydrateHiddenTabs`]. It used to be
+/// `writable(load())` — resolved at module-import time, which worked only
+/// because localStorage answers synchronously from the very first line of the
+/// bundle. The project file does not; see [`hydrateHiddenTabs`] for the
+/// ordering that replaces it.
+export const hiddenTabs: Writable<ReadonlySet<TabId>> = writable(new Set());
+
+/// Fill the hidden set from the hydrated UI-state cache.
+///
+/// **Ordering invariant.** This must run before `App.svelte`'s
+/// `stripHiddenTabsFromLayout()`, which is what re-establishes "hidden ⇔ not
+/// in the layout tree" after layout hydration re-adds hidden tabs as orphans.
+/// If the set were still empty at that point, every hidden tab would come
+/// back visible and the user's hidden set would then be overwritten with the
+/// empty one by the popover's next write.
+///
+/// `main.ts` guarantees it: `hydrateUiState()` then this, both awaited before
+/// `mount(App)`; `stripHiddenTabsFromLayout()` runs from App's `onMount`,
+/// which cannot fire before the mount call. Calling this twice is harmless —
+/// it is a pure read of the cache.
+export function hydrateHiddenTabs(): void {
+  hiddenTabs.set(load());
+}
 
 export function isTabHidden(id: TabId): boolean {
   return get(hiddenTabs).has(id);

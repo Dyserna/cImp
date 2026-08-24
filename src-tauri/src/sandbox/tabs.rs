@@ -134,7 +134,7 @@ pub fn off_note(s: &crate::settings::Settings) -> &'static str {
 /// cannot be started at all — and if it started it could not find the app: it
 /// resolves the loopback port + token from
 /// `<exe-dir>/.cimp-discovery/<pid>.json`, falling back to the legacy
-/// `<exe-dir>/.cimp-offload.json` (`offload::loopback::select_discovery`). Each
+/// `<exe-dir>/.cimp-offload.json` (`offload::discovery::select_discovery`). Each
 /// of those is a denial row, which is loud — and still a broken tab.
 ///
 /// **Three file-scoped rows, never the directory.** `<exe-dir>` is cImp's
@@ -188,7 +188,7 @@ fn cimp_child_rows(exe: Option<&Path>) -> Vec<GrantRow> {
             required: false,
         },
         GrantRow {
-            path: dir.join(crate::offload::loopback::DISCOVERY_FILE),
+            path: dir.join(crate::offload::discovery::DISCOVERY_FILE),
             access: GrantAccess::ReadExecute,
             is_file: true,
             reason: "the legacy discovery file the proxy child reads to find this app's loopback \
@@ -197,7 +197,7 @@ fn cimp_child_rows(exe: Option<&Path>) -> Vec<GrantRow> {
             required: false,
         },
         GrantRow {
-            path: dir.join(crate::offload::loopback::DISCOVERY_DIR),
+            path: dir.join(crate::offload::discovery::DISCOVERY_DIR),
             access: GrantAccess::ReadExecute,
             is_file: false,
             reason: "the per-instance discovery directory (<pid>.json per running instance), how \
@@ -1008,43 +1008,41 @@ mod tests {
         );
     }
 
-    /// The hand-maintained TS mirror (`src/lib/settings/types.ts`), embedded at
-    /// compile time so a Rust-side change that is not reflected there fails
-    /// `cargo test` rather than showing up as a runtime shape mismatch in the
-    /// Settings window. Same mechanism `checks::tests` uses for `CheckDef`.
+    /// The **defaults** the frontend falls back to before the backend's first
+    /// broadcast — and the one value in them that is a security switch.
+    ///
+    /// This used to be two halves: a scan asserting every `SandboxSettings`
+    /// field is spelled in the hand-written `src/lib/settings/types.ts`
+    /// interface, and this `tabs: false` check over the defaults beside it.
+    ///
+    /// **V42 Phase E retired the first half and re-pointed the second.** The
+    /// interface is generated now (`settings::codegen` → `generated/
+    /// settings.ts`, regenerated and diffed by CI), so the field scan asserted
+    /// that a generator generated. The DEFAULTS check is not tautological in
+    /// the same way: `generated/defaults.json` is a committed artifact the
+    /// frontend imports, so this is the guard that the committed bytes really
+    /// say `false` — a hand-edit, a bad merge or a stale regeneration that
+    /// flipped it would hand every client a settings snapshot that enables tab
+    /// sandboxing by default.
     #[test]
-    fn sandbox_settings_fields_are_mirrored_in_types_ts() {
-        const TS_TYPES: &str = include_str!("../../../src/lib/settings/types.ts");
+    fn the_sandbox_defaults_the_frontend_falls_back_to_keep_tabs_off() {
         // Destructured so ADDING a Rust field is a compile error here until the
-        // author has decided what the mirror should say about it.
+        // author has decided whether the generated defaults need a row below.
         let crate::settings::SandboxSettings {
             enabled: _,
             tabs: _,
             allow_network: _,
             extra_grant_dirs: _,
         } = crate::settings::SandboxSettings::default();
-        let iface = TS_TYPES
-            .split("export interface SandboxSettings {")
-            .nth(1)
-            .and_then(|s| s.split('}').next())
-            .expect("types.ts declares SandboxSettings");
-        for field in ["enabled", "tabs", "allow_network", "extra_grant_dirs"] {
-            assert!(
-                iface.contains(&format!("{field}:")),
-                "`{field}` is missing from the `SandboxSettings` interface in \
-                 src/lib/settings/types.ts — add it to keep the mirror in sync"
-            );
-        }
-        // …and the defaults object the Settings window falls back to.
-        let defaults = TS_TYPES
-            .split("sandbox: {")
-            .nth(1)
-            .and_then(|s| s.split('}').next())
-            .expect("types.ts carries a sandbox defaults block");
-        assert!(
-            defaults.contains("tabs: false"),
-            "the TS defaults must ship `tabs: false` — the Rust default is off, and a mirror \
-             that defaults it on would flip a security switch on any client that reads it"
+
+        const DEFAULTS: &str = include_str!("../../../src/lib/settings/generated/defaults.json");
+        let v: serde_json::Value = serde_json::from_str(DEFAULTS).expect("defaults.json parses");
+        assert_eq!(
+            v["sandbox"]["tabs"],
+            serde_json::Value::Bool(false),
+            "src/lib/settings/generated/defaults.json must ship `sandbox.tabs = false` — the \r
+             Rust default is off, and a committed defaults file that turned it on would \r
+             flip a security switch on every client that reads it"
         );
     }
 }

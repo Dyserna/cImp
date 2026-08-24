@@ -44,7 +44,7 @@
 {#if visible}
   <button
     type="button"
-    class="status-button wb-badge"
+    class="status-button status-badge wb-badge"
     onclick={open}
     title="{count} file{count === 1 ? '' : 's'} changed — open Workbench"
     aria-label="{count} files changed in the working tree — open the Workbench tab"
@@ -54,32 +54,13 @@
 {/if}
 
 <style>
+  /* Shell + focus ring: `.status-button.status-badge` in `src/app.css`. Local
+     delta: tabular numerals so the pill does not jitter as the count changes. */
   .status-button {
-    appearance: none;
-    background: transparent;
-    border: 1px solid transparent;
-    color: var(--text-secondary);
-    cursor: pointer;
-    height: 22px;
-    padding: 0 8px;
-    border-radius: var(--radius-pill);
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    line-height: 1;
-    font-size: 11px;
     font-variant-numeric: tabular-nums;
-    transition:
-      background var(--motion-fast) var(--easing-standard),
-      color var(--motion-fast) var(--easing-standard),
-      border-color var(--motion-fast) var(--easing-standard);
   }
   .status-button:hover {
     background: var(--surface-3);
     color: var(--text-primary);
-  }
-  .status-button:focus-visible {
-    outline: 2px solid var(--accent);
-    outline-offset: 2px;
   }
 </style>

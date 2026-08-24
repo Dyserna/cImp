@@ -699,14 +699,6 @@ pub async fn close_tab(
         warn!(?tab, error = %e, "close_tab: scrollback delete failed");
     }
 
-    // Drop the closed tab's typed-input echo buffer. Other per-tab maps
-    // (input_lengths, settings, scrollback) are cleaned up on close; without
-    // this one a long session that opens/closes many tabs slowly leaks one
-    // map entry per closed tab.
-    if let Ok(mut buf) = state.user_input_buf.lock() {
-        buf.remove(&tab);
-    }
-
     // V39 Phase A: and its read-only row. The settings entry is dropped just
     // below, so the next broadcast would clear a `User` lock anyway; this also
     // drops a `Driven` row (which settings never describes) and keeps the map
@@ -1500,13 +1492,6 @@ async fn remove_ai_builtin_tab(
 
     if let Err(e) = crate::pty::scrollback::delete(&tab) {
         warn!(?tab, error = %e, "set_enabled_ai_tabs: scrollback delete failed");
-    }
-
-    // Drop the tab's typed-input echo buffer, mirroring `close_tab` — without
-    // this, disabling an AI tab via the Settings checkbox leaves its
-    // `user_input_buf` entry behind.
-    if let Ok(mut buf) = state.user_input_buf.lock() {
-        buf.remove(&tab);
     }
 
     // V39 Phase A: same for its read-only row (mirrors `close_tab`).

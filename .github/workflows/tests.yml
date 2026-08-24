@@ -97,8 +97,31 @@ jobs:
       - name: vitest
         run: npx vitest run
 
+      # Code review 2026-08-24, finding RV-6. NO CI job ran `svelte-check`, so
+      # the frontend's type layer was verified only when a human happened to
+      # run it. That gap got sharp with V42 Phase E: `src/lib/settings/types.ts`
+      # is GENERATED from `settings/schema.rs` now, and the step below already
+      # fails when the committed bindings are stale — but a schema change that
+      # regenerates cleanly and *breaks a call site* (a renamed field, a
+      # narrowed union, an added variant nothing handles) is invisible to
+      # `git diff` and invisible to vitest, which does not type-check. This is
+      # the consumer of that signal.
+      #
+      # Windows only, mirroring vitest and for the same stated reason as the
+      # Linux job's missing vitest step: both are Node-only and cannot differ
+      # by OS, so a second copy is a second thing to maintain re-proving the
+      # same result. `npm run build` is different — it runs on both jobs
+      # because tauri-build needs the bundle there, not as a duplicate gate.
+      - name: svelte-check
+        run: npm run check
+
       # tauri-build resolves `frontendDist` (../dist) at compile time, so the
       # bundle must exist before cargo runs — same as the clippy job.
+      #
+      # It is also a real gate in its own right, which is why it is not merely
+      # a build step: `vite build` runs lightningcss over the stylesheets and
+      # rejects CSS that svelte-check happily accepts. That has already caught
+      # a break the type checker could not see (V42, 2026-08-24).
       - name: Build frontend
         run: npm run build
 
@@ -128,6 +151,45 @@ jobs:
         # `--bin cimp` because there is no lib target (see the header note).
         # `--locked` so CI tests the committed Cargo.lock resolution.
         run: cargo test --locked --bin cimp
+
+      # V42 Phase E — the settings types and defaults are GENERATED.
+      # `settings::codegen` writes src/lib/settings/generated/{settings.ts,
+      # defaults.json} during the `cargo test` above, from
+      # src-tauri/src/settings/schema.rs via ts-rs. Both are committed, and the
+      # frontend imports them, so a schema change whose regenerated output was
+      # not committed would ship a stale mirror — the exact drift this phase
+      # deleted the hand-written one to end.
+      #
+      # This step is the consumer of that signal: it fails the run when what
+      # the suite just regenerated differs from what is in the tree. The
+      # generation itself is silent by design (`write_if_changed`), so without
+      # a diff check here nothing would ever notice.
+      #
+      # Byte-exact on purpose, on BOTH runners: `.gitattributes` marks the
+      # directory `-text`, so neither this Windows checkout (autocrlf=true) nor
+      # the Linux one below translates line endings, and ts-rs emits LF.
+      #
+      # Code review 2026-08-24 (dropped-at-cap): `git diff` sees TRACKED files
+      # only. A generator that emits a NEW file — a type given its own
+      # `export_to`, a second root added beside `LocalProviderBlock`, a rename
+      # that leaves the old name behind — leaves it untracked, and the frontend
+      # would import a file no one committed. `ls-files --others` is the half
+      # `git diff` cannot answer, and it is deliberately run WITHOUT
+      # `--exclude-standard` so a `.gitignore` entry cannot hide the very file
+      # this step exists to notice.
+      - name: Generated settings bindings are up to date
+        run: |
+          git diff --exit-code -- src/lib/settings/generated
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::the committed settings bindings differ from what the suite just generated — run cargo test and commit src/lib/settings/generated."
+            exit $LASTEXITCODE
+          }
+          $untracked = @(git ls-files --others -- src/lib/settings/generated)
+          if ($untracked.Count -gt 0) {
+            Write-Host "::error::the generator wrote files that are not committed:"
+            $untracked | ForEach-Object { Write-Host "  $_" }
+            exit 1
+          }
 
       # Code review 2026-08-08, finding O-1. The suite has `#[ignore]`d tests and
       # CI ran NONE of them, so the only *executable* guards for the Phase H
@@ -402,3 +464,24 @@ jobs:
           export LIBCLANG_PATH="$(dirname "$(find /usr/lib/llvm-* -name libclang.so 2>/dev/null | sort | tail -1)")"
           echo "LIBCLANG_PATH=$LIBCLANG_PATH"
           cargo test --locked --bin cimp
+
+      # The Linux half of the V42 Phase E check (see the Windows job's note,
+      # including why the untracked half is needed and why it skips
+      # `--exclude-standard`). This copy is the one that would catch a
+      # platform-dependent generator: a line ending, a path separator in a
+      # `#[ts(type = "import('…')")]` seam, or a HashMap iteration order that
+      # happens to be stable on one OS.
+      - name: Generated settings bindings are up to date
+        shell: bash
+        run: |
+          set -e
+          if ! git diff --exit-code -- src/lib/settings/generated; then
+            echo "::error::the committed settings bindings differ from what the suite just generated — run cargo test and commit src/lib/settings/generated."
+            exit 1
+          fi
+          untracked=$(git ls-files --others -- src/lib/settings/generated)
+          if [ -n "$untracked" ]; then
+            echo "::error::the generator wrote files that are not committed:"
+            echo "$untracked"
+            exit 1
+          fi

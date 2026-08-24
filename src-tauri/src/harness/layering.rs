@@ -18,9 +18,11 @@
 //! three were added after the first two tests shipped a defect each — the story
 //! is on [`executable_text`], and it is worth reading before touching this file.
 //!
-//! The tree-reading tests use the repo's existing source-scanning idiom:
-//! `CARGO_MANIFEST_DIR` is `<repo>/src-tauri`, so `src/` is one join away and no
-//! path is hard-coded relative to a working directory.
+//! The tree-reading tests get their tree from [`crate::rustsrc::source_files`]
+//! — the one audited walk in this crate (R11), rooted at `CARGO_MANIFEST_DIR`
+//! rather than the cwd, `\r`-normalised at the read, dot-directories skipped,
+//! and floored against a vacuous answer. This file used to carry its own copy,
+//! which was one of the two that stripped no `\r`.
 //!
 //! # What "harness-owned" means here
 //!
@@ -33,46 +35,11 @@
 //! see outside `harness/`, which is the two-sources-of-truth discipline the rest
 //! of this milestone is built on.
 
+use crate::rustsrc::{source_files, src_root};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use super::contract::{self, Dep, Harness};
-
-/// `<repo>/src-tauri/src`.
-fn src_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
-}
-
-/// Every `.rs` file under `src/`, as `(repo-relative-ish path with forward
-/// slashes, contents)`. Paths are rooted at `src/` so the allowlists below read
-/// the way a person would write them.
-fn source_files() -> Vec<(String, String)> {
-    fn walk(dir: &Path, root: &Path, out: &mut Vec<(String, String)>) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for e in entries.flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                walk(&p, root, out);
-            } else if p.extension().and_then(|s| s.to_str()) == Some("rs") {
-                let rel = p
-                    .strip_prefix(root)
-                    .unwrap_or(&p)
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                if let Ok(text) = std::fs::read_to_string(&p) {
-                    out.push((rel, text));
-                }
-            }
-        }
-    }
-    let root = src_root();
-    let mut out = Vec::new();
-    walk(&root, &root, &mut out);
-    out.sort();
-    out
-}
 
 /// Drop every `#[cfg(test)]` item and every comment line.
 ///

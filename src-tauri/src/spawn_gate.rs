@@ -359,18 +359,14 @@ mod tests {
     /// expression instead of blanket-exempting a file, and
     /// [`no_process_spawn_call_escapes_the_gate`] fails if an entry stops
     /// matching an ungated hit — so an exemption cannot outlive its reason.
+    /// V42 Phase A1-3 retired this list's two `ipc/commands.rs` rows rather
+    /// than moving them. Both were an offload accessor's `.status()` colliding
+    /// with `Command::status()` in the one file that also opens a folder; those
+    /// bodies are `service::offload` use cases now, and a use case is named for
+    /// what it answers (`primary_state`, `aggregate_state`), so the collision no
+    /// longer exists to exempt. An exemption that can be DELETED is a better
+    /// outcome than one that is moved.
     const CALL_EXEMPT: &[(&str, &str, &str)] = &[
-        (
-            "ipc/commands.rs",
-            "supervisor.status()",
-            "`OffloadSupervisor::status()` — the offload server's state for the settings panel. \
-             An async accessor over in-process state; spawns nothing.",
-        ),
-        (
-            "ipc/commands.rs",
-            "service.status()",
-            "The graph/index service's own status accessor. Same shape as the supervisor row.",
-        ),
         (
             "offload/mcp_host.rs",
             "resp.status()",

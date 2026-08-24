@@ -223,7 +223,7 @@ pub fn updates_enabled(s: &Settings) -> bool {
 /// Naming the layer, nothing more. It changes no verdict — no caller may use it
 /// to admit an update — and it never widens what runs: `updates_enabled` is
 /// unchanged, so the updater stays app-scoped and one worker override still does
-/// not start it. Its consumers are the refusal `ipc::commands::updates_allowed`
+/// not start it. Its consumers are the refusal `service::offload::updates_allowed`
 /// hands the user and the `worker_only_detection` field of [`UpdaterStatus`],
 /// which the Settings surface renders instead of re-deriving the conjunction in
 /// TypeScript.

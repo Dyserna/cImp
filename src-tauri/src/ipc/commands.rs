@@ -18,6 +18,7 @@ use crate::service::graph::{
     VizGraphResult,
 };
 use crate::service::harness::{HarnessService, HarnessStatus, HarnessUsage};
+use crate::service::offload::{OffloadServerUseCases, OffloadServiceUseCases};
 use crate::service::usage::{AdvisorRules, AdvisorSnapshot, UsageService};
 use crate::service::workbench::WorkbenchUseCases;
 use crate::settings::{AiToolTabConfig, Settings, TabConfig};
@@ -1112,13 +1113,31 @@ pub async fn settings_update(
 // `offload-state` events, available only in the setup hook). These thin
 // commands drive its lifecycle from the Settings UI.
 
+/// Build the offload server/pool use cases over this app's handle. One place,
+/// so no command can drift in what it hands them.
+fn offload_server_use_cases(
+    supervisor: &std::sync::Arc<crate::offload::OffloadSupervisor>,
+) -> OffloadServerUseCases<'_> {
+    OffloadServerUseCases::new(supervisor)
+}
+
+/// Build the warm-offload-service use cases over this app's handle. Separate
+/// from [`offload_server_use_cases`] because the two are separate managed
+/// states: the supervisor owns the processes, the service owns the MCP host and
+/// the dashboard, and no command needs both.
+fn offload_service_use_cases(
+    service: &std::sync::Arc<crate::offload::OffloadService>,
+) -> OffloadServiceUseCases<'_> {
+    OffloadServiceUseCases::new(service)
+}
+
 /// Current offload server status (state + discovered `n_ctx`/slots/in-flight)
 /// for the **primary** local backend (legacy single-status readout).
 #[tauri::command]
 pub async fn offload_status(
     supervisor: State<'_, std::sync::Arc<crate::offload::OffloadSupervisor>>,
 ) -> AppResult<crate::offload::OffloadState> {
-    Ok(supervisor.status().await)
+    Ok(offload_server_use_cases(&supervisor).primary_state().await)
 }
 
 /// V8-02: per-backend status for every enabled backend in the pool (Local
@@ -1128,7 +1147,7 @@ pub async fn offload_status(
 pub async fn offload_statuses(
     supervisor: State<'_, std::sync::Arc<crate::offload::OffloadSupervisor>>,
 ) -> AppResult<Vec<crate::offload::supervisor::BackendStatus>> {
-    Ok(supervisor.statuses().await)
+    Ok(offload_server_use_cases(&supervisor).backend_states().await)
 }
 
 /// V8-02: start one named Local backend (idempotent). `command_override`
@@ -1141,13 +1160,8 @@ pub async fn offload_backend_start(
     name: String,
     command_override: Option<String>,
 ) -> AppResult<()> {
-    supervisor
-        .inner()
-        .start_backend(
-            &name,
-            command_override,
-            crate::offload::supervisor::StartCause::Ipc,
-        )
+    offload_server_use_cases(&supervisor)
+        .start_backend(&name, command_override)
         .await
 }
 
@@ -1157,9 +1171,7 @@ pub async fn offload_backend_stop(
     supervisor: State<'_, std::sync::Arc<crate::offload::OffloadSupervisor>>,
     name: String,
 ) -> AppResult<()> {
-    supervisor
-        .stop_backend(&name, crate::offload::supervisor::StopCause::Ipc)
-        .await;
+    offload_server_use_cases(&supervisor).stop_backend(&name).await;
     Ok(())
 }
 
@@ -1169,7 +1181,7 @@ pub async fn offload_backend_restart(
     supervisor: State<'_, std::sync::Arc<crate::offload::OffloadSupervisor>>,
     name: String,
 ) -> AppResult<()> {
-    supervisor.inner().restart_backend(&name).await
+    offload_server_use_cases(&supervisor).restart_backend(&name).await
 }
 
 /// Start the offload `llama-server` (idempotent).
@@ -1177,10 +1189,7 @@ pub async fn offload_backend_restart(
 pub async fn offload_server_start(
     supervisor: State<'_, std::sync::Arc<crate::offload::OffloadSupervisor>>,
 ) -> AppResult<()> {
-    supervisor
-        .inner()
-        .start(crate::offload::supervisor::StartCause::Ipc)
-        .await
+    offload_server_use_cases(&supervisor).start_server().await
 }
 
 /// Stop the offload `llama-server` (idempotent).
@@ -1188,9 +1197,7 @@ pub async fn offload_server_start(
 pub async fn offload_server_stop(
     supervisor: State<'_, std::sync::Arc<crate::offload::OffloadSupervisor>>,
 ) -> AppResult<()> {
-    supervisor
-        .stop(crate::offload::supervisor::StopCause::Ipc)
-        .await;
+    offload_server_use_cases(&supervisor).stop_server().await;
     Ok(())
 }
 
@@ -1200,7 +1207,7 @@ pub async fn offload_server_stop(
 pub async fn offload_server_restart(
     supervisor: State<'_, std::sync::Arc<crate::offload::OffloadSupervisor>>,
 ) -> AppResult<()> {
-    supervisor.inner().restart().await
+    offload_server_use_cases(&supervisor).restart_server().await
 }
 
 /// Run a canned offload task against the local server and return its
@@ -1210,15 +1217,7 @@ pub async fn offload_test(
     supervisor: State<'_, std::sync::Arc<crate::offload::OffloadSupervisor>>,
     instructions: String,
 ) -> AppResult<String> {
-    let task = if instructions.trim().is_empty() {
-        "Briefly confirm you are reachable and list the tools available to you.".to_string()
-    } else {
-        instructions
-    };
-    supervisor
-        .inner()
-        .run_task(task, crate::offload::agent::ThinkingMode::Auto)
-        .await
+    offload_server_use_cases(&supervisor).run_test(instructions).await
 }
 
 /// V21: derive a harness's local-provider block from a Local backend's server
@@ -1243,30 +1242,7 @@ pub async fn offload_derive_local_provider(
     harness: Option<String>,
     server_command: String,
 ) -> AppResult<crate::settings::LocalProviderBlock> {
-    let writers: Vec<crate::harness::HarnessId> = match harness.as_deref().map(str::trim) {
-        Some(h) if !h.is_empty() => vec![crate::harness::HarnessId::from_id(h).ok_or_else(|| {
-            crate::error::AppError::Offload(format!("{h:?} names no registered harness"))
-        })?],
-        _ => crate::harness::registry::all()
-            .filter(|h| h.plugin().is_some_and(|p| p.config_writer().is_some()))
-            .collect(),
-    };
-    let [only] = writers[..] else {
-        return Err(crate::error::AppError::Offload(format!(
-            "which harness should this provider be written for? {} of them accept one — name it",
-            writers.len()
-        )));
-    };
-    let writer = only
-        .plugin()
-        .and_then(|p| p.config_writer())
-        .ok_or_else(|| {
-            crate::error::AppError::Offload(format!(
-                "{} is not configured through a provider block cImp writes",
-                only.label()
-            ))
-        })?;
-    writer.derive_local_provider(&server_command)
+    crate::service::offload::derive_local_provider(harness.as_deref(), &server_command)
 }
 
 /// V8-03: aggregate offload-service status — the honest global in-flight
@@ -1276,7 +1252,7 @@ pub async fn offload_derive_local_provider(
 pub async fn offload_service_status(
     service: State<'_, std::sync::Arc<crate::offload::OffloadService>>,
 ) -> AppResult<crate::offload::service::ServiceStatus> {
-    Ok(service.status().await)
+    Ok(offload_service_use_cases(&service).aggregate_state().await)
 }
 
 /// Reconcile the warm MCP host against the *current* settings and return the
@@ -1287,8 +1263,7 @@ pub async fn offload_service_status(
 pub async fn offload_reload_mcp(
     service: State<'_, std::sync::Arc<crate::offload::OffloadService>>,
 ) -> AppResult<crate::offload::service::ServiceStatus> {
-    service.warm_host().await;
-    Ok(service.status().await)
+    Ok(offload_service_use_cases(&service).reload_mcp().await)
 }
 
 /// V32 Phase C/C3: how much of the injection-detection surface is actually live
@@ -1307,17 +1282,7 @@ pub async fn detection_status(
     state: State<'_, AppState>,
     reload: bool,
 ) -> AppResult<crate::offload::detection::DetectionStatus> {
-    let settings = state.settings.current();
-    let status = tokio::task::spawn_blocking(move || {
-        if reload {
-            crate::offload::detection::reload(&settings)
-        } else {
-            crate::offload::detection::status(&settings)
-        }
-    })
-    .await
-    .map_err(|e| AppError::Offload(format!("detection status task failed: {e}")))?;
-    Ok(status)
+    crate::service::offload::detection_status(state.settings.current(), reload).await
 }
 
 /// V32 Phase C3: run an update check right now for one component (or both when
@@ -1341,19 +1306,12 @@ pub async fn detection_check_now(
     component: Option<String>,
     apply: bool,
 ) -> AppResult<crate::offload::detection::DetectionStatus> {
-    use crate::offload::detection::updater::{self, manifest::Component};
-    let settings = state.settings.current();
-    updates_allowed(&settings)?;
-    let components: Vec<Component> = match component.as_deref() {
-        None | Some("") => Component::ALL.to_vec(),
-        Some(name) => vec![Component::parse(name).ok_or_else(|| {
-            AppError::Offload(format!(
-                "unknown detection component `{name}` (expected \"rules\")"
-            ))
-        })?],
-    };
-    updater::run_live(&components, &settings, apply).await;
-    Ok(crate::offload::detection::status(&settings))
+    crate::service::offload::detection_check_now(
+        &state.settings.current(),
+        component.as_deref(),
+        apply,
+    )
+    .await
 }
 
 /// V32 Phase C3: restore a component's retained previous version — the Settings
@@ -1367,93 +1325,20 @@ pub async fn detection_revert(
     state: State<'_, AppState>,
     component: String,
 ) -> AppResult<crate::offload::detection::DetectionStatus> {
-    use crate::offload::detection::updater::{self, manifest::Component};
-    let settings = state.settings.current();
-    updates_allowed(&settings)?;
-    let c = Component::parse(&component).ok_or_else(|| {
-        AppError::Offload(format!(
-            "unknown detection component `{component}` (expected \"rules\" or \"classifier\")"
-        ))
-    })?;
-    tokio::task::spawn_blocking(move || updater::revert_live(c))
-        .await
-        .map_err(|e| AppError::Offload(format!("detection revert task failed: {e}")))?;
-    Ok(crate::offload::detection::status(&settings))
-}
-
-/// The updater's gate for the two manual commands above, resolved through the
-/// same [`updater::updates_enabled`](crate::offload::detection::updater::updates_enabled)
-/// the scheduler tick uses — one predicate, so a button and a tick can never
-/// disagree about whether the feature is on.
-///
-/// An `Err` rather than a silently unchanged status: a security control that
-/// does nothing when clicked, and says nothing about it, teaches the user to
-/// distrust it (the same reasoning as `latch_override`'s verbatim errors).
-///
-/// **#48 (M-21): three refusals, because there are three states and they are
-/// different statements.** The gate is unchanged — one predicate,
-/// `updates_enabled`, so a button and a tick can still never disagree — but *why*
-/// it said no is not always "detection is off". A worker-scope override leaves
-/// this updater inert while injection detection is armed for the offload worker,
-/// which keeps screening with the bundle already on disk; telling that user their
-/// detection is switched off is a false claim about a running security layer, and
-/// it is the claim they would act on.
-///
-/// The third case is M-21's residual, folded in with F-35: the **L1 master** is
-/// off, which resolves detection off with it. Saying "injection detection is
-/// switched off" there points the user at the wrong switch — the one they can
-/// flip without effect until the master above it is back on. `SettingsApp.svelte`
-/// had already added this distinction as a frontend refinement; the two surfaces
-/// now single-source from the same three cases rather than the tooltip being
-/// more specific than the error.
-///
-/// Checked in the frontend's order, which is also the only correct one: the
-/// master-off case cannot collide with `worker_only_detection` (`decide`
-/// short-circuits every feature to `false` with L1 off, so no scope is armed),
-/// and the generic sentence keeps its parenthetical about the master because it
-/// is still the fall-through for a state nobody positively identified.
-///
-/// **Reporting only, and asserted as such** — every branch still returns `Err`.
-/// Reporting honesty must not become a new capability.
-fn updates_allowed(settings: &crate::settings::Settings) -> AppResult<()> {
-    use crate::offload::detection::updater;
-    if updater::updates_enabled(settings) {
-        return Ok(());
-    }
-    if updater::worker_only_detection(settings) {
-        return Err(AppError::Settings(
-            "injection detection is switched off app-wide and for every AI tab, so the detection \
-             updater will not check, apply or revert anything. It is still switched ON for the \
-             offload worker, which keeps screening with the rule bundle already on disk — the \
-             updater follows the app-wide answer, and one worker override does not start it. To \
-             keep that bundle current, turn injection detection back on app-wide in \
-             Settings → Injection protection."
-                .to_string(),
-        ));
-    }
-    if !crate::settings::injection::master_enabled(settings) {
-        return Err(AppError::Settings(
-            "injection protection is switched off at the master switch, which resolves injection \
-             detection off with it — so the detection updater will not check, apply or revert \
-             anything. Turn the master switch, and injection detection under it, back on in \
-             Settings → Injection protection."
-                .to_string(),
-        ));
-    }
-    // Reached only when the worker's row is off too and the master is on, which
-    // is what makes this sentence true rather than merely conventional.
-    Err(AppError::Settings(
-        "injection detection is switched off, so the detection updater will not check, apply or \
-         revert anything. Turn it (and the injection-protection master above it) back on in \
-         Settings → Injection protection."
-            .to_string(),
-    ))
+    crate::service::offload::detection_revert(&state.settings.current(), &component).await
 }
 
 /// V32 Phase C3: open `<exe-dir>/detection/rules.d/` in the host file manager,
 /// creating it first so the call does not fail on a layout where the folder was
 /// never staged. Same shape as [`content_open_folder`] — one pattern for "show
 /// me this directory".
+///
+/// **Left as a direct call** (V42 Phase A): the body is a `create_dir_all` and
+/// a platform `cfg!` handing a cImp-computed path to the host file manager —
+/// there is nothing to assert here that does not assert `explorer.exe`. And
+/// [`spawn_ledger`](crate::spawn_ledger)'s row of record names THIS file as the
+/// spawn site of both folder openers; moving an audited spawn to a service that
+/// buys no testability would move the audit for nothing.
 #[tauri::command]
 pub async fn detection_open_rules_folder() -> AppResult<()> {
     let dir = crate::offload::detection::signature::rules_dir().ok_or_else(|| {
@@ -1500,6 +1385,12 @@ pub async fn detection_open_rules_folder() -> AppResult<()> {
 /// `latch::TabLatch::awaiting_session_clear`. It grants nothing the next
 /// gated call would not have granted anyway; it only decides when the same fact
 /// becomes visible.
+///
+/// **Left as a direct call** (V42 Phase A): one call on the `AppHandle` Tauri
+/// injected, and the reason it needs one — the latch scope resolves through the
+/// V28 live-session registry — is the seam V42 #114 (loopback: latch +
+/// discovery) exists to unpick. A service in front of it would have to be
+/// undone by that work. Same for [`latch_override`] and [`injection_status`].
 #[tauri::command]
 pub async fn latch_status(
     app: tauri::AppHandle,
@@ -1516,6 +1407,9 @@ pub async fn latch_status(
 /// Introspection is part of the feature, not a debug affordance: with three
 /// levels, "why is this tab not latching?" must be answerable without reading
 /// code.
+///
+/// **Left as a direct call**, for [`latch_status`]'s reason: the resolver is
+/// `offload::loopback`'s, and #114 owns where it lives.
 #[tauri::command]
 pub async fn injection_status(state: State<'_, AppState>) -> AppResult<serde_json::Value> {
     Ok(crate::offload::loopback::injection_status(
@@ -1554,6 +1448,12 @@ pub async fn injection_status(state: State<'_, AppState>) -> AppResult<serde_jso
 /// V28 live-session registry, exactly as a gated tool call resolves it: an
 /// override must apply to the conversation the tab is running NOW, not to a
 /// stale row left by a previous session.
+///
+/// **Left as a direct call**, for [`latch_status`]'s reason — and one more
+/// here: `offload::loopback`'s route scan asserts that the only caller of
+/// `apply_latch_override` is this command, by the exact spelling of the call
+/// below. That tripwire is the record of "the clearing path is not an HTTP
+/// door", so the call site does not move on a mechanical wrap.
 #[tauri::command]
 pub async fn latch_override(
     app: tauri::AppHandle,
@@ -1573,7 +1473,7 @@ pub async fn offload_server_log(
     supervisor: State<'_, std::sync::Arc<crate::offload::OffloadSupervisor>>,
     name: Option<String>,
 ) -> AppResult<Vec<String>> {
-    Ok(supervisor.server_logs(name))
+    Ok(offload_server_use_cases(&supervisor).server_log(name))
 }
 
 /// V8-03: latest Offload Server dashboard snapshot — one row per enabled
@@ -1584,7 +1484,7 @@ pub async fn offload_server_log(
 pub async fn offload_server_metrics(
     service: State<'_, std::sync::Arc<crate::offload::OffloadService>>,
 ) -> AppResult<Vec<crate::offload::metrics::BackendDashboard>> {
-    Ok(service.server_metrics())
+    Ok(offload_service_use_cases(&service).server_metrics())
 }
 
 /// V22 Phase D: detect the project's languages/tooling and return `run_check`
@@ -2751,7 +2651,6 @@ pub async fn restart_shell_tab(app: AppHandle, tab: TabId) -> AppResult<()> {
 mod tests {
     use super::is_automatic_terminal_response as auto_reply;
     use super::read_only_refusal;
-    use crate::settings::Settings;
     use crate::state::{ReadOnlySource, TabId};
 
     /// **The facade knobs are a NARROW write** (V39 review M-10).
@@ -2995,82 +2894,6 @@ mod tests {
                 read_only_refusal(&ReadOnlySource::User, keys, None).is_some(),
                 "user input slipped through the lock: {keys:?}"
             );
-        }
-    }
-
-    /// **#48 (M-21): the manual buttons' refusal names the layer that is off.**
-    ///
-    /// The gate is unchanged and stays app-scoped — a worker-only override does
-    /// not start the updater — so both cases below still refuse. What is asserted
-    /// is the sentence: a user whose offload worker is screening every fetched
-    /// page must not be told their injection detection is switched off, because
-    /// that is a false statement about a running security layer and it is the one
-    /// they would act on.
-    #[test]
-    fn the_updater_refusal_does_not_call_a_running_layer_off() {
-        use crate::settings::injection::{Feature, Override};
-
-        // Detection off everywhere: the plain sentence, and it is true.
-        let mut off = Settings::default();
-        off.set_l2_for_test(Feature::Detection, false);
-        let plain = super::updates_allowed(&off).expect_err("the updater is off");
-        let plain = plain.to_string();
-        assert!(plain.contains("injection detection is switched off,"), "{plain}");
-        assert!(!plain.contains("offload worker"), "nothing is running: {plain}");
-
-        // M-21's state: off app-wide, ON for the offload worker. Still refused —
-        // the scope semantics are deliberate — but for the reason that is true.
-        let mut worker = off.clone();
-        worker
-            .set_worker_override_for_test(Feature::Detection, Override::On)
-            .expect("detection has a worker row");
-        assert!(
-            super::updates_allowed(&worker).is_err(),
-            "reporting honesty must not become a new capability"
-        );
-        let named = super::updates_allowed(&worker)
-            .expect_err("still refused")
-            .to_string();
-        assert!(
-            named.contains("still switched ON for the offload worker"),
-            "the running layer must be named: {named}"
-        );
-        assert!(
-            !named.contains("injection detection is switched off,"),
-            "the false claim must not survive beside the true one: {named}"
-        );
-        // #48 F-35, M-21's residual: the THIRD state. The L1 master is off,
-        // which resolves detection off with it — so "injection detection is
-        // switched off" points at the wrong switch, the one the user can flip
-        // with no effect until the master above it is back on. The frontend had
-        // already made this distinction (`detectionUpdatesOffReason`); the two
-        // surfaces now single-source from the same three cases.
-        let mut master = Settings::default();
-        master.set_master_for_test(false);
-        assert!(
-            super::updates_allowed(&master).is_err(),
-            "reporting honesty must not become a new capability"
-        );
-        let l1 = super::updates_allowed(&master)
-            .expect_err("still refused")
-            .to_string();
-        assert!(
-            l1.contains("master switch"),
-            "the switch that is actually off must be named: {l1}"
-        );
-        assert!(
-            !l1.contains("injection detection is switched off,"),
-            "the sentence that points at the wrong switch must not survive: {l1}"
-        );
-        assert!(
-            !l1.contains("offload worker"),
-            "an L1 off arms nothing anywhere: {l1}"
-        );
-
-        // All three refusals point at a section the sidebar has (F-18's tripwire
-        // holds the pointer itself; this holds that the new sentences carry one).
-        for r in [&plain, &named, &l1] {
-            assert!(r.contains("Injection protection"), "{r}");
         }
     }
 

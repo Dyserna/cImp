@@ -43,6 +43,7 @@ pub mod checks;
 pub mod graph;
 pub mod harness;
 pub mod layout;
+pub mod offload;
 pub mod pty;
 pub mod settings;
 pub mod sink;

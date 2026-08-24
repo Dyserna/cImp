@@ -324,7 +324,8 @@ export interface DelegationChanged {
 }
 
 /// What `tab_set_delegation_role` did, for the toast. Mirror of Rust
-/// `ipc::commands::RoleChange`. `displaced` is the tab that LOST Manual to this
+/// `service::delegation::RoleChange` (re-exported as `ipc::commands::RoleChange`,
+/// which is the command's return type). `displaced` is the tab that LOST Manual to this
 /// call — `null` when nothing moved.
 export interface RoleChange {
   tab: string;

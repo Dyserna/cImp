@@ -41,6 +41,7 @@
 pub mod audit;
 pub mod audio;
 pub mod checks;
+pub mod delegation;
 pub mod graph;
 pub mod harness;
 pub mod layout;

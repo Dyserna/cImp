@@ -10,6 +10,7 @@ use crate::pty::PtyHost;
 use crate::service::pty::PtyService;
 use crate::service::audio::AudioService;
 use crate::service::checks::{ApplySummary, ChecksService, ChecksSuggestion};
+use crate::service::delegation::DelegationControls;
 use crate::service::settings::SettingsService;
 use crate::service::sink::{OutputSink, TauriEventSink};
 use crate::service::graph::{
@@ -20,8 +21,8 @@ use crate::service::harness::{HarnessService, HarnessStatus, HarnessUsage};
 use crate::service::offload::{OffloadServerUseCases, OffloadServiceUseCases};
 use crate::service::usage::{AdvisorRules, AdvisorSnapshot, UsageService};
 use crate::service::workbench::WorkbenchUseCases;
-use crate::settings::{AiToolTabConfig, Settings, TabConfig};
-use crate::state::{StateSignal, TabId, TabKind};
+use crate::settings::{AiToolTabConfig, Settings};
+use crate::state::{StateSignal, TabId};
 
 /// V1.4-04 D: `pty_start` returns the persisted-scrollback bytes from the
 /// previous session (if any) — see [`PtyService::start`] for the whole
@@ -143,59 +144,25 @@ pub async fn pty_write(state: State<'_, AppState>, tab: TabId, input: String) ->
     pty_service(&state).write(tab, input).await
 }
 
-/// V39 Phase A: set or clear a tab's **user** read-only lock (locked
-/// decision 4's `ReadOnlySource::User`) — the Access radio in the tab's
-/// communication popover.
-///
-/// Does two things, in this order: takes the runtime lock (so it is in force
-/// before this call returns, with no window in which the UI shows "read-only"
-/// and the PTY still accepts keys), then persists the flag so it survives a
-/// restart. The persisted write broadcasts `settings-changed`, which is how
-/// the frontend learns the new state — there is no separate event.
-///
-/// Only ever sets `User`. The engine's `Driven` lock is not reachable from
-/// here: it belongs to a delegation's lifetime, and "Take over" (Phase B), not
-/// a radio button, is what ends one.
-#[tauri::command]
-pub async fn tab_set_read_only(state: State<'_, AppState>, tab: TabId, on: bool) -> AppResult<()> {
-    if tab.kind() != TabKind::AiTool {
-        return Err(AppError::Ipc(format!(
-            "tab `{}` is not an AI tab; the read-only lock applies to AI tabs only",
-            tab.as_str()
-        )));
-    }
-    if !matches!(
-        state.settings.current().find_tab(tab.as_str()),
-        Some(TabConfig::AiTool(_))
-    ) {
-        return Err(AppError::Ipc(format!(
-            "unknown AI tab `{}`",
-            tab.as_str()
-        )));
-    }
-    state.read_only.set_user(&tab, on);
-    let id = tab.as_str().to_string();
-    state.settings.mutate(move |snap| {
-        if let Some(TabConfig::AiTool(cfg)) = snap.find_tab_mut(&id) {
-            cfg.read_only = on;
-        }
-    });
-    Ok(())
+/// Build the per-tab delegation controls over this app's handles. One place,
+/// so the three popover commands cannot drift in what they hand them.
+fn delegation_controls(state: &AppState) -> DelegationControls<'_> {
+    DelegationControls::new(&state.settings, &state.tabs, &state.read_only)
 }
 
-/// V39 Phase B: what `tab_set_delegation_role` did, for the UI's toast.
-///
-/// `displaced` is the id of the tab that LOST the Manual role to this call
-/// (locked decision 8's move rule) — `None` when nothing moved. Returned rather
-/// than only recorded because the losing tab may not be visible, and a role
-/// that moved silently is a `delegate_task_*` tool that started driving a
-/// different tab with nothing on screen saying so.
-#[derive(serde::Serialize)]
-pub struct RoleChange {
-    pub tab: String,
-    pub role: crate::settings::DelegationRole,
-    pub displaced: Option<String>,
+/// V39 Phase A: set or clear a tab's **user** read-only lock — the Access radio
+/// in the tab's communication popover. See
+/// [`DelegationControls::set_read_only`] for why the runtime lock is taken
+/// before the persisted flag is written.
+#[tauri::command]
+pub async fn tab_set_read_only(state: State<'_, AppState>, tab: TabId, on: bool) -> AppResult<()> {
+    delegation_controls(&state).set_read_only(&tab, on)
 }
+
+/// V39 Phase B: what [`tab_set_delegation_role`] did, for the UI's toast.
+/// Defined in [`service::delegation`](crate::service::delegation) and named
+/// here because `src/lib/delegation.ts`'s mirror points at this path.
+pub use crate::service::delegation::RoleChange;
 
 /// V39 Phase B (locked decision 8): set a tab's delegation role, enforcing
 /// **at most one Manual tab per harness**.
@@ -225,108 +192,7 @@ pub async fn tab_set_delegation_role(
     tab: TabId,
     role: crate::settings::DelegationRole,
 ) -> AppResult<RoleChange> {
-    use crate::settings::DelegationRole;
-
-    if tab.is_reserved_dashboard() {
-        return Err(AppError::Ipc(format!(
-            "tab `{}` is an app-rendered dashboard, not a harness tab; it has no delegation role",
-            tab.as_str()
-        )));
-    }
-    if tab.kind() != TabKind::AiTool {
-        return Err(AppError::Ipc(format!(
-            "tab `{}` is not an AI tab; delegation roles apply to AI tabs only",
-            tab.as_str()
-        )));
-    }
-    let settings = state.settings.current();
-    let Some(TabConfig::AiTool(cfg)) = settings.find_tab(tab.as_str()) else {
-        return Err(AppError::Ipc(format!("unknown AI tab `{}`", tab.as_str())));
-    };
-    let Some(agent) = crate::tabs::tab_consumer(cfg) else {
-        // V40 Phase A (locked decision 2): a tab whose command names no
-        // registered harness is not a worker at all. It used to be classified
-        // as OpenCode here, become eligible for that harness's Manual slot, and
-        // be typed into with OpenCode's paste rules.
-        return Err(AppError::Ipc(format!(
-            "tab `{}` runs no registered harness, so cImp has no way to type a turn into \
-             it - it cannot hold a delegation role",
-            tab.as_str()
-        )));
-    };
-    if crate::harness::input_profile(agent).is_none() {
-        return Err(AppError::Ipc(format!(
-            "tab `{}` runs a harness with no input profile, so cImp could never type a turn into \
-             it — it cannot hold a delegation role",
-            tab.as_str()
-        )));
-    }
-
-    // Who currently holds Manual for this harness, if anyone. Read before the
-    // mutation so the row and the return value name the same tab the mutation
-    // is about to clear.
-    let displaced: Option<(String, String)> = if role == DelegationRole::Manual {
-        settings.tabs.iter().find_map(|t| match t {
-            TabConfig::AiTool(c)
-                if c.delegation_role == DelegationRole::Manual
-                    && c.id != tab.as_str()
-                    && crate::tabs::tab_consumer(c) == Some(agent) =>
-            {
-                Some((c.id.clone(), c.name.clone()))
-            }
-            _ => None,
-        })
-    } else {
-        None
-    };
-
-    let id = tab.as_str().to_string();
-    let losing = displaced.as_ref().map(|(id, _)| id.clone());
-    let agent_for_mutate = agent;
-    state.settings.mutate(move |snap| {
-        // ONE mutation for both writes: a snapshot in which two tabs of one
-        // harness hold Manual must never be observable by a broadcast reader.
-        for t in snap.tabs.iter_mut() {
-            let TabConfig::AiTool(c) = t else { continue };
-            if c.id == id {
-                c.delegation_role = role;
-            } else if role == DelegationRole::Manual
-                && c.delegation_role == DelegationRole::Manual
-                && crate::tabs::tab_consumer(c) == Some(agent_for_mutate)
-            {
-                c.delegation_role = DelegationRole::None;
-            }
-        }
-    });
-
-    if let Some((lost_id, lost_name)) = &displaced {
-        let taker = {
-            let registry = state.tabs.lock().await;
-            registry
-                .name_of(&tab)
-                .unwrap_or_else(|| tab.as_str().to_string())
-        };
-        crate::delegation::record_row(
-            crate::delegation::transition::ROLE_MOVED,
-            lost_name,
-            Some(&format!(
-                "the Manual role for this harness moved to `{taker}`"
-            )),
-            agent,
-            Some(tab.as_str()),
-            true,
-            0,
-            String::new(),
-            String::new(),
-        );
-        tracing::info!(from = %lost_id, to = %tab.as_str(), harness = %agent, "delegation: Manual role moved");
-    }
-
-    Ok(RoleChange {
-        tab: tab.as_str().to_string(),
-        role,
-        displaced: losing,
-    })
+    delegation_controls(&state).set_role(&tab, role).await
 }
 
 /// **Write one tab's facade-backend knobs, and nothing else** (V39 review
@@ -353,49 +219,7 @@ pub async fn tab_set_delegation_backend(
     tab: TabId,
     backend: crate::settings::DelegationBackend,
 ) -> AppResult<()> {
-    if tab.kind() != TabKind::AiTool {
-        return Err(AppError::Ipc(format!(
-            "tab `{}` is not an AI tab; delegation backends are configured on AI tabs only",
-            tab.as_str()
-        )));
-    }
-    if !matches!(
-        state.settings.current().find_tab(tab.as_str()),
-        Some(TabConfig::AiTool(_))
-    ) {
-        return Err(AppError::Ipc(format!("unknown AI tab `{}`", tab.as_str())));
-    }
-    let backend = normalise_backend(backend);
-    let id = tab.as_str().to_string();
-    state.settings.mutate(move |snap| {
-        if let Some(TabConfig::AiTool(cfg)) = snap.find_tab_mut(&id) {
-            apply_backend_patch(cfg, backend);
-        }
-    });
-    Ok(())
-}
-
-/// The two "blank means unset" rules, at the parse boundary rather than at
-/// every reader: a cleared text field arrives as `""` and a cleared number
-/// field as `0`, and both mean "use the default".
-fn normalise_backend(
-    mut backend: crate::settings::DelegationBackend,
-) -> crate::settings::DelegationBackend {
-    backend.name = backend
-        .name
-        .map(|n| n.trim().to_string())
-        .filter(|n| !n.is_empty());
-    backend.declared_context = backend.declared_context.filter(|n| *n > 0);
-    backend
-}
-
-/// Write the knobs onto one tab's config. **Only** the knobs — separated out
-/// so a test can state that, since the command itself needs a running app.
-fn apply_backend_patch(
-    cfg: &mut crate::settings::AiToolTabConfig,
-    backend: crate::settings::DelegationBackend,
-) {
-    cfg.delegation_backend = backend;
+    delegation_controls(&state).set_backend(&tab, backend)
 }
 
 /// V39 Phase B (locked decision 6): **take over** a driven tab.
@@ -413,6 +237,12 @@ fn apply_backend_patch(
 ///
 /// Returns whether a delegation was actually in flight, so the UI can tell "I
 /// cancelled it" from "it had already finished".
+///
+/// **Left as a direct call** (V42 Phase A): the body is one call on
+/// [`crate::delegation`]'s process-global registry, which a test reaches
+/// already — no `State`, no `AppHandle`, nothing to shape. Same for
+/// [`delegation_status`] and [`delegation_statuses`] below. The registry's own
+/// ambient-global shape is V42 #114's question, not a wrap's.
 #[tauri::command]
 pub async fn delegation_take_over(tab: TabId) -> AppResult<bool> {
     Ok(crate::delegation::take_over(&tab).is_some())
@@ -424,6 +254,8 @@ pub async fn delegation_take_over(tab: TabId) -> AppResult<bool> {
 /// A pull to pair with the `delegation-changed` push: the event carries every
 /// edge, and this is what a view that mounts mid-flight asks so it paints the
 /// right thing before the next edge arrives.
+///
+/// **Left as a direct call**, for [`delegation_take_over`]'s reason.
 #[tauri::command]
 pub async fn delegation_status(tab: TabId) -> AppResult<Option<crate::delegation::InFlightView>> {
     Ok(crate::delegation::status(&tab))
@@ -432,6 +264,8 @@ pub async fn delegation_status(tab: TabId) -> AppResult<Option<crate::delegation
 /// V39 Phase B: every in-flight delegation, keyed by worker tab id — the
 /// status-bar chip's count and the initial paint of every tab's glyph, in one
 /// call rather than one per tab.
+///
+/// **Left as a direct call**, for [`delegation_take_over`]'s reason.
 #[tauri::command]
 pub async fn delegation_statuses() -> AppResult<Vec<(String, crate::delegation::InFlightView)>> {
     Ok(crate::delegation::statuses())
@@ -2303,69 +2137,4 @@ pub async fn request_tab_restart(app: AppHandle, tab: TabId) -> AppResult<()> {
 #[tauri::command]
 pub async fn restart_shell_tab(app: AppHandle, tab: TabId) -> AppResult<()> {
     crate::service::tabs::request_tab_restart(&TauriEventSink::new(app), tab, true)
-}
-
-#[cfg(test)]
-mod tests {
-
-    /// **The facade knobs are a NARROW write** (V39 review M-10).
-    ///
-    /// The popover's old path sent the whole `Settings` document, which can
-    /// revert a role change that landed after its snapshot was taken (the
-    /// `40d2b32` class). What replaces it must touch the three knobs and
-    /// nothing else — least of all `delegation_role`, whose cross-tab rule
-    /// only `tab_set_delegation_role` enforces.
-    #[test]
-    fn the_backend_patch_touches_the_knobs_and_nothing_else() {
-        use crate::settings::{BackendTier, DelegationBackend, DelegationRole, TabConfig};
-        let mut tab = crate::settings::default_claude_tab();
-        let TabConfig::AiTool(cfg) = &mut tab else {
-            panic!("an AI tab");
-        };
-        cfg.delegation_role = DelegationRole::Manual;
-        cfg.read_only = true;
-        cfg.name = "api-work".to_string();
-        let before = cfg.clone();
-
-        super::apply_backend_patch(
-            cfg,
-            DelegationBackend {
-                name: Some("lan-worker-2".to_string()),
-                tier: BackendTier::Fast,
-                declared_context: Some(128_000),
-            },
-        );
-
-        assert_eq!(cfg.delegation_backend.name.as_deref(), Some("lan-worker-2"));
-        assert_eq!(cfg.delegation_backend.tier, BackendTier::Fast);
-        assert_eq!(cfg.delegation_backend.declared_context, Some(128_000));
-        assert_eq!(
-            cfg.delegation_role, before.delegation_role,
-            "the role is the one field a knob write must never move"
-        );
-        assert_eq!(cfg.read_only, before.read_only);
-        assert_eq!(cfg.name, before.name);
-        assert_eq!(cfg.command, before.command);
-    }
-
-    /// Blank is unset, at the boundary: a cleared text field arrives as `""`
-    /// and a cleared number field as `0`.
-    #[test]
-    fn a_cleared_knob_is_stored_as_absent_not_as_blank() {
-        use crate::settings::DelegationBackend;
-        let out = super::normalise_backend(DelegationBackend {
-            name: Some("   ".to_string()),
-            declared_context: Some(0),
-            ..Default::default()
-        });
-        assert_eq!(out.name, None);
-        assert_eq!(out.declared_context, None);
-        let kept = super::normalise_backend(DelegationBackend {
-            name: Some("  lan-worker-2 ".to_string()),
-            declared_context: Some(64_000),
-            ..Default::default()
-        });
-        assert_eq!(kept.name.as_deref(), Some("lan-worker-2"));
-        assert_eq!(kept.declared_context, Some(64_000));
-    }
 }

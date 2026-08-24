@@ -1513,34 +1513,15 @@ mod tests {
         // The failure this guards against is a SECOND writer appearing
         // ELSEWHERE, and a hardcoded list is blind to exactly that — the file
         // it does not name is the file the next writer lands in.
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut files: Vec<(String, String)> = Vec::new();
-        let mut stack = vec![root.clone()];
-        while let Some(dir) = stack.pop() {
-            for entry in std::fs::read_dir(&dir).expect("src is readable").flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    stack.push(path);
-                } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
-                    let name = path
-                        .strip_prefix(&root)
-                        .unwrap_or(&path)
-                        .to_string_lossy()
-                        .replace('\\', "/");
-                    // CRLF-safe: CI checks the tree out with CRLF and the
-                    // offsets `rustsrc` reports are into the stripped text.
-                    files.push((name, std::fs::read_to_string(&path).expect("utf-8")));
-                }
-            }
-        }
-        assert!(
-            files.len() > 50,
-            "the scan must actually have walked the tree, found {}",
-            files.len()
-        );
+        // The walk — dot-directories skipped, line endings normalised at the
+        // read (CI checks the tree out with CRLF and the offsets `rustsrc`
+        // reports are into the stripped text), and floored against a vacuous
+        // answer at >100 files rather than the >50 this test used to assert —
+        // is `rustsrc::source_files`, audited once for every scanner that gates
+        // on it (R11).
+        let files = crate::rustsrc::source_files();
         for (name, src) in files.iter().map(|(n, s)| (n.as_str(), s.as_str())) {
-            let src = src.replace('\r', "");
-            let code = crate::rustsrc::code_of(name, &src);
+            let code = crate::rustsrc::code_of(name, src);
             let mut body = String::new();
             let mut at = 0usize;
             for (start, end) in crate::rustsrc::test_regions(&code) {

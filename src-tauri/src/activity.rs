@@ -152,8 +152,8 @@ const DELEGATION_CAP: usize = 100;
 /// closes it is that no screen shares a window with any other — see [`Lane`].
 ///
 /// Sized for depth rather than for the old aggregate: 64 rows is more history
-/// than any screen could rely on under the shared 200 (eleven screens, ~18
-/// each), and the rare forensic screens — canary hits, beacons, user latch
+/// than any screen could rely on under the old shared 200 (then ~11 screens, ~18
+/// each; `Screen::ALL` has since grown), and the rare forensic screens — canary hits, beacons, user latch
 /// overrides — produce single digits in a whole session.
 const INJECTION_FLAG_SCREEN_CAP: usize = 64;
 /// How many lanes the `injection_flag` kind can hold: one per screen this

@@ -54,7 +54,7 @@ export function barHeightPct(total: number, max: number): number {
 /// The pricing category ids cImp's price table has rates for. These are
 /// **cImp's own provider vocabulary**, not a harness's: they are literally
 /// `PriceRates`' field names, and the backend's read boundary maps the four
-/// stored `usage_stat` columns onto them (see `graph/index.rs`). What a HARNESS
+/// stored `usage_stat` columns onto them (see `graph/index/usage.rs`). What a HARNESS
 /// declares is which of them it reports.
 export const KIND_INPUT = 'input';
 export const KIND_CACHE_WRITE = 'cache_write';

@@ -499,9 +499,152 @@ pub(crate) fn test_regions(code: &str) -> Vec<(usize, usize)> {
     out
 }
 
+/// **Production text**: `text` with every `#[cfg(test)]` item and every
+/// whole-line comment removed, for the scans whose subject is what the crate
+/// DOES rather than where in a file it does it. Used by
+/// [`crate::harness::layering`]'s four tree-wide tests and by
+/// `delegation`'s reserved-transition scan.
+///
+/// # Why this is a sibling of [`code_of`] and not a mode of it (R11)
+///
+/// The three look like they overlap, and merging them would be wrong.
+/// [`code_of`] and [`uncommented`] BLANK: they replace spans with spaces, so
+/// the result is byte-for-byte the same length as the input and a span found
+/// in it is a valid span in the original — which is the entire reason
+/// [`test_regions`] can return ranges rather than a string. This one DELETES:
+/// it is shorter than its input, and every offset into it is wrong for the
+/// original. Folding it into [`Erase`] would hand a caller a string whose
+/// offsets mean something different depending on a flag, and the callers of
+/// both families are source scanners that locate things by offset. Same
+/// module, same lexer underneath, deliberately separate contract.
+///
+/// It also keeps string and char literals — its callers' needles ARE literals
+/// (a harness-owned `"tool_name"`, a `transition::CANCELLED` path) — and drops
+/// only whole comment LINES, not trailing ones. Where that distinction matters
+/// and offsets must survive, [`uncommented`] is the answer instead.
+///
+/// Drop every `#[cfg(test)]` item and every comment line.
+///
+/// **Tests are deliberately out of scope.** A fixture that quotes a harness
+/// payload is a *recorded input*, not a dependency on one — the Phase B canary
+/// corpus is made of nothing else, and an assertion that Claude's overlay
+/// carries a `statusLine` key has to spell `statusLine` to be an assertion at
+/// all. What this scan is about is production code that *reads or writes* an
+/// upstream name; that is the thing which must sit in `harness/` so a rename
+/// upstream is a diff in one directory.
+///
+/// Comments go for the same reason: prose naming `rate_limits` is
+/// documentation, and documentation that explains the seam is wanted
+/// everywhere, not confined.
+///
+/// # Why this delegates instead of finding a boundary itself
+///
+/// It used to cut at `text.match_indices("\n#[cfg(test)]\n").last()`, and that
+/// was wrong in two independent ways — both of which shipped, and one of which
+/// only ever fired off this developer's machine:
+///
+///  1. **It was line-ending-sensitive.** `\r\n#[cfg(test)]\r\n` does not match,
+///     so a CRLF checkout found no boundary at all and fell back to scanning the
+///     WHOLE file, tests included. Every `.rs` file in this repo is LF *in the
+///     index*, but `core.autocrlf` is on by default on Windows, so the CI
+///     runner's checkout is CRLF while a working copy whose files were rewritten
+///     in place is a mix. The v0.52.0-rc.1 Tests run is the record: byte-identical
+///     content, `no_harness_literals_outside_harness` green on the Linux job and
+///     red on the Windows job with 26 hits across four files, every one inside a
+///     `mod tests`. A verification test whose coverage depends on how Git checked
+///     the file out reports on the checkout, not on the code.
+///  2. **`.last()` is not "the trailing test module".** `#[cfg(test)]` marks
+///     test-only *items*, of which a file may have many: `graph/mcp.rs` has
+///     eleven test modules, so the cut landed at the eleventh and left the first
+///     ten (~1800 lines) inside the scan. Worse in the other direction, a
+///     `#[cfg(test)] mod tests;` **declaration** is the last such item in its
+///     file — so `processing/mod.rs` was cut at line 47 of ~500 and
+///     `harness/mod.rs` at line 99, hiding the production code both tests exist
+///     to read. Silent under-coverage, which is how a canary goes vacuous.
+///
+/// Neither is fixable by a smarter single cut: `offload/mcp.rs` has production
+/// code (`proxy_graph_outcome`) *between* two test modules, so no one boundary
+/// separates test from production text. What is needed is every
+/// `#[cfg(test)]` item's span, brace-matched, with strings and comments blanked
+/// first so a `"#[cfg(test)]"` inside a literal is not mistaken for one — which
+/// is exactly what [`code_of`] and [`test_regions`] above already provide,
+/// controls and all. So this normalizes line endings, asks for the spans, and removes
+/// them.
+///
+/// What that deliberately still keeps in scope: `#[cfg(test)]`-gated *helpers*
+/// are removed along with the modules (they are test-only either way), while a
+/// plain `fn` used only by tests but not gated is production text and is
+/// scanned. That is the right side to err on — the gate is the declaration.
+pub(crate) fn executable_text(rel: &str, text: &str) -> String {
+    // FIRST, before any offset is taken: Windows and Linux must scan
+    // byte-identical bytes, so the local run is authoritative for CI.
+    let norm = text.replace('\r', "");
+    let code = code_of(rel, &norm);
+    let mut kept = String::with_capacity(norm.len());
+    let mut at = 0usize;
+    // Sorted by start; a nested `#[cfg(test)]` inside a test module yields a
+    // span already covered, hence the `max`.
+    for (start, end) in test_regions(&code) {
+        let (start, end) = (start.min(norm.len()), end.min(norm.len()));
+        if start > at {
+            kept.push_str(&norm[at..start]);
+        }
+        at = at.max(end);
+    }
+    kept.push_str(&norm[at..]);
+    kept.lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [`executable_text`]'s own unit controls, on input whose answer is written
+    /// down rather than inferred from the tree.
+    ///
+    /// The tree-wide tests in [`crate::harness::layering`] prove the property
+    /// end to end; these name the two specific defects, so a future regression
+    /// says which one came back. They moved here with the function (R11) — the
+    /// primitive and its controls travel together.
+    #[test]
+    fn executable_text_ignores_line_endings_and_cuts_at_every_test_item() {
+        // Defect 1: the same source, two line endings, one answer.
+        let src = "fn prod() { let a = \"keep\"; }\n#[cfg(test)]\nmod tests {\n    let b = \"drop\";\n}\n";
+        let lf = executable_text("f.rs", src);
+        let crlf = executable_text("f.rs", &src.replace('\n', "\r\n"));
+        assert_eq!(lf, crlf, "line endings must not change what is scanned");
+        assert!(lf.contains("\"keep\""));
+        assert!(!lf.contains("\"drop\""), "the test module must be dropped");
+
+        // Defect 2a: a `#[cfg(test)] mod tests;` DECLARATION ends at its semicolon —
+        // it must not swallow the production code that follows it, which is how
+        // `processing/mod.rs` lost ~500 lines from the scan.
+        let decl = "#[cfg(test)]\nmod tests;\n\nfn prod() { let a = \"keep\"; }\n";
+        let body = executable_text("f.rs", decl);
+        assert!(
+            body.contains("\"keep\""),
+            "a `#[cfg(test)] mod x;` declaration must not truncate the file: {body:?}"
+        );
+
+        // Defect 2b: EVERY test item goes, not just the last one, and production
+        // code between two of them survives — `offload/mcp.rs`'s real shape.
+        let many = "#[cfg(test)]\nmod a { let x = \"drop_a\"; }\nfn mid() { let m = \"keep_mid\"; }\n\
+                    #[cfg(test)]\nmod b { let y = \"drop_b\"; }\n";
+        let body = executable_text("f.rs", many);
+        assert!(body.contains("\"keep_mid\""), "code between test modules is production");
+        assert!(!body.contains("\"drop_a\""), "the FIRST test module must go too");
+        assert!(!body.contains("\"drop_b\""));
+
+        // A `#[cfg(test)]` spelt inside a string literal is not a test item.
+        let quoted = "fn prod() { let s = \"#[cfg(test)]\\nmod t {\"; let a = \"keep\"; }\n";
+        assert!(
+            executable_text("f.rs", quoted).contains("\"keep\""),
+            "a quoted `#[cfg(test)]` must not start a region"
+        );
+    }
 
     /// The walker's controls (R11), on a synthetic tree whose right answer is
     /// written down rather than read off the crate. Permanent, and one case per

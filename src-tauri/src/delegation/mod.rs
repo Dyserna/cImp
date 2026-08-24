@@ -1521,24 +1521,16 @@ mod tests {
         // on it (R11).
         let files = crate::rustsrc::source_files();
         for (name, src) in files.iter().map(|(n, s)| (n.as_str(), s.as_str())) {
-            let code = crate::rustsrc::code_of(name, src);
-            let mut body = String::new();
-            let mut at = 0usize;
-            for (start, end) in crate::rustsrc::test_regions(&code) {
-                let (start, end) = (start.min(src.len()), end.min(src.len()));
-                if start > at {
-                    body.push_str(&src[at..start]);
-                }
-                at = end.max(at);
-            }
-            if at < src.len() {
-                body.push_str(&src[at..]);
-            }
-            // Comments explaining the reservation are wanted; a CALL is not.
+            // Test text is not a second writer — a fixture that names the
+            // reserved transition is a recorded input — and comments
+            // explaining the reservation are wanted. `executable_text` drops
+            // both, and is the same primitive `harness::layering`'s tree-wide
+            // scans use (R11: one implementation with controls, not a copy per
+            // scanner); this test used to open-code it.
+            let body = crate::rustsrc::executable_text(name, src);
             let uses: Vec<&str> = body
                 .lines()
                 .filter(|l| l.contains("transition::CANCELLED"))
-                .filter(|l| !l.trim_start().starts_with("//"))
                 .collect();
             assert!(
                 uses.is_empty(),

@@ -346,3 +346,280 @@ identical primitive (`flock` on Unix, `LockFileEx` on Windows), no new crate in
 `Cargo.lock`, no license or build impact. The cost is `rust-version` 1.88 →
 1.89, recorded in `src-tauri/Cargo.toml` and in `docs/MAINTENANCE.md`'s
 not-covered-by-CI list. `Cargo.lock` is byte-identical to `8372e3e`.
+
+---
+
+# Tranche 2 — review of `ed1e93e..develop`, 2026-08-24
+
+A second adversarial pass, at **high** effort, over the V42 **tranche-2** merges
+— lane A (machine-scope table #116, migration floor + step deletion #120, schema
+per-domain split #121, invariant tables #125, offload lifts #126), lane B (the
+SettingsApp split a/b/c + residuals #129, core splits #124), lane C (GraphService
+/ advisor / mcp de-homing #117–#119, index split + stage-and-swap #122, param
+objects #126 R26).
+
+**Reviewer output:** 10 findings, plus five refuted on inspection and recorded
+below so they are not re-raised. **Every one of the ten was ruled CLOSE**, and
+every one carries its commit here.
+
+| Gate | Baseline (`3542dad`) | After (`a2da0a0`) |
+|---|---|---|
+| `cargo test --all-targets` | 2834 passed · 0 failed · 6 ignored | **2838 · 0 · 6** |
+| `cargo clippy --all-targets` | clean | **clean** |
+| `npx vitest run` | 907 tests · 46 files | **909 · 46** |
+| `npm run check` | 0 errors · 0 warnings · 394 files | **0 · 0 · 394** |
+| `npm run build` | clean | **clean** |
+
+Known flakes, unchanged by this pass: `sandbox::windows`'s mapped-drive case,
+and the gitignored census check (#135 — intermittent in a full run, green in
+isolation).
+
+One commit in the range is not a finding: `3e2bd94` regenerates
+`src/lib/settings/generated/settings.ts` after `0447d77`'s prose re-point, which
+changed a Rust doc comment mirrored into the generated bindings without
+regenerating them — the CI bindings diff would have gone red on the next run.
+The sentence itself was re-wrapped too: it ran past the column and closed a
+parenthesis it never opened.
+
+## The ten
+
+### T2-1 — a below-floor file that could not be quarantined was overwritten by the next save
+
+`settings/persistence.rs`. `reseed_below_floor`'s move-aside-FAILED branch
+returned seeded defaults and wrote nothing, which is half a promise: those
+defaults become the live `Settings`, and the next write of the global file —
+`load`'s own post-repair `save_global`, a Settings-window edit, one of the
+out-of-band writers — put them straight over the user's ONE remaining copy of
+settings this build could not read and could not move aside.
+
+**Fixed** (`526bd91`): the failure latches the path (`PRESERVED_GLOBAL`, one
+slot, path-keyed) and `save_to` — the single write path every global writer
+funnels through — refuses it loudly for the rest of the session, returning an
+error so each caller's own "save failed" log fires too. A successful quarantine
+releases the latch before writing the defaults.
+
+Deliberately **not** self-healing: nothing re-attempts the move inside the save
+path, because that would move the user's file aside at an arbitrary moment to
+make room for a write they never connected to it. The next launch re-reads,
+re-reaches the verdict, and either succeeds or says so again — the floor's
+existing loud-on-every-launch posture, extended to the writes.
+
+The test drives the real branch: a DIRECTORY at every quarantine name the move
+can aim at over a six-second window defeats both its rename and its copy
+fallback. It is discriminating in both directions — a working quarantine fails
+its byte comparison, a missing latch fails the refusal.
+
+### T2-2 — an unstamped overlay beside a quarantined global entered the cascade at CURRENT
+
+`settings/persistence.rs`. `load_global` reported a below-floor quarantine as
+`stated: None`, which `load` could not tell from "the file was silent". An
+overlay with no stamp of its own then fell through to the CURRENT default, so
+`migrate_overlay` found nothing to do, the value deep-merged unmigrated onto a
+DEFAULTS baseline, and serde silently dropped every key the deleted steps would
+have MOVED — the invisible per-project loss V40 Phase I closed, arriving through
+the floor.
+
+**Fixed** (`123cb6b`): `load_global` answers with a
+`GlobalLoad { settings, stated, below_floor }`, and `overlay_entry_version` is
+the one place the entry version is decided — own stamp, else the version the
+global file stated beside it, else CURRENT, except when the global was
+below-floor-quarantined and the overlay states nothing, where there is no honest
+answer and it returns `None`. `load` then logs an error naming the overlay file
+and passes a version below every floor, so the refusal is `migrate_overlay`'s
+own refuse-and-warn path (which still strips the stamp) rather than a second one
+written at the call site.
+
+The normal path is untouched by construction, and the test pins all four cases:
+stamped-ok (self-describing — the quarantine next door is irrelevant),
+unstamped-refused, and the two ordinary ones.
+
+### T2-3 — two chrome children #129 (a) changed without auditing
+
+`settings-chrome.css` + `EnvEditor.svelte` + `HarnessExtForm.svelte`. Hoisting
+the form chrome out of `SettingsApp.svelte` unscoped it, so it reaches markup no
+scoped rule ever could. #129 audited the sections; these two are what it did not.
+
+**Fixed** (`a2da0a0`):
+
+* `EnvEditor`'s `.remove:hover` (0,3,0) lost background and border-colour to the
+  chrome's `button:hover:not(:disabled)` (0,3,1) and kept only the danger
+  colour — a remove button that half turns red. Same counter-rule `ArrayEditor`
+  already carries, with the arithmetic written down.
+* `EnvEditor`'s monospace input rules TIE with `input[type='text']` at (0,2,1),
+  which decides on emission order — an order that file cannot see: EnvEditor is
+  used by the main window's tab dialogs too, so its CSS is in the shared app
+  chunk, which loads BEFORE the settings chunk carrying the chrome sheet. Env
+  names and values therefore rendered in the body font inside Settings and in
+  monospace everywhere else. Rooted at `.env-editor`, both are the file's own
+  decision again.
+* `HarnessExtForm`'s bare `<section>` started matching the hoisted card rules and
+  drew a card inside the Tabs section's card. **LV-20's half — the labels,
+  checkboxes and hints finally looking like every other section's — is INTENDED
+  and stays**; only the nesting is the defect, neutralized by class at (0,2,0)
+  against the chrome's (0,1,1) rather than by relying on order (`ChecksEditor`'s
+  `.check-card` is the same manoeuvre one card up).
+
+Verified against the emitted bundle: Svelte renders these as (0,3,1), (0,4,0)
+and (0,2,0).
+
+### T2-4 — the toolclass scan lost its coverage of the two graph entry points
+
+`offload/toolclass.rs`. V42 R8 (#119) routed `run_check` / `run_command` out of
+`graph::mcp::handle_call` and `GraphService::run_graph_tool` into the shared
+`dispatch_rootless`, and each entry point's `DISPATCH_SITES` row went with them.
+Correct — a row over a body with no name literal yields nothing and
+`served_names`' emptiness check would fail on it — but it left the two funnels
+every warm and every headless graph call arrives through with nothing watching
+them. A name comparison re-added there is a dispatch surface with no row, whose
+tool classifies EXTERNAL and is waved past the latch on a native route (finding
+M-2, and M-8 for why `run_check` sitting in one of those bodies mattered).
+
+**Fixed** (`dd0762f`) with the opposite assertion, which is the stronger one
+here: `NAME_BLIND_ENTRY_POINTS` names both bodies and the test asserts they
+compare no tool name (`name == "x"`, `match name`, `matches!(name`), still call
+`dispatch_rootless`, and that the table holds both.
+
+**Probe:** planting `if name == "probe"` in `handle_call` fails the test naming
+`["probe"]` and the gate it defeats. Reverted.
+
+### T2-5 — #129 (c) regression: section state no longer survived a sidebar switch
+
+The sidebar renders one section at a time inside an `{#if}`, so switching
+DESTROYS the component and takes its `$state` with it. Before the split all of
+this was the monolith's own state and lived as long as the window; the split
+moved it into the children by default and turned "come back to it later" into
+"start again" — silently, because nothing that survives a REMOUNT was involved.
+
+**Fixed** (`b8eb050`): hoisted back to `SettingsApp`, reaching their section as
+props + callbacks (the pattern `tabsSubSection` already used) — the offload test
+box's prompt and result plus its sub-tab, the Appearance save-preset dialog
+(open / name / error, as one value: the three are always written together), the
+Tool Plugins selection and its per-tool Detect results, and the Code
+Intelligence sub-tab. Nothing else moved: in-flight busy flags, transient inline
+messages and per-mount view modes (`managingPresets`) are genuinely per-mount and
+each now says so where it is declared. The Detect table is the one that cost the
+most to lose — a probe is an IPC round trip the user asked for.
+
+### T2-6 — the push-registers-with-draftSync scan was enforced over a fraction of its scope
+
+`draftSync.test.ts`. The scan read exactly ONE file, `SettingsApp.svelte`, while
+`applySettings` is importable by all twenty-one section children. The hole it was
+built to catch (#129's ungated `commitGraphIgnore`) could therefore be reopened
+in any of the other twenty-one with the guard still passing.
+
+**Fixed** (`26e86c7`) by making the pair inseparable rather than by scanning more
+files for it. `pushDraft(sync, next)` registers the push, sends it, and settles
+the window in either direction; the window's four pushers route through it and
+`SettingsApp` no longer imports `applySettings` at all. The structural scan is
+re-spelled honestly — every pusher goes through `pushDraft`, the exemption map is
+for RAW pushes and still empty — and gains the check that closes the scope gap:
+**no source under `src/lib/settings/`, nor the window, may IMPORT
+`applySettings`**, allowlist `store.ts` (defines it) and `draftSync.ts` (wraps
+it), matched on import statements so the identifier stays usable in prose. Both
+new checks carry vacuity guards.
+
+**Negative control:** an `import { applySettings }` in `OffloadSection` fails the
+ban naming the file and the specifier. Reverted.
+
+### T2-7 — stage-and-swap recovery promotes by name, with no cross-site distinctness guarantee
+
+`graph/index.rs`. The recovery branch promotes by NAME: a stage relation present
+on open means "a prior migration was interrupted after the stage was durably
+populated — adopt it", and nothing on disk says which migration built it. Two
+sites sharing a stage name would let whichever runs first rename the other
+relation's staged rows over its own live relation — the direction that loses
+rows, performed by the branch that exists to prevent losing them. The engine sees
+one call at a time, so the property is across call sites and had no owner.
+
+**Fixed** (`10749b5`): a scan of the two constructing files resolves each site's
+`live`/`stage` (a literal or a `Self::CONST` declared in the same file, panicking
+on anything it cannot read) and asserts the stages are pairwise distinct, differ
+from their own live relation, and collide with no other site's live relation.
+Vacuity-guarded at >= 2 sites.
+
+**Negative control:** pointing `USAGE_STAT_STAGE` at `"mem_note_v32"` fails the
+test naming both files and the shared relation. Reverted.
+
+### T2-8 — the cascade threaded a `ShellSpec` no remaining step uses
+
+`settings/migration.rs`. The v1.0 / v1.1 steps rebuilt a shell entry from the
+default shell; every step after them declared the parameter as `_shell` and
+ignored it. V42 R9 (#120) retired those two steps with the migration floor and
+left the parameter behind: `persistence::load` threaded it into
+`migrate_if_needed` and `migrate_overlay`, which handed it to eight wrappers
+whose entire body was to drop it.
+
+**Fixed** (`072ce44`): steps are `fn(&mut Value)`, the eight wrappers are gone
+and `MIGRATION_STEPS` points at the transforms directly, both public entry points
+lose the parameter as do their two call sites, and `fake_default_shell` plus its
+thirteen `let shell = …` lines go with them — as does the comment claiming the
+deleted steps still need the shell. **Step bodies are untouched**: the ladder's
+shape is unchanged and the cascade and floor tests pass unchanged.
+
+### T2-9 — `OVERLAY_BANNED_KEYS` was a hand-kept parallel of the `Banned` rows
+
+`settings/persistence.rs`. The drift class #116 exists to kill, kept in step by a
+test asserting the two agreed. The disagreement it guarded against was not
+cosmetic: the marker does no work of its own, so a `Banned` row whose key the
+const never gained is a family stripped by nothing on all three legs.
+
+**Fixed** (`1d68120`): `strip_overlay_banned` walks the table itself. The const
+is gone, and with it the agreement half of the test; what that half was really
+asserting is asserted directly instead — a banned row's keys must be TOP-LEVEL
+names, because the pass is a top-level `remove` — plus a vacuity guard. The
+all-three-legs-or-none invariant is kept unchanged, and is what makes deriving
+from `overlay_strip` safe for the readonly and diff legs too.
+
+Prose re-pointed in the four other files that named the const
+(`ipc/commands.rs`, `sandbox/mod.rs`, `settings/schema/mod.rs`,
+`docs/DESIGN.md`). Two of them said `harness` was in the list; it has not been
+since V40 review M-2 took it back out, so those two now say what actually holds
+it back (the structured per-field strip) and why the whole-key ban would be
+wrong. `schema/mod.rs`'s doc is mirrored into the CI-diffed generated
+`settings.ts`, regenerated in the same commit.
+
+### T2-10 — the orphan guard duplicated the token guard's walker, and re-read the repo
+
+`tests/settingsCssOrphans.test.ts` carried `walk`, `read` and `rel` byte for byte
+from `tests/cssTokens.test.ts`. Two copies of a walk is one copy that can grow an
+exclusion the other never hears about — a guard that quietly stops looking at
+part of the tree, which is the failure mode both of these exist to prevent.
+
+**Fixed** (`4b249a0`): they live in `tests/repoFiles.ts` (not a `*.test.ts`, so
+vitest does not collect it), with the reason they are outside `src/` written down
+once. Two costs in the orphan scan went with the duplication: `unscopedCss()` —
+every theme sheet plus every `.svelte` file in the repo, for the `:global(…)`
+pass — ran twice, once in the scan and once in the vacuity guard, so the scan
+hands the set back; and `hasRule` compiled a `RegExp` per class per source,
+replaced by one `classTokens` extraction and a Set lookup with the same
+permissive rule and the same charset `classesUsed` uses.
+
+**Negative controls, one per guard:** an unstyled class planted in a section
+fails the orphan guard naming it; a `var(--undeclared)` planted in the chrome
+sheet fails the token guard naming it. Both reverted.
+
+## Refuted — recorded so they are not re-raised
+
+1. **Overlay `stated=None` as originally framed.** The first form of the finding
+   misplaced the mechanism; the real one survives as T2-2 above, which is a
+   different claim about a different branch.
+2. **`load_readonly` bypasses the migration floor — as a regression.** It does
+   not migrate at all, by contract (no side effects for the MCP child), and that
+   predates the floor. Not something tranche 2 changed.
+3. **`TabsSection`'s `?? []`.** Not a swallowed error path.
+4. **The `kind_cap` arm.** Reads correctly on inspection.
+5. **`slot_for` divergence.** The matrix and its callers agree.
+
+## New live-verify items
+
+Two of the fixes are visible to the user and are eyes-on rather than
+test-covered:
+
+* **T2-5** — open a section, leave state in it, switch sections and come back:
+  the offload prompt + result and its sub-tab, a half-typed preset name, the
+  selected plugin and its Detect results, and the Code Intelligence sub-tab are
+  all still there. Closing and reopening the Settings window still starts clean.
+* **T2-3** — Settings → Checks (or a tab's env editor): env rows render
+  monospace and the `×` hover is fully red, not half. Tabs → the harness page: the
+  declared-settings block reads as a group inside the Tabs card, not as a card
+  inside a card, and keeps LV-20's label / checkbox / hint chrome.

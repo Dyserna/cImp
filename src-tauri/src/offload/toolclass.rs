@@ -1862,16 +1862,72 @@ mod tests {
         ),
     ];
 
-    /// The body of `site.func`, from its signature to the `}` at its own
+    /// One entry point that RECEIVES a model-supplied tool name and hands it
+    /// onward without ever comparing it. See [`NAME_BLIND_ENTRY_POINTS`].
+    struct NameBlindEntry {
+        /// For failure messages.
+        file: &'static str,
+        src: &'static str,
+        /// The item, verbatim from `fn`'s visibility up to the open paren.
+        func: &'static str,
+        /// The scanned surface this body hands the name to — the reason it needs
+        /// no row of its own. Asserted to still appear in the body, so a body
+        /// that stopped delegating cannot go on passing this test quietly.
+        routes_to: &'static str,
+        /// Which gate protects this entry point — the reason a name compared
+        /// HERE would be a containment defect and not a style question.
+        gated_by: &'static str,
+    }
+
+    /// **The two funnels that hold a model-supplied tool name and never look at
+    /// it.**
+    ///
+    /// V42 R8 (#119) routed `run_check` / `run_command` out of
+    /// `graph::mcp::handle_call` and `GraphService::run_graph_tool` into the one
+    /// shared `dispatch_rootless`, and each entry point's [`DISPATCH_SITES`] row
+    /// went with them. That was right — a row over a body with no name literal
+    /// in it yields nothing, and `served_names`' emptiness check would fail on
+    /// it — but it also removed the only thing WATCHING these two bodies. A name
+    /// comparison re-added here would be a dispatch surface with no row, whose
+    /// tool therefore classifies EXTERNAL and is waved straight past the latch
+    /// on a native route: finding M-2's hole, on the two functions every warm and
+    /// every headless graph call arrives through.
+    ///
+    /// They are covered by the opposite assertion instead: they must serve NO
+    /// name of their own. Growing an arm here is not forbidden — it is a
+    /// `DISPATCH_SITES` row plus a `row(…)` in [`TABLE`], and the test below says
+    /// so when it goes red.
+    const NAME_BLIND_ENTRY_POINTS: &[NameBlindEntry] = &[
+        NameBlindEntry {
+            file: "graph/mcp/tools.rs",
+            src: include_str!("../graph/mcp/tools.rs"),
+            func: "pub async fn handle_call(",
+            routes_to: "dispatch_rootless(",
+            gated_by: "graph/mcp/tools.rs::headless_refusal (the headless MCP child)",
+        },
+        NameBlindEntry {
+            file: "graph/service.rs",
+            src: include_str!("../graph/service.rs"),
+            func: "pub async fn run_graph_tool(",
+            routes_to: "dispatch_rootless(",
+            gated_by: "loopback /graph_run's gate on LatchRoute::Native (the warm route)",
+        },
+    ];
+
+    /// The body of `func` in `src`, from its signature to the `}` at its own
     /// indentation. Starting at the SIGNATURE is deliberate: a doc comment must
     /// not be able to contribute a tool name.
-    fn fn_body(site: &DispatchSite) -> String {
+    ///
+    /// Takes the three fields rather than a whole [`DispatchSite`] because
+    /// [`NAME_BLIND_ENTRY_POINTS`] reads bodies the same way, and must fail the
+    /// same loud way when an item it names has moved.
+    fn fn_body(src: &str, func: &str, file: &str) -> String {
         let mut out = String::new();
         let mut close = String::new();
         let mut inside = false;
-        for line in site.src.lines() {
+        for line in src.lines() {
             if !inside {
-                if !line.trim_start().starts_with(site.func) {
+                if !line.trim_start().starts_with(func) {
                     continue;
                 }
                 close = format!("{}}}", " ".repeat(line.len() - line.trim_start().len()));
@@ -1884,8 +1940,7 @@ mod tests {
             }
         }
         panic!(
-            "`{}` was not found in {}, or was not terminated — the scan would read past it",
-            site.func, site.file
+            "`{func}` was not found in {file}, or was not terminated — the scan would read past it"
         );
     }
 
@@ -2003,7 +2058,7 @@ mod tests {
     fn served_names() -> Vec<String> {
         let mut served: Vec<String> = Vec::new();
         for site in DISPATCH_SITES {
-            let body = fn_body(site);
+            let body = fn_body(site.src, site.func, site.file);
             let mut here: Vec<String> = Vec::new();
             for form in site.forms {
                 here.extend(match form {
@@ -2058,6 +2113,59 @@ mod tests {
              In RIGHT only ⇒ a classified name nothing serves: it would engage the latch and \
              only then be rejected as unknown. Use `unrouted(…)` and say why."
         );
+    }
+
+    /// **The other half of that tripwire: the funnels stay name-blind.**
+    ///
+    /// `served_names` can only read bodies that NAME tools. The two entry points
+    /// in [`NAME_BLIND_ENTRY_POINTS`] name none — they hand the model's string to
+    /// `dispatch_rootless` and then to the recorded dispatcher, both scanned —
+    /// so the union above is complete only for as long as that stays true. This
+    /// is what says it out loud: a comparison re-added to either body is a
+    /// dispatch surface with no `DISPATCH_SITES` row, and a tool served from one
+    /// classifies EXTERNAL, which on a native route is the latch waving it
+    /// through (finding M-2, and M-8 for why `run_check` sitting in exactly one
+    /// of these bodies mattered).
+    #[test]
+    fn the_name_blind_entry_points_serve_no_tool_name_of_their_own() {
+        // Vacuity: an emptied table would make every assertion below pass.
+        assert_eq!(
+            NAME_BLIND_ENTRY_POINTS.len(),
+            2,
+            "both graph entry points — the headless child's and the warm route's — are covered \
+             here, or one of them is unwatched"
+        );
+        for entry in NAME_BLIND_ENTRY_POINTS {
+            let body = fn_body(entry.src, entry.func, entry.file);
+            assert!(
+                body.contains(entry.routes_to),
+                "{}: `{}` no longer calls `{}` — it either routes some other way (which needs \
+                 its own scan) or the item moved; either way this test is now watching nothing",
+                entry.file,
+                entry.func,
+                entry.routes_to
+            );
+            let compared = name_equals_literals(&body);
+            assert!(
+                compared.is_empty(),
+                "{}: `{}` compares the model-supplied tool name against {compared:?}, so it is a \
+                 DISPATCH SURFACE again — give it a `DISPATCH_SITES` row and every name it \
+                 serves a `row(…)` in TABLE, or it classifies EXTERNAL and {} waves it through",
+                entry.file,
+                entry.func,
+                entry.gated_by
+            );
+            for shape in ["match name {", "match name.as_str()", "matches!(name"] {
+                assert!(
+                    !body.contains(shape),
+                    "{}: `{}` routes on the tool name (`{shape}`) — same conclusion as above: it \
+                     needs a `DISPATCH_SITES` row, because {} is what a missing one costs",
+                    entry.file,
+                    entry.func,
+                    entry.gated_by
+                );
+            }
+        }
     }
 
     /// **The documented exceptions, named rather than counted.**

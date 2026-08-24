@@ -49,6 +49,12 @@
     patch,
     backendStatuses,
     harnessNames,
+    subSection,
+    onsubsection,
+    testInput,
+    testResult,
+    ontestinput,
+    ontestresult,
     onenablereadonly,
     onnavigate,
   }: {
@@ -61,6 +67,18 @@
     /// The enabled harnesses' labels, joined. Parent-owned — three sections
     /// interpolate it.
     harnessNames: string;
+    /// The sub-tab this section shows, and the offload test box's prompt and
+    /// last answer. All parent-owned (V42 tranche-2 review, T2-5): the sidebar
+    /// destroys this component on every switch away, and before #129 (c) a
+    /// typed prompt and the answer to it outlived that.
+    subSection: string;
+    testInput: string;
+    testResult: string;
+    /// The user picked another sub-tab.
+    onsubsection: (id: string) => void;
+    /// The prompt changed / a run produced (or failed to produce) an answer.
+    ontestinput: (next: string) => void;
+    ontestresult: (next: string) => void;
     /// Grant the read-only command set. Parent-owned: the IPC returns a whole
     /// `Settings` that is assigned straight to `snapshot`.
     onenablereadonly: () => void;
@@ -68,17 +86,17 @@
     onnavigate: (section: string) => void;
   } = $props();
 
-  // V8-01 offload: test-box input/result and a busy guard for the
-  // Start/Stop/Reset/Test buttons.
-  let offloadTestInput = $state<string>('');
-  let offloadTestResult = $state<string>('');
+  // V8-01 offload: a busy guard for the Start/Stop/Reset/Test buttons. Local
+  // on purpose — it describes an IPC call in flight FROM THIS MOUNT, so a
+  // section switch is exactly when it should reset. The prompt and the answer
+  // beside it are the parent's (T2-5).
   let offloadBusy = $state<boolean>(false);
   async function runOffloadAction(action: () => Promise<void>): Promise<void> {
     offloadBusy = true;
     try {
       await action();
     } catch (e) {
-      offloadTestResult = `Error: ${e}`;
+      ontestresult(`Error: ${e}`);
     } finally {
       offloadBusy = false;
     }
@@ -86,11 +104,11 @@
 
   async function runOffloadTest(): Promise<void> {
     offloadBusy = true;
-    offloadTestResult = 'Running…';
+    ontestresult('Running…');
     try {
-      offloadTestResult = await offloadTest(offloadTestInput);
+      ontestresult(await offloadTest(testInput));
     } catch (e) {
-      offloadTestResult = `Error: ${e}`;
+      ontestresult(`Error: ${e}`);
     } finally {
       offloadBusy = false;
     }
@@ -118,8 +136,7 @@
   // 'pool'; native tools, allowlist, and command policies under 'tools'.
   // (MCP servers moved to their own top-level `mcp` section — they're usable by
   // the harness tabs directly now, not just the offload worker.)
-  type OffloadSubSection = 'pool' | 'tools';
-  let offloadSubSection = $state<OffloadSubSection>('pool');
+  // The CHOICE is the parent's; see the prop docs above.
 
   // V21: register the given Local backend as `harness`'s local provider.
   // Derives base URL + model from its server command in Rust (which errors,
@@ -475,24 +492,24 @@
     <button
       type="button"
       role="tab"
-      class:active={offloadSubSection === 'pool'}
-      aria-selected={offloadSubSection === 'pool'}
-      onclick={() => (offloadSubSection = 'pool')}
+      class:active={subSection === 'pool'}
+      aria-selected={subSection === 'pool'}
+      onclick={() => onsubsection('pool')}
     >
       Pool
     </button>
     <button
       type="button"
       role="tab"
-      class:active={offloadSubSection === 'tools'}
-      aria-selected={offloadSubSection === 'tools'}
-      onclick={() => (offloadSubSection = 'tools')}
+      class:active={subSection === 'tools'}
+      aria-selected={subSection === 'tools'}
+      onclick={() => onsubsection('tools')}
     >
       Tools
     </button>
   </div>
 
-  {#if offloadSubSection === 'pool'}
+  {#if subSection === 'pool'}
   <h3>Backend pool</h3>
   <small class="hint top">
     V8-02: route each offload to the right backend. Add a LAN box or a
@@ -1365,7 +1382,8 @@
     <span>Test offload</span>
     <input
       type="text"
-      bind:value={offloadTestInput}
+      value={testInput}
+      oninput={(e) => ontestinput((e.currentTarget as HTMLInputElement).value)}
       placeholder="Leave empty for a canned reachability check, or type a task…"
     />
     <div class="button-row">
@@ -1373,8 +1391,8 @@
         Run test
       </button>
     </div>
-    {#if offloadTestResult}
-      <pre class="offload-test-result">{offloadTestResult}</pre>
+    {#if testResult}
+      <pre class="offload-test-result">{testResult}</pre>
     {/if}
   </label>
   <small class="hint">

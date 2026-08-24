@@ -50,6 +50,10 @@
     pluginProjectKey,
     rescanning,
     loadError,
+    selected,
+    detect,
+    onselected,
+    ondetect,
     onrescan,
     onmanualtooledit,
   }: {
@@ -67,6 +71,23 @@
     rescanning: boolean;
     /// The plugins folder could not be read.
     loadError: string | null;
+    /// Which plugin the detail pane shows, and the per-tool Detect results
+    /// keyed by TOOL KEY (`cimp-audit@1/gitleaks`, or a user plugin's
+    /// `name@version/tool-id`), `'probing'` while the IPC is in flight.
+    ///
+    /// Both parent-owned (V42 tranche-2 review, T2-5). The sidebar destroys
+    /// this component on every switch away, and a probe is an IPC round trip
+    /// the user asked for — losing its answer to a sidebar click is the most
+    /// expensive of the split's dropped state to re-earn, and the selection is
+    /// where they were looking when they left.
+    selected: string | null;
+    detect: Record<string, AuditDetectResult | 'probing' | undefined>;
+    /// The user picked another plugin row.
+    onselected: (key: string | null) => void;
+    /// The probe table changed (a probe started, answered, or failed).
+    ondetect: (
+      next: Record<string, AuditDetectResult | 'probing' | undefined>,
+    ) => void;
     /// Ask the parent for a fresh scan — the only thing that re-reads the
     /// folder.
     onrescan: () => void;
@@ -76,15 +97,10 @@
     onmanualtooledit: (pluginKey: string, toolId: string) => void;
   } = $props();
 
-  /// Which plugin the detail pane shows. Purely a view concern.
-  let pluginSelected = $state<string | null>(null);
-
-  /// Per-tool Detect probe result, keyed by TOOL KEY (`cimp-audit@1/gitleaks`,
-  /// or a user plugin's `name@version/tool-id`). `'probing'` while the IPC is
-  /// in flight. The IPC itself writes no settings; when it answers a click on
-  /// an EMPTY path box, this component stores what it found — see
-  /// `detectPluginTool`.
-  let auditDetect = $state<Record<string, AuditDetectResult | 'probing' | undefined>>({});
+  // The selection and the probe table are the PARENT's (see the prop docs):
+  // both outlive a sidebar switch, and this component is destroyed by one.
+  // The IPC itself writes no settings; when it answers a click on an EMPTY
+  // path box, this component stores what it found — see `detectPluginTool`.
 
   const pluginList = $derived<PluginRow[]>(
     pluginSet ? pluginRows(pluginSet, snapshot, pluginProjectKey) : [],
@@ -93,7 +109,7 @@
   // Keep the selection valid across a Rescan that removed the selected plugin,
   // and land on the first one so the pane is never a blank right-hand side.
   const pluginActive = $derived<PluginRow | null>(
-    pluginList.find((p) => p.key === pluginSelected) ?? pluginList[0] ?? null,
+    pluginList.find((p) => p.key === selected) ?? pluginList[0] ?? null,
   );
   // What the LIST prints per key: the bare name, and the version only for rows
   // that would otherwise read identically (decision 9's collision case). The
@@ -152,12 +168,12 @@
     // population to fill.
     const siblings = path.trim() === '' ? siblingAutoFillTargets(plugin, tool) : [];
     const fillClicked = shouldAutoFill(tool);
-    auditDetect = { ...auditDetect, [toolKey]: 'probing' };
+    ondetect({ ...detect, [toolKey]: 'probing' });
     try {
       // Probe the LIVE editing value, not the persisted setting — a just-typed
       // path would otherwise race the fire-and-forget applySettings push.
       const r = await auditDetectTool(toolKey, path);
-      auditDetect = { ...auditDetect, [toolKey]: r };
+      ondetect({ ...detect, [toolKey]: r });
       const targets = [...(fillClicked ? [toolKey] : []), ...siblings.map((s) => s.toolKey)];
       if (path.trim() === '' && r.found && r.path && targets.length > 0) {
         const found = r.path;
@@ -169,10 +185,10 @@
         });
       }
     } catch (e) {
-      auditDetect = {
-        ...auditDetect,
+      ondetect({
+        ...detect,
         [toolKey]: { found: false, path: null, version: null, error: String(e) },
-      };
+      });
     }
   }
 </script>
@@ -325,8 +341,8 @@
             Clear
           </button>
         </div>
-        {#if formatDetect(auditDetect[tool.toolKey]).kind !== 'idle'}
-          {@const disp = formatDetect(auditDetect[tool.toolKey])}
+        {#if formatDetect(detect[tool.toolKey]).kind !== 'idle'}
+          {@const disp = formatDetect(detect[tool.toolKey])}
           <small
             class="hint audit-detect"
             class:ok={disp.kind === 'found'}
@@ -537,7 +553,7 @@
               class="plugin-list-entry icon"
               class:active={pluginActive?.key === p.key}
               class:off={!p.enabled}
-              onclick={() => (pluginSelected = p.key)}
+              onclick={() => onselected(p.key)}
             >
               {pluginLabels.get(p.key) ?? p.label}{p.enabled ? '' : ' · off'}
             </button>

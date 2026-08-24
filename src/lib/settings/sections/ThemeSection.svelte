@@ -38,11 +38,22 @@
   let {
     snapshot,
     patch,
+    savePreset,
+    onsavepreset,
   }: {
     /// The live settings snapshot values are read from.
     snapshot: Settings;
     /// The window's own settings mutator (clone-mutate-push; no `bind:`).
     patch: (updater: (s: Settings) => void) => void;
+    /// The inline save-preset dialog: whether it is open, the name being
+    /// typed, and the validation message under it. Parent-owned (V42
+    /// tranche-2 review, T2-5) — the sidebar destroys this component on every
+    /// switch away, and a half-typed name that vanishes when the user goes to
+    /// check something is the kind of state #129 (c) moved by accident. One
+    /// value rather than three props: the three are always written together.
+    savePreset: { open: boolean; name: string; error: string | null };
+    /// Any of the three changed.
+    onsavepreset: (next: { open: boolean; name: string; error: string | null }) => void;
   } = $props();
 
   /// Terminal palette paired with a UI chrome theme: each theme's metadata
@@ -56,31 +67,31 @@
   // V1.4-04 B.5: inline UI for save/manage presets. Implemented as
   // toggleable inline panels rather than modal dialogs to match the
   // SettingsApp's existing flow (no <dialog> elements elsewhere).
-  let savingPreset = $state(false);
-  let newPresetName = $state('');
-  let savePresetError = $state<string | null>(null);
+  // `managingPresets` is a per-mount view mode (a list either shows its
+  // delete buttons or it does not, and re-opening the section fresh is the
+  // right default). The save DIALOG next to it is the parent's, because it
+  // holds something the user typed — see the prop docs above.
   let managingPresets = $state(false);
 
   function startSavePreset() {
-    savingPreset = true;
-    newPresetName = '';
-    savePresetError = null;
+    onsavepreset({ open: true, name: '', error: null });
   }
 
   function cancelSavePreset() {
-    savingPreset = false;
-    newPresetName = '';
-    savePresetError = null;
+    onsavepreset({ open: false, name: '', error: null });
   }
 
   function commitSavePreset() {
-    const name = newPresetName.trim();
+    const name = savePreset.name.trim();
     if (!name) {
-      savePresetError = 'Name required.';
+      onsavepreset({ ...savePreset, error: 'Name required.' });
       return;
     }
     if (snapshot.terminal.background.presets.some((p) => p.name === name)) {
-      savePresetError = `A preset named "${name}" already exists.`;
+      onsavepreset({
+        ...savePreset,
+        error: `A preset named "${name}" already exists.`,
+      });
       return;
     }
     patch((s) => {
@@ -90,9 +101,7 @@
         { name, config: cfg },
       ];
     });
-    savingPreset = false;
-    newPresetName = '';
-    savePresetError = null;
+    onsavepreset({ open: false, name: '', error: null });
   }
 
   function deletePreset(name: string) {
@@ -386,12 +395,17 @@
     </button>
   </div>
 
-  {#if savingPreset}
+  {#if savePreset.open}
     <div class="preset-save">
       <input
         type="text"
         placeholder="Preset name"
-        bind:value={newPresetName}
+        value={savePreset.name}
+        oninput={(e) =>
+          onsavepreset({
+            ...savePreset,
+            name: (e.currentTarget as HTMLInputElement).value,
+          })}
         onkeydown={(e) => {
           if (e.key === 'Enter') commitSavePreset();
           if (e.key === 'Escape') cancelSavePreset();
@@ -399,8 +413,8 @@
       />
       <button type="button" onclick={commitSavePreset}>Save</button>
       <button type="button" onclick={cancelSavePreset}>Cancel</button>
-      {#if savePresetError}
-        <small class="error">{savePresetError}</small>
+      {#if savePreset.error}
+        <small class="error">{savePreset.error}</small>
       {/if}
     </div>
     <small class="hint">

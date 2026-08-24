@@ -505,9 +505,17 @@ pub struct Settings {
     /// auto-verify record) beside configuration that is about the harness
     /// INSTALL on this machine (where its local proxy is, whether its status
     /// line is on, whether cImp derived a provider block for it). None of that
-    /// is a property of the project you happen to have open, so `harness` is in
-    /// `OVERLAY_BANNED_KEYS` and a Settings save writes it through to the
-    /// physical global file — the `sandbox` pattern exactly.
+    /// is a property of the project you happen to have open, so a project overlay
+    /// never carries the machine-scope half of this block and a Settings save
+    /// writes that half through to the physical global file — the `sandbox`
+    /// pattern, one level down.
+    ///
+    /// One level down is also where the MECHANISM differs, and V40 review finding
+    /// M-2 is why: banning the whole container (as `sandbox` is banned) silently
+    /// narrowed five per-project settings that had moved into it to machine
+    /// scope. `harness` therefore gets a structured, per-field strip
+    /// (`persistence::strip_overlay_harness`, which NAMES what it drops) rather
+    /// than a whole-key ban.
     ///
     /// A `String` key rather than a `HarnessId`: an id nobody registered must
     /// survive a load/save round trip (a `harness.codex` block written by a

@@ -2880,4 +2880,147 @@ mod tests {
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // ── The stage-and-swap sites' one cross-site invariant ──────────────────
+    //
+    // Every file that constructs a [`StageAndSwap`]. The struct is private to
+    // `graph::index`, so a new site can only appear here or under `index/` — and
+    // a new file under `index/` is one row below.
+    const STAGE_AND_SWAP_SOURCES: &[(&str, &str)] = &[
+        ("graph/index/notes.rs", include_str!("index/notes.rs")),
+        ("graph/index/usage.rs", include_str!("index/usage.rs")),
+    ];
+
+    /// One `StageAndSwap { … }` construction, as the two relation names that
+    /// decide what the recovery branch adopts.
+    struct StageSite {
+        file: &'static str,
+        live: String,
+        stage: String,
+    }
+
+    /// Resolve a `live:` / `stage:` value — a string literal, or a `Self::CONST`
+    /// declared in the same file — to the relation name it names. Panics rather
+    /// than skipping: a site the scan cannot read is a site nothing compares.
+    fn resolve_relation(expr: &str, src: &str, file: &str) -> String {
+        let expr = expr.trim().trim_end_matches(',').trim();
+        if let Some(rest) = expr.strip_prefix('"') {
+            let end = rest
+                .find('"')
+                .unwrap_or_else(|| panic!("{file}: unterminated relation literal `{expr}`"));
+            return rest[..end].to_string();
+        }
+        let name = expr.strip_prefix("Self::").unwrap_or_else(|| {
+            panic!(
+                "{file}: `{expr}` is neither a string literal nor a `Self::CONST`, so this scan \
+                 cannot tell which relation the site stages into"
+            )
+        });
+        let decl = format!("const {name}: &'static str = \"");
+        let at = src
+            .find(&decl)
+            .unwrap_or_else(|| panic!("{file}: no `{name}` declaration to resolve"));
+        let rest = &src[at + decl.len()..];
+        let end = rest
+            .find('"')
+            .unwrap_or_else(|| panic!("{file}: unterminated `{name}` declaration"));
+        rest[..end].to_string()
+    }
+
+    /// Every stage-and-swap construction in [`STAGE_AND_SWAP_SOURCES`], read off
+    /// the sources so a third migration is covered by adding its file and
+    /// nothing else.
+    fn stage_and_swap_sites() -> Vec<StageSite> {
+        let mut out = Vec::new();
+        for (file, src) in STAGE_AND_SWAP_SOURCES {
+            let mut lines = src.lines();
+            while let Some(line) = lines.next() {
+                let head = line.trim_start();
+                if head.starts_with("//") || !line.contains("StageAndSwap {") {
+                    continue;
+                }
+                let (mut live, mut stage) = (None, None);
+                for field in lines.by_ref().take(25) {
+                    let t = field.trim();
+                    if let Some(v) = t.strip_prefix("live:") {
+                        live = Some(resolve_relation(v, src, file));
+                    } else if let Some(v) = t.strip_prefix("stage:") {
+                        stage = Some(resolve_relation(v, src, file));
+                    }
+                    if live.is_some() && stage.is_some() {
+                        break;
+                    }
+                }
+                let missing = |what: &str| -> String {
+                    panic!(
+                        "{file}: a `StageAndSwap` with no `{what}:` field near it — the scan has \
+                         drifted from the source it reads, and would report agreement it never \
+                         checked"
+                    )
+                };
+                out.push(StageSite {
+                    file,
+                    live: live.unwrap_or_else(|| missing("live")),
+                    stage: stage.unwrap_or_else(|| missing("stage")),
+                });
+            }
+        }
+        out
+    }
+
+    /// **Two migrations may never stage into the same relation.**
+    ///
+    /// [`GraphIndex::stage_and_swap`]'s recovery branch promotes by NAME: a
+    /// stage relation present on open means "a prior migration was interrupted
+    /// after the stage was durably populated — adopt it", and nothing on disk
+    /// says which migration built it. Two sites sharing a stage name would
+    /// therefore let whichever runs first rename the OTHER relation's staged
+    /// rows over its own live relation — the direction that loses rows,
+    /// performed by the branch that exists to prevent losing them. A stage that
+    /// collides with any site's LIVE relation is the same defect one step
+    /// earlier: the recovery branch would fire on an ordinary healthy database.
+    ///
+    /// The engine cannot check this — it sees one call at a time — so the
+    /// property, which is across call sites, is pinned here.
+    #[test]
+    fn every_stage_and_swap_site_stages_into_a_relation_of_its_own() {
+        let sites = stage_and_swap_sites();
+        // Vacuity: both known migrations (`usage_stat`'s V24 `origin` and
+        // `mem_note`'s V32 `tainted`/`quarantine`) must be in hand, or a parser
+        // that found nothing would read as a clean bill of health.
+        assert!(
+            sites.len() >= 2,
+            "the scan found {} stage-and-swap site(s) in {:?} — it has drifted from the source",
+            sites.len(),
+            STAGE_AND_SWAP_SOURCES.iter().map(|(f, _)| *f).collect::<Vec<_>>()
+        );
+        for (i, a) in sites.iter().enumerate() {
+            assert_ne!(
+                a.live, a.stage,
+                "{}: a site whose stage IS its live relation would have the recovery branch \
+                 promote the relation over itself on every open",
+                a.file
+            );
+            for b in &sites[i + 1..] {
+                assert_ne!(
+                    a.stage, b.stage,
+                    "{} and {} stage into the same relation `{}` — whichever migration opens \
+                     first would adopt the other's staged rows over its own live relation",
+                    a.file, b.file, a.stage
+                );
+                assert_ne!(
+                    a.stage, b.live,
+                    "{}'s stage is {}'s LIVE relation (`{}`), so the recovery branch would fire \
+                     on a healthy database and promote live data as if it were a stage",
+                    a.file, b.file, a.stage
+                );
+                assert_ne!(
+                    b.stage, a.live,
+                    "{}'s stage is {}'s LIVE relation (`{}`), so the recovery branch would fire \
+                     on a healthy database and promote live data as if it were a stage",
+                    b.file, a.file, b.stage
+                );
+            }
+        }
+    }
 }

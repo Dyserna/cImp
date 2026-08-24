@@ -38,7 +38,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::Value;
 
 use crate::error::{AppError, AppResult};
-use crate::shell::ShellSpec;
 
 /// The oldest schema version the **overlay** cascade can be entered at.
 ///
@@ -140,7 +139,7 @@ pub fn below_global_floor(value: &Value) -> bool {
 /// still on disk saying otherwise.
 ///
 /// Returns whether anything changed.
-pub fn migrate_overlay(overlay: &mut Value, from: u64, default_shell: &ShellSpec) -> bool {
+pub fn migrate_overlay(overlay: &mut Value, from: u64) -> bool {
     // Dropped on EVERY path below: an overlay's own stamp is an entry marker
     // for this function and must never survive into the merge, where it would
     // `deep_merge` over the global's `schema_version` and pin the merged
@@ -175,7 +174,7 @@ pub fn migrate_overlay(overlay: &mut Value, from: u64, default_shell: &ShellSpec
     );
     for step in MIGRATION_STEPS {
         if (step.detect)(overlay) {
-            (step.transform)(overlay, default_shell);
+            (step.transform)(overlay);
         }
     }
     // No force-stamp twin of `migrate_if_needed`'s: an overlay that did not
@@ -195,11 +194,7 @@ pub fn migrate_overlay(overlay: &mut Value, from: u64, default_shell: &ShellSpec
 /// up, or stamped and the caller is expected to have quarantined it already.
 /// `Err` if a backup write failed. Backup-write failure aborts migration
 /// loudly — we never proceed without a recoverable copy.
-pub fn migrate_if_needed(
-    value: &mut Value,
-    path: &Path,
-    default_shell: &ShellSpec,
-) -> AppResult<bool> {
+pub fn migrate_if_needed(value: &mut Value, path: &Path) -> AppResult<bool> {
     // **The global floor, enforced here as well as at the call site** (V42 R9,
     // issue #120). `persistence::load_global` quarantines a below-floor file
     // before it ever reaches this function; this is the second lock, and it is
@@ -252,7 +247,7 @@ pub fn migrate_if_needed(
     // step's detector matches.
     for step in MIGRATION_STEPS {
         if (step.detect)(value) {
-            (step.transform)(value, default_shell);
+            (step.transform)(value);
         }
     }
 
@@ -295,63 +290,66 @@ fn detect_entry_version(value: &Value) -> Option<&'static str> {
 /// One step of the migration cascade: detect a particular legacy shape
 /// and transform it forward by one schema version. The cascade is
 /// declarative — adding a new schema bump is a single new entry in
-/// `MIGRATION_STEPS`. Transform signatures are uniform `(value,
-/// default_shell)`; steps that don't need the shell take it as an
-/// underscore-prefixed param.
+/// `MIGRATION_STEPS`.
+///
+/// A transform takes the value and nothing else. It used to take a
+/// `&ShellSpec` too, for the v1.0 / v1.1 steps that rebuilt a shell entry
+/// from it; every other step declared it as `_shell` and ignored it. Those
+/// two steps were retired with the migration floor (V42 R9, issue #120),
+/// which left a parameter threaded from `persistence::load` through both
+/// public entry points to eight wrappers that dropped it — so it is gone
+/// (V42 tranche-2 review, T2-8). A step that needs a new input adds it to
+/// this signature, and the compiler names every site that has to supply it.
 struct MigrationStep {
     from_version: &'static str,
     detect: fn(&Value) -> bool,
-    transform: fn(&mut Value, &ShellSpec),
+    transform: fn(&mut Value),
 }
 
 /// The cascade. Order matters: the v1.0 → v1.2 transform produces the
 /// shape that the v1.2 → v1.3 detector needs to match, and so on. Two
 /// entry points (v1.0 and v1.1) both produce v1.2; once any one of them
 /// runs, the next pass looks for v1.2's discriminator.
-///
-/// V1.0 and V1.1 are the only steps that need the default shell (for
-/// the `_shell_1_tmp` interim key). The rest accept it via the uniform
-/// signature and ignore it.
 const MIGRATION_STEPS: &[MigrationStep] = &[
     MigrationStep {
         from_version: "v30",
         detect: looks_v30,
-        transform: migrate_v30_to_v31_step,
+        transform: migrate_v30_to_v31,
     },
     MigrationStep {
         from_version: "v31",
         detect: looks_v31,
-        transform: migrate_v31_to_v32_step,
+        transform: migrate_v31_to_v32,
     },
     MigrationStep {
         from_version: "v32",
         detect: looks_v32,
-        transform: migrate_v32_to_v33_step,
+        transform: migrate_v32_to_v33,
     },
     MigrationStep {
         from_version: "v33",
         detect: looks_v33,
-        transform: migrate_v33_to_v34_step,
+        transform: migrate_v33_to_v34,
     },
     MigrationStep {
         from_version: "v34",
         detect: looks_v34,
-        transform: migrate_v34_to_v35_step,
+        transform: migrate_v34_to_v35,
     },
     MigrationStep {
         from_version: "v35",
         detect: looks_v35,
-        transform: migrate_v35_to_v36_step,
+        transform: migrate_v35_to_v36,
     },
     MigrationStep {
         from_version: "v36",
         detect: looks_v36,
-        transform: migrate_v36_to_v37_step,
+        transform: migrate_v36_to_v37,
     },
     MigrationStep {
         from_version: "v37",
         detect: looks_v37,
-        transform: migrate_v37_to_v38_step,
+        transform: migrate_v37_to_v38,
     },
 ];
 
@@ -360,10 +358,6 @@ fn looks_v30(value: &Value) -> bool {
         .get("schema_version")
         .and_then(Value::as_u64)
         .is_some_and(|v| v == 30)
-}
-
-fn migrate_v30_to_v31_step(value: &mut Value, _shell: &ShellSpec) {
-    migrate_v30_to_v31(value)
 }
 
 /// V30 → V31: pure version stamp for the V33 Phase E LAN-auth fields.
@@ -404,10 +398,6 @@ fn looks_v31(value: &Value) -> bool {
         .get("schema_version")
         .and_then(Value::as_u64)
         .is_some_and(|v| v == 31)
-}
-
-fn migrate_v31_to_v32_step(value: &mut Value, _shell: &ShellSpec) {
-    migrate_v31_to_v32(value)
 }
 
 /// V31 → V32: pure version stamp for the V37 MCP registry fields.
@@ -458,10 +448,6 @@ fn looks_v32(value: &Value) -> bool {
         .is_some_and(|v| v == 32)
 }
 
-fn migrate_v32_to_v33_step(value: &mut Value, _shell: &ShellSpec) {
-    migrate_v32_to_v33(value)
-}
-
 /// V31 → V33: pure version stamp for the V38 `tool_plugins` container.
 ///
 /// **Nothing moves.** V38 Phase B adds one additive
@@ -500,10 +486,6 @@ fn looks_v33(value: &Value) -> bool {
         .get("schema_version")
         .and_then(Value::as_u64)
         .is_some_and(|v| v == 33)
-}
-
-fn migrate_v33_to_v34_step(value: &mut Value, _shell: &ShellSpec) {
-    migrate_v33_to_v34(value)
 }
 
 /// The fourteen built-in audit tool ids, and nothing else this step needs to
@@ -720,10 +702,6 @@ fn looks_v34(value: &Value) -> bool {
         .is_some_and(|v| v == 34)
 }
 
-fn migrate_v34_to_v35_step(value: &mut Value, _shell: &ShellSpec) {
-    migrate_v34_to_v35(value)
-}
-
 /// Every per-tab injection-override cell, by its wire key.
 ///
 /// The list mirrors `injection::TabInjectionOverrides`'s fields — i.e. exactly
@@ -828,10 +806,6 @@ fn looks_v35(value: &Value) -> bool {
         .is_some_and(|v| v == 35)
 }
 
-fn migrate_v35_to_v36_step(value: &mut Value, _shell: &ShellSpec) {
-    migrate_v35_to_v36(value)
-}
-
 fn looks_v36(value: &Value) -> bool {
     value
         .get("schema_version")
@@ -839,19 +813,11 @@ fn looks_v36(value: &Value) -> bool {
         .is_some_and(|v| v == 36)
 }
 
-fn migrate_v36_to_v37_step(value: &mut Value, _shell: &ShellSpec) {
-    migrate_v36_to_v37(value)
-}
-
 fn looks_v37(value: &Value) -> bool {
     value
         .get("schema_version")
         .and_then(Value::as_u64)
         .is_some_and(|v| v == 37)
-}
-
-fn migrate_v37_to_v38_step(value: &mut Value, _shell: &ShellSpec) {
-    migrate_v37_to_v38(value)
 }
 
 /// The v36 schema's serialised defaults for the two lane fields — what a file
@@ -1438,13 +1404,6 @@ mod tests {
     use serde_json::json;
     use std::path::PathBuf;
 
-    fn fake_default_shell() -> ShellSpec {
-        ShellSpec {
-            command: PathBuf::from("/bin/bash"),
-            args: vec!["-i".to_string()],
-        }
-    }
-
     /// A scratch directory that removes itself, so a floor test can write a real
     /// file and then look at what is beside it.
     struct TempDir(PathBuf);
@@ -1516,7 +1475,6 @@ mod tests {
     fn the_fixpoint_guard_does_not_stamp_a_below_floor_file() {
         let dir = TempDir::new("floor_stamp");
         let path = dir.join("settings.json");
-        let shell = fake_default_shell();
 
         for original in [
             json!({ "schema_version": 20, "tabs": [], "offload": {} }),
@@ -1527,7 +1485,7 @@ mod tests {
             fs::write(&path, serde_json::to_vec_pretty(&v).unwrap()).unwrap();
 
             assert!(
-                !migrate_if_needed(&mut v, &path, &shell).unwrap(),
+                !migrate_if_needed(&mut v, &path).unwrap(),
                 "a below-floor file reports no change, so the caller does not write it back"
             );
             assert_eq!(
@@ -1550,7 +1508,6 @@ mod tests {
     fn a_file_at_the_floor_still_migrates_normally() {
         let dir = TempDir::new("floor_ok");
         let path = dir.join("settings.json");
-        let shell = fake_default_shell();
         let mut v = json!({
             "schema_version": MIN_GLOBAL_SCHEMA_VERSION,
             "tabs": [],
@@ -1558,7 +1515,7 @@ mod tests {
         });
         fs::write(&path, serde_json::to_vec_pretty(&v).unwrap()).unwrap();
 
-        assert!(migrate_if_needed(&mut v, &path, &shell).unwrap());
+        assert!(migrate_if_needed(&mut v, &path).unwrap());
         assert_eq!(
             v["schema_version"],
             json!(crate::settings::schema::CURRENT_SCHEMA_VERSION),
@@ -1698,7 +1655,6 @@ mod tests {
     /// activation overrides.
     #[test]
     fn v31_to_v32_leaves_the_effective_mcp_surface_unchanged() {
-        let shell = fake_default_shell();
         let mut v = json!({
             "schema_version": 31,
             "tabs": [],
@@ -1711,7 +1667,7 @@ mod tests {
         });
         for step in MIGRATION_STEPS {
             if (step.detect)(&v) {
-                (step.transform)(&mut v, &shell);
+                (step.transform)(&mut v);
             }
         }
         let s: crate::settings::Settings = serde_json::from_value(v).unwrap();
@@ -1956,7 +1912,6 @@ mod tests {
     /// current version with its seeded prose on the placeholder.
     #[test]
     fn the_cascade_rewrites_notification_prose_on_the_way_to_the_current_version() {
-        let shell = fake_default_shell();
         let mut v = json!({
             "schema_version": 33,
             "tabs": [{
@@ -1972,7 +1927,7 @@ mod tests {
         });
         for step in MIGRATION_STEPS {
             if (step.detect)(&v) {
-                (step.transform)(&mut v, &shell);
+                (step.transform)(&mut v);
             }
         }
         assert_eq!(
@@ -2046,13 +2001,12 @@ mod tests {
     /// two directories away stated a different one.
     #[test]
     fn a_v35_overlay_migrates_its_claude_pair_into_the_harness_map() {
-        let shell = fake_default_shell();
         let mut overlay = json!({
             "claude_local": { "base_url": "http://myproxy:9000" },
             "statusline": { "enabled": false },
             "ui": { "theme": "future-light" },
         });
-        assert!(migrate_overlay(&mut overlay, 35, &shell), "the overlay changed");
+        assert!(migrate_overlay(&mut overlay, 35), "the overlay changed");
         assert_eq!(
             overlay["harness"]["claude"]["ext"]["local.base_url"],
             json!("http://myproxy:9000")
@@ -2086,20 +2040,19 @@ mod tests {
     /// below whatever the global file actually reached.
     #[test]
     fn the_overlay_entry_stamp_is_always_stripped() {
-        let shell = fake_default_shell();
         let current = crate::settings::schema::CURRENT_SCHEMA_VERSION as u64;
         // Current-schema overlay: nothing to do but drop the stamp.
         let mut cur = json!({ "schema_version": current, "ui": { "theme": "tui" } });
-        assert!(migrate_overlay(&mut cur, current, &shell));
+        assert!(migrate_overlay(&mut cur, current));
         assert_eq!(cur, json!({ "ui": { "theme": "tui" } }));
         // Stale overlay: migrated AND unstamped.
         let mut old = json!({ "schema_version": 35, "statusline": { "enabled": true } });
-        assert!(migrate_overlay(&mut old, 35, &shell));
+        assert!(migrate_overlay(&mut old, 35));
         assert!(old.get("schema_version").is_none());
         assert_eq!(old["harness"]["claude"]["ext"]["statusline"], json!(true));
         // Below the floor: still unstamped, and otherwise untouched.
         let mut ancient = json!({ "schema_version": 9, "tabs": [] });
-        migrate_overlay(&mut ancient, 9, &shell);
+        migrate_overlay(&mut ancient, 9);
         assert_eq!(ancient, json!({ "tabs": [] }));
     }
 
@@ -2119,23 +2072,14 @@ mod tests {
     /// moved the field into the harness map.
     #[test]
     fn the_overlay_cascade_refuses_below_the_migration_floor() {
-        let shell = fake_default_shell();
         let before = json!({ "claude_local": { "base_url": "http://box:8080" } });
 
         let mut v = before.clone();
-        assert!(!migrate_overlay(
-            &mut v,
-            MIN_OVERLAY_SCHEMA_VERSION - 1,
-            &shell
-        ));
+        assert!(!migrate_overlay(&mut v, MIN_OVERLAY_SCHEMA_VERSION - 1));
         assert_eq!(v, before, "an overlay too old to place must be left alone");
 
         let mut at_the_floor = before.clone();
-        assert!(migrate_overlay(
-            &mut at_the_floor,
-            MIN_OVERLAY_SCHEMA_VERSION,
-            &shell
-        ));
+        assert!(migrate_overlay(&mut at_the_floor, MIN_OVERLAY_SCHEMA_VERSION));
         assert_eq!(
             at_the_floor.pointer("/harness/claude/ext/local.base_url"),
             Some(&json!("http://box:8080")),
@@ -2151,7 +2095,6 @@ mod tests {
     /// byte, whatever keys it happens to lack.
     #[test]
     fn a_current_overlay_passes_through_unchanged() {
-        let shell = fake_default_shell();
         let current = crate::settings::schema::CURRENT_SCHEMA_VERSION as u64;
         let before = json!({
             "checks_allow_remote_worker": true,
@@ -2159,7 +2102,7 @@ mod tests {
             "tabs": [],
         });
         let mut v = before.clone();
-        assert!(!migrate_overlay(&mut v, current, &shell));
+        assert!(!migrate_overlay(&mut v, current));
         assert_eq!(v, before);
     }
 
@@ -2754,7 +2697,6 @@ mod tests {
     /// called directly.
     #[test]
     fn the_cascade_fills_tab_cells_on_the_way_to_35() {
-        let shell = fake_default_shell();
         let mut v = json!({
             "schema_version": 33,
             "tabs": [{ "kind": "ai_tool", "id": "claude", "command": "claude" }],
@@ -2762,7 +2704,7 @@ mod tests {
         });
         for step in MIGRATION_STEPS {
             if (step.detect)(&v) {
-                (step.transform)(&mut v, &shell);
+                (step.transform)(&mut v);
             }
         }
         assert_eq!(
@@ -2793,11 +2735,10 @@ mod tests {
     /// data (serde defaults carry the C2 invariant).
     #[test]
     fn a_pre_merge_v38_dev_file_converges_on_the_current_shape() {
-        let shell = fake_default_shell();
         let cascade = |mut v: Value| {
             for step in MIGRATION_STEPS {
                 if (step.detect)(&v) {
-                    (step.transform)(&mut v, &shell);
+                    (step.transform)(&mut v);
                 }
             }
             v
@@ -2881,7 +2822,6 @@ mod tests {
     /// here as a file that stalls partway.
     #[test]
     fn cascade_from_the_floor_reaches_the_current_schema_version() {
-        let shell = fake_default_shell();
         let mut v = json!({
             "schema_version": MIN_GLOBAL_SCHEMA_VERSION,
             "offload": {},
@@ -2889,7 +2829,7 @@ mod tests {
         });
         for step in MIGRATION_STEPS {
             if (step.detect)(&v) {
-                (step.transform)(&mut v, &shell);
+                (step.transform)(&mut v);
             }
         }
         assert_eq!(
@@ -2912,7 +2852,6 @@ mod tests {
     /// a failing test.
     #[test]
     fn an_old_file_with_configured_audit_tools_cascades_into_the_container() {
-        let shell = fake_default_shell();
         let mut v = json!({
             "schema_version": MIN_GLOBAL_SCHEMA_VERSION,
             "offload": {},
@@ -2936,7 +2875,7 @@ mod tests {
         });
         for step in MIGRATION_STEPS {
             if (step.detect)(&v) {
-                (step.transform)(&mut v, &shell);
+                (step.transform)(&mut v);
             }
         }
         assert_eq!(
@@ -3004,7 +2943,6 @@ mod tests {
     /// that tracks the constant it is testing cannot fail.
     #[test]
     fn local_data_tools_growth_requires_a_backfilling_migration() {
-        let shell = fake_default_shell();
         // The web-scope exclusion exactly as a v30 file carries it.
         let mut v = json!({
             "schema_version": MIN_GLOBAL_SCHEMA_VERSION,
@@ -3025,7 +2963,7 @@ mod tests {
         // backup write), so any future schema-bumping step also runs.
         for step in MIGRATION_STEPS {
             if (step.detect)(&v) {
-                (step.transform)(&mut v, &shell);
+                (step.transform)(&mut v);
             }
         }
 

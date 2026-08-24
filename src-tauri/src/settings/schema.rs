@@ -83,22 +83,25 @@ where
 pub const CLAUDE_TAB_ID: &str = "claude";
 /// V1.4-07: second Claude tab preconfigured to use a local LLM via the
 /// `claude_local` provider settings. Replaces the v1.7-and-earlier
-/// `aider` reserved id (the v1.7 → v1.8 migration rewrites the aider
-/// tab in place to this id).
+/// `aider` reserved id. (The v1.7 → v1.8 migration that rewrote the aider
+/// tab in place to this id was below the migration floor and deleted by V42 R9;
+/// a file old enough to still say `aider` is quarantined, not migrated.)
 pub const CLAUDE_LOCAL_TAB_ID: &str = "claude-local";
 /// The single OpenCode AI-tool tab. OpenCode picks its own provider/model
 /// (global config + credentials, switchable in-session), so unlike Claude
 /// there is no cloud/local pair. Reserved in V19, replacing BOTH the V14
-/// `aider` and `aider-local` reserved ids (the v18 → v19 migration collapses
-/// them into this one id).
+/// `aider` and `aider-local` reserved ids. (The v18 → v19 migration that
+/// collapsed them into this one id was below the migration floor and deleted by
+/// V42 R9.)
 pub const OPENCODE_TAB_ID: &str = "opencode";
 pub const SHELL_DEFAULT_TAB_ID: &str = "shell-default-1";
 /// Legacy id of the V8-03 reserved Offload Server tab. Retired in schema v25:
 /// the live backend dashboard moved INSIDE the Tool Activity tab as the
 /// "Offload server" section (ToolActivityView.svelte), so there is no separate
-/// reserved tab anymore. This constant survives only so the v24 → v25
-/// migration can find and drop the old materialized `offload-server` entry
-/// from existing settings files.
+/// reserved tab anymore. The v24 → v25 migration that dropped the old
+/// materialized entry is below the migration floor and deleted (V42 R9); this
+/// constant survives for `RETIRED_TAB_IDS`, the integrity check's fail-safe
+/// prune, which is what still catches the id in an unmigrated overlay.
 pub const OFFLOAD_SERVER_TAB_ID: &str = "offload-server";
 /// V9-01: reserved id of the read-only, non-closable "Code Graph" monitor
 /// tab. Materialized iff `graph.enabled` (reconciled by the integrity
@@ -112,9 +115,10 @@ pub const WORKBENCH_TAB_ID: &str = "workbench-1";
 /// Legacy id of the V15 Feature 4 reserved Graph View tab. Retired in schema
 /// v26: the live force-graph moved INSIDE the Tool Activity tab as the
 /// "Graph view" section (ToolActivityView.svelte), so there is no separate
-/// reserved tab anymore. This constant survives only so the v25 → v26
-/// migration (and the integrity check's retired-tab prune) can find and drop
-/// the old materialized `graph-view` entry from existing settings files.
+/// reserved tab anymore. The v25 → v26 migration that dropped the old
+/// materialized entry is below the migration floor and deleted (V42 R9); this
+/// constant survives for `RETIRED_TAB_IDS`, the integrity check's fail-safe
+/// prune, which is what still catches the id in an unmigrated overlay.
 pub const GRAPH_VIEW_TAB_ID: &str = "graph-view";
 /// Reserved id of the read-only, app-rendered Tool Activity tab — a unified
 /// feed of graph-tool calls + offload requests, plus the graph/offload tool
@@ -135,31 +139,33 @@ pub const EVENTS_TAB_ID: &str = "events";
 /// Legacy id of the V23 reserved Code Audit tab. Retired in schema v27: the
 /// Security | Quality audit panels moved INSIDE the Tool Activity tab as the
 /// "Code audit" section (ToolActivityView.svelte), so there is no separate
-/// reserved tab anymore. This constant survives only so the v26 → v27
-/// migration (and the integrity check's retired-tab prune) can find and drop
-/// the old materialized `code-audit` entry from existing settings files.
+/// reserved tab anymore. The v26 → v27 migration that dropped the old
+/// materialized entry is below the migration floor and deleted (V42 R9); this
+/// constant survives for `RETIRED_TAB_IDS`, the integrity check's fail-safe
+/// prune, which is what still catches the id in an unmigrated overlay.
 pub const CODE_AUDIT_TAB_ID: &str = "code-audit";
 /// Legacy id of the V25 reserved Code Quality tab. Retired in schema v23: the
 /// Quality view moved INSIDE the Code Audit tab as a sub-tab (Security |
-/// Quality), so there is no separate reserved tab anymore. This constant
-/// survives only so the v22 → v23 migration can find and drop the old
-/// materialized `code-quality` entry from existing settings files.
+/// Quality), so there is no separate reserved tab anymore. The v22 → v23
+/// migration that dropped the old materialized entry is below the migration
+/// floor and deleted (V42 R9); this constant survives for `RETIRED_TAB_IDS`,
+/// the integrity check's fail-safe prune, which is what still catches the id in
+/// an unmigrated overlay.
 pub const CODE_QUALITY_TAB_ID: &str = "code-quality";
-/// Legacy id of the V15 reserved broot tab. Retired in V16: broot is no
-/// longer a persistent builtin — it (like rustnet) launches on demand from
-/// the bottom-bar tool buttons into ordinary closable Shell tabs (uuid ids).
-/// This constant survives only so the v15 → v16 migration can find and drop
-/// the old auto-seeded `shell-broot` entry from existing settings files.
-pub const SHELL_BROOT_TAB_ID: &str = "shell-broot";
+// V42 R9 (issue #120): `SHELL_BROOT_TAB_ID` lived here for one reason — the
+// v15 → v16 migration that dropped the auto-seeded `shell-broot` entry. That
+// step is below the migration floor and gone, and the id needs no fail-safe of
+// its own: broot is an ordinary closable Shell tab now, so an entry that
+// survives in an unmigrated overlay is a tab the user can close, not a reserved
+// one the app would try to own (unlike the ids in `RETIRED_TAB_IDS`).
 
-/// The on-disk schema version. Bumped on every migration step. Detection
-/// of legacy files prefers this field's integer value over the older
-/// presence-of-key archaeology in the migration cascade — a future migration
-/// only needs to compare `value.schema_version < N`.
+/// The on-disk schema version. Bumped on every migration step, and the ONLY
+/// thing the cascade's detectors read: every step is `schema_version == N`.
 ///
-/// Files that pre-date V1.10 lack the field entirely; the cascade still
-/// uses the `looks_v1_X` predicates for those, falling through to a final
-/// step that stamps the field with the current value.
+/// A file that states no version at all is a pre-v1.10 file, from before this
+/// field existed. Since V42 R9 that is not a shape the cascade can enter — it is
+/// below [`crate::settings::migration::MIN_GLOBAL_SCHEMA_VERSION`], and such a
+/// file is quarantined and reseeded rather than migrated.
 pub const CURRENT_SCHEMA_VERSION: u8 = 38;
 
 fn current_schema_version() -> u8 {

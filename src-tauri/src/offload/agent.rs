@@ -3923,10 +3923,13 @@ mod tests {
     #[tokio::test]
     async fn an_existing_remote_backend_is_refused_run_check_at_call_time() {
         let cwd = std::env::current_dir().unwrap();
-        // A settings file written before the opt-in existed — the pre-existing
-        // install this half of the fix is for.
-        let legacy: crate::settings::Settings = serde_json::from_str(r#"{"schema_version": 29}"#)
-            .expect("a pre-F-12 settings file deserializes");
+        // A settings file that does not carry the opt-in key at all — stamped at
+        // the migration floor, the oldest file this build still loads (V42 R9
+        // rebased it from v29, which no longer exists). The container-level
+        // `#[serde(default)]` fills the field, and this is the install that
+        // depends on which way it fills.
+        let legacy: crate::settings::Settings = serde_json::from_str(r#"{"schema_version": 30}"#)
+            .expect("a settings file without the opt-in key deserializes");
         let router = NativeRouter::new(
             vec![ToolDef::function(
                 "run_check",
@@ -3960,8 +3963,10 @@ mod tests {
     #[tokio::test]
     async fn the_opt_in_permits_run_check_on_that_same_remote_backend() {
         let cwd = std::env::current_dir().unwrap();
+        // The same file as the test above (stamped at the migration floor), with
+        // the opt-in switched on.
         let mut opted: crate::settings::Settings =
-            serde_json::from_str(r#"{"schema_version": 29}"#).unwrap();
+            serde_json::from_str(r#"{"schema_version": 30}"#).unwrap();
         opted.checks_allow_remote_worker = true;
         let router = NativeRouter::new(
             vec![ToolDef::function(

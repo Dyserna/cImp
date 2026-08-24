@@ -182,11 +182,11 @@ pub fn load(default_shell: &ShellSpec, launch_cwd: &Path) -> LoadOutcome {
         // 2a. **Migrate it, before anything reads its shape** (V40 Phase I).
         //     Until Phase I this was skipped, for two reasons that were both
         //     about entering the cascade BLIND: the presence-archaeology
-        //     detectors key off top-level keys a partial diff legitimately
-        //     lacks, and a value with no version re-migrates every launch,
-        //     growing `.bak` files without bound. `migrate_overlay` is told the
-        //     version, refuses to start below where the archaeology ends, and
-        //     writes no file at all — so neither reason survives, and the gap
+        //     detectors (deleted by V42 R9) keyed off top-level keys a partial
+        //     diff legitimately lacks, and a value with no version re-migrates
+        //     every launch, growing `.bak` files without bound. `migrate_overlay`
+        //     is told the version, refuses to start below the migration floor,
+        //     and writes no file at all — so neither reason survives, and the gap
         //     they were covering does not: a project that set
         //     `claude_local.base_url` before schema 36 kept a top-level
         //     `claude_local` block that reached nothing after the global moved
@@ -2671,10 +2671,14 @@ const RESERVED_TAB_SPECS: &[ReservedTabSpec] = &[
 /// *global* file, and V40 Phase I extended the cascade to the per-folder
 /// overlay too — but only from [`migration::MIN_OVERLAY_SCHEMA_VERSION`] up:
 /// an overlay older than that (or carrying no version at all) is deliberately
-/// left unmigrated rather than run through the presence-archaeology steps on a
-/// partial file, and re-introduces the entry through the merge. This list feeds
-/// the integrity check's fail-safe prune, which catches every source that
-/// survives: pre-v10 overlays, hand-edits, imported files.
+/// left unmigrated, because below the floor there are no steps left to run, and
+/// it re-introduces the entry through the merge. This list feeds the integrity
+/// check's fail-safe prune, which catches every source that survives:
+/// below-floor overlays, hand-edits, imported files.
+///
+/// V42 R9 note: the GLOBAL side of this is now stricter than "the migrations
+/// prune them" — a below-floor global file is quarantined and reseeded rather
+/// than pruned. The overlay is the leg that still needs the fail-safe.
 const RETIRED_TAB_IDS: [&str; 4] = [
     OFFLOAD_SERVER_TAB_ID,
     CODE_QUALITY_TAB_ID,
@@ -4457,8 +4461,11 @@ mod tests {
         );
         assert!(loaded.checks_auto_configure);
 
-        // A config predating Phase D (neither key) defaults both to false.
-        let old: Settings = serde_json::from_str(r#"{"schema_version": 21}"#).unwrap();
+        // A config carrying neither key defaults both to false — stamped at the
+        // migration floor, the oldest file this build still loads (V42 R9
+        // rebased it from v21, which is below the floor and never reaches the
+        // typed container at all).
+        let old: Settings = serde_json::from_str(r#"{"schema_version": 30}"#).unwrap();
         assert!(!old.checks_suggestion_dismissed);
         assert!(!old.checks_auto_configure);
 
@@ -5836,7 +5843,7 @@ mod tests {
 
     // --- F-19: built-in price rows reach EXISTING installs ---------------
 
-    /// A settings file written before this field existed must read back as
+    /// A settings file that does not carry this field must read back as
     /// generation 0, not as `PRICING_GENERATION`.
     ///
     /// This is the whole fix in one assertion. `Settings` carries a
@@ -5848,7 +5855,9 @@ mod tests {
     /// built-in row.
     #[test]
     fn a_settings_file_without_the_watermark_reads_as_generation_zero() {
-        let s: Settings = serde_json::from_str(r#"{"schema_version": 29}"#).unwrap();
+        // Stamped at the migration floor — the oldest file this build still
+        // loads. V42 R9 rebased it from v29, which is below the floor.
+        let s: Settings = serde_json::from_str(r#"{"schema_version": 30}"#).unwrap();
         assert_eq!(
             s.pricing_seeded_generation, 0,
             "a file predating the watermark must look like generation 0, or the \

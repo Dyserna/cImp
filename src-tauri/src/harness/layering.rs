@@ -13,14 +13,18 @@
 //! Three more tests guard the *guards*, because a source scanner that reads the
 //! wrong slice of a file reports on nothing and says `ok` while doing it:
 //! [`the_literal_scan_reads_the_same_code_on_every_platform`],
-//! [`every_literal_allowlist_entry_is_still_earning_it`] and
-//! [`executable_text_ignores_line_endings_and_cuts_at_every_test_item`]. All
-//! three were added after the first two tests shipped a defect each — the story
-//! is on [`executable_text`], and it is worth reading before touching this file.
+//! [`every_literal_allowlist_entry_is_still_earning_it`] and — since R11 moved
+//! the primitive to its shared home —
+//! `rustsrc::tests::executable_text_ignores_line_endings_and_cuts_at_every_test_item`.
+//! All three were added after the first two tests shipped a defect each — the
+//! story is on [`executable_text`], and it is worth reading before touching
+//! this file.
 //!
-//! The tree-reading tests use the repo's existing source-scanning idiom:
-//! `CARGO_MANIFEST_DIR` is `<repo>/src-tauri`, so `src/` is one join away and no
-//! path is hard-coded relative to a working directory.
+//! The tree-reading tests get their tree from [`crate::rustsrc::source_files`]
+//! — the one audited walk in this crate (R11), rooted at `CARGO_MANIFEST_DIR`
+//! rather than the cwd, `\r`-normalised at the read, dot-directories skipped,
+//! and floored against a vacuous answer. This file used to carry its own copy,
+//! which was one of the two that stripped no `\r`.
 //!
 //! # What "harness-owned" means here
 //!
@@ -33,121 +37,11 @@
 //! see outside `harness/`, which is the two-sources-of-truth discipline the rest
 //! of this milestone is built on.
 
+use crate::rustsrc::{executable_text, source_files, src_root};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use super::contract::{self, Dep, Harness};
-
-/// `<repo>/src-tauri/src`.
-fn src_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
-}
-
-/// Every `.rs` file under `src/`, as `(repo-relative-ish path with forward
-/// slashes, contents)`. Paths are rooted at `src/` so the allowlists below read
-/// the way a person would write them.
-fn source_files() -> Vec<(String, String)> {
-    fn walk(dir: &Path, root: &Path, out: &mut Vec<(String, String)>) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for e in entries.flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                walk(&p, root, out);
-            } else if p.extension().and_then(|s| s.to_str()) == Some("rs") {
-                let rel = p
-                    .strip_prefix(root)
-                    .unwrap_or(&p)
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                if let Ok(text) = std::fs::read_to_string(&p) {
-                    out.push((rel, text));
-                }
-            }
-        }
-    }
-    let root = src_root();
-    let mut out = Vec::new();
-    walk(&root, &root, &mut out);
-    out.sort();
-    out
-}
-
-/// Drop every `#[cfg(test)]` item and every comment line.
-///
-/// **Tests are deliberately out of scope.** A fixture that quotes a harness
-/// payload is a *recorded input*, not a dependency on one — the Phase B canary
-/// corpus is made of nothing else, and an assertion that Claude's overlay
-/// carries a `statusLine` key has to spell `statusLine` to be an assertion at
-/// all. What this scan is about is production code that *reads or writes* an
-/// upstream name; that is the thing which must sit in `harness/` so a rename
-/// upstream is a diff in one directory.
-///
-/// Comments go for the same reason: prose naming `rate_limits` is
-/// documentation, and documentation that explains the seam is wanted
-/// everywhere, not confined.
-///
-/// # Why this delegates instead of finding a boundary itself
-///
-/// It used to cut at `text.match_indices("\n#[cfg(test)]\n").last()`, and that
-/// was wrong in two independent ways — both of which shipped, and one of which
-/// only ever fired off this developer's machine:
-///
-///  1. **It was line-ending-sensitive.** `\r\n#[cfg(test)]\r\n` does not match,
-///     so a CRLF checkout found no boundary at all and fell back to scanning the
-///     WHOLE file, tests included. Every `.rs` file in this repo is LF *in the
-///     index*, but `core.autocrlf` is on by default on Windows, so the CI
-///     runner's checkout is CRLF while a working copy whose files were rewritten
-///     in place is a mix. The v0.52.0-rc.1 Tests run is the record: byte-identical
-///     content, `no_harness_literals_outside_harness` green on the Linux job and
-///     red on the Windows job with 26 hits across four files, every one inside a
-///     `mod tests`. A verification test whose coverage depends on how Git checked
-///     the file out reports on the checkout, not on the code.
-///  2. **`.last()` is not "the trailing test module".** `#[cfg(test)]` marks
-///     test-only *items*, of which a file may have many: `graph/mcp.rs` has
-///     eleven test modules, so the cut landed at the eleventh and left the first
-///     ten (~1800 lines) inside the scan. Worse in the other direction, a
-///     `#[cfg(test)] mod tests;` **declaration** is the last such item in its
-///     file — so `processing/mod.rs` was cut at line 47 of ~500 and
-///     `harness/mod.rs` at line 99, hiding the production code both tests exist
-///     to read. Silent under-coverage, which is how a canary goes vacuous.
-///
-/// Neither is fixable by a smarter single cut: `offload/mcp.rs` has production
-/// code (`proxy_graph_outcome`) *between* two test modules, so no one boundary
-/// separates test from production text. What is needed is every
-/// `#[cfg(test)]` item's span, brace-matched, with strings and comments blanked
-/// first so a `"#[cfg(test)]"` inside a literal is not mistaken for one — which
-/// is exactly what [`crate::rustsrc`] already did for the spawn ledger, controls
-/// and all. So this normalizes line endings, asks for the spans, and removes
-/// them.
-///
-/// What that deliberately still keeps in scope: `#[cfg(test)]`-gated *helpers*
-/// are removed along with the modules (they are test-only either way), while a
-/// plain `fn` used only by tests but not gated is production text and is
-/// scanned. That is the right side to err on — the gate is the declaration.
-fn executable_text(rel: &str, text: &str) -> String {
-    // FIRST, before any offset is taken: Windows and Linux must scan
-    // byte-identical bytes, so the local run is authoritative for CI.
-    let norm = text.replace('\r', "");
-    let code = crate::rustsrc::code_of(rel, &norm);
-    let mut kept = String::with_capacity(norm.len());
-    let mut at = 0usize;
-    // Sorted by start; a nested `#[cfg(test)]` inside a test module yields a
-    // span already covered, hence the `max`.
-    for (start, end) in crate::rustsrc::test_regions(&code) {
-        let (start, end) = (start.min(norm.len()), end.min(norm.len()));
-        if start > at {
-            kept.push_str(&norm[at..start]);
-        }
-        at = at.max(end);
-    }
-    kept.push_str(&norm[at..]);
-    kept.lines()
-        .filter(|l| !l.trim_start().starts_with("//"))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
 
 /// Path segments too common to be evidence of harness knowledge on their own.
 ///
@@ -464,48 +358,6 @@ fn every_literal_allowlist_entry_is_still_earning_it() {
     assert!(
         stale.is_empty(),
         "LITERAL_ALLOWLIST entries that stopped earning their exemption:\n{stale:#?}"
-    );
-}
-
-/// [`executable_text`]'s own unit controls, on input whose answer is written
-/// down rather than inferred from the tree.
-///
-/// The tree-wide test above proves the property end to end; these name the two
-/// specific defects, so a future regression says which one came back.
-#[test]
-fn executable_text_ignores_line_endings_and_cuts_at_every_test_item() {
-    // Defect 1: the same source, two line endings, one answer.
-    let src = "fn prod() { let a = \"keep\"; }\n#[cfg(test)]\nmod tests {\n    let b = \"drop\";\n}\n";
-    let lf = executable_text("f.rs", src);
-    let crlf = executable_text("f.rs", &src.replace('\n', "\r\n"));
-    assert_eq!(lf, crlf, "line endings must not change what is scanned");
-    assert!(lf.contains("\"keep\""));
-    assert!(!lf.contains("\"drop\""), "the test module must be dropped");
-
-    // Defect 2a: a `#[cfg(test)] mod tests;` DECLARATION ends at its semicolon —
-    // it must not swallow the production code that follows it, which is how
-    // `processing/mod.rs` lost ~500 lines from the scan.
-    let decl = "#[cfg(test)]\nmod tests;\n\nfn prod() { let a = \"keep\"; }\n";
-    let body = executable_text("f.rs", decl);
-    assert!(
-        body.contains("\"keep\""),
-        "a `#[cfg(test)] mod x;` declaration must not truncate the file: {body:?}"
-    );
-
-    // Defect 2b: EVERY test item goes, not just the last one, and production
-    // code between two of them survives — `offload/mcp.rs`'s real shape.
-    let many = "#[cfg(test)]\nmod a { let x = \"drop_a\"; }\nfn mid() { let m = \"keep_mid\"; }\n\
-                #[cfg(test)]\nmod b { let y = \"drop_b\"; }\n";
-    let body = executable_text("f.rs", many);
-    assert!(body.contains("\"keep_mid\""), "code between test modules is production");
-    assert!(!body.contains("\"drop_a\""), "the FIRST test module must go too");
-    assert!(!body.contains("\"drop_b\""));
-
-    // A `#[cfg(test)]` spelt inside a string literal is not a test item.
-    let quoted = "fn prod() { let s = \"#[cfg(test)]\\nmod t {\"; let a = \"keep\"; }\n";
-    assert!(
-        executable_text("f.rs", quoted).contains("\"keep\""),
-        "a quoted `#[cfg(test)]` must not start a region"
     );
 }
 

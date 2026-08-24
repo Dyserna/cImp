@@ -2030,7 +2030,7 @@ detection_update_manifest_url: string,
  * Default `sensor` because we cannot assume what MCP setup a user runs and
  * a silently-open side channel is worse than a beacon. An unrecognized
  * string also reads as `sensor` (see
- * `crate::tabs::config::NativeWebVisibility::parse`): a typo must neither
+ * `crate::settings::injection::native_web_mode`): a typo must neither
  * blind the latch nor silently take a tool away. A value of the wrong JSON
  * *type* — `true`, `null`, `0` — reads the same way (#48) instead of
  * failing the typed parse of the whole file; see [`de_native_web_visibility`].

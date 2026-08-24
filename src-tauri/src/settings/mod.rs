@@ -150,7 +150,6 @@ pub fn init(default_shell: &ShellSpec, launch_cwd: &Path) -> SettingsHandle {
 mod frontend_mirrors {
     use super::injection::Feature;
     use super::LOCAL_DATA_TOOLS;
-    use std::path::{Path, PathBuf};
 
     /// The frontend's hand-mirror of the Rust settings wire types (F-27's two
     /// constants live here), embedded at compile time.
@@ -613,45 +612,16 @@ mod frontend_mirrors {
         })
     }
 
-    /// Every `.rs` / `.css` file under `src-tauri/src`, skipping dot-directories
-    /// (`.cimp` holds a graph db and a shadow git worktree, i.e. binaries).
-    fn source_files(dir: &Path, out: &mut Vec<PathBuf>) {
-        for entry in std::fs::read_dir(dir).expect("read_dir under src-tauri/src") {
-            let path = entry.expect("dir entry").path();
-            let name = path.file_name().unwrap_or_default().to_string_lossy();
-            if name.starts_with('.') {
-                continue;
-            }
-            if path.is_dir() {
-                source_files(&path, out);
-            } else if matches!(
-                path.extension().and_then(|e| e.to_str()),
-                Some("rs" | "css")
-            ) {
-                out.push(path);
-            }
-        }
-    }
-
     fn crate_pointers() -> Vec<Pointer> {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut files = Vec::new();
-        source_files(&root, &mut files);
-        assert!(
-            files.len() > 100,
-            "scanned only {} source files — the walk is broken, and a broken walk finds no \
-             bad pointer and passes",
-            files.len()
-        );
+        // `.css` alongside `.rs`: a settings-path pointer written in a
+        // stylesheet comment is held to exactly the same rule as one in a
+        // refusal string. The walk itself — dot-directories skipped (`.cimp`
+        // holds a graph db and a shadow git worktree, i.e. binaries), line
+        // endings normalised at the read, and floored against a vacuous answer
+        // — is `rustsrc::source_files_ext`, audited once for every scanner in
+        // the crate that gates on it (R11).
         let mut out = Vec::new();
-        for path in files {
-            let rel = path
-                .strip_prefix(&root)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .replace('\\', "/");
-            let text = std::fs::read_to_string(&path)
-                .unwrap_or_else(|e| panic!("{rel} is not readable as UTF-8: {e}"));
+        for (rel, text) in crate::rustsrc::source_files_ext(&["rs", "css"]) {
             out.extend(pointers_in(&rel, &text));
         }
         assert!(

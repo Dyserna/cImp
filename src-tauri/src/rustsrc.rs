@@ -18,6 +18,12 @@
 //!     `#[cfg(test)]` items in code and then act on the *unblanked* source, and
 //!     it is why [`test_regions`] returns ranges rather than a string.
 //!
+//! Since R11 the *walk* lives here too — [`src_root`] and [`source_files`], the
+//! one audited answer to "every `.rs` file in this crate". Same reason, same
+//! kind of incident: five copies of it disagreed about CR-stripping,
+//! dot-directory skipping and the vacuity floor, and the details are on
+//! [`source_files`].
+//!
 //! **Why this is a shared module and not a copy per caller.** The bug that
 //! created it: `harness::layering` had its own hand-rolled boundary finder
 //! (`text.match_indices("\n#[cfg(test)]\n").last()`) which was both
@@ -30,6 +36,128 @@
 //! checked the file out is the vacuous-canary class V35 exists to kill, so the
 //! answer is one audited implementation with controls
 //! (`spawn_ledger`'s `the_scanner_finds_what_it_claims_to_find`), not three.
+
+use std::path::{Path, PathBuf};
+
+/// The floor under [`source_files`]'s answer.
+///
+/// Every scanner built on this walk shares one failure mode: a walk that
+/// returns nothing finds no offender and reports `ok` while doing it. Three of
+/// the five copies R11 replaced asserted a floor of their own, two did not, and
+/// the two that did not are exactly the two whose scans are tree-wide security
+/// claims — so the floor lives here, once, where no caller can forget it. It is
+/// a vacuity floor, not a census: `src/` holds ~250 `.rs` files, and any answer
+/// under half of that is a broken walk rather than a smaller tree.
+const MIN_SOURCE_FILES: usize = 100;
+
+/// `<repo>/src-tauri/src`.
+///
+/// Resolved from `CARGO_MANIFEST_DIR` rather than the process cwd, so every
+/// scanner answers the same from any working directory (verified by running the
+/// suite from `C:\`), and asserted to exist: a scan whose root is missing has to
+/// say so rather than quietly walk nothing.
+pub(crate) fn src_root() -> PathBuf {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    assert!(
+        root.is_dir(),
+        "the source tree is missing at {} — a source scan cannot run",
+        root.display()
+    );
+    root
+}
+
+/// Every `.rs` file under [`src_root`], as `(slash-relative path, contents)` —
+/// sorted, `\r`-normalised, dot-directories skipped, guarded against vacuity.
+///
+/// # Why this is one function and not five (R11)
+///
+/// Five copies of this walk existed — in `harness::layering`, `spawn_gate`,
+/// `spawn_ledger`, `graph::index::notes` and `settings` — and they disagreed on
+/// exactly the three axes that decide what a *security* scan gets to see. The
+/// union is taken in the strict direction on every one, so no scanner reads
+/// fewer files, fewer bytes, or a different slice than it did before:
+///
+///  1. **`\r`.** `spawn_gate` stripped it, `layering` did not. That is the same
+///     fault the module docs above record from the other end — identical bytes,
+///     green on an LF working copy and red on a CRLF CI checkout — and the only
+///     place it can be fixed once is at the READ, before any caller takes an
+///     offset into the text. So this hands out LF, and no caller has to
+///     remember to.
+///  2. **Dot-directories.** `spawn_ledger` and `settings` skipped them; the
+///     other three walked in. A `.cimp/` under the crate holds a CozoDB graph
+///     database and a shadow git worktree — a whole second checkout of this
+///     tree, `.rs` files and all — so descending into it scans a stale copy of
+///     the crate and reports hits at paths nobody edits. (It is prophylactic
+///     today: the tree has no dot-directory under `src/` right now, and the
+///     point is that the day one appears no scan changes meaning.)
+///  3. **The vacuity floor.** See [`MIN_SOURCE_FILES`].
+///
+/// Sorting is the fourth, minor one: four of the five sorted and `spawn_ledger`
+/// did not, which made its failure messages depend on directory order.
+pub(crate) fn source_files() -> Vec<(String, String)> {
+    source_files_ext(&["rs"])
+}
+
+/// [`source_files`] over a caller-chosen extension set.
+///
+/// `settings`' pointer scan reads `.css` alongside `.rs` — a settings-path
+/// pointer is held to the same rule wherever it is written — and that is the
+/// only reason this parameter exists.
+pub(crate) fn source_files_ext(exts: &[&str]) -> Vec<(String, String)> {
+    let root = src_root();
+    let out = walk_tree(&root, exts);
+    assert!(
+        out.len() > MIN_SOURCE_FILES,
+        "the source walk found only {} {exts:?} files under {} — a walk that reads nothing finds \
+         no offender and passes, which is the one outcome a source scan may never have",
+        out.len(),
+        root.display()
+    );
+    out
+}
+
+/// The walk itself: an arbitrary root, no vacuity floor.
+///
+/// Split out so [`the_walk_skips_dot_dirs_normalises_line_endings_and_sorts`]
+/// can point it at a synthetic tree whose right answer is written down, rather
+/// than inferring the walker's behaviour from the crate it is walking.
+fn walk_tree(root: &Path, exts: &[&str]) -> Vec<(String, String)> {
+    fn walk(dir: &Path, root: &Path, exts: &[&str], out: &mut Vec<(String, String)>) {
+        let entries =
+            std::fs::read_dir(dir).unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()));
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .starts_with('.')
+            {
+                continue;
+            }
+            if path.is_dir() {
+                walk(&path, root, exts, out);
+            } else if path
+                .extension()
+                .and_then(|x| x.to_str())
+                .is_some_and(|x| exts.contains(&x))
+            {
+                let text = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|e| panic!("cannot read {} as UTF-8: {e}", path.display()));
+                let rel = path
+                    .strip_prefix(root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                out.push((rel, text.replace('\r', "")));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, root, exts, &mut out);
+    out.sort();
+    out
+}
 
 fn utf8_len(b: u8) -> usize {
     if b < 0x80 {
@@ -371,9 +499,243 @@ pub(crate) fn test_regions(code: &str) -> Vec<(usize, usize)> {
     out
 }
 
+/// **Production text**: `text` with every `#[cfg(test)]` item and every
+/// whole-line comment removed, for the scans whose subject is what the crate
+/// DOES rather than where in a file it does it. Used by
+/// [`crate::harness::layering`]'s four tree-wide tests and by
+/// `delegation`'s reserved-transition scan.
+///
+/// # Why this is a sibling of [`code_of`] and not a mode of it (R11)
+///
+/// The three look like they overlap, and merging them would be wrong.
+/// [`code_of`] and [`uncommented`] BLANK: they replace spans with spaces, so
+/// the result is byte-for-byte the same length as the input and a span found
+/// in it is a valid span in the original — which is the entire reason
+/// [`test_regions`] can return ranges rather than a string. This one DELETES:
+/// it is shorter than its input, and every offset into it is wrong for the
+/// original. Folding it into [`Erase`] would hand a caller a string whose
+/// offsets mean something different depending on a flag, and the callers of
+/// both families are source scanners that locate things by offset. Same
+/// module, same lexer underneath, deliberately separate contract.
+///
+/// It also keeps string and char literals — its callers' needles ARE literals
+/// (a harness-owned `"tool_name"`, a `transition::CANCELLED` path) — and drops
+/// only whole comment LINES, not trailing ones. Where that distinction matters
+/// and offsets must survive, [`uncommented`] is the answer instead.
+///
+/// Drop every `#[cfg(test)]` item and every comment line.
+///
+/// **Tests are deliberately out of scope.** A fixture that quotes a harness
+/// payload is a *recorded input*, not a dependency on one — the Phase B canary
+/// corpus is made of nothing else, and an assertion that Claude's overlay
+/// carries a `statusLine` key has to spell `statusLine` to be an assertion at
+/// all. What this scan is about is production code that *reads or writes* an
+/// upstream name; that is the thing which must sit in `harness/` so a rename
+/// upstream is a diff in one directory.
+///
+/// Comments go for the same reason: prose naming `rate_limits` is
+/// documentation, and documentation that explains the seam is wanted
+/// everywhere, not confined.
+///
+/// # Why this delegates instead of finding a boundary itself
+///
+/// It used to cut at `text.match_indices("\n#[cfg(test)]\n").last()`, and that
+/// was wrong in two independent ways — both of which shipped, and one of which
+/// only ever fired off this developer's machine:
+///
+///  1. **It was line-ending-sensitive.** `\r\n#[cfg(test)]\r\n` does not match,
+///     so a CRLF checkout found no boundary at all and fell back to scanning the
+///     WHOLE file, tests included. Every `.rs` file in this repo is LF *in the
+///     index*, but `core.autocrlf` is on by default on Windows, so the CI
+///     runner's checkout is CRLF while a working copy whose files were rewritten
+///     in place is a mix. The v0.52.0-rc.1 Tests run is the record: byte-identical
+///     content, `no_harness_literals_outside_harness` green on the Linux job and
+///     red on the Windows job with 26 hits across four files, every one inside a
+///     `mod tests`. A verification test whose coverage depends on how Git checked
+///     the file out reports on the checkout, not on the code.
+///  2. **`.last()` is not "the trailing test module".** `#[cfg(test)]` marks
+///     test-only *items*, of which a file may have many: `graph/mcp.rs` has
+///     eleven test modules, so the cut landed at the eleventh and left the first
+///     ten (~1800 lines) inside the scan. Worse in the other direction, a
+///     `#[cfg(test)] mod tests;` **declaration** is the last such item in its
+///     file — so `processing/mod.rs` was cut at line 47 of ~500 and
+///     `harness/mod.rs` at line 99, hiding the production code both tests exist
+///     to read. Silent under-coverage, which is how a canary goes vacuous.
+///
+/// Neither is fixable by a smarter single cut: `offload/mcp.rs` has production
+/// code (`proxy_graph_outcome`) *between* two test modules, so no one boundary
+/// separates test from production text. What is needed is every
+/// `#[cfg(test)]` item's span, brace-matched, with strings and comments blanked
+/// first so a `"#[cfg(test)]"` inside a literal is not mistaken for one — which
+/// is exactly what [`code_of`] and [`test_regions`] above already provide,
+/// controls and all. So this normalizes line endings, asks for the spans, and removes
+/// them.
+///
+/// What that deliberately still keeps in scope: `#[cfg(test)]`-gated *helpers*
+/// are removed along with the modules (they are test-only either way), while a
+/// plain `fn` used only by tests but not gated is production text and is
+/// scanned. That is the right side to err on — the gate is the declaration.
+pub(crate) fn executable_text(rel: &str, text: &str) -> String {
+    // FIRST, before any offset is taken: Windows and Linux must scan
+    // byte-identical bytes, so the local run is authoritative for CI.
+    let norm = text.replace('\r', "");
+    let code = code_of(rel, &norm);
+    let mut kept = String::with_capacity(norm.len());
+    let mut at = 0usize;
+    // Sorted by start; a nested `#[cfg(test)]` inside a test module yields a
+    // span already covered, hence the `max`.
+    for (start, end) in test_regions(&code) {
+        let (start, end) = (start.min(norm.len()), end.min(norm.len()));
+        if start > at {
+            kept.push_str(&norm[at..start]);
+        }
+        at = at.max(end);
+    }
+    kept.push_str(&norm[at..]);
+    kept.lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [`executable_text`]'s own unit controls, on input whose answer is written
+    /// down rather than inferred from the tree.
+    ///
+    /// The tree-wide tests in [`crate::harness::layering`] prove the property
+    /// end to end; these name the two specific defects, so a future regression
+    /// says which one came back. They moved here with the function (R11) — the
+    /// primitive and its controls travel together.
+    #[test]
+    fn executable_text_ignores_line_endings_and_cuts_at_every_test_item() {
+        // Defect 1: the same source, two line endings, one answer.
+        let src = "fn prod() { let a = \"keep\"; }\n#[cfg(test)]\nmod tests {\n    let b = \"drop\";\n}\n";
+        let lf = executable_text("f.rs", src);
+        let crlf = executable_text("f.rs", &src.replace('\n', "\r\n"));
+        assert_eq!(lf, crlf, "line endings must not change what is scanned");
+        assert!(lf.contains("\"keep\""));
+        assert!(!lf.contains("\"drop\""), "the test module must be dropped");
+
+        // Defect 2a: a `#[cfg(test)] mod tests;` DECLARATION ends at its semicolon —
+        // it must not swallow the production code that follows it, which is how
+        // `processing/mod.rs` lost ~500 lines from the scan.
+        let decl = "#[cfg(test)]\nmod tests;\n\nfn prod() { let a = \"keep\"; }\n";
+        let body = executable_text("f.rs", decl);
+        assert!(
+            body.contains("\"keep\""),
+            "a `#[cfg(test)] mod x;` declaration must not truncate the file: {body:?}"
+        );
+
+        // Defect 2b: EVERY test item goes, not just the last one, and production
+        // code between two of them survives — `offload/mcp.rs`'s real shape.
+        let many = "#[cfg(test)]\nmod a { let x = \"drop_a\"; }\nfn mid() { let m = \"keep_mid\"; }\n\
+                    #[cfg(test)]\nmod b { let y = \"drop_b\"; }\n";
+        let body = executable_text("f.rs", many);
+        assert!(body.contains("\"keep_mid\""), "code between test modules is production");
+        assert!(!body.contains("\"drop_a\""), "the FIRST test module must go too");
+        assert!(!body.contains("\"drop_b\""));
+
+        // A `#[cfg(test)]` spelt inside a string literal is not a test item.
+        let quoted = "fn prod() { let s = \"#[cfg(test)]\\nmod t {\"; let a = \"keep\"; }\n";
+        assert!(
+            executable_text("f.rs", quoted).contains("\"keep\""),
+            "a quoted `#[cfg(test)]` must not start a region"
+        );
+    }
+
+    /// The walker's controls (R11), on a synthetic tree whose right answer is
+    /// written down rather than read off the crate. Permanent, and one case per
+    /// divergence that made five copies of this walk disagree — a future edit
+    /// that reintroduces one fails here, rather than in a security assertion
+    /// that quietly stops matching anything.
+    #[test]
+    fn the_walk_skips_dot_dirs_normalises_line_endings_and_sorts() {
+        let root = std::env::temp_dir().join(format!("rustsrc-walk-{}", uuid::Uuid::new_v4()));
+        let write = |rel: &str, body: &str| {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().expect("every fixture has a parent"))
+                .expect("mkdir under temp");
+            std::fs::write(&p, body).expect("write a fixture");
+        };
+        // A CRLF file and an LF file with byte-identical content modulo the
+        // line ending — divergence 1.
+        write("z.rs", "fn z() {}\r\nfn zz() {}\r\n");
+        write("a/b.rs", "fn b() {}\n");
+        write("a/skip.txt", "not source\n");
+        write("theme.css", "a{}\n");
+        // Divergence 2, in its real shape: `.cimp/` holds a shadow worktree,
+        // i.e. a second checkout of the crate, `.rs` files and all.
+        write(".cimp/shadow/src/z.rs", "fn stale() {}\n");
+
+        let rs = walk_tree(&root, &["rs"]);
+        let paths: Vec<&str> = rs.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["a/b.rs", "z.rs"],
+            "the walk must be sorted, slash-separated, extension-filtered, and must not \
+             descend into a dot-directory"
+        );
+        assert!(
+            !rs.iter().any(|(_, t)| t.contains("stale")),
+            "a `.cimp/` shadow worktree was scanned as if it were the crate"
+        );
+        assert_eq!(
+            rs[1].1, "fn z() {}\nfn zz() {}\n",
+            "`\\r` must be stripped at the read, before any caller takes an offset"
+        );
+
+        let both = walk_tree(&root, &["rs", "css"]);
+        assert_eq!(
+            both.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>(),
+            vec!["a/b.rs", "theme.css", "z.rs"],
+            "widening the extension set must only ever add files"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// …and the same walk over the REAL tree is substantive and normalised.
+    ///
+    /// The synthetic control above proves the semantics; this one proves they
+    /// are the semantics the crate's scanners actually get, which is the half a
+    /// fixture can never establish.
+    #[test]
+    fn the_crate_walk_is_substantive_and_normalised() {
+        let files = source_files();
+        assert!(
+            files.len() > MIN_SOURCE_FILES,
+            "only {} files — the floor in `source_files_ext` should have fired first",
+            files.len()
+        );
+        assert!(
+            files.iter().any(|(p, _)| p == "rustsrc.rs"),
+            "the walk lost its own module, so it is not walking the crate root"
+        );
+        assert!(
+            files.iter().all(|(_, t)| !t.contains('\r')),
+            "a `\\r` reached a caller — on a CRLF checkout every offset-taking scan diverges"
+        );
+        assert!(
+            files
+                .iter()
+                .all(|(p, _)| !p.contains('\\') && !p.starts_with('/')),
+            "paths must be `src/`-relative with forward slashes: that is how the allowlists \
+             in `harness::layering` and the ledger rows in `spawn_ledger` are written"
+        );
+        let mut sorted = files.clone();
+        sorted.sort();
+        assert_eq!(files, sorted, "the walk must be sorted");
+
+        let widened = source_files_ext(&["rs", "css"]);
+        assert!(
+            widened.len() > files.len() && widened.iter().any(|(p, _)| p.ends_with(".css")),
+            "widening the extension set found no extra file — `settings`' pointer scan reads \
+             `.css` too, and would be silently reading less"
+        );
+    }
 
     /// The controls for [`uncommented`] (V42 review, RV-9). Each input is a
     /// shape a source scan can be fooled by, so a future edit to `blank_out`'s

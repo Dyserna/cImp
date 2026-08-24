@@ -26,6 +26,16 @@ export async function saveLayoutPreset(name: string, tree: LayoutNode): Promise<
   await invoke('save_layout_preset', { name, tree });
 }
 
+/// Ask the backend for a preset's tree, adapted to the live tab list and ready
+/// to drop into the layout store: tabs deleted since the save are gone, tabs
+/// created since it land in the focused pane, hidden tabs stay hidden, ratios
+/// are clamped, panes emptied by any of that collapse. Same integrity walk the
+/// load path runs — the rules live in `settings::layout` and nowhere else.
+/// Rejects when no preset has that name.
+export async function restoreLayoutPreset(name: string): Promise<LayoutPersisted> {
+  return await invoke<LayoutPersisted>('restore_layout_preset', { name });
+}
+
 /// Delete a preset by name. No-op when the name doesn't exist.
 export async function deleteLayoutPreset(name: string): Promise<void> {
   await invoke('delete_layout_preset', { name });

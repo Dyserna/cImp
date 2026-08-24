@@ -86,7 +86,10 @@
   }
 
   function handleRestore(p: LayoutPreset): void {
-    restoreLayoutPreset(p.name);
+    // Fire-and-forget: the restore is an IPC round-trip since V42 Phase B, and
+    // holding the dialog open until it lands would only show a frozen list. A
+    // failure leaves the live layout untouched (see `presets.ts`).
+    void restoreLayoutPreset(p.name);
     close();
   }
 

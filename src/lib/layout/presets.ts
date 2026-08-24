@@ -7,19 +7,13 @@
 
 import { get } from 'svelte/store';
 import { layout } from './store';
-import { settings } from '../settings/store';
-import { tabs as tabsStore } from '../settings/store';
 import { cancelDrag } from '../dnd/drag';
 import {
   deleteLayoutPreset as deletePresetIpc,
   renameLayoutPreset as renamePresetIpc,
+  restoreLayoutPreset as restorePresetIpc,
   saveLayoutPreset as savePresetIpc,
 } from './ipc';
-import {
-  leftmostLeafPaneId,
-  validateAndRepairLayout,
-} from './persistence';
-import type { LayoutPersisted } from '../settings/types';
 
 /// Snapshot the current layout's tree (without focus — presets are
 /// "set up panes this way" and focus is the user's next-click
@@ -35,33 +29,37 @@ export async function saveCurrentLayoutAsPreset(name: string): Promise<void> {
   await savePresetIpc(name, tree);
 }
 
-/// Restore a preset into the live layout. The preset's tree is
-/// adapted to the current tab list via the same integrity sieve used
-/// at launch — orphans (tabs created since the preset was saved)
-/// land in the focused pane, missing tabs are silently dropped.
-/// Focus is seeded from the leftmost leaf because presets don't
-/// store focus; the user's next click moves it from there.
+/// Restore a preset into the live layout.
 ///
-/// The debounced layout-save subscription (installed in App.svelte)
-/// writes the new layout back to settings on its own — no extra IPC
-/// from this function.
-export function restoreLayoutPreset(name: string): void {
-  const presets = get(settings).layout_presets;
-  const preset = presets.find((p) => p.name === name);
-  if (!preset) {
-    console.warn(`restoreLayoutPreset: no preset named '${name}'`);
+/// The backend adapts the preset's tree to the current tab list — orphans
+/// (tabs created since the preset was saved) land in the focused pane, missing
+/// tabs are dropped, hidden tabs stay hidden, ratios are clamped — and seeds
+/// focus from the leftmost leaf, because presets don't store focus and the
+/// user's next click moves it from there. V42 Phase B: that is the same
+/// integrity walk the launch path runs, and it exists only there; this function
+/// asks for the answer rather than recomputing it.
+///
+/// Async now that the adaptation is an IPC round-trip. Nothing else about the
+/// flow changed: the eager layout-save subscription (installed in App.svelte)
+/// writes the result back to settings on its own — no extra IPC from here.
+///
+/// A rejection (only cause: the preset vanished between the menu render and the
+/// click) leaves the live layout alone, which is the right outcome — the user
+/// keeps what they had.
+export async function restoreLayoutPreset(name: string): Promise<void> {
+  let repaired;
+  try {
+    repaired = await restorePresetIpc(name);
+  } catch (e) {
+    console.warn(`restoreLayoutPreset: ${String(e)}`);
     return;
   }
-  // A drag in flight references the live tree's pane ids; replacing
-  // the tree wholesale would strand sourcePaneId. Cancelling the drag
-  // first is cheaper than threading "tree may have changed" checks
-  // through every pointermove handler.
+  // A drag in flight references the live tree's pane ids; replacing the tree
+  // wholesale would strand sourcePaneId. Cancelling the drag first is cheaper
+  // than threading "tree may have changed" checks through every pointermove
+  // handler. After the await, not before: cancelling a drag the user is still
+  // making and THEN failing the restore would be a change with no result.
   cancelDrag();
-  const persisted: LayoutPersisted = {
-    tree: preset.tree,
-    focused_pane_id: leftmostLeafPaneId(preset.tree),
-  };
-  const repaired = validateAndRepairLayout(persisted, get(tabsStore));
   layout.set(repaired);
 }
 

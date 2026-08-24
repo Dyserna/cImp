@@ -7,10 +7,12 @@
 //! debounced disk save. Presets live in a separate `layout_presets`
 //! field; CRUD ops below upsert / rename / delete by name.
 //!
-//! No layout-tree validation happens here at runtime — the frontend's
-//! `validateAndRepairLayout` covers integrity for restored presets, and
-//! `persistence::integrity_check` covers the load-from-disk path. The
-//! commands below trust their inputs.
+//! `save_layout` trusts its input: the frontend just built that tree with the
+//! tree ops, and re-validating every splitter frame would buy nothing. The two
+//! places a tree arrives from somewhere the frontend did NOT just build it —
+//! the settings file at load, and a preset saved against a different tab list —
+//! both run `settings::layout`'s integrity walk: `persistence::integrity_check`
+//! for the first, [`restore_layout_preset`] for the second.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -62,6 +64,51 @@ pub async fn save_layout_preset(
         }
     });
     Ok(())
+}
+
+/// Restore a preset: return its tree adapted to the live tab list, ready for
+/// the frontend to drop straight into the layout store.
+///
+/// A preset carries a tree and nothing else — no focus (restoring one is "set
+/// up panes this way"; focus follows the user's next click) and no promise that
+/// the tabs it names still exist. Adapting it is exactly the hydration problem:
+/// drop tabs deleted since the save, place tabs created since it as orphans,
+/// leave hidden tabs out, clamp ratios, collapse whatever that emptied. So it
+/// runs the same [`crate::settings::layout::repair`] the load path runs, which
+/// is the point of doing it here — V42 Phase B, the repair rules exist exactly
+/// once, and the frontend copy that used to run at this call site is gone.
+///
+/// Focus is seeded from the leftmost leaf before the repair, which then
+/// validates it like any other persisted focus.
+///
+/// **Reads, never writes.** The restored layout reaches settings through the
+/// frontend's ordinary save-on-change path, like any other layout mutation — a
+/// preset restore is not a special kind of write.
+#[tauri::command]
+pub async fn restore_layout_preset(
+    state: State<'_, AppState>,
+    name: String,
+) -> AppResult<LayoutPersisted> {
+    let snap = state.settings.current();
+    let Some(preset) = snap.layout_presets.iter().find(|p| p.name == name) else {
+        return Err(AppError::Settings(format!(
+            "restore_layout_preset: no preset named '{name}'"
+        )));
+    };
+    let mut layout = LayoutPersisted {
+        focused_pane_id: crate::settings::layout::leftmost_pane_id(&preset.tree),
+        tree: preset.tree.clone(),
+    };
+    let tab_ids: Vec<&str> = snap.tabs.iter().map(|t| t.id()).collect();
+    // The hidden set is a small per-project file read; off the async worker for
+    // the same reason `ui_state_get` is (see its note).
+    let cwd = state.launch.cwd.clone();
+    let hidden =
+        tauri::async_runtime::spawn_blocking(move || crate::ipc::ui_state::read_hidden_tabs(&cwd))
+            .await
+            .map_err(|e| AppError::Settings(format!("hidden-tab read task failed: {e}")))?;
+    crate::settings::layout::repair(&mut layout, &tab_ids, &hidden);
+    Ok(layout)
 }
 
 /// Delete a preset by name. No-op if the name doesn't exist (callers

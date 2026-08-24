@@ -95,7 +95,8 @@ use crate::ipc::commands::{
     workbench_worktree_run_checks, workbench_worktrees,
 };
 use crate::ipc::layout::{
-    delete_layout_preset, rename_layout_preset, save_layout, save_layout_preset,
+    delete_layout_preset, rename_layout_preset, restore_layout_preset, save_layout,
+    save_layout_preset,
 };
 use crate::ipc::note::{read_note, write_note};
 use crate::ipc::tab_lifecycle::{
@@ -848,6 +849,7 @@ fn main() {
             save_layout_preset,
             delete_layout_preset,
             rename_layout_preset,
+            restore_layout_preset,
             content_open_folder,
             content_clear,
             offload_status,

@@ -174,16 +174,26 @@ const RESPONSE_CAP_CHARS: usize = 24_000;
 const FILE_NAME: &str = "tool-activity.jsonl";
 /// Every row the store can hold with every lane full — the ring's size, and
 /// the floor under [`FILE_COMPACT_LINES`].
-const TOTAL_CAPACITY: usize = GRAPH_CAP
-    + OFFLOAD_CAP
-    + OFFLOAD_SERVER_CAP
-    + AUDIT_CAP
-    + MCP_CAP
-    + MCP_HEALTH_CAP
-    + SANDBOX_CAP
-    + PLUGIN_CAP
-    + DELEGATION_CAP
-    + INJECTION_FLAG_TOTAL_CAP;
+///
+/// **Derived from [`KINDS`]** (R23), not hand-summed. It used to be a chain of
+/// ten named terms, and a kind added without one made the ring smaller than the
+/// lanes it is supposed to hold — silently, because this sum is the only thing
+/// in the module that knows how big "everything" is, and nothing checks a sum
+/// against a table it was written beside. Now the table is the sum.
+const TOTAL_CAPACITY: usize = total_capacity();
+
+/// The fold behind [`TOTAL_CAPACITY`]. A `const fn` because the compaction
+/// headroom is a compile-time assertion (see [`FILE_COMPACT_LINES`]), and a
+/// runtime sum could not be one.
+const fn total_capacity() -> usize {
+    let mut sum = 0;
+    let mut i = 0;
+    while i < KINDS.len() {
+        sum += KINDS[i].retention.ceiling();
+        i += 1;
+    }
+    sum
+}
 /// Appends between compactions once the ring is full. Compaction rewrites the
 /// whole file (and re-reads it first, to merge a child's lines), so this is the
 /// amount of cheap appending bought per expensive rewrite.
@@ -213,6 +223,116 @@ const FILE_COMPACT_LINES: usize = TOTAL_CAPACITY + FILE_COMPACT_SLACK;
 /// being edited to 0 (survey defect D3).
 const _: () = assert!(FILE_COMPACT_LINES > TOTAL_CAPACITY);
 
+/// How one [`ActivityKind`]'s rows are retained — the cell that used to be a
+/// `*_CAP` arm in [`kind_cap`]'s string if-chain and a term in the hand-summed
+/// [`TOTAL_CAPACITY`], in the row itself.
+#[derive(Clone, Copy)]
+enum Retention {
+    /// ONE window for the whole kind: the cap [`kind_cap`] answers with, and
+    /// the kind's whole contribution to [`TOTAL_CAPACITY`].
+    PerKind(usize),
+    /// **No kind cap at all** — this kind's rows are retained PER SOURCE LANE,
+    /// so a number here would be a cap nothing enforces.
+    ///
+    /// `injection_flag` is the one kind that carries it (#48, H-9): its rows
+    /// share a kind but not a source, and the sources have wildly different
+    /// volumes, so `MemoryQuarantine`'s flood could delete the `Canary` rows
+    /// that were the only record of what got through. [`Lane`] gives each
+    /// [`Screen`] its own window of [`INJECTION_FLAG_SCREEN_CAP`], and
+    /// [`Lane::cap`] answers for such a row before [`kind_cap`] is ever asked.
+    ///
+    /// The value is therefore not a cap but the **aggregate ceiling** — the sum
+    /// of the lane caps — which is what this kind is worth to
+    /// [`TOTAL_CAPACITY`], and which is the only number about it the ring needs.
+    PerSourceLanes(usize),
+}
+
+impl Retention {
+    /// The most rows this kind can hold: one window, or all its lanes full.
+    const fn ceiling(self) -> usize {
+        match self {
+            Retention::PerKind(cap) => cap,
+            Retention::PerSourceLanes(total) => total,
+        }
+    }
+}
+
+/// One [`ActivityKind`]'s row in [`KINDS`]: the variant, its wire string, and
+/// how its rows are retained.
+///
+/// R23 (V42): those three used to be four parallel structures — an enum arm, an
+/// `as_str` arm, a `*_CAP` const reached only through a chain of STRING
+/// comparisons, and a term in a hand-written `TOTAL_CAPACITY` sum. The sum was
+/// the dangerous one: a kind added without a term in it made the ring smaller
+/// than its own lanes, silently, because nothing else knows how big
+/// "everything" is. Both are derived from this table now.
+///
+/// The named `*_CAP` consts above stay exactly where they are: each carries the
+/// reasoning for its number, they are what the retention tests count against,
+/// and one that no row references becomes an unused-constant WARNING — which is
+/// the drift signal a bare literal in the table would have thrown away.
+struct KindRow {
+    /// The variant this row is about. Read by the const assertion below, which
+    /// is what lets [`ActivityKind::as_str`] index [`KINDS`] by discriminant.
+    kind: ActivityKind,
+    /// The serialized form — a JSONL/IPC wire value, so a rename is a wire
+    /// change and the feeds' kind filters are written against it.
+    key: &'static str,
+    retention: Retention,
+}
+
+/// Declare [`ActivityKind`], its wire strings and the [`KINDS`] table from one
+/// list, so no two of the three can drift — the same shape `declare_screens!`
+/// uses one module over, and for the same reason.
+///
+/// A variant added without a row is a macro PARSE error, and so is a row with a
+/// cell left out: picking a retention lane on purpose (#51) is a decision the
+/// compiler now insists on rather than a follow-up. That is the property the
+/// four hand-kept structures never had — the if-chain compared STRINGS, so a
+/// kind whose cap was never added to it simply fell through to the graph window
+/// and was evicted by ordinary graph traffic.
+macro_rules! declare_activity_kinds {
+    (
+        $(#[$enum_attr:meta])*
+        pub enum $name:ident {
+            $(
+                $(#[$variant_attr:meta])*
+                $variant:ident {
+                    key: $key:literal,
+                    retention: $retention:expr $(,)?
+                }
+            ),+ $(,)?
+        }
+    ) => {
+        $(#[$enum_attr])*
+        pub enum $name {
+            $( $(#[$variant_attr])* $variant, )+
+        }
+
+        /// Every kind, in declaration order, with its wire string and its
+        /// retention cell. Emitted from the variant list by
+        /// [`declare_activity_kinds`], so it covers the enum exactly.
+        const KINDS: &[KindRow] = &[ $(
+            KindRow {
+                kind: $name::$variant,
+                key: $key,
+                retention: $retention,
+            },
+        )+ ];
+
+        impl $name {
+            /// The serialized form — the row's `kind` column.
+            ///
+            /// Indexes [`KINDS`] by discriminant; the const assertion below is
+            /// what says row *i* is variant *i*.
+            pub const fn as_str(self) -> &'static str {
+                KINDS[self as usize].key
+            }
+        }
+    };
+}
+
+declare_activity_kinds! {
 /// The feed kind an activity belongs to. Kept as a closed enum at every
 /// recording site (see [`ActivityEntry::new`]) so a new recorder can't typo a
 /// kind string that would compile fine and silently vanish from the
@@ -222,19 +342,32 @@ const _: () = assert!(FILE_COMPACT_LINES > TOTAL_CAPACITY);
 pub enum ActivityKind {
     /// A `graph_*` / `context_*` / `run_check` tool call (including the
     /// backend-internal read-advisor and auto-check recorders).
-    Graph,
+    Graph {
+        key: "graph",
+        // Also the window an UNKNOWN kind shares — see `kind_cap`.
+        retention: Retention::PerKind(GRAPH_CAP),
+    },
     /// One completed `offload_task` run.
-    Offload,
+    Offload {
+        key: "offload",
+        retention: Retention::PerKind(OFFLOAD_CAP),
+    },
     /// V23: one completed audit tool run (a scanned tool within a Code Audit
     /// scan, source `"audit"`), or a whole `security_audit`/`quality_audit`
     /// agent call (roll-up row, source = the consumer — see
     /// `audit::mcp::run_audit`).
-    Audit,
+    Audit {
+        key: "audit",
+        retention: Retention::PerKind(AUDIT_CAP),
+    },
     /// One proxied MCP tool call (`<server>__<tool>`) through the warm
     /// [`McpHost`](crate::offload::mcp_host::McpHost) — from Claude/OpenCode
     /// via the loopback `/mcp/call` route or from the offload worker's
     /// in-process router (recorded by `McpHost::call_recorded`).
-    Mcp,
+    Mcp {
+        key: "mcp",
+        retention: Retention::PerKind(MCP_CAP),
+    },
     /// V37 contract C6: one MCP-server **health** transition — a server the
     /// periodic checker confirmed unhealthy (N consecutive failed probes), a
     /// server that came back, or an enabled server `reconcile` could not connect
@@ -250,7 +383,10 @@ pub enum ActivityKind {
     /// producer saw it in `source`. Steady states mint nothing: only a
     /// transition writes, so an idle-but-healthy pool is silent rather than a
     /// heartbeat feed.
-    McpHealth,
+    McpHealth {
+        key: "mcp_health",
+        retention: Retention::PerKind(MCP_HEALTH_CAP),
+    },
     /// One offload **server process** lifecycle transition: a local backend
     /// spawned, became healthy, was stopped, or failed to start. Recorded by
     /// [`offload::supervisor::lifecycle_record`](crate::offload::supervisor).
@@ -262,20 +398,31 @@ pub enum ActivityKind {
     /// nothing persisted. `ok` is the transition's outcome, and a `stop` is
     /// `true`: an intentional shutdown is not a failure. Which transition it
     /// was lives in `tool`, and *why* in `target`.
-    OffloadServer,
+    OffloadServer {
+        key: "offload_server",
+        retention: Retention::PerKind(OFFLOAD_SERVER_CAP),
+    },
     /// V32: one injection-containment denial — an SSRF-screened URL, an
     /// exhausted per-scope fetch budget, a canary hit, or a taint-latch
     /// refusal. Recorded by
     /// [`offload::outbound::record_flag`](crate::offload::outbound::record_flag);
     /// which screen fired is carried in the row's `source` field and (with the
     /// full detail) in its request payload.
-    InjectionFlag,
+    InjectionFlag {
+        key: "injection_flag",
+        // The ONE kind with no kind cap: retained per SOURCE lane, one window
+        // per `Screen` (#48, H-9). See `Retention::PerSourceLanes` and `Lane`.
+        retention: Retention::PerSourceLanes(INJECTION_FLAG_TOTAL_CAP),
+    },
     /// V33 Phase A: one OS-sandbox fact — a child that ran UNSANDBOXED and why
     /// (the distinct `off (user choice)` / `unavailable` states of locked
     /// decision 17), or a grant/drive-mapping event. Recorded by
     /// [`sandbox::record_skip`](crate::sandbox::record_skip) and
     /// [`sandbox::record_event`](crate::sandbox::record_event).
-    Sandbox,
+    Sandbox {
+        key: "sandbox",
+        retention: Retention::PerKind(SANDBOX_CAP),
+    },
     /// V38 Phase A: one tool-plugin discovery fact — a manifest that failed to
     /// load (with its reason), an identity conflict naming both offending
     /// files, or the per-scan summary. Recorded by
@@ -286,7 +433,10 @@ pub enum ActivityKind {
     /// settings pane pairs each of them with an error state — the two surfaces
     /// exist so a rejected plugin is visible both where it happened and where
     /// it gets fixed.
-    Plugin,
+    Plugin {
+        key: "plugin",
+        retention: Retention::PerKind(PLUGIN_CAP),
+    },
     /// V39 Phase B (locked decision 14): one cross-harness **delegation**
     /// transition — a tab was asked to drive another tab, and what came of it.
     ///
@@ -303,58 +453,54 @@ pub enum ActivityKind {
     /// `source` is the backend NAME, so it reads `lan-worker-2` and the facade
     /// holds here too), while these rows are the worker side. Same split as
     /// `offload` vs `offload_server`: the task, versus what carried it.
-    Delegation,
+    Delegation {
+        key: "delegation",
+        retention: Retention::PerKind(DELEGATION_CAP),
+    },
+}
 }
 
-impl ActivityKind {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            ActivityKind::Graph => "graph",
-            ActivityKind::Offload => "offload",
-            ActivityKind::OffloadServer => "offload_server",
-            ActivityKind::Audit => "audit",
-            ActivityKind::Mcp => "mcp",
-            ActivityKind::McpHealth => "mcp_health",
-            ActivityKind::InjectionFlag => "injection_flag",
-            ActivityKind::Sandbox => "sandbox",
-            ActivityKind::Plugin => "plugin",
-            ActivityKind::Delegation => "delegation",
-        }
+/// [`ActivityKind::as_str`] indexes [`KINDS`] by discriminant, and this is what
+/// says it may: row *i* is variant *i*, checked at COMPILE time rather than
+/// trusted.
+///
+/// It holds by construction — [`declare_activity_kinds`] emits the enum and the
+/// table from one list, in one order — but every derivation in this module rests
+/// on it, so it is asserted rather than assumed. Reading `kind` here is also
+/// what keeps that cell honest: a row naming the wrong variant would otherwise
+/// be a field nobody reads.
+const _: () = {
+    let mut i = 0;
+    while i < KINDS.len() {
+        assert!(
+            KINDS[i].kind as usize == i,
+            "`KINDS` must list every `ActivityKind` in enum-declaration order — \
+             `as_str` indexes it by discriminant"
+        );
+        i += 1;
     }
-}
+};
 
 /// The retention cap for a (serialized) kind. Unknown strings (a future kind
 /// loaded from a newer file) share the graph window rather than erroring.
 ///
-/// `injection_flag` is deliberately absent: its rows are never counted per kind
-/// (see [`Lane`]), so a cap here would be a number nothing reads.
+/// `injection_flag` answers the same way and for a different reason: it has no
+/// kind cap at all ([`Retention::PerSourceLanes`]) because its rows are counted
+/// per SOURCE (see [`Lane`]), and [`Lane::cap`] takes that branch before this
+/// function is ever reached for one.
 ///
 /// **Adding an event class? Pick a lane on purpose** (#51). The graph-window
 /// fallback below exists for FORWARD COMPAT (a file written by a newer build
 /// must still load here), not as a home: a kind left on it can be evicted by
 /// ordinary graph traffic, which is exactly the failure H-9 closed for the
 /// containment screens. A new kind recorded by *this* build gets its own cap
-/// in the table above — or a per-source lane split like `injection_flag`'s —
-/// as part of being added, not as a follow-up.
+/// in [`KINDS`] — or a per-source lane split like `injection_flag`'s — as part
+/// of being added, which the table now makes compulsory rather than a
+/// follow-up.
 fn kind_cap(kind: &str) -> usize {
-    if kind == ActivityKind::Offload.as_str() {
-        OFFLOAD_CAP
-    } else if kind == ActivityKind::OffloadServer.as_str() {
-        OFFLOAD_SERVER_CAP
-    } else if kind == ActivityKind::Audit.as_str() {
-        AUDIT_CAP
-    } else if kind == ActivityKind::Mcp.as_str() {
-        MCP_CAP
-    } else if kind == ActivityKind::McpHealth.as_str() {
-        MCP_HEALTH_CAP
-    } else if kind == ActivityKind::Sandbox.as_str() {
-        SANDBOX_CAP
-    } else if kind == ActivityKind::Plugin.as_str() {
-        PLUGIN_CAP
-    } else if kind == ActivityKind::Delegation.as_str() {
-        DELEGATION_CAP
-    } else {
-        GRAPH_CAP
+    match KINDS.iter().find(|row| row.key == kind).map(|r| r.retention) {
+        Some(Retention::PerKind(cap)) => cap,
+        Some(Retention::PerSourceLanes(_)) | None => GRAPH_CAP,
     }
 }
 
@@ -1951,6 +2097,53 @@ mod tests {
         assert!(Screen::ALL
             .iter()
             .all(|s| s.as_str() != UNKNOWN_SCREEN_LANE));
+    }
+
+    /// **R23's pin.** The kind table is the only enumerator of kinds, so it has
+    /// to cover the enum exactly and answer for it consistently.
+    ///
+    /// * every ROW names a real variant — carried by the type (`kind:
+    ///   ActivityKind`), and checked to be the variant whose slot it occupies;
+    /// * every VARIANT has exactly one row — `declare_activity_kinds!` emits the
+    ///   enum and the table from one list, so a variant without a row is a macro
+    ///   parse error and `KINDS`' const assertion refuses to build on a
+    ///   mis-ordered one. This is those guarantees restated where a reader looks
+    ///   for them, plus the two they cannot make: that the wire keys are unique,
+    ///   and that `as_str` really answers from the row.
+    #[test]
+    fn every_kind_has_exactly_one_row() {
+        let mut seen: Vec<&str> = Vec::new();
+        for (i, row) in KINDS.iter().enumerate() {
+            assert!(!seen.contains(&row.key), "duplicate kind key {}", row.key);
+            seen.push(row.key);
+            assert_eq!(row.kind as usize, i, "row {i} names another kind");
+            assert_eq!(row.kind.as_str(), row.key, "as_str disagrees with row {i}");
+        }
+    }
+
+    /// **The capacity pin.** [`TOTAL_CAPACITY`] is folded out of [`KINDS`] now;
+    /// this is the literal it used to be hand-summed to, asserted once so a cap
+    /// edit is LOUD rather than a quietly larger ring.
+    ///
+    /// Only the nine per-kind windows are a literal. The `injection_flag` term
+    /// stays symbolic on purpose: it is per-SOURCE-lane, and its lane count is
+    /// `Screen::ALL.len() + 1` precisely so that a new screen gets a guaranteed
+    /// window by existing (#48, H-9) — pinning a number here would turn that
+    /// guarantee into a test failure.
+    #[test]
+    fn total_capacity_is_the_sum_the_table_says_it_is() {
+        // 400 graph + 100 offload + 100 audit + 200 mcp + 200 mcp_health
+        // + 200 offload_server + 60 sandbox + 100 plugin + 100 delegation
+        const PER_KIND_WINDOWS: usize = 1_460;
+        assert_eq!(
+            TOTAL_CAPACITY,
+            PER_KIND_WINDOWS + INJECTION_FLAG_TOTAL_CAP,
+            "a per-kind retention cap changed — intended?"
+        );
+        // `injection_flag` reaches the sum through its lane aggregate and NOT
+        // through a kind cap: it has none, so `kind_cap` answers for it exactly
+        // as it answers for a kind written by a newer build.
+        assert_eq!(kind_cap(ActivityKind::InjectionFlag.as_str()), GRAPH_CAP);
     }
 
     /// Compaction must leave room to append (#48, H-9).

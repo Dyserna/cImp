@@ -27,6 +27,27 @@
 
 use std::path::{Path, PathBuf};
 
+/// **The per-project cImp data directory**, `<project>/.cimp`.
+///
+/// Holds the per-folder settings overlay (`config.json`), the code-graph store
+/// (`graph.db`), the note (`cimp.note.txt`) and the per-project UI state
+/// (`ui_state.json`). One name, here, rather than a private copy per owner.
+///
+/// It used to be a private `CIMP_DIR_NAME` in `settings::persistence`,
+/// re-spelled in `ipc::note` and again in `ipc::ui_state`, each carrying a
+/// comment explaining that the copy exists so the module need not depend on
+/// the settings internals. That reasoning was right about the coupling and
+/// wrong about the remedy: the name is a filesystem-layout fact, not a
+/// settings fact, so its home is the path module all of them already depend
+/// on. Three literals that must agree and are checked by nothing is how a
+/// rename half-lands (V42 review, dropped-at-cap item).
+///
+/// Deliberately NOT derived from `graph.db_subdir`: the overlay decides where
+/// the overlay is read from, so its location cannot depend on a value stored
+/// *inside* it. [`find_project_root`] falls back to this same name for the
+/// same reason.
+pub const CIMP_DIR_NAME: &str = ".cimp";
+
 // ---------------------------------------------------------------------------
 // Shared directory-key normalization.
 //
@@ -326,7 +347,7 @@ fn has_vcs_marker(dir: &Path) -> bool {
 /// Purely observational: no directory is created, and nothing is deleted.
 pub fn find_project_root(start: &Path, db_subdir: &str) -> Option<ProjectRoot> {
     let sub = match db_subdir.trim() {
-        "" => ".cimp",
+        "" => CIMP_DIR_NAME,
         s => s,
     };
     let mut weak: Option<PathBuf> = None;

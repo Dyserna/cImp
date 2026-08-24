@@ -40,6 +40,12 @@ use std::collections::HashSet;
 use serde_json::{Map, Value};
 
 use crate::error::{AppError, AppResult};
+// The per-project cImp data directory. Holds the per-folder settings overlay
+// (`config.json`) and the code-graph store (`graph.db`). It was declared here
+// and copied into two other modules until the V42 review folded the three into
+// one — see [`crate::fsutil::CIMP_DIR_NAME`], which also carries the reason it
+// is not derived from `graph.db_subdir`.
+use crate::fsutil::CIMP_DIR_NAME;
 use crate::settings::migration;
 use crate::settings::schema::{
     default_ai_tab, default_events_tab, default_graph_monitor_tab,
@@ -56,12 +62,6 @@ use crate::settings::write_atomic;
 use crate::shell::ShellSpec;
 
 const GLOBAL_FILE_NAME: &str = "settings.json";
-/// The per-project cImp data directory. Holds the per-folder settings overlay
-/// (`config.json`) and the code-graph store (`graph.db`); the home for any
-/// future cImp-specific per-project file. Kept as a literal here rather than
-/// tied to `graph.db_subdir`: the overlay determines where the overlay is read
-/// from, so its location can't depend on a value that lives *inside* it.
-const CIMP_DIR_NAME: &str = ".cimp";
 /// Per-folder overlay filename, inside `<launch_cwd>/.cimp/`.
 const CUSTOM_FILE_NAME: &str = "config.json";
 /// Pre-consolidation overlay filename — a loose file in `launch_cwd`, migrated

@@ -964,10 +964,10 @@ impl WorkbenchService {
             diff::DEFAULT_CONTEXT,
         )
         .await?;
-        let mut files: Vec<diff::FileDiffMeta> = diff::parse_unified(&text)
-            .iter()
-            .map(diff::file_diff_meta_from_parsed)
-            .collect();
+        // The count-only parse (V42 Phase-F review, F-5): this is a POLL, and
+        // every hunk it builds is dropped once its added/removed lines are counted,
+        // so it must not spend the word-diff DP on the whole working tree.
+        let mut files: Vec<diff::FileDiffMeta> = diff::file_metas_from_unified(&text);
         files.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(diff::DiffSummary {
             files,

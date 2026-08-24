@@ -12,11 +12,21 @@
 //!
 //! **Payload shape, deliberately.** [`HunkLineGroup`] names lines by their
 //! INDEX into [`Hunk::lines`](super::diff::Hunk::lines) rather than carrying
-//! their text, so the common case (context lines, and unpaired adds/removes)
-//! costs a small integer per line instead of a second copy of the file. Only
-//! a `pair` carries text, and only the two lines it word-diffs — which is the
-//! content the old TS computed on the client anyway. A full-file diff (the
-//! "whole file as one hunk" toggle) is therefore NOT doubled in size.
+//! their text, so context lines and unpaired adds/removes cost a small integer
+//! each instead of a second copy of the file. Only a `pair` carries text, and
+//! only the two lines it word-diffs — which is the content the old TS computed
+//! on the client anyway.
+//!
+//! What that does and does not buy, stated honestly: a full-file diff (the
+//! "whole file as one hunk" toggle) is dominated by context lines, so it grows
+//! by an index per line and nothing else. A PAIR-HEAVY diff does grow — every
+//! paired line's text is carried again, split into spans, so both sides of the
+//! pair are a second copy plus the per-span overhead. That is the cost of
+//! computing this once here instead of in every consumer on every re-render,
+//! and it is bounded by the same two limits the render path already has:
+//! [`MAX_DP_CELLS`] falls back to a whole-line del+add (two spans, not many)
+//! for a very long line pair, and `diff::MAX_DIFF_FILE_BYTES` keeps a giant
+//! file out of the parse entirely.
 
 use serde::Serialize;
 

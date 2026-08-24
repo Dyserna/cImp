@@ -108,6 +108,26 @@ pub struct Hunk {
     pub groups: Vec<worddiff::HunkLineGroup>,
 }
 
+/// Whether a parse spends the word-diff DP.
+///
+/// [`Hunk::groups`] is a RENDERING decision, and computing it costs an O(n·m)
+/// LCS per changed line pair. Every consumer that shows a hunk needs it; the
+/// one consumer that shows nothing —
+/// [`WorkbenchService::diff_summary`](super::WorkbenchService::diff_summary)'s
+/// non-git fallback, which parses one whole-repo blob only to count `+`/`-`
+/// per file — was paying for it on every poll of a shadow-repo project and
+/// throwing every group away.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WordDiff {
+    /// Fill [`Hunk::groups`]. Every path whose `FileDiff` reaches the wire.
+    Compute,
+    /// Leave [`Hunk::groups`] empty. Only for a parse whose hunks are consumed
+    /// as counts and then dropped — [`file_metas_from_unified`] is the sole
+    /// way to ask for it, which is what keeps a group-less `FileDiff` from
+    /// escaping this module.
+    Skip,
+}
+
 /// Fill a fully-parsed hunk's DERIVED fields — [`Hunk::hash`] and
 /// [`Hunk::groups`]. One helper rather than two assignments at each builder
 /// so a third derived field can never be added to one path and forgotten on
@@ -117,10 +137,13 @@ pub struct Hunk {
 /// [`hunk_hash`] deliberately still hashes only the PARSED content: `groups`
 /// is a pure function of `lines`, so folding it in would add nothing to the
 /// staleness guard and would make the fingerprint depend on this module's
-/// rendering decisions.
-fn finish_hunk(hunk: &mut Hunk) {
+/// rendering decisions. That is also what makes [`WordDiff::Skip`] safe: the
+/// hash — the one derived field both modes produce — does not move.
+fn finish_hunk(hunk: &mut Hunk, words: WordDiff) {
     hunk.hash = hunk_hash(hunk);
-    hunk.groups = worddiff::pair_hunk_lines(&hunk.lines);
+    if words == WordDiff::Compute {
+        hunk.groups = worddiff::pair_hunk_lines(&hunk.lines);
+    }
 }
 
 /// One file's full parsed diff — the payload of `workbench_diff_file`.
@@ -222,7 +245,37 @@ pub struct DiffSummary {
 /// emits hunks for a binary diff); and `\ No newline at end of file` markers
 /// (consumed, not added to `lines`). [`FileStatus::Untracked`] is never
 /// produced here — see [`FileStatus::Untracked`]'s doc comment.
+///
+/// Every hunk carries its [`groups`](Hunk::groups): this is the parse whose
+/// result gets RENDERED. The count-only path is
+/// [`file_metas_from_unified`].
 pub fn parse_unified(diff_text: &str) -> Vec<FileDiff> {
+    parse_unified_mode(diff_text, WordDiff::Compute)
+}
+
+/// Parse one multi-file unified diff into the file-list rows the Diff
+/// section shows, WITHOUT spending the word-diff DP on hunks nobody will
+/// render.
+///
+/// The caller is
+/// [`WorkbenchService::diff_summary`](super::WorkbenchService::diff_summary)'s
+/// FIX 7 shadow-repo fallback: for a non-git project with checkpoints on, one
+/// `shadow::diff_vs_now` blob covers every changed file, and the summary needs
+/// nothing from it but each file's identity and its `+`/`-` counts. That is a
+/// POLL — it re-runs on every save — and until this existed it word-diffed the
+/// entire working tree each time and dropped the result.
+///
+/// Bundled as one function rather than a mode flag on [`parse_unified`] so the
+/// group-less `FileDiff`s never leave this module: what comes back is
+/// [`FileDiffMeta`], which has no `groups` to be missing.
+pub fn file_metas_from_unified(diff_text: &str) -> Vec<FileDiffMeta> {
+    parse_unified_mode(diff_text, WordDiff::Skip)
+        .iter()
+        .map(file_diff_meta_from_parsed)
+        .collect()
+}
+
+fn parse_unified_mode(diff_text: &str, words: WordDiff) -> Vec<FileDiff> {
     let mut files = Vec::new();
     // Split on `\n` only, preserving any trailing `\r` as part of the line's
     // content. `str::lines()` strips `\r\n` down to LF, which silently drops
@@ -384,7 +437,7 @@ pub fn parse_unified(diff_text: &str) -> Vec<FileDiff> {
                     break;
                 }
             }
-            finish_hunk(&mut hunk);
+            finish_hunk(&mut hunk, words);
             hunks.push(hunk);
         }
 
@@ -958,7 +1011,7 @@ fn synthesize_untracked(root: &Path, path: &str) -> AppResult<FileDiff> {
         hash: String::new(),
         groups: Vec::new(),
     };
-    finish_hunk(&mut hunk);
+    finish_hunk(&mut hunk, WordDiff::Compute);
     Ok(FileDiff {
         path: path.to_string(),
         status: FileStatus::Untracked,
@@ -1258,6 +1311,56 @@ diff --git a/a.rs b/a.rs
             files[0].hunks[0].lines[0],
             ('+', "++ looks like a header but isn't".to_string())
         );
+    }
+
+    /// **The summary path does not pay for rendering it will never do.**
+    ///
+    /// `diff_summary`'s shadow-repo fallback parses one whole-repo blob on
+    /// every poll and keeps nothing from it but each file's `+`/`-` counts.
+    /// The word-diff DP was being spent on all of it, per save, and the hunks
+    /// it was spent on were dropped one line later. What must NOT change is
+    /// the answer: the counts, and `hash` — the one derived field both modes
+    /// produce, and the token the frontend echoes back on a revert.
+    #[test]
+    fn the_meta_parse_skips_the_word_diff_but_not_the_hash() {
+        let diff = "\
+diff --git a/a.rs b/a.rs
+--- a/a.rs
++++ b/a.rs
+@@ -1,3 +1,3 @@
+ line1
+-let x = 1;
++let x = 2;
+ line3
+";
+        let rendered = parse_unified(diff);
+        assert!(
+            rendered[0].hunks[0]
+                .groups
+                .iter()
+                .any(|g| matches!(g, worddiff::HunkLineGroup::Pair { .. })),
+            "the RENDER path must still word-diff the pair: {:?}",
+            rendered[0].hunks[0].groups
+        );
+
+        let skipped = parse_unified_mode(diff, WordDiff::Skip);
+        assert!(
+            skipped[0].hunks[0].groups.is_empty(),
+            "the count-only path must not spend the DP"
+        );
+        assert_eq!(
+            skipped[0].hunks[0].hash, rendered[0].hunks[0].hash,
+            "the hash is a function of the parsed content, not of the mode"
+        );
+
+        // And the rows it exists to produce are identical either way.
+        let via_meta = file_metas_from_unified(diff);
+        let via_render: Vec<FileDiffMeta> =
+            rendered.iter().map(file_diff_meta_from_parsed).collect();
+        assert_eq!(via_meta.len(), 1);
+        assert_eq!(via_meta[0].path, via_render[0].path);
+        assert_eq!(via_meta[0].added, via_render[0].added);
+        assert_eq!(via_meta[0].removed, via_render[0].removed);
     }
 
     // ── file_diff_meta_from_parsed (FIX 7 shadow-repo fallback) ─────────

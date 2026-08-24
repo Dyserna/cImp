@@ -42,7 +42,7 @@
   import { checksSuggestion, checksDismissSuggestion } from './checks';
   import { computeChip } from './settings/checksEditor';
   import { GRAPH_MONITOR_TAB_ID } from './tabs/types';
-  import { isAppViewVisible, onAppViewShown } from './appViewVisibility';
+  import { onAppViewShown, pollWhileVisible } from './appViewVisibility';
   import SectionNav from './SectionNav.svelte';
   import UsageOverview from './codeIntel/UsageOverview.svelte';
   import AnalysesSection from './codeIntel/AnalysesSection.svelte';
@@ -452,7 +452,7 @@
     }
   }
 
-  let poll: ReturnType<typeof setInterval> | null = null;
+  let stopPoll: (() => void) | null = null;
 
   function upsert(s: GraphStatus): void {
     const i = roots.findIndex((r) => r.root === s.root);
@@ -518,15 +518,14 @@
   onMount(async () => {
     await refresh();
     // A light poll backstops the event for the section-gated fetches (memory,
-    // usage) and the checks-suggestion readiness edge.
-    poll = setInterval(() => {
-      if (isAppViewVisible(GRAPH_MONITOR_TAB_ID)) void refresh();
-    }, 2000);
+    // usage) and the checks-suggestion readiness edge. It idles while the tab
+    // is off-screen — see `pollWhileVisible`.
+    stopPoll = pollWhileVisible(GRAPH_MONITOR_TAB_ID, () => void refresh(), 2000);
     window.addEventListener('keydown', onKeyDown);
   });
 
   onDestroy(() => {
-    if (poll) clearInterval(poll);
+    stopPoll?.();
     unsubShown();
     window.removeEventListener('keydown', onKeyDown);
   });

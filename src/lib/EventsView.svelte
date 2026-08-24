@@ -44,7 +44,7 @@
   import { fmtTok } from './usageMath';
   import { EVENTS_TAB_ID, WORKBENCH_TAB_ID } from './tabs/types';
   import { revealTab } from './tabs/visibility';
-  import { isAppViewVisible, onAppViewShown } from './appViewVisibility';
+  import { onAppViewShown, pollWhileVisible } from './appViewVisibility';
   import { loadViewSet, loadViewString, saveViewSet, saveViewString } from './viewSection';
   import { settings } from './settings/store';
   import { accentFor, harnesses } from './harness';
@@ -55,7 +55,7 @@
   // `crate::activity`) and is only ever REPLACED, never mutated in place, so
   // plain `$state` would deep-proxy every row on every poll for nothing.
   let entries = $state.raw<ActivityEntry[]>([]);
-  let poll: ReturnType<typeof setInterval> | null = null;
+  let stopPoll: (() => void) | null = null;
   // Bumped by every local mutation (delete/clear — moved here from the Tools
   // tab's retired Activities section). A poll response already in flight when
   // a mutation landed is stale — applying it would resurrect just-deleted
@@ -499,17 +499,20 @@
   onMount(() => {
     void refresh();
     void refreshCheckpoints();
-    poll = setInterval(() => {
-      if (!isAppViewVisible(EVENTS_TAB_ID)) return;
-      void refresh();
-      pollTick += 1;
-      if (pollTick % CP_EVERY === 0) void refreshCheckpoints();
-    }, 2000);
+    stopPoll = pollWhileVisible(
+      EVENTS_TAB_ID,
+      () => {
+        void refresh();
+        pollTick += 1;
+        if (pollTick % CP_EVERY === 0) void refreshCheckpoints();
+      },
+      2000,
+    );
     window.addEventListener('keydown', onKeyDown);
   });
 
   onDestroy(() => {
-    if (poll) clearInterval(poll);
+    stopPoll?.();
     if (clearTimer) clearTimeout(clearTimer);
     window.removeEventListener('keydown', onKeyDown);
     unsubShown();

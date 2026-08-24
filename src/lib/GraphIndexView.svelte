@@ -24,7 +24,7 @@
   } from './graph';
   import { listenManaged } from './listenManaged';
   import { TOOL_ACTIVITY_TAB_ID } from './tabs/types';
-  import { isAppViewVisible, onAppViewShown } from './appViewVisibility';
+  import { onAppViewShown, pollWhileVisible } from './appViewVisibility';
 
   let roots = $state<GraphStatus[]>([]);
   // Index cards in a stable, hierarchy-shaped order: shallower paths first
@@ -46,7 +46,7 @@
 
   let probe = $state<EmbedderProbe | null>(null);
   let probing = $state<boolean>(false);
-  let poll: ReturnType<typeof setInterval> | null = null;
+  let stopPoll: (() => void) | null = null;
 
   // Per-root language census (all languages present on disk, classified
   // green/yellow/red). Walking the tree is comparatively expensive, so it's
@@ -159,16 +159,14 @@
     await refresh();
     // A light poll backstops the event for coverage/progress counters that
     // change without a discrete state transition.
-    poll = setInterval(() => {
-      if (isAppViewVisible(TOOL_ACTIVITY_TAB_ID)) void refresh();
-    }, 2000);
+    stopPoll = pollWhileVisible(TOOL_ACTIVITY_TAB_ID, () => void refresh(), 2000);
     // Probe the embedder once on open so reachability is visible immediately,
     // without waiting for a backfill to populate the per-root embed status.
     void testEmbedder();
   });
 
   onDestroy(() => {
-    if (poll) clearInterval(poll);
+    stopPoll?.();
     unsubShown();
   });
 

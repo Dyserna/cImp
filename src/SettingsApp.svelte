@@ -32,6 +32,7 @@
   import { listen } from '@tauri-apps/api/event';
   import type {
     AiToolTabConfig,
+    AuditDetectResult,
     HarnessStatus,
     Settings,
   } from './lib/settings/types';
@@ -655,6 +656,38 @@
     return aiTabIds.includes(tabId) ? tabId : 'shells';
   }
 
+  // ── Section view state the WINDOW owns (V42 tranche-2 review, T2-5) ──────
+  //
+  // The sidebar renders one section at a time inside an `{#if}`, so switching
+  // sections DESTROYS the component and takes its `$state` with it. Before
+  // #129 (c) split this file up, every field below was the monolith's own and
+  // therefore lived as long as the window; the split moved them into the
+  // children by default, which quietly turned "come back to it later" into
+  // "start again". These are the fields where that is visible — a typed
+  // prompt, a probe result, a half-filled dialog, a chosen sub-tab — so they
+  // stay here and reach their section as props, exactly as `tabsSubSection`
+  // above already does. Everything else a section keeps is genuinely per-mount
+  // (in-flight busy flags, transient inline messages) and stays there.
+  /// The Appearance section's inline save-preset dialog, as one value: it is
+  /// opened, filled and validated together, so it is carried together.
+  type ThemeSavePreset = { open: boolean; name: string; error: string | null };
+  type OffloadSubSection = 'pool' | 'tools';
+  let offloadSubSection = $state<OffloadSubSection>('pool');
+  /// The offload test box: what the user typed, and the last answer.
+  let offloadTestInput = $state('');
+  let offloadTestResult = $state('');
+  type GraphSubSection = 'graph' | 'semantic' | 'efficiency' | 'viz';
+  let graphSubSection = $state<GraphSubSection>('graph');
+  /// The Appearance section's inline save-preset dialog: open, the name being
+  /// typed, and the validation message under it.
+  let themeSavePreset = $state<ThemeSavePreset>({ open: false, name: '', error: null });
+  /// Which plugin the Tool Plugins detail pane shows.
+  let pluginSelected = $state<string | null>(null);
+  /// Per-tool Detect results, keyed by tool key. A probe is an IPC round trip
+  /// the user asked for; losing its answer to a sidebar click is the most
+  /// expensive of these to re-earn.
+  let pluginDetect = $state<Record<string, AuditDetectResult | 'probing' | undefined>>({});
+
   // Keep `snapshot` in sync with the global store. Every input mutates
   // `snapshot` and pushes via `applySettings`; the broadcast comes back and
   // overwrites `snapshot`.
@@ -1188,7 +1221,12 @@
       {:else if activeSection === 'avatar'}
         <AvatarSection {snapshot} {patch} />
       {:else if activeSection === 'theme'}
-        <ThemeSection {snapshot} {patch} />
+        <ThemeSection
+          {snapshot}
+          {patch}
+          savePreset={themeSavePreset}
+          onsavepreset={(next) => (themeSavePreset = next)}
+        />
       {:else if activeSection === 'bottom-bar'}
         <BottomBarSection {snapshot} {patch} />
       {:else if activeSection === 'tabs'}
@@ -1223,6 +1261,12 @@
           {patch}
           {backendStatuses}
           {harnessNames}
+          subSection={offloadSubSection}
+          onsubsection={(id) => (offloadSubSection = id as OffloadSubSection)}
+          testInput={offloadTestInput}
+          testResult={offloadTestResult}
+          ontestinput={(v) => (offloadTestInput = v)}
+          ontestresult={(v) => (offloadTestResult = v)}
           onenablereadonly={() => void enableReadonlyCommands()}
           onnavigate={(s) => (activeSection = s as SectionId)}
         />
@@ -1253,6 +1297,8 @@
           {patch}
           {localOffloadReady}
           {e1Gate}
+          subSection={graphSubSection}
+          onsubsection={(id) => (graphSubSection = id as GraphSubSection)}
           statuses={graphStatuses}
           busy={graphBusy}
           onrefresh={() => void refreshGraphStatus()}
@@ -1278,6 +1324,10 @@
           {pluginProjectKey}
           rescanning={pluginRescanning}
           loadError={pluginLoadError}
+          selected={pluginSelected}
+          detect={pluginDetect}
+          onselected={(key) => (pluginSelected = key)}
+          ondetect={(next) => (pluginDetect = next)}
           onrescan={() => void refreshPlugins(true)}
           onmanualtooledit={noteManualToolEdit}
         />

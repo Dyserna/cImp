@@ -34,6 +34,8 @@
     busy,
     localOffloadReady,
     e1Gate,
+    subSection,
+    onsubsection,
     onrefresh,
     onrebuild,
     onignorepick,
@@ -52,6 +54,12 @@
     /// it; turning it off is always allowed. Derived from the parent's
     /// backend-status poll — one poll, one owner.
     localOffloadReady: boolean;
+    /// The sub-tab this section shows. Parent-owned, like the Tabs section's
+    /// (V42 tranche-2 review, T2-5): the sidebar destroys this component on
+    /// every switch away, and before #129 (c) the choice outlived that.
+    subSection: string;
+    /// The user picked another sub-tab.
+    onsubsection: (id: string) => void;
     /// The read-advisor capability gate, or `null` when nothing blocks it.
     /// Read off the same `harness_versions_get` payload the Harness health
     /// section renders, which is why it is the parent's.
@@ -78,10 +86,6 @@
       .join(', '),
   );
 
-  // Sub-tab nav within this section. Local: no deep link targets it and
-  // nothing outside reads it.
-  type GraphSubSection = 'graph' | 'semantic' | 'efficiency' | 'viz';
-  let graphSubSection = $state<GraphSubSection>('graph');
 </script>
 
 <section>
@@ -106,42 +110,42 @@
       <button
         type="button"
         role="tab"
-        class:active={graphSubSection === 'graph'}
-        aria-selected={graphSubSection === 'graph'}
-        onclick={() => (graphSubSection = 'graph')}
+        class:active={subSection === 'graph'}
+        aria-selected={subSection === 'graph'}
+        onclick={() => onsubsection('graph')}
       >
         Code graph
       </button>
       <button
         type="button"
         role="tab"
-        class:active={graphSubSection === 'semantic'}
-        aria-selected={graphSubSection === 'semantic'}
-        onclick={() => (graphSubSection = 'semantic')}
+        class:active={subSection === 'semantic'}
+        aria-selected={subSection === 'semantic'}
+        onclick={() => onsubsection('semantic')}
       >
         Semantic search
       </button>
       <button
         type="button"
         role="tab"
-        class:active={graphSubSection === 'efficiency'}
-        aria-selected={graphSubSection === 'efficiency'}
-        onclick={() => (graphSubSection = 'efficiency')}
+        class:active={subSection === 'efficiency'}
+        aria-selected={subSection === 'efficiency'}
+        onclick={() => onsubsection('efficiency')}
       >
         Token efficiency
       </button>
       <button
         type="button"
         role="tab"
-        class:active={graphSubSection === 'viz'}
-        aria-selected={graphSubSection === 'viz'}
-        onclick={() => (graphSubSection = 'viz')}
+        class:active={subSection === 'viz'}
+        aria-selected={subSection === 'viz'}
+        onclick={() => onsubsection('viz')}
       >
         Graph view
       </button>
     </div>
 
-    {#if graphSubSection === 'graph'}
+    {#if subSection === 'graph'}
     <div class="button-row">
       <button type="button" disabled={busy} onclick={onrebuild}>
         {busy ? 'Rebuilding…' : 'Rebuild index'}
@@ -325,7 +329,7 @@
       <code>graph_*</code> tools are unaffected by this
       setting.
     </small>
-    {:else if graphSubSection === 'semantic'}
+    {:else if subSection === 'semantic'}
     <h3>Semantic search</h3>
     <Toggle
       label="Enable semantic (embedding) doc search"
@@ -433,7 +437,7 @@
         Use <strong>Rebuild embeddings</strong> in Tools →
         Graph index after a silent model swap behind the same name.
       </small>
-    {:else if graphSubSection === 'efficiency'}
+    {:else if subSection === 'efficiency'}
     <h3>Context injection</h3>
     <Toggle
       label="Auto-inject relevant file digests into each prompt"
@@ -660,7 +664,7 @@
       {/if}
     </small>
 
-    {:else if graphSubSection === 'viz'}
+    {:else if subSection === 'viz'}
     <Toggle
       checked={snapshot.graph.graph_viz}
       onchange={(next) => patch((s) => (s.graph.graph_viz = next))}

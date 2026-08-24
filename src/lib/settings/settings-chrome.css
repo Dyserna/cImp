@@ -1,0 +1,363 @@
+/* Settings-window form + chrome base styles, hoisted out of `SettingsApp.svelte`
+   (#129 (a)). These are the bare-element rules every settings section needs;
+   keeping them scoped to one component is what blocked splitting that file.
+   Import this sheet from SettingsApp and from every section child extracted in
+   #129 (c).
+
+   SCOPING. Every rule is prefixed with `.settings-chrome`, the wrapper class on
+   SettingsApp's `.root`. That is not decoration:
+
+     * Svelte 5 emits a scoped rule as `section.svelte-HASH` /
+       `label.svelte-HASH > span:where(.svelte-HASH):first-child` — exactly ONE
+       real class per selector, the rest `:where()` (zero weight). A single
+       `.settings-chrome ` prefix therefore reproduces the ORIGINAL specificity
+       exactly, selector for selector. That is load-bearing: the theme files
+       (`tui_theme.css`, the per-theme `theme.css` files) deliberately pitch their
+       `html[data-theme=…] X` overrides against 0,1,1-style scoped rules, and
+       some of these rules are meant to win that contest while others are meant
+       to lose it. A `:where(.settings-chrome)` prefix would drop a class and
+       flip `button:hover:not(:disabled)` under `html[data-theme] section
+       button:hover`.
+     * The wrapper also keeps the sheet off everything rendered OUTSIDE
+       `.root` — `TuiTitleBar` and the `.loading` splash — which bare-global
+       `button {…}` would have restyled.
+
+   ORDER. SettingsApp imports this sheet FIRST, so it is emitted ahead of every
+   child component's CSS. Rules here tie on specificity with a child's own
+   scoped rules (both = selector + one class), so the child wins the tie and
+   keeps its own look. Do not move the import.
+ */
+
+/* ORDER-PRESERVATION COMPANION (#129 (a)) — this rule is NOT chrome; it belongs
+   with the offload section when #129 (c) extracts it. It is here only because it
+   ties on specificity (0,3,1) with `.button-row + small.hint` further down, and
+   its single call site sits directly after a `.button-row` — so which of the two
+   wins is decided by source order alone. In the old single style block the
+   adjacency rule came last and won (the hint gets `--space-1`, not 1.5rem);
+   hoisting only the adjacency rule would have silently flipped that. Keep these
+   two in this relative order, or move both out together. */
+/* Offload local-backend card: 1 blank line between the provider buttons
+   (Add to <harness> / Auto-sync) and their description. Overrides the
+   default `small.hint` negative top margin. */
+.settings-chrome small.hint.provider-desc {
+  margin-top: 1.5rem;
+}
+.settings-chrome h4 {
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+  margin: var(--space-4) 0 var(--space-1) 0;
+  color: var(--text-primary);
+}
+.settings-chrome button.danger {
+  color: var(--text-danger-soft, #d06b6b);
+}
+/* ORDER-PRESERVATION COMPANIONS (#129 (a)) — neither is chrome. Both tie at
+   0,3,1 with `button:hover:not(:disabled)` further down and both mark a button
+   that can be hovered, so which one paints a hovered-and-active button is
+   decided by source order alone. In the old single style block both came first
+   and LOST, so the generic hover won; they are kept ahead of it here so that
+   stays true. (Whether that is the look anyone wants is a separate question —
+   `.sidebar button:hover:not(.active)` right next to the second one suggests
+   not — but changing it is not this refactor's job.) Move each back to its
+   section in #129 (c), together with the hover rule or after re-deciding. */
+.settings-chrome .template-actions button.active {
+  border-color: var(--accent, #d08770);
+  color: var(--accent, #d08770);
+}
+.settings-chrome .sidebar button.active {
+  background: var(--surface-1);
+  color: var(--accent-purple);
+  font-weight: 600;
+  border-color: var(--border-subtle);
+}
+.settings-chrome h2 {
+  font-size: 14px;
+  font-weight: 600;
+  margin: 0 0 var(--space-3) 0;
+  color: var(--accent-purple);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+/* Sub-headings inside a section get a bit more weight + breathing room
+   than the original — used to separate distinct logical groups inside
+   a single section (e.g. UI theme vs Terminal palette in Theme). */
+.settings-chrome h3 {
+  font-size: var(--font-size-md);
+  font-weight: 600;
+  margin: var(--space-5) 0 var(--space-2) 0;
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--border-faint);
+  color: var(--text-primary);
+}
+.settings-chrome section > h3:first-of-type {
+  margin-top: var(--space-3);
+  padding-top: 0;
+  border-top: none;
+}
+.settings-chrome section {
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  padding: var(--space-4);
+  margin-bottom: var(--space-4);
+  background: var(--surface-1);
+}
+.settings-chrome label {
+  display: block;
+  margin-bottom: var(--space-3);
+}
+.settings-chrome label > span:first-child {
+  display: block;
+  margin-bottom: var(--space-1);
+  color: var(--text-quiet-strong);
+  font-size: var(--font-size-sm);
+  /* Tabular numerics so slider value labels (e.g. "Speed: 1.20×")
+     don't jitter the label width as the value changes. */
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum";
+}
+.settings-chrome label.checkbox {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.settings-chrome label.checkbox > span {
+  margin: 0;
+}
+.settings-chrome label.checkbox.disabled {
+  opacity: 0.6;
+}
+.settings-chrome input[type='text'],
+.settings-chrome input[type='number'],
+.settings-chrome input[type='password'],
+.settings-chrome select {
+  width: 100%;
+  background: var(--surface-sunken);
+  border: 1px solid var(--border-default);
+  color: var(--text-primary);
+  padding: 6px var(--space-2);
+  border-radius: var(--radius-md);
+  font-family: inherit;
+  font-size: var(--font-size-md);
+  box-sizing: border-box;
+  transition: border-color var(--motion-fast) var(--easing-standard);
+}
+.settings-chrome input[type='text']:focus,
+.settings-chrome input[type='number']:focus,
+.settings-chrome input[type='password']:focus,
+.settings-chrome select:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.settings-chrome input[type='range'] {
+  width: 100%;
+  accent-color: var(--accent);
+}
+.settings-chrome input[type='color'] {
+  height: 32px;
+  padding: 0;
+  border: 1px solid var(--border-default);
+  background: var(--surface-2);
+  border-radius: var(--radius-md);
+}
+.settings-chrome .row {
+  display: flex;
+  gap: var(--space-3);
+}
+.settings-chrome .row > label {
+  flex: 1;
+}
+/* Pair an input with an inline action button (Show/Hide, Browse, etc.).
+   Without this, the button wraps below a width:100% input and
+   `small.hint`'s negative top margin pulls the hint upward into the
+   wrapped button. */
+.settings-chrome .input-with-action {
+  display: flex;
+  gap: var(--space-2);
+  align-items: stretch;
+}
+.settings-chrome .input-with-action > input {
+  flex: 1;
+  min-width: 0;
+}
+/* ORDER-PRESERVATION COMPANION (#129 (a)) — same story as
+   `small.hint.provider-desc` above: not chrome, belongs with the Tool Plugins
+   section, but it ties (0,3,1) with `.button-row + small.hint` below and one of
+   its call sites (the plugin-load error) follows a `.button-row`. Order kept so
+   the adjacency rule still wins there. `.audit-detect.ok` / `.bad` stay in
+   SettingsApp — they are 0,4,1 and win from anywhere. */
+.settings-chrome small.hint.audit-detect {
+  margin: 0;
+  font-family: var(--font-mono, monospace);
+  word-break: break-all;
+}
+.settings-chrome .input-with-action > button {
+  flex-shrink: 0;
+}
+.settings-chrome button {
+  background: var(--surface-2);
+  border: 1px solid var(--border-default);
+  color: var(--text-primary);
+  padding: 6px var(--space-3);
+  border-radius: var(--radius-md);
+  font-size: var(--font-size-sm);
+  cursor: pointer;
+  transition:
+    background var(--motion-fast) var(--easing-standard),
+    border-color var(--motion-fast) var(--easing-standard);
+}
+.settings-chrome button:hover:not(:disabled) {
+  background: var(--surface-input);
+  border-color: var(--border-strong);
+}
+.settings-chrome button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.settings-chrome button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.settings-chrome button.ghost {
+  background: transparent;
+}
+.settings-chrome button.danger {
+  color: var(--text-danger-bright);
+  border-color: var(--border-danger);
+}
+.settings-chrome button.danger:hover:not(:disabled) {
+  background: var(--surface-danger-soft);
+  border-color: var(--border-danger-strong);
+}
+.settings-chrome small.hint {
+  display: block;
+  color: var(--text-tertiary);
+  font-size: var(--font-size-xs);
+  /* Generous leading so tall inline glyphs — e.g. the ▓░ shade blocks in
+     the context-bar example below — don't bleed up into the line
+     above when their fallback-font ink overflows the line box. */
+  line-height: 1.6;
+  margin: -8px 0 var(--space-3) 0;
+}
+/* Inline code inside a hint (the context-bar example, env-var names, …):
+   pin a monospace with tight metrics and clamp its line box so the shade
+   glyphs stay contained within the paragraph's leading. */
+.settings-chrome small.hint code {
+  font-family: Consolas, Menlo, monospace;
+  font-size: 0.95em;
+  line-height: 1;
+}
+/* hint placed directly under an h3 (rather than tucked under a label)
+   needs normal top margin — it has no preceding label to overlap. */
+.settings-chrome small.hint.top {
+  margin-top: 0;
+  margin-bottom: var(--space-3);
+}
+/* A hint that follows a bare button or a checkbox row has no tall block
+   label above it for the negative top margin to tuck under — that margin
+   would otherwise pull the hint up over the button/checkbox (e.g. the
+   Bottom bar → Status bar arrangement and context bar sections).
+   Reset to a normal positive gap. */
+.settings-chrome button + small.hint,
+.settings-chrome .button-row + small.hint,
+.settings-chrome label.checkbox + small.hint {
+  margin-top: var(--space-1);
+}
+/* V6-01: missing-model / device-not-found warning hint. */
+.settings-chrome small.hint.warn {
+  color: var(--accent, #d77757);
+}
+/* When a hint is nested *inside* a label after the input (Local LLM
+   section, shell command field, etc.) the global -8px would pull it
+   up over the input box. The negative margin only makes sense for
+   sibling hints below a label, where it tightens the gap to the
+   label above. */
+.settings-chrome label > small.hint {
+  margin-top: var(--space-1);
+}
+.settings-chrome small.error {
+  color: var(--text-danger-soft);
+  font-size: var(--font-size-xs);
+}
+.settings-chrome .sub-tabs {
+  display: flex;
+  gap: 2px;
+  margin: 0 0 var(--space-4) 0;
+  padding: 0;
+  border-bottom: 1px solid var(--border-subtle);
+}
+.settings-chrome .sub-tabs button {
+  appearance: none;
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--text-quiet);
+  cursor: pointer;
+  padding: 8px 14px;
+  font-size: var(--font-size-sm);
+  font-weight: 500;
+  border-radius: 0;
+  margin-bottom: -1px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  transition:
+    color var(--motion-fast) var(--easing-standard),
+    border-color var(--motion-fast) var(--easing-standard);
+}
+.settings-chrome .sub-tabs button:hover:not(.active) {
+  color: var(--text-primary);
+  background: transparent;
+}
+.settings-chrome .sub-tabs button.active {
+  color: var(--accent-purple);
+  border-bottom-color: var(--accent-purple);
+  font-weight: 600;
+  background: transparent;
+}
+.settings-chrome .sub-tabs button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.settings-chrome .sub-tab-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: var(--radius-pill);
+  background: var(--surface-2);
+  color: var(--text-tertiary);
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1;
+}
+.settings-chrome .sub-tabs button.active .sub-tab-count {
+  background: var(--accent-muted);
+  color: var(--accent-purple);
+}
+.settings-chrome details {
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--surface-deep);
+}
+.settings-chrome details[open] {
+  background: var(--surface-sunken);
+}
+.settings-chrome summary {
+  cursor: pointer;
+  padding: var(--space-2) var(--space-3);
+  color: var(--text-primary);
+  font-weight: 600;
+  font-size: var(--font-size-sm);
+  user-select: none;
+  border-radius: var(--radius-md);
+  transition: background var(--motion-fast) var(--easing-standard);
+}
+.settings-chrome summary:hover {
+  background: var(--surface-1);
+}
+.settings-chrome details[open] > summary {
+  border-bottom: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md) var(--radius-md) 0 0;
+}

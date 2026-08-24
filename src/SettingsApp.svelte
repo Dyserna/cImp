@@ -1,4 +1,13 @@
 <script lang="ts">
+  // #129 (a): the form/chrome base styles used to live in this file's own style
+  // block, which is what stopped the sections being split out into children —
+  // Svelte scoping keeps a parent's rules out of every child component. They
+  // are now a plain sheet keyed on the `.settings-chrome` class this component
+  // puts on `.root`; a section child extracted in #129 (c) imports the same
+  // sheet and needs no markup change. This import stays FIRST: the sheet must
+  // be emitted ahead of every child component's CSS so that where a rule here
+  // ties on specificity with a child's own scoped rule, the child wins.
+  import './lib/settings/settings-chrome.css';
   import { onMount, onDestroy } from 'svelte';
   import { get } from 'svelte/store';
   import { open } from '@tauri-apps/plugin-dialog';
@@ -2410,7 +2419,10 @@
 {#if !snapshot}
   <div class="loading">Loading settings…</div>
 {:else}
-  <div class="root">
+  <!-- `settings-chrome` keys `lib/settings/settings-chrome.css`. It sits on
+       `.root` rather than on `<html>` so the sheet cannot reach TuiTitleBar or
+       the `.loading` splash, both of which render outside this element. -->
+  <div class="root settings-chrome">
     <nav class="sidebar" aria-label="Settings sections">
       <div class="sidebar-title">Settings</div>
       {#each SECTIONS as s}
@@ -8451,12 +8463,6 @@
     margin-top: 0.4rem;
     flex-wrap: wrap;
   }
-  /* Offload local-backend card: 1 blank line between the provider buttons
-     (Add to <harness> / Auto-sync) and their description. Overrides the
-     default `small.hint` negative top margin. */
-  small.hint.provider-desc {
-    margin-top: 1.5rem;
-  }
   /* …and 2 blank lines between that description and the Start/Stop/Reset
      lifecycle row, which now sits at the bottom of the card. Overrides the
      default `.button-row` top margin. */
@@ -8546,12 +8552,6 @@
      user should act on, not an error state for the whole section. */
   small.hint.down {
     color: var(--danger, #c9564b);
-  }
-  h4 {
-    font-size: var(--font-size-sm);
-    font-weight: 600;
-    margin: var(--space-4) 0 var(--space-1) 0;
-    color: var(--text-primary);
   }
   /* LLM pricing editor: shared column template so the header row and every
      data row line up as a table. Provider/model get the flexible tracks; the
@@ -8690,9 +8690,6 @@
   .cloud-consent {
     border-left: 3px solid var(--accent, #d08770);
     padding-left: 0.5rem;
-  }
-  button.danger {
-    color: var(--text-danger-soft, #d06b6b);
   }
   .badge {
     font-size: var(--font-size-sm);
@@ -8914,10 +8911,6 @@
   .template-actions {
     margin-top: 0.35rem;
   }
-  .template-actions button.active {
-    border-color: var(--accent, #d08770);
-    color: var(--accent, #d08770);
-  }
   .template-popup {
     border: 1px solid var(--border-subtle);
     border-radius: var(--radius-md, 6px);
@@ -9034,12 +9027,6 @@
     background: var(--surface-1);
     color: var(--text-primary);
   }
-  .sidebar button.active {
-    background: var(--surface-1);
-    color: var(--accent-purple);
-    font-weight: 600;
-    border-color: var(--border-subtle);
-  }
   .sidebar button:focus-visible {
     outline: 2px solid var(--accent);
     outline-offset: 2px;
@@ -9062,97 +9049,8 @@
     text-align: center;
     color: var(--text-tertiary);
   }
-  h2 {
-    font-size: 14px;
-    font-weight: 600;
-    margin: 0 0 var(--space-3) 0;
-    color: var(--accent-purple);
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-  }
-  /* Sub-headings inside a section get a bit more weight + breathing room
-     than the original — used to separate distinct logical groups inside
-     a single section (e.g. UI theme vs Terminal palette in Theme). */
-  h3 {
-    font-size: var(--font-size-md);
-    font-weight: 600;
-    margin: var(--space-5) 0 var(--space-2) 0;
-    padding-top: var(--space-3);
-    border-top: 1px solid var(--border-faint);
-    color: var(--text-primary);
-  }
   /* The first h3 in a section sits right under the h2 — skip the divider
      so we don't double-up with the section's top edge. */
-  section > h3:first-of-type {
-    margin-top: var(--space-3);
-    padding-top: 0;
-    border-top: none;
-  }
-  section {
-    border: 1px solid var(--border-subtle);
-    border-radius: var(--radius-lg);
-    padding: var(--space-4);
-    margin-bottom: var(--space-4);
-    background: var(--surface-1);
-  }
-  label {
-    display: block;
-    margin-bottom: var(--space-3);
-  }
-  label > span:first-child {
-    display: block;
-    margin-bottom: var(--space-1);
-    color: var(--text-quiet-strong);
-    font-size: var(--font-size-sm);
-    /* Tabular numerics so slider value labels (e.g. "Speed: 1.20×")
-       don't jitter the label width as the value changes. */
-    font-variant-numeric: tabular-nums;
-    font-feature-settings: "tnum";
-  }
-  label.checkbox {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-  label.checkbox > span {
-    margin: 0;
-  }
-  label.checkbox.disabled {
-    opacity: 0.6;
-  }
-  input[type='text'],
-  input[type='number'],
-  input[type='password'],
-  select {
-    width: 100%;
-    background: var(--surface-sunken);
-    border: 1px solid var(--border-default);
-    color: var(--text-primary);
-    padding: 6px var(--space-2);
-    border-radius: var(--radius-md);
-    font-family: inherit;
-    font-size: var(--font-size-md);
-    box-sizing: border-box;
-    transition: border-color var(--motion-fast) var(--easing-standard);
-  }
-  input[type='text']:focus,
-  input[type='number']:focus,
-  input[type='password']:focus,
-  select:focus {
-    outline: none;
-    border-color: var(--accent);
-  }
-  input[type='range'] {
-    width: 100%;
-    accent-color: var(--accent);
-  }
-  input[type='color'] {
-    height: 32px;
-    padding: 0;
-    border: 1px solid var(--border-default);
-    background: var(--surface-2);
-    border-radius: var(--radius-md);
-  }
   /* Selection-highlight color pickers: two columns, each a label + a
      "Custom" toggle + the swatch. */
   .color-grid {
@@ -9176,26 +9074,6 @@
   }
   .color-grid.disabled {
     opacity: 0.5;
-  }
-  .row {
-    display: flex;
-    gap: var(--space-3);
-  }
-  .row > label {
-    flex: 1;
-  }
-  /* Pair an input with an inline action button (Show/Hide, Browse, etc.).
-     Without this, the button wraps below a width:100% input and
-     `small.hint`'s negative top margin pulls the hint upward into the
-     wrapped button. */
-  .input-with-action {
-    display: flex;
-    gap: var(--space-2);
-    align-items: stretch;
-  }
-  .input-with-action > input {
-    flex: 1;
-    min-width: 0;
   }
   /* V23 Phase A: Code Audit per-tool row. */
   .audit-tool {
@@ -9227,11 +9105,6 @@
   .audit-tool .audit-scope.local {
     color: var(--accent, #d77757);
     border-color: currentcolor;
-  }
-  small.hint.audit-detect {
-    margin: 0;
-    font-family: var(--font-mono, monospace);
-    word-break: break-all;
   }
   small.hint.audit-detect.ok {
     color: var(--success, #4caf50);
@@ -9268,9 +9141,6 @@
   }
   .audit-timeout input {
     width: 7rem;
-  }
-  .input-with-action > button {
-    flex-shrink: 0;
   }
   /* V38: Tool Plugins master-detail. */
   .plugin-split {
@@ -9409,87 +9279,6 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  button {
-    background: var(--surface-2);
-    border: 1px solid var(--border-default);
-    color: var(--text-primary);
-    padding: 6px var(--space-3);
-    border-radius: var(--radius-md);
-    font-size: var(--font-size-sm);
-    cursor: pointer;
-    transition:
-      background var(--motion-fast) var(--easing-standard),
-      border-color var(--motion-fast) var(--easing-standard);
-  }
-  button:hover:not(:disabled) {
-    background: var(--surface-input);
-    border-color: var(--border-strong);
-  }
-  button:focus-visible {
-    outline: 2px solid var(--accent);
-    outline-offset: 2px;
-  }
-  button:disabled {
-    opacity: 0.4;
-    cursor: not-allowed;
-  }
-  button.ghost {
-    background: transparent;
-  }
-  button.danger {
-    color: var(--text-danger-bright);
-    border-color: var(--border-danger);
-  }
-  button.danger:hover:not(:disabled) {
-    background: var(--surface-danger-soft);
-    border-color: var(--border-danger-strong);
-  }
-  small.hint {
-    display: block;
-    color: var(--text-tertiary);
-    font-size: var(--font-size-xs);
-    /* Generous leading so tall inline glyphs — e.g. the ▓░ shade blocks in
-       the context-bar example below — don't bleed up into the line
-       above when their fallback-font ink overflows the line box. */
-    line-height: 1.6;
-    margin: -8px 0 var(--space-3) 0;
-  }
-  /* Inline code inside a hint (the context-bar example, env-var names, …):
-     pin a monospace with tight metrics and clamp its line box so the shade
-     glyphs stay contained within the paragraph's leading. */
-  small.hint code {
-    font-family: Consolas, Menlo, monospace;
-    font-size: 0.95em;
-    line-height: 1;
-  }
-  /* hint placed directly under an h3 (rather than tucked under a label)
-     needs normal top margin — it has no preceding label to overlap. */
-  small.hint.top {
-    margin-top: 0;
-    margin-bottom: var(--space-3);
-  }
-  /* A hint that follows a bare button or a checkbox row has no tall block
-     label above it for the negative top margin to tuck under — that margin
-     would otherwise pull the hint up over the button/checkbox (e.g. the
-     Bottom bar → Status bar arrangement and context bar sections).
-     Reset to a normal positive gap. */
-  button + small.hint,
-  .button-row + small.hint,
-  label.checkbox + small.hint {
-    margin-top: var(--space-1);
-  }
-  /* V6-01: missing-model / device-not-found warning hint. */
-  small.hint.warn {
-    color: var(--accent, #d77757);
-  }
-  /* When a hint is nested *inside* a label after the input (Local LLM
-     section, shell command field, etc.) the global -8px would pull it
-     up over the input box. The negative margin only makes sense for
-     sibling hints below a label, where it tightens the gap to the
-     label above. */
-  label > small.hint {
-    margin-top: var(--space-1);
-  }
   .preset-actions {
     display: flex;
     gap: var(--space-2);
@@ -9508,10 +9297,6 @@
   }
   .preset-save input[type='text'] {
     flex: 1;
-  }
-  small.error {
-    color: var(--text-danger-soft);
-    font-size: var(--font-size-xs);
   }
   /* V40 review F-3: the roster-load failure banner. Same weight as a field
      error — it explains why a block is missing, and carries the retry. */
@@ -9610,94 +9395,11 @@
     font-size: var(--font-size-sm);
     cursor: pointer;
   }
-  .sub-tabs {
-    display: flex;
-    gap: 2px;
-    margin: 0 0 var(--space-4) 0;
-    padding: 0;
-    border-bottom: 1px solid var(--border-subtle);
-  }
-  .sub-tabs button {
-    appearance: none;
-    background: transparent;
-    border: none;
-    border-bottom: 2px solid transparent;
-    color: var(--text-quiet);
-    cursor: pointer;
-    padding: 8px 14px;
-    font-size: var(--font-size-sm);
-    font-weight: 500;
-    border-radius: 0;
-    margin-bottom: -1px;
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    transition:
-      color var(--motion-fast) var(--easing-standard),
-      border-color var(--motion-fast) var(--easing-standard);
-  }
-  .sub-tabs button:hover:not(.active) {
-    color: var(--text-primary);
-    background: transparent;
-  }
-  .sub-tabs button.active {
-    color: var(--accent-purple);
-    border-bottom-color: var(--accent-purple);
-    font-weight: 600;
-    background: transparent;
-  }
-  .sub-tabs button:focus-visible {
-    outline: 2px solid var(--accent);
-    outline-offset: 2px;
-  }
-  .sub-tab-count {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    min-width: 18px;
-    height: 18px;
-    padding: 0 5px;
-    border-radius: var(--radius-pill);
-    background: var(--surface-2);
-    color: var(--text-tertiary);
-    font-size: 10px;
-    font-weight: 600;
-    line-height: 1;
-  }
-  .sub-tabs button.active .sub-tab-count {
-    background: var(--accent-muted);
-    color: var(--accent-purple);
-  }
   .tabs-grid {
     display: flex;
     flex-direction: column;
     gap: 10px;
     margin-top: var(--space-2);
-  }
-  details {
-    border: 1px solid var(--border-subtle);
-    border-radius: var(--radius-md);
-    background: var(--surface-deep);
-  }
-  details[open] {
-    background: var(--surface-sunken);
-  }
-  summary {
-    cursor: pointer;
-    padding: var(--space-2) var(--space-3);
-    color: var(--text-primary);
-    font-weight: 600;
-    font-size: var(--font-size-sm);
-    user-select: none;
-    border-radius: var(--radius-md);
-    transition: background var(--motion-fast) var(--easing-standard);
-  }
-  summary:hover {
-    background: var(--surface-1);
-  }
-  details[open] > summary {
-    border-bottom: 1px solid var(--border-subtle);
-    border-radius: var(--radius-md) var(--radius-md) 0 0;
   }
   .kind-badge {
     display: inline-block;

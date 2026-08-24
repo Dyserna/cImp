@@ -134,7 +134,11 @@
     border-radius: var(--radius-sm);
     font-size: 16px;
   }
-  .remove:hover {
+  /* #129 (a): scoped under `.array-editor` so this beats the hoisted
+     `settings-chrome.css` rule `button:hover:not(:disabled)` (0,3,1) — a bare
+     `.remove:hover` is 0,3,0 and would lose the danger colours to the generic
+     hover. Adding the root class makes it 0,4,0. */
+  .array-editor .remove:hover {
     background: var(--surface-danger-bg);
     color: var(--text-danger-pale);
     border-color: var(--border-danger-strong);

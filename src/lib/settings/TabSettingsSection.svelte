@@ -453,6 +453,9 @@
     margin: 0;
   }
   .field > span:first-child {
+    /* #129 (a): `settings-chrome.css`'s `label > span:first-child` reaches
+       these now and would add a `margin-bottom` on top of `.field`'s gap. */
+    margin-bottom: 0;
     color: var(--text-quiet-strong);
     font-size: var(--font-size-sm);
     font-variant-numeric: tabular-nums;

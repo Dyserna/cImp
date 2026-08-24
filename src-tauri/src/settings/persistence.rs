@@ -168,9 +168,14 @@ pub struct LoadOutcome {
 pub fn load(default_shell: &ShellSpec, launch_cwd: &Path) -> LoadOutcome {
     // 1. Load and migrate the global baseline. After this `global` is in
     //    the current schema shape; a v1.x file on disk has been backed up
-    //    next to the global path and rewritten. `global_stated` is the version
-    //    the file claimed BEFORE that, which step 2a needs.
-    let (mut global, global_stated) = load_global(default_shell);
+    //    next to the global path and rewritten. `stated` is the version the
+    //    file claimed BEFORE that and `below_floor` says whether there was a
+    //    readable baseline at all — step 2a needs both.
+    let GlobalLoad {
+        settings: mut global,
+        stated: global_stated,
+        below_floor: global_below_floor,
+    } = load_global(default_shell);
 
     // 2. Load the overlay (if any).
     //    First fold any pre-consolidation loose overlay into `.cimp/`, then
@@ -192,17 +197,31 @@ pub fn load(default_shell: &ShellSpec, launch_cwd: &Path) -> LoadOutcome {
         //     `claude_local` block that reached nothing after the global moved
         //     the field, with the file still on disk saying otherwise.
         //
-        //     The version comes from the overlay's own `schema_version` stamp
-        //     (written by `save` since Phase I) and falls back to what the
-        //     global file stated: an overlay beside a v35 global was written
-        //     against a v35 baseline. Neither present ⇒ the overlay is current,
-        //     which is what every reader assumed before Phase I anyway.
-        //     The stamp is stripped inside `migrate_overlay`; it must never
-        //     reach the merge, or an old overlay would pin the merged
-        //     `schema_version` below the global's.
-        let from = migration::stated_schema_version(&v)
-            .or(global_stated)
-            .unwrap_or(crate::settings::schema::CURRENT_SCHEMA_VERSION as u64);
+        //     Which version to enter at is [`overlay_entry_version`]'s
+        //     question, including the case where there is no honest answer:
+        //     the global file beside this overlay was below the floor, so the
+        //     "current unless something says otherwise" default would be a
+        //     guess about a project whose baseline is now DEFAULTS.
+        //     The stamp is stripped inside `migrate_overlay` on every path,
+        //     refusals included; it must never reach the merge, or an old
+        //     overlay would pin the merged `schema_version` below the global's.
+        let entry = overlay_entry_version(&v, global_stated, global_below_floor);
+        if entry.is_none() {
+            tracing::error!(
+                path = %overlay_path.display(),
+                floor = migration::MIN_OVERLAY_SCHEMA_VERSION,
+                "settings: this project overlay states no schema version, and the global file \
+                 beside it was too old to migrate and has been set aside — so nothing says which \
+                 schema the project's keys are in, and the baseline they are being merged onto is \
+                 fresh defaults. Refusing to run the cascade on a guess: the overlay is merged \
+                 exactly as it is, and any key an older schema has since moved reaches nothing. \
+                 Re-save this project's settings to rewrite the file in the current shape"
+            );
+        }
+        // `0` is below every floor, so a refusal takes `migrate_overlay`'s own
+        // refuse-and-warn path rather than a second one written here — and
+        // still gets the stamp stripped.
+        let from = entry.unwrap_or(0);
         if migration::migrate_overlay(&mut v, from) {
             tracing::info!(
                 path = %overlay_path.display(),
@@ -709,24 +728,53 @@ pub fn read_project_prompt_templates(root: &Path) -> Vec<PromptTemplate> {
         .unwrap_or_default()
 }
 
+/// What [`load_global`] hands back: the baseline, plus the two facts about the
+/// FILE it came from that [`load`] needs to place an overlay beside it.
+struct GlobalLoad {
+    settings: Settings,
+    /// The `schema_version` the file **stated before migration** (V40 Phase I,
+    /// issue #107 item 5) — what [`load`] falls back to for an overlay written
+    /// by a build that predates the overlay stamp: an overlay sitting beside a
+    /// v35 global file was written against a v35 baseline, so that is the
+    /// version to enter its cascade at. `None` for a file that stated none
+    /// (pre-v1.10, before `schema_version` existed) and for every path that
+    /// never got to read one.
+    stated: Option<u64>,
+    /// The file was below the migration floor: it was NOT read, `settings` is
+    /// fresh defaults, and the file itself has been set aside (or, if that
+    /// failed, left alone and locked against writes). `stated` is `None` here
+    /// on purpose — the version that file claimed is not a version anything
+    /// beside it may be entered at — and this flag is what tells `load` the
+    /// difference between "nothing said" and "there is nothing left to ask"
+    /// (V42 tranche-2 review, T2-2).
+    below_floor: bool,
+}
+
+impl GlobalLoad {
+    /// The baseline is defaults and the file said nothing usable — absent,
+    /// unreadable, unparseable, or never reached.
+    fn defaults(settings: Settings) -> Self {
+        Self {
+            settings,
+            stated: None,
+            below_floor: false,
+        }
+    }
+}
+
 /// Read the global file. Writes seeded defaults when absent. On parse
 /// failure quarantines the file and returns defaults. Runs migration on
 /// the global file in place — backup goes next to the global path itself,
 /// not next to whatever path the merged result resolved to.
 ///
-/// The second half of the answer is the `schema_version` the file **stated
-/// before migration** (V40 Phase I, issue #107 item 5). It is what [`load`]
-/// falls back to for an overlay written by a build that predates the overlay
-/// stamp: an overlay sitting beside a v35 global file was written against a v35
-/// baseline, so that is the version to enter its cascade at. `None` for a file
-/// that stated none (pre-v1.10, before `schema_version` existed) and for every
-/// path that never got to read one.
-fn load_global(default_shell: &ShellSpec) -> (Settings, Option<u64>) {
+/// See [`GlobalLoad`] for the two facts returned beside the settings and why
+/// each is load-bearing for the overlay.
+fn load_global(default_shell: &ShellSpec) -> GlobalLoad {
     let path = match global_path() {
         Ok(p) => p,
         Err(e) => {
             tracing::warn!(error = %e, "settings: cannot resolve global path; using defaults");
-            return (seeded_defaults(default_shell), None);
+            return GlobalLoad::defaults(seeded_defaults(default_shell));
         }
     };
 
@@ -737,14 +785,14 @@ fn load_global(default_shell: &ShellSpec) -> (Settings, Option<u64>) {
         } else {
             tracing::info!(path = %path.display(), "settings: wrote global defaults");
         }
-        return (s, None);
+        return GlobalLoad::defaults(s);
     }
 
     let text = match fs::read_to_string(&path) {
         Ok(t) => t,
         Err(e) => {
             tracing::warn!(error = %e, path = %path.display(), "settings: read global failed; using defaults");
-            return (seeded_defaults(default_shell), None);
+            return GlobalLoad::defaults(seeded_defaults(default_shell));
         }
     };
 
@@ -759,7 +807,7 @@ fn load_global(default_shell: &ShellSpec) -> (Settings, Option<u64>) {
             migration::quarantine_corrupt_file(&path);
             let s = seeded_defaults(default_shell);
             let _ = save_to(&path, &s);
-            return (s, None);
+            return GlobalLoad::defaults(s);
         }
     };
 
@@ -774,7 +822,13 @@ fn load_global(default_shell: &ShellSpec) -> (Settings, Option<u64>) {
     // a file this old and would otherwise rewrite it as current with its
     // contents silently defaulted.
     if let Some(reseeded) = reseed_below_floor(&path, &value, default_shell) {
-        return (reseeded, None);
+        // `stated` is deliberately dropped: what this file claimed is a version
+        // no overlay may be entered at, and `below_floor` is what says so.
+        return GlobalLoad {
+            settings: reseeded,
+            stated: None,
+            below_floor: true,
+        };
     }
 
     // Migrate the global file in place. Backup is named after the global
@@ -787,7 +841,7 @@ fn load_global(default_shell: &ShellSpec) -> (Settings, Option<u64>) {
                 path = %path.display(),
                 "settings: global migration aborted (backup failed); using defaults"
             );
-            return (seeded_defaults(default_shell), None);
+            return GlobalLoad::defaults(seeded_defaults(default_shell));
         }
     };
 
@@ -802,7 +856,7 @@ fn load_global(default_shell: &ShellSpec) -> (Settings, Option<u64>) {
             migration::quarantine_corrupt_file(&path);
             let s = seeded_defaults(default_shell);
             let _ = save_to(&path, &s);
-            return (s, None);
+            return GlobalLoad::defaults(s);
         }
     };
 
@@ -840,7 +894,7 @@ fn load_global(default_shell: &ShellSpec) -> (Settings, Option<u64>) {
     } else {
         tracing::info!(path = %path.display(), "settings: global loaded");
     }
-    (typed, stated)
+    GlobalLoad { settings: typed, stated, below_floor: false }
 }
 
 /// **The global migration floor** (V42 R9, issue #120).
@@ -919,6 +973,53 @@ fn reseed_below_floor(path: &Path, value: &Value, default_shell: &ShellSpec) -> 
         tracing::warn!(error = %e, path = %path.display(), "settings: write global defaults after quarantine failed");
     }
     Some(s)
+}
+
+/// **The schema version a project overlay's cascade may be entered at** — or
+/// `None`, meaning there is no honest answer and the cascade must be refused
+/// (V42 tranche-2 review, T2-2).
+///
+/// Three sources, in order:
+///
+/// 1. the overlay's OWN `schema_version` stamp, written by [`save`] since V40
+///    Phase I. It is the only self-describing answer, so it wins outright;
+/// 2. the version the global file beside it stated BEFORE its own migration: an
+///    overlay written by a build whose global file said v35 was written against
+///    a v35 baseline;
+/// 3. `CURRENT` — "nothing says otherwise, so it is current", which is what
+///    every reader assumed before Phase I anyway.
+///
+/// **The case that has no third source.** When the global file was below the
+/// migration floor it was set aside unread, and `stated` comes back `None` —
+/// not because the file was silent but because it is gone from the answer
+/// entirely, and the baseline this overlay is about to merge onto is fresh
+/// DEFAULTS. Falling through to (3) there is a guess, and a bad one: it says
+/// "current" about a project whose settings are old enough that the global file
+/// beside them could not be upgraded, so `migrate_overlay` finds nothing to do,
+/// the value deep-merges unmigrated, and every key an old schema has since MOVED
+/// is dropped silently by serde on the typed parse — the exact invisible
+/// per-project loss Phase I existed to close, arriving through the floor.
+///
+/// So it is refused instead: the caller says so with the file's name in the log,
+/// and passes a version below every floor so `migrate_overlay` takes its own
+/// refuse-and-warn path (which still strips the stamp). The overlay is merged
+/// as-is — it is a diff, and the global baseline plus the user's next save
+/// rewrite it in the current shape — but nothing pretends it was considered.
+fn overlay_entry_version(
+    overlay: &Value,
+    global_stated: Option<u64>,
+    global_below_floor: bool,
+) -> Option<u64> {
+    if let Some(own) = migration::stated_schema_version(overlay) {
+        return Some(own);
+    }
+    if let Some(beside) = global_stated {
+        return Some(beside);
+    }
+    if global_below_floor {
+        return None;
+    }
+    Some(crate::settings::schema::CURRENT_SCHEMA_VERSION as u64)
 }
 
 /// The global settings file this session has promised not to overwrite, if any.
@@ -4485,6 +4586,49 @@ mod tests {
         save_to(&other, &reseeded).expect("an unrelated settings file still saves");
         release_preserved_global(&path);
         save_to(&path, &reseeded).expect("released, the path is writable again");
+    }
+
+    /// **An overlay beside a quarantined global is refused, not guessed at**
+    /// (V42 tranche-2 review, T2-2).
+    ///
+    /// The two cases the review named, and the two ordinary ones beside them so
+    /// the refusal is visibly a decision rather than the only outcome.
+    #[test]
+    fn an_unstamped_overlay_beside_a_below_floor_global_refuses_to_enter_the_cascade() {
+        let current = crate::settings::schema::CURRENT_SCHEMA_VERSION as u64;
+        let unstamped = serde_json::json!({ "claude_local": { "base_url": "http://box:8080" } });
+        let stamped = serde_json::json!({ "schema_version": 34, "tts": { "enabled": true } });
+
+        // STAMPED-OK: the overlay says what it is, so the state of the global
+        // file beside it does not matter — the cascade runs from its own stamp.
+        assert_eq!(
+            overlay_entry_version(&stamped, None, true),
+            Some(34),
+            "an overlay that carries its own stamp is self-describing; the quarantine next door \
+             cannot make it unreadable"
+        );
+
+        // UNSTAMPED-REFUSED: nothing says which schema these keys are in, and
+        // the baseline they would merge onto is fresh defaults.
+        assert_eq!(
+            overlay_entry_version(&unstamped, None, true),
+            None,
+            "with the global file quarantined below the floor there is no version to enter at — \
+             defaulting to CURRENT would skip the cascade and deep-merge an old diff, and serde \
+             drops what the deleted steps would have MOVED"
+        );
+
+        // …and the two ordinary paths are untouched by the fix.
+        assert_eq!(
+            overlay_entry_version(&unstamped, Some(35), false),
+            Some(35),
+            "an unstamped overlay beside a healthy v35 global was written against v35"
+        );
+        assert_eq!(
+            overlay_entry_version(&unstamped, None, false),
+            Some(current),
+            "nothing said otherwise and the global is healthy ⇒ current, as before Phase I"
+        );
     }
 
     /// The floor retires steps; it does not stop the ladder. A file **at** the

@@ -252,6 +252,18 @@
   margin-top: 0;
   margin-bottom: var(--space-3);
 }
+/* A row of buttons (Add / Save / Delete …). Chrome rather than one section's
+   own rule: five sections use it, and the `+ small.hint` reset below already
+   named it here, so the base declaration belongs beside that companion. Moved
+   out of `SettingsApp.svelte` in #129 (c) — a scoped rule stops matching the
+   instant its markup becomes a child component's. The `.offload-lifecycle-row`
+   modifier stays with the offload section it belongs to. */
+.settings-chrome .button-row {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 0.4rem;
+  flex-wrap: wrap;
+}
 /* A hint that follows a bare button or a checkbox row has no tall block
    label above it for the negative top margin to tuck under — that margin
    would otherwise pull the hint up over the button/checkbox (e.g. the

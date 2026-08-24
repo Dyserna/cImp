@@ -129,6 +129,7 @@
   import AboutSection from './lib/settings/sections/AboutSection.svelte';
   import ChecksSection from './lib/settings/sections/ChecksSection.svelte';
   import McpSection from './lib/settings/sections/McpSection.svelte';
+  import PricingSection from './lib/settings/sections/PricingSection.svelte';
   import NumberField from './lib/settings/NumberField.svelte';
   import SelectField from './lib/settings/SelectField.svelte';
   import Toggle from './lib/settings/Toggle.svelte';
@@ -367,30 +368,12 @@
       llmPricingLoading = false;
     }
   }
-  function addLlmPricingRow(): void {
-    llmPricing = [
-      ...llmPricing,
-      { provider: 'Custom', model: `model-${llmPricing.length + 1}`, model_prefix: '', input: 0, cache_write: 0, cache_read: 0, output: 0 },
-    ];
-    llmPricingDirty = true;
-  }
-  function editLlmPricingText(i: number, field: 'provider' | 'model' | 'model_prefix', value: string): void {
-    llmPricing = llmPricing.map((r, idx) => (idx === i ? { ...r, [field]: value } : r));
-    llmPricingDirty = true;
-  }
-  function editLlmPricingRate(
-    i: number,
-    field: 'input' | 'cache_write' | 'cache_read' | 'output',
-    value: string,
-  ): void {
-    // Clamp garbage/negatives to 0 so a saved row can never poison the cost
-    // popup's math with NaN or a negative price.
-    const n = Math.max(0, Number(value) || 0);
-    llmPricing = llmPricing.map((r, idx) => (idx === i ? { ...r, [field]: n } : r));
-    llmPricingDirty = true;
-  }
-  function deleteLlmPricingRow(i: number): void {
-    llmPricing = llmPricing.filter((_, idx) => idx !== i);
+  /// The one place an edit marks the table dirty. `PricingSection` owns the row
+  /// transforms — they are pure functions of the current array — and hands the
+  /// result back here, so "changed" is decided once rather than in each of the
+  /// four editors.
+  function setLlmPricingRows(next: LlmPricingModel[]): void {
+    llmPricing = next;
     llmPricingDirty = true;
   }
   async function saveLlmPricing(): Promise<void> {
@@ -6890,122 +6873,14 @@
 
         </section>
       {:else if activeSection === 'pricing'}
-        <section>
-          <h2>LLM pricing</h2>
-          <small class="hint top">
-            Provider/model token prices (USD per <strong>million tokens</strong>,
-            "MTok") used by the Code Intelligence tab's session-cost popup and
-            its Usage view's <em>est. cost</em> mode (auto-matched by the
-            <em>Id prefix</em> column). Fresh installs are seeded with current
-            vendor API and GitHub Copilot rates — cache-write priced at the
-            1-hour-TTL 2× rate a real session actually pays; every
-            value is editable, and prices drift, so corrections are yours to
-            make (no auto-update). Saved to the global settings file, not this
-            project's overlay.
-          </small>
-          {#if llmPricingLoading}
-            <small class="hint">Loading…</small>
-          {:else}
-            {#if llmPricing.length === 0}
-              <small class="hint">No entries — add one below.</small>
-            {:else}
-              <div class="pricing-head-row">
-                <span>Provider</span>
-                <span>Model</span>
-                <span title="Transcript model-id prefix this row auto-matches in the Usage view's cost mode. Longest match wins; empty = manual-pick only.">Id prefix</span>
-                <span class="num">Input</span>
-                <span class="num">Cache write</span>
-                <span class="num">Cache read</span>
-                <span class="num">Output</span>
-                <span></span>
-              </div>
-              <!-- Keyed by index deliberately, same as the MCP editor: rows are
-                   editable and replaced (cloned) on every edit, so a value-based
-                   key would change mid-edit and drop input focus. -->
-              {#each llmPricing as row, i (i)}
-                <div class="pricing-row">
-                  <input
-                    type="text"
-                    placeholder="Provider"
-                    value={row.provider}
-                    oninput={(e) =>
-                      editLlmPricingText(i, 'provider', (e.currentTarget as HTMLInputElement).value)}
-                  />
-                  <input
-                    type="text"
-                    placeholder="Model"
-                    value={row.model}
-                    oninput={(e) =>
-                      editLlmPricingText(i, 'model', (e.currentTarget as HTMLInputElement).value)}
-                  />
-                  <input
-                    type="text"
-                    placeholder="model-id prefix"
-                    title="Transcript model-id prefix for cost-mode auto-match (longest wins; empty = manual-pick only)"
-                    value={row.model_prefix}
-                    oninput={(e) =>
-                      editLlmPricingText(i, 'model_prefix', (e.currentTarget as HTMLInputElement).value)}
-                  />
-                  <input
-                    type="number"
-                    class="num"
-                    min="0"
-                    step="0.01"
-                    title="$ per MTok, input tokens"
-                    value={row.input}
-                    onchange={(e) =>
-                      editLlmPricingRate(i, 'input', (e.currentTarget as HTMLInputElement).value)}
-                  />
-                  <input
-                    type="number"
-                    class="num"
-                    min="0"
-                    step="0.01"
-                    title="$ per MTok, cache-write tokens"
-                    value={row.cache_write}
-                    onchange={(e) =>
-                      editLlmPricingRate(i, 'cache_write', (e.currentTarget as HTMLInputElement).value)}
-                  />
-                  <input
-                    type="number"
-                    class="num"
-                    min="0"
-                    step="0.01"
-                    title="$ per MTok, cache-read tokens"
-                    value={row.cache_read}
-                    onchange={(e) =>
-                      editLlmPricingRate(i, 'cache_read', (e.currentTarget as HTMLInputElement).value)}
-                  />
-                  <input
-                    type="number"
-                    class="num"
-                    min="0"
-                    step="0.01"
-                    title="$ per MTok, output tokens"
-                    value={row.output}
-                    onchange={(e) =>
-                      editLlmPricingRate(i, 'output', (e.currentTarget as HTMLInputElement).value)}
-                  />
-                  <button type="button" class="secondary danger" onclick={() => deleteLlmPricingRow(i)}>
-                    Delete
-                  </button>
-                </div>
-              {/each}
-            {/if}
-            <div class="button-row">
-              <button type="button" onclick={addLlmPricingRow}>Add model</button>
-              <button type="button" disabled={!llmPricingDirty} onclick={() => void saveLlmPricing()}>
-                Save
-              </button>
-              {#if llmPricingDirty}
-                <small class="hint">Unsaved changes</small>
-              {/if}
-            </div>
-            {#if llmPricingError}
-              <small class="error">{llmPricingError}</small>
-            {/if}
-          {/if}
-        </section>
+        <PricingSection
+          rows={llmPricing}
+          loading={llmPricingLoading}
+          dirty={llmPricingDirty}
+          error={llmPricingError}
+          onrows={setLlmPricingRows}
+          onsave={() => void saveLlmPricing()}
+        />
       {:else if activeSection === 'sandboxing'}
         <section>
           <!--
@@ -7789,13 +7664,10 @@
     font-family: system-ui, -apple-system, sans-serif;
     font-size: var(--font-size-md);
   }
-  /* V8-01 offload controls */
-  .button-row {
-    display: flex;
-    gap: 0.5rem;
-    margin-top: 0.4rem;
-    flex-wrap: wrap;
-  }
+  /* V8-01 offload controls. The `.offload-lifecycle-row` modifier below still
+     lives here; the base `.button-row` moved to `settings-chrome.css` in
+     #129 (c) — five sections use it, so an extracted child would have lost it
+     the moment its markup left this file's scope. */
   /* …and 2 blank lines between that description and the Start/Stop/Reset
      lifecycle row, which now sits at the bottom of the card. Overrides the
      default `.button-row` top margin. */
@@ -7885,27 +7757,6 @@
      user should act on, not an error state for the whole section. */
   small.hint.down {
     color: var(--danger, #c9564b);
-  }
-  /* LLM pricing editor: shared column template so the header row and every
-     data row line up as a table. Provider/model get the flexible tracks; the
-     four $/MTok fields are fixed-width numerics. */
-  .pricing-head-row,
-  .pricing-row {
-    display: grid;
-    /* V16 Feature 8 added the Id-prefix column between Model and Input. */
-    grid-template-columns: minmax(6rem, 0.7fr) minmax(8rem, 1fr) minmax(7rem, 0.9fr) 5.5rem 5.5rem 5.5rem 5.5rem auto;
-    gap: 0.4rem;
-    align-items: center;
-    margin-top: 0.4rem;
-  }
-  .pricing-head-row {
-    font-size: var(--font-size-sm);
-    color: var(--text-quiet, #999);
-    margin-top: 0.8rem;
-  }
-  .pricing-head-row .num,
-  .pricing-row input.num {
-    text-align: right;
   }
   .offload-test-result {
     margin-top: 0.5rem;

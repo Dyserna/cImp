@@ -111,6 +111,36 @@ const IMPORTED_CARDS = [
 /// `code-audit.*` / `code-quality.*` keep their legacy namespaces verbatim —
 /// they are the `view` prop `CodeAuditView` passes to the two `AuditPanel`
 /// instances, and renaming them would silently drop users' saved filters.
+///
+/// ## The allowlist is hand-kept, and nothing checks it (accepted)
+///
+/// V42 review, DEFERRED with this note. Two consequences, both real:
+///
+///   1. **Adding a durable pref means editing this set.** A `saveViewString`
+///      call with a name that is not here routes to `localStorage` and stays
+///      per-machine. It fails quietly — the value persists, just in the wrong
+///      place and the wrong scope — so nothing goes red and no user sees an
+///      error. The only signal is a reviewer noticing.
+///   2. **A pref promoted AFTER a project's marker is set never gets
+///      imported.** [`IMPORT_MARKER_KEY`] records "this project has been
+///      through the import", not "these keys have been". A key added to this
+///      set in a later release therefore starts empty on every project that
+///      already ran the import, and whatever the user had set for it stays
+///      stranded in `localStorage`.
+///
+/// Both are accepted rather than fixed. The set has been stable since the
+/// move, promotions are a deliberate, reviewed act (the whole point of the
+/// durable/ephemeral split is that most of this family is *supposed* to be
+/// throwaway), and the cost of the alternative — a per-key marker set, or a
+/// re-import pass keyed on which names are new — is real machinery guarding a
+/// once-a-year event whose failure mode is one view toggle reverting to its
+/// default. The mechanism that would close (1) properly is the same
+/// build-time name-join the `cssTokens` guard does for CSS tokens, and that
+/// idea rides with the codegen work in #131 rather than being invented here.
+///
+/// If a key IS promoted later and its value matters, the honest fix at that
+/// point is a one-off migration that reads it from `localStorage` — not a
+/// change to the marker, which other projects depend on meaning what it says.
 export const DURABLE_VIEW_PREFS: ReadonlySet<string> = new Set([
   'diff.view-mode',
   'events.col-widths',

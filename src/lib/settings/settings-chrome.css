@@ -409,3 +409,13 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* A denser checkbox row, for a control that sits inside another cell rather
+   than in the section's own column (the selection-highlight colour grid's
+   "Custom" ticks). Chrome rather than that section's own rule: it styles the
+   markup `Toggle.svelte` renders, so a rule scoped to any section — parent or
+   child — cannot reach it. Moved out of `SettingsApp.svelte` in #129 (c),
+   which is what let that row finally become a `Toggle`. */
+.settings-chrome label.checkbox.compact {
+  font-size: 0.9em;
+  gap: var(--space-1);
+}

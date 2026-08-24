@@ -224,6 +224,16 @@ The "Code Graph" tab is renamed **Code Intelligence** (internal tab id
 (`src/lib/CodeIntelligenceView.svelte`) routes five sections: Index / Activity /
 Memory / Context / Analyses.
 
+Since #130 that file is the ROUTER plus the Memory and Context sections; the other
+four live in `src/lib/codeIntel/` (`UsageOverview`, `AnalysesSection`,
+`TracePathSection`, `ArchitectureSection`), and the rules more than one of them
+needs are in `src/lib/codeIntel/codeIntel.css` — an unscoped sheet keyed on the
+`.graph-monitor` class the router puts on its root, so a child picks them up
+through the DOM rather than losing them to Svelte style scoping. Each child is
+mounted unconditionally and gates its own markup on an `active` prop: the state
+behind a section (a selected session, a typed trace, a scan result) has always
+outlived a section switch, and an `{#if}` around the component would not let it.
+
 **Schema versioning & migration.** `graph/schema.rs::GRAPH_SCHEMA_VERSION` stamps
 the derived-relation shape. On open, `GraphIndex::migrate_schema` compares it
 against a `schema_meta` singleton (which is **not** in `RELATIONS`, so it survives

@@ -1356,8 +1356,10 @@ mod tests {
     /// **Card order is a user-visible contract** (V42 R7).
     ///
     /// `evaluate` returns a `Vec<Proposal>` and the Advisor panel renders it in
-    /// order — `{#each advice.proposals}` in `CodeIntelligenceView.svelte`,
-    /// with no sort between here and the DOM. R7 split one 744-line
+    /// order — `{#each advice.proposals}` in
+    /// `src/lib/codeIntel/UsageOverview.svelte` (it was
+    /// `CodeIntelligenceView.svelte` until #130 split that view), with no sort
+    /// between here and the DOM. R7 split one 744-line
     /// `drift_rules` into `drift` + `detection`, and the detection block sat in
     /// the MIDDLE of it (ahead of `drift.read_bypass.v1`), so the obvious
     /// "drift, then detection" composition would have quietly reshuffled every

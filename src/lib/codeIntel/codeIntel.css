@@ -1,0 +1,218 @@
+/* Code Intelligence view chrome + shared section styles, hoisted out of
+   `CodeIntelligenceView.svelte` (#130, F4 step 1). These are the rules that
+   MORE THAN ONE section of that view needs; keeping them in the parent's
+   scoped `<style>` is what blocked splitting the sections into children,
+   because Svelte scoping keeps a parent's rules out of every child component.
+
+   SCOPING. Every rule is prefixed with `.graph-monitor`, the class the view
+   already had on its root element. That is not decoration — it reproduces the
+   ORIGINAL specificity exactly, selector for selector: Svelte 5 emits a scoped
+   rule with exactly ONE real class (`button.svelte-HASH`,
+   `.arow.svelte-HASH`), the rest `:where()` (zero weight), so a single
+   `.graph-monitor ` prefix weighs the same as the hash class it replaces. That
+   matters: the theme files (`theme.css`, `tui_theme.css`) pitch their
+   `html[data-theme=…] X` overrides against these weights, and some of these
+   rules are meant to win that contest while others are meant to lose it. The
+   wrapper also keeps the sheet off everything rendered outside `.graph-monitor`.
+
+   ORDER. `CodeIntelligenceView.svelte` imports this sheet FIRST, ahead of every
+   section child it imports, so the sheet is emitted before their CSS. Where a
+   rule here ties on specificity with a child's own scoped rule, the child wins
+   — which is what the single style block did when the child's rule came later.
+   Do not move the import.
+
+   The rules are in their ORIGINAL relative order. Two pairs depend on it:
+   the two `.history-head` blocks (a `font-weight`/`margin` one and a
+   `display: flex` one — disjoint, but kept in sequence), and
+   `button` • `button.secondary` • `button:disabled` • `button.mini`.
+
+   ORDER-PRESERVATION COMPANION: `button.secondary` is used by the Overview
+   section alone, so by the "exclusive rules move with their section" rule it
+   belongs in `UsageOverview.svelte`. It stays HERE because it ties at 0,1,1
+   with `button.mini` (which several sections need) and `class="mini secondary"`
+   is a real combination in the Overview. In the old single block `button.mini`
+   came later and won the tie; moving `button.secondary` into the child would
+   have made it come later and win instead. The two declare disjoint properties
+   today — this keeps that from being load-bearing tomorrow.
+
+   NOT hoisted, deliberately: the `.qmark` / `.qreason` / `.qconfirm*` /
+   `button.mini.danger*` / `.pin` families. They are shared between the Memory
+   section and the quarantined-note dialog, which are one feature and both
+   still live in the parent. They move here the day Memory becomes a child.
+ */
+
+.graph-monitor .actions {
+  display: flex;
+  gap: 8px;
+}
+
+.graph-monitor button {
+  padding: 4px 10px;
+  border-radius: 5px;
+  border: 1px solid var(--border-default, #444);
+  background: var(--accent, #3b6ea5);
+  color: var(--accent-fg, #fff);
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.graph-monitor button.secondary {
+  background: transparent;
+  color: var(--text-primary, #ddd);
+}
+
+.graph-monitor button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.graph-monitor .placeholder {
+  opacity: 0.6;
+  font-style: italic;
+  padding: 8px 2px;
+}
+
+/* V12 Phase F (6c): "+N since last pass" badge on the Analyses tab + its
+   buttons — a small pill, never wraps, doesn't disturb button sizing. */
+.graph-monitor .badge {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: var(--surface-warning, #c9820a);
+  color: var(--text-warning, #fff);
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 16px;
+  vertical-align: middle;
+}
+
+.graph-monitor .card {
+  border: 1px solid var(--border-subtle, #3a3a3a);
+  border-radius: 8px;
+  padding: 12px;
+  margin-bottom: 12px;
+  background: var(--surface-card, #1e1e1e);
+}
+
+.graph-monitor .error {
+  color: var(--text-danger-soft, #ff8a80);
+  font-size: 12px;
+  margin: 6px 0 0;
+}
+
+.graph-monitor .history-head {
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+
+.graph-monitor .muted {
+  opacity: 0.6;
+  font-weight: 400;
+}
+
+.graph-monitor .caveat {
+  font-size: 11px;
+  opacity: 0.65;
+  margin: 2px 0 8px;
+  line-height: 1.4;
+}
+
+.graph-monitor .rows {
+  display: flex;
+  flex-direction: column;
+}
+
+.graph-monitor .arow {
+  display: grid;
+  grid-template-columns: 1fr 6rem 2fr;
+  gap: 8px;
+  align-items: baseline;
+  padding: 3px 4px;
+  border-bottom: 1px solid var(--border-faint, #2a2a2a);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.graph-monitor .aname {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.graph-monitor .akind {
+  opacity: 0.7;
+  font-size: 11px;
+}
+
+.graph-monitor .aloc {
+  font-family: monospace;
+  font-size: 11px;
+  opacity: 0.8;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.graph-monitor .pin-toggle {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 12px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.graph-monitor .history-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.graph-monitor .history-head .muted {
+  margin-right: auto;
+}
+
+.graph-monitor button.mini {
+  padding: 2px 8px;
+  font-size: 11px;
+}
+
+.graph-monitor .preview-in {
+  display: flex;
+  gap: 8px;
+  margin: 6px 0 10px;
+}
+
+.graph-monitor .preview-in input {
+  flex: 1;
+  min-width: 0;
+  padding: 5px 8px;
+  border-radius: 5px;
+  border: 1px solid var(--border-default, #444);
+  background: var(--surface-input, #1e1e1e);
+  color: var(--text-primary, #ddd);
+  font-size: 12px;
+}
+
+.graph-monitor .preview-meta {
+  font-size: 11px;
+  opacity: 0.75;
+  margin: 4px 0;
+  font-variant-numeric: tabular-nums;
+}
+
+
+/* ── V15: confidence badges (impact dependents, path edges) ──────────── */
+.graph-monitor .conf {
+  display: inline-block;
+  margin-left: 4px;
+  padding: 0 6px;
+  border-radius: 8px;
+  font-size: 9.5px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  line-height: 15px;
+  vertical-align: middle;
+  white-space: nowrap;
+}

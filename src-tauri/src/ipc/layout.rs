@@ -22,15 +22,26 @@ use crate::error::{AppError, AppResult};
 use crate::ipc::AppState;
 use crate::settings::{LayoutNodePersisted, LayoutPersisted, LayoutPreset};
 
-/// Persist the full layout tree + focused-pane id. Called by the
-/// frontend on every layout mutation, debounced 250ms there to coalesce
-/// splitter drags. The backend's settings handle does its own 500ms
-/// debounce on the disk write, so a fast burst writes the file once.
+/// Persist the full layout tree + focused-pane id. Called by the frontend on
+/// EVERY layout-store mutation — no frontend debounce, deliberately (see
+/// `installLayoutPersistence`: the 250 ms one it used to have left a
+/// closing-race window where the last edit before teardown was dropped). A
+/// splitter drag therefore lands here once per pointer event.
+///
+/// Coalescing is the settings handle's 500 ms debounce on the disk write, so a
+/// fast burst writes the file once.
+///
+/// **Quiet write.** `mutate_quiet` instead of `mutate`: the in-memory store is
+/// updated and the save is requested, but no `settings-changed` is broadcast.
+/// Nothing consumes a layout change through that channel — see
+/// `SettingsHandle::mutate_quiet` for the audit — and broadcasting cloned the
+/// whole `Settings` struct to every webview per pointer event to deliver a
+/// value none of them read.
 #[tauri::command]
 pub async fn save_layout(state: State<'_, AppState>, layout: LayoutPersisted) -> AppResult<()> {
     // Atomic mutate so a concurrent tab create/close or settings_update can't
     // clobber the layout with a stale whole-struct snapshot (lost-update).
-    state.settings.mutate(move |snap| {
+    state.settings.mutate_quiet(move |snap| {
         snap.layout = Some(layout);
     });
     Ok(())
@@ -231,6 +242,29 @@ fn epoch_to_ymdhms(secs: i64) -> (i32, u32, u32, u32, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// V42 Phase B. Structural because the thing worth defending is which
+    /// handle method this command calls, and there is no way to observe that
+    /// from a unit test without an `AppState`. Swapping it back to `mutate`
+    /// would restore a whole-`Settings` broadcast to every webview once per
+    /// pointer event during a splitter drag — see the doc comments on both
+    /// sides for why nothing is listening. Newline-agnostic: CI checks this
+    /// tree out with CRLF.
+    #[test]
+    fn save_layout_writes_quietly() {
+        let src = include_str!("layout.rs");
+        let start = src
+            .find("pub async fn save_layout(")
+            .expect("`save_layout` is gone — re-point this test");
+        let body = &src[start..];
+        let body = &body[..body.find("\n}").unwrap_or(body.len())];
+        assert!(
+            body.contains("mutate_quiet"),
+            "`save_layout` must use `mutate_quiet`: it runs once per pointer event during a \
+             splitter drag, and `mutate` clones and broadcasts the whole Settings struct to \
+             every window each time"
+        );
+    }
 
     #[test]
     fn epoch_zero_is_unix_epoch() {

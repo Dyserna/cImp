@@ -189,9 +189,9 @@
         console.error('list_tabs failed:', e);
       }
       if (disposed) return;
-      // Install the debounced save subscription AFTER hydration so the
-      // first emission (the just-set layout from settings) is the one
-      // it swallows. If we install earlier, the subscription would
+      // Install the save subscription AFTER hydration so the first
+      // emission (the just-set layout from settings) is the one it
+      // swallows. If we install earlier, the subscription would
       // round-trip the hydrated layout straight back to the backend on
       // launch — harmless (would write the same state) but wasteful.
       unsubLayoutSave = installLayoutPersistence();

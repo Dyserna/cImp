@@ -131,10 +131,10 @@
   import McpSection from './lib/settings/sections/McpSection.svelte';
   import PricingSection from './lib/settings/sections/PricingSection.svelte';
   import ComposeSection from './lib/settings/sections/ComposeSection.svelte';
+  import ShortcutsSection from './lib/settings/sections/ShortcutsSection.svelte';
   import NumberField from './lib/settings/NumberField.svelte';
   import SelectField from './lib/settings/SelectField.svelte';
   import Toggle from './lib/settings/Toggle.svelte';
-  import ShortcutCapture from './lib/settings/ShortcutCapture.svelte';
   import TabSettingsSection from './lib/settings/TabSettingsSection.svelte';
   import ThemeSwatch from './lib/settings/ThemeSwatch.svelte';
   import TuiTitleBar from './lib/TuiTitleBar.svelte';
@@ -1386,31 +1386,6 @@
     { id: 'harness', label: 'Harness health' },
     { id: 'advanced', label: 'Advanced' },
     { id: 'about', label: 'About' },
-  ];
-
-  // Shortcut rows rendered as loops — the numbered tab slots and the pane
-  // actions are 16 near-identical <label> rows otherwise. Every key is a
-  // `string | null` field of the shortcuts slice.
-  type ShortcutKey = keyof Settings['shortcuts'];
-  const TAB_SHORTCUT_ROWS: readonly (readonly [ShortcutKey, string])[] = [
-    ['switch_to_tab_3', 'Switch to tab 3'],
-    ['switch_to_tab_4', 'Switch to tab 4'],
-    ['switch_to_tab_5', 'Switch to tab 5'],
-    ['switch_to_tab_6', 'Switch to tab 6'],
-    ['switch_to_tab_7', 'Switch to tab 7'],
-    ['switch_to_tab_8', 'Switch to tab 8'],
-    ['switch_to_tab_9', 'Switch to tab 9'],
-    ['new_shell_tab', 'New shell tab'],
-    ['close_tab', 'Close current tab'],
-  ];
-  const PANE_SHORTCUT_ROWS: readonly (readonly [ShortcutKey, string])[] = [
-    ['focus_pane_left', 'Focus pane left'],
-    ['focus_pane_right', 'Focus pane right'],
-    ['focus_pane_up', 'Focus pane up'],
-    ['focus_pane_down', 'Focus pane down'],
-    ['split_pane_horizontal', 'Split pane (side by side)'],
-    ['split_pane_vertical', 'Split pane (stacked)'],
-    ['close_pane', 'Close focused pane'],
   ];
 
   // Sub-tab nav within the Tabs section. Each AI builtin gets its own
@@ -3882,128 +3857,7 @@
           {/if}
         </section>
       {:else if activeSection === 'shortcuts'}
-        <section>
-          <h2>Keyboard controls</h2>
-          <label>
-            <span>Open compose</span>
-            <ShortcutCapture
-              bind:value={
-                () => snapshot!.shortcuts.open_compose,
-                (v) => patch((s) => (s.shortcuts.open_compose = v))
-              }
-            />
-          </label>
-          <label>
-            <span>Open compose with template picker</span>
-            <ShortcutCapture
-              bind:value={
-                () => snapshot!.shortcuts.open_compose_picker,
-                (v) => patch((s) => (s.shortcuts.open_compose_picker = v))
-              }
-            />
-          </label>
-          <label>
-            <span>Submit compose</span>
-            <ShortcutCapture
-              bind:value={
-                () => snapshot!.shortcuts.submit_compose,
-                (v) => patch((s) => (s.shortcuts.submit_compose = v))
-              }
-            />
-          </label>
-          <label>
-            <span>Cancel compose</span>
-            <ShortcutCapture
-              bind:value={
-                () => snapshot!.shortcuts.cancel_compose,
-                (v) => patch((s) => (s.shortcuts.cancel_compose = v))
-              }
-            />
-          </label>
-          <label>
-            <span>Open settings</span>
-            <ShortcutCapture
-              bind:value={
-                () => snapshot!.shortcuts.open_settings,
-                (v) => patch((s) => (s.shortcuts.open_settings = v))
-              }
-            />
-          </label>
-          <h3>Tabs</h3>
-          <label>
-            <span>Switch to tab 1</span>
-            <ShortcutCapture
-              bind:value={
-                () => snapshot!.shortcuts.switch_to_tab_1,
-                (v) => patch((s) => (s.shortcuts.switch_to_tab_1 = v))
-              }
-            />
-          </label>
-          <label>
-            <span>Switch to tab 2</span>
-            <ShortcutCapture
-              bind:value={
-                () => snapshot!.shortcuts.switch_to_tab_2,
-                (v) => patch((s) => (s.shortcuts.switch_to_tab_2 = v))
-              }
-            />
-          </label>
-          {#each TAB_SHORTCUT_ROWS as [key, label] (key)}
-            <label>
-              <span>{label}</span>
-              <ShortcutCapture
-                bind:value={
-                  () => snapshot!.shortcuts[key],
-                  (v) => patch((s) => (s.shortcuts[key] = v))
-                }
-              />
-            </label>
-          {/each}
-
-          <h3>Panes</h3>
-          {#each PANE_SHORTCUT_ROWS as [key, label] (key)}
-            <label>
-              <span>{label}</span>
-              <ShortcutCapture
-                bind:value={
-                  () => snapshot!.shortcuts[key],
-                  (v) => patch((s) => (s.shortcuts[key] = v))
-                }
-              />
-            </label>
-          {/each}
-
-          <h3>Voice</h3>
-          <label>
-            <span>Push-to-talk (speech-to-text)</span>
-            <ShortcutCapture
-              bind:value={
-                () => snapshot!.shortcuts.push_to_talk,
-                (v) => patch((s) => (s.shortcuts.push_to_talk = v))
-              }
-            />
-          </label>
-          <small class="hint">
-            Hold the chord to record, release to transcribe. Works only when
-            speech-to-text is enabled. The default is bare
-            <code>Ctrl+Shift</code> — a quick tap or a
-            <code>Ctrl+Shift+&lt;key&gt;</code> chord won't trigger a recording.
-          </small>
-          <label>
-            <span>Speak selection (text-to-speech)</span>
-            <ShortcutCapture
-              bind:value={
-                () => snapshot!.shortcuts.speak_selection,
-                (v) => patch((s) => (s.shortcuts.speak_selection = v))
-              }
-            />
-          </label>
-          <small class="hint">
-            Reads the active terminal's current selection aloud — the keyboard
-            equivalent of Ctrl+right-click. Shows a "No text selected" notice
-            when nothing is selected.
-          </small>
-        </section>
+        <ShortcutsSection {snapshot} {patch} />
       {:else if activeSection === 'compose'}
         <ComposeSection
           globals={globalTemplates}

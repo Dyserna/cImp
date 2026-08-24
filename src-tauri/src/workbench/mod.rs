@@ -24,6 +24,7 @@ pub mod diff;
 pub mod git;
 pub mod history;
 pub mod shadow;
+pub mod worddiff;
 pub mod worktree;
 
 use std::collections::{HashMap, HashSet};

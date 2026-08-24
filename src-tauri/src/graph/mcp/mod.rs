@@ -28,7 +28,7 @@ pub use tools::{
     tools_for, LEAN_HIDDEN,
 };
 pub(crate) use checks_tools::dispatch_rootless;
-pub(crate) use tools::dispatch_recorded;
+pub(crate) use tools::{dispatch_recorded, ToolCall};
 
 use std::path::{Path, PathBuf};
 

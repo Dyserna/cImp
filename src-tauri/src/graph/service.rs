@@ -699,17 +699,26 @@ impl GraphService {
     /// (so an id naming no configured tab arrives as `Unrecognized`, never as a
     /// tab). It is threaded rather than derived here for the same reason `guards`
     /// is: only the proxy knows the calling tab.
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// V42 R26: those four values plus the tool `name` and `args` arrive bundled
+    /// as a [`ToolCall`](crate::graph::ToolCall) — the same set, unchanged, that
+    /// this frame threads to `dispatch_recorded` and that `dispatch_recorded`
+    /// threads to `run_tool`. `cwd` and `consumer` stay separate: they are what
+    /// THIS frame resolves (the project root and the activity source), and
+    /// neither travels past it.
     pub async fn run_graph_tool(
         &self,
         cwd: &Path,
-        name: &str,
-        args: &serde_json::Value,
         consumer: &str,
-        session: Option<&str>,
-        guards: crate::offload::toolclass::CallGuards,
-        tab: crate::activity::Attribution,
+        call: super::mcp::ToolCall<'_>,
     ) -> Result<String, String> {
+        let super::mcp::ToolCall {
+            name,
+            args,
+            session,
+            guards,
+            tab,
+        } = call;
         let settings = self.settings.current();
         let sub = settings.graph.effective_db_subdir();
         // The consumer selects the activity source + the memory tools' agent
@@ -750,9 +759,19 @@ impl GraphService {
         // worker's route is `graph::mcp::offload_query`, which passes `Headless`
         // for real.
         super::mcp::dispatch_recorded(
-            &root, &idx, &settings, source, name, args, session, guards, tab,
+            &root,
+            &idx,
+            &settings,
+            source,
+            super::mcp::ToolCall {
+                name,
+                args,
+                session,
+                guards,
+                tab,
+            },
         )
-            .await
+        .await
     }
 
     /// The configured per-project db subdirectory (default `.cimp`).

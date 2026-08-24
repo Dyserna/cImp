@@ -255,7 +255,7 @@ pub fn surface_stats() -> SurfaceStats {
 
 #[cfg(test)]
 mod surface_tests {
-    use super::super::tools::{lean_filter, run_tool, tool_specs, LEAN_HIDDEN};
+    use super::super::tools::{lean_filter, run_tool, tool_specs, ToolCall, LEAN_HIDDEN};
     use super::*;
     use crate::graph::index::GraphIndex;
     use crate::graph::{parse_file, Lang};
@@ -345,14 +345,16 @@ mod surface_tests {
         let out = run_tool(
             &idx,
             &dir,
-            "graph_dead_exports",
-            &serde_json::json!({}),
             50,
             200,
             None,
-            None,
-            CallGuards::clean(),
-            crate::activity::Attribution::Unattributed,
+            ToolCall {
+                name: "graph_dead_exports",
+                args: &serde_json::json!({}),
+                session: None,
+                guards: CallGuards::clean(),
+                tab: crate::activity::Attribution::Unattributed,
+            },
         )
         .expect("hidden tool still dispatches");
         assert!(!out.starts_with("unknown graph tool"), "{out}");

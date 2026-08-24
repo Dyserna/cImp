@@ -63,6 +63,9 @@ describe('harnessRow', () => {
         last_seen: '2.2.0',
         last_verified: '2.1.0',
         input_profile_status: 'pass',
+        // Required since V42 Phase E: the generated `HarnessSettings` spells
+        // Rust's `Option<AutoVerify>` as `AutoVerify | null`, not `?`.
+        auto_verify: null,
         ext: { [H1_KEY_A]: false },
       },
     };

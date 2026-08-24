@@ -250,9 +250,26 @@ describe('settings draft sync', () => {
 ///
 /// A comment saying "register your push" is the kind of contract this codebase
 /// has repeatedly re-learned gets violated by someone who never read it, so the
-/// rule is enforced here instead: in `SettingsApp.svelte`, every top-level
-/// function that calls `applySettings` must also call `draftSync.beginPush()`.
-/// The exemption list below is EMPTY, and staying empty is the point.
+/// rule was enforced here instead: every top-level function of
+/// `SettingsApp.svelte` that called `applySettings` had to call
+/// `draftSync.beginPush()` too.
+///
+/// **The V42 tranche-2 review (T2-6) found the scope of that wrong**, and the
+/// rule below is its replacement. `applySettings` is importable by all
+/// twenty-one section children, while the scan read exactly ONE file — so the
+/// hole it was built to catch could be reopened in any of the other twenty-one
+/// and the guard would have gone on passing. The fix is to make the pair
+/// inseparable rather than to scan more files for it: `pushDraft` is the gate
+/// and the push in one call, and nothing under `src/lib/settings/` — nor the
+/// window itself — may import `applySettings` to assemble its own.
+///
+/// So there are two checks now, and the second is the load-bearing one:
+///
+/// 1. every top-level function of the window that pushes the draft does it
+///    through `pushDraft` (and none of them touches `applySettings`);
+/// 2. no source under `src/lib/settings/`, and not `SettingsApp.svelte`,
+///    IMPORTS `applySettings` at all — `store.ts` defines it and `draftSync.ts`
+///    is the gate that wraps it, and those two are the whole allowlist.
 ///
 /// Read through Vite's own glob rather than `node:fs` — the app's tsconfig has
 /// no node types, and the emptiness assertions below fail loudly if this ever
@@ -263,9 +280,25 @@ const WINDOW_SOURCES = import.meta.glob(['/src/SettingsApp.svelte'], {
   eager: true,
 }) as Record<string, string>;
 
+/// Every settings source the import ban covers: the twenty-one sections, the
+/// editors they share, this directory's own modules — and the window, which
+/// owns the draft and is therefore the one file that used to need it.
+const SETTINGS_SOURCES = import.meta.glob(
+  ['/src/lib/settings/**/*.ts', '/src/lib/settings/**/*.svelte', '/src/SettingsApp.svelte'],
+  { query: '?raw', import: 'default', eager: true },
+) as Record<string, string>;
+
+/// The two files that may name `applySettings` in an import: the module that
+/// DEFINES it, and the gate that is the only sanctioned way to call it.
+const APPLY_SETTINGS_ALLOWED = new Set([
+  '/src/lib/settings/store.ts',
+  '/src/lib/settings/draftSync.ts',
+]);
+
 /**
- * Sanctioned unregistered pushes, each with the reason it is one — currently
- * NONE, and a row is a review decision rather than a formality.
+ * Sanctioned RAW pushes — a function that calls `applySettings` itself instead
+ * of `pushDraft` — each with the reason it is one. Currently NONE, and a row is
+ * a review decision rather than a formality.
  *
  * It held exactly one row for a while: `resetSettingsToDefaults`, which pushed
  * `defaultSettings()` and never assigned `snapshot`, letting the echo bring the
@@ -273,11 +306,11 @@ const WINDOW_SOURCES = import.meta.glob(['/src/SettingsApp.svelte'], {
  * left the pre-reset draft standing until the echo landed, and an edit made in
  * that window cloned it and pushed it wholesale, undoing the reset. The fix was
  * the behaviour change the row said it would take: the reset now assigns the
- * draft and registers its push exactly as `patch()` does, so the row is gone
- * and `the reset assigns the draft and takes the gate (#129)` below pins the
- * new shape.
+ * draft and pushes it through the gate exactly as `patch()` does, so the row is
+ * gone and `the reset assigns the draft and takes the gate (#129)` below pins
+ * the new shape.
  */
-const UNREGISTERED_PUSHES = new Map<string, string>();
+const UNGATED_PUSHES = new Map<string, string>();
 
 /** Every top-level `function name(…) { … }` block in the component's script. */
 function topLevelFunctions(src: string): Map<string, string> {
@@ -297,10 +330,10 @@ describe('every settings push registers with the draft-sync gate', () => {
     expect(src, `${path} did not resolve — the scan is looking at the wrong tree`).toBeTypeOf(
       'string',
     );
-    expect(src).toContain('draftSync.beginPush()');
+    expect(src).toContain('pushDraft(draftSync');
   });
 
-  test('every function that calls applySettings also opens a push window', () => {
+  test('every function that pushes the draft pushes it through pushDraft', () => {
     const fns = topLevelFunctions(src);
     // Under-parse guard: a regex that matched nothing would make this test
     // pass vacuously, which is the failure mode of every source scan.
@@ -308,14 +341,22 @@ describe('every settings push registers with the draft-sync gate', () => {
       true,
     );
 
-    const pushers = [...fns].filter(([, body]) => /\bapplySettings\(/.test(body));
     // `patch`, `applyMcpRegistry`, `commitGraphIgnore`, `resetSettingsToDefaults`.
-    expect(pushers.length).toBeGreaterThanOrEqual(4);
+    const gated = [...fns].filter(([, body]) => /\bpushDraft\(/.test(body));
+    expect(
+      gated.length,
+      `only ${gated.length} function(s) push the draft — the window has four, so either the ` +
+        'parse has drifted or a push has found another way out',
+    ).toBeGreaterThanOrEqual(4);
 
-    const unregistered = pushers
-      .filter(([, body]) => !body.includes('draftSync.beginPush()'))
+    const raw = [...fns]
+      .filter(([, body]) => /\bapplySettings\(/.test(body))
       .map(([name]) => name);
-    expect(unregistered.filter((n) => !UNREGISTERED_PUSHES.has(n))).toEqual([]);
+    expect(
+      raw.filter((n) => !UNGATED_PUSHES.has(n)),
+      'these functions push the draft with a raw `applySettings` instead of `pushDraft`, so ' +
+        'the lost-update gate is theirs to remember and one day one of them will not',
+    ).toEqual([]);
   });
 
   test('commitGraphIgnore in particular takes the gate (#129)', () => {
@@ -323,9 +364,10 @@ describe('every settings push registers with the draft-sync gate', () => {
     expect(body, 'commitGraphIgnore is no longer a top-level function of the window').toBeTypeOf(
       'string',
     );
-    expect(body).toContain('draftSync.beginPush()');
-    // …and settles it in either direction, or the gate wedges shut.
-    expect(body).toMatch(/\.finally\(settled\)/);
+    // One call now carries both halves — registering the push and settling it
+    // in either direction (`pushDraft`'s `.finally`), which is what stops the
+    // gate wedging shut on a rejected push.
+    expect(body).toMatch(/\bpushDraft\(draftSync,/);
   });
 
   test('the reset assigns the draft and takes the gate (#129)', () => {
@@ -333,26 +375,25 @@ describe('every settings push registers with the draft-sync gate', () => {
     expect(body, 'resetSettingsToDefaults is no longer a top-level function of the window').toBeTypeOf(
       'string',
     );
-    // The two halves of the fix, and both are load-bearing: registering the
-    // push without assigning the draft would leave the pre-reset state
-    // standing (the gate would then actively DEFEND it against the reset's own
-    // echo), and assigning without registering re-opens the burst race.
+    // The two halves of the fix, and both are load-bearing: pushing through the
+    // gate without assigning the draft would leave the pre-reset state standing
+    // (the gate would then actively DEFEND it against the reset's own echo),
+    // and assigning without the gate re-opens the burst race.
     expect(body, 'the reset must assign the draft, not wait for its own echo').toMatch(
       /\bsnapshot = \w+/,
     );
-    expect(body).toContain('draftSync.beginPush()');
-    expect(body).toMatch(/\.finally\(settled\)/);
+    expect(body).toMatch(/\bpushDraft\(draftSync,/);
     // …and it is still the DEFAULTS that get assigned and pushed, not the draft.
     expect(body).toMatch(/=\s*defaultSettings\(\)/);
   });
 
   test('the exemption list has no stale rows', () => {
     const fns = topLevelFunctions(src);
-    for (const [name, reason] of UNREGISTERED_PUSHES) {
+    for (const [name, reason] of UNGATED_PUSHES) {
       const body = fns.get(name);
       expect(body, `${name} is exempted but no longer exists`).toBeTypeOf('string');
       expect(body).toMatch(/\bapplySettings\(/);
-      expect(body).not.toContain('draftSync.beginPush()');
+      expect(body).not.toMatch(/\bpushDraft\(/);
       expect(reason, `${name} is exempted with no reason given`).not.toBe('');
     }
     // The list is empty today, so the loop above asserts nothing — and a test
@@ -360,9 +401,56 @@ describe('every settings push registers with the draft-sync gate', () => {
     // deliberate act with a reviewer behind it, so it has to come through this
     // line: state the roster, and let a silent new exemption fail here.
     expect(
-      [...UNREGISTERED_PUSHES.keys()],
+      [...UNGATED_PUSHES.keys()],
       'a push was exempted from the draft-sync gate — that is a review decision: ' +
-        'name it here with the reason it cannot register',
+        'name it here with the reason it cannot go through `pushDraft`',
+    ).toEqual([]);
+  });
+
+  // ── The check that made the one above stop being enough (T2-6) ───────────
+
+  test('the settings tree is actually in the import scan', () => {
+    const files = Object.keys(SETTINGS_SOURCES);
+    // ~30 files: 21 sections, the shared editors, this directory's modules and
+    // the window. A glob that resolved nothing would make the ban vacuous.
+    expect(
+      files.length,
+      `the settings glob resolved ${files.length} file(s) — it is looking at the wrong tree`,
+    ).toBeGreaterThan(20);
+    for (const allowed of APPLY_SETTINGS_ALLOWED) {
+      expect(files, `${allowed} is allowlisted but not in the scan`).toContain(allowed);
+    }
+    // …and the allowlisted files must actually be the ones that name it, or the
+    // allowlist has outlived its reason.
+    expect(SETTINGS_SOURCES['/src/lib/settings/store.ts']).toContain(
+      'export async function applySettings',
+    );
+    expect(SETTINGS_SOURCES['/src/lib/settings/draftSync.ts']).toContain(
+      "import { applySettings } from './store'",
+    );
+  });
+
+  test('no settings source imports applySettings except the store and the gate', () => {
+    // Import statements only: the identifier appears in plenty of PROSE here
+    // and in the components, and a comment explaining the rule must not break
+    // it. Both the named form and a namespace import of the store count — the
+    // latter would reach `applySettings` through the namespace.
+    const offenders: string[] = [];
+    for (const [file, source] of Object.entries(SETTINGS_SOURCES)) {
+      if (APPLY_SETTINGS_ALLOWED.has(file)) continue;
+      for (const m of source.matchAll(/import\s+([\s\S]*?)\s+from\s+['"]([^'"]+)['"]/g)) {
+        const [, bindings, specifier] = m;
+        const named = /\{[\s\S]*\bapplySettings\b[\s\S]*\}/.test(bindings);
+        const namespaced = /\*\s+as\s+\w+/.test(bindings) && /(^|\/)store$/.test(specifier);
+        if (named || namespaced) offenders.push(`${file}  (from '${specifier}')`);
+      }
+    }
+    expect(
+      offenders,
+      'these files import `applySettings` directly, which lets them push the settings draft ' +
+        'without the lost-update gate. Push through `pushDraft(draftSync, next)` instead — or, ' +
+        'in a section child, through the callback the window passes down:\n' +
+        offenders.join('\n'),
     ).toEqual([]);
   });
 });

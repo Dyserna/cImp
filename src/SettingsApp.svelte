@@ -10,12 +10,12 @@
   import './lib/settings/settings-chrome.css';
   import { onMount, onDestroy } from 'svelte';
   import { get } from 'svelte/store';
-  import {
-    initSettings,
-    settings,
-    applySettings,
-  } from './lib/settings/store';
-  import { createDraftSync } from './lib/settings/draftSync';
+  import { initSettings, settings } from './lib/settings/store';
+  // `applySettings` is deliberately NOT imported here: every push of this
+  // window's draft goes through `pushDraft`, which is the gate and the push
+  // in one call (V42 tranche-2 review, T2-6). `draftSync.test.ts` enforces
+  // that — assembling the pair by hand is how one push came to be ungated.
+  import { createDraftSync, pushDraft } from './lib/settings/draftSync';
   import {
     aiToolTabDefaults,
     consumeSettingsDeepLink,
@@ -154,12 +154,11 @@
   // the user just typed, with the next `patch()` then cloning the regressed
   // draft and pushing it wholesale. That is the lost-update race `draftSync`
   // exists to close, and this was the one push in the window not registered
-  // with it. Settling in `.finally` matches `patch()`: the gate must reopen in
-  // either direction, or it wedges shut for the life of the window.
+  // with it — which is why there is no longer a way to write one that is not:
+  // `pushDraft` IS the gate plus the push (T2-6).
   function commitGraphIgnore(): void {
     if (!snapshot) return;
-    const settled = draftSync.beginPush();
-    void applySettings($state.snapshot(snapshot)).finally(settled);
+    void pushDraft(draftSync, $state.snapshot(snapshot));
   }
   // "Add file…" / "Add folder…": native picker → project-relative glob,
   // appended and committed in one step. Cancel (null) changes nothing.
@@ -378,16 +377,16 @@
   // ── MCP tool servers (MCP servers section) ─────────────────────────────
   // V37 Phase D (contract C8): the editor itself is `McpManagementEditor`. What
   // stays here is the persistence seam, because only this file owns `snapshot`
-  // and the awaited `applySettings` the rest of the panel uses.
+  // and the awaited push the rest of the panel uses.
   //
   // Two callbacks, deliberately distinct:
   //
   // * `setMcpRegistry` — the LOCAL snapshot only, no backend write. Text fields
   //   commit on blur rather than per keystroke: persisting per keystroke raced,
-  //   because fire-and-forget `applySettings` calls could complete out of order
+  //   because fire-and-forget pushes could complete out of order
   //   and leave the backend holding a half-typed URL, which the 12s health watch
   //   would then flag as down.
-  // * `applyMcpRegistry` — ONE awaited `settings_update` followed by ONE
+  // * `applyMcpRegistry` — ONE awaited gated push followed by ONE
   //   `offload_reload_mcp` (contract C5's UI half). Awaited in that order so the
   //   reconcile runs against the new config rather than the stale one, and a
   //   category toggle spanning N servers is still exactly one of each.
@@ -402,14 +401,10 @@
   async function applyMcpRegistry(next: McpRegistry): Promise<void> {
     setMcpRegistry(next);
     if (!snapshot) return;
-    // Same lost-update gate as `patch()`: this is a wholesale push too, and a
-    // broadcast landing during the awaits below must not regress the draft.
-    const settled = draftSync.beginPush();
-    try {
-      await applySettings($state.snapshot(snapshot));
-    } finally {
-      settled();
-    }
+    // Same lost-update gate as `patch()` — `pushDraft` carries it — because
+    // this is a wholesale push too, and a broadcast landing during the awaits
+    // below must not regress the draft.
+    await pushDraft(draftSync, $state.snapshot(snapshot));
     await reloadMcpHost();
   }
   // Reconcile the warm host now and fold the fresh status into the health chips.
@@ -879,20 +874,18 @@
   /// Mutate the live snapshot via `updater`, then push to the backend.
   /// Backend's debounced save coalesces rapid calls (slider drags).
   ///
-  /// The push is registered with `draftSync` for as long as it is in flight, so
-  /// a `settings-changed` broadcast that lands mid-burst cannot replace the
-  /// draft with a state that is missing an edit this window just made — the
-  /// lost-update race. The promise is no longer discarded silently: settling it
-  /// is what reopens the gate, in either direction (`applySettings` resolves
-  /// even on a rejected push — it rolls the store back itself — but `finally`
-  /// keeps that from mattering here).
+  /// `pushDraft` registers the push with `draftSync` for as long as it is in
+  /// flight, so a `settings-changed` broadcast that lands mid-burst cannot
+  /// replace the draft with a state that is missing an edit this window just
+  /// made — the lost-update race. It also settles the promise in either
+  /// direction rather than discarding it, which is what reopens the gate; see
+  /// `lib/settings/draftSync.ts` for why those two halves are one call.
   function patch(updater: (s: Settings) => void) {
     if (!snapshot) return;
     const next = structuredClone($state.snapshot(snapshot));
     updater(next);
     snapshot = next;
-    const settled = draftSync.beginPush();
-    void applySettings(next).finally(settled);
+    void pushDraft(draftSync, next);
   }
 
   /// Toggle one AI tab's enabled state. Routes through the dedicated
@@ -1084,8 +1077,8 @@
   /// bring the draft down — which left a window in which the draft still held
   /// the PRE-reset settings: an edit made in that window cloned the stale
   /// draft and pushed it wholesale, resurrecting everything the user had just
-  /// reset. So the draft is assigned here, immediately, and the push is
-  /// registered with `draftSync` like every other one.
+  /// reset. So the draft is assigned here, immediately, and the push goes
+  /// through `pushDraft` like every other one.
   ///
   /// `defaultSettings()` already hands back a fresh deep clone per call, so
   /// the assign-and-push pair aliases one private object exactly as `patch()`
@@ -1103,8 +1096,7 @@
     if (!ok) return;
     const next = defaultSettings();
     snapshot = next;
-    const settled = draftSync.beginPush();
-    void applySettings(next).finally(settled);
+    void pushDraft(draftSync, next);
   }
 
   // ── Code Audit ─────────────────────────────────────────────────────────

@@ -1178,7 +1178,11 @@ mod tests {
     #[test]
     fn each_migrated_capability_is_arbitrated_on_both_sides() {
         const READER: &str = include_str!("claude/read.rs");
-        const LOOPBACK: &str = include_str!("../offload/loopback.rs");
+        // V42 R4 (#115) split the loopback routes across a directory; the push
+        // cores are in `loopback/session.rs` today. The scan takes the whole
+        // surface rather than a file, so a core that moves between families
+        // keeps this assertion instead of silently losing it.
+        let loopback = crate::offload::loopback::ROUTE_SOURCES;
         // (event const name, how the reader spells its guard)
         for (event, konst) in [
             (EV_ASSISTANT_TEXT, "EV_ASSISTANT_TEXT"),
@@ -1190,8 +1194,10 @@ mod tests {
                 "`{event}` migrated but `harness/claude/read.rs` still produces it \
                  unconditionally — that is the double-delivery this phase exists to avoid"
             );
+            let needle =
+                format!("crate::harness::chp::served(agent, tab, crate::harness::chp::{konst})");
             assert!(
-                LOOPBACK.contains(&format!("crate::harness::chp::served(agent, tab, crate::harness::chp::{konst})")),
+                loopback.iter().any(|(_file, src)| src.contains(&needle)),
                 "`{event}`'s push core does not check `chp::served` — it would act on a tab whose \
                  reader is also still producing it"
             );

@@ -2278,14 +2278,17 @@ mod tests {
             !hooks.to_string().contains("terminalSequence"),
             "the overlay must never mention it: {hooks}"
         );
+        // V42 R2 (#114) split the loopback module and R4 (#115) split its route
+        // surface again; the scan follows every file both produced, or the
+        // needle could just move next door.
         for (file, src) in [
             ("harness/claude/hook.rs", include_str!("../harness/claude/hook.rs")),
-            ("offload/loopback.rs", include_str!("../offload/loopback.rs")),
-            // V42 R2 (#114) split the loopback module; the scan follows every
-            // file it produced, or the needle could just move next door.
             ("offload/discovery.rs", include_str!("../offload/discovery.rs")),
             ("offload/latch.rs", include_str!("../offload/latch.rs")),
-        ] {
+        ]
+        .into_iter()
+        .chain(crate::offload::loopback::ROUTE_SOURCES.iter().copied())
+        {
             // The needle is the JSON KEY form, so the prose and the assertions
             // that name the field (including this one) are not false positives —
             // what is forbidden is writing it into an emitted object.

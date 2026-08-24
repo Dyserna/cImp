@@ -1832,9 +1832,13 @@ mod tests {
             gated_by: "loopback /graph_run's gate on LatchRoute::Native",
         },
         DispatchSite {
-            file: "offload/loopback.rs",
-            src: include_str!("loopback.rs"),
-            func: "fn offload_tool_name(",
+            // V42 R4 (#115) split the loopback routes by family; the naming
+            // funnel belongs to `/run`. `fn_body` panics rather than skipping
+            // when the item is not in the file named here, so a later move
+            // fails this scan loudly instead of silently scanning nothing.
+            file: "offload/loopback/run.rs",
+            src: include_str!("loopback/run.rs"),
+            func: "pub(super) fn offload_tool_name(",
             forms: &[Form::EveryLiteral],
             gated_by: "loopback /run's gate on LatchRoute::Native",
         },

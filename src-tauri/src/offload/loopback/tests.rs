@@ -4,8 +4,12 @@
 //!
 //! Many of these are **source-scanning** tests: they `include_str!` the
 //! production file(s) and assert on the text, so that a gate deleted from a
-//! handler fails a test rather than a review. From here the loopback source is
-//! one directory up — `include_str!("../loopback.rs")`.
+//! handler fails a test rather than a review. Since V42 R4 (#115) the route
+//! surface is a DIRECTORY, so they read a list of files — [`ROUTE_SOURCES`],
+//! declared beside the dispatch in `mod.rs` — rather than one `include_str!`.
+//! A scan that kept reading the file a handler used to be in would be green
+//! about code it no longer covers, which for a security assertion is the same
+//! thing as being deleted.
 
 use super::*;
 
@@ -28,6 +32,85 @@ use crate::harness::claude::hook as claude_hook;
 /// V40 Phase C moved the ingress here; the source-scanning tests that read
 /// a handler's body follow it.
 const HOOK_SRC: &str = include_str!("../../harness/claude/hook.rs");
+
+/// **Every file a loopback route handler can live in**, paired with its source.
+///
+/// The route surface ([`super::ROUTE_SOURCES`], one row per family file since
+/// V42 R4 (#115)) plus the Claude plugin's ingress, which V40 Phase C moved
+/// twelve handlers into. The source-scanning tests below take a LIST rather
+/// than a file, so a handler that moves between families keeps its scanners
+/// instead of quietly losing them: a scan that kept reading `mod.rs` after the
+/// routes moved out would be green about code it no longer covers, and for a
+/// security assertion green-about-nothing is the failure mode.
+fn route_surface() -> Vec<(&'static str, &'static str)> {
+    let mut files = ROUTE_SOURCES.to_vec();
+    files.push(("harness/claude/hook.rs", HOOK_SRC));
+    files
+}
+
+/// Whether `line` opens a top-level item whose signature is `sig`, whatever
+/// visibility it wears.
+///
+/// V40 Phase C made moved items `pub(crate)`; V42 R4 (#115) made every item a
+/// family file publishes `pub(super)`. The item is still top-level, which is
+/// the property the column-0 `}` terminator depends on — so the scan reads
+/// through the modifier rather than growing a case per spelling (which is how
+/// a scan comes to silently match nothing).
+fn declares(line: &str, sig: &str) -> bool {
+    if line.starts_with(sig) {
+        // A caller that spells the visibility in `sig` itself (`pub fn
+        // proxy_base_for(`) is pinning THAT too, and must not be read
+        // through.
+        return true;
+    }
+    let rest = match line.strip_prefix("pub") {
+        None => return false,
+        Some(tail) => tail
+            .strip_prefix('(')
+            .and_then(|t| t.split_once(") "))
+            .map(|(_scope, after)| after)
+            .or_else(|| tail.strip_prefix(' '))
+            .unwrap_or(tail),
+    };
+    rest.starts_with(sig)
+}
+
+/// [`fn_body`] over a LIST of files: the one that declares `sig` is found
+/// first, and its body scanned.
+///
+/// **Exactly one file may declare it.** Two copies of a handler is itself the
+/// failure these scans exist to catch, and a scan that read whichever came
+/// first would be pinning one of them while the other ran.
+fn fn_body_in(files: &[(&'static str, &'static str)], sig: &str) -> String {
+    let named: Vec<&'static str> = files
+        .iter()
+        .filter(|(_, src)| src.lines().any(|l| declares(l, sig)))
+        .map(|(file, _)| *file)
+        .collect();
+    assert_eq!(
+        named.len(),
+        1,
+        "`{sig}` is declared in {named:?} — exactly one file in the route surface must"
+    );
+    let src = files
+        .iter()
+        .find(|(file, _)| *file == named[0])
+        .expect("the file just found")
+        .1;
+    fn_body(src, sig)
+}
+
+/// The files in `files` whose source contains `needle`, for the scans whose
+/// assertion is about PRESENCE somewhere in the surface rather than about one
+/// item's body.
+fn files_containing(files: &[(&'static str, &'static str)], needle: &str) -> Vec<&'static str> {
+    files
+        .iter()
+        .filter(|(_, src)| src.contains(needle))
+        .map(|(file, _)| *file)
+        .collect()
+}
+
 
 /// V32 Phase G: the default posture — both feature switches on. Every
 /// pre-Phase-G latch test asserted this implicitly, so it is the value they
@@ -182,22 +265,18 @@ fn a_grant_bearing_route_resolves_one_identity_for_the_grant_and_the_latch() {
 /// split by deriving its latch key from the caller's raw claim.
 #[test]
 fn every_grant_bearing_handler_resolves_through_proxy_identity() {
-    let src = include_str!("../loopback.rs");
     for (handler, route) in [
         ("async fn handle_mcp_list(", "/mcp/list"),
         ("async fn handle_mcp_call(", "/mcp/call"),
         ("async fn handle_run(", "/run"),
         ("async fn handle_graph_run(", "/graph_run"),
     ] {
-        let start = src
-            .find(handler)
-            .unwrap_or_else(|| panic!("`{handler}` still exists"));
-        let rest = &src[start..];
-        // Handler items are the only things at column 0 in this file, so
-        // a newline followed by a column-0 `}` closes this one.
-        let end = rest.find("\n}\n").unwrap_or(rest.len());
+        // V42 R4 (#115): these four are in three different family files
+        // now, so the body is looked up ACROSS the surface rather than by
+        // slicing one — a handler that moved must not fall out of the scan.
+        let body = fn_body_in(ROUTE_SOURCES, handler);
         assert!(
-            rest[..end].contains("proxy_identity("),
+            body.contains("proxy_identity("),
             "{route} must resolve its consumer through `proxy_identity` — the grant \
              and the taint latch have to name one harness (V40 review H-1)"
         );
@@ -927,8 +1006,7 @@ fn a_forged_discovery_report_cannot_claim_a_tab_or_choose_what_the_row_says() {
 fn the_discovery_report_answers_identically_on_every_path() {
     // Half 1: the bytes. One constant, one exit, no branch before it.
     assert_eq!(DISCOVERY_ACK, br#"{"ok":true}"#);
-    let src = include_str!("../loopback.rs");
-    let body = handler_body(src, "handle_discovery_skipped");
+    let body = handler_body("handle_discovery_skipped");
     assert_eq!(
         body.matches("write_").count(),
         1,
@@ -1551,8 +1629,10 @@ fn the_discovery_report_never_reaches_the_hook_shims_path() {
     // The production ledger really is what the route claims: the process-wide
     // doubling map, not a per-call one that would bound nothing. This half is
     // about the APP side of the seam, so it reads the file the handler is in.
+    // V42 R4 (#115) split the route surface again; the scan follows the code
+    // by asking the whole surface which file declares the item.
     assert!(
-        top_level_fn(include_str!("../loopback.rs"), "fn note_discovery_skipped(")
+        fn_body_in(ROUTE_SOURCES, "fn note_discovery_skipped(")
             .contains("claim_discovery_report"),
         "the handler must claim against the process ledger"
     );
@@ -1618,7 +1698,7 @@ fn top_level_fn(src: &str, sig: &str) -> String {
     let mut inside = false;
     for line in src.lines() {
         if !inside {
-            if !line.starts_with(sig) {
+            if !declares(line, sig) {
                 continue;
             }
             inside = true;
@@ -1978,8 +2058,7 @@ fn a_contaminated_tab_is_refused_a_delegation_and_a_clean_one_is_not() {
 /// is about what the handler can do rather than about what one run did.
 #[test]
 fn the_delegate_gate_runs_before_anything_is_driven() {
-    let src = include_str!("../loopback.rs");
-    let body = handler_body(src, "handle_delegate");
+    let body = handler_body("handle_delegate");
     let gate_at = body
         .find("delegate_admit(")
         .expect("handle_delegate must gate");
@@ -2018,8 +2097,7 @@ fn the_delegate_gate_runs_before_anything_is_driven() {
 /// ordering test above does it.
 #[test]
 fn a_facade_run_is_refused_by_offload_tasks_own_gate_before_the_engine() {
-    let src = include_str!("../loopback.rs");
-    let body = handler_body(src, "handle_run");
+    let body = handler_body("handle_run");
     let gate_at = body
         .find("latches().gate(")
         .expect("handle_run must gate — V32 C-1c");
@@ -6868,12 +6946,12 @@ fn clearing_the_bit_does_not_promote_anything_already_quarantined() {
     // in the file it scans.
     // V42 R2 (#114): this module was one file when the scan was written, so it
     // read one. Every file the split produced is read, or the needle could
-    // simply move next door.
-    for (file, src) in [
-        ("offload/loopback.rs", include_str!("../loopback.rs")),
+    // simply move next door. V42 R4 (#115) split the routes themselves, so
+    // the route surface arrives as [`ROUTE_SOURCES`] rather than as a row.
+    for (file, src) in ROUTE_SOURCES.iter().copied().chain([
         ("offload/discovery.rs", include_str!("../discovery.rs")),
         ("offload/latch.rs", include_str!("../latch.rs")),
-    ] {
+    ]) {
         for promotion in [
             concat!("mem_", "promote_note"),
             concat!("mem_", "delete_note"),
@@ -7491,11 +7569,20 @@ const ROUTE_CONTAINMENT: &[RouteRow] = &[
 
 /// Every path the dispatch table routes, sorted and deduped — scanned from
 /// the source because the `match` is not reachable from a test.
-fn dispatched_routes(src: &str) -> Vec<&str> {
-    let mut routes: Vec<&str> = Vec::new();
+///
+/// V42 R4 (#115): every file of the route surface is scanned, not just the
+/// one the `match` is in. Core's arms all live in `loopback/mod.rs` today,
+/// and a route arm is not something a family file may grow — but a scan that
+/// looked in one place could not tell the difference between "there are none"
+/// and "they moved", and this list is what the containment enumeration is
+/// checked against in both directions.
+fn dispatched_routes(files: &[(&'static str, &'static str)]) -> Vec<&'static str> {
+    let mut routes: Vec<&'static str> = Vec::new();
     for marker in ["(\"POST\", \"", "(\"GET\", \""] {
-        for part in src.split(marker).skip(1) {
-            routes.push(part.split('"').next().expect("a closing quote"));
+        for (_file, src) in files {
+            for part in src.split(marker).skip(1) {
+                routes.push(part.split('"').next().expect("a closing quote"));
+            }
         }
     }
     // V40 Phase C, locked decision 15: core's `match` is no longer the whole
@@ -7529,6 +7616,53 @@ fn route_const_named(src: &str, path: &str) -> Option<String> {
     })
 }
 
+/// **The scanners see every file the routes are in.**
+///
+/// [`ROUTE_SOURCES`] is what every source-scanning test below reads, and it is
+/// hand-kept — so the way it goes wrong is a family file added to `mod.rs` and
+/// not to the list: the new routes' handlers would then be scanned by nobody,
+/// with every test green. Joined here at the two real sources, the `mod`
+/// declarations and the list itself, in both directions.
+#[test]
+fn the_source_scanners_read_every_route_file() {
+    let dispatch = include_str!("mod.rs");
+    let mut declared: Vec<String> = dispatch
+        .lines()
+        .filter_map(|l| l.strip_prefix("mod ")?.strip_suffix(';'))
+        .filter(|m| *m != "tests")
+        .map(|m| format!("offload/loopback/{m}.rs"))
+        .collect();
+    // Vacuity guard: an empty scrape would make the comparison below trivially
+    // satisfiable by an empty list, which is the failure this test is about.
+    assert!(
+        declared.len() > 5,
+        "the `mod` scrape found {declared:?} — it is not seeing the declarations"
+    );
+    declared.push("offload/loopback/mod.rs".to_string());
+    declared.sort();
+
+    let mut listed: Vec<String> = ROUTE_SOURCES.iter().map(|(f, _)| f.to_string()).collect();
+    listed.sort();
+    assert_eq!(
+        listed, declared,
+        "a route file is declared but unscanned (or the reverse) — every source \
+         scan below would silently stop covering it"
+    );
+
+    // …and no two rows are the same text: a list of twelve copies of one
+    // `include_str!` would satisfy the join above and scan one file twelve
+    // times.
+    for (a, (file, src)) in ROUTE_SOURCES.iter().enumerate() {
+        for (other, second) in ROUTE_SOURCES.iter().skip(a + 1) {
+            assert_ne!(
+                src, second,
+                "{file} and {other} scan the same text — one of the rows names the \
+                 wrong file"
+            );
+        }
+    }
+}
+
 /// Whether `path` is served by a plugin rather than by core's own `match`.
 fn is_plugin_route(path: &str) -> bool {
     crate::harness::registry::all()
@@ -7543,23 +7677,15 @@ fn is_plugin_route(path: &str) -> bool {
 ///
 /// Starts at the SIGNATURE, so a handler's doc comment is deliberately not
 /// part of it: a route must not be able to claim a gate in prose.
-fn handler_body(src: &str, name: &str) -> String {
+fn handler_body(name: &str) -> String {
     // V40 Phase C: the twelve `handle_claude_*` bodies and the legacy
-    // `--notify-hook` route live in `harness/claude/hook.rs` now. These
-    // scans are about the PROPERTY (one core per capability, the gate in
-    // the route's own body), which the move did not change — so the scanner
-    // follows the code rather than the tests being deleted with it.
-    let src = if fn_body_exists(src, name) { src } else { HOOK_SRC };
-    fn_body(src, &format!("async fn {name}("))
-}
-
-/// Whether `src` declares a top-level `async fn name(` at all — the lookup
-/// [`handler_body`] uses to pick the file, kept separate so a genuinely
-/// missing handler still fails loudly in `fn_body`.
-fn fn_body_exists(src: &str, name: &str) -> bool {
-    let sig = format!("async fn {name}(");
-    src.lines()
-        .any(|l| l.starts_with(&sig) || l.starts_with(&format!("pub(crate) {sig}")))
+    // `--notify-hook` route live in `harness/claude/hook.rs` now, and V42 R4
+    // (#115) spread the rest across `loopback/*.rs`. These scans are about
+    // the PROPERTY (one core per capability, the gate in the route's own
+    // body), which neither move changed — so the scanner takes the whole
+    // surface and follows the code, rather than the tests being deleted with
+    // it or left reading the file it used to be in.
+    fn_body_in(&route_surface(), &format!("async fn {name}("))
 }
 
 /// [`handler_body`] for any top-level item, given its exact opening text —
@@ -7572,9 +7698,11 @@ fn fn_body(src: &str, sig: &str) -> String {
         if !inside {
             // V40 Phase C: a moved item is often `pub(crate)` now, because
             // its one remaining caller is the plugin that used to sit
-            // beside it. The item is still top-level, which is the property
-            // the column-0 `}` terminator depends on.
-            if !line.starts_with(sig) && !line.starts_with(&format!("pub(crate) {sig}")) {
+            // beside it; V42 R4 (#115) made a family file's items
+            // `pub(super)`. The item is still top-level, which is the
+            // property the column-0 `}` terminator depends on — see
+            // [`declares`].
+            if !declares(line, sig) {
                 continue;
             }
             inside = true;
@@ -7614,13 +7742,17 @@ fn fn_body(src: &str, sig: &str) -> String {
 ///    `hook_post_edit` to TRUSTED therefore fails here.
 #[test]
 fn every_loopback_route_declares_what_it_does_about_the_latch() {
-    let src = include_str!("../loopback.rs");
+    // V42 R4 (#115): the dispatch `match` is core's and stays in
+    // `loopback/mod.rs`, but the handlers it names are spread across the
+    // family files — so the two halves of this test read different things:
+    // the ARM from the dispatch, the BODY from whichever family declares it.
+    let dispatch = include_str!("mod.rs");
 
     // 1. Surface ↔ declaration, both directions.
     let mut declared: Vec<&str> = ROUTE_CONTAINMENT.iter().map(|r| r.path).collect();
     declared.sort_unstable();
     assert_eq!(
-        dispatched_routes(src),
+        dispatched_routes(ROUTE_SOURCES),
         declared,
         "a route is dispatched but undeclared (or the reverse)"
     );
@@ -7645,12 +7777,12 @@ fn every_loopback_route_declares_what_it_does_about_the_latch() {
             );
         } else {
             let arm = format!("(\"{}\", \"{}\") =>", row.method, row.path);
-            let arm_at = src
+            let arm_at = dispatch
                 .find(&arm)
                 .unwrap_or_else(|| panic!("no dispatch arm for {}", row.path));
             if !row.handler.is_empty() {
                 assert!(
-                    src[arm_at..].starts_with(&format!("{arm} {}(", row.handler)),
+                    dispatch[arm_at..].starts_with(&format!("{arm} {}(", row.handler)),
                     "{} does not dispatch to `{}`",
                     row.path,
                     row.handler
@@ -7667,7 +7799,7 @@ fn every_loopback_route_declares_what_it_does_about_the_latch() {
             );
             continue;
         }
-        let body = handler_body(src, row.handler);
+        let body = handler_body(row.handler);
         // V40 Phase C: a plugin route reaches the registry through the
         // narrow facades (`hook_gate_admits`, `latch_beacon_for`), because
         // `LatchRegistry` is private to this module and a harness may not
@@ -8052,8 +8184,7 @@ fn post_edit_runs_only_in_a_directory_this_instance_serves() {
 /// route to grow its own directory resolution without failing here.
 #[test]
 fn post_edit_takes_its_working_directory_from_the_app_not_from_the_body() {
-    let src = include_str!("../loopback.rs");
-    let body = fn_body(src, "async fn post_edit_diagnostics(");
+    let body = fn_body_in(ROUTE_SOURCES, "async fn post_edit_diagnostics(");
     assert!(
         body.contains("admitted_hook_root(&hook_exec_roots(app, settings), body.cwd.as_deref())"),
         "the route must resolve its cwd through the C4 allowlist: {body}"
@@ -8064,14 +8195,20 @@ fn post_edit_takes_its_working_directory_from_the_app_not_from_the_body() {
     );
     for handler in ["handle_post_edit", "handle_claude_post_tool_use"] {
         assert!(
-            handler_body(src, handler).contains("post_edit_diagnostics("),
+            handler_body(handler).contains("post_edit_diagnostics("),
             "{handler} must run the checks through the one admitted-root core"
         );
     }
-    assert!(
-        src.contains(
+    // The signature is looked for across the whole route surface: V42 R4
+    // (#115) moved it to `loopback/context.rs`, and a scan pinned to one file
+    // would have started asserting nothing the moment it did.
+    assert_eq!(
+        files_containing(
+            ROUTE_SOURCES,
             "fn hook_exec_roots(app: &AppHandle, settings: &crate::settings::Settings) -> Vec<PathBuf>"
-        ),
+        )
+        .len(),
+        1,
         "the roots must derive from the app and the settings, never from a request body"
     );
 }
@@ -8413,7 +8550,6 @@ fn pre_48_hook_bodies_still_parse_without_tab_or_agent() {
 /// is how two paths silently diverge while every unit test stays green.
 #[test]
 fn both_transports_of_a_capability_call_one_core() {
-    let src = include_str!("../loopback.rs");
     for (core, handlers) in [
         (
             "context_retrieve_core(",
@@ -8467,7 +8603,7 @@ fn both_transports_of_a_capability_call_one_core() {
     ] {
         for h in handlers {
             assert!(
-                handler_body(src, h).contains(core),
+                handler_body(h).contains(core),
                 "`{h}` must reach `{core}` — the two transports of one capability may not \
                  grow separate implementations"
             );
@@ -8482,7 +8618,7 @@ fn both_transports_of_a_capability_call_one_core() {
         "handle_claude_post_tool_use",
     ] {
         assert!(
-            handler_body(src, h).contains("if !hook_gate_admits("),
+            handler_body(h).contains("if !hook_gate_admits("),
             "`{h}` must gate in its own body"
         );
     }
@@ -8630,7 +8766,7 @@ fn an_injection_reply_keeps_its_locked_order_and_skips_empties() {
 /// an absence has no call to observe.
 #[test]
 fn a_failed_tool_result_is_counted_but_never_reaches_provenance() {
-    let body = handler_body(HOOK_SRC, "handle_claude_tool_failure");
+    let body = handler_body("handle_claude_tool_failure");
     assert!(
         body.contains("tool_result_core("),
         "the failure half must feed the same accounting as the success half"
@@ -8658,7 +8794,6 @@ fn a_failed_tool_result_is_counted_but_never_reaches_provenance() {
 /// still 200 and simply stop being attributed to a tab.
 #[test]
 fn the_cimp_headers_are_read_under_the_names_the_overlay_emits() {
-    let src = include_str!("../loopback.rs");
     for name in [
         claude_hook::HEADER_TAB,
         claude_hook::HEADER_AGENT,
@@ -8666,8 +8801,11 @@ fn the_cimp_headers_are_read_under_the_names_the_overlay_emits() {
         claude_hook::HEADER_HELLO,
     ] {
         let lower = name.to_ascii_lowercase();
+        // `read_request` is in `loopback/mod.rs`, but the property is that
+        // SOMETHING in the surface reads the header — asked of the whole
+        // list so the answer cannot become "nothing does" by relocation.
         assert!(
-            src.contains(&format!("\"{lower}\" =>")),
+            !files_containing(ROUTE_SOURCES, &format!("\"{lower}\" =>")).is_empty(),
             "`{name}` is emitted but `read_request` never matches `{lower}`"
         );
     }
@@ -8689,8 +8827,7 @@ fn no_http_route_can_reach_a_contamination_clear() {
     //    [`ROUTE_CONTAINMENT`], which is the same enumeration answering one
     //    more question per route (does it gate?). ONE list, so a new route
     //    cannot satisfy one enumeration and be missing from the other.
-    let src = include_str!("../loopback.rs");
-    let routes = dispatched_routes(src);
+    let routes = dispatched_routes(ROUTE_SOURCES);
     let declared: Vec<&str> = {
         let mut v: Vec<&str> = ROUTE_CONTAINMENT.iter().map(|r| r.path).collect();
         v.sort_unstable();
@@ -8722,16 +8859,25 @@ fn no_http_route_can_reach_a_contamination_clear() {
     // point in the module that has it, and none in the module that answers
     // HTTP. The door-shaped needles are scanned over both for the same reason
     // — a parse-from-body added on either side is the same door.
+    //
+    // V42 R4 (#115) split the routes across `loopback/*.rs`; both counts are
+    // taken over EVERY file of the surface, or the door could be cut into a
+    // family file with this test still counting one.
     let latch_src = include_str!("../latch.rs");
+    let surface: Vec<(&str, &str)> = ROUTE_SOURCES
+        .iter()
+        .copied()
+        .chain([("offload/latch.rs", latch_src)])
+        .collect();
     assert_eq!(
-        src.matches(concat!("pub fn ", "apply_latch_override")).count()
-            + latch_src
-                .matches(concat!("pub fn ", "apply_latch_override"))
-                .count(),
+        surface
+            .iter()
+            .map(|(_, text)| text.matches(concat!("pub fn ", "apply_latch_override")).count())
+            .sum::<usize>(),
         1,
         "one entry point, or the doc's claim is unverifiable"
     );
-    for (file, text) in [("offload/loopback.rs", src), ("offload/latch.rs", latch_src)] {
+    for (file, text) in surface {
         assert!(
             !text.contains(concat!("LatchOverride::", "parse(&body"))
                 && !text.contains(concat!("LatchOverride::", "parse(body")),

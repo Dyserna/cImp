@@ -355,7 +355,6 @@ mod tests {
     use super::*;
     use crate::rustsrc::{code_of, test_regions};
     use std::collections::BTreeMap;
-    use std::path::{Path, PathBuf};
 
     // ── the scanner ────────────────────────────────────────────────────────
     //
@@ -551,48 +550,6 @@ mod tests {
         .collect()
     }
 
-    /// Every `.rs` file under `src/`, as `(slash path, contents)` — the
-    /// EXHAUSTIVE half. `include_str!` can only name files someone remembered;
-    /// a brand-new module that spawns something is exactly what nobody
-    /// remembers, so the ledger's completeness claim has to come from a walk.
-    /// Resolved from the manifest, not the cwd, so it answers the same from any
-    /// working directory (the `graph::index::notes` pattern).
-    fn source_files() -> Vec<(String, String)> {
-        fn walk(dir: &Path, root: &Path, out: &mut Vec<(String, String)>) {
-            let entries = std::fs::read_dir(dir)
-                .unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()));
-            for e in entries.flatten() {
-                let p = e.path();
-                let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
-                if name.starts_with('.') {
-                    continue;
-                }
-                if p.is_dir() {
-                    walk(&p, root, out);
-                } else if p.extension().is_some_and(|x| x == "rs") {
-                    let text = std::fs::read_to_string(&p)
-                        .unwrap_or_else(|e| panic!("cannot read {}: {e}", p.display()));
-                    let rel = p
-                        .strip_prefix(root)
-                        .unwrap_or(&p)
-                        .to_string_lossy()
-                        .replace('\\', "/");
-                    out.push((rel, text));
-                }
-            }
-        }
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut out = Vec::new();
-        walk(&root, &root, &mut out);
-        assert!(
-            out.len() > 100,
-            "the source walk found only {} files — a broken walk finds no unledgered spawn \
-             and passes, which is the one outcome this tripwire may never have",
-            out.len()
-        );
-        out
-    }
-
     // ── the tripwire ───────────────────────────────────────────────────────
 
     /// V33 C1 — every external-process spawn in the crate is in [`ledger`],
@@ -617,8 +574,14 @@ mod tests {
             ),
         }
 
-        // 2. filesystem view — the WHOLE tree.
-        let all = source_files();
+        // 2. filesystem view — the WHOLE tree. `include_str!` can only name
+        //    files somebody remembered, and a brand-new module that spawns
+        //    something is exactly what nobody remembers, so the ledger's
+        //    completeness claim has to come from a walk. That walk is
+        //    `rustsrc::source_files` — audited once for every scanner that
+        //    gates on it (R11), and resolved from the manifest rather than the
+        //    cwd so it answers the same from any working directory.
+        let all = crate::rustsrc::source_files();
         match audit_against(&all, &expected) {
             Ok(n) => assert!(n > 0, "the tree walk counted zero spawns"),
             Err(problems) => panic!(

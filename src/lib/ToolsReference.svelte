@@ -4,16 +4,15 @@
   // sized to fill the hosting section (the list scrolls internally). Reused
   // by the Tool Activity tab's reference sections.
 
-  interface ToolRef {
-    name: string;
-    desc: string;
-    example: string;
-  }
+  // The row shape is GENERATED with the lists themselves (V42 F6, #131) — it
+  // used to be re-declared here, which is a three-field hand mirror of the
+  // same kind the generation exists to delete.
+  import type { ToolRef } from './generated/tools';
   let {
     title = 'Tools',
     tools,
     note = '',
-  }: { title?: string; tools: ToolRef[]; note?: string } = $props();
+  }: { title?: string; tools: readonly ToolRef[]; note?: string } = $props();
 </script>
 
 <div class="tools-ref">

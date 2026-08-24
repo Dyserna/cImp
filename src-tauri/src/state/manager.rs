@@ -1263,7 +1263,7 @@ impl Loop {
     /// one-line `emit_*` forwards this replaced differed only in which variant
     /// they built, which the call sites now say for themselves.
     fn emit(&self, event: StateEvent) {
-        if let Err(e) = self.app.emit("avatar-state", &event) {
+        if let Err(e) = self.app.emit(crate::service::events::AVATAR_STATE, &event) {
             warn!(error = %e, "failed to emit avatar-state");
         }
         let _ = self.events.send(event);
@@ -1272,7 +1272,7 @@ impl Loop {
     /// The error channel is a separate Tauri event with no broadcast half — the
     /// one emit that is not a [`StateEvent`].
     fn emit_error(&self, info: &ErrorInfo) {
-        if let Err(e) = self.app.emit("avatar-error", info) {
+        if let Err(e) = self.app.emit(crate::service::events::AVATAR_ERROR, info) {
             warn!(error = %e, "failed to emit avatar-error");
         }
     }

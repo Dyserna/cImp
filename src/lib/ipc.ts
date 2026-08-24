@@ -1,5 +1,6 @@
 import { invoke, Channel } from '@tauri-apps/api/core';
-import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import { type UnlistenFn } from '@tauri-apps/api/event';
+import { listenEvent, PTY_EXIT } from './events';
 import type { TabId, TabKind } from './tabs/types';
 import type { DelegationRole, InFlightView, RoleChange } from './delegation';
 import type { DelegationBackend } from './settings/types';
@@ -601,7 +602,7 @@ export interface PtyExitPayload {
 }
 
 export function onPtyExit(handler: (payload: PtyExitPayload) => void): Promise<UnlistenFn> {
-  return listen<PtyExitPayload>('pty-exit', (event) => handler(event.payload));
+  return listenEvent(PTY_EXIT, (event) => handler(event.payload));
 }
 
 export function decodeBase64(b64: string): Uint8Array {

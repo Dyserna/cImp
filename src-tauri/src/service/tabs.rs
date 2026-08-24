@@ -1367,7 +1367,11 @@ impl<'a> TabService<'a> {
 const MAIN_WINDOW: &str = "main";
 
 /// The event a Terminal component listens for to re-run its own `pty_restart`.
-const TAB_RESTART_REQUESTED: &str = "tab-restart-requested";
+///
+/// V42 F6 (#131): DEFINED FROM `service::events`, so the string is spelled
+/// exactly once in the crate. The alias stays because this name is what the
+/// module's own callers and tests read.
+const TAB_RESTART_REQUESTED: &str = crate::service::events::TAB_RESTART_REQUESTED;
 
 /// Ask the main window to restart a tab's PTY.
 ///

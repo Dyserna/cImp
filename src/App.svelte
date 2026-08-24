@@ -2,7 +2,7 @@
   import { onMount } from 'svelte';
   import { get } from 'svelte/store';
   import { getCurrentWindow } from '@tauri-apps/api/window';
-  import { listen } from '@tauri-apps/api/event';
+  import { listenEvent, AI_TAB_RESTART_HINT } from './lib/events';
   import LayoutNodeRenderer from './lib/LayoutNodeRenderer.svelte';
   import StatusBar from './lib/StatusBar.svelte';
   import TuiTitleBar from './lib/TuiTitleBar.svelte';
@@ -226,7 +226,7 @@
       // V40 Phase F: the payload carries harness ids and the registry names
       // them, so a harness this build learned about over IPC is named properly
       // instead of falling through to its bare id (locked decision 7).
-      void listen<string[]>('ai-tab-restart-hint', (e) => {
+      void listenEvent(AI_TAB_RESTART_HINT, (e) => {
         const names = (e.payload ?? []).map((c) => harnessLabel(c)).join(' and ');
         if (!names) return;
         showToast(

@@ -42,7 +42,11 @@ use crate::settings::{SettingsHandle, TabConfig};
 /// Tauri event name for the frontend's fs-batch subscription (§0.3). Payload
 /// is [`FsBatch`]. Emitted only while `settings.workbench.enabled` — see
 /// [`WorkbenchService::publish_fs_batch`].
-pub const FS_BATCH_EVENT: &str = "fs-batch";
+///
+/// V42 F6 (#131): DEFINED FROM `service::events`, so the string is spelled
+/// exactly once in the crate. The alias stays because this name is what the
+/// module's own callers and tests read.
+pub const FS_BATCH_EVENT: &str = crate::service::events::FS_BATCH;
 
 /// Hard cap on how many paths one `fs-batch` event/broadcast carries. A
 /// coalesced watcher batch from a large checkout/format pass can be huge;

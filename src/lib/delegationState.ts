@@ -8,16 +8,12 @@
 // calling into `delegation.ts`.
 
 import { get, readable, writable, type Readable, type Writable } from 'svelte/store';
-import { listen } from '@tauri-apps/api/event';
+import { listenEvent, DELEGATION_CHANGED } from './events';
 import { delegationStatuses } from './ipc';
-import { writeLocalEcho, type DelegationChanged, type InFlightView } from './delegation';
+import { writeLocalEcho, type InFlightView } from './delegation';
 import { setPromptRelaxedTabs } from './delegationPrompt';
 import { getTerminal } from './terminals';
 import type { TabId } from './tabs/types';
-
-/// The Tauri event the backend publishes on every delegation edge. Spelled
-/// verbatim from Rust's `delegation::engine::EVENT_DELEGATION_CHANGED`.
-const EVENT_DELEGATION_CHANGED = 'delegation-changed';
 
 /// Every in-flight delegation, keyed by WORKER tab id.
 ///
@@ -96,7 +92,7 @@ export async function initDelegation(): Promise<void> {
   initialized = true;
   let gotEvent = false;
   try {
-    await listen<DelegationChanged>(EVENT_DELEGATION_CHANGED, (e) => {
+    await listenEvent(DELEGATION_CHANGED, (e) => {
       gotEvent = true;
       apply(e.payload?.in_flight ?? []);
     });

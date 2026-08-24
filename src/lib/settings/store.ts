@@ -5,7 +5,7 @@
 // in the other (and persisted to disk by the backend's debounced saver).
 
 import { writable, derived, get, type Readable } from 'svelte/store';
-import { listen } from '@tauri-apps/api/event';
+import { listenEvent, SETTINGS_CHANGED } from '../events';
 import { settingsGet, settingsUpdate } from './ipc';
 import { defaultSettings, type Settings } from './types';
 
@@ -25,7 +25,7 @@ export function initSettings(): Promise<void> {
     // prevents the (possibly older) get snapshot from clobbering a newer event
     // value that already arrived.
     let gotEvent = false;
-    await listen<Settings>('settings-changed', (event) => {
+    await listenEvent(SETTINGS_CHANGED, (event) => {
       gotEvent = true;
       settings.set(event.payload);
     });

@@ -97,7 +97,11 @@ numbering, no preamble, no blank lines.";
 /// Tauri event carrying a [`GraphStatus`] snapshot whenever a root's build
 /// state changes (queued → building → ready/error). The Phase-I monitor tab
 /// subscribes to this; for now it's also handy for debugging.
-pub const GRAPH_STATUS_EVENT: &str = "graph-status";
+///
+/// V42 F6 (#131): DEFINED FROM `service::events`, so the string is spelled
+/// exactly once in the crate. The alias stays because this name is what the
+/// module's own callers and tests read.
+pub const GRAPH_STATUS_EVENT: &str = crate::service::events::GRAPH_STATUS;
 
 /// One project root's live indexing state, serialized to the frontend.
 #[derive(Clone, Debug, serde::Serialize)]
@@ -2652,7 +2656,7 @@ impl GraphService {
                 "dead_exports": dead,
                 "import_cycles": cycles,
             });
-            let _ = self.events.emit("graph-analyses", &payload);
+            let _ = self.events.emit(crate::service::events::GRAPH_ANALYSES, &payload);
         }
     }
 

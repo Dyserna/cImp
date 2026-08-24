@@ -535,7 +535,7 @@ impl OffloadSupervisor {
 
     async fn set_state(&self, new: OffloadState) {
         *self.state.write().await = new.clone();
-        if let Err(e) = self.core.events.emit("offload-state", &new) {
+        if let Err(e) = self.core.events.emit(crate::service::events::OFFLOAD_STATE, &new) {
             warn!(error = %e, "offload: emit offload-state failed");
         }
     }
@@ -1228,7 +1228,7 @@ async fn log_stream<R>(
         }
         // Push live to the read-only panel (best-effort).
         let _ = events.emit(
-            "offload-server-output",
+            crate::service::events::OFFLOAD_SERVER_OUTPUT,
             &ServerLogLine {
                 backend: backend.clone(),
                 line,

@@ -36,7 +36,11 @@ use super::runnable::{AuditParser, RunnableAudit, ToolKey};
 
 /// Tauri event emitted on every per-tool transition, carrying a (findings-
 /// capped) [`AuditSnapshot`]. Phase C subscribes to this.
-pub const AUDIT_STATUS_EVENT: &str = "audit-status";
+///
+/// V42 F6 (#131): DEFINED FROM `service::events`, so the string is spelled
+/// exactly once in the crate. The alias stays because this name is what the
+/// module's own callers and tests read.
+pub const AUDIT_STATUS_EVENT: &str = crate::service::events::AUDIT_STATUS;
 
 /// Per-tool captured-output cap. SARIF for a large scan is sizable but bounded;
 /// 16 MiB is generous headroom without letting a runaway tool exhaust memory.

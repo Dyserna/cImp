@@ -46,3 +46,8 @@ src-tauri/fixtures/** text eol=lf
 # to be the bytes a Linux runner regenerates: no eol translation in either
 # direction. (ts-rs and the defaults writer both emit LF.)
 src/lib/settings/generated/** -text
+
+# V42 F6 (#131): `src/lib/generated/` is written by `service::codegen` (the
+# Tauri event names and the Tools tab reference lists) and diffed by the same
+# CI step as the directory above, for the same reason and with the same rule.
+src/lib/generated/** -text

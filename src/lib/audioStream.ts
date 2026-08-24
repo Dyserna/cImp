@@ -1,4 +1,4 @@
-import { listen } from '@tauri-apps/api/event';
+import { listenEvent, AUDIO_AMPLITUDE, MIC_AMPLITUDE } from './events';
 
 // Mutable ref rather than a Svelte store: the visualizer reads this from
 // requestAnimationFrame at display rate, and stores would force a reactive
@@ -42,7 +42,7 @@ let started = false;
 export function startAmplitudeListener(): void {
   if (started) return;
   started = true;
-  listen<number[]>('audio-amplitude', (event) => {
+  listenEvent(AUDIO_AMPLITUDE, (event) => {
     latestSamples.current = new Float32Array(event.payload);
     latestSamples.seq++;
     notifySamples();
@@ -65,7 +65,7 @@ let micStarted = false;
 export function startMicAmplitudeListener(): void {
   if (micStarted) return;
   micStarted = true;
-  listen<number[]>('mic-amplitude', (event) => {
+  listenEvent(MIC_AMPLITUDE, (event) => {
     latestSamples.current = new Float32Array(event.payload);
     latestSamples.seq++;
     notifySamples();

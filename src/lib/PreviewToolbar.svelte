@@ -18,7 +18,8 @@
   // backend webview so a re-mount calls `previewShow` instead of
   // `previewOpen`.
   import { onMount } from 'svelte';
-  import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+  import { type UnlistenFn } from '@tauri-apps/api/event';
+  import { listenEvent, FS_BATCH } from './events';
   import {
     previewCapture,
     previewClose,
@@ -94,7 +95,7 @@
     unlistenFsBatch?.();
     unlistenFsBatch = null;
     if (!autoReload) return;
-    void listen('fs-batch', () => {
+    void listenEvent(FS_BATCH, () => {
       if (reloadDebounce) clearTimeout(reloadDebounce);
       // ~1s quiet period following a batch, per the milestone's Phase F4 —
       // only fires while this component is mounted, which (per the

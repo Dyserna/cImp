@@ -27,50 +27,14 @@
   import { graphReveal } from './graphReveal';
   import SectionNav from './SectionNav.svelte';
   import { loadViewSection } from './viewSection';
-
-  // Reference list of the graph_* MCP tools the code graph exposes to AI tabs
-  // (and the offload worker) while the graph is enabled. Mirrors the
-  // descriptions in `src-tauri/src/graph/mcp.rs::tool_specs`; kept here as
-  // static docs (moved from CodeIntelligenceView).
-  const GRAPH_TOOLS = [
-    { name: 'graph_find_symbol', desc: 'Where a symbol (function/struct/trait/…) is defined — file, line, kind. Never source text (V32 H-1); pair with graph_snippet for the body.', example: 'Where is GraphService defined?' },
-    { name: 'graph_callers', desc: 'Which functions call the given symbol (its call sites). Impact analysis.', example: 'What calls graphRebuild?' },
-    { name: 'graph_callees', desc: 'Which symbols are called by the given symbol.', example: 'What does handle_call call?' },
-    { name: 'graph_references', desc: 'Every reference (use site) of a name — file, line, column.', example: 'Find all references to ToolDef.' },
-    { name: 'graph_imports', desc: 'The modules/paths a file imports.', example: 'What does src/offload/mcp.rs import?' },
-    { name: 'graph_outline', desc: 'Every definition in a file, in source order (a structural outline).', example: 'Outline BackendDashboardCard.svelte.' },
-    { name: 'graph_snippet', desc: "Fetch just one definition's body (by symbol, or file+line) instead of reading the whole file. Pair with graph_outline for big files.", example: 'Show the body of dispatch_recorded.' },
-    { name: 'graph_repo_map', desc: 'A budget-bounded map of the most call-central files with their top signatures — orient fast at the start of a task.', example: 'Give me a project map.' },
-    { name: 'graph_transitive', desc: 'Transitive call chain for a symbol — everything it reaches (callees) or that reaches it (callers).', example: 'What does runOffloadTest transitively call?' },
-    { name: 'graph_search_docs', desc: 'Keyword search over docs and doc-comments; returns matching snippets.', example: "Search the docs for 'warm pool'." },
-    { name: 'graph_struct_search', desc: 'Find code by AST shape via a tree-sitter query (not text).', example: 'Find every .unwrap() in the Rust code.' },
-    { name: 'graph_path', desc: 'Shortest path between two code entities through call/import/containment edges — how does X reach Y. Each hop shows its edge kind and confidence; says so plainly when there is no path instead of inventing one.', example: 'How does the auth handler reach the connection pool?' },
-    { name: 'graph_architecture', desc: 'A once-per-project map of the system’s shape: god nodes (the highest-degree hubs everything flows through), subsystems (cohesive file communities), and surprising connections (candidate accidental coupling). Topology only; clustering is heuristic, so treat subsystem boundaries as advisory.', example: 'What does this codebase look like architecturally?' },
-    { name: 'graph_semantic_docs', desc: 'Meaning-based (embedding) search over docs — only when Semantic search is enabled.', example: 'Find docs about how offload timeouts are handled.' },
-    { name: 'graph_semantic_code', desc: 'Meaning-based (embedding) search over symbol bodies — only when "Embed code bodies" is enabled. Returns file:line/kind/signature/distance, never the body; pair with graph_snippet.', example: 'Find code that retries a failed network request.' },
-    { name: 'graph_dead_exports', desc: 'Candidate unused public symbols (no reference, no inbound call). Candidates only — may include false positives.', example: 'List candidate dead exports.' },
-    { name: 'graph_cycles', desc: 'Import cycles between files (loops of files that import one another).', example: 'Are there any import cycles?' },
-    { name: 'graph_impact', desc: 'Blast radius: what could this change break? Defaults to the working-tree diff vs HEAD; pass symbols to analyze specific names instead. include_tests appends an affected-tests block. Results are approximate (name-keyed).', example: 'What would break if I change GraphIndex::dependents_transitive?' },
-    { name: 'graph_tests_for', desc: 'Which tests (candidates) would exercise a symbol or file if it changed — the transitive dependents tagged as tests. Candidates only — dynamic dispatch/fixtures aren\'t captured.', example: 'What tests cover dependents_transitive?' },
-    { name: 'graph_recent_changes', desc: "What's been happening lately — files ranked by git churn (touch count, then recency) with their last commit subject. File-level, 90-day window. Unavailable outside a git repo.", example: 'What files have changed most recently?' },
-    { name: 'context_recall', desc: "Recall this session's working set — the files it read/edited/queried and the symbols touched.", example: 'What has this session been working on?' },
-    { name: 'context_note', desc: 'Remember a non-obvious decision/fact for this project (pin to keep it across sessions).', example: 'Note: we chose FNV hashing for stability.' },
-    { name: 'context_notes', desc: "List this session's notes plus every pinned note for the project.", example: 'Show my remembered notes.' },
-  ];
-
-  // Reference list of the tools the offload feature provides. `offload_task`
-  // is the MCP tool an AI tab calls to delegate; read_file / code_search /
-  // run_command are the native tools the local worker uses to complete the
-  // task (toggle them in Settings → Offload task tools → Tools). Static docs (moved from
-  // OffloadServerView).
-  const OFFLOAD_TOOLS = [
-    { name: 'offload_task', desc: 'Delegate a token-heavy subtask to the local model and get back only the synthesized result — conserving the main session’s context.', example: 'Offload: summarize every TODO/FIXME across the repo and group them by theme.' },
-    { name: 'read_file', desc: 'Worker reads a file (within the configured allowed roots).', example: 'Read src/offload/openai.rs, lines 1–200.' },
-    { name: 'list_dir', desc: 'Worker enumerates a directory — the ground-truth answer to what files exist / how many.', example: 'List the top-level *.md files in docs/.' },
-    { name: 'code_search', desc: 'Worker searches the codebase with ripgrep.', example: 'Search the repo for predicted_per_second.' },
-    { name: 'run_command', desc: 'Worker runs an allowlisted, read-only command.', example: 'Run git log --oneline -20.' },
-    { name: 'run_check', desc: "Worker runs one of the project's configured checks (build/typecheck/lint/test) to verify a claim before stating it. Inert until checks are configured.", example: 'Does the test suite pass? Prove it with run_check.' },
-  ];
+  // The two reference lists are GENERATED (V42 F6, #131) from
+  // `src-tauri/src/service/toolref.rs`, whose tests pin the SET of names to the
+  // real tool tables in both directions. They used to be two hand-written arrays
+  // right here, mirroring `graph::mcp::tools::tool_specs` and the offload tool
+  // defs by eye; the mirror drifted (#113, D1 — three graph tools missing) and
+  // nothing noticed. Add a tool on the Rust side and the suite tells you to
+  // write its user-facing line.
+  import { GRAPH_TOOLS, OFFLOAD_TOOLS } from './generated/tools';
 
   type Section =
     | 'graph-tools'
@@ -158,7 +122,7 @@
     <ToolsReference
       title="Offload tools"
       tools={OFFLOAD_TOOLS}
-      note="offload_task is the tool an AI tab calls to delegate; the rest are the tools the local worker uses to complete the task."
+      note="offload_task and offload_batch are the tools an AI tab calls to delegate; the rest are the tools the local worker uses to complete the task."
     />
   {:else if section === 'offload-server'}
     <!-- The live backend dashboard (event-driven, remount-cheap), in normal

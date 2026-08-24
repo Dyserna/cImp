@@ -29,7 +29,11 @@
     pluginsSnapshot,
     requestTabRestart,
   } from './lib/settings/ipc';
-  import { listen } from '@tauri-apps/api/event';
+  import {
+    listenEvent,
+    AI_TAB_RESTART_HINT,
+    SETTINGS_DEEP_LINK,
+  } from './lib/events';
   import type {
     AiToolTabConfig,
     AuditDetectResult,
@@ -859,8 +863,8 @@
     // disposed between the await and now, tear the listener down
     // immediately rather than storing it where onDestroy can no longer
     // reach it.
-    const deepLinkUnlisten = await listen<{ kind: string; tab_id?: string; section?: string }>(
-      'settings-deep-link',
+    const deepLinkUnlisten = await listenEvent(
+      SETTINGS_DEEP_LINK,
       (e) => {
         if (e.payload.kind === 'tab' && e.payload.tab_id) {
           scrollToTabSection(e.payload.tab_id);
@@ -880,7 +884,7 @@
     // standing HERE when they flip the switch that raised it. Rendered as the
     // per-tab restart hint the Tabs section already has, so the affordance the
     // hint points at (a Restart button) is the same one it appears beside.
-    const restartHintUnlisten = await listen<string[]>('ai-tab-restart-hint', (e) => {
+    const restartHintUnlisten = await listenEvent(AI_TAB_RESTART_HINT, (e) => {
       const tabs = new Set(spawnStaleTabs);
       for (const c of e.payload ?? []) for (const t of consumerTabs(c)) tabs.add(t);
       spawnStaleTabs = [...tabs];

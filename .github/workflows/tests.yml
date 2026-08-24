@@ -152,7 +152,13 @@ jobs:
         # `--locked` so CI tests the committed Cargo.lock resolution.
         run: cargo test --locked --bin cimp
 
-      # V42 Phase E — the settings types and defaults are GENERATED.
+      # V42 Phase E + F6 (#131) — TWO generated directories.
+      #
+      # `src/lib/generated/` is the F6 pair: `service::codegen` writes the Tauri
+      # event names (from `service::events`) and the Tools tab reference lists
+      # (from `service::toolref`). Same contract as the settings bindings below,
+      # same `.gitattributes` `-text` rule, so one step gates both.
+      #
       # `settings::codegen` writes src/lib/settings/generated/{settings.ts,
       # defaults.json} during the `cargo test` above, from
       # src-tauri/src/settings/schema.rs via ts-rs. Both are committed, and the
@@ -177,14 +183,14 @@ jobs:
       # `git diff` cannot answer, and it is deliberately run WITHOUT
       # `--exclude-standard` so a `.gitignore` entry cannot hide the very file
       # this step exists to notice.
-      - name: Generated settings bindings are up to date
+      - name: Generated bindings are up to date
         run: |
-          git diff --exit-code -- src/lib/settings/generated
+          git diff --exit-code -- src/lib/settings/generated src/lib/generated
           if ($LASTEXITCODE -ne 0) {
-            Write-Host "::error::the committed settings bindings differ from what the suite just generated — run cargo test and commit src/lib/settings/generated."
+            Write-Host "::error::the committed generated bindings differ from what the suite just generated — run cargo test and commit src/lib/settings/generated + src/lib/generated."
             exit $LASTEXITCODE
           }
-          $untracked = @(git ls-files --others -- src/lib/settings/generated)
+          $untracked = @(git ls-files --others -- src/lib/settings/generated src/lib/generated)
           if ($untracked.Count -gt 0) {
             Write-Host "::error::the generator wrote files that are not committed:"
             $untracked | ForEach-Object { Write-Host "  $_" }
@@ -471,15 +477,15 @@ jobs:
       # platform-dependent generator: a line ending, a path separator in a
       # `#[ts(type = "import('…')")]` seam, or a HashMap iteration order that
       # happens to be stable on one OS.
-      - name: Generated settings bindings are up to date
+      - name: Generated bindings are up to date
         shell: bash
         run: |
           set -e
-          if ! git diff --exit-code -- src/lib/settings/generated; then
-            echo "::error::the committed settings bindings differ from what the suite just generated — run cargo test and commit src/lib/settings/generated."
+          if ! git diff --exit-code -- src/lib/settings/generated src/lib/generated; then
+            echo "::error::the committed generated bindings differ from what the suite just generated — run cargo test and commit src/lib/settings/generated + src/lib/generated."
             exit 1
           fi
-          untracked=$(git ls-files --others -- src/lib/settings/generated)
+          untracked=$(git ls-files --others -- src/lib/settings/generated src/lib/generated)
           if [ -n "$untracked" ]; then
             echo "::error::the generator wrote files that are not committed:"
             echo "$untracked"

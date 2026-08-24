@@ -85,7 +85,11 @@ const PROMPT_GRACE: Duration = Duration::from_secs(300);
 /// never-persisted flight started" would force every existing listener to
 /// re-read settings on an edge that changed none. Payload is
 /// [`DelegationChanged`].
-pub const EVENT_DELEGATION_CHANGED: &str = "delegation-changed";
+///
+/// V42 F6 (#131): DEFINED FROM `service::events`, so the string is spelled
+/// exactly once in the crate. The alias stays because this name is what the
+/// module's own callers and tests read.
+pub const EVENT_DELEGATION_CHANGED: &str = crate::service::events::DELEGATION_CHANGED;
 
 /// The `delegation-changed` payload: **the whole in-flight set**, every time.
 ///

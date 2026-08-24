@@ -204,7 +204,7 @@ fn spawn_mic_streamer(app: AppHandle, recording: Arc<AtomicBool>, mic: Arc<RwLoc
             if samples.is_empty() {
                 continue;
             }
-            if let Err(e) = app.emit("mic-amplitude", samples) {
+            if let Err(e) = app.emit(crate::service::events::MIC_AMPLITUDE, samples) {
                 warn!(target: "stt", error = %e, "emit mic-amplitude failed");
             }
         }
@@ -217,7 +217,7 @@ pub(crate) fn set_state(app: &AppHandle, cell: &RwLock<SttState>, new: SttState)
     if let Ok(mut s) = cell.write() {
         *s = new;
     }
-    if let Err(e) = app.emit("stt-state", serde_json::json!({ "state": new })) {
+    if let Err(e) = app.emit(crate::service::events::STT_STATE, serde_json::json!({ "state": new })) {
         warn!(target: "stt", error = %e, "emit stt-state failed");
     }
 }

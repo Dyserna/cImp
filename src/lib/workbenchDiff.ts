@@ -16,7 +16,8 @@
 //     (fs-batch already covers that case, so the tick is a no-op rather than
 //     the poll being torn down/rebuilt on every settings change).
 import { writable, get } from 'svelte/store';
-import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import { type UnlistenFn } from '@tauri-apps/api/event';
+import { listenEvent, FS_BATCH } from './events';
 import { settings } from './settings/store';
 import { workbenchDiffSummary, type DiffSummary } from './workbench';
 
@@ -73,7 +74,7 @@ export function watchWorkbenchDiff(): () => void {
   if (refCount === 1) {
     const gen = ++listenGen;
     void refresh();
-    listen('fs-batch', () => scheduleRefresh())
+    listenEvent(FS_BATCH, () => scheduleRefresh())
       .then((fn) => {
         // If this session was torn down (or superseded by a newer start)
         // while `listen()` was still resolving, `gen` no longer matches —

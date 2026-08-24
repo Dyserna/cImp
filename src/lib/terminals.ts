@@ -40,7 +40,7 @@ import { WebglAddon } from '@xterm/addon-webgl';
 import { SerializeAddon } from '@xterm/addon-serialize';
 import '@xterm/xterm/css/xterm.css';
 import './terminals.css';
-import { listen } from '@tauri-apps/api/event';
+import { listenEvent, TAB_RESTART_REQUESTED } from './events';
 import {
   readText as clipboardReadText,
   writeText as clipboardWriteText,
@@ -242,7 +242,7 @@ async function ensureModuleListeners(): Promise<void> {
     console.error('listen pty-exit failed:', e);
   }
   try {
-    await listen<TabId>('tab-restart-requested', async (event) => {
+    await listenEvent(TAB_RESTART_REQUESTED, async (event) => {
       const entry = entries.get(event.payload);
       if (!entry || entry.restarting) return;
       // V1.4-03: a Restart click during a debounced recreate would

@@ -43,7 +43,7 @@ pub fn spawn_amplitude_streamer(app: AppHandle, audio: Arc<AudioOutput>) {
             if samples.is_empty() {
                 continue;
             }
-            if let Err(e) = app.emit("audio-amplitude", samples) {
+            if let Err(e) = app.emit(crate::service::events::AUDIO_AMPLITUDE, samples) {
                 warn!(error = %e, "emit audio-amplitude failed");
             }
         }

@@ -10,6 +10,7 @@ use crate::ipc::AppState;
 use crate::pty::PtyHost;
 use crate::service::on_blocking_pool as run_on_blocking_pool;
 use crate::service::pty::PtyService;
+use crate::service::checks::{ApplySummary, ChecksService, ChecksSuggestion};
 use crate::service::settings::SettingsService;
 use crate::service::sink::{OutputSink, TauriEventSink};
 use crate::settings::{AiToolTabConfig, Settings, TabConfig};
@@ -1697,47 +1698,22 @@ pub async fn offload_server_metrics(
     Ok(service.server_metrics())
 }
 
-/// V22 Phase D: the passive-nudge payload for the Code Intelligence chip.
-/// `count` is the number of VALID detection proposals for a project whose
-/// `checks` is empty; the chip renders only when `count > 0 && !dismissed`.
-#[derive(serde::Serialize)]
-pub struct ChecksSuggestion {
-    pub count: usize,
-    pub dismissed: bool,
-    pub auto_configure: bool,
-}
-
-/// V22 Phase D: `checks_apply_proposals` result — the check names actually
-/// written (added or refreshed) after the `auto`-ownership merge.
-#[derive(serde::Serialize)]
-pub struct ApplySummary {
-    pub applied: Vec<String>,
-}
-
 /// V22 Phase D: detect the project's languages/tooling and return `run_check`
-/// proposals (marker + code-graph evidence, PATH-validated — invalid ones carry
-/// a `reason` for greying). Read-only; the bounded filesystem + PATH scan runs
-/// on a blocking thread so the async reactor (and the UI) stays responsive. No
-/// network.
+/// proposals. See [`service::checks::detect`](crate::service::checks::detect) —
+/// this is the wire boundary only: it names the warm index the detector asks
+/// for its per-language file counts.
 #[tauri::command]
 pub async fn checks_detect(
     service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
     root: Option<String>,
 ) -> AppResult<Vec<crate::checks::detect::Proposal>> {
-    let root = resolve_graph_root(root)?;
-    let stats = service.checks_lang_stats(&root);
-    tokio::task::spawn_blocking(move || crate::checks::detect::detect(&root, &stats))
-        .await
-        .map_err(|e| AppError::Checks(format!("detection task failed: {e}")))
+    crate::service::checks::detect(root, service.inner()).await
 }
 
 /// V22 Phase D: merge selected proposal checks into the project's `checks`
-/// setting (by `name`, honoring the `auto`-ownership rule — a user-owned
-/// `auto == false` entry is never overwritten) through the normal settings
-/// path, which lands the change as a per-project `.cimp/config.json` overlay
-/// diff. Returns the names actually written. `root` is informational: the write
-/// targets the active project's settings handle (cImp's settings are the launch
-/// project's overlay).
+/// setting. See [`ChecksService::apply_proposals`]. `root` is informational:
+/// the write targets the active project's settings handle (cImp's settings are
+/// the launch project's overlay).
 #[tauri::command]
 pub async fn checks_apply_proposals(
     state: State<'_, AppState>,
@@ -1745,108 +1721,64 @@ pub async fn checks_apply_proposals(
     checks: Vec<crate::checks::CheckDef>,
 ) -> AppResult<ApplySummary> {
     let _ = root;
-    // Defense in depth: reject a malformed selection (bad `regex-custom`,
-    // escaping `cwd`/`report_file`) before it lands in settings.
-    for def in &checks {
-        def.validate()?;
-    }
-    let mut applied = Vec::new();
-    state.settings.mutate(|s| {
-        applied = crate::checks::detect::merge_auto(&mut s.checks, checks);
-    });
-    Ok(ApplySummary { applied })
+    checks_service(&state).apply_proposals(checks)
 }
 
-/// V22 Phase D: the passive nudge. When the project's `checks` is empty and the
-/// user hasn't dismissed it, returns how many VALID proposals detection finds so
-/// the Code Intelligence chip can show "N suggested checks". Chosen as a
-/// queryable command over wiring the count into the `graph-status` event — far
-/// less invasive. Runs the scan off-thread.
+/// Build the checks service over this app's handles. One place, so no command
+/// can drift in what it hands it.
+fn checks_service(state: &AppState) -> ChecksService<'_> {
+    ChecksService::new(&state.settings)
+}
+
+/// V22 Phase D: the passive nudge for the Code Intelligence chip. See
+/// [`ChecksService::suggestion`].
 #[tauri::command]
 pub async fn checks_suggestion(
     state: State<'_, AppState>,
     service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
     root: Option<String>,
 ) -> AppResult<ChecksSuggestion> {
-    let snap = state.settings.current();
-    let dismissed = snap.checks_suggestion_dismissed;
-    let auto_configure = snap.checks_auto_configure;
-    // Only offer for a project with no checks configured yet.
-    if !snap.checks.is_empty() {
-        return Ok(ChecksSuggestion {
-            count: 0,
-            dismissed,
-            auto_configure,
-        });
-    }
-    let root = resolve_graph_root(root)?;
-    let stats = service.checks_lang_stats(&root);
-    let count = tokio::task::spawn_blocking(move || {
-        crate::checks::detect::detect(&root, &stats)
-            .into_iter()
-            .filter(|p| p.valid)
-            .count()
-    })
-    .await
-    .map_err(|e| AppError::Checks(format!("detection task failed: {e}")))?;
-    Ok(ChecksSuggestion {
-        count,
-        dismissed,
-        auto_configure,
-    })
+    checks_service(&state).suggestion(root, service.inner()).await
 }
 
 /// V22 Phase D: remember that the user dismissed the suggestion nudge for this
-/// project (persists via the per-project overlay). Idempotent.
+/// project. See [`ChecksService::dismiss_suggestion`].
 #[tauri::command]
 pub async fn checks_dismiss_suggestion(state: State<'_, AppState>) -> AppResult<()> {
-    state
-        .settings
-        .mutate(|s| s.checks_suggestion_dismissed = true);
-    Ok(())
+    checks_service(&state).dismiss_suggestion()
 }
 
-/// V22 Phase E: dry-run one (possibly unsaved) [`CheckDef`] through the ordinary
-/// `checks::run` path (`changed_only = false`) so the Settings "Test" button can
-/// show exit status, the parsed diagnostic count, the first few diagnostics, and
-/// the captured output sizes — the last of which lets the UI flag a wrong-parser
-/// config (output produced, zero diagnostics). A validation/spawn failure is
-/// folded into the result's `error` field, not returned as an `Err`, so the
-/// editor renders every outcome inline. `root` defaults to the launch directory.
-///
-/// V33: the Test button's dry run gets the SAME OS sandbox a real `run_check`
-/// gets (locked decision L2 — the boundary belongs to the seam, not to who
-/// clicked). `state` is here only to reach the live settings; the frontend's
-/// invoke arguments are unchanged.
+/// V22 Phase E: dry-run one (possibly unsaved) `CheckDef` for the Settings
+/// "Test" button, in the same OS sandbox a real `run_check` gets. See
+/// [`ChecksService::test`]. `state` is here only to reach the live settings;
+/// the frontend's invoke arguments are unchanged.
 #[tauri::command]
 pub async fn checks_test(
     state: State<'_, AppState>,
     root: Option<String>,
     def: crate::checks::CheckDef,
 ) -> AppResult<crate::checks::ChecksTestResult> {
-    let root = resolve_graph_root(root)?;
-    let sandbox = crate::sandbox::SandboxCfg::from_settings(&state.settings.current());
-    Ok(crate::checks::test_check(&root, &def, &sandbox).await)
+    checks_service(&state).test(root, def).await
 }
 
-/// V22 Phase E: validate a `regex-custom` pattern for the ChecksEditor's live
-/// (debounced) feedback — the exact same check the save path (`CheckDef::validate`
-/// → `parsers::validate_pattern`) applies, so the UI error matches what a save
-/// would reject. `Ok(())` when the pattern compiles and declares the mandatory
-/// `file`/`line`/`message` named groups; the `Err` string is ready to display.
+/// V22 Phase C/E: validate a `regex-custom` pattern for the ChecksEditor's live
+/// (debounced) feedback. See
+/// [`service::checks::validate_pattern`](crate::service::checks::validate_pattern).
 #[tauri::command]
 pub async fn checks_validate_pattern(pattern: String) -> Result<(), String> {
-    crate::checks::parsers::validate_pattern(&pattern)
+    crate::service::checks::validate_pattern(&pattern)
 }
 
 /// Resolve an optional `root` IPC argument to a project directory: the given
 /// path when non-blank, else the app's launch directory. Shared by the graph
 /// commands so the fallback lives in one place.
+/// Resolve an optional `root` IPC argument to a project directory: the given
+/// path when non-blank, else the app's launch directory. Shared by the graph
+/// commands so the fallback lives in one place — the service layer needs the
+/// same answer, so the rule itself is [`crate::service::project_root`] and this
+/// is its name at the wire boundary.
 fn resolve_graph_root(root: Option<String>) -> AppResult<std::path::PathBuf> {
-    match root {
-        Some(r) if !r.trim().is_empty() => Ok(std::path::PathBuf::from(r)),
-        _ => std::env::current_dir().map_err(|e| AppError::Settings(format!("cwd: {e}"))),
-    }
+    crate::service::project_root(root)
 }
 
 /// V9-01: known per-root code-graph status (idle/building/ready/error + row

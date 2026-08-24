@@ -38,6 +38,7 @@
 //! `pty_rebind_channel`) and one poll view (`activity_list`). It is a real
 //! increment, not a prototype — but it is deliberately not the whole surface.
 
+pub mod checks;
 pub mod layout;
 pub mod pty;
 pub mod settings;
@@ -66,4 +67,20 @@ where
     tokio::task::spawn_blocking(f)
         .await
         .map_err(|e| crate::error::AppError::Ipc(format!("blocking task join: {e}")))
+}
+
+/// Resolve an optional `root` IPC argument to a project directory: the given
+/// path when non-blank, else the app's launch directory.
+///
+/// Lives here rather than in `ipc::commands` (where it is spelled
+/// `resolve_graph_root`) because the services need the same answer, and a
+/// second copy of "which project is this about" is exactly the kind of
+/// duplication V42 exists to remove. The wire boundary keeps its own name for
+/// it — one line, delegating here.
+pub(crate) fn project_root(root: Option<String>) -> crate::error::AppResult<std::path::PathBuf> {
+    match root {
+        Some(r) if !r.trim().is_empty() => Ok(std::path::PathBuf::from(r)),
+        _ => std::env::current_dir()
+            .map_err(|e| crate::error::AppError::Settings(format!("cwd: {e}"))),
+    }
 }

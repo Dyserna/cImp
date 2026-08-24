@@ -1276,6 +1276,24 @@ impl OffloadService {
         // instead of running an orphan to completion.
         cancel: CancellationToken,
     ) -> AppResult<String> {
+        // #126/R21: the five values that ARE the task — the instructions, the
+        // caller’s context, the thinking mode, the answer schema and the routing
+        // profile — are bundled HERE, at the top, and travel as one from here on.
+        // They used to be threaded through `run_on` as five positional parameters
+        // and assembled into this very struct at the bottom of the chain, so four
+        // call sites re-spelled the same five clones and every frame in between
+        // carried arguments whose only relationship was that `agent::run` wanted
+        // them together. The retry ladder below hands each attempt a copy; the
+        // On→Auto retry is the one attempt that differs, and it says so in one
+        // field rather than by re-listing the other four.
+        let task = OffloadTask {
+            instructions,
+            context,
+            thinking,
+            schema,
+            profile,
+        };
+
         // ONE read, and the whole file: `snap` is what the rest of this call
         // reasons about, and V39's facade backends are synthesized from the tab
         // list beside it. Two reads could disagree about the pool mid-route.
@@ -1367,12 +1385,12 @@ impl OffloadService {
             })
             .collect();
 
-        let req = router::analyze_task(&instructions, context.as_deref(), tier);
+        let req = router::analyze_task(&task.instructions, task.context.as_deref(), tier);
         let chosen = router::select(&views, &req)
             .map_err(|e: RouteError| AppError::OffloadNotReady(e.to_string()))?;
         info!(
             target: "offload",
-            task_chars = instructions.len(),
+            task_chars = task.instructions.len(),
             est_ctx = req.estimated_context,
             tier = ?req.tier_hint,
             backend = %views[chosen].name,
@@ -1390,7 +1408,7 @@ impl OffloadService {
         let mut active = chosen;
         let run_id = self.run_id_seq.fetch_add(1, Ordering::Relaxed);
         let run_started = now_ms();
-        self.run_begin(&backend_name, run_id, &instructions, thinking);
+        self.run_begin(&backend_name, run_id, &task.instructions, task.thinking);
         let mut trace = RunTrace::default();
         // #48 (finding M-1): ONE scope for this whole `offload_task` — its
         // EXTERNAL budget, its `injection_flag` scope id, its latch-refusal claim
@@ -1408,13 +1426,9 @@ impl OffloadService {
                 &pool[chosen],
                 &views[chosen],
                 &snap,
-                &instructions,
-                context.clone(),
-                thinking,
+                task.clone(),
                 session_cwd.clone(),
                 tab,
-                schema.clone(),
-                profile,
                 overall_deadline,
                 Some(&mut trace),
                 &cancel,
@@ -1446,13 +1460,9 @@ impl OffloadService {
                             &pool[next],
                             &views[next],
                             &snap,
-                            &instructions,
-                            context.clone(),
-                            thinking,
+                            task.clone(),
                             session_cwd.clone(),
                             tab,
-                            schema.clone(),
-                            profile,
                             overall_deadline,
                             Some(&mut trace),
                             &cancel,
@@ -1472,7 +1482,9 @@ impl OffloadService {
         // is what avoids the runaway. Not retried with `off`: thinking was
         // explicitly wanted. If auto also fails, the run is marked failed.
         let mut recovered = false;
-        if matches!(result, Err(AppError::OffloadNoAnswer(_))) && thinking == ThinkingMode::On {
+        if matches!(result, Err(AppError::OffloadNoAnswer(_)))
+            && task.thinking == ThinkingMode::On
+        {
             warn!(
                 target: "offload",
                 run_id,
@@ -1488,13 +1500,12 @@ impl OffloadService {
                     &pool[active],
                     &views[active],
                     &snap,
-                    &instructions,
-                    context.clone(),
-                    ThinkingMode::Auto,
+                    OffloadTask {
+                        thinking: ThinkingMode::Auto,
+                        ..task.clone()
+                    },
                     session_cwd.clone(),
                     tab,
-                    schema.clone(),
-                    profile,
                     retry_deadline,
                     Some(&mut trace),
                     &cancel,
@@ -1545,13 +1556,9 @@ impl OffloadService {
                         &pool[q],
                         &views[q],
                         &snap,
-                        &instructions,
-                        context.clone(),
-                        thinking,
+                        task.clone(),
                         session_cwd.clone(),
                         tab,
-                        schema.clone(),
-                        profile,
                         esc_deadline,
                         Some(&mut trace),
                         &cancel,
@@ -1604,11 +1611,11 @@ impl OffloadService {
         // store (the Tool Activity tab's feed): full instruction text (+ any
         // caller-supplied context) as the request, the synthesized answer (or
         // the error) as the response.
-        let request = match context.as_deref() {
+        let request = match task.context.as_deref() {
             Some(ctx) if !ctx.is_empty() => {
-                format!("{instructions}\n\n--- context ---\n{ctx}")
+                format!("{}\n\n--- context ---\n{ctx}", task.instructions)
             }
-            _ => instructions.clone(),
+            _ => task.instructions.clone(),
         };
         let response = match &result {
             Ok(text) => text.clone(),
@@ -1624,7 +1631,7 @@ impl OffloadService {
                     .unwrap_or_default(),
                 backend_name.clone(),
                 "offload_task".to_string(),
-                instruction_headline(&instructions),
+                instruction_headline(&task.instructions),
                 result.as_ref().map(|t| t.chars().count()).unwrap_or(0),
                 now_ms().saturating_sub(run_started),
                 result.is_ok(),
@@ -1823,17 +1830,15 @@ impl OffloadService {
         entry: &PoolEntry,
         view: &BackendView,
         snap: &OffloadSettings,
-        instructions: &str,
-        context: Option<String>,
-        thinking: ThinkingMode,
+        // #126/R21: the five values that ARE the task, as the one struct
+        // `agent::run` has always wanted at the end of this chain. Owned, because
+        // this frame is ONE ATTEMPT: the ladder in [`Self::run`] hands each attempt
+        // its own copy, exactly as the five separate `.clone()`s used to.
+        task: OffloadTask,
         session_cwd: Option<PathBuf>,
         // V33 Phase F: the requesting tab, for the pre-mutation checkpoint's
         // attribution only. See [`Self::run`]'s parameter of the same name.
         tab: Option<&str>,
-        schema: Option<serde_json::Value>,
-        // V32 Phase A: pre-applies the agent loop's taint latch (see
-        // `agent::OffloadTask::profile`).
-        profile: Option<Profile>,
         deadline: Instant,
         trace: Option<&mut RunTrace>,
         cancel: &CancellationToken,
@@ -1859,11 +1864,21 @@ impl OffloadService {
         // cross-module invariant). This branch does not grow a second write
         // path; it hands over and waits.
         if let Handle::HarnessTab(facade) = &entry.handle {
+            // The bundle is unpacked rather than borrowed: a facade hands the
+            // worker tab the task's own text and owns it from here, and there is
+            // no `agent::run` below this branch to hand it to.
+            let OffloadTask {
+                instructions,
+                context,
+                schema,
+                profile,
+                ..
+            } = task;
             return self
                 .run_facade(
                     facade,
                     FacadeCall {
-                        instructions,
+                        instructions: &instructions,
                         context,
                         tab,
                         schema: schema.as_ref(),
@@ -2009,13 +2024,6 @@ impl OffloadService {
                 WORKER,
                 &cur,
             ),
-        };
-        let task = OffloadTask {
-            instructions: instructions.to_string(),
-            context,
-            thinking,
-            schema,
-            profile,
         };
         agent::run(
             &self.client,

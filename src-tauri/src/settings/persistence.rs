@@ -182,11 +182,11 @@ pub fn load(default_shell: &ShellSpec, launch_cwd: &Path) -> LoadOutcome {
         // 2a. **Migrate it, before anything reads its shape** (V40 Phase I).
         //     Until Phase I this was skipped, for two reasons that were both
         //     about entering the cascade BLIND: the presence-archaeology
-        //     detectors key off top-level keys a partial diff legitimately
-        //     lacks, and a value with no version re-migrates every launch,
-        //     growing `.bak` files without bound. `migrate_overlay` is told the
-        //     version, refuses to start below where the archaeology ends, and
-        //     writes no file at all — so neither reason survives, and the gap
+        //     detectors (deleted by V42 R9) keyed off top-level keys a partial
+        //     diff legitimately lacks, and a value with no version re-migrates
+        //     every launch, growing `.bak` files without bound. `migrate_overlay`
+        //     is told the version, refuses to start below the migration floor,
+        //     and writes no file at all — so neither reason survives, and the gap
         //     they were covering does not: a project that set
         //     `claude_local.base_url` before schema 36 kept a top-level
         //     `claude_local` block that reached nothing after the global moved
@@ -210,23 +210,16 @@ pub fn load(default_shell: &ShellSpec, launch_cwd: &Path) -> LoadOutcome {
                 "settings: project overlay migrated in memory (written back on the next save)"
             );
         }
-        // Per-install fields never belong in an overlay (see
-        // `OVERLAY_BANNED_KEYS`) — drop them before the merge so an overlay
-        // contaminated by a pre-guard version can't shadow the global file.
-        strip_overlay_banned(&mut v);
-        // V38: `tool_plugins` cannot be banned wholesale (two of its leaves are
-        // genuinely per-project), so it gets a structured strip — and unlike the
-        // key ban, this one SAYS SO. A hand-edited config that sets a binary
-        // path per repo is a reasonable thing to try and a silent no-op is how
-        // that becomes "cImp ignores my config" an hour later.
-        let mut dropped = strip_overlay_tool_plugins(&mut v);
-        // V40 review M-2: the same structured strip for the per-harness map,
-        // whose scope is per FIELD (see `OVERLAY_BANNED_HARNESS_FIELDS`). Named
-        // in the SAME Events row for the same reason the tool-plugins strip is
-        // named: a hand-edited config that sets one of these per repo is a
-        // reasonable thing to try, and a silent no-op is how that becomes "cImp
-        // ignores my config" an hour later.
-        dropped.extend(strip_overlay_harness(&mut v));
+        // Every machine-scope family, in one walk of [`MACHINE_SCOPED`] — drop
+        // them before the merge so an overlay contaminated by a pre-guard
+        // version can't shadow the global file. The whole-key bans go silently
+        // (see `OVERLAY_BANNED_KEYS`); the structured strips NAME what they
+        // dropped, because a hand-edited config that sets a plugin's binary path
+        // or one of the per-harness fields per repo is a reasonable thing to try
+        // and a silent no-op is how that becomes "cImp ignores my config" an
+        // hour later. A family added to the table is stripped here without this
+        // call site being touched, which is the whole point of the table.
+        let dropped = strip_overlay_for_merge(&mut v);
         crate::plugins::events::record_overlay_strip(
             &overlay_path.display().to_string(),
             &dropped,
@@ -234,18 +227,15 @@ pub fn load(default_shell: &ShellSpec, launch_cwd: &Path) -> LoadOutcome {
         v
     });
 
-    // 2b. Promote legacy overlay scanner paths (empty slots only) and
-    //     offload template libraries (new names only) into the global
-    //     baseline — see the machine-scope notes above
-    //     `promote_overlay_audit_paths` / `promote_overlay_offload_templates`.
-    //     Persisted below via the post-load `save`, which also rewrites the
-    //     overlay in the stripped shape.
-    let promoted = overlay_value.as_ref().is_some_and(|ov| {
-        let paths = promote_overlay_audit_config(&mut global, ov);
-        let templates = promote_overlay_offload_templates(&mut global, ov);
-        let registry = promote_overlay_mcp_registry(&mut global, ov);
-        paths || templates || registry
-    });
+    // 2b. Promote legacy overlay data into the global baseline — every
+    //     `promote` cell of [`MACHINE_SCOPED`]: the audit scanner paths (empty
+    //     slots only), the offload template libraries and the MCP registry (new
+    //     names only), each described above its own function. Persisted below
+    //     via the post-load `save`, which also rewrites the overlay in the
+    //     stripped shape.
+    let promoted = overlay_value
+        .as_ref()
+        .is_some_and(|ov| promote_overlay_into_global(&mut global, ov));
 
     // 3. Merge the (now both-current-shape) global + overlay.
     let mut merged = match serde_json::to_value(&global) {
@@ -261,11 +251,11 @@ pub fn load(default_shell: &ShellSpec, launch_cwd: &Path) -> LoadOutcome {
     let overlay_existed = overlay_value.is_some();
     if let Some(overlay) = overlay_value {
         deep_merge(&mut merged, overlay);
-        // 3b. Paths and template libraries always come from the
-        //     (post-promotion) global baseline — an overlay's copies are
-        //     legacy data, not authority.
-        enforce_global_offload_templates(&mut merged, &global);
-        enforce_global_mcp_registry(&mut merged, &global);
+        // 3b. **After the merge, never before.** Template libraries and the MCP
+        //     registry always come from the (post-promotion) global baseline —
+        //     an overlay's copies are legacy data, not authority. Every
+        //     `enforce` cell of [`MACHINE_SCOPED`].
+        enforce_global_machine_scope(&mut merged, &global);
     }
 
     let mut settings: Settings = match serde_json::from_value(merged) {
@@ -357,25 +347,20 @@ pub fn load_readonly(launch_cwd: &Path) -> Settings {
         None => return Settings::default(),
     };
     if let Some(mut overlay) = read_overlay(&overlay_read_path(launch_cwd), false) {
-        strip_overlay_banned(&mut overlay);
-        // V38, and NOT optional here: the children this serves are the Phase C/D
-        // consumers that resolve a plugin tool's binary path and enable state,
-        // and they run INSIDE the sandbox boundary whose writable area holds
-        // this very file. No Events row — a lightweight subprocess has no lane
-        // to speak into, and the app's own `load` already reported it.
-        let _ = strip_overlay_tool_plugins(&mut overlay);
-        // V40 review M-2, and NOT optional here either: `expose_commands`
-        // decides whether `run_command` is advertised, and this reader IS the
-        // child that asks.
-        let _ = strip_overlay_harness(&mut overlay);
-        // V37 registry, same reason and the SAME asymmetry made explicit: `load`
-        // promotes an overlay's servers/categories into the global baseline and
-        // then enforces the global arrays over the merged view, so an overlay
-        // holds no registry authority there. This reader does neither, so it
-        // removes the keys outright — see the block comment above
-        // `promote_overlay_mcp_registry` for why removal and not
-        // `strip_mcp_registry`.
-        let _ = strip_overlay_mcp_registry(&mut overlay);
+        // The same table [`load`] walks, on this leg's cells — and NOT optional
+        // here. The children this serves are the Phase C/D consumers that
+        // resolve a plugin tool's binary path and enable state, and they run
+        // INSIDE the sandbox boundary whose writable area holds this very file;
+        // `expose_commands` decides whether `run_command` is advertised, and
+        // this reader IS the child that asks. The MCP registry is the one family
+        // the two readers handle differently, and the difference lives in the
+        // TABLE rather than in this call site: `load` promotes and then enforces
+        // (healing the file on the way), while this reader has no side effects
+        // to heal with and so removes the keys outright — see the block comment
+        // above `promote_overlay_mcp_registry` for why removal and not
+        // `strip_mcp_registry`. No Events row: a lightweight subprocess has no
+        // lane to speak into, and the app's own `load` already reported it.
+        let _ = strip_overlay_for_readonly_merge(&mut overlay);
         deep_merge(&mut merged, overlay);
     }
     let mut settings: Settings = serde_json::from_value(merged).unwrap_or_default();
@@ -783,6 +768,15 @@ fn load_global(default_shell: &ShellSpec) -> (Settings, Option<u64>) {
     // against is gone (see this function's doc comment).
     let stated = migration::stated_schema_version(&value);
 
+    // **The migration floor** (V42 R9, issue #120). Strictly after the
+    // fresh-install branch above — a file that is MISSING is seeded, never
+    // quarantined — and strictly before the cascade, which has no steps left for
+    // a file this old and would otherwise rewrite it as current with its
+    // contents silently defaulted.
+    if let Some(reseeded) = reseed_below_floor(&path, &value, default_shell) {
+        return (reseeded, None);
+    }
+
     // Migrate the global file in place. Backup is named after the global
     // file, which is the source of truth for the global baseline shape.
     let migrated = match migration::migrate_if_needed(&mut value, &path, default_shell) {
@@ -849,6 +843,69 @@ fn load_global(default_shell: &ShellSpec) -> (Settings, Option<u64>) {
     (typed, stated)
 }
 
+/// **The global migration floor** (V42 R9, issue #120).
+///
+/// `value` is the global file at `path`, already read and parsed as JSON. If it
+/// states a schema below [`migration::MIN_GLOBAL_SCHEMA_VERSION`] — or states
+/// none at all, which is what a pre-v1.10 file looks like — it is moved aside
+/// INTACT, fresh defaults are written in its place, and those defaults are
+/// returned. `None` means the file is at or above the floor and the caller
+/// carries on into the cascade.
+///
+/// **Why not just parse it.** Because that succeeds. `Settings` carries a
+/// container-level `#[serde(default)]`, so an old file deserializes cleanly with
+/// every field the deleted v1.0 → v29 steps would have MOVED quietly reset to a
+/// default — and is then written back still stamped at its old version, so no
+/// later launch ever notices. Loud beats silent, and a file the user still has
+/// beats a file they do not.
+///
+/// **What is shared with the corrupt path, and what is not.** The mechanism is
+/// shared on purpose ([`migration::quarantine_outdated_file`] is
+/// [`migration::quarantine_corrupt_file`]'s twin over one helper): the outcome
+/// the user needs is the same — the app launches, their old file is still on
+/// disk. The WORDING is deliberately not shared. This file is valid JSON written
+/// by an older cImp, not a broken one, and calling a user's intact settings
+/// "corrupt" sends them looking for the wrong problem. The quarantine file says
+/// so too: `.outdated.` rather than `.corrupted.`.
+///
+/// **If the move fails, nothing is overwritten.** The corrupt path reseeds
+/// regardless (its bytes are unreadable anyway); here the bytes are the user's
+/// readable settings, so a failed move means we hand back defaults for this
+/// session and leave the file exactly where it is. It stays loud on every launch
+/// rather than becoming quiet and gone once.
+fn reseed_below_floor(path: &Path, value: &Value, default_shell: &ShellSpec) -> Option<Settings> {
+    if !migration::below_global_floor(value) {
+        return None;
+    }
+    let stated = migration::stated_schema_version(value);
+    let Some(quarantine) = migration::quarantine_outdated_file(path) else {
+        tracing::error!(
+            ?stated,
+            floor = migration::MIN_GLOBAL_SCHEMA_VERSION,
+            path = %path.display(),
+            "settings: the global settings file was written by a version of cImp too old for \
+             this build to upgrade, AND it could not be moved aside — running on defaults for \
+             this session and leaving the file untouched rather than overwriting it"
+        );
+        return Some(seeded_defaults(default_shell));
+    };
+    tracing::error!(
+        ?stated,
+        floor = migration::MIN_GLOBAL_SCHEMA_VERSION,
+        path = %path.display(),
+        quarantine = %quarantine.display(),
+        "settings: the global settings file was written by a version of cImp too old for this \
+         build to upgrade (its schema is below the migration floor). It has NOT been read and \
+         NOT been deleted: it was moved aside intact to the quarantine path below, and fresh \
+         defaults were written in its place"
+    );
+    let s = seeded_defaults(default_shell);
+    if let Err(e) = save_to(path, &s) {
+        tracing::warn!(error = %e, path = %path.display(), "settings: write global defaults after quarantine failed");
+    }
+    Some(s)
+}
+
 /// Read and parse the custom overlay file as a generic `Value`. Returns
 /// `None` if absent. On parse failure the file is quarantined and `None`
 /// is returned — we want the app to come up cleanly even if a hand-edit
@@ -886,6 +943,349 @@ fn read_overlay(path: &Path, quarantine: bool) -> Option<Value> {
             }
             None
         }
+    }
+}
+
+// ── The machine-scope matrix ────────────────────────────────────────────────
+//
+// Several settings families are MACHINE scope in whole or in part: they
+// describe this install (or this machine's OS boundary), not this checkout, and
+// a project overlay must never carry them. Each one has to answer the SAME set
+// of questions, on three different legs:
+//
+//   * [`load`]           — strip the family out of the overlay before the
+//                          merge, and/or promote a legacy overlay's copy into
+//                          the global baseline and then ENFORCE the baseline
+//                          over the merged view.
+//   * [`load_readonly`]  — the same strip for the `cimp --offload-mcp` child,
+//                          which has no side effects to heal with.
+//   * [`save`]           — write the live value THROUGH to the physical global
+//                          file (the only place a Settings-window edit of it
+//                          can land, since the diff strips it), then normalize
+//                          both diff sides so the overlay carries no copy.
+//
+// Until V42 those cells were sixteen hand-written functions wired by
+// hand-enumerated call sites, and the failure mode of a missed cell is not a
+// crash: it is machine state silently leaking into a portable overlay, or a
+// setting the Settings window can edit and then cannot save. That bug was found
+// and fixed twice — for `tool_plugins` in V38 and for `harness` in the V40
+// review (finding M-2) — which is two more times than a shape that made it
+// impossible would have needed.
+//
+// The sixteen functions are unchanged. What changed is that they are now CELLS
+// OF A TABLE the three legs iterate, so adding a family is adding one row plus
+// its functions: there is no call site to remember, every optional cell must be
+// either filled or given a written reason for being empty (`readonly_exempt`,
+// `sync_writer`), and `every_top_level_setting_declares_its_scope` fails until
+// a newly added top-level settings key says which side of the line it is on.
+// (`machine_scope_phase_order_is_pinned` also wants the new name, deliberately:
+// the order the legs run in is a record someone confirms, not a side effect.)
+//
+// ORDER IS PART OF THE TABLE, and two orderings are load-bearing:
+//
+//   * the wholesale ban ([`strip_overlay_banned`]) runs BEFORE the structured
+//     strips, on every leg — the walks below do it, not their callers;
+//   * `enforce` runs AFTER `deep_merge`, never before.
+//
+// `machine_scope_phase_order_is_pinned` freezes the per-leg row order. The
+// three strip legs run in exactly the order the hand-written call sites ran in.
+// The `promote` and `sync` legs are in table order rather than their pre-V42
+// order, which is safe because no two rows own overlapping keys
+// (`machine_scope_families_own_disjoint_keys`) — every promoter and every
+// syncer still runs (the hand-written sites computed all of them into locals
+// and then OR'd, which the walks' `|=` preserves; a `||` over the CALLS would
+// short-circuit and skip a later family's one-time heal), and each writes into
+// its own field of the same value.
+
+/// How one leg removes a machine-scope family from a settings value.
+enum OverlayStrip {
+    /// Nothing to remove on this leg.
+    ///
+    /// Legal only where the row says why: `promote` + `enforce` cover the
+    /// family instead (a global-authority family's LOAD leg), or
+    /// `readonly_exempt` names the reason a read-only reader needs none. See
+    /// `every_machine_scoped_family_fills_or_explains_every_cell`.
+    Nothing,
+    /// Covered by the wholesale [`strip_overlay_banned`] pass that runs at the
+    /// head of every strip leg — this row's keys are in [`OVERLAY_BANNED_KEYS`].
+    ///
+    /// A marker rather than a hook, because the ban is ONE pass over the value
+    /// for all of them and it has to run before the structured strips.
+    /// `the_banned_rows_and_overlay_banned_keys_agree` keeps the marker and the
+    /// list from drifting apart.
+    Banned,
+    /// A structured strip: only part of the subtree is machine scope, so it
+    /// returns the dotted names of what it dropped for the `plugin` Events lane.
+    Named(fn(&mut Value) -> Vec<String>),
+    /// A whole-value normalizer with nothing to name.
+    ///
+    /// Only ever a DIFF-side cell, and that is enforced. These write `[]` into
+    /// the family's keys rather than removing them, and `deep_merge` replaces
+    /// arrays wholesale — so the same function on an overlay leg would ERASE the
+    /// global value instead of ignoring the overlay's, which is exactly what
+    /// `the_save_side_normalizer_would_erase_the_global_registry_on_the_load_side`
+    /// pins.
+    Normalize(fn(&mut Value)),
+}
+
+impl OverlayStrip {
+    /// Apply this cell to `v`, returning the dotted names worth reporting.
+    fn apply(&self, v: &mut Value) -> Vec<String> {
+        match self {
+            // `Banned` is applied wholesale at the head of the leg, before any
+            // structured strip runs.
+            Self::Nothing | Self::Banned => Vec::new(),
+            Self::Named(f) => f(v),
+            Self::Normalize(f) => {
+                f(v);
+                Vec::new()
+            }
+        }
+    }
+}
+
+/// One machine-scope settings family — a cell for every leg that has to know
+/// about it. See the block comment above.
+///
+/// Four cells (`name`, `keys`, `readonly_exempt`, `sync_writer`) are
+/// DECLARATIONS the coverage tests read rather than hooks the legs call: they
+/// are why an empty cell is a test failure instead of a silent hole. Each
+/// carries its own `allow(dead_code)` — per field on purpose, so a HOOK that
+/// stops being called is still reported.
+struct MachineScopedField {
+    /// Stable family name: diagnostics, and the coverage tests' identity.
+    #[allow(dead_code)]
+    name: &'static str,
+    /// The dotted wire paths this family owns — a top-level key for a
+    /// whole-key family, `container.field` for one that shares a container with
+    /// project-scoped siblings. No two rows may overlap
+    /// (`machine_scope_families_own_disjoint_keys`), which is what makes the
+    /// `promote` and `sync` legs order-independent.
+    #[allow(dead_code)]
+    keys: &'static [&'static str],
+    /// [`load`], on the overlay value before the merge.
+    overlay_strip: OverlayStrip,
+    /// [`load_readonly`], on the overlay value before the merge.
+    readonly_strip: OverlayStrip,
+    /// Why `readonly_strip` is [`OverlayStrip::Nothing`] — required exactly when
+    /// it is, so no family can be exempted by omission. The MCP registry's
+    /// exemption was exactly that omission until the V38 merge review found it.
+    #[allow(dead_code)]
+    readonly_exempt: Option<&'static str>,
+    /// [`load`]: fold a legacy overlay's copy into the global baseline. Returns
+    /// "the caller should persist".
+    promote: Option<fn(&mut Settings, &Value) -> bool>,
+    /// [`load`], **after `deep_merge`**: overwrite the merged view from the
+    /// (post-promotion) global baseline.
+    enforce: Option<fn(&mut Value, &Settings)>,
+    /// [`save`]: write the live value through to the physical global file.
+    /// Returns "the file is worth rewriting".
+    sync: Option<fn(&mut Settings, &Settings) -> bool>,
+    /// The dedicated out-of-band writer that stands in for `sync` — required
+    /// exactly when `sync` is `None`, because a machine-scope family with
+    /// neither is one the Settings window can edit and then never save.
+    #[allow(dead_code)]
+    sync_writer: Option<&'static str>,
+    /// [`save`]: normalize both diff sides so no overlay pins a copy.
+    diff_strip: OverlayStrip,
+}
+
+/// Every machine-scope settings family, in the order the legs walk them.
+const MACHINE_SCOPED: &[MachineScopedField] = &[
+    // The three whole-key bans first — see [`OVERLAY_BANNED_KEYS`] for why each
+    // is per-install state, and `sync_writer` for where an edit of it lands.
+    MachineScopedField {
+        name: "llm_pricing",
+        keys: &["llm_pricing"],
+        overlay_strip: OverlayStrip::Banned,
+        readonly_strip: OverlayStrip::Banned,
+        readonly_exempt: None,
+        promote: None,
+        enforce: None,
+        sync: None,
+        sync_writer: Some("write_global_llm_pricing"),
+        diff_strip: OverlayStrip::Banned,
+    },
+    MachineScopedField {
+        name: "harness_versions",
+        keys: &["harness_versions"],
+        overlay_strip: OverlayStrip::Banned,
+        readonly_strip: OverlayStrip::Banned,
+        readonly_exempt: None,
+        promote: None,
+        enforce: None,
+        sync: None,
+        sync_writer: Some("mutate_global_harness"),
+        diff_strip: OverlayStrip::Banned,
+    },
+    // V33: banned because the overlay file lives INSIDE the boundary this block
+    // configures. The write-through is what keeps it savable at all, which is
+    // the thing a plain ban would have broken.
+    MachineScopedField {
+        name: "sandbox",
+        keys: &["sandbox"],
+        overlay_strip: OverlayStrip::Banned,
+        readonly_strip: OverlayStrip::Banned,
+        readonly_exempt: None,
+        promote: None,
+        enforce: None,
+        sync: Some(sync_sandbox_into),
+        sync_writer: None,
+        diff_strip: OverlayStrip::Banned,
+    },
+    // Global libraries that ride two `offload` array fields: promoted once by
+    // name, then enforced over the merged view, so an overlay carries no
+    // authority and needs no strip on the LOAD leg.
+    MachineScopedField {
+        name: "offload_templates",
+        keys: &[
+            "offload.server_command_templates",
+            "offload.remote_backend_templates",
+        ],
+        overlay_strip: OverlayStrip::Nothing,
+        readonly_strip: OverlayStrip::Nothing,
+        readonly_exempt: Some(
+            "the MCP children never read the template libraries — they are a \
+             Settings-UI paste convenience with no consumer behind `load_readonly`",
+        ),
+        promote: Some(promote_overlay_offload_templates),
+        enforce: Some(enforce_global_offload_templates),
+        sync: Some(sync_offload_templates_into),
+        sync_writer: None,
+        diff_strip: OverlayStrip::Normalize(strip_offload_templates),
+    },
+    // V38: the first block whose two scopes interleave rather than separate by
+    // key, so the strip is structured and is an ALLOW-list. `promote` here is
+    // the one-time legacy `code_audit.tools` fold — the SOURCE key is not this
+    // family's (it is dead schema), the destination is.
+    MachineScopedField {
+        name: "tool_plugins",
+        keys: &["tool_plugins"],
+        overlay_strip: OverlayStrip::Named(strip_overlay_tool_plugins),
+        readonly_strip: OverlayStrip::Named(strip_overlay_tool_plugins),
+        readonly_exempt: None,
+        promote: Some(promote_overlay_audit_config),
+        enforce: None,
+        sync: Some(sync_tool_plugin_state_into),
+        sync_writer: None,
+        diff_strip: OverlayStrip::Named(strip_overlay_tool_plugins),
+    },
+    // V40 review M-2: the same structured strip for the per-harness map, whose
+    // scope is per FIELD — and a DENY-list, deliberately the opposite of
+    // `tool_plugins` (see [`OVERLAY_BANNED_HARNESS_FIELDS`]).
+    MachineScopedField {
+        name: "harness",
+        keys: &["harness"],
+        overlay_strip: OverlayStrip::Named(strip_overlay_harness),
+        readonly_strip: OverlayStrip::Named(strip_overlay_harness),
+        readonly_exempt: None,
+        promote: None,
+        enforce: None,
+        sync: Some(sync_harness_into),
+        sync_writer: None,
+        diff_strip: OverlayStrip::Named(strip_overlay_harness),
+    },
+    // V37 F5: the registry is global, activation is per-project. The one family
+    // whose two overlay legs differ, and the difference lives HERE rather than
+    // in either reader: `load` promotes and then enforces (healing the file on
+    // the way), `load_readonly` has no side effects to heal with and so removes
+    // the keys — with the removal function, never the `[]`-writing normalizer.
+    MachineScopedField {
+        name: "mcp_registry",
+        keys: &["offload.mcp_servers", "offload.mcp_categories"],
+        overlay_strip: OverlayStrip::Nothing,
+        readonly_strip: OverlayStrip::Named(strip_overlay_mcp_registry),
+        readonly_exempt: None,
+        promote: Some(promote_overlay_mcp_registry),
+        enforce: Some(enforce_global_mcp_registry),
+        sync: Some(sync_mcp_registry_into),
+        sync_writer: None,
+        diff_strip: OverlayStrip::Normalize(strip_mcp_registry),
+    },
+];
+
+/// [`load`]'s overlay leg: strip every machine-scope family from an overlay
+/// value before the merge, returning the dotted names the structured strips
+/// dropped (the whole-key bans name nothing — see [`OverlayStrip::Banned`]).
+///
+/// The wholesale ban runs first, then the rows in table order.
+fn strip_overlay_for_merge(v: &mut Value) -> Vec<String> {
+    strip_overlay_banned(v);
+    let mut dropped = Vec::new();
+    for row in MACHINE_SCOPED {
+        dropped.extend(row.overlay_strip.apply(v));
+    }
+    dropped
+}
+
+/// [`load_readonly`]'s overlay leg: the same table, this leg's cells. The
+/// caller discards the names — a lightweight subprocess has no Events lane, and
+/// the app's own [`load`] has already reported them.
+fn strip_overlay_for_readonly_merge(v: &mut Value) -> Vec<String> {
+    strip_overlay_banned(v);
+    let mut dropped = Vec::new();
+    for row in MACHINE_SCOPED {
+        dropped.extend(row.readonly_strip.apply(v));
+    }
+    dropped
+}
+
+/// [`load`]'s promote leg: fold a legacy overlay's copies into the global
+/// baseline. True ⇒ the caller must persist.
+///
+/// **Every promoter runs**, which is why the accumulation is `|=` and not a
+/// `||` chain over the calls. The pre-V42 site computed all three into locals
+/// and then OR'd them, so it ran them all too; a short-circuit here would skip
+/// a later family's one-time heal — and `promote_overlay_mcp_registry` returns
+/// true for "promoted nothing, but the overlay still carries a registry key",
+/// which is a rewrite request, not a no-op.
+fn promote_overlay_into_global(global: &mut Settings, overlay: &Value) -> bool {
+    let mut changed = false;
+    for row in MACHINE_SCOPED {
+        if let Some(promote) = row.promote {
+            changed |= promote(global, overlay);
+        }
+    }
+    changed
+}
+
+/// [`load`]'s enforce leg — **after `deep_merge`, never before**: overwrite the
+/// merged view's global-authority fields from the (post-promotion) baseline.
+fn enforce_global_machine_scope(merged: &mut Value, global: &Settings) {
+    for row in MACHINE_SCOPED {
+        if let Some(enforce) = row.enforce {
+            enforce(merged, global);
+        }
+    }
+}
+
+/// [`save`]'s write-through leg: copy every family's live value onto the
+/// on-disk global settings. True ⇒ the physical file is worth rewriting.
+///
+/// Every syncer runs, for the same reason every promoter does.
+fn sync_machine_scope_into(disk_global: &mut Settings, current: &Settings) -> bool {
+    let mut changed = false;
+    for row in MACHINE_SCOPED {
+        if let Some(sync) = row.sync {
+            changed |= sync(disk_global, current);
+        }
+    }
+    changed
+}
+
+/// [`save`]'s diff leg: normalize BOTH sides identically, so what is left is
+/// only what a project may legitimately carry and the diff can express the
+/// project's overrides and nothing else.
+///
+/// The structured strips' return values are discarded here: a strip of OUR OWN
+/// serialized value is not a user's hand edit, so there is nothing to warn
+/// about — the load path is where a warning belongs.
+fn strip_machine_scope_from_diff(current: &mut Value, baseline: &mut Value) {
+    strip_overlay_banned(current);
+    strip_overlay_banned(baseline);
+    for row in MACHINE_SCOPED {
+        let _ = row.diff_strip.apply(current);
+        let _ = row.diff_strip.apply(baseline);
     }
 }
 
@@ -1783,39 +2183,18 @@ fn strip_mcp_registry(v: &mut Value) {
 pub fn save(settings: &Settings, launch_cwd: &Path, global: &Settings) -> AppResult<()> {
     let path = custom_path(launch_cwd);
 
-    // The offload template libraries are machine-scope:
-    // write them through to the PHYSICAL global file (read-modify-write,
-    // every other field preserved — the `write_global_prompt_templates`
-    // pattern) so every project sees them, then normalize both diff sides
-    // below so no overlay pins a copy. Best-effort: a failed global write
-    // must not block the overlay save (the values stay live in memory and
-    // re-sync on the next save).
+    // Every machine-scope family's write-through, in one walk of
+    // [`MACHINE_SCOPED`]: copy the live values onto the PHYSICAL global file
+    // (read-modify-write, every other field preserved — the
+    // `write_global_prompt_templates` pattern) so every project sees them, then
+    // normalize both diff sides below so no overlay pins a copy. This is the
+    // ONLY place a Settings-window edit of one of them can land. Best-effort: a
+    // failed global write must not block the overlay save (the values stay live
+    // in memory and re-sync on the next save).
     if let Ok(gpath) = global_path() {
         if gpath.exists() {
             let mut disk = read_settings_or_default(&gpath);
-            let templates_changed = sync_offload_templates_into(&mut disk, settings);
-            // V37 F5: the MCP registry is global; only `mcp_activation` varies
-            // per project.
-            let registry_changed = sync_mcp_registry_into(&mut disk, settings);
-            // V33: `sandbox` is banned from overlays (it configures a boundary
-            // whose own writable area holds the overlay file), so the global
-            // file is the ONLY place a sandbox edit can land.
-            let sandbox_changed = sync_sandbox_into(&mut disk, settings);
-            // V38: the machine-scope halves of `tool_plugins` (enables,
-            // timeouts, both path maps). The overlay carries only the per-tool
-            // `variables`/`parameters`, so this is the only place the rest can
-            // land — see the block comment above `strip_overlay_tool_plugins`.
-            let plugins_changed = sync_tool_plugin_state_into(&mut disk, settings);
-            // V40 Phase B: the machine-scope half of the per-harness map.
-            // Stripped from overlays (`strip_overlay_harness`), so the global
-            // file is the ONLY place those fields can land.
-            let harness_changed = sync_harness_into(&mut disk, settings);
-            if templates_changed
-                || registry_changed
-                || sandbox_changed
-                || plugins_changed
-                || harness_changed
-            {
+            if sync_machine_scope_into(&mut disk, settings) {
                 if let Err(e) = save_to(&gpath, &disk) {
                     tracing::warn!(error = %e, "settings: machine-scope global write-through failed");
                 }
@@ -1827,25 +2206,7 @@ pub fn save(settings: &Settings, launch_cwd: &Path, global: &Settings) -> AppRes
         .map_err(|e| AppError::Settings(format!("serialize current: {e}")))?;
     let mut baseline = serde_json::to_value(global)
         .map_err(|e| AppError::Settings(format!("serialize global: {e}")))?;
-    strip_overlay_banned(&mut current);
-    strip_overlay_banned(&mut baseline);
-    strip_offload_templates(&mut current);
-    strip_offload_templates(&mut baseline);
-    // Both sides, identically: what remains under `tool_plugins` on either side
-    // is only `variables`/`parameters`, so the diff can express a project's
-    // overrides and nothing else. Return values ignored — a strip of OUR OWN
-    // serialized value is not a user's hand edit, so there is nothing to warn
-    // about; the load path is where a warning belongs.
-    let _ = strip_overlay_tool_plugins(&mut current);
-    let _ = strip_overlay_tool_plugins(&mut baseline);
-    // V40 review M-2: both sides, identically — what remains under `harness` on
-    // either side is only the project-settable half, so the diff can express a
-    // project's `ext` overrides and nothing else. `sync_harness_into` above is
-    // the only place the machine-scope half can land.
-    let _ = strip_overlay_harness(&mut current);
-    let _ = strip_overlay_harness(&mut baseline);
-    strip_mcp_registry(&mut current);
-    strip_mcp_registry(&mut baseline);
+    strip_machine_scope_from_diff(&mut current, &mut baseline);
 
     match diff(&current, &baseline) {
         Some(delta) => {
@@ -2310,10 +2671,14 @@ const RESERVED_TAB_SPECS: &[ReservedTabSpec] = &[
 /// *global* file, and V40 Phase I extended the cascade to the per-folder
 /// overlay too — but only from [`migration::MIN_OVERLAY_SCHEMA_VERSION`] up:
 /// an overlay older than that (or carrying no version at all) is deliberately
-/// left unmigrated rather than run through the presence-archaeology steps on a
-/// partial file, and re-introduces the entry through the merge. This list feeds
-/// the integrity check's fail-safe prune, which catches every source that
-/// survives: pre-v10 overlays, hand-edits, imported files.
+/// left unmigrated, because below the floor there are no steps left to run, and
+/// it re-introduces the entry through the merge. This list feeds the integrity
+/// check's fail-safe prune, which catches every source that survives:
+/// below-floor overlays, hand-edits, imported files.
+///
+/// V42 R9 note: the GLOBAL side of this is now stricter than "the migrations
+/// prune them" — a below-floor global file is quarantined and reseeded rather
+/// than pruned. The overlay is the leg that still needs the fail-safe.
 const RETIRED_TAB_IDS: [&str; 4] = [
     OFFLOAD_SERVER_TAB_ID,
     CODE_QUALITY_TAB_ID,
@@ -3837,6 +4202,175 @@ mod tests {
         );
     }
 
+    // ── The migration floor (V42 R9, issue #120) ───────────────────────────
+
+    /// A scratch directory that removes itself, so a floor test can write a real
+    /// global file and then look at what ends up beside it.
+    struct FloorDir(PathBuf);
+    impl FloorDir {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("cimp_{tag}_{}", uuid::Uuid::new_v4()));
+            fs::create_dir_all(&dir).expect("create scratch dir");
+            Self(dir)
+        }
+        fn settings_json(&self) -> PathBuf {
+            self.0.join("settings.json")
+        }
+        fn baks(&self) -> Vec<String> {
+            let mut out: Vec<String> = fs::read_dir(&self.0)
+                .expect("read scratch dir")
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.ends_with(".bak"))
+                .collect();
+            out.sort();
+            out
+        }
+    }
+    impl Drop for FloorDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn floor_shell() -> ShellSpec {
+        ShellSpec {
+            command: PathBuf::from("/bin/bash"),
+            args: vec!["-i".to_string()],
+        }
+    }
+
+    /// **A file too old to migrate is set aside, not read.**
+    ///
+    /// Both below-floor shapes at once — an old stamp, and (the case that needed
+    /// deciding) no stamp at all. Three claims, and the first is the one that
+    /// matters most to the user: their file still exists, byte for byte, at a
+    /// path the log names. Then: defaults are in its place, so the app launches.
+    /// And nothing of the old file leaked into them.
+    #[test]
+    fn a_below_floor_global_file_is_moved_aside_intact_and_defaults_reseeded() {
+        for (tag, original) in [
+            (
+                "floor_v20",
+                b"{\r\n \"schema_version\":20,\n\t\"tabs\": [] }\n".to_vec(),
+            ),
+            // Pre-v1.10: `schema_version` did not exist yet. Valid JSON, no
+            // stamp, and the shape the deleted `looks_v1` detector recognised.
+            (
+                "floor_nostamp",
+                br#"{"claude_code": {"command": "claude"}}"#.to_vec(),
+            ),
+        ] {
+            let dir = FloorDir::new(tag);
+            let path = dir.settings_json();
+            fs::write(&path, &original).unwrap();
+            let value: Value = serde_json::from_slice(&original).expect("valid JSON, just old");
+
+            let reseeded = reseed_below_floor(&path, &value, &floor_shell())
+                .expect("a below-floor file is handled here, not by the cascade");
+
+            let baks = dir.baks();
+            assert_eq!(baks.len(), 1, "exactly one quarantine file: {baks:?}");
+            assert!(
+                baks[0].contains(".outdated."),
+                "it says why it was set aside, and it does not say 'corrupted': {baks:?}"
+            );
+            assert_eq!(
+                fs::read(dir.0.join(&baks[0])).unwrap(),
+                original,
+                "the user's settings file must survive byte for byte — the floor sets it aside, \
+                 it never rewrites it and never deletes it"
+            );
+
+            // …and the app has something to launch on.
+            let on_disk: Settings =
+                serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(
+                on_disk.schema_version,
+                crate::settings::schema::CURRENT_SCHEMA_VERSION,
+                "the reseeded file is stamped CURRENT, so the next launch is an ordinary one"
+            );
+            assert_eq!(
+                serde_json::to_value(&on_disk).unwrap(),
+                serde_json::to_value(&reseeded).unwrap(),
+                "what was returned to the caller is what was written"
+            );
+            assert!(
+                !on_disk.tabs.is_empty(),
+                "seeded defaults, not a bare `Settings::default()`"
+            );
+        }
+    }
+
+    /// The floor retires steps; it does not stop the ladder. A file **at** the
+    /// floor is left alone here and goes on to the cascade like any other.
+    #[test]
+    fn a_global_file_at_or_above_the_floor_is_left_to_the_cascade() {
+        let dir = FloorDir::new("floor_ok");
+        let path = dir.settings_json();
+        for version in [
+            migration::MIN_GLOBAL_SCHEMA_VERSION,
+            crate::settings::schema::CURRENT_SCHEMA_VERSION as u64,
+        ] {
+            let original = format!(r#"{{"schema_version": {version}}}"#).into_bytes();
+            fs::write(&path, &original).unwrap();
+            let value: Value = serde_json::from_slice(&original).unwrap();
+
+            assert!(
+                reseed_below_floor(&path, &value, &floor_shell()).is_none(),
+                "v{version} is at or above the floor and must reach the migration cascade"
+            );
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                original,
+                "and it must not have been touched on the way"
+            );
+            assert!(dir.baks().is_empty(), "no quarantine: {:?}", dir.baks());
+        }
+    }
+
+    /// **A fresh install is not a quarantine case, and the ORDER is what makes
+    /// that true.**
+    ///
+    /// "States no schema version" is below the floor — that is the pre-v1.10
+    /// file. A brand-new install states no version either, for the entirely
+    /// different reason that it has no file. The two are told apart by position:
+    /// `load_global` seeds a missing file and returns before the floor is ever
+    /// consulted. Structural because there is no way to reach `load_global` from
+    /// a unit test — it resolves its own path from the running exe.
+    /// Newline-agnostic: CI checks this tree out with CRLF.
+    #[test]
+    fn the_fresh_install_branch_runs_before_the_floor() {
+        let src = include_str!("persistence.rs");
+        let start = src
+            .find("fn load_global(")
+            .expect("`load_global` is gone — re-point this test");
+        let body = &src[start..];
+        let body = &body[..body.find("\n}").unwrap_or(body.len())];
+
+        let seed_at = body
+            .find("if !path.exists()")
+            .expect("`load_global` must seed defaults for a missing file");
+        let floor_at = body
+            .find("reseed_below_floor")
+            .expect("`load_global` must enforce the migration floor, or a file it cannot migrate \
+                     is parsed anyway and silently defaulted");
+        let migrate_at = body
+            .find("migrate_if_needed")
+            .expect("`load_global` must still run the cascade");
+        assert!(
+            seed_at < floor_at,
+            "the fresh-install branch must come FIRST: an absent file states no schema version, \
+             which is exactly what a pre-v1.10 file looks like, and quarantining a brand-new \
+             install would be nonsense"
+        );
+        assert!(
+            floor_at < migrate_at,
+            "the floor must come BEFORE the cascade: after it, a below-floor file has already \
+             fallen through every remaining detector and been force-stamped as current"
+        );
+    }
+
     /// **Tests only** — drop the overlay's schema stamp, asserting it was
     /// there.
     ///
@@ -3927,8 +4461,11 @@ mod tests {
         );
         assert!(loaded.checks_auto_configure);
 
-        // A config predating Phase D (neither key) defaults both to false.
-        let old: Settings = serde_json::from_str(r#"{"schema_version": 21}"#).unwrap();
+        // A config carrying neither key defaults both to false — stamped at the
+        // migration floor, the oldest file this build still loads (V42 R9
+        // rebased it from v21, which is below the floor and never reaches the
+        // typed container at all).
+        let old: Settings = serde_json::from_str(r#"{"schema_version": 30}"#).unwrap();
         assert!(!old.checks_suggestion_dismissed);
         assert!(!old.checks_auto_configure);
 
@@ -4396,7 +4933,7 @@ mod tests {
     }
 
     /// **The two settings readers must strip the overlay the same way**
-    /// (V38 Phase D).
+    /// (V38 Phase D; re-pointed at the table by V42 R5, issue #116).
     ///
     /// `run_check` is answered from more than one PROCESS: the app (through
     /// [`load`]) and the `cimp --offload-mcp` child (through [`load_readonly`]).
@@ -4405,18 +4942,21 @@ mod tests {
     /// values — which ride the project overlay. If one reader applied a
     /// different rule to `tool_plugins`, the same check would run with this
     /// project's values on one leg and the machine's on the other, with nothing
-    /// anywhere to notice. They stay identical by calling ONE function; this
-    /// pins that they still do, at the only level a test can see it without a
-    /// real global settings file on disk.
+    /// anywhere to notice. They stay identical by walking ONE TABLE, and by
+    /// every family both legs strip structurally naming the SAME function in
+    /// both of its cells. Both halves are pinned here.
     ///
     /// The same claim covers the V37 **MCP registry** (V38 merge review). The
     /// two readers do not handle it identically and must not: `load` promotes
     /// an overlay's servers/categories into the global baseline and then
     /// enforces the global arrays over the merged view, healing the file on the
     /// way; `load_readonly` has no side effects to heal with, so it removes the
-    /// keys. What is pinned here is that NEITHER reader simply merges them —
-    /// the state this test was written against, in which a project overlay's
-    /// `offload.mcp_servers` reached the `cimp --offload-mcp` child untouched.
+    /// keys. Since V42 that difference lives in the ROW rather than in either
+    /// reader's body. What is pinned here is that NEITHER reader simply merges
+    /// them — the state this test was written against, in which a project
+    /// overlay's `offload.mcp_servers` reached the `cimp --offload-mcp` child
+    /// untouched — and that the read-only leg REMOVES the keys where the diff
+    /// leg empties them.
     ///
     /// Newline-agnostic: CI checks this tree out with CRLF.
     #[test]
@@ -4427,19 +4967,14 @@ mod tests {
             (
                 "pub fn load(",
                 &[
-                    "strip_overlay_tool_plugins",
-                    "strip_overlay_harness",
-                    "promote_overlay_mcp_registry",
-                    "enforce_global_mcp_registry",
+                    "strip_overlay_for_merge",
+                    "promote_overlay_into_global",
+                    "enforce_global_machine_scope",
                 ],
             ),
             (
                 "pub fn load_readonly(",
-                &[
-                    "strip_overlay_tool_plugins",
-                    "strip_overlay_harness",
-                    "strip_overlay_mcp_registry",
-                ],
+                &["strip_overlay_for_readonly_merge"],
             ),
         ];
         for (sig, needles) in required {
@@ -4452,22 +4987,424 @@ mod tests {
             for needle in needles {
                 assert!(
                     body.contains(needle),
-                    "`{sig}` must name `{needle}`: the machine-scope blocks (`tool_plugins`, the \
-                     MCP registry) are never authority an overlay can carry, and a reader that \
-                     merged one of them straight through would answer differently from the other"
+                    "`{sig}` must reach the machine-scope families through `{needle}`: they are \
+                     never authority an overlay can carry, and a reader that merged one of them \
+                     straight through would answer differently from the other. Walk \
+                     `MACHINE_SCOPED`; do not hand-enumerate families here again"
                 );
             }
         }
+
+        // The half a source scan cannot see: where both legs strip a family
+        // structurally, they must strip it with the SAME function.
+        for row in MACHINE_SCOPED {
+            if let (OverlayStrip::Named(on_load), OverlayStrip::Named(on_readonly)) =
+                (&row.overlay_strip, &row.readonly_strip)
+            {
+                assert!(
+                    *on_load as *const () == *on_readonly as *const (),
+                    "`{}`: the two readers strip it with different functions, so the same check \
+                     could run with this project's values on one leg and the machine's on the \
+                     other",
+                    row.name
+                );
+            }
+        }
+
         // The load-side removal must never be the SAVE-side normalizer: that
-        // one INSERTS `[]`, and `deep_merge` replaces arrays wholesale.
-        let start = src.find("pub fn load_readonly(").unwrap();
-        let body = &src[start..];
-        let end = body.find("\n}").unwrap_or(body.len());
-        assert!(
-            !body[..end].contains("strip_mcp_registry(&mut overlay)"),
+        // one INSERTS `[]`, and `deep_merge` replaces arrays wholesale. Pinned
+        // by BEHAVIOUR rather than by the absence of a call — the read-only leg
+        // must leave the registry keys ABSENT, the diff leg present-and-empty.
+        let mut overlay = serde_json::json!({
+            "offload": { "mcp_servers": [{ "name": "attacker" }], "mcp_categories": [] }
+        });
+        let _ = strip_overlay_for_readonly_merge(&mut overlay);
+        assert_eq!(
+            overlay,
+            serde_json::json!({ "offload": {} }),
             "`load_readonly` must REMOVE the registry keys, not normalize them to `[]` — an \
              empty array in the overlay would erase the global registry through the merge"
         );
+        let mut current = serde_json::json!({ "offload": { "mcp_servers": [{ "name": "real" }] } });
+        let mut baseline = current.clone();
+        strip_machine_scope_from_diff(&mut current, &mut baseline);
+        assert_eq!(
+            current["offload"]["mcp_servers"],
+            serde_json::json!([]),
+            "the SAVE side normalizes to `[]` on BOTH sides, so the diff cancels instead of \
+             pinning a copy in the overlay"
+        );
+    }
+
+    /// **The per-leg row order is frozen** (V42 R5).
+    ///
+    /// The table replaced hand-enumerated call sites, and the three strip legs
+    /// reproduce their exact pre-V42 order: the whole-key bans first (a
+    /// documented invariant — [`strip_overlay_banned`] runs before the
+    /// structured strips), then the structured strips in this order. The
+    /// `promote` and `sync` legs are in TABLE order rather than their pre-V42
+    /// order, which is only safe because the families own disjoint keys
+    /// (`machine_scope_families_own_disjoint_keys`) — this test is where that
+    /// re-ordering is recorded, so a future change to it is a decision and not
+    /// an accident.
+    #[test]
+    fn machine_scope_phase_order_is_pinned() {
+        fn names(sel: fn(&MachineScopedField) -> bool) -> Vec<&'static str> {
+            MACHINE_SCOPED
+                .iter()
+                .filter(|r| sel(r))
+                .map(|r| r.name)
+                .collect()
+        }
+        assert_eq!(
+            MACHINE_SCOPED.iter().map(|r| r.name).collect::<Vec<_>>(),
+            [
+                "llm_pricing",
+                "harness_versions",
+                "sandbox",
+                "offload_templates",
+                "tool_plugins",
+                "harness",
+                "mcp_registry",
+            ],
+            "a new family belongs here too — this list is the RECORD of the order three legs              run in, so both adding and re-ordering one are decisions someone confirms"
+        );
+        assert_eq!(
+            names(|r| matches!(r.overlay_strip, OverlayStrip::Named(_))),
+            ["tool_plugins", "harness"],
+            "`load`'s structured strips, in the order `load` ran them before V42"
+        );
+        assert_eq!(
+            names(|r| matches!(r.readonly_strip, OverlayStrip::Named(_))),
+            ["tool_plugins", "harness", "mcp_registry"],
+            "`load_readonly`'s structured strips, in the order it ran them before V42"
+        );
+        assert_eq!(
+            names(|r| !matches!(
+                r.diff_strip,
+                OverlayStrip::Nothing | OverlayStrip::Banned
+            )),
+            ["offload_templates", "tool_plugins", "harness", "mcp_registry"],
+            "`save`'s diff normalizers, in the order it ran them before V42"
+        );
+        assert_eq!(
+            names(|r| r.promote.is_some()),
+            ["offload_templates", "tool_plugins", "mcp_registry"],
+            "`load`'s promoters — table order, not the pre-V42 order (safe: disjoint keys)"
+        );
+        assert_eq!(
+            names(|r| r.enforce.is_some()),
+            ["offload_templates", "mcp_registry"],
+            "`load`'s enforcers, which run AFTER `deep_merge`"
+        );
+        assert_eq!(
+            names(|r| r.sync.is_some()),
+            [
+                "sandbox",
+                "offload_templates",
+                "tool_plugins",
+                "harness",
+                "mcp_registry",
+            ],
+            "`save`'s write-throughs — table order, not the pre-V42 order (safe: disjoint keys)"
+        );
+    }
+
+    /// **No cell of a machine-scope family may be empty by omission** (V42 R5).
+    ///
+    /// This is the tripwire the sixteen hand-written functions did not have.
+    /// The failure mode of a missed cell is silent — machine state leaking into
+    /// a portable overlay, or a setting the Settings window can edit and never
+    /// save — and it shipped twice (V38 `tool_plugins`, V40 review M-2
+    /// `harness`). Every optional cell here is either filled or paired with a
+    /// written reason, and the pairing is asserted both ways.
+    #[test]
+    fn every_machine_scoped_family_fills_or_explains_every_cell() {
+        for row in MACHINE_SCOPED {
+            let name = row.name;
+            assert!(
+                !row.keys.is_empty(),
+                "`{name}`: a family with no keys cannot be classified"
+            );
+            // An overlay can never carry it into the APP's merged view: either
+            // it is stripped, or the global baseline is promoted-then-enforced
+            // over it.
+            assert!(
+                !matches!(row.overlay_strip, OverlayStrip::Nothing)
+                    || (row.promote.is_some() && row.enforce.is_some()),
+                "`{name}`: `load` neither strips it nor promotes-and-enforces it, so a project \
+                 overlay's copy reaches the merged view"
+            );
+            // ...nor into a READ-ONLY child's, and an exemption must say why.
+            assert_eq!(
+                matches!(row.readonly_strip, OverlayStrip::Nothing),
+                row.readonly_exempt.is_some(),
+                "`{name}`: `readonly_exempt` must be set exactly when `readonly_strip` is \
+                 `Nothing` — the MCP registry was exempt by omission until the V38 merge review \
+                 found it reaching the `cimp --offload-mcp` child untouched"
+            );
+            // ...and an edit of it must have somewhere to land.
+            assert_eq!(
+                row.sync.is_none(),
+                row.sync_writer.is_some(),
+                "`{name}`: a machine-scope family with neither a `sync` write-through nor a named \
+                 out-of-band writer is one the Settings window can edit and then never save"
+            );
+            // The diff side is always normalized — otherwise the overlay pins a
+            // copy the next launch honours.
+            assert!(
+                !matches!(row.diff_strip, OverlayStrip::Nothing),
+                "`{name}`: `save` would write it into the project overlay"
+            );
+            // A `[]`-writing normalizer on an overlay leg would ERASE the
+            // global value through `deep_merge`, not ignore the overlay's.
+            assert!(
+                !matches!(row.overlay_strip, OverlayStrip::Normalize(_))
+                    && !matches!(row.readonly_strip, OverlayStrip::Normalize(_)),
+                "`{name}`: a diff-side normalizer is not an overlay-side strip — see \
+                 `the_save_side_normalizer_would_erase_the_global_registry_on_the_load_side`"
+            );
+        }
+    }
+
+    /// **The families own disjoint keys** — which is what makes the `promote`
+    /// and `sync` legs order-independent, and therefore what makes it safe for
+    /// those two legs to run in table order rather than their pre-V42 order
+    /// (see `machine_scope_phase_order_is_pinned`).
+    #[test]
+    fn machine_scope_families_own_disjoint_keys() {
+        let owned: Vec<(&str, &str)> = MACHINE_SCOPED
+            .iter()
+            .flat_map(|r| r.keys.iter().map(move |k| (r.name, *k)))
+            .collect();
+        for (i, (a_name, a)) in owned.iter().enumerate() {
+            for (b_name, b) in &owned[i + 1..] {
+                let overlaps = a == b
+                    || b.starts_with(&format!("{a}."))
+                    || a.starts_with(&format!("{b}."));
+                assert!(
+                    !overlaps,
+                    "`{a_name}` owns `{a}` and `{b_name}` owns `{b}`: overlapping families make \
+                     the promote/sync legs order-dependent, and one of them would silently win"
+                );
+            }
+        }
+    }
+
+    /// The whole-key bans are a marker on the row plus one wholesale pass; this
+    /// keeps the two from drifting apart. A row marked
+    /// [`OverlayStrip::Banned`] whose key is not in [`OVERLAY_BANNED_KEYS`]
+    /// would not be stripped at all.
+    #[test]
+    fn the_banned_rows_and_overlay_banned_keys_agree() {
+        let banned: Vec<&str> = MACHINE_SCOPED
+            .iter()
+            .filter(|r| matches!(r.overlay_strip, OverlayStrip::Banned))
+            .flat_map(|r| r.keys.iter().copied())
+            .collect();
+        assert_eq!(
+            banned, OVERLAY_BANNED_KEYS,
+            "every `Banned` row's keys must be in `OVERLAY_BANNED_KEYS`, in the same order — the \
+             marker does not strip anything by itself"
+        );
+        for row in MACHINE_SCOPED {
+            let is_banned = matches!(row.overlay_strip, OverlayStrip::Banned);
+            assert_eq!(
+                is_banned,
+                matches!(row.readonly_strip, OverlayStrip::Banned)
+                    && matches!(row.diff_strip, OverlayStrip::Banned),
+                "`{}`: a whole-key ban applies to all three legs or to none — a family banned on \
+                 one leg and merged on another is the leak this table exists to prevent",
+                row.name
+            );
+        }
+    }
+
+    /// Top-level `Settings` keys a project overlay may carry IN FULL — the
+    /// other half of the classification `every_top_level_setting_declares_its_scope`
+    /// enforces. Not "harmless": several of these have out-of-band global
+    /// readers too (`prompt_templates`), but nothing in them is machine scope
+    /// in the sense the table means — an overlay's copy is the project's answer
+    /// and is honoured.
+    const OVERLAY_CARRYABLE_KEYS: &[&str] = &[
+        "schema_version",
+        "tts",
+        "stt",
+        "avatar",
+        "display",
+        "behavior",
+        "usage",
+        "system_stats",
+        "compose",
+        "shortcuts",
+        "tabs",
+        "processing",
+        "session",
+        "layout",
+        "layout_presets",
+        "ui",
+        "terminal",
+        "external_tools",
+        "graph",
+        "workbench",
+        "delegation",
+        "checks",
+        "checks_auto_configure",
+        "checks_suggestion_dismissed",
+        "checks_allow_remote_worker",
+        "enabled_ai_tabs",
+        "logging",
+        "prompt_templates",
+        "templates_seeded",
+        "pricing_seeded_generation",
+        "advisor_dismissed",
+        "advisor_applied",
+        "preview_last_url",
+        "preview_allow_remote",
+        "code_audit",
+    ];
+
+    /// **A new top-level settings key must declare its scope** (V42 R5).
+    ///
+    /// The point of the table is that the NEXT machine-scope family cannot
+    /// forget a cell. This is the step before that: it cannot be added without
+    /// anyone noticing it is a family at all. A key that is neither owned by a
+    /// [`MACHINE_SCOPED`] row nor listed in [`OVERLAY_CARRYABLE_KEYS`] fails
+    /// here, and the author has to answer the question `tool_plugins` and
+    /// `harness` were both shipped without answering.
+    ///
+    /// Granularity is the top-level key. Inside a container the table already
+    /// splits, the container's own rule decides a newly added field:
+    /// `tool_plugins`' strip is an ALLOW-list (a new field is machine scope by
+    /// default — fails safe), `harness`' is a DENY-list (project by default,
+    /// deliberately — see [`OVERLAY_BANNED_HARNESS_FIELDS`]), and `offload`
+    /// gets its own classification test below because it is the one mixed
+    /// container that fails OPEN.
+    #[test]
+    fn every_top_level_setting_declares_its_scope() {
+        let value = serde_json::to_value(Settings::default()).expect("Settings serializes");
+        let on_the_wire: Vec<String> = value
+            .as_object()
+            .expect("Settings is an object")
+            .keys()
+            .cloned()
+            .collect();
+        let machine: Vec<&str> = MACHINE_SCOPED
+            .iter()
+            .flat_map(|r| r.keys.iter())
+            .map(|k| k.split('.').next().expect("a non-empty key"))
+            .collect();
+
+        for key in &on_the_wire {
+            let is_machine = machine.contains(&key.as_str());
+            let is_project = OVERLAY_CARRYABLE_KEYS.contains(&key.as_str());
+            assert!(
+                is_machine != is_project,
+                "`{key}` does not declare its scope. Either it is per-install / per-machine state \
+                 — add a `MACHINE_SCOPED` row, which forces you to answer the strip, promote, \
+                 enforce, sync and diff questions for it — or a project overlay may carry it, in \
+                 which case add it to `OVERLAY_CARRYABLE_KEYS`. Machine state that rides the \
+                 overlay leaks this machine's paths, tokens and boundaries into a portable file."
+            );
+        }
+        for key in OVERLAY_CARRYABLE_KEYS {
+            assert!(
+                on_the_wire.iter().any(|k| k == key),
+                "`{key}` is listed as overlay-carryable but is not a `Settings` field any more"
+            );
+        }
+        for key in machine {
+            assert!(
+                on_the_wire.iter().any(|k| k == key),
+                "`{key}` is owned by a `MACHINE_SCOPED` row but is not a `Settings` field any more"
+            );
+        }
+    }
+
+    /// `offload` sub-keys a project overlay may carry — see
+    /// `every_offload_field_declares_its_scope`.
+    const OVERLAY_CARRYABLE_OFFLOAD_KEYS: &[&str] = &[
+        "enabled",
+        "autostart",
+        "inject_guidance",
+        "server_command",
+        "tools",
+        "allowed_roots",
+        "command_allowlist",
+        "command_policies",
+        "mcp_activation",
+        "mcp_health_interval_secs",
+        "backends",
+        "budget_high_water_pct",
+        "per_tool_result_token_cap",
+        "max_steps",
+        "offload_timeout_secs",
+        "global_concurrency",
+        "max_queue_depth",
+        "escalate_partial",
+        "session_push",
+        "external_fetch_max_calls",
+        "external_fetch_max_bytes",
+        "detection_signature_enabled",
+        "detection_classifier_enabled",
+        "detection_classifier_threshold",
+        "detection_update_rules_mode",
+        "detection_update_interval_hours",
+        "detection_update_manifest_url",
+        "native_web_visibility",
+        "injection",
+    ];
+
+    /// **The same question, one level down, for the one container that fails
+    /// open** (V42 R5).
+    ///
+    /// `offload` is the only settings container that holds both project-scoped
+    /// fields and machine-scope ones split out by key — and unlike
+    /// `tool_plugins` (allow-list strip) a newly added `offload` field rides
+    /// the overlay by default. Both of the families that were carved out of it
+    /// (`offload_templates`, `mcp_registry`) were found the same way: a user
+    /// reporting that a global edit was invisible inside one project. This
+    /// makes the next one a test failure instead.
+    #[test]
+    fn every_offload_field_declares_its_scope() {
+        let value = serde_json::to_value(crate::settings::OffloadSettings::default())
+            .expect("OffloadSettings serializes");
+        let on_the_wire: Vec<String> = value
+            .as_object()
+            .expect("OffloadSettings is an object")
+            .keys()
+            .cloned()
+            .collect();
+        let machine: Vec<&str> = MACHINE_SCOPED
+            .iter()
+            .flat_map(|r| r.keys.iter())
+            .filter_map(|k| k.strip_prefix("offload."))
+            .collect();
+
+        for key in &on_the_wire {
+            let is_machine = machine.contains(&key.as_str());
+            let is_project = OVERLAY_CARRYABLE_OFFLOAD_KEYS.contains(&key.as_str());
+            assert!(
+                is_machine != is_project,
+                "`offload.{key}` does not declare its scope. A global library or registry belongs \
+                 in a `MACHINE_SCOPED` row (`diff` replaces arrays WHOLESALE, so the first \
+                 project the user touches pins a snapshot of it and every later global edit is \
+                 invisible there); anything the project legitimately varies goes in \
+                 `OVERLAY_CARRYABLE_OFFLOAD_KEYS`."
+            );
+        }
+        for key in OVERLAY_CARRYABLE_OFFLOAD_KEYS {
+            assert!(
+                on_the_wire.iter().any(|k| k == key),
+                "`offload.{key}` is listed as overlay-carryable but is not a field any more"
+            );
+        }
+        for key in machine {
+            assert!(
+                on_the_wire.iter().any(|k| k == key),
+                "`offload.{key}` is owned by a `MACHINE_SCOPED` row but is not a field any more"
+            );
+        }
     }
 
     /// **A project overlay's MCP registry cannot reach a read-only snapshot**
@@ -4906,7 +5843,7 @@ mod tests {
 
     // --- F-19: built-in price rows reach EXISTING installs ---------------
 
-    /// A settings file written before this field existed must read back as
+    /// A settings file that does not carry this field must read back as
     /// generation 0, not as `PRICING_GENERATION`.
     ///
     /// This is the whole fix in one assertion. `Settings` carries a
@@ -4918,7 +5855,9 @@ mod tests {
     /// built-in row.
     #[test]
     fn a_settings_file_without_the_watermark_reads_as_generation_zero() {
-        let s: Settings = serde_json::from_str(r#"{"schema_version": 29}"#).unwrap();
+        // Stamped at the migration floor — the oldest file this build still
+        // loads. V42 R9 rebased it from v29, which is below the floor.
+        let s: Settings = serde_json::from_str(r#"{"schema_version": 30}"#).unwrap();
         assert_eq!(
             s.pricing_seeded_generation, 0,
             "a file predating the watermark must look like generation 0, or the \

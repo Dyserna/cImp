@@ -294,7 +294,7 @@ async fn consume(
 /// this tap cannot parse is exactly the drift signal that must not be silent —
 /// but a *single* bad line in an otherwise healthy stream is noise. First skip
 /// per CONNECTION warns (visible at the shipped Info level, see
-/// `settings/schema.rs`'s default); every later one carries the running count at
+/// `settings/schema/mod.rs`'s default); every later one carries the running count at
 /// debug. Same posture as `claude::parse_transcript_line`'s per-file throttle.
 fn log_unparseable_payload(ctx: &OobContext, count: u64, payload: &str, err: &serde_json::Error) {
     let prefix: String = payload.chars().take(120).collect();

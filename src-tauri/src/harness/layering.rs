@@ -1099,7 +1099,7 @@ fn harness_modules_do_not_import_capabilities() {
 const IDENTITY_ALLOWLIST: &[(&str, &str)] = &[
     // ── settings: persisted wire forms and frozen migrations ───────────────
     (
-        "settings/schema.rs",
+        "settings/schema/mod.rs",
         "PERSISTED WIRE FORMS, and after Phase B that is ALL that is left. `CLAUDE_TAB_ID` / \
          `CLAUDE_LOCAL_TAB_ID` / `OPENCODE_TAB_ID` and `AiTabId`'s serde renames are what is on \
          disk in every user's settings file, and `RETIRED_TAB_IDS` is a migration input; locked \
@@ -1109,7 +1109,12 @@ const IDENTITY_ALLOWLIST: &[(&str, &str)] = &[
          the ORDER (`canonical_ai_tab_order` is a registry view) and the ranking; Phase B took \
          every per-harness FIELD (`claude_local`, `statusline`, `expose_commands_*`, \
          `code_audit.expose_*`, `claude_access`/`opencode_access`, `harness_versions.*`) into \
-         `Settings::harness` and the plugins' `ext`.",
+         `Settings::harness` and the plugins' `ext`. V42 R10 split `settings/schema.rs` into a \
+         directory, and this row followed the three constants into `schema/mod.rs`: it is the \
+         ONLY file in that tree that still spells a harness, because the seeded tabs read the \
+         constants rather than restating them. The reverse check \
+         (`every_identity_allowlist_entry_is_still_earning_it`) is what would have caught the \
+         re-point going stale.",
     ),
     // ── state: a persisted tab id is a persisted tab id ────────────────────
     //

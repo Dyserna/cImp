@@ -12,7 +12,7 @@
 //!
 //! So it does **not** live behind `HarnessPlugin` (a plugin that owned it would
 //! have to be asked "what does Anthropic charge" by a code path that has no
-//! harness in hand), and it does not live in `settings/schema.rs` either, where
+//! harness in hand), and it does not live in `settings/schema/` either, where
 //! it was the largest single block of vendor data inside the persisted-shape
 //! module. It lives here, on its own, with the two functions that are its whole
 //! interface:
@@ -24,7 +24,7 @@
 //!   reaching fresh installs only.
 //!
 //! The persisted row type itself ([`crate::settings::LlmPricingModel`]) stays in
-//! `settings/schema.rs`: it is an on-disk shape the user edits in Settings, not
+//! `settings/schema/mod.rs`: it is an on-disk shape the user edits in Settings, not
 //! vendor data.
 
 use crate::settings::LlmPricingModel;

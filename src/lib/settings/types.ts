@@ -2,7 +2,7 @@
 // that codegen cannot produce.
 //
 // V42 Phase E replaced ~1,850 lines of hand-written interfaces here with
-// `./generated/settings.ts`, emitted from `src-tauri/src/settings/schema.rs`
+// `./generated/settings.ts`, emitted from `src-tauri/src/settings/schema/`
 // by `settings::codegen` (ts-rs) and committed. CI regenerates and diffs it, so
 // the mirror can no longer drift — the failure mode this file existed in for
 // three years. Field names are still snake_case (serde's output) and optional
@@ -18,7 +18,7 @@
 //     (`crate::checks`), the Harness-health family (`harness::health`,
 //     `harness::chp`), `AuditDetectResult` (`audit`), the `Checks*` IPC
 //     payloads (`ipc::commands`). Phase E's scope was the `Settings` tree in
-//     `schema.rs`; these keep their own `include_str!` tripwires.
+//     the `schema/` tree; these keep their own `include_str!` tripwires.
 //   * **TS-only aliases** derived FROM the generated types (never restating
 //     them) — see the block under the re-export.
 
@@ -127,7 +127,7 @@ export function setHarnessExt(
 ///
 /// V40 Phase F: this file is on the frontend identity allowlist for exactly
 /// this constant and the reason above — the same rule Rust's
-/// `IDENTITY_ALLOWLIST` applies to `settings/schema.rs`. Nothing reads it as an
+/// `IDENTITY_ALLOWLIST` applies to `settings/schema/mod.rs`. Nothing reads it as an
 /// identity: which harness owns the feature is `harness_list`'s
 /// `scoped_features`.
 export const HARNESS_NATIVE_GATE_KEY = 'opencode_native_gate';
@@ -337,7 +337,7 @@ export function isBackgroundDisabled(
 /// `settings-changed` broadcast arrives. Deliberately NOT the real version.
 ///
 /// There used to be a `CURRENT_SCHEMA_VERSION = 21` here, described as
-/// mirroring `src-tauri/src/settings/schema.rs`. It drifted to nine versions
+/// mirroring `src-tauri/src/settings/schema/mod.rs`. It drifted to nine versions
 /// behind (the Rust constant reached 31 in V33 Phase E) without anything
 /// noticing — which is the proof that no frontend logic depends on it. A
 /// mirror that nothing checks does not stay a mirror, and a number that is
@@ -735,7 +735,7 @@ export interface AuditDetectResult {
 
 /// V8-02: native + MCP tool names treated as local-data (denied to cloud
 /// backends by default). Mirrors Rust `LOCAL_DATA_TOOLS`
-/// (`src-tauri/src/settings/schema.rs`) — kept in the same order so the two are
+/// (`src-tauri/src/settings/schema/mcp.rs`) — kept in the same order so the two are
 /// diffable by eye.
 ///
 /// **This is a hand-mirrored constant with no compile-time link to the Rust

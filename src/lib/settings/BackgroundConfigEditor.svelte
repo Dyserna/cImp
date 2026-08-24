@@ -18,7 +18,7 @@
   // V1.4-04 B.4: presets are read from the global settings store, not
   // from the bound `config`. The bound config can itself be a per-tab
   // override (which carries an empty `presets: []` for wire-format
-  // reasons — see `BackgroundOverride` doc note in schema.rs). The
+  // reasons — see `BackgroundOverride` doc note in schema/ui.rs). The
   // user-facing preset library is global only.
   let presets = $derived($settingsStore.terminal.background.presets);
 

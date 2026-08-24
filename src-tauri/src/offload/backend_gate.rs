@@ -418,10 +418,12 @@ mod tests {
     /// that a config file predating the field lands on the *denied* side.
     #[test]
     fn for_worker_resolves_run_check_from_settings_and_defaults_to_denied() {
-        // A settings file that predates the field (container-level
-        // `#[serde(default)]` fills it) — the pre-existing-install case.
-        let legacy: Settings = serde_json::from_str(r#"{"schema_version": 29}"#)
-            .expect("a pre-F-12 settings file deserializes");
+        // A settings file that does not carry the field (container-level
+        // `#[serde(default)]` fills it), stamped at the migration floor — the
+        // oldest file this build still loads. V42 R9 rebased it from v29, which
+        // is below the floor and no longer reaches the typed container at all.
+        let legacy: Settings = serde_json::from_str(r#"{"schema_version": 30}"#)
+            .expect("a settings file without the opt-in key deserializes");
         assert!(
             !legacy.checks_allow_remote_worker,
             "F-19 trap: the additive field's default must be the SAFE value"

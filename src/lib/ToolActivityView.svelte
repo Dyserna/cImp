@@ -25,7 +25,8 @@
   import GraphView from './GraphView.svelte';
   import CodeAuditView from './CodeAuditView.svelte';
   import { graphReveal } from './graphReveal';
-  import { loadViewSection, saveViewSection } from './viewSection';
+  import SectionNav from './SectionNav.svelte';
+  import { loadViewSection } from './viewSection';
 
   // Reference list of the graph_* MCP tools the code graph exposes to AI tabs
   // (and the offload worker) while the graph is enabled. Mirrors the
@@ -92,7 +93,6 @@
   let section = $state<Section>(
     loadViewSection('tool-activity', SECTIONS.map((s) => s.id), 'offload-server'),
   );
-  $effect(() => saveViewSection('tool-activity', section));
 
   // Unlike the other sections, the Graph view keeps an expensive laid-out
   // force simulation, so it is NOT destroyed on a section switch: mounted
@@ -130,16 +130,11 @@
     <h2>Tools</h2>
   </header>
 
-  <nav class="sections">
-    {#each SECTIONS as s (s.id)}
-      <button
-        type="button"
-        class="seg"
-        class:active={section === s.id}
-        onclick={() => (section = s.id)}
-      >{s.label}</button>
-    {/each}
-  </nav>
+  <SectionNav
+    view="tool-activity"
+    sections={SECTIONS}
+    bind:section
+  />
 
   {#if !$settings.graph.enabled && !$settings.offload.enabled && !$settings.code_audit.enabled}
     <div class="feature-note">
@@ -250,35 +245,6 @@
   header h2 {
     margin: 0;
     font-size: 15px;
-  }
-  /* Segmented section nav under the header (matches CodeIntelligenceView). */
-  nav.sections {
-    display: flex;
-    gap: 4px;
-    margin-bottom: 14px;
-    border-bottom: 1px solid var(--border-subtle, #333);
-    padding-bottom: 8px;
-    flex-wrap: wrap;
-  }
-  .seg {
-    padding: 4px 12px;
-    border-radius: 6px;
-    border: 1px solid transparent;
-    background: transparent;
-    color: var(--text-primary, #ddd);
-    font-size: 12px;
-    cursor: pointer;
-    opacity: 0.7;
-  }
-  .seg:hover {
-    background: rgba(255, 255, 255, 0.06);
-    opacity: 1;
-  }
-  .seg.active {
-    background: var(--accent, #3b6ea5);
-    color: var(--accent-fg, #fff);
-    opacity: 1;
-    border-color: var(--accent, #3b6ea5);
   }
   .feature-note {
     border: 1px solid var(--border-warning, rgba(227, 179, 65, 0.5));

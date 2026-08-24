@@ -97,12 +97,12 @@
   import { tabMeta } from './tabs/store';
   import { GRAPH_MONITOR_TAB_ID, WORKBENCH_TAB_ID } from './tabs/types';
   import { isAppViewVisible, onAppViewShown } from './appViewVisibility';
+  import SectionNav from './SectionNav.svelte';
   import {
     loadCardOpen,
     loadViewSection,
     loadViewString,
     saveCardOpen,
-    saveViewSection,
     saveViewString,
   } from './viewSection';
   import { harnessMarkVerified } from './graph';
@@ -1727,7 +1727,6 @@
   let section = $state<Section>(
     loadViewSection('code-intelligence', SECTIONS.map((s) => s.id), 'overview'),
   );
-  $effect(() => saveViewSection('code-intelligence', section));
 
   // Open/collapsed state of the Overview usage cards — native <details>
   // elements, so a remount would otherwise snap them back to collapsed.
@@ -1873,25 +1872,26 @@
     <h2>Code Intelligence</h2>
   </header>
 
-  <nav class="sections">
-    {#each SECTIONS as s (s.id)}
-      <button
-        type="button"
-        class="seg"
-        class:active={section === s.id}
-        onclick={() => {
-          section = s.id;
-          if (s.id === 'memory') {
-            refreshMemory();
-            refreshFacts();
-          }
-          if (s.id === 'overview') {
-            refreshUsage();
-          }
-        }}
-      >{s.label}{#if s.id === 'analyses' && analysesBadgeTotal > 0}<span class="badge" title="New since last pass">+{analysesBadgeTotal}</span>{/if}{#if s.id === 'memory' && quarantined.length > 0}<span class="badge" title="Quarantined notes awaiting review">⚠{quarantined.length}</span>{/if}</button>
-    {/each}
-  </nav>
+  <!-- The badges keep their markup (and therefore their `.badge` rule) in
+       this component: a snippet is compiled where it is DECLARED, so this
+       one carries this file's style scope even though `SectionNav` renders
+       it inside a button it owns. -->
+  {#snippet sectionBadge(id: Section)}{#if id === 'analyses' && analysesBadgeTotal > 0}<span class="badge" title="New since last pass">+{analysesBadgeTotal}</span>{/if}{#if id === 'memory' && quarantined.length > 0}<span class="badge" title="Quarantined notes awaiting review">⚠{quarantined.length}</span>{/if}{/snippet}
+  <SectionNav
+    view="code-intelligence"
+    sections={SECTIONS}
+    bind:section
+    onselect={(id) => {
+      if (id === 'memory') {
+        refreshMemory();
+        refreshFacts();
+      }
+      if (id === 'overview') {
+        refreshUsage();
+      }
+    }}
+    trailing={sectionBadge}
+  />
 
   {#if checksChip}
     <div class="checks-chip">
@@ -3336,35 +3336,6 @@
   .placeholder.notice {
     opacity: 0.85;
     color: var(--accent, #e0a060);
-  }
-  /* Segmented section nav under the header. */
-  nav.sections {
-    display: flex;
-    gap: 4px;
-    margin-bottom: 14px;
-    border-bottom: 1px solid var(--border-subtle, #333);
-    padding-bottom: 8px;
-    flex-wrap: wrap;
-  }
-  .seg {
-    padding: 4px 12px;
-    border-radius: 6px;
-    border: 1px solid transparent;
-    background: transparent;
-    color: var(--text-primary, #ddd);
-    font-size: 12px;
-    cursor: pointer;
-    opacity: 0.7;
-  }
-  .seg:hover {
-    background: rgba(255, 255, 255, 0.06);
-    opacity: 1;
-  }
-  .seg.active {
-    background: var(--accent, #3b6ea5);
-    color: var(--accent-fg, #fff);
-    opacity: 1;
-    border-color: var(--accent, #3b6ea5);
   }
   /* V22: the run_check suggestion nudge — a lightweight, dismissable chip. */
   .checks-chip {

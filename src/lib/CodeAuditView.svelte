@@ -9,7 +9,8 @@
   // is display:none — so a running scan keeps streaming into a hidden
   // sub-tab.
   import AuditPanel from './AuditPanel.svelte';
-  import { loadViewSection, saveViewSection } from './viewSection';
+  import SectionNav from './SectionNav.svelte';
+  import { loadViewSection } from './viewSection';
 
   type Section = 'security' | 'quality';
   const SECTIONS: { id: Section; label: string }[] = [
@@ -21,23 +22,18 @@
   let section = $state<Section>(
     loadViewSection('code-audit', SECTIONS.map((s) => s.id), 'security'),
   );
-  $effect(() => saveViewSection('code-audit', section));
 </script>
 
 <div class="code-audit-tab">
   <header>
     <h2>Code Audit</h2>
   </header>
-  <nav class="sections">
-    {#each SECTIONS as s (s.id)}
-      <button
-        type="button"
-        class="seg"
-        class:active={section === s.id}
-        onclick={() => (section = s.id)}
-      >{s.label}</button>
-    {/each}
-  </nav>
+  <SectionNav
+    view="code-audit"
+    sections={SECTIONS}
+    bind:section
+    layout="inset"
+  />
   <!-- The `view` keys are the panels' localStorage filter namespaces; they
        predate the sub-tab merge (the Quality panel was its own tab), so
        keeping them preserves users' persisted filters. -->
@@ -59,8 +55,9 @@
     color: var(--text-primary, #ddd);
   }
   /* Title above the section row — the Workbench / Code Intelligence header
-     layout. The 16px side padding lives on the header/nav (not the
-     container) because each AuditPanel below carries its own 16px padding. */
+     layout. The 16px side padding lives on the header and on the section
+     strip (`SectionNav layout="inset"`), not on the container, because each
+     AuditPanel below carries its own 16px padding. */
   header {
     display: flex;
     align-items: center;
@@ -72,35 +69,6 @@
   header h2 {
     margin: 0;
     font-size: 15px;
-  }
-  /* Same segmented sub-tab look as the Code Intelligence sections. */
-  nav.sections {
-    display: flex;
-    gap: 4px;
-    flex-wrap: wrap;
-    margin: 0 16px;
-    padding-bottom: 8px;
-    border-bottom: 1px solid var(--border-subtle, #333);
-  }
-  .seg {
-    padding: 4px 12px;
-    border-radius: 6px;
-    border: 1px solid transparent;
-    background: transparent;
-    color: var(--text-primary, #ddd);
-    font-size: 12px;
-    cursor: pointer;
-    opacity: 0.7;
-  }
-  .seg:hover {
-    background: rgba(255, 255, 255, 0.06);
-    opacity: 1;
-  }
-  .seg.active {
-    background: var(--accent, #3b6ea5);
-    color: var(--accent-fg, #fff);
-    opacity: 1;
-    border-color: var(--accent, #3b6ea5);
   }
   /* Each AuditPanel roots an absolute-inset element; the host gives it a
      positioned, flex-filling box. `display: none` (not unmount) keeps the

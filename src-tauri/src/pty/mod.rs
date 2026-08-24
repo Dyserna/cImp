@@ -8,5 +8,5 @@ pub mod sandboxed_conpty;
 pub mod scrollback;
 mod tasks;
 
-pub use manager::{PtyLaunchSpec, PtyManager, PtyStart};
+pub use manager::{PtyHost, PtyLaunchSpec, PtyManager, PtyStart};
 pub use resolve::resolve_command;

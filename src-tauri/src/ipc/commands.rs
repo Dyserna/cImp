@@ -1,4 +1,5 @@
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Emitter, EventTarget, State};
@@ -6,24 +7,21 @@ use tauri::{AppHandle, Emitter, EventTarget, State};
 use crate::error::{AppError, AppResult};
 use crate::ipc::windows::{open_or_focus_settings, SETTINGS_LABEL};
 use crate::ipc::AppState;
+use crate::pty::PtyHost;
+use crate::service::on_blocking_pool as run_on_blocking_pool;
+use crate::service::pty::PtyService;
+use crate::service::sink::{OutputSink, TauriEventSink};
 use crate::settings::{
     default_claude_local_tab, default_claude_tab, default_opencode_tab, AiToolTabConfig, Settings,
     TabConfig, CLAUDE_LOCAL_TAB_ID, CLAUDE_TAB_ID, OPENCODE_TAB_ID,
 };
 use crate::state::{ReadOnlySource, StateSignal, TabId, TabKind};
 
-/// V1.4-04 D: pty_start now returns the persisted-scrollback bytes
-/// from the previous session (if any). The frontend writes them to the
-/// new xterm before the live channel binds so the user sees their
-/// previous shell output above the fresh prompt. The bytes are also
-/// seeded into the new ring buffer so a subsequent crash-restart
-/// preserves continuity (capped at the ring size, naturally).
-///
-/// Returns `None` when:
-///   - `terminal.scrollback.restore_on_launch` is `false`
-///   - no persisted file exists for this tab (cold install, or
-///     already consumed earlier in this session)
-///   - reading the file failed (logged at warn; treated as cold start)
+/// V1.4-04 D: `pty_start` returns the persisted-scrollback bytes from the
+/// previous session (if any) — see [`PtyService::start`] for the whole
+/// contract. This is the wire boundary only: it names the two things the
+/// service cannot get for itself, the app host ([`PtyHost::from_app`]) and the
+/// frontend's `Channel`, and hands everything else off.
 #[tauri::command]
 pub async fn pty_start(
     app: AppHandle,
@@ -33,72 +31,32 @@ pub async fn pty_start(
     rows: u16,
     cols: u16,
 ) -> AppResult<Option<Vec<u8>>> {
-    let cwd = state.launch.cwd.clone();
-    let invocation_args = state.launch.extra_args.clone();
-    let tts_tx = state.tts_segments.clone();
-    let settings = state.settings.clone();
-    let restore_on_launch = settings.current().terminal.scrollback.restore_on_launch;
-
-    // V39 review R-5: seed the activity mirror for THIS start and carry its
-    // generation into the spawn, so an exit belonging to an earlier start of
-    // the same tab can be recognised as late rather than latched onto this one.
-    let start_gen = state.tab_activity.begin_start(&tab);
-    {
-        let registry = state.tabs.lock().await;
-        registry
-            .start_tab(crate::tabs::registry::TabStart {
-                app,
-                tab: tab.clone(),
-                output_channel: channel,
-                rows,
-                cols,
-                launch_cwd: &cwd,
-                invocation_args: &invocation_args,
-                tts_segments: tts_tx,
-                settings,
-                start_gen,
-            })
-            .await?;
-    }
-
-    // V1.4-04 D.5: read any persisted scrollback for this tab. Done
-    // after a successful start so a spawn failure doesn't burn the
-    // bytes. V0.6+: read-then-delete is split — we only delete the
-    // on-disk file after `seed_scrollback` returns Ok, so a transient
-    // seed failure (poisoned mutex, ring contention) leaves the file
-    // in place for the next launch to retry rather than dropping the
-    // user's scrollback between read and seed.
-    if !restore_on_launch {
-        return Ok(None);
-    }
-    // Read the scrollback file WITHOUT holding the registry lock: it's a
-    // synchronous `fs::read` of the whole file and only needs `&tab`. Holding
-    // the single registry TokioMutex across it (as the original code did)
-    // stalls every other registry-touching command (pty_write, pty_resize,
-    // tab_activate, …) behind disk latency / AV scans. Re-acquire only for the
-    // seed, which does touch the registry.
-    // `scrollback::read` is a synchronous `fs::read` of the whole file; run it
-    // on the blocking pool so a large scrollback under slow / AV-scanned disk
-    // doesn't stall other IPC futures on this tokio worker (mirrors
-    // `get_system_stats`). Re-acquire the registry lock only for the seed.
-    let restored = {
-        let tab_for_read = tab.clone();
-        tauri::async_runtime::spawn_blocking(move || crate::pty::scrollback::read(&tab_for_read))
-            .await
-            .map_err(|e| AppError::Pty(format!("scrollback read join: {e}")))?
-    };
-    if let Some(bytes) = &restored {
-        let registry = state.tabs.lock().await;
-        match registry.seed_scrollback(&tab, bytes).await {
-            Ok(()) => crate::pty::scrollback::consume_after_read(&tab),
-            Err(e) => {
-                tracing::warn!(?tab, error = %e, "scrollback seed failed; on-disk copy retained for retry");
-            }
-        }
-    }
-    Ok(restored)
+    pty_service(&state)
+        .start(
+            PtyHost::from_app(&app),
+            tab,
+            Arc::new(channel) as Arc<dyn OutputSink>,
+            rows,
+            cols,
+        )
+        .await
 }
 
+/// Build the PTY service over this app's handles. One place, so the three PTY
+/// commands cannot drift in what they hand it.
+fn pty_service<'a>(state: &'a AppState) -> PtyService<'a> {
+    PtyService::new(
+        &state.tabs,
+        &state.settings,
+        &state.tab_activity,
+        &state.tts_segments,
+        &state.launch.cwd,
+        &state.launch.extra_args,
+    )
+}
+
+/// Tear a tab's subprocess down and bring a fresh one up on a new channel.
+/// See [`PtyService::restart`].
 #[tauri::command]
 pub async fn pty_restart(
     app: AppHandle,
@@ -108,59 +66,15 @@ pub async fn pty_restart(
     rows: u16,
     cols: u16,
 ) -> AppResult<()> {
-    let cwd = state.launch.cwd.clone();
-    let invocation_args = state.launch.extra_args.clone();
-    let tts_tx = state.tts_segments.clone();
-    let settings = state.settings.clone();
-    // V39 review HIGH-3 + R-5: re-seed the activity mirror for the fresh
-    // subprocess, BEFORE it is spawned.
-    //
-    // `TabActivity::exited` is latched, and the two signals that clear it do
-    // not cover this path: `TabAdded` fires for a NEW tab, and `ShellRestarted`
-    // is emitted for Shell-kind tabs only (`TabRegistry::restart_tab`). An AI
-    // tab — the only kind a delegation can drive — therefore restarted into a
-    // row still marked `exited`, and preflight refused it forever with "has no
-    // running process".
-    //
-    // Before the spawn rather than after it (R-5), and with a generation the
-    // spawn carries: clearing afterwards raced the old child's exit through the
-    // state-manager mpsc, which re-latched `exited` on the process that had
-    // just started. A failed restart re-latches it honestly — its own failure
-    // path emits an exit under THIS generation.
-    let start_gen = state.tab_activity.begin_start(&tab);
-    let registry = state.tabs.lock().await;
-    let result = registry
-        .restart_tab(crate::tabs::registry::TabStart {
-            app,
-            tab: tab.clone(),
-            output_channel: channel,
+    pty_service(&state)
+        .restart(
+            PtyHost::from_app(&app),
+            tab,
+            Arc::new(channel) as Arc<dyn OutputSink>,
             rows,
             cols,
-            launch_cwd: &cwd,
-            invocation_args: &invocation_args,
-            tts_segments: tts_tx,
-            settings,
-            start_gen,
-        })
-        .await;
-    // V39 review HIGH-3: re-seed the activity mirror for the fresh subprocess.
-    //
-    // `TabActivity::exited` is latched, and the two signals that clear it do
-    // not cover this path: `TabAdded` fires for a NEW tab, and `ShellRestarted`
-    // is emitted for Shell-kind tabs only (`TabRegistry::restart_tab`). An AI
-    // tab — the only kind a delegation can drive — therefore restarted into a
-    // row still marked `exited`, and preflight refused it forever with "has no
-    // running process". Only on success: a failed restart leaves no process,
-    // and clearing the flag would claim one.
-    // V1.4-04 D.6: on user-initiated restart, the prior session's
-    // scrollback is no longer relevant. Clear the in-memory ring so
-    // the next graceful-exit persist doesn't include stale bytes from
-    // before the restart. Done regardless of whether the restart
-    // succeeded — the user explicitly asked for a clean shell.
-    if let Err(e) = registry.clear_scrollback(&tab).await {
-        tracing::warn!(?tab, error = %e, "scrollback clear after restart failed");
-    }
-    result
+        )
+        .await
 }
 
 /// V1.4-03: re-point a still-running PTY's bytes at a fresh JS-side
@@ -175,8 +89,9 @@ pub async fn pty_rebind_channel(
     tab: TabId,
     channel: Channel<String>,
 ) -> AppResult<()> {
-    let registry = state.tabs.lock().await;
-    registry.rebind_channel(tab, channel).await
+    pty_service(&state)
+        .rebind(tab, Arc::new(channel) as Arc<dyn OutputSink>)
+        .await
 }
 
 /// V1.4-04 D.3: snapshot a tab's PTY scrollback as raw bytes. Exposed
@@ -1247,8 +1162,9 @@ pub async fn acknowledge_error(state: State<'_, AppState>, tab: TabId) -> AppRes
 /// tab to settings — use `set_active_tab` for that.
 #[tauri::command]
 pub async fn tab_activate(state: State<'_, AppState>, tab: TabId) -> AppResult<()> {
-    let mut registry = state.tabs.lock().await;
-    registry.activate(tab).await
+    crate::ipc::tab_lifecycle::tab_service(&state)
+        .activate(tab)
+        .await
 }
 
 /// Activate a tab AND persist its id as `session.active_tab_id`. Used by
@@ -1257,21 +1173,9 @@ pub async fn tab_activate(state: State<'_, AppState>, tab: TabId) -> AppResult<(
 /// debounced so a fast Ctrl+1/Ctrl+2 burst doesn't hammer the disk.
 #[tauri::command]
 pub async fn set_active_tab(state: State<'_, AppState>, tab: TabId) -> AppResult<()> {
-    let id_string = tab.as_str().to_string();
-    {
-        let mut registry = state.tabs.lock().await;
-        registry.activate(tab).await?;
-    }
-    // Atomic read-modify-write so a concurrent close_tab / settings_update
-    // can't clobber this with a stale whole-struct snapshot (lost-update). The
-    // outer `current()` check just skips the broadcast/save on a no-op
-    // re-activation; the real write re-checks under the held lock.
-    if state.settings.current().session.active_tab_id.as_deref() != Some(id_string.as_str()) {
-        state.settings.mutate(move |snap| {
-            snap.session.active_tab_id = Some(id_string);
-        });
-    }
-    Ok(())
+    crate::ipc::tab_lifecycle::tab_service(&state)
+        .set_active(tab)
+        .await
 }
 
 /// Snapshot the live tab list. Frontend calls this once on App mount to
@@ -2421,7 +2325,7 @@ pub async fn graph_history(
 /// actually runs it.
 #[tauri::command]
 pub async fn activity_list(since_ts: Option<u64>) -> AppResult<Vec<crate::activity::ActivityEntry>> {
-    run_on_blocking_pool(move || crate::activity::snapshot_since(since_ts.unwrap_or(0))).await
+    crate::service::view::activity_since(since_ts).await
 }
 
 /// One activity's full record — including the captured request/response
@@ -2429,7 +2333,7 @@ pub async fn activity_list(since_ts: Option<u64>) -> AppResult<Vec<crate::activi
 /// aged out) between the list poll and the click.
 #[tauri::command]
 pub async fn activity_detail(id: u64) -> AppResult<Option<crate::activity::ActivityRecord>> {
-    run_on_blocking_pool(move || crate::activity::detail(id)).await
+    crate::service::view::activity_detail(id).await
 }
 
 /// Delete one activity entry (persists immediately).
@@ -2445,24 +2349,6 @@ pub async fn activity_delete(id: u64) -> AppResult<()> {
 #[tauri::command]
 pub async fn activity_clear() -> AppResult<()> {
     run_on_blocking_pool(crate::activity::clear).await
-}
-
-/// Run a synchronous, potentially slow operation on tokio's blocking pool.
-///
-/// An `async fn` Tauri command runs ON a runtime worker, so calling synchronous
-/// store work from one parks that worker for the whole pass and starves every
-/// other IPC queued behind it. Originally the activity store's file-I/O-under-a-
-/// lock escape hatch; now the shared one for any command whose body blocks —
-/// notably the graph usage commands, whose Cozo passes have been measured in
-/// seconds against a large store and which the Overview polls on a timer.
-async fn run_on_blocking_pool<T, F>(f: F) -> AppResult<T>
-where
-    T: Send + 'static,
-    F: FnOnce() -> T + Send + 'static,
-{
-    tokio::task::spawn_blocking(f)
-        .await
-        .map_err(|e| crate::error::AppError::Ipc(format!("blocking task join: {e}")))
 }
 
 /// V10: one candidate dead export (unused public symbol) for the Analyses tab.
@@ -4319,13 +4205,7 @@ pub async fn consume_settings_deep_link(state: State<'_, AppState>) -> AppResult
 /// so the main window can keep all PTY-touching IPC in one place.
 #[tauri::command]
 pub async fn request_tab_restart(app: AppHandle, tab: TabId) -> AppResult<()> {
-    app.emit_to(
-        EventTarget::webview_window("main"),
-        "tab-restart-requested",
-        tab,
-    )
-    .map_err(|e| AppError::Ipc(format!("emit restart: {e}")))?;
-    Ok(())
+    crate::service::tabs::request_tab_restart(&TauriEventSink::new(app), tab, false)
 }
 
 /// Restart a closed Shell tab. Driven by the closed-state overlay's
@@ -4336,18 +4216,7 @@ pub async fn request_tab_restart(app: AppHandle, tab: TabId) -> AppResult<()> {
 /// `ShellRestarted` signal emitted from `TabRegistry::restart_tab`.
 #[tauri::command]
 pub async fn restart_shell_tab(app: AppHandle, tab: TabId) -> AppResult<()> {
-    if !matches!(tab.kind(), crate::state::TabKind::Shell) {
-        return Err(AppError::Ipc(format!(
-            "restart_shell_tab: not a shell tab: {tab:?}"
-        )));
-    }
-    app.emit_to(
-        EventTarget::webview_window("main"),
-        "tab-restart-requested",
-        tab,
-    )
-    .map_err(|e| AppError::Ipc(format!("emit restart: {e}")))?;
-    Ok(())
+    crate::service::tabs::request_tab_restart(&TauriEventSink::new(app), tab, true)
 }
 
 #[cfg(test)]

@@ -1,13 +1,24 @@
-//! Tab-lifecycle IPC commands for V3: create / close / rename / reconfigure
-//! user-managed Shell tabs. Each command returns a `TabLifecycleError`
-//! with a serde-tagged shape so the frontend dialog can render inline
-//! field errors keyed off the variant.
+//! Tab-lifecycle IPC: create / close / rename / reconfigure user-managed
+//! tabs.
 //!
-//! V3-M3: every command persists its mutation to settings via
-//! `SettingsHandle::set`, which broadcasts the new state to all listeners
-//! and triggers a debounced disk write. Settings is the single source of
-//! truth for tab identity, name, and spawn config — there is no per-tab
-//! side table any more.
+//! **V42 Phase 0.** The use cases moved to [`crate::service::tabs`]; what is
+//! left here is the wire boundary. A command in this file names the Tauri
+//! things the service cannot get for itself (`State<'_, AppState>`, the
+//! `PreviewRegistry` behind [`WebviewHost`]) and delegates. The serde-tagged
+//! error shape the dialogs match on ([`TabLifecycleError`]) is re-exported
+//! from here so the frontend contract reads unchanged.
+//!
+//! Not everything moved: `reconfigure_shell_tab`, `set_enabled_ai_tabs`,
+//! `open_tool_tab`, `open_note_tab`, `create_ai_tab_in_worktree` and the
+//! reserved-feature-tab sync are outside the Phase 0 slice and still hold
+//! their own bodies. They share the validation helpers and the name-uniquing
+//! helpers with the service rather than keeping a second copy — those live in
+//! `service::tabs` now, one call away.
+//!
+//! Every command still persists its mutation to settings via `SettingsHandle`,
+//! which broadcasts the new state to all listeners and triggers a debounced
+//! disk write. Settings is the single source of truth for tab identity, name
+//! and spawn config — there is no per-tab side table.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -18,191 +29,37 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::ipc::AppState;
+use crate::service::sink::WebviewHost;
+use crate::service::tabs::{
+    notifications_from_dialog, unique_tab_name, validate_inputs, TabService,
+};
+pub use crate::service::tabs::TabLifecycleError;
 use crate::settings::{
-    default_ai_tab, AiTabId, Settings, ShellNotificationConfig, ShellTabConfig as ShellTabSettings,
-    TabConfig,
+    default_ai_tab, AiTabId, Settings, ShellNotificationConfig,
+    ShellTabConfig as ShellTabSettings, TabConfig,
 };
 use crate::shell::detect;
 use crate::state::{StateSignal, TabId, TabKind, TabMeta};
 
-/// Wire-format error for the tab-lifecycle commands. Internally tagged so
-/// each variant becomes `{ "kind": "...", ...fields }` on the JSON side.
-/// The frontend's dialog matches on `kind` to render inline errors next
-/// to the offending field.
-#[derive(Debug, Clone, Serialize)]
-#[serde(tag = "kind", rename_all = "kebab-case")]
-pub enum TabLifecycleError {
-    /// Name field was empty (or whitespace-only). Validation happens on
-    /// the backend after `trim()`; the dialog re-trims locally for live
-    /// feedback but the canonical check is here.
-    EmptyName,
-    /// `command` could not be resolved. `tried` is whatever the user
-    /// typed (relative path, absolute path, or bare name resolved via
-    /// PATH).
-    CommandNotFound { tried: String },
-    /// `cwd` was provided but the directory does not exist.
-    CwdNotFound { path: String },
-    /// The target tab id does not exist in the registry.
-    TabNotFound { tab: String },
-    /// Attempt to close an AI builtin (Claude / Claude-local).
-    BuiltinNotClosable,
-    /// `reconfigure_shell_tab` was called on a non-Shell tab.
-    WrongKind,
-    /// `set_enabled_ai_tabs` was called with an empty list. The UI's
-    /// last-checked-is-locked rule prevents this from the user side; the
-    /// IPC enforces it as defense-in-depth.
-    EmptyAiTabsList,
-    /// An attempt to enable a harness tab whose CLI cannot be resolved (not in
-    /// `ebin`, not on PATH). The tab is left disabled and the UI surfaces
-    /// `label` + `hint` so the user can install it first.
-    ///
-    /// **V40 Phase E (locked decision 26).** This was `OpencodeNotFound`, with
-    /// the probe and the exemption for the other harness both spelled in this
-    /// file. Which harnesses are gated, and what a refusal advises, are
-    /// `HarnessPlugin::preflight`'s answer now; core carries the refusal without
-    /// knowing whose it is.
-    HarnessNotFound {
-        harness: String,
-        label: String,
-        hint: String,
-    },
-    /// Internal error (lock poisoning, channel send failure, etc.). Not
-    /// expected in practice — surfaces as a toast on the frontend.
-    Internal { message: String },
+/// Build the tab service over this app's handles. One place, so no command
+/// can drift in what it hands it — and `pub(crate)` because the two
+/// activation commands live in [`crate::ipc::commands`].
+pub(crate) fn tab_service(state: &AppState) -> TabService<'_> {
+    TabService::new(
+        &state.settings,
+        &state.tabs,
+        &state.state_signals,
+        &state.read_only,
+        &state.lifecycle_serializer,
+    )
 }
 
-impl TabLifecycleError {
-    pub fn internal(msg: impl Into<String>) -> Self {
-        Self::Internal {
-            message: msg.into(),
-        }
-    }
-}
-
-/// Validated input for `create_shell_tab` / `reconfigure_shell_tab`.
-/// Frontend dialog sends raw strings; backend resolves command, splits
-/// args via `shlex`, and only then constructs this struct.
-struct ValidatedShellInput {
-    name: String,
-    command: PathBuf,
-    args: Vec<String>,
-    cwd: Option<PathBuf>,
-    env: HashMap<String, String>,
-}
-
-/// Validate the dialog inputs. Each filesystem probe (`which::which`,
-/// `is_file`, `is_dir`) is synchronous and may stat slow paths (network
-/// drives, antivirus-scanned directories), so the whole probe runs on a
-/// blocking pool thread. The Tauri command wrapper is async; calling
-/// this from there off the runtime keeps the tokio worker thread free
-/// for other IPC work while a slow PATH walk is in flight.
-async fn validate_inputs(
-    name: String,
-    command: String,
-    args: Vec<String>,
-    cwd: Option<String>,
-    env: HashMap<String, String>,
-) -> Result<ValidatedShellInput, TabLifecycleError> {
-    let trimmed_name = name.trim().to_string();
-    if trimmed_name.is_empty() {
-        return Err(TabLifecycleError::EmptyName);
-    }
-
-    let cwd_string = cwd;
-    tokio::task::spawn_blocking(move || {
-        // Resolve the command. If it contains a path separator we treat it
-        // as an absolute or relative path; otherwise we resolve via PATH
-        // using `which`.
-        let raw = command.clone();
-        let resolved = if command.contains(['/', '\\']) {
-            let path = PathBuf::from(&command);
-            if !path.is_file() {
-                return Err(TabLifecycleError::CommandNotFound { tried: raw });
-            }
-            path
-        } else {
-            which::which(&command)
-                .map_err(|_| TabLifecycleError::CommandNotFound { tried: raw.clone() })?
-        };
-
-        let cwd_path = match cwd_string
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            Some(s) => {
-                let p = PathBuf::from(s);
-                if !p.is_dir() {
-                    return Err(TabLifecycleError::CwdNotFound {
-                        path: s.to_string(),
-                    });
-                }
-                Some(p)
-            }
-            None => None,
-        };
-
-        Ok(ValidatedShellInput {
-            name: trimmed_name,
-            command: resolved,
-            args,
-            cwd: cwd_path,
-            env,
-        })
-    })
-    .await
-    .map_err(|e| TabLifecycleError::internal(format!("validate_inputs join: {e}")))?
-}
-
-fn validated_to_shell_config(
-    id: String,
-    builtin: bool,
-    input: &ValidatedShellInput,
-    notifications: ShellNotificationConfig,
-) -> ShellTabSettings {
-    ShellTabSettings {
-        id,
-        builtin,
-        name: input.name.clone(),
-        command: input.command.to_string_lossy().into_owned(),
-        args: input.args.clone(),
-        cwd: input.cwd.clone(),
-        env: input.env.clone(),
-        notifications,
-        theme_override: None,
-        background_override: None,
-    }
-}
-
-/// Build a `ShellNotificationConfig` from the dialog's two strings. An empty
-/// string is intentional disable-this-notification (the manager treats empty
-/// as "skip"); the dialog is responsible for pre-filling the defaults so the
-/// user has to actively clear a field to disable it. V1.11 promoted each
-/// slot to `{ enabled, text }`; the dialog still sends bare strings, so
-/// `enabled` is derived from non-emptiness here. Users wanting the
-/// "disabled but text preserved" combination edit via Settings → Tabs.
-fn notifications_from_dialog(error: String, exited: String) -> ShellNotificationConfig {
-    ShellNotificationConfig {
-        error: crate::settings::NotificationSlot {
-            enabled: !error.is_empty(),
-            text: error,
-        },
-        exited: crate::settings::NotificationSlot {
-            enabled: !exited.is_empty(),
-            text: exited,
-        },
-    }
-}
-
-/// Create a new user-managed Shell tab. Validates the inputs, registers it
-/// in the registry, appends a `TabConfig::Shell` to settings, and emits
-/// `TabAdded` so the frontend mirrors the addition into its tabs store.
+/// Create a new user-managed Shell tab. See [`TabService::create_shell`].
 // Tauri command: each parameter is a field of the frontend's `invoke` payload,
 // so collapsing them into a struct changes the IPC contract.
 #[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn create_shell_tab(
-    app: AppHandle,
     state: State<'_, AppState>,
     name: String,
     command: String,
@@ -212,288 +69,35 @@ pub async fn create_shell_tab(
     notifications_error: String,
     notifications_exited: String,
 ) -> Result<TabId, TabLifecycleError> {
-    let _serializer = state.lifecycle_serializer.lock().await;
-    let args = shlex::split(&args_string).unwrap_or_else(|| {
-        warn!(args = %args_string, "tab args have unbalanced quotes; treating as no args");
-        Vec::new()
-    });
-    let validated = validate_inputs(name, command, args, cwd, env).await?;
-    let notifications = notifications_from_dialog(notifications_error, notifications_exited);
-
-    let tab = TabId::Shell(format!("shell-{}", Uuid::new_v4()));
-    let tab_meta = TabMeta {
-        id: tab.clone(),
-        kind: TabKind::Shell,
-        name: validated.name.clone(),
-    };
-
-    // Persist to settings BEFORE registering with the registry. This way,
-    // when the registry's start_tab path runs (post TabAdded → frontend
-    // mount → pty_start), `build_launch_spec` can find the entry. The
-    // broadcast triggered by `set` is also what the frontend's settings
-    // store consumes to reflect the new entry in the Tabs section.
-    {
-        let entry = TabConfig::Shell(validated_to_shell_config(
-            tab.as_str().to_string(),
-            false,
-            &validated,
-            notifications,
-        ));
-        // Atomic mutate (not current()/set()) so a concurrent save_layout /
-        // settings_update / set_active_tab can't clobber the new tab with a
-        // stale whole-struct snapshot. Idempotent on duplicate id.
-        let id = tab.as_str().to_string();
-        state.settings.mutate(move |snap| {
-            if let Some(existing) = snap.tabs.iter_mut().find(|t| t.id() == id) {
-                *existing = entry;
-            } else {
-                snap.tabs.push(entry);
-            }
-        });
-    }
-
-    let position = {
-        let mut registry = state.tabs.lock().await;
-        registry.insert_user_tab(tab.clone(), validated.name.clone())
-    };
-
-    if let Err(e) = state
-        .state_signals
-        .send(StateSignal::TabAdded {
-            meta: tab_meta,
-            position,
-        })
+    tab_service(&state)
+        .create_shell(
+            name,
+            command,
+            args_string,
+            cwd,
+            env,
+            notifications_error,
+            notifications_exited,
+        )
         .await
-    {
-        warn!(error = %e, "create_shell_tab: state-signal channel closed");
-        // Roll back the committed settings + registry entries so a phantom tab
-        // doesn't persist (and resurrect on next launch) with no frontend view.
-        let id = tab.as_str().to_string();
-        state
-            .settings
-            .mutate(move |snap| snap.tabs.retain(|t| t.id() != id));
-        state.tabs.lock().await.remove_tab(&tab).await;
-        return Err(TabLifecycleError::internal("state signal channel closed"));
-    }
-
-    {
-        let mut registry = state.tabs.lock().await;
-        if let Err(e) = registry.activate(tab.clone()).await {
-            warn!(error = %e, "create_shell_tab: activate failed");
-        }
-    }
-
-    let _ = app; // reserved for future per-window emits
-    info!(?tab, "shell tab created");
-    Ok(tab)
 }
 
-/// Create a new user-managed Preview tab (the "+"-adjacent "New Preview tab"
-/// affordance — V14 Phase F). Unlike `create_shell_tab`/`create_ai_tab`
-/// there is no command/binary/cwd/env to validate — a Preview tab has no
-/// PTY at all, just a `url`/`device_width`/`auto_reload` triple the backend
-/// child webview (`crate::preview`) reads. An empty `url` falls back to
-/// `Settings::preview_last_url` (the last URL used by any Preview tab in
-/// this project), then `preview::DEFAULT_PREVIEW_URL`.
+/// Create a new user-managed Preview tab. See [`TabService::create_preview`].
 #[tauri::command]
 pub async fn create_preview_tab(
     state: State<'_, AppState>,
     url: String,
 ) -> Result<TabId, TabLifecycleError> {
-    let _serializer = state.lifecycle_serializer.lock().await;
-
-    let snap = state.settings.current();
-    let resolved_url = {
-        let trimmed = url.trim();
-        if trimmed.is_empty() {
-            snap.preview_last_url
-                .clone()
-                .unwrap_or_else(|| crate::preview::DEFAULT_PREVIEW_URL.to_string())
-        } else {
-            trimmed.to_string()
-        }
-    };
-    let name = unique_preview_tab_name(&snap);
-
-    let tab = TabId::Preview(format!("preview-{}", Uuid::new_v4()));
-    let tab_meta = TabMeta {
-        id: tab.clone(),
-        kind: TabKind::Preview,
-        name: name.clone(),
-    };
-
-    // Persist BEFORE registering — same ordering rationale as
-    // `create_shell_tab`/`create_ai_tab` (though Preview tabs never call
-    // `pty_start`, keeping the ordering uniform avoids a special case here).
-    {
-        let entry = crate::settings::PreviewTabConfig {
-            id: tab.as_str().to_string(),
-            builtin: false,
-            name: name.clone(),
-            url: resolved_url.clone(),
-            device_width: None,
-            auto_reload: false,
-        };
-        state.settings.mutate(move |s| {
-            s.tabs.push(TabConfig::Preview(entry.clone()));
-            s.preview_last_url = Some(resolved_url.clone());
-        });
-    }
-
-    let position = {
-        let mut registry = state.tabs.lock().await;
-        registry.insert_user_tab(tab.clone(), name.clone())
-    };
-
-    if let Err(e) = state
-        .state_signals
-        .send(StateSignal::TabAdded {
-            meta: tab_meta,
-            position,
-        })
-        .await
-    {
-        warn!(error = %e, "create_preview_tab: state-signal channel closed");
-        let id = tab.as_str().to_string();
-        state
-            .settings
-            .mutate(move |s| s.tabs.retain(|t| t.id() != id));
-        state.tabs.lock().await.remove_tab(&tab).await;
-        return Err(TabLifecycleError::internal("state signal channel closed"));
-    }
-
-    {
-        let mut registry = state.tabs.lock().await;
-        if let Err(e) = registry.activate(tab.clone()).await {
-            warn!(error = %e, "create_preview_tab: activate failed");
-        }
-    }
-
-    info!(?tab, "preview tab created");
-    Ok(tab)
+    tab_service(&state).create_preview(url).await
 }
 
-/// "Preview" if untaken, else the lowest-free-integer-suffixed "Preview N"
-/// (N ≥ 2) — unlike [`unique_tab_name`] (which always suffixes, because its
-/// caller's `base` is an existing template's name), a Preview tab has no
-/// pre-existing instance to collide with, so the FIRST one is plain
-/// "Preview".
-fn unique_preview_tab_name(settings: &Settings) -> String {
-    let taken: std::collections::HashSet<&str> = settings.tabs.iter().map(|t| t.name()).collect();
-    if !taken.contains("Preview") {
-        return "Preview".to_string();
-    }
-    for n in 2..1000 {
-        let candidate = format!("Preview {n}");
-        if !taken.contains(candidate.as_str()) {
-            return candidate;
-        }
-    }
-    format!("Preview {}", Uuid::new_v4())
-}
-
-/// Pick a unique display name for a spawned duplicate by suffixing the
-/// template's name with the lowest free integer ≥ 2 (e.g. "Claude" →
-/// "Claude 2", "Claude 3"). Falls back to a uuid suffix in the
-/// (practically impossible) event the first thousand are all taken.
-fn unique_tab_name(settings: &Settings, base: &str) -> String {
-    let taken: std::collections::HashSet<&str> = settings.tabs.iter().map(|t| t.name()).collect();
-    for n in 2..1000 {
-        let candidate = format!("{base} {n}");
-        if !taken.contains(candidate.as_str()) {
-            return candidate;
-        }
-    }
-    format!("{base} {}", Uuid::new_v4())
-}
-
-/// Spawn a duplicate of an existing AI tab — the `+` affordance on a
-/// Claude/Aider builtin. The new tab clones the *template's live config*
-/// (command, env, tts-injection, use_local_provider, theme/background
-/// overrides, …) so it behaves identically to the tab it came from,
-/// including local-provider env synthesis. It gets a fresh `"ai-<uuid>"`
-/// id, `builtin: false` (so it's closable and shows the `×`), and a
-/// unique auto-incremented name. Persisting it to `settings.tabs` means
-/// it survives a restart; the integrity check leaves non-reserved AI ids
-/// untouched.
+/// Spawn a duplicate of an existing AI tab. See [`TabService::create_ai`].
 #[tauri::command]
 pub async fn create_ai_tab(
-    app: AppHandle,
     state: State<'_, AppState>,
     template: TabId,
 ) -> Result<TabId, TabLifecycleError> {
-    let _serializer = state.lifecycle_serializer.lock().await;
-
-    // Clone the template's AI config. The `+` only appears on AI tabs, so
-    // a missing entry or a Shell template is a malformed request.
-    let mut cfg = {
-        let snap = state.settings.current();
-        let entry =
-            snap.find_tab(template.as_str())
-                .ok_or_else(|| TabLifecycleError::TabNotFound {
-                    tab: template.as_str().to_string(),
-                })?;
-        match entry {
-            TabConfig::AiTool(ai) => ai.clone(),
-            TabConfig::Shell(_) | TabConfig::Preview(_) => {
-                return Err(TabLifecycleError::WrongKind)
-            }
-        }
-    };
-
-    let tab = TabId::Ai(format!("ai-{}", Uuid::new_v4()));
-    let name = unique_tab_name(&state.settings.current(), &cfg.name);
-    cfg.id = tab.as_str().to_string();
-    cfg.builtin = false;
-    cfg.name = name.clone();
-
-    let tab_meta = TabMeta {
-        id: tab.clone(),
-        kind: TabKind::AiTool,
-        name: name.clone(),
-    };
-
-    // Persist BEFORE registering so `build_launch_spec` can find the entry
-    // once the frontend mounts the new tab and calls `pty_start` (same
-    // ordering rationale as `create_shell_tab`). Append, like a shell tab —
-    // the visible position is owned by the frontend layout.
-    state.settings.mutate(move |snap| {
-        snap.tabs.push(TabConfig::AiTool(cfg));
-    });
-
-    let position = {
-        let mut registry = state.tabs.lock().await;
-        registry.insert_user_tab(tab.clone(), name.clone())
-    };
-
-    if let Err(e) = state
-        .state_signals
-        .send(StateSignal::TabAdded {
-            meta: tab_meta,
-            position,
-        })
-        .await
-    {
-        warn!(error = %e, "create_ai_tab: state-signal channel closed");
-        // Roll back the committed settings + registry entries (see create_shell_tab).
-        let id = tab.as_str().to_string();
-        state
-            .settings
-            .mutate(move |snap| snap.tabs.retain(|t| t.id() != id));
-        state.tabs.lock().await.remove_tab(&tab).await;
-        return Err(TabLifecycleError::internal("state signal channel closed"));
-    }
-
-    {
-        let mut registry = state.tabs.lock().await;
-        if let Err(e) = registry.activate(tab.clone()).await {
-            warn!(error = %e, "create_ai_tab: activate failed");
-        }
-    }
-
-    let _ = app; // reserved for future per-window emits
-    info!(?tab, ?template, "ai tab duplicated");
-    Ok(tab)
+    tab_service(&state).create_ai(template).await
 }
 
 /// V13 Phase D D3: "New <Claude|OpenCode> tab in worktree…" — the worktree
@@ -610,130 +214,17 @@ pub async fn create_ai_tab_in_worktree(
     Ok(tab)
 }
 
-/// Close a Shell tab (including the default `shell-default-1`). The AI
-/// builtins (Claude / Claude-local) reject with `BuiltinNotClosable`. The
-/// PTY is killed, the registry entry dropped, the settings entry removed,
-/// and `TabRemoved` is emitted.
+/// Close a user tab. Builtins reject with `BuiltinNotClosable`. See
+/// [`TabService::close`] — the `PreviewRegistry` this extracts is the
+/// [`WebviewHost`] the close path needs for a Preview tab's child webview.
 #[tauri::command]
 pub async fn close_tab(
     state: State<'_, AppState>,
     preview_registry: State<'_, crate::preview::PreviewRegistry>,
     tab: TabId,
 ) -> Result<(), TabLifecycleError> {
-    let _serializer = state.lifecycle_serializer.lock().await;
-    // The reserved dashboard tabs are never closable — each is removed only
-    // by disabling its feature toggle. Guard on the shared predicate (not
-    // the settings `builtin` flag) so a hand-edit that clears the flag still
-    // can't close them, and a new reserved dashboard can't miss this guard.
-    if tab.is_reserved_dashboard() {
-        return Err(TabLifecycleError::BuiltinNotClosable);
-    }
-    {
-        // Snapshot the entry to gate on builtin status. Settings is the
-        // canonical builtin marker; the id-based heuristic is a fallback.
-        let snap = state.settings.current();
-        if let Some(entry) = snap.find_tab(tab.as_str()) {
-            if entry.builtin() {
-                return Err(TabLifecycleError::BuiltinNotClosable);
-            }
-        }
-    }
-
-    // Existence check, active-switch, and removal all happen under ONE lock
-    // acquisition. Splitting them lets a concurrent `tab_activate` /
-    // `set_active_tab` (which take `state.tabs` but NOT the lifecycle
-    // serializer) re-activate this tab in the gap between the switch and the
-    // remove, leaving `active` dangling at a removed tab. Holding the lock
-    // across the whole sequence closes that window.
-    //
-    // If we're closing the active tab, switch to its left neighbor first so the
-    // frontend's active-tab indicator (and the TTS active cell) points at a tab
-    // that still exists. Builtins always occupy the leftmost positions, so a
-    // previous tab always exists.
-    let removed = {
-        let mut registry = state.tabs.lock().await;
-        if !registry.has_tab(&tab) {
-            return Err(TabLifecycleError::TabNotFound {
-                tab: tab.as_str().to_string(),
-            });
-        }
-        if registry.active() == tab {
-            // Prefer the left neighbor; if this is the leftmost tab (a closable
-            // non-builtin can legitimately be at index 0 once AI builtins are
-            // disabled), fall back to the right neighbor so `active` never
-            // dangles at the just-removed tab.
-            let target = registry
-                .previous_tab(&tab)
-                .or_else(|| registry.next_tab(&tab));
-            if let Some(target) = target {
-                if let Err(e) = registry.activate(target).await {
-                    warn!(error = %e, "close_tab: activate neighbor failed");
-                }
-            }
-        }
-        registry.remove_tab(&tab).await
-    };
-    if !removed {
-        return Err(TabLifecycleError::TabNotFound {
-            tab: tab.as_str().to_string(),
-        });
-    }
-
-    // V14 code-review fix (webview leak): proactively destroy a closed
-    // Preview tab's child webview from the backend, rather than relying
-    // solely on `PreviewToolbar.svelte`'s `onDestroy` — a renderer crash,
-    // an HMR reload, or a thrown exception could skip that path entirely
-    // and leak the webview for the rest of the process's life.
-    // `destroy_if_open` is idempotent, so this is safe even if the
-    // frontend's own cleanup also runs (whichever gets there first wins;
-    // the other is a no-op).
-    if tab.kind() == TabKind::Preview {
-        crate::preview::destroy_if_open(&preview_registry, tab.as_str());
-    }
-
-    // V1.4-04 D.6: drop any persisted scrollback file for the closed
-    // tab. The orphan-prune sweep at next launch would also catch it,
-    // but cleaning up immediately keeps the disk-state consistent
-    // with the user's mental model.
-    if let Err(e) = crate::pty::scrollback::delete(&tab) {
-        warn!(?tab, error = %e, "close_tab: scrollback delete failed");
-    }
-
-    // V39 Phase A: and its read-only row. The settings entry is dropped just
-    // below, so the next broadcast would clear a `User` lock anyway; this also
-    // drops a `Driven` row (which settings never describes) and keeps the map
-    // from holding one entry per closed tab for the rest of the session.
-    state.read_only.forget(&tab);
-    // V39 Phase B: and tell any delegation in flight on this tab that its
-    // worker is gone. It cannot be inferred from the state mirror — closing a
-    // tab drops that row, so a closed tab reads exactly like an idle one — and
-    // without it the driver would wait out its whole deadline on a tab that no
-    // longer exists.
-    crate::delegation::note_worker_gone(&tab);
-
-    // Remove the settings entry. Drop the active_tab_id pointer if it
-    // referenced this tab — the frontend will set a new one on its next
-    // tab-switch event. Atomic mutate so a concurrent save_layout /
-    // settings_update can't resurrect the just-closed tab from a stale
-    // whole-struct snapshot.
-    state.settings.mutate(|snap| {
-        snap.tabs.retain(|t| t.id() != tab.as_str());
-        if snap.session.active_tab_id.as_deref() == Some(tab.as_str()) {
-            snap.session.active_tab_id = None;
-        }
-    });
-
-    if let Err(e) = state
-        .state_signals
-        .send(StateSignal::TabRemoved { tab: tab.clone() })
-        .await
-    {
-        warn!(error = %e, "close_tab: state-signal channel closed");
-        return Err(TabLifecycleError::internal("state signal channel closed"));
-    }
-
-    info!(?tab, "tab closed");
-    Ok(())
+    let webviews: &dyn WebviewHost = preview_registry.inner();
+    tab_service(&state).close(tab, webviews).await
 }
 
 /// V8-03/V9-01: materialize or tear down a reserved, app-rendered feature tab
@@ -816,45 +307,14 @@ pub(crate) async fn sync_reserved_feature_tab(state: &AppState, tab: TabId, enab
     }
 }
 
-/// Rename any tab. Builtins are renamable too — only the display name
-/// changes; the underlying command/args are unaffected.
+/// Rename any tab. See [`TabService::rename`].
 #[tauri::command]
 pub async fn rename_tab(
     state: State<'_, AppState>,
     tab: TabId,
     new_name: String,
 ) -> Result<(), TabLifecycleError> {
-    let _serializer = state.lifecycle_serializer.lock().await;
-    let trimmed = new_name.trim().to_string();
-    if trimmed.is_empty() {
-        return Err(TabLifecycleError::EmptyName);
-    }
-    {
-        let mut registry = state.tabs.lock().await;
-        if !registry.has_tab(&tab) {
-            return Err(TabLifecycleError::TabNotFound {
-                tab: tab.as_str().to_string(),
-            });
-        }
-        registry.set_name(&tab, &trimmed);
-    }
-    state.settings.mutate(|snap| {
-        if let Some(entry) = snap.find_tab_mut(tab.as_str()) {
-            entry.set_name(trimmed.clone());
-        }
-    });
-    if let Err(e) = state
-        .state_signals
-        .send(StateSignal::TabRenameRequested {
-            tab: tab.clone(),
-            name: trimmed,
-        })
-        .await
-    {
-        warn!(error = %e, "rename_tab: state-signal channel closed");
-        return Err(TabLifecycleError::internal("state signal channel closed"));
-    }
-    Ok(())
+    tab_service(&state).rename(tab, new_name).await
 }
 
 /// Update a Shell tab's spawn config. Does NOT respawn — the new config

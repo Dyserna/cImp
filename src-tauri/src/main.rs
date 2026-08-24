@@ -29,6 +29,9 @@ mod pty;
 #[cfg(test)]
 mod rustsrc;
 mod sandbox;
+/// V42 Phase 0: the UI-neutral service layer the `#[tauri::command]`s delegate
+/// to, and the sinks that stand in for the app host.
+mod service;
 mod settings;
 mod shell;
 mod spawn_gate;

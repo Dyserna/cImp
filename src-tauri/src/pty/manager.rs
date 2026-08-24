@@ -3,7 +3,6 @@ use std::io::Write;
 use std::sync::{Arc, Mutex as StdMutex};
 
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
-use tauri::ipc::Channel;
 use tauri::{AppHandle, Manager};
 use tokio::sync::{mpsc, Mutex as TokioMutex};
 use tokio_util::sync::CancellationToken;
@@ -12,6 +11,8 @@ use tracing::{debug, info, warn};
 use crate::error::{AppError, AppResult};
 use crate::processing::permission::PermissionPattern;
 use crate::pty::tasks;
+use crate::service::sink::{EventSink, OutputSink, TauriEventSink};
+use crate::settings::SettingsHandle;
 use crate::state::{StateSignal, TabId};
 use crate::tts::TtsRequest;
 
@@ -57,6 +58,48 @@ pub struct PtyLaunchSpec {
     pub harness: Option<crate::sandbox::tabs::Harness>,
 }
 
+/// What a PTY session needs from the application host, as a value.
+///
+/// V42 Phase 0. This replaces the `AppHandle` that used to ride [`PtyStart`],
+/// which was doing two jobs at once: emitting `pty-exit` at the end of a
+/// session, and standing in for a DI container — four `state::<T>()` lookups
+/// performed *inside* [`PtyManager::start`], one of them re-deriving a settings
+/// handle the caller was already passing in beside it.
+///
+/// The lookups did not go away; they moved to [`PtyHost::from_app`], which runs
+/// once at the Tauri boundary. That is the whole difference, and it is the one
+/// that matters: a session can now be started by anything that can name these
+/// three values, and a test can supply a recording sink and two `None`s.
+pub struct PtyHost {
+    /// Where this session's `pty-exit` goes.
+    pub events: Arc<dyn EventSink>,
+    /// V10: the warm graph service, so the harness transcript tap can record
+    /// session/action memory in-process. Absent in headless/test builds.
+    pub mem: Option<Arc<crate::graph::GraphService>>,
+    /// V30 Phase D: the session-push bus, so an out-of-band tap can subscribe
+    /// its tab in-process and forward notices over its agent's own API. Only
+    /// the send half's registry travels (not the service), exactly like the
+    /// Phase C producers in `main.rs` — no Arc cycle. Absent in headless/test
+    /// builds ⇒ `None` ⇒ no fanout.
+    pub pushes: Option<Arc<crate::offload::service::PushRegistry>>,
+}
+
+impl PtyHost {
+    /// Resolve the host's services from a live app. The ONE service-locator
+    /// site left on this path; everything downstream takes the values.
+    pub fn from_app(app: &AppHandle) -> Self {
+        Self {
+            events: Arc::new(TauriEventSink::new(app.clone())),
+            mem: app
+                .try_state::<Arc<crate::graph::GraphService>>()
+                .map(|s| s.inner().clone()),
+            pushes: app
+                .try_state::<Arc<crate::offload::OffloadService>>()
+                .map(|s| s.push_registry()),
+        }
+    }
+}
+
 /// Everything one PTY launch needs, in one value.
 ///
 /// R25: [`PtyManager::start`] used to take these as nine positional
@@ -70,9 +113,13 @@ pub struct PtyLaunchSpec {
 /// on its first line and then runs exactly the body it ran before, so nothing
 /// here touches the synchronous stretch the H1-R3 note in that body protects.
 pub struct PtyStart {
-    pub app: AppHandle,
+    pub host: PtyHost,
+    /// V42 Phase 0: passed in rather than looked up off an `AppHandle`. The
+    /// registry that builds this already holds the handle — the old code took
+    /// the app handle from the same caller and asked it for the same value.
+    pub settings: SettingsHandle,
     pub spec: PtyLaunchSpec,
-    pub output_channel: Channel<String>,
+    pub output: Arc<dyn OutputSink>,
     pub initial_rows: u16,
     pub initial_cols: u16,
     pub tts_segments: mpsc::Sender<TtsRequest>,
@@ -124,7 +171,7 @@ fn apply_env(
 /// V1.4-03 renderer-flip path destroys the JS xterm and rebinds the PTY's
 /// bytes to a freshly-constructed one.
 pub enum ProcessorControl {
-    ChannelChange(Channel<String>),
+    ChannelChange(Arc<dyn OutputSink>),
     /// A real (non-deduped) PTY resize just pulsed SIGWINCH at the child,
     /// which makes a TUI like Claude Code repaint. That repaint is a burst
     /// of bytes indistinguishable from genuine output, so it can trip the
@@ -302,9 +349,10 @@ impl PtyManager {
 
     pub async fn start(&self, start: PtyStart) -> AppResult<()> {
         let PtyStart {
-            app,
+            host,
+            settings,
             spec,
-            output_channel,
+            output,
             initial_rows,
             initial_cols,
             tts_segments,
@@ -312,6 +360,11 @@ impl PtyManager {
             patterns,
             start_gen,
         } = start;
+        let PtyHost {
+            events,
+            mem,
+            pushes,
+        } = host;
         let mut guard = self.inner.lock().await;
         if guard.is_some() {
             return Err(AppError::AlreadyStarted);
@@ -341,7 +394,7 @@ impl PtyManager {
         // ONE settings snapshot serves the decision and the rows it mints: a
         // second read could straddle a save and describe the boundary with a
         // posture the child never ran under.
-        let sandbox_settings = app.state::<crate::ipc::AppState>().settings.current();
+        let sandbox_settings = settings.current();
         // Read on every platform (the value is what the ROWS are described
         // with), consumed only by the Windows engine — the same shape the rest
         // of the sandbox layer carries off Windows.
@@ -521,7 +574,6 @@ impl PtyManager {
         // — control messages are rare (one per renderer-flip).
         let (control_tx, control_rx) = mpsc::channel::<ProcessorControl>(4);
 
-        let settings = app.state::<crate::ipc::AppState>().settings.clone();
         // V1.4-04 D: per-tab scrollback ring buffer. Reader task
         // appends every PTY byte; we hand out clones via
         // `scrollback_snapshot` for persistence and via the
@@ -533,20 +585,9 @@ impl PtyManager {
 
         // V20: build the out-of-band TTS source context before the senders are
         // moved into the processor/waiter. The source rides `cancel`, so it
-        // starts now and dies when the tab's PTY does.
-        // V10: the warm graph service, so the Claude transcript tap can record
-        // session/action memory in-process. Absent in headless/test builds.
-        let mem = app
-            .try_state::<Arc<crate::graph::GraphService>>()
-            .map(|s| s.inner().clone());
-        // V30 Phase D: the session-push bus, so the OpenCode tap can subscribe
-        // its tab in-process and forward notices over OpenCode's HTTP API. Only
-        // the send half's registry travels (not the service), exactly like the
-        // Phase C producers in `main.rs` — no Arc cycle. Absent in
-        // headless/test builds ⇒ `None` ⇒ no fanout.
-        let pushes = app
-            .try_state::<Arc<crate::offload::OffloadService>>()
-            .map(|s| s.push_registry());
+        // starts now and dies when the tab's PTY does. `mem` and `pushes` came
+        // off `PtyHost` above — they used to be two `app.try_state` lookups
+        // here (V42 Phase 0).
         let oob_ctx = spec.oob.clone().map(|oob_spec| {
             (
                 oob_spec,
@@ -587,7 +628,7 @@ impl PtyManager {
         tasks::spawn_processor(
             tab.clone(),
             bytes_rx,
-            output_channel,
+            output,
             control_rx,
             cancel.clone(),
             state_signals.clone(),
@@ -598,7 +639,7 @@ impl PtyManager {
         tasks::spawn_waiter(
             tab.clone(),
             child,
-            app,
+            events,
             cancel.clone(),
             state_signals,
             start_gen,
@@ -747,14 +788,14 @@ impl PtyManager {
     /// V1.4-03: swap the processor task's output channel without
     /// restarting the PTY. Used when the JS-side xterm is destroyed and
     /// recreated for a renderer-category flip — the shell session, env,
-    /// cwd, and running processes survive; only the IPC `Channel<String>`
-    /// is replaced.
+    /// cwd, and running processes survive; only the output sink is
+    /// replaced.
     ///
     /// Returns `AppError::NotStarted` if no PTY is registered, or
     /// `AppError::Pty` if the processor task has already exited (e.g.,
     /// after a child PTY exit). In both cases the caller is expected to
     /// fall back to `pty_start`.
-    pub async fn rebind_channel(&self, new_channel: Channel<String>) -> AppResult<()> {
+    pub async fn rebind_channel(&self, new_channel: Arc<dyn OutputSink>) -> AppResult<()> {
         let control_tx = {
             let guard = self.inner.lock().await;
             let handle = guard.as_ref().ok_or(AppError::NotStarted)?;
@@ -903,9 +944,9 @@ impl Default for PtyManager {
 mod tests {
     use super::*;
     use crate::pty::tasks::spawn_processor;
+    use crate::service::sink::testing::RecordingOutputSink;
     use crate::settings::SettingsHandle;
     use crate::state::TabId;
-    use std::sync::Mutex as StdMutex;
     use std::time::Duration;
     use tokio::sync::mpsc;
 
@@ -1027,35 +1068,25 @@ mod tests {
     #[tokio::test]
     async fn rebind_with_no_pty_errors() {
         let manager = PtyManager::new();
-        let dummy = Channel::new(|_| Ok(()));
+        let dummy: Arc<dyn OutputSink> = Arc::new(RecordingOutputSink::default());
         let result = manager.rebind_channel(dummy).await;
         assert!(matches!(result, Err(AppError::NotStarted)));
     }
 
-    /// V1.4-03: directly exercises the processor task's channel-swap
-    /// behavior without spinning up a real PTY. Confirms that bytes
-    /// emitted before `ChannelChange` reach the old `Channel<String>`,
-    /// bytes emitted after reach the new one, and no bytes are lost
-    /// across the swap (the cancel-safety claim about `mpsc::Receiver::
-    /// recv()` in the select loop).
+    /// V1.4-03: directly exercises the processor task's sink-swap behavior
+    /// without spinning up a real PTY. Confirms that bytes emitted before
+    /// `ChannelChange` reach the old sink, bytes emitted after reach the new
+    /// one, and no bytes are lost across the swap (the cancel-safety claim
+    /// about `mpsc::Receiver::recv()` in the select loop).
+    ///
+    /// V42 Phase 0: the two `Channel<String>`s this used to build are
+    /// `RecordingOutputSink`s now, which is why it can assert what arrived
+    /// rather than only that something did — the sink decodes the base64 the
+    /// processor sends, where an `InvokeResponseBody` did not.
     #[tokio::test]
     async fn channel_rebind_routes_bytes_to_new_channel() {
-        let received_a: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
-        let received_b: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
-
-        let a_buf = received_a.clone();
-        let channel_a: Channel<String> = Channel::new(move |body| {
-            // `body` is the encoded base64 string the processor sends.
-            let s = String::from_utf8(body.deserialize().unwrap_or_default()).unwrap_or_default();
-            a_buf.lock().unwrap().push(s);
-            Ok(())
-        });
-        let b_buf = received_b.clone();
-        let channel_b: Channel<String> = Channel::new(move |body| {
-            let s = String::from_utf8(body.deserialize().unwrap_or_default()).unwrap_or_default();
-            b_buf.lock().unwrap().push(s);
-            Ok(())
-        });
+        let sink_a = Arc::new(RecordingOutputSink::default());
+        let sink_b = Arc::new(RecordingOutputSink::default());
 
         let (bytes_tx, bytes_rx) = mpsc::channel::<Vec<u8>>(16);
         let (control_tx, control_rx) = mpsc::channel::<ProcessorControl>(4);
@@ -1072,7 +1103,7 @@ mod tests {
         spawn_processor(
             tab,
             bytes_rx,
-            channel_a,
+            sink_a.clone(),
             control_rx,
             cancel.clone(),
             state_tx,
@@ -1087,9 +1118,9 @@ mod tests {
         bytes_tx.send(b"hello-A\r\n".to_vec()).await.unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await;
 
-        // Swap to channel B.
+        // Swap to sink B.
         control_tx
-            .send(ProcessorControl::ChannelChange(channel_b))
+            .send(ProcessorControl::ChannelChange(sink_b.clone()))
             .await
             .unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1101,19 +1132,11 @@ mod tests {
         cancel.cancel();
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        let a = received_a.lock().unwrap().clone();
-        let b = received_b.lock().unwrap().clone();
-        // The processor base64-encodes terminal bytes. We don't decode
-        // here — just assert the routing: A got something, B got
-        // something, and nothing crossed.
-        assert!(
-            !a.is_empty(),
-            "channel A should have received pre-swap bytes"
-        );
-        assert!(
-            !b.is_empty(),
-            "channel B should have received post-swap bytes"
-        );
+        let a = String::from_utf8_lossy(&sink_a.decoded()).into_owned();
+        let b = String::from_utf8_lossy(&sink_b.decoded()).into_owned();
+        assert!(a.contains("hello-A"), "sink A should carry the pre-swap bytes: {a:?}");
+        assert!(!a.contains("hello-B"), "sink A must not see post-swap bytes: {a:?}");
+        assert!(b.contains("hello-B"), "sink B should carry the post-swap bytes: {b:?}");
     }
 
     /// V1.4-03: confirms the processor handles three rapid rebinds
@@ -1122,8 +1145,6 @@ mod tests {
     /// the JS-side debounce can collapse them.
     #[tokio::test]
     async fn processor_survives_rapid_rebinds() {
-        let final_buf: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
-
         let (bytes_tx, bytes_rx) = mpsc::channel::<Vec<u8>>(16);
         let (control_tx, control_rx) = mpsc::channel::<ProcessorControl>(8);
         let (state_tx, _state_rx) = mpsc::channel(8);
@@ -1131,14 +1152,12 @@ mod tests {
         let defaults = crate::settings::Settings::default();
         let settings = SettingsHandle::new(defaults.clone(), defaults, std::env::temp_dir());
 
-        let initial: Channel<String> = Channel::new(|_| Ok(()));
-
         let tab = TabId::Shell("shell-test".to_string());
         let patterns = Arc::new(Vec::new());
         spawn_processor(
             tab,
             bytes_rx,
-            initial,
+            Arc::new(RecordingOutputSink::default()),
             control_rx,
             cancel.clone(),
             state_tx,
@@ -1148,23 +1167,18 @@ mod tests {
             crate::harness::plugin::ActivitySource::OutOfBand,
         );
 
-        // Three rapid rebinds. The last channel is the one whose buffer
-        // we assert against.
+        // Three rapid rebinds. The last sink is the one we assert against.
         for _ in 0..2 {
-            let throwaway: Channel<String> = Channel::new(|_| Ok(()));
             control_tx
-                .send(ProcessorControl::ChannelChange(throwaway))
+                .send(ProcessorControl::ChannelChange(Arc::new(
+                    RecordingOutputSink::default(),
+                )))
                 .await
                 .unwrap();
         }
-        let final_clone = final_buf.clone();
-        let final_channel: Channel<String> = Channel::new(move |body| {
-            let s = String::from_utf8(body.deserialize().unwrap_or_default()).unwrap_or_default();
-            final_clone.lock().unwrap().push(s);
-            Ok(())
-        });
+        let final_sink = Arc::new(RecordingOutputSink::default());
         control_tx
-            .send(ProcessorControl::ChannelChange(final_channel))
+            .send(ProcessorControl::ChannelChange(final_sink.clone()))
             .await
             .unwrap();
 
@@ -1176,10 +1190,10 @@ mod tests {
         cancel.cancel();
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        let received = final_buf.lock().unwrap().clone();
+        let received = String::from_utf8_lossy(&final_sink.decoded()).into_owned();
         assert!(
-            !received.is_empty(),
-            "final channel should have received post-rebind bytes"
+            received.contains("final"),
+            "the final sink should have received the post-rebind bytes: {received:?}"
         );
     }
 }

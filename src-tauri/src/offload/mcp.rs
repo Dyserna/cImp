@@ -522,6 +522,16 @@ async fn offload_task_tool_live() -> Value {
 /// learn two spellings. The `enum` here is advisory only — the value is
 /// re-validated post-hoc ([`Profile::parse`]) at both the child and the app
 /// parse boundaries.
+/// The two `offload_*` MCP tool names this server advertises, spelled once.
+///
+/// V42 F6 (#131): `service::toolref`'s parity test builds the offload reference
+/// list's expected surface from these, so a third `offload_*` tool added here
+/// without a Tools-tab row is a red test rather than a tool the user is never
+/// told about. (The `delegate_task_<harness>` family is minted per tab at
+/// `tools/list` time and has no fixed name to pin.)
+pub(crate) const OFFLOAD_TASK_TOOL: &str = "offload_task";
+pub(crate) const OFFLOAD_BATCH_TOOL: &str = "offload_batch";
+
 fn profile_param_schema() -> Value {
     json!({
         "type": "string",
@@ -534,7 +544,7 @@ fn profile_param_schema() -> Value {
 /// from the current (config-derived) capability set.
 fn offload_task_tool() -> Value {
     json!({
-        "name": "offload_task",
+        "name": OFFLOAD_TASK_TOOL,
         "description": offload_task_description(&current_settings_full()),
         "inputSchema": {
             "type": "object",
@@ -922,7 +932,7 @@ fn schema_arg(args: &Value) -> Option<Value> {
 /// The `offload_batch` tool descriptor.
 fn offload_batch_tool() -> Value {
     json!({
-        "name": "offload_batch",
+        "name": OFFLOAD_BATCH_TOOL,
         "description": format!(
             "Run several offload subtasks IN PARALLEL across the local worker's slots in a single \
              call. Prefer this over issuing multiple `offload_task` calls when you want real \

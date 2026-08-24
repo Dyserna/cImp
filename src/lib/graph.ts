@@ -4,7 +4,8 @@
 // is consumed by the Phase-I monitor tab, not here.
 
 import { invoke } from '@tauri-apps/api/core';
-import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import { type UnlistenFn } from '@tauri-apps/api/event';
+import { listenEvent, GRAPH_ANALYSES, GRAPH_STATUS } from './events';
 
 /// Mirror of Rust `graph::index::LangCount` — indexed file count for one
 /// language. Only languages with at least one file are present.
@@ -159,7 +160,7 @@ export function graphHistory(opts?: {
 /// Subscribe to live per-root status transitions (emitted as one status at a
 /// time). Returns an unlisten fn.
 export function onGraphStatus(cb: (status: GraphStatus) => void): Promise<UnlistenFn> {
-  return listen<GraphStatus>('graph-status', (e) => cb(e.payload));
+  return listenEvent(GRAPH_STATUS, (e) => cb(e.payload));
 }
 
 /// V12 Phase F (6c): the analyses-auto trigger's live counts, emitted only
@@ -173,7 +174,7 @@ export interface GraphAnalyses {
 /// Subscribe to `graph-analyses` (fires only on a count change, per-root).
 /// Drives the Analyses section's "+N since last pass" badges.
 export function onGraphAnalyses(cb: (a: GraphAnalyses) => void): Promise<UnlistenFn> {
-  return listen<GraphAnalyses>('graph-analyses', (e) => cb(e.payload));
+  return listenEvent(GRAPH_ANALYSES, (e) => cb(e.payload));
 }
 
 /// V10 (Analyses): one candidate dead export. Mirror of Rust `DeadExportRow`.

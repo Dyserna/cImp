@@ -4,7 +4,13 @@
 
 import { writable, type Writable } from 'svelte/store';
 import { invoke } from '@tauri-apps/api/core';
-import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import { type UnlistenFn } from '@tauri-apps/api/event';
+import {
+  listenEvent,
+  OFFLOAD_SERVER_METRICS,
+  OFFLOAD_SERVER_OUTPUT,
+  OFFLOAD_STATE,
+} from './events';
 import type { LocalProviderBlock, Settings } from './settings/types';
 
 /// Mirror of Rust `OffloadState` (serde tag = "state").
@@ -34,7 +40,7 @@ export async function initOffloadStatus(): Promise<void> {
     } catch (e) {
       console.warn('offload_status failed', e);
     }
-    await listen<OffloadState>('offload-state', (event) => {
+    await listenEvent(OFFLOAD_STATE, (event) => {
       offloadState.set(event.payload);
     });
     // Mark initialized only after the subscription is established; if `listen`
@@ -486,7 +492,7 @@ export async function offloadServerLog(name?: string): Promise<string[]> {
 export function onOffloadServerOutput(
   cb: (line: ServerLogLine) => void,
 ): Promise<UnlistenFn> {
-  return listen<ServerLogLine>('offload-server-output', (e) => cb(e.payload));
+  return listenEvent(OFFLOAD_SERVER_OUTPUT, (e) => cb(e.payload));
 }
 
 /// V8-03: Offload server dashboard snapshot (mirror of Rust `ServerMetrics`).
@@ -586,7 +592,7 @@ export async function offloadServerMetrics(): Promise<BackendDashboard[]> {
 export function onOffloadServerMetrics(
   cb: (rows: BackendDashboard[]) => void,
 ): Promise<UnlistenFn> {
-  return listen<BackendDashboard[]>('offload-server-metrics', (e) => cb(e.payload));
+  return listenEvent(OFFLOAD_SERVER_METRICS, (e) => cb(e.payload));
 }
 
 /// One-line summary of an MCP-server health row for the Settings list.

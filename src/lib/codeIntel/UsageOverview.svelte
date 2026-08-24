@@ -32,7 +32,7 @@
   /// reaches this markup through the DOM. Only the rules no other section can
   /// reach travelled here.
   import { onMount, onDestroy } from 'svelte';
-  import { listen } from '@tauri-apps/api/event';
+  import { listenEvent, LLM_PRICING_CHANGED } from '../events';
   import { writeText as clipboardWriteText } from '@tauri-apps/plugin-clipboard-manager';
   import { get } from 'svelte/store';
   import {
@@ -1328,7 +1328,7 @@
   // file (bypassing the settings-changed broadcast), so `llm_pricing_set`
   // emits its own event: refetch the shared table so already-open cost
   // surfaces reprice without a card reopen or an app restart.
-  listenManaged(() => listen('llm-pricing-changed', () => void refreshPricingTable()));
+  listenManaged(() => listenEvent(LLM_PRICING_CHANGED, () => void refreshPricingTable()));
 
   onMount(() => {
     // Static backend data, once — see `loadAdvisorRules`.

@@ -32,7 +32,11 @@ use crate::service::sink::{EventSink, EventSinkExt};
 
 /// The `settings-deep-link` event name, and the window label it is targeted at.
 /// Named here so the two halves of the protocol are spelled once.
-pub const DEEP_LINK_EVENT: &str = "settings-deep-link";
+///
+/// V42 F6 (#131): DEFINED FROM `service::events`, so the string is spelled
+/// exactly once in the crate. The alias stays because this name is what the
+/// module's own callers and tests read.
+pub const DEEP_LINK_EVENT: &str = crate::service::events::SETTINGS_DEEP_LINK;
 
 /// The prefix the cold slot uses to mark a SECTION target. A bare target is a
 /// tab id; `SettingsApp.svelte`'s consume path routes on exactly this string.

@@ -631,7 +631,7 @@ pub fn spawn_waiter(
             start_gen,
         });
         if let Err(e) = events.emit(
-            "pty-exit",
+            crate::service::events::PTY_EXIT,
             &PtyExitPayload {
                 tab: tab.clone(),
                 exit: exit_str,

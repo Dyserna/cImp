@@ -74,7 +74,13 @@
 pub mod audit;
 pub mod audio;
 pub mod checks;
+/// V42 F6 (#131): writes `src/lib/generated/{events.ts,tools.ts}` from the two
+/// tables below. Test-cfg only — see the module docs.
+#[cfg(test)]
+mod codegen;
 pub mod delegation;
+/// V42 F6 (#131): every Tauri event name the backend emits, in one table.
+pub mod events;
 pub mod graph;
 pub mod harness;
 pub mod host;
@@ -85,6 +91,11 @@ pub mod pty;
 pub mod settings;
 pub mod sink;
 pub mod tabs;
+/// V42 F6 (#131): the Tools tab's tool reference lists + the tripwires pinning
+/// them to the real tool tables. Test-cfg only: its only consumer is `codegen`,
+/// which emits the committed TypeScript the frontend imports.
+#[cfg(test)]
+mod toolref;
 pub mod usage;
 pub mod view;
 pub mod window;

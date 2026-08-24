@@ -207,7 +207,10 @@ pub fn enabled_defs(toggles: &OffloadToolToggles) -> Vec<ToolDef> {
 
 /// The pure toggle→def mapping, split from the live `checks` read so the
 /// `run_check` advertisement gate is testable without touching disk settings.
-fn enabled_defs_inner(toggles: &OffloadToolToggles, checks_configured: bool) -> Vec<ToolDef> {
+pub(crate) fn enabled_defs_inner(
+    toggles: &OffloadToolToggles,
+    checks_configured: bool,
+) -> Vec<ToolDef> {
     let mut defs = Vec::new();
     if toggles.read_file {
         defs.push(read_file::def());

@@ -8,7 +8,7 @@
 
 import { writable, get } from 'svelte/store';
 import { invoke } from '@tauri-apps/api/core';
-import { listen } from '@tauri-apps/api/event';
+import { listenEvent, STT_STATE, STT_TRANSCRIPTION } from './events';
 import { composeContent, composeOpen, openCompose } from './composeState';
 import { showToast } from './toast';
 
@@ -32,7 +32,7 @@ export function initStt(): void {
   if (inited) return;
   inited = true;
 
-  void listen<{ state: SttState }>('stt-state', (e) => {
+  void listenEvent(STT_STATE, (e) => {
     const next = e.payload.state;
     sttState.set(next);
     if (next === 'error') {
@@ -40,7 +40,7 @@ export function initStt(): void {
     }
   });
 
-  void listen<{ text: string }>('stt-transcription', (e) => {
+  void listenEvent(STT_TRANSCRIPTION, (e) => {
     const text = (e.payload.text ?? '').trim();
     if (!text) {
       // Silence / too-short utterance — the backend emits an empty transcript.

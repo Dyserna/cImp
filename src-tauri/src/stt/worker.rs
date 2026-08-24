@@ -149,7 +149,7 @@ fn load_engine(
 }
 
 fn emit_transcript(app: &AppHandle, text: &str) {
-    if let Err(e) = app.emit("stt-transcription", serde_json::json!({ "text": text })) {
+    if let Err(e) = app.emit(crate::service::events::STT_TRANSCRIPTION, serde_json::json!({ "text": text })) {
         warn!(target: "stt", error = %e, "emit stt-transcription failed");
     }
 }

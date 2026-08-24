@@ -1,5 +1,6 @@
 import { writable, derived, get, type Readable } from 'svelte/store';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import { listenEvent, AVATAR_ERROR, AVATAR_STATE } from './events';
 import { settings, applySettings } from './settings/store';
 import { activeTab } from './tabs/state';
 import {
@@ -173,7 +174,7 @@ const closedTabs = new Set<TabId>();
 /// them — which is why no UnlistenFn is exposed.
 export function startAvatarStateListener(): Promise<void> {
   if (!statePromise) {
-    statePromise = listen<StateEvent>('avatar-state', (event) => {
+    statePromise = listen<StateEvent>(AVATAR_STATE, (event) => {
       const e = event.payload;
       if (e.type === 'state-changed') {
         if (closedTabs.has(e.tab)) return;
@@ -246,7 +247,7 @@ export function startAvatarStateListener(): Promise<void> {
     });
   }
   if (!errorPromise) {
-    errorPromise = listen<AvatarErrorInfo>('avatar-error', (event) => {
+    errorPromise = listenEvent(AVATAR_ERROR, (event) => {
       const info = event.payload;
       if (closedTabs.has(info.tab)) return;
       perTabError.update((m) => ({ ...m, [info.tab]: info }));

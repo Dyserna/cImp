@@ -13,7 +13,8 @@
   // scan running" note (`scanLock`). All testable logic lives in
   // `./codeAudit/logic`.
   import { onMount, onDestroy } from 'svelte';
-  import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+  import { type UnlistenFn } from '@tauri-apps/api/event';
+  import { listenEvent, AUDIT_STATUS } from './events';
   import { writeText as clipboardWriteText } from '@tauri-apps/plugin-clipboard-manager';
   import { settings } from './settings/store';
   import { openSettingsWindowToSection } from './settings/ipc';
@@ -208,7 +209,7 @@
   onMount(() => {
     void pullFull(true);
     void (async () => {
-      const un = await listen<AuditSnapshot>('audit-status', (e) => {
+      const un = await listenEvent(AUDIT_STATUS, (e) => {
         if (!alive) return;
         noteActive(e.payload);
         // A truncated event dropped findings to the per-tool cap — fetch the

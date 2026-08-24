@@ -542,7 +542,7 @@ impl Wiring {
             let mut current_content_enabled = initial.logging.content_capture.enabled;
             let mut current_content_retention: LogRetention =
                 initial.logging.content_capture.retention;
-            let _ = app.emit("settings-changed", initial);
+            let _ = app.emit(crate::service::events::SETTINGS_CHANGED, initial);
             loop {
                 match rx.recv().await {
                     Ok(s) => {
@@ -569,7 +569,7 @@ impl Wiring {
                             current_content_retention = s.logging.content_capture.retention;
                             content::run_cleanup(current_content_retention);
                         }
-                        let _ = app.emit::<Settings>("settings-changed", s);
+                        let _ = app.emit::<Settings>(crate::service::events::SETTINGS_CHANGED, s);
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         warn!(skipped = n, "settings broadcast lagged");

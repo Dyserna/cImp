@@ -25,6 +25,7 @@
 
 import type { Terminal, IDecoration, IMarker } from '@xterm/xterm';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import { AVATAR_STATE } from './events';
 import { get, writable } from 'svelte/store';
 
 import { ttsSpeakSelection, ttsStop, ttsSetPaused } from './ipc';
@@ -303,7 +304,7 @@ async function ensureListener(): Promise<void> {
     type: string;
     session: number;
     index: number;
-  }>('avatar-state', (event) => {
+  }>(AVATAR_STATE, (event) => {
     const e = event.payload;
     if (e.type !== 'tts-selection-progress') return;
     if (e.session !== activeSession) return; // stale read

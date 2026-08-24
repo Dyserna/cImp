@@ -284,7 +284,7 @@ impl<'a> SettingsService<'a> {
             // regardless of the target it was addressed to — so two targeted
             // emits reached the main window's listener twice and it showed the
             // toast twice. `emit` delivers once to every webview.
-            let _ = events.emit("ai-tab-restart-hint", &consumers);
+            let _ = events.emit(crate::service::events::AI_TAB_RESTART_HINT, &consumers);
         }
         Ok(())
     }
@@ -493,7 +493,7 @@ pub fn set_llm_pricing(
     events: &dyn EventSink,
 ) -> AppResult<()> {
     crate::settings::write_global_llm_pricing(pricing)?;
-    let _ = events.emit("llm-pricing-changed", &());
+    let _ = events.emit(crate::service::events::LLM_PRICING_CHANGED, &());
     Ok(())
 }
 

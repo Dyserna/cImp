@@ -2678,7 +2678,7 @@ impl OffloadService {
                 }
 
                 *this.latest_metrics.lock().unwrap() = rows.clone();
-                let _ = this.core.events.emit("offload-server-metrics", &rows);
+                let _ = this.core.events.emit(crate::service::events::OFFLOAD_SERVER_METRICS, &rows);
             }
         });
     }

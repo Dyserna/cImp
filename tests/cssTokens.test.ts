@@ -85,6 +85,25 @@ const DECL_FILES = [
   join(REPO_ROOT, 'settings.html'),
 ];
 
+/**
+ * Everything the USE scan reads — the same list.
+ *
+ * V42 review (dropped-at-cap). The use scan ran over `SRC_FILES` only, so the
+ * theme sheets were declaration-ONLY: they could hand out tokens, but were
+ * never asked whether the tokens THEY consume resolve. A theme sheet is not a
+ * passive table — `themes/<id>/theme.css` and the backend-compiled `tui` theme
+ * both build values out of other tokens (`var(--accent)`, `color-mix(in srgb,
+ * var(--bg-elevated) …)`), which is exactly the defect-D2 shape one layer
+ * below where anyone was looking. A `var()` naming nothing is worse there than
+ * in a component, because it is wrong for every component the theme paints.
+ *
+ * One list in both roles closes that by construction: a file that may declare
+ * a token is a file whose own uses must resolve. The two entry HTML files ride
+ * along, and they earn it — their inline FOUC-avoidance styles are the
+ * earliest `var()` uses in the app's life.
+ */
+const USE_FILES = DECL_FILES;
+
 function declaredTokens(): Set<string> {
   const declared = new Set<string>();
   for (const file of DECL_FILES) {
@@ -108,12 +127,24 @@ describe('CSS custom properties', () => {
   test('the scan actually sees the frontend (vacuity guard)', () => {
     expect(SRC_FILES.length).toBeGreaterThan(100);
     expect(declaredTokens().size).toBeGreaterThan(50);
+    // …and it sees the theme sheets, in the USE role too. `walk` swallows a
+    // missing directory (an optional tree), so an empty result here would
+    // silently mean "the themes are never checked" rather than "there are
+    // none".
+    const themeSheets = USE_FILES.filter((f) => {
+      const rel = relative(REPO_ROOT, f).split(sep).join('/');
+      return rel.startsWith('themes/') || rel.startsWith('src-tauri/src/theming/');
+    });
+    expect(
+      themeSheets.length,
+      'no external/backend theme sheet reached the scan — the token homes are unchecked',
+    ).toBeGreaterThan(0);
   });
 
   test('every var(--token) with no fallback names a declared token', () => {
     const declared = declaredTokens();
     const offenders: string[] = [];
-    for (const file of SRC_FILES) {
+    for (const file of USE_FILES) {
       const lines = read(file).split('\n');
       lines.forEach((line, i) => {
         for (const m of line.matchAll(/var\(\s*(--[A-Za-z0-9_-]+)\s*(,?)/g)) {

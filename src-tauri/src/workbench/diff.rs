@@ -16,6 +16,7 @@ use serde::Serialize;
 use crate::error::{AppError, AppResult};
 
 use super::git::{self, GitCtx};
+use super::worddiff;
 
 /// Files larger than this are flagged `too_large` and never diffed/rendered —
 /// a giant generated/binary-ish file blowing up into a multi-MB unified diff
@@ -94,6 +95,32 @@ pub struct Hunk {
     /// freshly-`Default`-constructed `Hunk` that hasn't gone through either
     /// builder (only happens in this module's own unit tests).
     pub hash: String,
+    /// V42 Phase D: the rendering decision for every line in
+    /// [`lines`](Self::lines) — context / plain add / plain del / a `-`+`+`
+    /// PAIR carrying its word-level spans. Filled by [`finish_hunk`] at the
+    /// same moment as [`hash`](Self::hash) (so every builder gets it once) and
+    /// carried over the wire: this is what `src/lib/diffWords.ts` used to
+    /// recompute in the browser for every diff surface, on every re-render.
+    ///
+    /// Groups name their lines by INDEX rather than repeating the text — see
+    /// [`super::worddiff`] for why (a full-file diff must not double in size).
+    /// Empty on a freshly-`Default`-constructed `Hunk`, like `hash`.
+    pub groups: Vec<worddiff::HunkLineGroup>,
+}
+
+/// Fill a fully-parsed hunk's DERIVED fields — [`Hunk::hash`] and
+/// [`Hunk::groups`]. One helper rather than two assignments at each builder
+/// so a third derived field can never be added to one path and forgotten on
+/// the other (the `hash`-only version of this was already duplicated between
+/// [`parse_unified`] and [`synthesize_untracked`]).
+///
+/// [`hunk_hash`] deliberately still hashes only the PARSED content: `groups`
+/// is a pure function of `lines`, so folding it in would add nothing to the
+/// staleness guard and would make the fingerprint depend on this module's
+/// rendering decisions.
+fn finish_hunk(hunk: &mut Hunk) {
+    hunk.hash = hunk_hash(hunk);
+    hunk.groups = worddiff::pair_hunk_lines(&hunk.lines);
 }
 
 /// One file's full parsed diff — the payload of `workbench_diff_file`.
@@ -357,7 +384,7 @@ pub fn parse_unified(diff_text: &str) -> Vec<FileDiff> {
                     break;
                 }
             }
-            hunk.hash = hunk_hash(&hunk);
+            finish_hunk(&mut hunk);
             hunks.push(hunk);
         }
 
@@ -411,9 +438,10 @@ fn parse_hunk_header(full_line: &str, rest: &str) -> Option<Hunk> {
         new_lines,
         lines: Vec::new(),
         no_newline_at: Vec::new(),
-        // Filled in by the caller once `lines` is populated — see the
-        // `hunk.hash = hunk_hash(&hunk)` right before this hunk is pushed.
+        // Both filled in by the caller once `lines` is populated — see the
+        // `finish_hunk(&mut hunk)` right before this hunk is pushed.
         hash: String::new(),
+        groups: Vec::new(),
     })
 }
 
@@ -928,8 +956,9 @@ fn synthesize_untracked(root: &Path, path: &str) -> AppResult<FileDiff> {
         lines: body,
         no_newline_at: Vec::new(),
         hash: String::new(),
+        groups: Vec::new(),
     };
-    hunk.hash = hunk_hash(&hunk);
+    finish_hunk(&mut hunk);
     Ok(FileDiff {
         path: path.to_string(),
         status: FileStatus::Untracked,
@@ -1270,6 +1299,7 @@ diff --git a/a.rs b/a.rs
                 lines: vec![('-', "old".into()), ('+', "new".into())],
                 no_newline_at: Vec::new(),
                 hash: String::new(),
+                groups: Vec::new(),
             }],
             too_large: true,
         };
@@ -1295,6 +1325,7 @@ diff --git a/a.rs b/a.rs
             lines: vec![('-', "a".into()), ('+', "b".into())],
             no_newline_at: vec![],
             hash: String::new(),
+            groups: Vec::new(),
         };
         let h1_again = h1.clone();
         let mut h2 = h1.clone();
@@ -1384,6 +1415,7 @@ diff --git a/a.rs b/a.rs
             lines: vec![('-', "old".into()), ('+', "new".into())],
             no_newline_at: vec![],
             hash: String::new(),
+            groups: Vec::new(),
         };
         let patch = String::from_utf8(build_hunk_patch(&file, &hunk)).unwrap();
         assert!(patch.starts_with("--- a/f.txt\n+++ b/f.txt\n@@ -2,1 +2,1 @@\n-old\n+new\n"));
@@ -1407,6 +1439,7 @@ diff --git a/a.rs b/a.rs
             lines: vec![('+', "hi".into())],
             no_newline_at: vec![],
             hash: String::new(),
+            groups: Vec::new(),
         };
         let patch = String::from_utf8(build_hunk_patch(&file, &hunk)).unwrap();
         assert!(patch.starts_with("--- /dev/null\n+++ b/new.txt\n"));

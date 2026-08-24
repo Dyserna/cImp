@@ -199,8 +199,17 @@ export interface ActivityEntry {
   /// `injection_flag` rows invert it (a DENIAL is `false`, a detection flag
   /// that was still delivered is `true`), and the telemetry-channel sources
   /// record `false` to mean "this signal fired", not "this call failed".
-  /// `status()` in EventsView.svelte is the one place that untangles it.
+  /// `status` below is the untangled reading of it.
   ok: boolean;
+  /// **What this row reports, as one word** — computed backend-side (Rust
+  /// `activity::RowStatus::classify`) and rendered by `StatusChip`.
+  ///
+  /// Derived from the row, never stored input: the backend classifies at the
+  /// recording site and re-derives on every read of the JSONL mirror, so a row
+  /// written by an older build arrives in today's vocabulary. See [`RowStatus`]
+  /// for what each word claims — and for why several of them exist precisely so
+  /// that no two of these facts collapse into one chip.
+  status: RowStatus;
   /// #51: which tab this row belongs to. Always present on the wire (Rust
   /// serializes the default), so no optionality here — an absent field on an
   /// old persisted row is repaired backend-side into `'unattributed'`.
@@ -238,8 +247,7 @@ export interface ActivityRecord extends ActivityEntry {
 
 // ── Row status (#48, M-24) ────────────────────────────────────────────────
 //
-// **Why this is here and not in either feed component.** Both the Tool Activity
-// tab and the Events tab render this store, and both collapsed every
+// **The finding.** Both feeds rendering this store collapsed every
 // `injection_flag` row into one treatment: Tool Activity painted the whole kind
 // chip danger-red ("the only kind with a tinted chip"), and Events mapped
 // `ok ? 'flagged' : 'denied'`. So `unscreened`, the two detector screens,
@@ -249,17 +257,20 @@ export interface ActivityRecord extends ActivityEntry {
 // `latch_override` — a user GRANTING capability back — read as containment
 // firing.
 //
-// One classifier, in the `.ts` file that has a test harness, consumed by both
-// feeds: the security vocabulary of this app must not differ between two tabs
-// showing the same rows.
-
-/// Sources that are TELEMETRY CHANNELS rather than tool invocations:
-/// `read_advisor` reports advisor reminders and full-file-`Read` bypasses,
-/// `harness` reports contract/sub-agent drift. Both record `ok: false` to mean
-/// "this signal fired", not "this call failed" — so painting them with the error
-/// colour made the feed read as mostly-broken when nothing had broken (20 of 28
-/// red rows on one machine were bypass canaries).
-export const CANARY_SOURCES = new Set(['read_advisor', 'harness']);
+// **What is left here, and what moved (V42).** The classifier was a ~120-line
+// pure function of one row, and every branch of it restated a rule that lives
+// backend-side: `Screen::is_denial`, the `updater` source written outside
+// `record_flag`, the transition verbs the lifecycle recorders mint, the exact
+// wire value of the screening source. A restatement cannot be checked against
+// what it restates — a screen added backend-side simply fell through to the
+// "unknown" branch here — so classification moved to `crate::activity`, where a
+// new screen must pick a word or the build fails, and where a test holds the
+// vocabulary to `is_denial` itself. Each row now arrives carrying its
+// `status`.
+//
+// What stayed is the part that is genuinely presentation and has no backend
+// meaning: the word list below (which the backend's own guard checks itself
+// against), the sentence each word wears (`STATUS_TITLE`) and the chip's CSS.
 
 /// What one feed row actually reports, as one word.
 ///
@@ -269,7 +280,11 @@ export const CANARY_SOURCES = new Set(['read_advisor', 'harness']);
 /// Three plain call outcomes:
 /// - `ok` — the call worked.
 /// - `failed` — the call failed.
-/// - `signal` — a telemetry channel fired ([`CANARY_SOURCES`]); not a failure.
+/// - `signal` — a telemetry channel fired (`read_advisor` reminders and
+///   full-file-`Read` bypasses, `harness` contract/sub-agent drift, both of
+///   which record `ok: false` to mean "this signal fired"); not a failure.
+///   Painting them with the error colour made the feed read as mostly-broken
+///   when nothing had broken — 20 of 28 red rows on one machine were canaries.
 ///
 /// …and nine `injection_flag` outcomes, which are NOT interchangeable:
 /// - `denied` — a screen stopped the call. The only one that means "we blocked
@@ -379,137 +394,6 @@ export type RowStatus =
   ///   REMOVES something. A row that reports a removal as a delivery is the
   ///   M-24 defect pointed the other way.
   | 'withheld';
-
-/// The `source` value the backend stamps on every C9 screening row
-/// (`SCREEN_DROP_SOURCE` in `src-tauri/src/offload/mcp_host.rs` — the Rust side
-/// keeps it in one constant for exactly this reason). Matched exactly: it is a
-/// wire value, not a prose prefix.
-const SCREEN_DROP_SOURCE = 'screen';
-
-/// Classify one row.
-///
-/// `ok` is read as the denial predicate ONLY for the screens that follow it.
-/// `Screen::is_denial` is the backend's rule and `record_flag` publishes it as
-/// `ok: false` — but `updater` rows are documented as the one source written
-/// outside `record_flag`, where `ok` is the bundle OUTCOME (`rejected ⇒ false`).
-/// Reading `!ok` as "denied" there would report a refused rules bundle as a
-/// blocked tool call, which is the same collapse this function exists to undo,
-/// so `updater` is matched on `source` before `ok` is consulted at all.
-export function rowStatus(e: ActivityEntry): RowStatus {
-  if (e.kind === 'offload_server') {
-    // Keyed on `tool` (the transition), never on `ok` alone: `ok` is true for
-    // BOTH a healthy start and a deliberate stop, so reading it by itself
-    // would render "the server is gone" and "the server is up" as one word.
-    switch (e.tool) {
-      case 'start':
-        return 'started';
-      case 'ready':
-        return 'ready';
-      case 'stop':
-        return 'stopped';
-      case 'fail':
-        return 'down';
-      default:
-        // A transition added backend-side that this build predates. `ok` is
-        // documented as the transition's outcome, which is a claim we can
-        // still make; the verb it belongs to is not.
-        return e.ok ? 'ok' : 'down';
-    }
-  }
-  if (e.kind === 'sandbox') {
-    // Keyed on `tool`, like `offload_server` and for the same reason: `ok`
-    // here distinguishes a CHOSEN unsandboxed state (the switch is off) from
-    // an unavailable one, so it cannot also carry the verb. Locked decision
-    // 17 requires those two to stay visibly distinct, which the row's
-    // `target` text spells out ("off (user choice)" / "unavailable").
-    switch (e.tool) {
-      case 'unsandboxed':
-        return 'unsandboxed';
-      // A child ran INSIDE the boundary. Deliberately quiet: this is the
-      // expected case, and the row exists to remove the empty-lane ambiguity
-      // ("everything was sandboxed" vs "nothing ever ran"), not to compete for
-      // attention. The row's `target` names the program.
-      case 'sandboxed':
-        return 'ok';
-      // A sandboxed child failed with denial-shaped output. Its own word — see
-      // `boundary` in `RowStatus` for why neither `denied` nor `failed` fits.
-      case 'denied':
-        return 'boundary';
-      default:
-        // `grant` and anything added backend-side that this build predates:
-        // `ok` is that event's outcome, which is a claim we can still make.
-        return e.ok ? 'ok' : 'failed';
-    }
-  }
-  if (e.kind === 'mcp_health') {
-    // Keyed on `tool` (the transition), like `offload_server` and `sandbox` —
-    // `ok` alone cannot carry the verb, and here it is the transition's outcome.
-    switch (e.tool) {
-      case 'unhealthy':
-      case 'connect_failed':
-        return 'unhealthy';
-      case 'healthy':
-        return 'recovered';
-      default:
-        // A transition added backend-side that this build predates.
-        return e.ok ? 'recovered' : 'unhealthy';
-    }
-  }
-  if (e.kind === 'injection_flag') {
-    switch (e.source) {
-      // Checked first: its `ok` is an outcome, not a denial (see above).
-      case 'updater':
-        return e.ok ? 'update' : 'rejected';
-      case 'signature':
-      case 'classifier':
-        return 'flagged';
-      case 'unscreened':
-        return 'unscreened';
-      case 'memory_quarantine':
-        return 'held';
-      case 'latch_beacon':
-      case 'contamination':
-        return 'engaged';
-      case 'latch_override':
-      case 'contamination_cleared':
-        return 'granted';
-      case 'ssrf':
-      case 'budget':
-      case 'canary':
-      case 'latch_refusal':
-        return 'denied';
-      default:
-        // A screen added backend-side that this build predates. `ok: false`
-        // still carries `Screen::is_denial`, which is a claim we can make; a
-        // delivered one gets the no-category word rather than a borrowed one.
-        return e.ok ? 'recorded' : 'denied';
-    }
-  }
-  // V39 locked decision 14. Keyed on `tool` (the transition), like
-  // `offload_server`, `sandbox` and `mcp_health` and for the same reason: `ok`
-  // here is the transition's own outcome, so it cannot also carry the verb.
-  // Only the rows that are NOT call outcomes are named; `done`, `refused`,
-  // `timeout` and `worker_exited` fall through, where `ok`/`failed` say exactly
-  // what happened and a synonym would dilute the vocabulary.
-  if (e.kind === 'delegation') {
-    switch (e.tool) {
-      case 'start':
-        return 'driving';
-      case 'takeover':
-        return 'takeover';
-      case 'role_moved':
-        return 'moved';
-      default:
-        break;
-    }
-  }
-  // V37 C9, and BEFORE the generic `ok` fallthrough on purpose: these rows are
-  // minted `ok: false` in the `mcp` lane, so without this branch a withheld tool
-  // renders as "Call failed" — a claim about a call that never happened.
-  if (e.kind === 'mcp' && e.source === SCREEN_DROP_SOURCE) return 'withheld';
-  if (!e.ok) return CANARY_SOURCES.has(e.source) ? 'signal' : 'failed';
-  return 'ok';
-}
 
 /// The tooltip each status wears. The first five are the Events tab's own
 /// sentences, kept; every state ADDED here says explicitly what was *not*

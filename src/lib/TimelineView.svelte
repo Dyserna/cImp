@@ -36,7 +36,7 @@
   import { errorMessage } from './errors';
   import CheckpointDiffView from './CheckpointDiffView.svelte';
   import { WORKBENCH_TAB_ID, type TabId } from './tabs/types';
-  import { onAppViewShown, isAppViewVisible } from './appViewVisibility';
+  import { isAppViewVisible, onAppViewShown, pollWhileVisible } from './appViewVisibility';
   import { loadViewString, saveViewString } from './viewSection';
   import { latchByTab, applyLatchOverride, type LatchRow } from './latch';
   import { findHarness, harnesses } from './harness';
@@ -137,12 +137,12 @@
   const POLL_MS = 5000;
   onMount(() => {
     const unsub = onAppViewShown(WORKBENCH_TAB_ID, () => void refresh());
-    const poll = setInterval(() => {
-      if (isAppViewVisible(WORKBENCH_TAB_ID) && !actionBusy) void refresh(true);
-    }, POLL_MS);
+    const stopPoll = pollWhileVisible(WORKBENCH_TAB_ID, () => void refresh(true), POLL_MS, {
+      skipWhen: () => actionBusy,
+    });
     return () => {
       unsub();
-      clearInterval(poll);
+      stopPoll();
       if (highlightTimer) clearTimeout(highlightTimer);
     };
   });

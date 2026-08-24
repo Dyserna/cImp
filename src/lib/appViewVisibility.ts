@@ -46,3 +46,39 @@ export function onAppViewShown(id: TabId, cb: () => void): () => void {
     if (v && !was) cb();
   });
 }
+
+/// Run `tick` every `everyMs` for as long as the app view `id` is on screen,
+/// and stop when the returned teardown is called.
+///
+/// THE RULE THIS EXISTS TO KEEP (#130). An app view stays mounted for the
+/// app's lifetime once created, so a bare `setInterval` in one keeps burning
+/// IPC forever after the tab is opened once — even while it is detached.
+/// Every keep-alive poll therefore has to gate on `isAppViewVisible`, and
+/// five of them wrote that gate out by hand. One spelling, five callers: a
+/// sixth poll added tomorrow gets the gate by construction rather than by
+/// whether its author had read the comment on one of the others.
+///
+/// The GATE ONLY. Two things deliberately stay at the call site: the
+/// hidden→visible refresh (`onAppViewShown`, which several views want to do
+/// something different from a tick) and whatever the tick itself is — the
+/// Events feed runs its checkpoint read on every third tick, the Timeline
+/// asks for a cheaper refresh than its on-shown one. Those are decisions,
+/// not boilerplate.
+export function pollWhileVisible(
+  id: TabId,
+  tick: () => void,
+  everyMs: number,
+  opts: {
+    /// Skip THIS tick without stopping the poll — an action or a fetch
+    /// already in flight. Asked after the visibility gate, so a hidden view
+    /// never pays for it.
+    skipWhen?: () => boolean;
+  } = {},
+): () => void {
+  const timer = setInterval(() => {
+    if (!isAppViewVisible(id)) return;
+    if (opts.skipWhen?.()) return;
+    tick();
+  }, everyMs);
+  return () => clearInterval(timer);
+}

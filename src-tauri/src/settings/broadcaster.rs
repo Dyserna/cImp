@@ -166,6 +166,54 @@ impl SettingsHandle {
         }
     }
 
+    /// [`Self::mutate`] without the broadcast: the store is updated and a
+    /// debounced save is requested, but no `settings-changed` goes out.
+    ///
+    /// **For a field whose authority lives in the frontend** — today that is
+    /// `layout`, written by `save_layout` (V42 Phase B). The layout tree is
+    /// owned by the window that is dragging it; `settings.layout` is where it
+    /// gets persisted, not where anyone reads it from. The audit, as of this
+    /// commit: `wire_settings_broadcast` reads logging, content capture and the
+    /// read-only mirror, never `layout`; the frontend settings store's only
+    /// reader of `layout` is App's `onMount`, which runs once, off the
+    /// hydration emission; and `settings_update` (the Settings window's
+    /// whole-struct replace) explicitly PRESERVES `layout` from live state, so
+    /// a window holding a stale copy cannot write one back. Nobody was
+    /// listening.
+    ///
+    /// What they were paying for it: `installLayoutPersistence` saves on EVERY
+    /// layout-store update — the V0.6 removal of its 250 ms debounce closed a
+    /// real closing race and is not coming back — so a splitter drag calls
+    /// `save_layout` once per mousemove. Each call cloned the entire `Settings`
+    /// struct and emitted it to every webview, at pointer-event rate, for a
+    /// value none of them read. In the Settings window every one of those
+    /// arrivals is a broadcast the draft gate has to reconcile against an
+    /// in-flight edit.
+    ///
+    /// Everything else is unchanged: the write is atomic against a concurrent
+    /// tab create/close (the same held lock as `mutate`), and the debounced
+    /// saver and `flush()` both read this same `inner`, so last-write-wins on
+    /// disk and the close-flush property hold exactly as before. A later
+    /// broadcast from any other mutation carries the current layout with it —
+    /// quiet writes leave a subscriber's copy stale, never wrong.
+    ///
+    /// **Not a general-purpose "cheaper mutate".** A field some subsystem
+    /// reacts to must go through [`Self::mutate`]; if a future consumer needs
+    /// to know about layout changes, give it a dedicated event rather than
+    /// putting a per-frame whole-`Settings` emit back on this path.
+    pub fn mutate_quiet<F: FnOnce(&mut Settings)>(&self, f: F) {
+        {
+            let mut g = match self.inner.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            f(&mut g);
+        }
+        if self.save_tx.send(()).is_err() {
+            tracing::warn!("settings: saver task is gone; changes will not persist");
+        }
+    }
+
     /// Synchronously persist the current settings, bypassing the 500ms
     /// debounce. Intended for shutdown so an edit made within the debounce
     /// window is not silently lost when the saver task is still mid-sleep.
@@ -267,6 +315,54 @@ fn spawn_saver(
 mod tests {
     use super::*;
     use crate::settings::LogLevel;
+
+    /// A scratch launch dir so the debounced saver can't write an overlay into
+    /// the repo if it fires before the test ends.
+    struct TempCwd(PathBuf);
+
+    impl TempCwd {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("cimp-{tag}-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+
+    impl Drop for TempCwd {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).ok();
+        }
+    }
+
+    /// V42 Phase B. `mutate_quiet` must land the write and request the save —
+    /// it is a real mutation, not a dry run — while sending nothing to
+    /// subscribers. A splitter drag calls `save_layout` once per pointer event;
+    /// with `mutate` that was a whole-`Settings` clone emitted to every webview
+    /// at that rate, for a field none of them read.
+    #[test]
+    fn mutate_quiet_updates_the_store_without_broadcasting() {
+        let tmp = TempCwd::new("quiet-test");
+        let handle = SettingsHandle::new(Settings::default(), Settings::default(), tmp.0.clone());
+        let mut rx = handle.subscribe();
+
+        handle.mutate_quiet(|s| s.logging.level = LogLevel::Debug);
+
+        assert_eq!(
+            handle.current().logging.level,
+            LogLevel::Debug,
+            "the write must land in the store — quiet is about the broadcast, not the mutation"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a quiet mutation must not reach subscribers"
+        );
+
+        // …and a subsequent ordinary mutation still carries the quiet write with
+        // it, so a subscriber's copy goes stale, never wrong.
+        handle.mutate(|s| s.ui.events_tab = !s.ui.events_tab);
+        let seen = rx.try_recv().expect("the loud mutation broadcasts");
+        assert_eq!(seen.logging.level, LogLevel::Debug);
+    }
 
     /// Regression (2026-07 review): `set`/`mutate` used to broadcast AFTER
     /// releasing the store lock, so two racing writers could deliver the

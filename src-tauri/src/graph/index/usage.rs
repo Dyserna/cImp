@@ -566,15 +566,7 @@ impl GraphIndex {
         let per_tool = self.usage_per_tool(&s.session_id)?;
         let models = self.usage_session_models(&s.session_id)?;
         let tool_chars: u64 = per_tool.iter().map(|(_, c)| *c).sum();
-        // Derived from the raw COLUMNS, not from the declared-shape payload: a
-        // harness that does not declare `cache_read` has no ratio to show, and
-        // reading an absent category as 0 here would print a confident "0%".
-        let denom = cols.cache_read + cols.in_tok;
-        let cache_hit_ratio = if denom > 0 {
-            cols.cache_read as f64 / denom as f64
-        } else {
-            0.0
-        };
+        let cache_hit_ratio = cache_hit_ratio(&totals);
         // V24 Phase E: "est" means "no real token accounting", derived from
         // whether ANY turn was recorded — not from the summed token totals. A
         // recorded turn (Claude, or OpenCode once its plugin forwards usage in
@@ -696,6 +688,41 @@ fn column_kinds(
         }
     }
     out
+}
+
+/// The two pricing ids [`cache_hit_ratio`] divides, named off [`COLUMN_KINDS`]
+/// so they cannot drift from the columns they stand for (`in_tok` is column 0,
+/// `cache_read` column 2 — pinned by `the_ratio_reads_the_two_columns_it_names`).
+const KIND_INPUT: &str = COLUMN_KINDS[0];
+const KIND_CACHE_READ: &str = COLUMN_KINDS[2];
+
+/// `cache_read / (cache_read + input)` over one session's DECLARED totals —
+/// [`SessionUsageRow::cache_hit_ratio`](crate::graph::memory::SessionUsageRow::cache_hit_ratio).
+///
+/// Read off the declared-category map rather than off the raw columns, because
+/// the question it answers is what the session's HARNESS reported: one that
+/// declares neither category has no ratio at all, and reading an absent
+/// category as 0 would print a confident "0% cache hit" for a bill nobody sent.
+///
+/// The three edge cases, which are the whole of the contract:
+/// * neither category declared ⇒ `None` (nothing to divide);
+/// * declared but summing to zero ⇒ `None` too — no denominator is no ratio,
+///   not 0, and not NaN;
+/// * only one declared ⇒ divide by what is there. `input: 100` alone is an
+///   honest 0%, `cache_read: 100` alone an honest 100%.
+///
+/// **V42: this was `cacheHitRatio` in `src/lib/usageMath.ts`** — those rules in
+/// its doc comment, those edge cases in `usageMath.test.ts`, and the row's own
+/// `f64` (`0.0` for the no-denominator case) rendered by nobody. The formula
+/// lives once now, beside the columns it divides.
+fn cache_hit_ratio(totals: &crate::harness::plugin::TokenKinds) -> Option<f64> {
+    let cache_read = totals.get(KIND_CACHE_READ);
+    let input = totals.get(KIND_INPUT);
+    if cache_read.is_none() && input.is_none() {
+        return None;
+    }
+    let denom = cache_read.unwrap_or(0) + input.unwrap_or(0);
+    (denom > 0).then(|| cache_read.unwrap_or(0) as f64 / denom as f64)
 }
 
 /// A nullable `String?` column: `None` for a stored `Null`/missing cell
@@ -1302,8 +1329,11 @@ mod tests {
             .expect("c1 present");
         assert!(!claude.est_only, "claude sessions carry exact usage");
         assert_eq!(claude.totals.get("input"), Some(306));
-        // cache_read / (cache_read + in_tok) = 50 / 356.
-        assert!((claude.cache_hit_ratio - (50.0 / 356.0)).abs() < 1e-9);
+        // cache_read / (cache_read + input) = 50 / 356.
+        let hit = claude
+            .cache_hit_ratio
+            .expect("claude declares both categories and spent both");
+        assert!((hit - (50.0 / 356.0)).abs() < 1e-9);
         assert_eq!(
             claude.models,
             vec!["claude-opus-4-8".to_string(), "claude-sonnet-5".to_string()],
@@ -1329,8 +1359,9 @@ mod tests {
         );
         assert_eq!(opencode.tool_chars, 20);
         assert_eq!(
-            opencode.cache_hit_ratio, 0.0,
-            "no denominator ⇒ 0.0, not NaN"
+            opencode.cache_hit_ratio, None,
+            "declared at zero on both sides ⇒ no denominator ⇒ no ratio at all: \
+             not 0.0 (which would claim a 0% hit rate), and not NaN"
         );
         assert!(
             opencode.models.is_empty(),
@@ -1639,5 +1670,70 @@ mod tests {
 
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── V42: the cache-hit ratio, ported from `usageMath.ts` ──────────────
+    //
+    // One case per test in `describe('cacheHitRatio')` in
+    // `src/lib/usageMath.test.ts`, which is deleted with the function: the row
+    // carries the ratio now, so there is no second implementation left to test.
+    // The edge cases ARE the contract — each of them is a way to answer "0%"
+    // about a session that never billed a cache read.
+
+    /// A declared-category map, built the way [`column_kinds`] builds one.
+    fn kinds(pairs: &[(&str, u64)]) -> crate::harness::plugin::TokenKinds {
+        let mut k = crate::harness::plugin::TokenKinds::default();
+        for (id, v) in pairs {
+            k.set(id, *v);
+        }
+        k
+    }
+
+    #[test]
+    fn the_ratio_reads_the_two_columns_it_names() {
+        // The `COLUMN_KINDS` indices behind `KIND_INPUT`/`KIND_CACHE_READ` are
+        // the one thing in that derivation a reader has to take on trust.
+        assert_eq!(KIND_INPUT, "input");
+        assert_eq!(KIND_CACHE_READ, "cache_read");
+    }
+
+    #[test]
+    fn cache_hit_ratio_divides_cache_read_by_cache_read_plus_input() {
+        assert_eq!(
+            cache_hit_ratio(&kinds(&[("cache_read", 75), ("input", 25)])),
+            Some(0.75)
+        );
+        assert_eq!(
+            cache_hit_ratio(&kinds(&[("cache_read", 0), ("input", 100)])),
+            Some(0.0)
+        );
+        assert_eq!(
+            cache_hit_ratio(&kinds(&[("cache_read", 100), ("input", 0)])),
+            Some(1.0)
+        );
+    }
+
+    #[test]
+    fn no_denominator_is_no_ratio_rather_than_zero_or_nan() {
+        assert_eq!(cache_hit_ratio(&kinds(&[])), None);
+        assert_eq!(
+            cache_hit_ratio(&kinds(&[("cache_read", 0), ("input", 0)])),
+            None,
+            "both DECLARED and both zero is still nothing to divide"
+        );
+    }
+
+    #[test]
+    fn a_harness_that_declares_neither_category_has_no_ratio_at_all() {
+        // V40 Phase G: absence is not zero. A harness billing one flat token
+        // number reports no `cache_read` and no `input`, and "0% cache hit"
+        // would be a claim it never made.
+        assert_eq!(cache_hit_ratio(&kinds(&[("output", 500)])), None);
+    }
+
+    #[test]
+    fn a_partially_declared_shape_still_divides_by_what_it_has() {
+        assert_eq!(cache_hit_ratio(&kinds(&[("input", 100)])), Some(0.0));
+        assert_eq!(cache_hit_ratio(&kinds(&[("cache_read", 100)])), Some(1.0));
     }
 }

@@ -19,7 +19,6 @@
     type FileDiff,
   } from './workbench';
   import { workbenchDiff, workbenchDiffError, watchWorkbenchDiff, refreshWorkbenchDiffNow } from './workbenchDiff';
-  import { pairHunkLines, wordDiff } from './diffWords';
   import HunkBody from './diff/HunkBody.svelte';
   import { openComposeWith } from './composeState';
   import { settings } from './settings/store';
@@ -373,30 +372,28 @@
 
                     {#if viewMode === 'unified'}
                       <div class="hunk-body unified">
-                        <HunkBody lines={hunk.lines} />
+                        <HunkBody lines={hunk.lines} groups={hunk.groups} />
                       </div>
                     {:else}
                       <div class="hunk-body side-by-side">
-                        {#each pairHunkLines(hunk.lines) as group, gi (gi)}
+                        {#each hunk.groups as group, gi (gi)}
                           <div class="sbs-row">
                             <div class="sbs-col" class:empty={group.type === 'add'}>
                               {#if group.type === 'ctx'}
-                                <span class="text">{group.text}</span>
+                                <span class="text">{hunk.lines[group.line][1]}</span>
                               {:else if group.type === 'del'}
-                                <span class="text del">{group.text}</span>
+                                <span class="text del">{hunk.lines[group.line][1]}</span>
                               {:else if group.type === 'pair'}
-                                {@const wd = wordDiff(group.oldText, group.newText)}
-                                <span class="text del">{#each wd.left as p, pi (pi)}<span class:hl={p.kind === 'del'}>{p.text}</span>{/each}</span>
+                                <span class="text del">{#each group.left as p, pi (pi)}<span class:hl={p.kind === 'del'}>{p.text}</span>{/each}</span>
                               {/if}
                             </div>
                             <div class="sbs-col" class:empty={group.type === 'del'}>
                               {#if group.type === 'ctx'}
-                                <span class="text">{group.text}</span>
+                                <span class="text">{hunk.lines[group.line][1]}</span>
                               {:else if group.type === 'add'}
-                                <span class="text add">{group.text}</span>
+                                <span class="text add">{hunk.lines[group.line][1]}</span>
                               {:else if group.type === 'pair'}
-                                {@const wd = wordDiff(group.oldText, group.newText)}
-                                <span class="text add">{#each wd.right as p, pi (pi)}<span class:hl={p.kind === 'add'}>{p.text}</span>{/each}</span>
+                                <span class="text add">{#each group.right as p, pi (pi)}<span class:hl={p.kind === 'add'}>{p.text}</span>{/each}</span>
                               {/if}
                             </div>
                           </div>

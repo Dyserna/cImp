@@ -51,34 +51,12 @@ export function barHeightPct(total: number, max: number): number {
   return Math.min(100, Math.max(0, (total / max) * 100));
 }
 
-/// The pricing category ids cImp's price table has rates for. These are
-/// **cImp's own provider vocabulary**, not a harness's: they are literally
-/// `PriceRates`' field names, and the backend's read boundary maps the four
-/// stored `usage_stat` columns onto them (see `graph/index/usage.rs`). What a HARNESS
-/// declares is which of them it reports.
-export const KIND_INPUT = 'input';
-export const KIND_CACHE_WRITE = 'cache_write';
-export const KIND_CACHE_READ = 'cache_read';
-export const KIND_OUTPUT = 'output';
-
-/// `cache_read / (cache_read + input)` — the honest cache-hit ratio shown as a
-/// percentage in the Sessions table.
-///
-/// **`null` when there is no ratio to show**: either the session's harness
-/// declares neither cache-read nor input (nothing to divide) or both are zero
-/// (no denominator). V40 Phase G made this `null` rather than `0`, because "0%
-/// cache hit" is a claim about a session that spent tokens, and a harness that
-/// does not bill cache reads never made it. The backend's
-/// `SessionUsageRow.cache_hit_ratio` still returns `0.0` for the no-denominator
-/// case — it is an `f64` on a struct that cannot carry absence, and this is the
-/// consumer that renders it.
-export function cacheHitRatio(totals: TokenKinds): number | null {
-  const cacheRead = totals[KIND_CACHE_READ];
-  const input = totals[KIND_INPUT];
-  if (cacheRead === undefined && input === undefined) return null;
-  const denom = (cacheRead ?? 0) + (input ?? 0);
-  return denom > 0 ? (cacheRead ?? 0) / denom : null;
-}
+// V42: `cacheHitRatio` and the four `KIND_*` ids it read stood here. The ratio
+// is `SessionUsageRow.cache_hit_ratio` now — an `Option<f64>` that can finally
+// state the "no denominator ⇒ no ratio" rule this file was re-deriving because
+// the payload's `f64` could not. The four pricing ids live where they are
+// authoritative: `COLUMN_KINDS` in `src-tauri/src/graph/index/usage.rs`, which
+// is also `PriceRates`' field names (see below).
 
 /// The four $/MTok rates the session-cost popup multiplies against a
 /// session's totals. Structural subset of the settings-side `LlmPricingModel`
@@ -394,6 +372,25 @@ export function costOverrideForIdx<T extends IdentifiedPricingRow>(
 /// 1970-01-01…") and stay live with a transient notice instead.
 export function isEmptyDetailRow(row: { agent: string; started_ms: number }): boolean {
   return row.agent === '' && row.started_ms === 0;
+}
+
+/// Whether a session is actually live right now, per a `UsageSnapshot`'s
+/// `active_session_ids` (open tab ∪ recency). A fresh empty session has
+/// recorded nothing yet, so `usage.current` / `memory.current_session` still
+/// point at the PREVIOUS session — the live card and the Working-set label say
+/// "last session" then instead of claiming it's this one.
+///
+/// A free function rather than a closure over the snapshot because #130 put
+/// the snapshot in `codeIntel/UsageOverview.svelte` while the Memory section,
+/// which asks the same question of the same list, stayed in
+/// `CodeIntelligenceView.svelte`. Two call sites, one predicate: absent ids
+/// answer false, exactly as the `usage?.active_session_ids ?? []` spelling
+/// they both replaced did.
+export function isActiveSessionIn(
+  ids: readonly string[] | undefined,
+  sid?: string | null,
+): boolean {
+  return !!sid && (ids ?? []).includes(sid);
 }
 
 /// What the Overview poll should do with an arriving `graph_usage`

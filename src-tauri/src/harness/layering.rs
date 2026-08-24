@@ -246,7 +246,7 @@ fn literal_offenders(files: &[(String, String)]) -> BTreeMap<String, BTreeSet<St
     );
     let mut offenders: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for (path, text) in files {
-        if path.starts_with("harness/") || path.ends_with("tests.rs") {
+        if path.starts_with("harness/") || is_test_source(path) {
             continue;
         }
         if LITERAL_ALLOWLIST.iter().any(|(p, _)| p == path) {
@@ -308,24 +308,44 @@ fn the_literal_scan_reads_the_same_code_on_every_platform() {
     // …and neither pass may be reading nothing. `tabs/config.rs` is the file the
     // CRLF bug flooded with false hits, so it is also the honest witness that the
     // CRLF pass still reaches real production code: `build_ai_tool_spec` is a
-    // production fn, sits above that file's test module, and is not a needle.
-    // (It replaced `resolve_oob_source`, which V40 Phase A moved behind
-    // `HarnessPlugin::resolve_oob` — a witness has to be a function that is
-    // still there.)
+    // production fn, sits above where that file's test module used to be, and is
+    // not a needle. (It replaced `resolve_oob_source`, which V40 Phase A moved
+    // behind `HarnessPlugin::resolve_oob` — a witness has to be a function that
+    // is still there.)
     let (_, config) = crlf
         .iter()
         .find(|(p, _)| p == "tabs/config.rs")
         .expect("tabs/config.rs is in the tree");
-    let body = executable_text("tabs/config.rs", config);
     assert!(
-        body.contains("fn build_ai_tool_spec"),
+        executable_text("tabs/config.rs", config).contains("fn build_ai_tool_spec"),
         "the CRLF pass lost `tabs/config.rs`'s production code — an equal-and-empty comparison \
          above would then be two blind runs agreeing"
     );
+
+    // The other half of the witness — that the pass still CUTS — had to change
+    // file with #132. It read `tabs/config.rs`'s test module, and that module is
+    // `tabs/config/tests/*.rs` now: a test file the scan skips by class
+    // ([`is_test_source`]), so the old assertion would hold by having nothing
+    // left to find, which is a vacuous pass and not a control. `spawn_ledger.rs`
+    // is the replacement and has the same shape the old witness relied on: a
+    // production `fn ledger()` above an INLINE `#[cfg(test)]` module whose
+    // `the_opener_grant_stays_scopeless` reads `cap["permissions"]` out of the
+    // Tauri capability files — `permissions` being a registry-derived needle
+    // (capability `claude.settings_overlay`'s `Dep::ConfigKey`).
+    let (_, ledger) = crlf
+        .iter()
+        .find(|(p, _)| p == "spawn_ledger.rs")
+        .expect("spawn_ledger.rs is in the tree");
+    let body = executable_text("spawn_ledger.rs", ledger);
     assert!(
-        !body.contains("\"PostToolUse\""),
-        "the CRLF pass is still scanning `tabs/config.rs`'s test module, where ~70 tests assert \
-         on Claude's hook names — that is the exact CI failure this test pins"
+        body.contains("fn ledger()"),
+        "the CRLF pass lost `spawn_ledger.rs`'s production code — the cut moved above it"
+    );
+    assert!(
+        !body.contains("\"permissions\""),
+        "the CRLF pass is still scanning `spawn_ledger.rs`'s test module, where a capability \
+         fixture is read by a key that is also a harness needle — that is the exact CI failure \
+         this test pins"
     );
 }
 
@@ -1047,7 +1067,23 @@ fn identity_needles() -> BTreeSet<String> {
 /// same reason [`executable_text`] drops test modules — a fixture that names a
 /// harness is a recorded input, not a dependency on one.
 fn identity_exempt_by_class(path: &str) -> bool {
-    path == "settings/migration.rs" || path.ends_with("tests.rs")
+    path == "settings/migration.rs" || is_test_source(path)
+}
+
+/// **Is this file test text?** — the one spelling of "test file by class", used
+/// by both tree scans above.
+///
+/// `<name>/tests.rs` was the whole answer while every sibling test file was a
+/// single one. #132's test-placement wave splits the big ones by section, so a
+/// module's tests can be `tabs/config/tests/overlay.rs` — still test text, still
+/// a recorded input, and NOT matched by a `tests.rs` suffix. Both scans read
+/// every `.rs` file in the tree ([`crate::rustsrc::source_files`]), and a test
+/// file has no `#[cfg(test)]` item inside it for [`executable_text`] to cut, so
+/// without this the scans would read fixtures as production code — exactly the
+/// false-positive class [`the_literal_scan_reads_the_same_code_on_every_platform`]
+/// exists to keep out.
+fn is_test_source(path: &str) -> bool {
+    path.ends_with("tests.rs") || path.contains("/tests/")
 }
 
 /// Every production file outside `harness/` that still names a harness, with the

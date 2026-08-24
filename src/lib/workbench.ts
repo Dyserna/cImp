@@ -52,11 +52,40 @@ export interface DiffSummary {
   source: DiffSource | null;
 }
 
+/// Mirror of Rust `workbench::worddiff::WordDiffPart` — one span of a
+/// word-diffed line. `del` spans only ever appear in a `pair`'s `left`, `add`
+/// spans only in its `right`.
+export interface WordDiffPart {
+  text: string;
+  kind: 'same' | 'add' | 'del';
+}
+
+/// Mirror of Rust `workbench::worddiff::HunkLineGroup` — the backend's
+/// rendering decision for each of a hunk's lines.
+///
+/// **Lines are named by INDEX into `Hunk.lines`, not by text** (a full-file
+/// diff would otherwise ship every line twice): render `lines[g.line][1]`.
+/// Only `pair` carries text, and only the word-level spans of the two lines it
+/// diffed. V42 Phase D moved this derivation out of `src/lib/diffWords.ts` —
+/// nothing in the app computes it client-side any more.
+export type HunkLineGroup =
+  | { type: 'ctx'; line: number }
+  | { type: 'del'; line: number }
+  | { type: 'add'; line: number }
+  | {
+      type: 'pair';
+      old_line: number;
+      new_line: number;
+      left: WordDiffPart[];
+      right: WordDiffPart[];
+    };
+
 /// Mirror of Rust `workbench::diff::Hunk`. `lines` is `[marker, text]` pairs —
 /// `marker` is `' '` (context), `'+'` (added), or `'-'` (removed); `text`
 /// excludes the marker and any trailing newline. `hash` is opaque — the
 /// frontend never computes or inspects it, only echoes it back verbatim to
-/// `workbenchRevertHunk` as the staleness guard.
+/// `workbenchRevertHunk` as the staleness guard. `groups` is the precomputed
+/// render plan over `lines` (see `HunkLineGroup`).
 export interface Hunk {
   header: string;
   old_start: number;
@@ -65,6 +94,7 @@ export interface Hunk {
   new_lines: number;
   lines: [string, string][];
   hash: string;
+  groups: HunkLineGroup[];
 }
 
 /// Mirror of Rust `workbench::diff::FileDiff` — the `workbench_diff_file`

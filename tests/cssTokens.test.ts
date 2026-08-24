@@ -31,36 +31,16 @@
 // friends) in front of the DOM's for the whole frontend -- a much larger
 // change than this guard is worth. `vite.config.ts` sits outside the same
 // include for the same reason. Vitest's default discovery finds it here.
+//
+// The walk, the CRLF-stripping read and the repo root come from `./repoFiles`:
+// they were duplicated byte for byte with `settingsCssOrphans.test.ts` until the
+// V42 tranche-2 review (T2-10), and a walk that grows an exclusion in one copy
+// and not the other is a guard that quietly stops looking at part of the tree.
 
-import { readdirSync, readFileSync } from 'node:fs';
-import { dirname, join, relative, sep } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { join } from 'node:path';
 import { describe, expect, test } from 'vitest';
 
-// this file: <repo>/tests/cssTokens.test.ts
-const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
-
-function walk(dir: string, exts: string[]): string[] {
-  const out: string[] = [];
-  let entries;
-  try {
-    entries = readdirSync(dir, { withFileTypes: true });
-  } catch {
-    return out; // an optional tree (e.g. themes/) that isn't present
-  }
-  for (const entry of entries) {
-    if (entry.name === 'node_modules' || entry.name.startsWith('.')) continue;
-    const full = join(dir, entry.name);
-    if (entry.isDirectory()) out.push(...walk(full, exts));
-    else if (exts.some((ext) => entry.name.endsWith(ext))) out.push(full);
-  }
-  return out;
-}
-
-/** Read a source file line-ending agnostically (see the CRLF note above). */
-function read(file: string): string {
-  return readFileSync(file, 'utf8').replace(/\r/g, '');
-}
+import { read, rel, REPO_ROOT, walk } from './repoFiles';
 
 /**
  * Frontend sources: the files that USE tokens (and may also declare them).
@@ -132,8 +112,8 @@ describe('CSS custom properties', () => {
     // silently mean "the themes are never checked" rather than "there are
     // none".
     const themeSheets = USE_FILES.filter((f) => {
-      const rel = relative(REPO_ROOT, f).split(sep).join('/');
-      return rel.startsWith('themes/') || rel.startsWith('src-tauri/src/theming/');
+      const path = rel(f);
+      return path.startsWith('themes/') || path.startsWith('src-tauri/src/theming/');
     });
     expect(
       themeSheets.length,
@@ -150,7 +130,7 @@ describe('CSS custom properties', () => {
         for (const m of line.matchAll(/var\(\s*(--[A-Za-z0-9_-]+)\s*(,?)/g)) {
           if (m[2] === ',') continue; // has a literal fallback — fine
           if (declared.has(m[1])) continue;
-          const where = relative(REPO_ROOT, file).split(sep).join('/');
+          const where = rel(file);
           offenders.push(`${where}:${i + 1}  ${m[1]}  →  ${line.trim()}`);
         }
       });

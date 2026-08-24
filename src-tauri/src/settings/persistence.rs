@@ -50,7 +50,7 @@ use crate::settings::migration;
 use crate::settings::schema::{
     default_ai_tab, default_events_tab, default_graph_monitor_tab,
     default_shell_1_tab, default_tool_activity_tab, default_workbench_tab,
-    starter_prompt_templates, AiTabId, HarnessVersions, LayoutNodePersisted, LlmPricingModel,
+    starter_prompt_templates, AiTabId, HarnessVersions, LlmPricingModel,
     McpCategory, McpServerConfig, PromptTemplate, RemoteBackendTemplate, ServerCommandTemplate,
     Settings, TabConfig,
     CODE_AUDIT_TAB_ID, CODE_QUALITY_TAB_ID, EVENTS_TAB_ID, GRAPH_MONITOR_TAB_ID,
@@ -168,9 +168,14 @@ pub struct LoadOutcome {
 pub fn load(default_shell: &ShellSpec, launch_cwd: &Path) -> LoadOutcome {
     // 1. Load and migrate the global baseline. After this `global` is in
     //    the current schema shape; a v1.x file on disk has been backed up
-    //    next to the global path and rewritten. `global_stated` is the version
-    //    the file claimed BEFORE that, which step 2a needs.
-    let (mut global, global_stated) = load_global(default_shell);
+    //    next to the global path and rewritten. `stated` is the version the
+    //    file claimed BEFORE that and `below_floor` says whether there was a
+    //    readable baseline at all — step 2a needs both.
+    let GlobalLoad {
+        settings: mut global,
+        stated: global_stated,
+        below_floor: global_below_floor,
+    } = load_global(default_shell);
 
     // 2. Load the overlay (if any).
     //    First fold any pre-consolidation loose overlay into `.cimp/`, then
@@ -192,18 +197,32 @@ pub fn load(default_shell: &ShellSpec, launch_cwd: &Path) -> LoadOutcome {
         //     `claude_local` block that reached nothing after the global moved
         //     the field, with the file still on disk saying otherwise.
         //
-        //     The version comes from the overlay's own `schema_version` stamp
-        //     (written by `save` since Phase I) and falls back to what the
-        //     global file stated: an overlay beside a v35 global was written
-        //     against a v35 baseline. Neither present ⇒ the overlay is current,
-        //     which is what every reader assumed before Phase I anyway.
-        //     The stamp is stripped inside `migrate_overlay`; it must never
-        //     reach the merge, or an old overlay would pin the merged
-        //     `schema_version` below the global's.
-        let from = migration::stated_schema_version(&v)
-            .or(global_stated)
-            .unwrap_or(crate::settings::schema::CURRENT_SCHEMA_VERSION as u64);
-        if migration::migrate_overlay(&mut v, from, default_shell) {
+        //     Which version to enter at is [`overlay_entry_version`]'s
+        //     question, including the case where there is no honest answer:
+        //     the global file beside this overlay was below the floor, so the
+        //     "current unless something says otherwise" default would be a
+        //     guess about a project whose baseline is now DEFAULTS.
+        //     The stamp is stripped inside `migrate_overlay` on every path,
+        //     refusals included; it must never reach the merge, or an old
+        //     overlay would pin the merged `schema_version` below the global's.
+        let entry = overlay_entry_version(&v, global_stated, global_below_floor);
+        if entry.is_none() {
+            tracing::error!(
+                path = %overlay_path.display(),
+                floor = migration::MIN_OVERLAY_SCHEMA_VERSION,
+                "settings: this project overlay states no schema version, and the global file \
+                 beside it was too old to migrate and has been set aside — so nothing says which \
+                 schema the project's keys are in, and the baseline they are being merged onto is \
+                 fresh defaults. Refusing to run the cascade on a guess: the overlay is merged \
+                 exactly as it is, and any key an older schema has since moved reaches nothing. \
+                 Re-save this project's settings to rewrite the file in the current shape"
+            );
+        }
+        // `0` is below every floor, so a refusal takes `migrate_overlay`'s own
+        // refuse-and-warn path rather than a second one written here — and
+        // still gets the stamp stripped.
+        let from = entry.unwrap_or(0);
+        if migration::migrate_overlay(&mut v, from) {
             tracing::info!(
                 path = %overlay_path.display(),
                 from,
@@ -213,7 +232,7 @@ pub fn load(default_shell: &ShellSpec, launch_cwd: &Path) -> LoadOutcome {
         // Every machine-scope family, in one walk of [`MACHINE_SCOPED`] — drop
         // them before the merge so an overlay contaminated by a pre-guard
         // version can't shadow the global file. The whole-key bans go silently
-        // (see `OVERLAY_BANNED_KEYS`); the structured strips NAME what they
+        // (see [`strip_overlay_banned`]); the structured strips NAME what they
         // dropped, because a hand-edited config that sets a plugin's binary path
         // or one of the per-harness fields per repo is a reasonable thing to try
         // and a silent no-op is how that becomes "cImp ignores my config" an
@@ -279,7 +298,13 @@ pub fn load(default_shell: &ShellSpec, launch_cwd: &Path) -> LoadOutcome {
     // value is not a repair of the GLOBAL file, and `load_global` has already
     // healed that one on disk.
     settings.normalize_harness_settings();
-    let repaired = integrity_check(&mut settings);
+    // V42 Phase B: the layout step of the integrity check needs the project's
+    // UI-hidden tab set, so a hidden tab isn't re-placed as an orphan in the
+    // tree the main window is about to render. Read from the same per-project
+    // `.cimp/ui_state.json` the frontend writes it to; a missing or unreadable
+    // file reads as "nothing hidden" (see `read_hidden_tabs`).
+    let hidden_tabs = crate::ipc::ui_state::read_hidden_tabs(launch_cwd);
+    let repaired = integrity_check_with_hidden(&mut settings, &hidden_tabs);
 
     // Re-point bundled avatar videos at the loaded theme. Existing installs
     // had absolute paths frozen to the seed-time theme written into their
@@ -709,24 +734,53 @@ pub fn read_project_prompt_templates(root: &Path) -> Vec<PromptTemplate> {
         .unwrap_or_default()
 }
 
+/// What [`load_global`] hands back: the baseline, plus the two facts about the
+/// FILE it came from that [`load`] needs to place an overlay beside it.
+struct GlobalLoad {
+    settings: Settings,
+    /// The `schema_version` the file **stated before migration** (V40 Phase I,
+    /// issue #107 item 5) — what [`load`] falls back to for an overlay written
+    /// by a build that predates the overlay stamp: an overlay sitting beside a
+    /// v35 global file was written against a v35 baseline, so that is the
+    /// version to enter its cascade at. `None` for a file that stated none
+    /// (pre-v1.10, before `schema_version` existed) and for every path that
+    /// never got to read one.
+    stated: Option<u64>,
+    /// The file was below the migration floor: it was NOT read, `settings` is
+    /// fresh defaults, and the file itself has been set aside (or, if that
+    /// failed, left alone and locked against writes). `stated` is `None` here
+    /// on purpose — the version that file claimed is not a version anything
+    /// beside it may be entered at — and this flag is what tells `load` the
+    /// difference between "nothing said" and "there is nothing left to ask"
+    /// (V42 tranche-2 review, T2-2).
+    below_floor: bool,
+}
+
+impl GlobalLoad {
+    /// The baseline is defaults and the file said nothing usable — absent,
+    /// unreadable, unparseable, or never reached.
+    fn defaults(settings: Settings) -> Self {
+        Self {
+            settings,
+            stated: None,
+            below_floor: false,
+        }
+    }
+}
+
 /// Read the global file. Writes seeded defaults when absent. On parse
 /// failure quarantines the file and returns defaults. Runs migration on
 /// the global file in place — backup goes next to the global path itself,
 /// not next to whatever path the merged result resolved to.
 ///
-/// The second half of the answer is the `schema_version` the file **stated
-/// before migration** (V40 Phase I, issue #107 item 5). It is what [`load`]
-/// falls back to for an overlay written by a build that predates the overlay
-/// stamp: an overlay sitting beside a v35 global file was written against a v35
-/// baseline, so that is the version to enter its cascade at. `None` for a file
-/// that stated none (pre-v1.10, before `schema_version` existed) and for every
-/// path that never got to read one.
-fn load_global(default_shell: &ShellSpec) -> (Settings, Option<u64>) {
+/// See [`GlobalLoad`] for the two facts returned beside the settings and why
+/// each is load-bearing for the overlay.
+fn load_global(default_shell: &ShellSpec) -> GlobalLoad {
     let path = match global_path() {
         Ok(p) => p,
         Err(e) => {
             tracing::warn!(error = %e, "settings: cannot resolve global path; using defaults");
-            return (seeded_defaults(default_shell), None);
+            return GlobalLoad::defaults(seeded_defaults(default_shell));
         }
     };
 
@@ -737,14 +791,14 @@ fn load_global(default_shell: &ShellSpec) -> (Settings, Option<u64>) {
         } else {
             tracing::info!(path = %path.display(), "settings: wrote global defaults");
         }
-        return (s, None);
+        return GlobalLoad::defaults(s);
     }
 
     let text = match fs::read_to_string(&path) {
         Ok(t) => t,
         Err(e) => {
             tracing::warn!(error = %e, path = %path.display(), "settings: read global failed; using defaults");
-            return (seeded_defaults(default_shell), None);
+            return GlobalLoad::defaults(seeded_defaults(default_shell));
         }
     };
 
@@ -759,7 +813,7 @@ fn load_global(default_shell: &ShellSpec) -> (Settings, Option<u64>) {
             migration::quarantine_corrupt_file(&path);
             let s = seeded_defaults(default_shell);
             let _ = save_to(&path, &s);
-            return (s, None);
+            return GlobalLoad::defaults(s);
         }
     };
 
@@ -774,12 +828,18 @@ fn load_global(default_shell: &ShellSpec) -> (Settings, Option<u64>) {
     // a file this old and would otherwise rewrite it as current with its
     // contents silently defaulted.
     if let Some(reseeded) = reseed_below_floor(&path, &value, default_shell) {
-        return (reseeded, None);
+        // `stated` is deliberately dropped: what this file claimed is a version
+        // no overlay may be entered at, and `below_floor` is what says so.
+        return GlobalLoad {
+            settings: reseeded,
+            stated: None,
+            below_floor: true,
+        };
     }
 
     // Migrate the global file in place. Backup is named after the global
     // file, which is the source of truth for the global baseline shape.
-    let migrated = match migration::migrate_if_needed(&mut value, &path, default_shell) {
+    let migrated = match migration::migrate_if_needed(&mut value, &path) {
         Ok(b) => b,
         Err(e) => {
             tracing::error!(
@@ -787,7 +847,7 @@ fn load_global(default_shell: &ShellSpec) -> (Settings, Option<u64>) {
                 path = %path.display(),
                 "settings: global migration aborted (backup failed); using defaults"
             );
-            return (seeded_defaults(default_shell), None);
+            return GlobalLoad::defaults(seeded_defaults(default_shell));
         }
     };
 
@@ -802,7 +862,7 @@ fn load_global(default_shell: &ShellSpec) -> (Settings, Option<u64>) {
             migration::quarantine_corrupt_file(&path);
             let s = seeded_defaults(default_shell);
             let _ = save_to(&path, &s);
-            return (s, None);
+            return GlobalLoad::defaults(s);
         }
     };
 
@@ -840,7 +900,7 @@ fn load_global(default_shell: &ShellSpec) -> (Settings, Option<u64>) {
     } else {
         tracing::info!(path = %path.display(), "settings: global loaded");
     }
-    (typed, stated)
+    GlobalLoad { settings: typed, stated, below_floor: false }
 }
 
 /// **The global migration floor** (V42 R9, issue #120).
@@ -868,24 +928,36 @@ fn load_global(default_shell: &ShellSpec) -> (Settings, Option<u64>) {
 /// "corrupt" sends them looking for the wrong problem. The quarantine file says
 /// so too: `.outdated.` rather than `.corrupted.`.
 ///
-/// **If the move fails, nothing is overwritten.** The corrupt path reseeds
-/// regardless (its bytes are unreadable anyway); here the bytes are the user's
-/// readable settings, so a failed move means we hand back defaults for this
-/// session and leave the file exactly where it is. It stays loud on every launch
-/// rather than becoming quiet and gone once.
+/// **If the move fails, nothing is overwritten — and nothing may overwrite it
+/// later either.** The corrupt path reseeds regardless (its bytes are unreadable
+/// anyway); here the bytes are the user's readable settings, so a failed move
+/// means we hand back defaults for this session and leave the file exactly where
+/// it is. It stays loud on every launch rather than becoming quiet and gone once.
+///
+/// Returning defaults is not by itself enough to keep that promise, which is
+/// what the V42 tranche-2 review (T2-1) found: those defaults become the live
+/// `Settings`, and the very next thing that saves the global file —
+/// `load`'s own post-repair [`save_global`], a Settings-window edit, one of the
+/// out-of-band writers — would write them straight over the one copy of the
+/// user's settings that still exists. So the failure LATCHES the path
+/// ([`preserve_unquarantinable_global`]) and [`save_to`] refuses it for the rest
+/// of the session. The user loses this session's setting changes; they do not
+/// lose the file the app could not read.
 fn reseed_below_floor(path: &Path, value: &Value, default_shell: &ShellSpec) -> Option<Settings> {
     if !migration::below_global_floor(value) {
         return None;
     }
     let stated = migration::stated_schema_version(value);
     let Some(quarantine) = migration::quarantine_outdated_file(path) else {
+        preserve_unquarantinable_global(path);
         tracing::error!(
             ?stated,
             floor = migration::MIN_GLOBAL_SCHEMA_VERSION,
             path = %path.display(),
             "settings: the global settings file was written by a version of cImp too old for \
              this build to upgrade, AND it could not be moved aside — running on defaults for \
-             this session and leaving the file untouched rather than overwriting it"
+             this session, leaving the file untouched, and refusing every write to it until it \
+             can be quarantined (so nothing overwrites the only copy of these settings)"
         );
         return Some(seeded_defaults(default_shell));
     };
@@ -899,11 +971,102 @@ fn reseed_below_floor(path: &Path, value: &Value, default_shell: &ShellSpec) -> 
          NOT been deleted: it was moved aside intact to the quarantine path below, and fresh \
          defaults were written in its place"
     );
+    // The file is safely aside, so this path is writable again — and must be
+    // released before the write below, which goes through the same guard.
+    release_preserved_global(path);
     let s = seeded_defaults(default_shell);
     if let Err(e) = save_to(path, &s) {
         tracing::warn!(error = %e, path = %path.display(), "settings: write global defaults after quarantine failed");
     }
     Some(s)
+}
+
+/// **The schema version a project overlay's cascade may be entered at** — or
+/// `None`, meaning there is no honest answer and the cascade must be refused
+/// (V42 tranche-2 review, T2-2).
+///
+/// Three sources, in order:
+///
+/// 1. the overlay's OWN `schema_version` stamp, written by [`save`] since V40
+///    Phase I. It is the only self-describing answer, so it wins outright;
+/// 2. the version the global file beside it stated BEFORE its own migration: an
+///    overlay written by a build whose global file said v35 was written against
+///    a v35 baseline;
+/// 3. `CURRENT` — "nothing says otherwise, so it is current", which is what
+///    every reader assumed before Phase I anyway.
+///
+/// **The case that has no third source.** When the global file was below the
+/// migration floor it was set aside unread, and `stated` comes back `None` —
+/// not because the file was silent but because it is gone from the answer
+/// entirely, and the baseline this overlay is about to merge onto is fresh
+/// DEFAULTS. Falling through to (3) there is a guess, and a bad one: it says
+/// "current" about a project whose settings are old enough that the global file
+/// beside them could not be upgraded, so `migrate_overlay` finds nothing to do,
+/// the value deep-merges unmigrated, and every key an old schema has since MOVED
+/// is dropped silently by serde on the typed parse — the exact invisible
+/// per-project loss Phase I existed to close, arriving through the floor.
+///
+/// So it is refused instead: the caller says so with the file's name in the log,
+/// and passes a version below every floor so `migrate_overlay` takes its own
+/// refuse-and-warn path (which still strips the stamp). The overlay is merged
+/// as-is — it is a diff, and the global baseline plus the user's next save
+/// rewrite it in the current shape — but nothing pretends it was considered.
+fn overlay_entry_version(
+    overlay: &Value,
+    global_stated: Option<u64>,
+    global_below_floor: bool,
+) -> Option<u64> {
+    if let Some(own) = migration::stated_schema_version(overlay) {
+        return Some(own);
+    }
+    if let Some(beside) = global_stated {
+        return Some(beside);
+    }
+    if global_below_floor {
+        return None;
+    }
+    Some(crate::settings::schema::CURRENT_SCHEMA_VERSION as u64)
+}
+
+/// The global settings file this session has promised not to overwrite, if any.
+///
+/// Set by [`reseed_below_floor`] when a below-floor file could not be moved
+/// aside, and read by [`save_to`], which then refuses. One slot because there is
+/// one global file; a path rather than a flag so the refusal is aimed at the
+/// file we actually failed to preserve and nothing else.
+///
+/// **Session-scoped, and deliberately not self-healing.** Nothing re-attempts
+/// the quarantine on a later write: the move failed for a reason (a lock, a
+/// permission, a full disk) and retrying it inside the save path would mean
+/// moving the user's file aside at an arbitrary moment to make room for a write
+/// they never connected to it. The next launch is where the retry belongs — it
+/// re-reads the file, re-reaches the same verdict, and either succeeds or says
+/// so again. That is the "loud on every launch" posture the floor was built
+/// with, extended to the writes.
+static PRESERVED_GLOBAL: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+/// Refuse every later write to `path` for the rest of this session.
+fn preserve_unquarantinable_global(path: &Path) {
+    if let Ok(mut slot) = PRESERVED_GLOBAL.lock() {
+        *slot = Some(path.to_path_buf());
+    }
+}
+
+/// `path` is safely aside (or was never at risk) — writes to it are allowed.
+fn release_preserved_global(path: &Path) {
+    if let Ok(mut slot) = PRESERVED_GLOBAL.lock() {
+        if slot.as_deref() == Some(path) {
+            *slot = None;
+        }
+    }
+}
+
+/// Whether `path` is the file this session refuses to overwrite.
+fn is_preserved_global(path: &Path) -> bool {
+    PRESERVED_GLOBAL
+        .lock()
+        .ok()
+        .is_some_and(|slot| slot.as_deref() == Some(path))
 }
 
 /// Read and parse the custom overlay file as a generic `Value`. Returns
@@ -1007,7 +1170,7 @@ enum OverlayStrip {
     /// `every_machine_scoped_family_fills_or_explains_every_cell`.
     Nothing,
     /// Covered by the wholesale [`strip_overlay_banned`] pass that runs at the
-    /// head of every strip leg — this row's keys are in [`OVERLAY_BANNED_KEYS`].
+    /// head of every strip leg, which reads this row's `keys` off the table.
     ///
     /// A marker rather than a hook, because the ban is ONE pass over the value
     /// for all of them and it has to run before the structured strips.
@@ -1092,7 +1255,7 @@ struct MachineScopedField {
 
 /// Every machine-scope settings family, in the order the legs walk them.
 const MACHINE_SCOPED: &[MachineScopedField] = &[
-    // The three whole-key bans first — see [`OVERLAY_BANNED_KEYS`] for why each
+    // The three whole-key bans first — see [`strip_overlay_banned`] for why each
     // is per-install state, and `sync_writer` for where an edit of it lands.
     MachineScopedField {
         name: "llm_pricing",
@@ -1289,6 +1452,26 @@ fn strip_machine_scope_from_diff(current: &mut Value, baseline: &mut Value) {
     }
 }
 
+/// **The wholesale ban.** Remove every [`OverlayStrip::Banned`] row's keys from
+/// `v` — the one pass that runs at the head of every strip leg, before any
+/// structured strip.
+///
+/// The banned set is READ OFF [`MACHINE_SCOPED`], not restated beside it. It was
+/// a hand-kept `OVERLAY_BANNED_KEYS` const until the V42 tranche-2 review
+/// (T2-9), with a test asserting the const and the `Banned` markers agreed:
+/// exactly the parallel-list shape issue #116 exists to delete, and one whose
+/// disagreement would not have been cosmetic — a row marked `Banned` whose key
+/// the const had never gained is a family stripped by nothing at all, since the
+/// marker is a marker and does no work of its own. The row is the declaration
+/// now.
+///
+/// Keyed on `overlay_strip` for all three legs, which is safe because
+/// `the_banned_rows_are_whole_top_level_keys_on_every_leg` holds a whole-key ban
+/// to all three legs or none — a family banned on one leg and merged on another
+/// is the leak the table exists to prevent.
+///
+/// # What is in the set, and why each is
+///
 /// Top-level `Settings` fields that are PER-INSTALL state, written straight
 /// to the physical global file by dedicated writers
 /// (`write_global_llm_pricing`, `mutate_global_harness_versions`) — and must
@@ -1350,12 +1533,16 @@ fn strip_machine_scope_from_diff(current: &mut Value, baseline: &mut Value) {
 // refactor, with the first post-upgrade save erasing the project's values and
 // no trace anywhere. The machine-scope half gets [`strip_overlay_harness`]
 // instead, which names what it drops.
-const OVERLAY_BANNED_KEYS: &[&str] = &["llm_pricing", "harness_versions", "sandbox"];
-
 fn strip_overlay_banned(v: &mut Value) {
-    if let Value::Object(map) = v {
-        for k in OVERLAY_BANNED_KEYS {
-            map.remove(*k);
+    let Value::Object(map) = v else {
+        return;
+    };
+    for row in MACHINE_SCOPED {
+        if !matches!(row.overlay_strip, OverlayStrip::Banned) {
+            continue;
+        }
+        for key in row.keys {
+            map.remove(*key);
         }
     }
 }
@@ -1363,7 +1550,7 @@ fn strip_overlay_banned(v: &mut Value) {
 /// SAVE write-through for the machine-scope `sandbox` block: copy the live
 /// value onto the on-disk global settings, returning true when it changed.
 ///
-/// `sandbox` is in [`OVERLAY_BANNED_KEYS`], so [`save`]'s diff can never carry
+/// `sandbox` is an [`OverlayStrip::Banned`] row, so [`save`]'s diff can never carry
 /// it into a project overlay — which would leave a Settings-window edit with
 /// nowhere to land if this did not exist. Same pattern as
 /// [`sync_tool_plugin_state_into`]: the pure half, so the caller decides
@@ -1648,7 +1835,7 @@ fn sync_offload_templates_into(disk_global: &mut Settings, current: &Settings) -
 // every sandboxed child, and a confined tool that could write its own
 // `.cimp/config.json` could then point cImp at a different binary — or flip its
 // own `enabled` — on the next run. A boundary a confined process can widen is
-// not a boundary. `sandbox` could be banned wholesale ([`OVERLAY_BANNED_KEYS`]);
+// not a boundary. `sandbox` could be banned wholesale (an [`OverlayStrip::Banned`] row);
 // this block cannot, because two of its leaves genuinely belong to the project.
 // So the strip is STRUCTURED instead of a key removal, and it is an ALLOW-list:
 // anything not named survives nowhere, including keys a future version adds.
@@ -2257,7 +2444,27 @@ pub fn save_global(settings: &Settings) -> AppResult<()> {
     save_to(&path, settings)
 }
 
+/// Write `settings` to `path` — the ONE write path for the global settings
+/// file, which is why the below-floor refusal lives here rather than at each of
+/// its callers (V42 tranche-2 review, T2-1).
 fn save_to(path: &Path, settings: &Settings) -> AppResult<()> {
+    if is_preserved_global(path) {
+        // Loud on every attempt, not once: each refusal is a save the user
+        // believes happened, and the only thing that clears the condition is
+        // the next launch getting the file moved aside.
+        tracing::error!(
+            path = %path.display(),
+            "settings: refusing to write the global settings file — it is a below-floor file \
+             this build could not migrate AND could not move aside, so writing would destroy \
+             the only copy of it. Move it somewhere safe by hand (or free whatever holds it) \
+             and relaunch; changes made this session are not being saved"
+        );
+        return Err(AppError::Settings(format!(
+            "refusing to overwrite {}: it is an unmigratable settings file that could not be \
+             quarantined, and it is the only copy",
+            path.display()
+        )));
+    }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(AppError::Io)?;
     }
@@ -2810,6 +3017,20 @@ fn ai_builtin_ids() -> Vec<&'static str> {
 /// repaired by forcing it back to `[claude]` so the user always boots
 /// with at least one AI tab.
 pub fn integrity_check(settings: &mut Settings) -> bool {
+    integrity_check_with_hidden(settings, &HashSet::new())
+}
+
+/// [`integrity_check`] plus the project's UI-hidden tab set, which only the
+/// layout step (5) reads.
+///
+/// Two callers, deliberately different: [`load`] passes the real set, because
+/// the layout it repairs is the one the main window is about to render and a
+/// hidden tab must not come back as an orphan. The GLOBAL baseline is checked
+/// with an empty set — the hidden set is per-PROJECT state (it lives in the
+/// project's `.cimp/ui_state.json`), so a layout stripped by it belongs in the
+/// project overlay, which is exactly where the settings-vs-baseline diff puts
+/// a value that differs between the two sides.
+pub fn integrity_check_with_hidden(settings: &mut Settings, hidden: &HashSet<String>) -> bool {
     let mut changed = false;
 
     // 0. Empty enabled_ai_tabs is invalid — repair to the FIRST REGISTERED
@@ -2947,88 +3168,34 @@ pub fn integrity_check(settings: &mut Settings) -> bool {
     }
 
 
-    // 5. Backend layout sanity. The frontend owns the deep integrity
-    //    walk (orphan placement, empty-pane collapse) — it has the tree
-    //    helpers. The backend's job here is just to keep the file
-    //    deserializable and stop a hand-edit from referring to dead tab
-    //    ids: drop tab_ids that don't exist, and clear invalid
-    //    `focused_pane_id` so the frontend's leftmost-leaf fallback
-    //    kicks in.
+    // 5. Layout integrity — the WHOLE walk, not a shallow scrub.
+    //
+    //    V42 Phase B moved `validateAndRepairLayout` here from the frontend.
+    //    Until then this step dropped dead tab ids and reset an invalid
+    //    `focused_pane_id`, and left orphan placement, tree-wide dedupe, ratio
+    //    clamping and empty-pane collapse to the frontend — so the tree the
+    //    backend handed out was one it knew to be incomplete, and every
+    //    consumer outside the main window (`layout_focused_active_tab_id`, the
+    //    post-repair save, this function's own `changed` result) saw that
+    //    shape. `settings::layout` now owns all six rules; see its module docs
+    //    for what each one does and why the order matters.
     if let Some(layout) = settings.layout.as_mut() {
-        let valid_ids: HashSet<&str> = settings.tabs.iter().map(|t| t.id()).collect();
-        let mut pane_ids: HashSet<String> = HashSet::new();
-        if filter_layout_tab_ids(&mut layout.tree, &valid_ids, &mut pane_ids) {
+        let valid_ids: Vec<&str> = settings.tabs.iter().map(|t| t.id()).collect();
+        if crate::settings::layout::repair(layout, &valid_ids, hidden) {
             changed = true;
-            tracing::warn!("integrity: dropped unknown tab ids from layout");
-        }
-        if !pane_ids.contains(&layout.focused_pane_id) {
-            // Pick the leftmost-leaf pane id as a deterministic fallback.
-            if let Some(replacement) = leftmost_pane_id(&layout.tree) {
-                if layout.focused_pane_id != replacement {
-                    tracing::warn!(
-                        previous = %layout.focused_pane_id,
-                        new = %replacement,
-                        "integrity: focused_pane_id no longer exists; reset to leftmost leaf"
-                    );
-                    layout.focused_pane_id = replacement;
-                    changed = true;
-                }
-            }
+            tracing::warn!("integrity: repaired the persisted layout tree");
         }
     }
 
     changed
 }
 
-/// Walk the layout tree, dropping any `tab_ids` entries that aren't in
-/// `valid_ids` (and clearing `active_tab_id` if it was dropped or no
-/// longer matches a remaining id). Records every encountered pane id in
-/// `pane_ids` so the caller can validate `focused_pane_id` afterwards.
-/// Returns `true` if anything was changed.
-fn filter_layout_tab_ids(
-    node: &mut LayoutNodePersisted,
-    valid_ids: &HashSet<&str>,
-    pane_ids: &mut HashSet<String>,
-) -> bool {
-    match node {
-        LayoutNodePersisted::Pane {
-            id,
-            tab_ids,
-            active_tab_id,
-        } => {
-            pane_ids.insert(id.clone());
-            let before = tab_ids.len();
-            tab_ids.retain(|t| valid_ids.contains(t.as_str()));
-            let mut changed = tab_ids.len() != before;
-            if let Some(active) = active_tab_id.as_deref() {
-                if !tab_ids.iter().any(|t| t == active) {
-                    *active_tab_id = tab_ids.first().cloned();
-                    changed = true;
-                }
-            }
-            changed
-        }
-        LayoutNodePersisted::Split { first, second, .. } => {
-            let mut changed = filter_layout_tab_ids(first, valid_ids, pane_ids);
-            changed |= filter_layout_tab_ids(second, valid_ids, pane_ids);
-            changed
-        }
-    }
-}
-
-/// Pane id of the leftmost leaf in `node`. Used as the deterministic
-/// fallback when `focused_pane_id` no longer maps to an existing pane.
-fn leftmost_pane_id(node: &LayoutNodePersisted) -> Option<String> {
-    match node {
-        LayoutNodePersisted::Pane { id, .. } => Some(id.clone()),
-        LayoutNodePersisted::Split { first, .. } => leftmost_pane_id(first),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::settings::schema::{CLAUDE_LOCAL_TAB_ID, CLAUDE_TAB_ID, OPENCODE_TAB_ID};
+    use crate::settings::schema::{
+        LayoutNodePersisted, CLAUDE_LOCAL_TAB_ID, CLAUDE_TAB_ID, OPENCODE_TAB_ID,
+    };
     use std::path::PathBuf;
 
     fn fake_default_shell() -> ShellSpec {
@@ -3435,10 +3602,15 @@ mod tests {
             .filter(|id| *id != EVENTS_TAB_ID)
             .collect();
         assert_eq!(after, user_tabs, "existing tabs survive, in order");
-        // …and the layout still names them all: a materialized tab must not
-        // cost the user the arrangement they had.
+        // …and the layout still names them all, in order: a materialized tab
+        // must not cost the user the arrangement they had. Since V42 Phase B
+        // the freshly-materialized tab is APPENDED here too, by the layout
+        // step's orphan placement — before that the backend left it out of the
+        // tree and the frontend's boot-time repair placed it a moment later.
+        let mut expected = user_tabs.clone();
+        expected.push(EVENTS_TAB_ID.to_string());
         match &s.layout.as_ref().unwrap().tree {
-            LayoutNodePersisted::Pane { tab_ids, .. } => assert_eq!(*tab_ids, user_tabs),
+            LayoutNodePersisted::Pane { tab_ids, .. } => assert_eq!(*tab_ids, expected),
             other => panic!("layout tree was rewritten: {other:?}"),
         }
     }
@@ -4240,6 +4412,20 @@ mod tests {
         }
     }
 
+    /// Whether `save_global` still writes through [`save_to`] — where the
+    /// preserved-file refusal lives, and therefore the reason one guard covers
+    /// every writer of the global file. Structural because `save_global`
+    /// resolves its own path from the running exe and cannot be called here.
+    /// Newline-agnostic: CI checks this tree out with CRLF.
+    fn save_global_goes_through_save_to() -> bool {
+        let src = include_str!("persistence.rs");
+        let start = src
+            .find("pub fn save_global(")
+            .expect("`save_global` is gone — re-point this helper");
+        let body = &src[start..];
+        body[..body.find("\n}").unwrap_or(body.len())].contains("save_to(")
+    }
+
     /// **A file too old to migrate is set aside, not read.**
     ///
     /// Both below-floor shapes at once — an old stamp, and (the case that needed
@@ -4300,6 +4486,120 @@ mod tests {
                 "seeded defaults, not a bare `Settings::default()`"
             );
         }
+    }
+
+    /// **A below-floor file that could not be moved aside is not overwritten
+    /// LATER either** (V42 tranche-2 review, T2-1).
+    ///
+    /// The move-failed branch already returned defaults without writing, which
+    /// looks like the whole promise and is only half of it: those defaults
+    /// become the live `Settings`, and the next thing that saves the global file
+    /// — `load`'s own post-repair `save_global`, a Settings-window edit, an
+    /// out-of-band writer — used to write them straight over the user's one
+    /// remaining copy. The refusal has to outlive the branch, so the branch
+    /// latches the path and every later `save_to` of it fails loudly.
+    ///
+    /// Making the move actually fail is the fiddly part: a DIRECTORY at the name
+    /// `move_settings_file_aside` aims for defeats both its rename and its
+    /// copy fallback. The name carries a unix-second timestamp, so a small
+    /// window of them is blocked rather than one.
+    #[test]
+    fn a_below_floor_global_that_could_not_be_quarantined_is_never_written_over() {
+        let dir = FloorDir::new("floor_stuck");
+        let path = dir.settings_json();
+        let original = b"{\"schema_version\": 20, \"tabs\": []}\n".to_vec();
+        fs::write(&path, &original).unwrap();
+        let value: Value = serde_json::from_slice(&original).unwrap();
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        for ts in now - 1..=now + 4 {
+            fs::create_dir_all(dir.0.join(format!("settings.json.outdated.{ts}.bak"))).unwrap();
+        }
+
+        let reseeded = reseed_below_floor(&path, &value, &floor_shell())
+            .expect("a below-floor file is handled here whether or not the move works");
+        assert!(
+            !reseeded.tabs.is_empty(),
+            "the session still gets seeded defaults to run on"
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            original,
+            "the move failed, so the user's file must still be exactly where it was"
+        );
+
+        // The half this test exists for: the NEXT save must not undo that.
+        let err = save_to(&path, &reseeded)
+            .expect_err("writing the preserved file must be refused, not silently done");
+        assert!(
+            err.to_string().contains("refusing to overwrite"),
+            "the refusal must say what it refused and why: {err}"
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            original,
+            "and it must actually still be the user's bytes on disk"
+        );
+        // Every global writer funnels through `save_to` — `save_global`, the
+        // machine-scope write-through, the two out-of-band table writers — so
+        // pinning the refusal there covers all of them at once.
+        assert!(
+            save_global_goes_through_save_to(),
+            "save_global must go through `save_to`, which is where the refusal lives"
+        );
+
+        // The latch is aimed at ONE file, not at saving in general: a different
+        // path is unaffected, and the file is writable again once it is aside.
+        let other = dir.0.join("elsewhere.json");
+        save_to(&other, &reseeded).expect("an unrelated settings file still saves");
+        release_preserved_global(&path);
+        save_to(&path, &reseeded).expect("released, the path is writable again");
+    }
+
+    /// **An overlay beside a quarantined global is refused, not guessed at**
+    /// (V42 tranche-2 review, T2-2).
+    ///
+    /// The two cases the review named, and the two ordinary ones beside them so
+    /// the refusal is visibly a decision rather than the only outcome.
+    #[test]
+    fn an_unstamped_overlay_beside_a_below_floor_global_refuses_to_enter_the_cascade() {
+        let current = crate::settings::schema::CURRENT_SCHEMA_VERSION as u64;
+        let unstamped = serde_json::json!({ "claude_local": { "base_url": "http://box:8080" } });
+        let stamped = serde_json::json!({ "schema_version": 34, "tts": { "enabled": true } });
+
+        // STAMPED-OK: the overlay says what it is, so the state of the global
+        // file beside it does not matter — the cascade runs from its own stamp.
+        assert_eq!(
+            overlay_entry_version(&stamped, None, true),
+            Some(34),
+            "an overlay that carries its own stamp is self-describing; the quarantine next door \
+             cannot make it unreadable"
+        );
+
+        // UNSTAMPED-REFUSED: nothing says which schema these keys are in, and
+        // the baseline they would merge onto is fresh defaults.
+        assert_eq!(
+            overlay_entry_version(&unstamped, None, true),
+            None,
+            "with the global file quarantined below the floor there is no version to enter at — \
+             defaulting to CURRENT would skip the cascade and deep-merge an old diff, and serde \
+             drops what the deleted steps would have MOVED"
+        );
+
+        // …and the two ordinary paths are untouched by the fix.
+        assert_eq!(
+            overlay_entry_version(&unstamped, Some(35), false),
+            Some(35),
+            "an unstamped overlay beside a healthy v35 global was written against v35"
+        );
+        assert_eq!(
+            overlay_entry_version(&unstamped, None, false),
+            Some(current),
+            "nothing said otherwise and the global is healthy ⇒ current, as before Phase I"
+        );
     }
 
     /// The floor retires steps; it does not stop the ladder. A file **at** the
@@ -5191,22 +5491,39 @@ mod tests {
         }
     }
 
-    /// The whole-key bans are a marker on the row plus one wholesale pass; this
-    /// keeps the two from drifting apart. A row marked
-    /// [`OverlayStrip::Banned`] whose key is not in [`OVERLAY_BANNED_KEYS`]
-    /// would not be stripped at all.
+    /// The two properties [`strip_overlay_banned`] relies on now that it reads
+    /// the banned set off the table instead of off a second list beside it
+    /// (V42 tranche-2 review, T2-9).
+    ///
+    /// The list-agreement half of this test went with the list. What it was
+    /// really asserting — that a `Banned` marker names something the wholesale
+    /// pass can actually remove — is asserted directly instead: the pass is
+    /// `map.remove(key)` on the object's TOP level, so a banned row's keys must
+    /// be top-level names. A dotted key there (`offload.mcp_servers`) would be a
+    /// family marked banned and stripped by nothing, which is exactly the
+    /// silent-hole shape the old test was aimed at.
     #[test]
-    fn the_banned_rows_and_overlay_banned_keys_agree() {
+    fn the_banned_rows_are_whole_top_level_keys_on_every_leg() {
         let banned: Vec<&str> = MACHINE_SCOPED
             .iter()
             .filter(|r| matches!(r.overlay_strip, OverlayStrip::Banned))
             .flat_map(|r| r.keys.iter().copied())
             .collect();
-        assert_eq!(
-            banned, OVERLAY_BANNED_KEYS,
-            "every `Banned` row's keys must be in `OVERLAY_BANNED_KEYS`, in the same order — the \
-             marker does not strip anything by itself"
+        // Vacuity: `strip_overlay_banned` derives its work from these rows, so
+        // an empty set would make it a no-op and every leg would merge them.
+        assert!(
+            !banned.is_empty(),
+            "no `Banned` rows at all — the wholesale ban now strips nothing, and `llm_pricing` / \
+             `harness_versions` / `sandbox` are merged from any overlay that carries them"
         );
+        for key in &banned {
+            assert!(
+                !key.contains('.'),
+                "`{key}` is a banned row's key but is not a top-level one — the wholesale ban is \
+                 a top-level `remove`, so this family would be marked banned and stripped by \
+                 nothing"
+            );
+        }
         for row in MACHINE_SCOPED {
             let is_banned = matches!(row.overlay_strip, OverlayStrip::Banned);
             assert_eq!(

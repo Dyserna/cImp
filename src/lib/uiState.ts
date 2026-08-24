@@ -34,10 +34,10 @@
 // `localStorage.setItem` this replaces did not have: a toggle followed within
 // 250 ms by the window closing was lost unless the `pagehide` flush won, and
 // `pagehide` is not guaranteed on every teardown path (a crash, a kill, a
-// webview the OS reclaims). `installLayoutPersistence`'s debounce was cited
-// here as precedent and is NOT one: the layout tree it coalesces is held by
-// the BACKEND, which flushes it on close from the Rust side, so a frontend
-// timer dropped at teardown there costs nothing. This data had no second copy.
+// webview the OS reclaims). The layout save path was cited here as precedent
+// and is not one — it dropped its own 250 ms timer back in V0.6 for exactly
+// this reason, and what coalesces layout writes now is the BACKEND, which
+// flushes on close from the Rust side. This data had no second copy either.
 //
 // What is left is same-tick coalescing only: the writes one event handler
 // makes (an `$effect` that touches three keys does so in a single task) batch

@@ -129,7 +129,20 @@
     gap: 6px;
     align-items: center;
   }
-  .row input {
+  /* **Rooted at `.env-editor` to outrank the settings chrome.** This editor
+     renders in the Settings window (Checks, per-tab settings) AND in the
+     main window's tab dialogs, and the two differ in a way this file cannot
+     see: only the Settings window wraps it in `.settings-chrome`, whose
+     `input[type='text']` rule (0,2,1) TIES with a scoped `.row input` and
+     therefore wins or loses on emission order alone — and it wins, because
+     this component is used by the main window too, so its CSS lands in the
+     shared app chunk, which the page loads BEFORE the settings chunk that
+     carries the chrome sheet. The visible cost was the monospace: env names
+     and values rendered in the body font inside Settings and in monospace
+     everywhere else, from one stylesheet that reads as if it decided.
+     Prefixing the root class makes it (0,3,1) and the decision this file's
+     own. */
+  .env-editor .row input {
     background: var(--surface-sunken);
     border: 1px solid var(--border-default);
     color: var(--text-primary);
@@ -146,7 +159,7 @@
   .row input.value {
     flex: 3 1 0;
   }
-  .row input:focus {
+  .env-editor .row input:focus {
     outline: none;
     border-color: var(--accent);
   }
@@ -193,7 +206,13 @@
     border-radius: var(--radius-sm);
     font-size: 16px;
   }
-  .remove:hover {
+  /* Same counter-rule as `ArrayEditor`'s, for the same reason: scoped under
+     `.env-editor` so it beats the hoisted `settings-chrome.css` rule
+     `button:hover:not(:disabled)` (0,3,1). A bare `.remove:hover` is 0,3,0,
+     so the generic hover took the background and the border and left only
+     the danger COLOUR — a remove button that half turns red. Adding the root
+     class makes it 0,4,0. */
+  .env-editor .remove:hover {
     background: var(--surface-danger-bg);
     color: var(--text-danger-pale);
     border-color: var(--border-danger-strong);

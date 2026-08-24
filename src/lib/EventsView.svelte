@@ -26,7 +26,6 @@
     filterEntries,
     matchesTabFilter,
     mergeEntries,
-    rowStatus,
     tabFilterValue,
     FILTER_ANY,
     NO_FILTER,
@@ -44,7 +43,7 @@
   import { fmtTok } from './usageMath';
   import { EVENTS_TAB_ID, WORKBENCH_TAB_ID } from './tabs/types';
   import { revealTab } from './tabs/visibility';
-  import { isAppViewVisible, onAppViewShown } from './appViewVisibility';
+  import { onAppViewShown, pollWhileVisible } from './appViewVisibility';
   import { loadViewSet, loadViewString, saveViewSet, saveViewString } from './viewSection';
   import { settings } from './settings/store';
   import { accentFor, harnesses } from './harness';
@@ -55,7 +54,7 @@
   // `crate::activity`) and is only ever REPLACED, never mutated in place, so
   // plain `$state` would deep-proxy every row on every poll for nothing.
   let entries = $state.raw<ActivityEntry[]>([]);
-  let poll: ReturnType<typeof setInterval> | null = null;
+  let stopPoll: (() => void) | null = null;
   // Bumped by every local mutation (delete/clear — moved here from the Tools
   // tab's retired Activities section). A poll response already in flight when
   // a mutation landed is stale — applying it would resurrect just-deleted
@@ -499,17 +498,20 @@
   onMount(() => {
     void refresh();
     void refreshCheckpoints();
-    poll = setInterval(() => {
-      if (!isAppViewVisible(EVENTS_TAB_ID)) return;
-      void refresh();
-      pollTick += 1;
-      if (pollTick % CP_EVERY === 0) void refreshCheckpoints();
-    }, 2000);
+    stopPoll = pollWhileVisible(
+      EVENTS_TAB_ID,
+      () => {
+        void refresh();
+        pollTick += 1;
+        if (pollTick % CP_EVERY === 0) void refreshCheckpoints();
+      },
+      2000,
+    );
     window.addEventListener('keydown', onKeyDown);
   });
 
   onDestroy(() => {
-    if (poll) clearInterval(poll);
+    stopPoll?.();
     if (clearTimer) clearTimeout(clearTimer);
     window.removeEventListener('keydown', onKeyDown);
     unsubShown();
@@ -535,9 +537,9 @@
   }
 
   // `ok` alone does not mean "the call worked" in this store, so the status
-  // column untangles the overlapping conventions instead of painting a bare
-  // pass/fail. The rule itself now lives in `activity.ts::rowStatus` and is
-  // rendered by `StatusChip`, shared with the Tool Activity feed.
+  // chip renders `r.status` — the row's own untangled word — instead of a bare
+  // pass/fail. Same chip in both feeds: the security vocabulary of this app must
+  // not differ between two tabs rendering the same rows.
   //
   // **What moved and why** (#48, M-24). The local version here was
   // `e.ok ? 'flagged' : 'denied'` for every `injection_flag` row, so five
@@ -549,9 +551,10 @@
   // `!ok` as "denied" for `updater` rows, whose `ok` is a bundle outcome — so a
   // rejected rules bundle reported as a blocked tool call.
   //
-  // Kept in a `.ts` file because `.svelte` has no test harness here, and shared
-  // with the other feed because the security vocabulary of this app must not
-  // differ between two tabs rendering the same rows.
+  // It became one classifier in `activity.ts`, then (V42) a computed column on
+  // the row itself: every branch of it was restating a backend rule, and a
+  // restatement of `Screen::is_denial` is exactly what cannot be checked against
+  // `Screen::is_denial`. See the header of `activity.ts` for the split.
 
   function rowTool(e: ActivityEntry): string {
     // mcp tools are namespaced `<server>__<tool>` — render the first `__` as
@@ -800,7 +803,7 @@
                 >{/if}
               {#if visible.tool}<span class="etool" title={r.tool}>{rowTool(r)}</span>{/if}
               {#if visible.target}<span class="etarget" title={r.target}>{r.target}</span>{/if}
-              {#if visible.status}<StatusChip status={rowStatus(r)} />{/if}
+              {#if visible.status}<StatusChip status={r.status} />{/if}
               {#if visible.tab}<span class="eattr attr-{attrState(r.tab)}" title={attrTitle(r.tab)}
                   >{attrLabel(r.tab)}</span
                 >{/if}
@@ -961,7 +964,7 @@
         <div class="detail-title">
           <span class="ekind {detail.kind}">{detail.kind}</span>
           <span class="detail-tool">{detail.tool}</span>
-          <StatusChip status={rowStatus(detail)} />
+          <StatusChip status={detail.status} />
         </div>
         <button type="button" class="detail-close icon" onclick={closeDetail} aria-label="Close"
           >×</button

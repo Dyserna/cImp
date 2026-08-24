@@ -16,7 +16,10 @@ pub struct SessionState {
 /// `type` discriminator on `LayoutNodePersisted` matches the frontend's
 /// `'split' | 'pane'` shape, so serialize/deserialize is identity work
 /// across the IPC boundary.
-#[derive(Clone, Serialize, Deserialize, Debug)]
+// `PartialEq` is how the hydration-time repair (`settings::layout`) answers
+// "did anything change?", which is what gates the post-repair save: a healthy
+// tree must not rewrite the project overlay on every launch.
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(export_to = "settings.ts"))]
 pub struct LayoutPersisted {
@@ -32,7 +35,7 @@ pub struct LayoutPersisted {
 /// Recursive layout-tree node. Splits are internal (two children + ratio +
 /// direction); panes are leaves (ordered tab id list + per-pane active tab
 /// id).
-#[derive(Clone, Serialize, Deserialize, Debug)]
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum LayoutNodePersisted {
     Split {

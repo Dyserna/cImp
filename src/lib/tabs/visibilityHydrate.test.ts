@@ -6,10 +6,13 @@ import { beforeEach, describe, expect, test, vi } from 'vitest';
 ///
 /// `hiddenTabs` therefore starts EMPTY and is filled by `hydrateHiddenTabs()`,
 /// which `main.ts` calls after `hydrateUiState()` and before `mount(App)`.
-/// App's `onMount` then runs `stripHiddenTabsFromLayout()`, which re-imposes
-/// "hidden ⇔ absent from the layout tree". These tests pin the two halves of
-/// that seam: an unhydrated store is empty (so nothing accidentally works by
-/// reading it too early), and a hydrated one holds exactly the saved set.
+/// App's `onMount` reads it on the fresh-install path, where there is no
+/// persisted tree for the backend to have repaired and the layout has to be
+/// built hidden-aware here. (V42 Phase B: on every other launch the backend's
+/// `settings::layout` reads the same file and hands over a tree the hidden tabs
+/// were never in.) These tests pin the two halves of that seam: an unhydrated
+/// store is empty (so nothing accidentally works by reading it too early), and
+/// a hydrated one holds exactly the saved set.
 
 const invoke = vi.fn();
 vi.mock('@tauri-apps/api/core', () => ({ invoke: (...a: unknown[]) => invoke(...a) }));

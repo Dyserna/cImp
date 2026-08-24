@@ -17,25 +17,33 @@
   // The `.line` rule set moved WHOLESALE. A partial move would leave a
   // scoped selector in the caller with nothing left to match — Svelte prunes
   // it, and the styling silently disappears.
-  import { pairHunkLines, wordDiff } from '../diffWords';
+  //
+  // V42 Phase D: the grouping and the word-level LCS are no longer computed
+  // here (or anywhere in the frontend) — `Hunk.groups` arrives precomputed
+  // from `workbench::worddiff`, once per hunk, instead of being recomputed by
+  // this component on every re-render. Groups name their lines by index, so
+  // the text still comes from `lines`.
+  import type { HunkLineGroup } from '../workbench';
 
-  let { lines }: { lines: [string, string][] } = $props();
+  let {
+    lines,
+    groups,
+  }: { lines: [string, string][]; groups: HunkLineGroup[] } = $props();
 </script>
 
-{#each pairHunkLines(lines) as group, gi (gi)}
+{#each groups as group, gi (gi)}
   {#if group.type === 'ctx'}
-    <div class="line ctx"><span class="marker"> </span><span class="text">{group.text}</span></div>
+    <div class="line ctx"><span class="marker"> </span><span class="text">{lines[group.line][1]}</span></div>
   {:else if group.type === 'del'}
-    <div class="line del"><span class="marker">-</span><span class="text">{group.text}</span></div>
+    <div class="line del"><span class="marker">-</span><span class="text">{lines[group.line][1]}</span></div>
   {:else if group.type === 'add'}
-    <div class="line add"><span class="marker">+</span><span class="text">{group.text}</span></div>
+    <div class="line add"><span class="marker">+</span><span class="text">{lines[group.line][1]}</span></div>
   {:else}
-    {@const wd = wordDiff(group.oldText, group.newText)}
     <div class="line del">
-      <span class="marker">-</span><span class="text">{#each wd.left as p, pi (pi)}<span class:hl={p.kind === 'del'}>{p.text}</span>{/each}</span>
+      <span class="marker">-</span><span class="text">{#each group.left as p, pi (pi)}<span class:hl={p.kind === 'del'}>{p.text}</span>{/each}</span>
     </div>
     <div class="line add">
-      <span class="marker">+</span><span class="text">{#each wd.right as p, pi (pi)}<span class:hl={p.kind === 'add'}>{p.text}</span>{/each}</span>
+      <span class="marker">+</span><span class="text">{#each group.right as p, pi (pi)}<span class:hl={p.kind === 'add'}>{p.text}</span>{/each}</span>
     </div>
   {/if}
 {/each}

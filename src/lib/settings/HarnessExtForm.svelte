@@ -102,7 +102,8 @@
 </script>
 
 {#if rendered.length > 0}
-  <section>
+  <!-- `ext-form`: see the counter-rule in the style block below. -->
+  <section class="ext-form">
     <h3>{harness.label}</h3>
     {#each rendered as field (field.key)}
       {#if field.kind === 'bool'}
@@ -203,3 +204,32 @@
     {/each}
   </section>
 {/if}
+
+<style>
+  /* **This form is not a card.** It renders INSIDE one — the Tabs section's
+     — so the hoisted `settings-chrome.css` rule `.settings-chrome section`
+     (border, radius, padding, its own background, a bottom margin) draws a
+     second card inside the first.
+     
+     That is new, and it is a side effect rather than a decision: before
+     #129 (a) hoisted those rules out of `SettingsApp.svelte` they were
+     Svelte-SCOPED to the parent, so a `<section>` rendered by a child
+     component never matched them. Unscoping them is what LV-20 wanted —
+     the labels, checkboxes and hints in here finally look like every other
+     section's, and that stays — but the card chrome came along with it.
+     
+     Neutralized by CLASS, at (0,2,0) against the chrome's (0,1,1), rather
+     than by relying on source order: this component's CSS and the chrome
+     sheet are in the same chunk today, and which of two tie-level rules
+     wins would then depend on emission order — a fact this file cannot see
+     (`ChecksEditor`'s `.check-card` is the same manoeuvre, one card up).
+     The `<h3>` keeps the chrome's heading look; `section > h3:first-of-type`
+     still matches, so it sits flush at the top of the group. */
+  .ext-form {
+    border: none;
+    border-radius: 0;
+    background: none;
+    padding: 0;
+    margin: var(--space-4) 0 0 0;
+  }
+</style>

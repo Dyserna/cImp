@@ -17,7 +17,6 @@ import {
   isTabAttribution,
   matchesTabFilter,
   mergeEntries,
-  rowStatus,
   tabFilterValue,
   FILTER_ANY,
   NO_FILTER,
@@ -50,6 +49,9 @@ function entry(id: number, over: Partial<ActivityEntry> = {}): ActivityEntry {
     chars: 10,
     ms: 5,
     ok: true,
+    // The backend classifies this column; a fixture states the word the
+    // row would carry, and the cases that care override it.
+    status: 'ok',
     tab: 'unattributed',
     session: null,
     server: null,
@@ -248,103 +250,26 @@ describe('filterEntries', () => {
   });
 });
 
-// ── rowStatus (#48, M-24) ─────────────────────────────────────────────────
+// ── The status vocabulary the feeds render (#48, M-24) ────────────────────
 //
-// The finding: `Unscreened`, the detector flags, `MemoryQuarantine` and
-// `LatchOverride` all collapsed into ONE red chip, so "we did not look at all of
-// it" read as "we blocked something" — the opposite of the truth — and a latch
-// override the USER applied to hand capability back read as containment firing.
+// The finding: `unscreened`, the detector flags, `memory_quarantine` and
+// `latch_override` all collapsed into ONE red chip, so "we did not look at all
+// of it" read as "we blocked something" — the opposite of the truth — and a
+// latch override the USER applied to hand capability back read as containment
+// firing.
 //
-// These pin the distinctions rather than the current words: what must not
-// regress is that no two of these screens share a status, and that the only
-// status meaning "we stopped it" is reached by the screens that actually did.
+// **V42: the classifier moved to `crate::activity`.** A row arrives carrying
+// its `status`, and the distinctions — no two containment screens sharing a
+// word, a grant never reading as a block, an unscreened result reading as
+// neither — are pinned in Rust, beside `Screen::is_denial` itself. What is
+// still testable here is the rendering half: every word the backend can publish
+// has a sentence, and (at the bottom of this file) a chip rule to draw it with.
+// The two halves are held together across the language boundary by the Rust
+// guard `the_status_vocabulary_matches_the_frontends`, which reads the union in
+// `activity.ts` and refuses to let either side hold a word the other does not.
 
-/// One `injection_flag` row for `screen`.
-function flag(screen: string, ok = true): ActivityEntry {
-  return entry(1, { kind: 'injection_flag', source: screen, ok, tool: 'WebFetch' });
-}
-
-describe('rowStatus', () => {
-  it('gives every containment screen its OWN status — no two collapse', () => {
-    const byScreen: Record<string, RowStatus> = {
-      // `is_denial` screens: the backend publishes these as ok:false.
-      ssrf: rowStatus(flag('ssrf', false)),
-      budget: rowStatus(flag('budget', false)),
-      canary: rowStatus(flag('canary', false)),
-      latch_refusal: rowStatus(flag('latch_refusal', false)),
-      // Everything below denied NOTHING.
-      signature: rowStatus(flag('signature')),
-      unscreened: rowStatus(flag('unscreened')),
-      memory_quarantine: rowStatus(flag('memory_quarantine')),
-      latch_override: rowStatus(flag('latch_override')),
-      latch_beacon: rowStatus(flag('latch_beacon')),
-    };
-    // The four denials share `denied`, which is correct — they all stopped a
-    // call. The five that stopped nothing must each differ from that AND from
-    // one another.
-    expect(byScreen.ssrf).toBe('denied');
-    expect(byScreen.budget).toBe('denied');
-    expect(byScreen.canary).toBe('denied');
-    expect(byScreen.latch_refusal).toBe('denied');
-    const nonDenials = [
-      byScreen.signature,
-      byScreen.unscreened,
-      byScreen.memory_quarantine,
-      byScreen.latch_override,
-      byScreen.latch_beacon,
-    ];
-    expect(new Set(nonDenials).size).toBe(nonDenials.length);
-    expect(nonDenials).not.toContain('denied');
-  });
-
-  it('never reports an unscreened result as a denial or as clean', () => {
-    // The whole finding in one assertion: an absent verdict is neither a
-    // verdict of absence nor an alarm.
-    const s = rowStatus(flag('unscreened'));
-    expect(s).toBe('unscreened');
-    expect(s).not.toBe('denied');
-    expect(s).not.toBe('ok');
-    expect(STATUS_TITLE[s]).toContain('nothing was blocked');
-  });
-
-  it('reports a user latch override as a GRANT, not as containment firing', () => {
-    expect(rowStatus(flag('latch_override'))).toBe('granted');
-    expect(rowStatus(flag('contamination_cleared'))).toBe('granted');
-    // A grant and a block must not share a word — a release that reads as a
-    // refusal is the inverted half of the same defect.
-    expect(rowStatus(flag('latch_override'))).not.toBe('denied');
-  });
-
-  it('reports a held memory write as held, not as a refusal', () => {
-    expect(rowStatus(flag('memory_quarantine'))).toBe('held');
-    expect(STATUS_TITLE.held).toContain('Nothing was blocked');
-  });
-
-  it('does NOT read a rejected updater bundle as a blocked call', () => {
-    // `updater` is documented as the one source written outside `record_flag`:
-    // its `ok` is the bundle OUTCOME, not `Screen::is_denial`. Reading `!ok` as
-    // "denied" there reported a refused rules bundle as a blocked tool call.
-    expect(rowStatus(flag('updater', true))).toBe('update');
-    expect(rowStatus(flag('updater', false))).toBe('rejected');
-    expect(rowStatus(flag('updater', false))).not.toBe('denied');
-  });
-
-  it('gives an unknown screen no category rather than a borrowed one', () => {
-    // A screen added backend-side after this build. Delivered ⇒ we have no word
-    // for it; refused ⇒ `Screen::is_denial` is a claim we can still make.
-    expect(rowStatus(flag('some_future_screen', true))).toBe('recorded');
-    expect(rowStatus(flag('some_future_screen', false))).toBe('denied');
-  });
-
-  it('keeps the three plain call outcomes intact', () => {
-    expect(rowStatus(entry(1))).toBe('ok');
-    expect(rowStatus(entry(1, { ok: false }))).toBe('failed');
-    // Telemetry channels record ok:false to mean "this signal fired".
-    expect(rowStatus(entry(1, { ok: false, source: 'read_advisor' }))).toBe('signal');
-    expect(rowStatus(entry(1, { ok: false, source: 'harness' }))).toBe('signal');
-  });
-
-  it('has a tooltip for every status it can return', () => {
+describe('STATUS_TITLE', () => {
+  it('has a tooltip for every status a row can carry', () => {
     // A status with no sentence would render a bare word in a security feed.
     const all: RowStatus[] = [
       'ok',
@@ -379,115 +304,29 @@ describe('rowStatus', () => {
     ];
     for (const s of all) expect(STATUS_TITLE[s].length).toBeGreaterThan(0);
   });
-});
 
-// ── V37 C6: mcp_health rows ───────────────────────────────────────────────
-//
-// Same discipline as the lifecycle feed below: the verb is in `tool`, and `ok`
-// is the transition's OUTCOME. Reading `ok` first would render "this server
-// came back" and "this call succeeded" as the same word in a lane whose whole
-// purpose is telling you a server went away.
-
-/// One `mcp_health` row for transition `tool`.
-function mcpHealth(tool: string, ok: boolean, over: Partial<ActivityEntry> = {}): ActivityEntry {
-  return entry(1, {
-    kind: 'mcp_health',
-    source: tool === 'connect_failed' ? 'connect' : 'probe',
-    tool,
-    ok,
-    server: 'ddg',
-    category: 'research',
-    ...over,
-  });
-}
-
-describe('rowStatus — mcp health', () => {
-  it('gives the down transitions and the recovery different words', () => {
-    expect(rowStatus(mcpHealth('unhealthy', false))).toBe('unhealthy');
-    expect(rowStatus(mcpHealth('connect_failed', false))).toBe('unhealthy');
-    expect(rowStatus(mcpHealth('healthy', true))).toBe('recovered');
-  });
-
-  it('never borrows the offload-server vocabulary', () => {
-    // `down`/`ready` are written about a process cImp owns and stopped; an MCP
-    // server is somebody else's, and the tooltips say so.
-    const seen = [rowStatus(mcpHealth('unhealthy', false)), rowStatus(mcpHealth('healthy', true))];
-    expect(seen).not.toContain('down');
-    expect(seen).not.toContain('ready');
-    expect(seen).not.toContain('stopped');
-  });
-
-  it('falls back on ok for a transition this build predates', () => {
-    expect(rowStatus(mcpHealth('quarantined', false))).toBe('unhealthy');
-    expect(rowStatus(mcpHealth('quarantined', true))).toBe('recovered');
-  });
-
-  it('does not classify an ordinary mcp CALL row as a health row', () => {
-    // The two kinds share a server but not a lane: a failed call is a failed
-    // call, not a server going down (that is exactly what the flap guard is
-    // for).
-    const call = entry(2, { kind: 'mcp', tool: 'ddg__search', ok: false, server: 'ddg' });
-    expect(rowStatus(call)).toBe('failed');
-  });
-});
-
-// ── V37 C9: tools withheld by description screening ───────────────────────
-//
-// These rows land in the `mcp` lane with `ok: false` and `source: "screen"` —
-// the wire value the Rust side pins in one constant (`SCREEN_DROP_SOURCE` in
-// `mcp_host.rs`), because a reader has to be able to tell a screening row from a
-// call row without parsing prose. With no branch for them the classifier fell
-// through to `failed`, whose sentence is "Call failed" — a claim about a call
-// that was never made. `flagged` would be worse: its sentence promises "nothing
-// was blocked", and this is the one site in cImp where detection really does
-// remove something.
-
-/// One `mcp`-lane screening row for the withheld tool `tool`.
-function screenDrop(tool: string, over: Partial<ActivityEntry> = {}): ActivityEntry {
-  return entry(3, {
-    kind: 'mcp',
-    source: 'screen',
-    tool,
-    target:
-      'withheld from `evil` advertised tools: the injection screen flagged its name or description',
-    ok: false,
-    server: 'evil',
-    category: 'research',
-    ...over,
-  });
-}
-
-describe('rowStatus — screen-withheld tools', () => {
-  it('gives a withheld tool its own status, not a failed call', () => {
-    const s = rowStatus(screenDrop('exfiltrate'));
-    expect(s).toBe('withheld');
-    expect(s).not.toBe('failed');
-  });
-
-  it('never reports a withheld tool as merely flagged', () => {
-    // `flagged` means delivered-anyway, and its tooltip says so out loud. This
-    // row is the opposite fact.
-    expect(rowStatus(screenDrop('exfiltrate'))).not.toBe('flagged');
+  it('says out loud what was NOT blocked', () => {
+    // Every word ADDED by M-24 exists because it was being read as containment
+    // firing; the sentence is where that gets corrected for a reader who does
+    // not know the vocabulary. An absent verdict is not a verdict of absence.
+    expect(STATUS_TITLE.unscreened).toContain('nothing was blocked');
+    expect(STATUS_TITLE.held).toContain('Nothing was blocked');
+    expect(STATUS_TITLE.engaged).toContain('Nothing was blocked');
+    expect(STATUS_TITLE.granted).toContain('not a block');
+    // `flagged` means delivered-anyway, and says so.
     expect(STATUS_TITLE.flagged).toContain('nothing was blocked');
-    expect(STATUS_TITLE.withheld).not.toContain('nothing was blocked');
   });
 
-  it('says the tool was withheld and that the server is unaffected', () => {
+  it('never promises "nothing was blocked" for the one word that means something WAS', () => {
+    // V37 C9 is the single place in cImp where detection actually REMOVES
+    // something. Its sentence has to be the opposite of `flagged`'s, and it has
+    // to say the blast radius: the server and its other tools are unaffected,
+    // and the tool comes back if the screen stops matching.
     const t = STATUS_TITLE.withheld;
+    expect(t).not.toContain('nothing was blocked');
     expect(t).toContain('WITHHELD');
     expect(t).toContain('unaffected');
     expect(t).toContain('re-screened');
-  });
-
-  it('keys on the exact wire source, not on kind alone', () => {
-    // An ordinary failed CALL row on the same lane and the same server stays
-    // `failed`: only `source === "screen"` marks a screening row, and matching
-    // it loosely (a prefix, a substring) would relabel real failures.
-    const call = entry(4, { kind: 'mcp', tool: 'ddg__search', ok: false, server: 'ddg' });
-    expect(rowStatus(call)).toBe('failed');
-    expect(rowStatus(screenDrop('x', { source: 'screening' }))).toBe('failed');
-    // …and the source alone does not hijack another lane.
-    expect(rowStatus(entry(5, { kind: 'graph', source: 'screen', ok: false }))).toBe('failed');
   });
 });
 
@@ -507,263 +346,6 @@ describe('mcp identity columns', () => {
     const row = entry(10, { kind: 'graph' });
     expect(row.server).toBeNull();
     expect(row.category).toBeNull();
-  });
-});
-
-// ── offload_server lifecycle rows ─────────────────────────────────────────
-//
-// Mirror of the injection_flag discipline above, for the feed added with the
-// server-lifecycle events. The trap here is `ok`: it is true for a healthy
-// start AND for a deliberate stop, so any classifier that consults it before
-// the transition renders "the server is up" and "the server is gone" as the
-// same word.
-
-/// One `offload_server` row for transition `tool`.
-function srv(tool: string, ok = true, over: Partial<ActivityEntry> = {}): ActivityEntry {
-  return entry(1, { kind: 'offload_server', source: 'big-local', tool, ok, ...over });
-}
-
-describe('rowStatus — offload server lifecycle', () => {
-  it('gives every transition its own status', () => {
-    const seen = [
-      rowStatus(srv('start')),
-      rowStatus(srv('ready')),
-      rowStatus(srv('stop')),
-      rowStatus(srv('fail', false)),
-    ];
-    expect(seen).toEqual(['started', 'ready', 'stopped', 'down']);
-    expect(new Set(seen).size).toBe(4);
-  });
-
-  it('never reads a deliberate stop as a failure', () => {
-    // The backend records a stop as ok:true precisely so this holds; pinned
-    // here because the frontend must not re-derive it from `ok` either way.
-    expect(rowStatus(srv('stop'))).toBe('stopped');
-    expect(rowStatus(srv('stop'))).not.toBe('down');
-    expect(rowStatus(srv('stop'))).not.toBe('failed');
-  });
-
-  it('does not let a healthy start and a stop collapse via ok', () => {
-    // Both are ok:true. A classifier keyed on `ok` would return one word here.
-    expect(rowStatus(srv('start'))).not.toBe(rowStatus(srv('stop')));
-  });
-
-  it('separates a server failure from a failed tool call', () => {
-    // `failed` is a call that errored; `down` is a backend that is not running.
-    // Sharing a word would put a crashed llama-server in the same bucket as a
-    // graph query that threw.
-    expect(rowStatus(srv('fail', false))).toBe('down');
-    expect(rowStatus(entry(1, { ok: false }))).toBe('failed');
-  });
-
-  it('degrades an unknown transition without inventing a claim', () => {
-    // A verb added backend-side that this build predates.
-    expect(rowStatus(srv('paused'))).toBe('ok');
-    expect(rowStatus(srv('paused', false))).toBe('down');
-  });
-
-  it('does not misclassify an offload TASK row as a lifecycle row', () => {
-    // The two kinds are one underscore apart and both carry a backend name in
-    // `source`; a prefix match instead of an equality check would swallow the
-    // task feed whole.
-    expect(rowStatus(entry(1, { kind: 'offload', source: 'big-local', tool: 'offload_task' }))).toBe(
-      'ok'
-    );
-  });
-});
-
-// ── sandbox rows (V33 Phase A) ─────────────────────────────────────────────
-//
-// Locked decision 17 requires "off (user choice)" and "unavailable
-// (prerequisite missing)" to stay DISTINCT states — collapsing them is how a
-// broken prerequisite hides behind a deliberate setting. The frontend half of
-// that guarantee is here: both render as `unsandboxed`, and the row's own text
-// carries which one, so nothing about the chip may start reading `ok` as the
-// verb.
-
-/// One `sandbox` row. `ok` mirrors "was this state chosen?" — true for the
-/// user's switch being off, false for a missing prerequisite.
-function sbx(tool: string, ok: boolean, over: Partial<ActivityEntry> = {}): ActivityEntry {
-  return entry(1, { kind: 'sandbox', source: 'run_command', tool, ok, ...over });
-}
-
-describe('rowStatus — sandbox', () => {
-  it('reports both negative states as unsandboxed, never as a blocked call', () => {
-    const off = sbx('unsandboxed', true, { target: 'off (user choice) — git.exe' });
-    const unavailable = sbx('unsandboxed', false, { target: 'unavailable — git.exe' });
-    expect(rowStatus(off)).toBe('unsandboxed');
-    expect(rowStatus(unavailable)).toBe('unsandboxed');
-    // The command ran fine in both cases: this must never wear the words that
-    // mean "we stopped something" or "the call errored".
-    expect(rowStatus(off)).not.toBe('denied');
-    expect(rowStatus(unavailable)).not.toBe('failed');
-  });
-
-  it('keeps the two states distinguishable in the row itself', () => {
-    // The chip is one word by design; decision 17's distinctness lives in
-    // `target`, which the detail popup shows. If a future change moves the
-    // distinction into the chip, this test is where that gets noticed.
-    const off = sbx('unsandboxed', true, { target: 'off (user choice) — git.exe' });
-    const unavailable = sbx('unsandboxed', false, { target: 'unavailable — git.exe' });
-    expect(off.target).not.toEqual(unavailable.target);
-    expect(off.ok).not.toEqual(unavailable.ok);
-  });
-
-  it('does not read a grant event as an unsandboxed run', () => {
-    // Other tools in this lane (grants, drive mappings) are ordinary rows.
-    expect(rowStatus(sbx('grant', true, { target: 'C:/tools' }))).toBe('ok');
-    expect(rowStatus(sbx('grant', false, { target: 'C:/tools' }))).toBe('failed');
-  });
-
-  it('reads a sandboxed run as ordinary traffic, not as an alarm', () => {
-    // The confirmation row exists to answer "is this actually sandboxed?" —
-    // an empty lane used to mean either "everything was" or "nothing ran".
-    // Answering it must not cost the lane its signal-to-noise: the expected
-    // case stays quiet, and the program name lives in `target`.
-    const run = sbx('sandboxed', true, { target: 'sandboxed — git.exe' });
-    expect(rowStatus(run)).toBe('ok');
-    expect(run.target).toContain('git.exe');
-  });
-
-  it('gives a suspected boundary hit its own word — not denied, not failed', () => {
-    const hit = sbx('denied', false, {
-      target: 'filesystem/OS access denied — git.exe',
-    });
-    expect(rowStatus(hit)).toBe('boundary');
-    // `denied` is this app's one "we stopped it", and it is filled red. cImp
-    // cannot see the OS's ACL decision — the backend words this row as a
-    // heuristic, so the chip must not assert more than the row does.
-    expect(rowStatus(hit)).not.toBe('denied');
-    // `failed` is wrong the other way: the tool call itself returned output.
-    expect(rowStatus(hit)).not.toBe('failed');
-    // The program is in the scannable column, like every other row in the lane.
-    expect(hit.target).toContain('git.exe');
-  });
-
-  it('keeps every sandbox row type visibly distinct', () => {
-    // One lane, four row types. If two of them ever render as the same word,
-    // the lane stops answering the question it was added to answer.
-    const words = [
-      rowStatus(sbx('unsandboxed', true, { target: 'off (user choice) — git.exe' })),
-      rowStatus(sbx('sandboxed', true, { target: 'sandboxed — git.exe' })),
-      rowStatus(sbx('denied', false, { target: 'socket access denied — curl.exe' })),
-      rowStatus(sbx('grant', false, { target: 'C:/tools' })),
-    ];
-    expect(new Set(words).size).toBe(words.length);
-  });
-});
-
-// ── plugin discovery rows (V38 Phase A) ───────────────────────────────────
-//
-// This lane deliberately adds NO new status word: a plugin definition either
-// loaded or it did not, and `ok`/`failed` say that exactly. What it must not do
-// is fall into any of the words that carry a security claim — a rejected
-// manifest is a malformed FILE, not a blocked call.
-
-/// One `plugin` row. `tool` is the verb (`rejected` / `conflict` / `rescan`).
-function plug(tool: string, ok: boolean, over: Partial<ActivityEntry> = {}): ActivityEntry {
-  return entry(1, { kind: 'plugin', source: 'acme@1.0.0', tool, ok, ...over });
-}
-
-describe('rowStatus — plugin discovery', () => {
-  it('reads a rejected manifest as a plain failure, never as a blocked call', () => {
-    const rejected = plug('rejected', false, { target: 'identity: `name` must be…' });
-    expect(rowStatus(rejected)).toBe('failed');
-    // The security vocabulary belongs to rows where something was STOPPED.
-    expect(rowStatus(rejected)).not.toBe('denied');
-    expect(rowStatus(rejected)).not.toBe('flagged');
-    expect(rowStatus(rejected)).not.toBe('boundary');
-  });
-
-  it('reads an identity conflict as a failure too', () => {
-    expect(rowStatus(plug('conflict', false, { source: 'acme@1.0.0' }))).toBe('failed');
-  });
-
-  it('lets the scan summary report the folder at a glance', () => {
-    // The backend sets `ok` on the summary to the FOLDER’s health, so a clean
-    // folder is one green row and a folder with a rejected plugin is not.
-    expect(rowStatus(plug('rescan', true, { source: 'plugins', target: 'loaded 2 · rejected 0' }))).toBe(
-      'ok',
-    );
-    expect(rowStatus(plug('rescan', false, { source: 'plugins', target: 'loaded 1 · rejected 1' }))).toBe(
-      'failed',
-    );
-  });
-});
-
-// ── delegation rows (V39, locked decision 14) ─────────────────────────────
-//
-// The lane where `ok` carries the least: a `start` row is `ok:true` before
-// anything has happened, a `takeover` is `ok:false` because the user chose to
-// end it, and a `role_moved` is not a call at all. The plain `ok`/`failed`
-// fallthrough said "Call succeeded" for the first, "Call failed" for the
-// second and "Call succeeded" for the third — three claims, none of them true.
-
-/// One `delegation` row for transition `tool`. Defaults mirror the writer in
-/// `src-tauri/src/delegation/mod.rs::record_row`: `source` is the DRIVER's
-/// harness, the attribution is the driver TAB.
-function dlg(tool: string, ok: boolean, over: Partial<ActivityEntry> = {}): ActivityEntry {
-  return entry(1, {
-    kind: 'delegation',
-    source: H2,
-    tab: { tab: H2 },
-    tool,
-    ok,
-    ...over,
-  });
-}
-
-describe('rowStatus — delegation transitions', () => {
-  it('gives the three non-outcome transitions their own word', () => {
-    expect(rowStatus(dlg('start', true))).toBe('driving');
-    expect(rowStatus(dlg('takeover', false))).toBe('takeover');
-    expect(rowStatus(dlg('role_moved', true))).toBe('moved');
-  });
-
-  it('never renders a user take-over as a failure', () => {
-    // The whole point of the branch: the user reclaiming their own tab is a
-    // deliberate act, and the worker kept running.
-    expect(rowStatus(dlg('takeover', false))).not.toBe('failed');
-  });
-
-  it('does not let a start and a completed reply collapse via ok', () => {
-    // Both are ok:true. A classifier keyed on `ok` would return one word.
-    expect(rowStatus(dlg('start', true))).not.toBe(rowStatus(dlg('done', true)));
-  });
-
-  it('leaves the real outcomes to ok/failed rather than inventing synonyms', () => {
-    expect(rowStatus(dlg('done', true))).toBe('ok');
-    // A completed turn whose text was not substantive is a `done` that FAILED
-    // (locked decision 13) — the worker really did run.
-    expect(rowStatus(dlg('done', false))).toBe('failed');
-    expect(rowStatus(dlg('refused', false))).toBe('failed');
-    expect(rowStatus(dlg('timeout', false))).toBe('failed');
-    expect(rowStatus(dlg('worker_exited', false))).toBe('failed');
-  });
-
-  it('renders a `driver_gone` row as the failure it is', () => {
-    // V39 review L-7: a new transition — the caller's connection died while the
-    // worker was working. It has no word of its own on purpose: like `timeout`
-    // and `worker_exited`, `failed` plus the row's own reason says it, and a
-    // synonym would dilute the three words that DO mean something.
-    expect(rowStatus(dlg('driver_gone', false))).toBe('failed');
-  });
-
-  it('renders a `cancelled` row an older build wrote', () => {
-    // The vocabulary is a contract with rows already on disk: the transition is
-    // reserved and unreachable today, and must still render rather than throw.
-    expect(rowStatus(dlg('cancelled', false))).toBe('failed');
-  });
-
-  it('degrades an unknown transition without inventing a claim', () => {
-    expect(rowStatus(dlg('resumed', true))).toBe('ok');
-    expect(rowStatus(dlg('resumed', false))).toBe('failed');
-  });
-
-  it('does not treat the driver harness as a canary source', () => {
-    // `source` here is a harness id, not a telemetry channel — a `refused` row
-    // must read as a failed delegation, not as a signal that fired.
-    expect(rowStatus(dlg('refused', false, { source: H1 }))).toBe('failed');
   });
 });
 

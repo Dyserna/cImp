@@ -664,7 +664,15 @@ export interface SessionUsageRow {
   agent: string;
   totals: UsageTotals;
   tool_chars: number;
-  cache_hit_ratio: number;
+  /// `cache_read / (cache_read + input)`, computed backend-side — the Sessions
+  /// table renders it as a percentage.
+  ///
+  /// **`null` when there is no ratio to show**: the session's harness declares
+  /// neither category (nothing to divide), or both are zero (no denominator).
+  /// Never 0 for those — "0% cache hit" is a claim about a session that spent
+  /// tokens. V42: the `usageMath.cacheHitRatio` that used to re-derive this
+  /// here, because an `f64` could not carry absence, is gone with the `Option`.
+  cache_hit_ratio: number | null;
   /// True when this session recorded no real Turn tokens (all four token
   /// totals are zero) — the table's "est" badge. V24 Phase E: token-less
   /// sessions (a harness that reported no tokens) keep it; any session with

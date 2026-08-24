@@ -45,6 +45,9 @@
 // made the live loss reproducible (echo latency ≪ burst length); widening the
 // fix to broadcast identity is a backend change and out of scope here.
 
+import { applySettings } from './store';
+import type { Settings } from './types';
+
 /** Closes the window opened by {@link SettingsDraftSync.beginPush}. Idempotent. */
 export type SettlePush = () => void;
 
@@ -129,4 +132,38 @@ export class SettingsDraftSync<S> {
 /** Convenience constructor, matching the `newX()` style of this directory. */
 export function createDraftSync<S>(adopt: AdoptDraft<S>): SettingsDraftSync<S> {
   return new SettingsDraftSync(adopt);
+}
+
+/**
+ * **Push the Settings window's draft to the backend, gated.** Registers the
+ * push, sends the whole struct, and settles the window in EITHER direction.
+ *
+ * This is the only sanctioned way to push the draft, and the coupling is the
+ * point (V42 tranche-2 review, T2-6). The gate above protects nothing that does
+ * not call it, and until this existed the two halves — `beginPush()` and
+ * `applySettings()` — were assembled by hand at every call site, with a test
+ * scanning `SettingsApp.svelte` to check that whoever assembled them had
+ * remembered both. #129's audit found exactly one who had not
+ * (`commitGraphIgnore`), and the scan could only ever have found it in that ONE
+ * file, while `applySettings` is importable by all twenty-one section children.
+ *
+ * Making the pair inseparable retires that whole question: a section that wants
+ * to push cannot assemble an ungated one without importing `applySettings`
+ * directly, which `draftSync.test.ts` now forbids anywhere under
+ * `src/lib/settings/` (this module and `store.ts` excepted — the definition and
+ * its gate). Sections push through the parent's callbacks anyway; the guard is
+ * for the next one that reaches for a shortcut.
+ *
+ * `.finally` rather than `.then`: a rejected push must still close its window,
+ * or the gate wedges shut and the window stops accepting cross-window updates
+ * for the rest of its life. (`applySettings` resolves even on a rejected
+ * push — it rolls the store back itself — but `finally` keeps that from
+ * mattering here.)
+ */
+export function pushDraft(
+  sync: SettingsDraftSync<Settings>,
+  next: Settings,
+): Promise<void> {
+  const settled = sync.beginPush();
+  return applySettings(next).finally(settled);
 }

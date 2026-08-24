@@ -122,11 +122,15 @@ if (!target) {
 //
 //   1. `mount(App)` must not run first, or every view would paint its default
 //      section/collapsed card and snap to the saved one a frame later.
-//   2. `hydrateHiddenTabs()` must not run later than App's `onMount`, where
-//      `stripHiddenTabsFromLayout()` re-establishes "hidden ⇔ absent from the
-//      layout tree". An empty set at that moment would un-hide every hidden
-//      tab — and the popover's next write would then persist the empty set,
-//      losing the user's choice for good.
+//   2. `hydrateHiddenTabs()` must not run later than App's `onMount`, which
+//      reads it to keep hidden tabs out of the tree it builds on the
+//      fresh-install path. An empty set at that moment un-hides them for the
+//      session. Weaker than it was: until V42 Phase B this was the ONLY thing
+//      keeping "hidden ⇔ absent from the layout tree" true after hydration, and
+//      the popover's next write would then persist the empty set over the
+//      user's choice. The backend reads the same file now and hands over a tree
+//      the hidden tabs were never in, so the persisted-layout path — the one
+//      every launch after the first takes — no longer depends on this at all.
 //
 // Neither call rejects: a backend that cannot answer leaves the window
 // unhydrated, which renders defaults and writes nothing (see `uiState.ts`).

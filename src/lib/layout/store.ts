@@ -1,9 +1,8 @@
 // Layout store. Holds the current layout tree and the focused-pane id.
-// In M1 the tree starts as a single root pane that all tabs land in;
-// debug-menu splits and (later) drag-and-drop mutate it from there.
-// Persistence does not exist yet — the store rebuilds from scratch each
-// launch, mirroring the snapshot flow that App.svelte already runs for
-// the tabs store.
+// The tree starts as a single root pane that all tabs land in; splits and
+// drag-and-drop mutate it from there. App.svelte fills it at launch, either
+// from the backend-hydrated `settings.layout` or (fresh install) from the tab
+// snapshot.
 //
 // The store also owns two thin lifecycle hooks called from the same
 // places that mutate the tabs store:
@@ -12,6 +11,29 @@
 //     it, collapsing non-root panes that become empty.
 // Keeping them here (rather than in tabs/store.ts) avoids a circular
 // import and keeps every layout-mutating path in one file.
+//
+// ## Why the runtime ops are still here (V42 Phase B, consciously deferred)
+//
+// Phase B moved HYDRATION-time layout integrity to Rust
+// (`src-tauri/src/settings/layout.rs`): the load path and preset restore both
+// hand this store a tree that is already correct, and the frontend keeps no
+// copy of those rules. RUNTIME mutation — commitDrop, closeFocusedPane,
+// moveAllTabsToPane, the split/merge ops, pane-id minting — stayed, and moving
+// it is not a matter of porting more tree math. Two synchronous
+// read-after-write couplings are the blocker:
+//
+//   1. `visibility.ts`'s `mirrorFocusedSwitch` reads `focusedActiveTabId`
+//      immediately after a hide/show mutates the tree and calls `switchTab`
+//      when it changed. It needs the post-mutation value in the same turn.
+//   2. App.svelte's `focusedActiveTabId` -> `set_active_tab` guard does the
+//      same for every other focus-moving op.
+//
+// A Rust-side op returns its new tree over an async IPC round-trip, so both
+// sites would read the PRE-mutation store and mirror the wrong tab. Fixing that
+// means deciding afresh who owns "the active tab" — a phase of its own, not a
+// side effect of porting an op. Until then the `#[ts(type)]` seam on
+// `LayoutPersisted::tree` stays too: the union is authored here because the
+// code that constructs and rewrites those nodes is here.
 
 import { derived, get, writable, type Readable, type Writable } from 'svelte/store';
 import type { TabId } from '../tabs/types';

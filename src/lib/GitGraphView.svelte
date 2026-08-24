@@ -18,7 +18,7 @@
   import RefChip from './RefChip.svelte';
   import { fmtDate, fmtTime } from './format';
   import { WORKBENCH_TAB_ID } from './tabs/types';
-  import { isAppViewVisible, onAppViewShown } from './appViewVisibility';
+  import { onAppViewShown, pollWhileVisible } from './appViewVisibility';
   import { loadViewString, saveViewString } from './viewSection';
 
   let graph = $state<GitGraph | null>(null);
@@ -96,12 +96,14 @@
 
   onMount(() => {
     void refresh();
-    const timer = setInterval(() => {
-      if (isAppViewVisible(WORKBENCH_TAB_ID)) void refresh(true);
-    }, AUTO_REFRESH_MS);
+    const stopPoll = pollWhileVisible(
+      WORKBENCH_TAB_ID,
+      () => void refresh(true),
+      AUTO_REFRESH_MS,
+    );
     const unsubShown = onAppViewShown(WORKBENCH_TAB_ID, () => void refresh(true));
     return () => {
-      clearInterval(timer);
+      stopPoll();
       unsubShown();
     };
   });

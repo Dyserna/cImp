@@ -322,8 +322,9 @@ fn apply_incoming_settings(cur: &mut Settings, mut incoming: Settings) {
     // physical global file. A stale Settings-window snapshot must not revert
     // a version observation or a Mark-verified. (The persistence layer
     // additionally bans `llm_pricing`/`harness_versions` from project
-    // overlays wholesale — `OVERLAY_BANNED_KEYS` in settings/persistence.rs;
-    // this list here covers the in-memory round trip, that one the on-disk
+    // overlays wholesale — the `OverlayStrip::Banned` rows of `MACHINE_SCOPED`
+    // in settings/persistence.rs; this list here covers the in-memory round
+    // trip, that one the on-disk
     // diff/merge. Keep both in mind when adding an out-of-band field.)
     incoming.harness_versions = cur.harness_versions.clone();
     // V40 Phase B: the same rule, one level down. `Settings::harness` is NOT

@@ -12,6 +12,18 @@
 //! edits are visibility (`pub(super)` where loopback's handlers or its tests
 //! were the caller — `pub(super)` here means `offload`, and nothing wider).
 //!
+//! #132 re-checked those 93 markers one at a time, keeping only the ones the
+//! compiler still demands: seven are private again (`ai_tab_ids_for`,
+//! `names_a_configured_ai_tab_for`, `Contamination`, `clear_detail`,
+//! `note_contamination`, `unattributed_write`, `user_flip_refusal`) — they had
+//! been widened for a caller that no longer exists. The other 86 are load-
+//! bearing, and it is worth writing down why so nobody re-runs this: the tests
+//! that drive this module are `offload::loopback`'s route tests, they live at
+//! `offload::loopback::tests::{latch,identity,contamination}`, and a descendant
+//! of `offload` sees `pub(super)` exactly as the handlers do. Only a caller
+//! INSIDE `offload::latch` can hold a private item, so for a leaf module there
+//! is one step below `pub(super)` and it is all the way to private.
+//!
 //! **It is deliberately ONE module.** The obvious internal seams — identity,
 //! per-tab state, the registry, the Events rows — are not module boundaries:
 //! [`LatchRegistry::gate`] and the row builders read [`LatchScope`]'s and
@@ -193,7 +205,7 @@ pub(super) fn ai_tab_ids(settings: &crate::settings::Settings) -> impl Iterator<
 
 /// Every configured AI tab id belonging to `agent` (`"claude"` / `"opencode"`),
 /// in settings order — V33 C5's key space.
-pub(super) fn ai_tab_ids_for<'a>(
+fn ai_tab_ids_for<'a>(
     settings: &'a crate::settings::Settings,
     agent: &'static str,
 ) -> impl Iterator<Item = &'a str> {
@@ -207,7 +219,7 @@ pub(super) fn ai_tab_ids_for<'a>(
 
 /// Whether `id` exactly names a configured AI tab **of `agent`** —
 /// [`is_configured_tab`] without its availability floor.
-pub(super) fn names_a_configured_ai_tab_for(
+fn names_a_configured_ai_tab_for(
     settings: &crate::settings::Settings,
     agent: &'static str,
     id: &str,
@@ -1404,7 +1416,7 @@ impl GatePolicy {
 /// goes through `activity::record_bg`, whose contract is that it does file I/O
 /// (inline off a tokio runtime), and holding a lock across that would put the
 /// store's I/O on the critical path of every other tab's gated call.
-pub(super) struct Contamination {
+struct Contamination {
     origin: outbound::Origin,
     consumer: &'static str,
     /// `agent:tab` — [`LatchScope::label`], the same convention every other
@@ -1572,7 +1584,7 @@ impl ContaminationCleared {
 /// point of the pair is that they say the same things about different bases: the
 /// prior state, what was and was not restored by the clear, and — the part a
 /// reviewer most needs — that quarantined notes are untouched by it.
-pub(super) fn clear_detail(
+fn clear_detail(
     basis: ClearBasis,
     origin: outbound::Origin,
     prior_latch: &str,
@@ -1693,7 +1705,7 @@ impl ClearedOnRotation {
 /// the retention lane.
 #[must_use = "a contamination transition that is detected and not recorded is finding F-3 again — \
               call Contamination::record() after dropping the registry lock"]
-pub(super) fn note_contamination(
+fn note_contamination(
     entry: &mut TabLatch,
     scope: &LatchScope,
     tool: &str,
@@ -1781,7 +1793,7 @@ pub(super) fn note_contamination(
 /// from"*, is true of `gate` and **false of the route that calls it**: the only
 /// route that can reach this line with a PERSISTENT-WRITE is `/graph_run`, and
 /// that handler holds the project the note is about to be written into.
-pub(super) fn unattributed_write(
+fn unattributed_write(
     policy: GatePolicy,
     route: LatchRoute,
     name: &str,
@@ -1877,7 +1889,7 @@ pub(super) fn unattributed_write(
 /// that pair, and it cannot silently capture a future refusal that means
 /// something else. The other two constants are unreachable under a `Local`
 /// latch, so they fall through untouched.
-pub(super) fn user_flip_refusal(refusal: &'static str, local_by_user_flip: bool) -> &'static str {
+fn user_flip_refusal(refusal: &'static str, local_by_user_flip: bool) -> &'static str {
     if local_by_user_flip && refusal == toolclass::REFUSAL_EXTERNAL_BLOCKED {
         // The user's own IPC flip closed the external side. Saying a tool call
         // did it is F-23's defect on the route that ships ON.

@@ -1,16 +1,18 @@
 //! Layout-tree and layout-preset use cases (V4-04).
 //!
 //! The frontend owns every structural mutation of the layout tree and pushes
-//! the full serialized state here whenever it changes (debounced frontend
-//! side). This layer's job is to slot the new tree into the settings struct and
-//! let `SettingsHandle::mutate` drive the broadcast + debounced disk save.
-//! Presets live in a separate `layout_presets` field; the CRUD below upserts /
-//! renames / deletes by name.
+//! the full serialized state here whenever it changes. This layer's job is to
+//! slot the new tree into the settings struct and let the settings handle drive
+//! the debounced disk save. Presets live in a separate `layout_presets` field;
+//! the CRUD below upserts / renames / deletes by name.
 //!
-//! No layout-tree validation happens here at runtime — the frontend's
-//! `validateAndRepairLayout` covers integrity for restored presets, and
-//! `persistence::integrity_check` covers the load-from-disk path. These
-//! operations trust their inputs.
+//! [`Self::save`](LayoutService::save) trusts its input: the frontend just built
+//! that tree with the tree ops, and re-validating every splitter frame would buy
+//! nothing. The two places a tree arrives from somewhere the frontend did NOT
+//! just build it — the settings file at load, and a preset saved against a
+//! different tab list — both run `settings::layout`'s integrity walk:
+//! `persistence::integrity_check` for the first,
+//! [`restore_preset`](LayoutService::restore_preset) for the second.
 //!
 //! ## Its own module, and no sink
 //!
@@ -32,6 +34,7 @@
 //! it one step further — it re-checks its preconditions *inside* the closure
 //! and reports a no-op as an error rather than a false `Ok`.
 
+use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{AppError, AppResult};
@@ -48,14 +51,25 @@ impl<'a> LayoutService<'a> {
         Self { settings }
     }
 
-    /// Persist the full layout tree + focused-pane id. Called by the frontend
-    /// on every layout mutation, debounced 250ms there to coalesce splitter
-    /// drags. The settings handle does its own 500ms debounce on the disk
-    /// write, so a fast burst writes the file once.
+    /// Persist the full layout tree + focused-pane id. Called by the frontend on
+    /// EVERY layout-store mutation — no frontend debounce, deliberately (see
+    /// `installLayoutPersistence`: the 250 ms one it used to have left a
+    /// closing-race window where the last edit before teardown was dropped). A
+    /// splitter drag therefore lands here once per pointer event.
+    ///
+    /// Coalescing is the settings handle's 500 ms debounce on the disk write, so
+    /// a fast burst writes the file once.
+    ///
+    /// **Quiet write.** `mutate_quiet` instead of `mutate`: the in-memory store
+    /// is updated and the save is requested, but no `settings-changed` is
+    /// broadcast. Nothing consumes a layout change through that channel — see
+    /// `SettingsHandle::mutate_quiet` for the audit — and broadcasting cloned
+    /// the whole `Settings` struct to every webview per pointer event to deliver
+    /// a value none of them read.
     pub fn save(&self, layout: LayoutPersisted) -> AppResult<()> {
         // Atomic mutate so a concurrent tab create/close or settings_update can't
         // clobber the layout with a stale whole-struct snapshot (lost-update).
-        self.settings.mutate(move |snap| {
+        self.settings.mutate_quiet(move |snap| {
             snap.layout = Some(layout);
         });
         Ok(())
@@ -84,6 +98,45 @@ impl<'a> LayoutService<'a> {
             }
         });
         Ok(())
+    }
+
+    /// Restore a preset: return its tree adapted to the live tab list, ready for
+    /// the frontend to drop straight into the layout store.
+    ///
+    /// A preset carries a tree and nothing else — no focus (restoring one is
+    /// "set up panes this way"; focus follows the user's next click) and no
+    /// promise that the tabs it names still exist. Adapting it is exactly the
+    /// hydration problem: drop tabs deleted since the save, place tabs created
+    /// since it as orphans, leave hidden tabs out, clamp ratios, collapse
+    /// whatever that emptied. So it runs the same
+    /// [`crate::settings::layout::repair`] the load path runs, which is the point
+    /// of doing it here — V42 Phase B, the repair rules exist exactly once, and
+    /// the frontend copy that used to run at this call site is gone.
+    ///
+    /// Focus is seeded from the leftmost leaf before the repair, which then
+    /// validates it like any other persisted focus.
+    ///
+    /// **Reads, never writes.** The restored layout reaches settings through the
+    /// frontend's ordinary save-on-change path, like any other layout mutation —
+    /// a preset restore is not a special kind of write.
+    pub fn restore_preset(
+        &self,
+        name: String,
+        hidden: &HashSet<String>,
+    ) -> AppResult<LayoutPersisted> {
+        let snap = self.settings.current();
+        let Some(preset) = snap.layout_presets.iter().find(|p| p.name == name) else {
+            return Err(AppError::Settings(format!(
+                "restore_layout_preset: no preset named '{name}'"
+            )));
+        };
+        let mut layout = LayoutPersisted {
+            focused_pane_id: crate::settings::layout::leftmost_pane_id(&preset.tree),
+            tree: preset.tree.clone(),
+        };
+        let tab_ids: Vec<&str> = snap.tabs.iter().map(|t| t.id()).collect();
+        crate::settings::layout::repair(&mut layout, &tab_ids, hidden);
+        Ok(layout)
     }
 
     /// Delete a preset by name. No-op if the name doesn't exist (callers don't
@@ -322,8 +375,15 @@ mod tests {
     /// **Previously "user clicks in the app".** `save_layout` is the command
     /// the frontend fires on every splitter drag, and the only observable is
     /// that the next launch restores what the user last saw.
+    ///
+    /// **And it lands QUIETLY** (V42 Phase B). The write reaches the in-memory
+    /// store and the debounced saver, but no `settings-changed` goes out:
+    /// nothing consumes a layout change through that channel, and broadcasting
+    /// cloned the whole `Settings` struct to every webview once per pointer
+    /// event. The silence is the assertion — [`Self::save`]'s only observable
+    /// difference from `mutate` is what does NOT happen.
     #[test]
-    fn save_layout_lands_in_settings_and_broadcasts() {
+    fn save_layout_lands_in_settings_and_stays_quiet() {
         let fixture = Fixture::new();
         let mut watch = fixture.settings.subscribe();
         assert!(fixture.settings.current().layout.is_none());
@@ -336,8 +396,73 @@ mod tests {
 
         assert!(fixture.settings.current().layout.is_some());
         assert!(
-            watch.try_recv().expect("a broadcast").layout.is_some(),
-            "the settings-changed broadcast carries the new layout"
+            watch.try_recv().is_err(),
+            "a layout save must not broadcast: nothing reads a layout change off \
+             `settings-changed`, and the clone is per pointer event"
+        );
+        // The control: this handle DOES broadcast for an ordinary write, so the
+        // silence above is `mutate_quiet` and not a dead subscription.
+        fixture.service().save_preset("Focus".to_string(), a_tree()).expect("save");
+        assert!(
+            watch.try_recv().is_ok(),
+            "the subscription is live — an ordinary preset write still broadcasts"
+        );
+    }
+
+    /// V42 Phase B, re-pointed by the Phase A merge. Structural because the
+    /// thing worth defending is which handle method this body calls, and the
+    /// test above can only see the absence of a broadcast — which a future
+    /// `current()` + `set()` rewrite would also produce, while reintroducing the
+    /// lost-update this module exists to prevent. Newline-agnostic: CI checks
+    /// this tree out with CRLF.
+    ///
+    /// (It scanned `ipc/layout.rs` on develop. V42 Phase A moved the body onto
+    /// [`LayoutService`], so it follows the body — the wire command is one line
+    /// that calls this.)
+    #[test]
+    fn save_writes_quietly() {
+        let src = include_str!("layout.rs");
+        let start = src
+            .find("pub fn save(&self, layout: LayoutPersisted)")
+            .expect("`LayoutService::save` is gone — re-point this test");
+        let body = &src[start..];
+        let body = &body[..body.find("\n    }").unwrap_or(body.len())];
+        assert!(
+            body.contains("mutate_quiet"),
+            "`save` must use `mutate_quiet`: it runs once per pointer event during a \
+             splitter drag, and `mutate` clones and broadcasts the whole Settings struct to \
+             every window each time"
+        );
+    }
+
+    /// **Previously "user clicks in the app".** Restoring a preset is a READ
+    /// that adapts: an unknown name is an error rather than a silently empty
+    /// layout, a known one comes back with focus seeded and the load path's own
+    /// repair walk already applied — which is the whole point of V42 Phase B,
+    /// the rules existing once. Nothing is written either way.
+    #[test]
+    fn restoring_a_preset_adapts_it_and_writes_nothing() {
+        let fixture = Fixture::new();
+        let svc = fixture.service();
+        let hidden = HashSet::new();
+
+        assert!(
+            svc.restore_preset("Nope".to_string(), &hidden).is_err(),
+            "an unknown name must be an error, not an empty layout the frontend adopts"
+        );
+
+        svc.save_preset("Focus".to_string(), a_tree()).expect("save");
+        let before = fixture.settings.current();
+        let restored = svc.restore_preset("Focus".to_string(), &hidden).expect("restore");
+
+        assert!(
+            !restored.focused_pane_id.is_empty(),
+            "focus is seeded from the leftmost leaf, then validated by the repair"
+        );
+        assert_eq!(
+            fixture.settings.current().layout,
+            before.layout,
+            "a restore is a read: the tree reaches settings through the frontend's ordinary save-on-change path, not from here"
         );
     }
 

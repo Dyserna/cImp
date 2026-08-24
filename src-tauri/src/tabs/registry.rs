@@ -2,14 +2,13 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicI32;
 use std::sync::{Arc, RwLock};
 
-use tauri::ipc::Channel;
-use tauri::AppHandle;
 use tokio::sync::{mpsc, Mutex as TokioMutex};
 use tracing::{debug, info, warn};
 
 use crate::error::{AppError, AppResult};
 use crate::processing::permission::PermissionPattern;
-use crate::pty::PtyManager;
+use crate::pty::{PtyHost, PtyManager};
+use crate::service::sink::OutputSink;
 use crate::settings::{AiTabId, SettingsHandle};
 use crate::state::{InputLengths, StateSignal, TabId, TabKind};
 use crate::tabs::config::build_launch_spec;
@@ -36,9 +35,9 @@ pub struct TabMetaWire {
 /// one struct the two signatures are *literally* identical and a field added to
 /// one is added to both.
 pub struct TabStart<'a> {
-    pub app: AppHandle,
+    pub host: PtyHost,
     pub tab: TabId,
-    pub output_channel: Channel<String>,
+    pub output: Arc<dyn OutputSink>,
     pub rows: u16,
     pub cols: u16,
     pub launch_cwd: &'a std::path::Path,
@@ -290,13 +289,13 @@ impl TabRegistry {
         position
     }
 
-    /// Spawn the subprocess for `tab` and bind it to `output_channel`. Each
+    /// Spawn the subprocess for `tab` and bind it to `output`. Each
     /// tab calls this once on first xterm mount.
     pub async fn start_tab(&self, start: TabStart<'_>) -> AppResult<()> {
         let TabStart {
-            app,
+            host,
             tab,
-            output_channel,
+            output,
             rows,
             cols,
             launch_cwd,
@@ -332,9 +331,10 @@ impl TabRegistry {
         };
         let result = manager
             .start(crate::pty::PtyStart {
-                app,
+                host,
+                settings,
                 spec,
-                output_channel,
+                output,
                 initial_rows: rows,
                 initial_cols: cols,
                 tts_segments,
@@ -366,9 +366,9 @@ impl TabRegistry {
     /// previous session.
     pub async fn restart_tab(&self, start: TabStart<'_>) -> AppResult<()> {
         let TabStart {
-            app,
+            host,
             tab,
-            output_channel,
+            output,
             rows,
             cols,
             launch_cwd,
@@ -395,9 +395,10 @@ impl TabRegistry {
         };
         let result = manager
             .start(crate::pty::PtyStart {
-                app,
+                host,
+                settings,
                 spec,
-                output_channel,
+                output,
                 initial_rows: rows,
                 initial_cols: cols,
                 tts_segments,
@@ -421,15 +422,19 @@ impl TabRegistry {
         result
     }
 
-    /// V1.4-03: rebind the PTY's output channel to a fresh
-    /// `Channel<String>` without restarting the shell. Used when the
+    /// V1.4-03: rebind the PTY's output to a fresh
+    /// [`OutputSink`] without restarting the shell. Used when the
     /// JS-side xterm is destroyed and recreated for a renderer-category
     /// flip (image ↔ fast). Errors propagate from `PtyManager::rebind_channel`
     /// — `NotStarted` if the PTY never spawned, `Pty("processor task gone")`
     /// if the child has exited and the processor task already cleaned up.
     /// In either case the caller (frontend `attemptSpawn(entry, 'rebind')`)
     /// falls back to a fresh `pty_start`.
-    pub async fn rebind_channel(&self, tab: TabId, new_channel: Channel<String>) -> AppResult<()> {
+    pub async fn rebind_channel(
+        &self,
+        tab: TabId,
+        new_channel: Arc<dyn OutputSink>,
+    ) -> AppResult<()> {
         let manager = self
             .managers
             .get(&tab)

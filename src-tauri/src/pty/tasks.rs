@@ -5,14 +5,13 @@ use std::time::Duration;
 
 use base64::prelude::*;
 use portable_pty::Child;
-use tauri::ipc::Channel;
-use tauri::{AppHandle, Emitter};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use super::manager::ProcessorControl;
 use crate::harness::plugin::{ActivitySource, ActivityTuning};
+use crate::service::sink::{EventSink, EventSinkExt, OutputSink};
 use crate::processing::permission::{
     PatternKind, PatternTransition, PermissionDetector, PermissionPattern,
 };
@@ -147,7 +146,7 @@ pub fn spawn_reader(
 pub fn spawn_processor(
     tab: TabId,
     mut rx: mpsc::Receiver<Vec<u8>>,
-    channel: Channel<String>,
+    channel: Arc<dyn OutputSink>,
     mut control_rx: mpsc::Receiver<ProcessorControl>,
     cancel: CancellationToken,
     state_signals: mpsc::Sender<StateSignal>,
@@ -305,7 +304,7 @@ pub fn spawn_processor(
                                 e,
                                 ProcessingEvent::TerminalBytes(b) if !b.is_empty()
                             ));
-                            if dispatch_events(events, &channel).await.is_err() {
+                            if dispatch_events(events, channel.as_ref()).await.is_err() {
                                 break;
                             }
                             if saw_terminal_bytes && !is_shell {
@@ -335,7 +334,7 @@ pub fn spawn_processor(
                         e,
                         ProcessingEvent::TerminalBytes(b) if !b.is_empty()
                     ));
-                    if dispatch_events(events, &channel).await.is_err() {
+                    if dispatch_events(events, channel.as_ref()).await.is_err() {
                         break;
                     }
                     if saw_terminal_bytes && !is_shell {
@@ -538,7 +537,7 @@ fn run_permission_check(
 
 async fn dispatch_events(
     events: Vec<ProcessingEvent>,
-    channel: &Channel<String>,
+    channel: &dyn OutputSink,
 ) -> Result<(), ()> {
     for ev in events {
         match ev {
@@ -570,12 +569,12 @@ async fn dispatch_events(
     Ok(())
 }
 
-/// Waiter task. Blocks on child.wait(), emits `pty-exit` on the AppHandle, and
-/// cancels sibling tasks so the reader/processor unwind cleanly.
+/// Waiter task. Blocks on child.wait(), emits `pty-exit` through the event
+/// sink, and cancels sibling tasks so the reader/processor unwind cleanly.
 pub fn spawn_waiter(
     tab: TabId,
     mut child: Box<dyn Child + Send + Sync>,
-    app: AppHandle,
+    events: Arc<dyn EventSink>,
     cancel: CancellationToken,
     state_signals: mpsc::Sender<StateSignal>,
     // V39 review R-5: which start this waiter watches. It rides the exit signal
@@ -631,9 +630,9 @@ pub fn spawn_waiter(
             code,
             start_gen,
         });
-        if let Err(e) = app.emit(
+        if let Err(e) = events.emit(
             "pty-exit",
-            PtyExitPayload {
+            &PtyExitPayload {
                 tab: tab.clone(),
                 exit: exit_str,
             },

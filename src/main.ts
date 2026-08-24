@@ -130,6 +130,15 @@ if (!target) {
 //
 // Neither call rejects: a backend that cannot answer leaves the window
 // unhydrated, which renders defaults and writes nothing (see `uiState.ts`).
+//
+// And neither HANGS (V42 review, RV-3). Gating the mount on an unbounded file
+// read meant a stalled network share, a locked file or a backend wedged before
+// managed state came up produced a window that was revealed by
+// `showMainWindowOnce`'s 3 s net and then never mounted anything into it.
+// `hydrateUiState` carries its own 2 s budget and gives up on defaults; the
+// window it gives up on is write-INERT, which is what keeps guarantee 2 above
+// intact — an empty hidden-tab set can un-hide tabs for that session, but the
+// popover's write cannot persist the emptiness back over the user's choice.
 await hydrateUiState();
 hydrateHiddenTabs();
 

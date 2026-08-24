@@ -179,14 +179,61 @@ interface UiStateFile {
 /// been confirmed unnecessary. A failed import means read-only for the session
 /// — the values are still in `localStorage`, the marker is still absent, and
 /// the next launch retries the whole thing.
+///
+/// **It is also BOUNDED** (V42 review, RV-3). `mount(App)` waits on this, so
+/// an answer that never comes was a window that was never mounted — revealed
+/// (`showMainWindowOnce`'s 3 s safety net fires regardless) and permanently
+/// empty. A hung `ui_state_get` is not hypothetical: it is one blocking file
+/// read on a path that can be a stalled network share, a locked file, or a
+/// backend wedged before managed state came up. After
+/// [`HYDRATE_TIMEOUT_MS`] this gives up and lets the app mount on defaults —
+/// the module's stated posture, "loses persistence, never breaks the UI",
+/// applied to the one place that could still break it.
+///
+/// The abandoned read is not allowed to land later. A late answer would fill
+/// the cache under a mounted app (values snapping in a frame after paint) and,
+/// worse, could start the one-time import against a window that has already
+/// been rendering and writing defaults. So the timeout latches, and everything
+/// past an `await` in here checks it.
 export async function hydrateUiState(): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const budget = new Promise<'timeout'>((resolve) => {
+    timer = setTimeout(() => resolve('timeout'), HYDRATE_TIMEOUT_MS);
+  });
+
+  const outcome = await Promise.race([hydrateFromDisk(), budget]);
+  clearTimeout(timer);
+  if (outcome === 'timeout') {
+    // Latch first, so whatever `hydrateFromDisk` is suspended on cannot
+    // mutate the cache or arm writes when it finally resumes.
+    abandoned = true;
+    console.warn(
+      `ui_state_get did not answer within ${HYDRATE_TIMEOUT_MS} ms; ` +
+        'mounting on default view state, which will not be persisted this session',
+    );
+  }
+}
+
+/// How long `mount(App)` may wait on the one blocking read. Generous relative
+/// to a local file read (single-digit milliseconds) and well under
+/// `main.ts`'s 3 s reveal net, so a window that hits this still mounts before
+/// it becomes visible.
+const HYDRATE_TIMEOUT_MS = 2000;
+
+/// Set when [`hydrateUiState`] gave up waiting. One-way: a window that timed
+/// out stays on defaults and write-inert for its whole life rather than
+/// half-adopting a late answer.
+let abandoned = false;
+
+async function hydrateFromDisk(): Promise<'done'> {
   let file: UiStateFile;
   try {
     file = await invoke<UiStateFile>('ui_state_get');
   } catch (e) {
     console.error('ui_state_get failed; view state is defaults this session:', e);
-    return;
+    return 'done';
   }
+  if (abandoned) return 'done';
 
   const next: Record<string, string> = {};
   for (const [k, v] of Object.entries(file?.values ?? {})) {
@@ -200,9 +247,17 @@ export async function hydrateUiState(): Promise<void> {
   // Reads are live from here on regardless; only WRITES wait for the import.
   if (cache[IMPORT_MARKER_KEY] === '1') {
     hydrated = true; // no import owed — this project has been through one
-    return;
+    return 'done';
   }
-  hydrated = await runOneTimeImport();
+  const imported = await runOneTimeImport();
+  // Re-checked because the import is the long half. If the budget expired
+  // while it was in flight the app has already mounted, and arming writes for
+  // a window whose import may or may not have committed is exactly the
+  // half-story RV-4 is about — so it stays read-only and the next launch
+  // settles it. (The cache filled above is kept: those are the file's real
+  // values, and reading them is never the risk.)
+  if (!abandoned) hydrated = imported;
+  return 'done';
 }
 
 /// The saved value for `key`, or `null` when there is none. Synchronous by

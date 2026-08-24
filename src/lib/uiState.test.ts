@@ -118,6 +118,69 @@ describe('hydrateUiState', () => {
     expect(invoke.mock.calls.filter(([c]) => c === 'ui_state_set')).toHaveLength(0);
   });
 
+  test('a backend that never answers is given up on, not waited for', async () => {
+    // V42 review RV-3. `mount(App)` awaits this, so an unbounded read meant a
+    // revealed-but-never-mounted window (`showMainWindowOnce`'s 3 s net fires
+    // regardless of what this does).
+    vi.useFakeTimers();
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    invoke.mockReturnValue(new Promise(() => {})); // never settles
+    const m = await freshModule();
+
+    const hydrating = m.hydrateUiState();
+    await vi.advanceTimersByTimeAsync(2000);
+    await expect(hydrating).resolves.toBeUndefined();
+
+    expect(console.warn).toHaveBeenCalledTimes(1);
+    expect(m.getUiValue('anything')).toBeNull();
+  });
+
+  test('a window that timed out is WRITE-INERT, and a late answer cannot arm it', async () => {
+    // The cache may be missing everything the file holds, so a patch from
+    // this window would persist defaults over good state. The abandoned read
+    // must also not land afterwards and quietly re-arm writes under an app
+    // that has already painted.
+    vi.useFakeTimers();
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    let land: (v: unknown) => void = () => {};
+    invoke.mockImplementation((cmd: string) =>
+      cmd === 'ui_state_get'
+        ? new Promise((resolve) => {
+            land = resolve;
+          })
+        : Promise.resolve(),
+    );
+    const m = await freshModule();
+
+    const hydrating = m.hydrateUiState();
+    await vi.advanceTimersByTimeAsync(2000);
+    await hydrating;
+
+    // The read finally answers, well after the app mounted.
+    land(file({ 'cimp.view-section.v1.workbench': 'diff' }));
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(m.getUiValue('cimp.view-section.v1.workbench')).toBeNull();
+    invoke.mockReset();
+    invoke.mockResolvedValue(undefined);
+    m.setUiValue('k', 'v');
+    await m.flushUiState();
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+  test('a read that lands inside the budget is a normal hydrate', async () => {
+    // The guard must not cost anything on the path everyone actually takes.
+    vi.useFakeTimers();
+    const m = await freshModule();
+    invoke.mockResolvedValue(file({ 'cimp.view-section.v1.workbench': 'diff' }));
+
+    await m.hydrateUiState();
+    expect(m.getUiValue('cimp.view-section.v1.workbench')).toBe('diff');
+    // …and the timer it armed is cleared, so a fake-timer suite cannot be
+    // left with a pending handle.
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   test('a garbage file shape degrades to empty rather than throwing', async () => {
     invoke.mockResolvedValue({ version: 1 });
     const m = await freshModule();

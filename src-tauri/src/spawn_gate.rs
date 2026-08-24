@@ -488,33 +488,83 @@ mod tests {
         );
     }
 
+    /// **Files that build a `Command` and hand it to a named delegate to
+    /// spawn**, as `(spawning file, the delegate's file, the call spelling)`.
+    ///
+    /// V42 R27 extracted the confined-spawn walk out of the two agent seams
+    /// that ran it line for line, so the `Command` is now BUILT in
+    /// `audit/runner.rs` / `checks/mod.rs` and SPAWNED one hop away, in
+    /// `sandbox/confine.rs`. The routing is still real; only the textual proof
+    /// moved — and the answer to that is to prove the hop, never to exempt it.
+    ///
+    /// [`every_spawning_file_routes_through_the_spawn_gate`] accepts a caller
+    /// listed here only after checking that the DELEGATE itself names the gate
+    /// in production code. So the chain is verified end to end: a delegate that
+    /// stops being gated fails its callers too, and a row whose caller no longer
+    /// names the delegate is stale and fails on its own. One verified
+    /// indirection, not a hole.
+    ///
+    /// Keep this list short on purpose. Every entry is a file whose spawn a
+    /// reader cannot see by reading that file, which is a real cost — it is
+    /// worth paying only where the alternative is a security boundary
+    /// maintained in two copies.
+    const GATE_DELEGATES: &[(&str, &str, &str)] = &[
+        (
+            "audit/runner.rs",
+            "sandbox/confine.rs",
+            concat!("confine::", "run_confined"),
+        ),
+        (
+            "checks/mod.rs",
+            "sandbox/confine.rs",
+            concat!("confine::", "run_confined"),
+        ),
+    ];
+
+    /// Does `rel` name `needle` outside its `#[cfg(test)]` regions?
+    fn names_in_production(rel: &str, src: &str, needle: &'static str) -> bool {
+        !production_hits(rel, src, &[needle]).1.is_empty()
+    }
+
     /// **Every spawning file names the gate** (design invariant, module doc).
     ///
     /// The call-site scan below cannot see a spawn that has no `Command` —
     /// portable-pty's ConPTY spawn, the OS opener, the sandbox's bespoke
     /// `CreateProcessW`. This one can: whatever the mechanism, the file that
-    /// uses it has to mention `spawn_gate::`.
+    /// uses it has to mention `spawn_gate::` — or hand its `Command` to a
+    /// [`GATE_DELEGATES`] hop that does, which this test then verifies rather
+    /// than assumes.
     #[test]
     fn every_spawning_file_routes_through_the_spawn_gate() {
         let files = source_files();
         let spawning = spawning_files(&files);
+        let by_path: BTreeMap<&str, &String> =
+            files.iter().map(|(r, s)| (r.as_str(), s)).collect();
         let mut ungated = Vec::new();
+        let mut used_delegates: BTreeSet<&str> = BTreeSet::new();
         for (rel, src) in &spawning {
-            let code = code_of(rel, src);
-            let regions = test_regions(&code);
-            let gated = [concat!("spawn_", "gate::")].iter().any(|n| {
-                let mut from = 0usize;
-                while let Some(off) = code[from..].find(n) {
-                    let at = from + off;
-                    from = at + n.len();
-                    if !regions.iter().any(|(s, e)| at >= *s && at < *e) {
-                        return true;
-                    }
+            if names_in_production(rel, src, concat!("spawn_", "gate::")) {
+                continue;
+            }
+            // V42 R27 — a one-hop route counts, but only once the hop is
+            // checked. See [`GATE_DELEGATES`].
+            let hop = GATE_DELEGATES
+                .iter()
+                .find(|(caller, _, call)| *caller == rel.as_str() && names_in_production(rel, src, call));
+            match hop {
+                Some((caller, delegate, call)) => {
+                    let dsrc = by_path.get(delegate).unwrap_or_else(|| {
+                        panic!("{caller} routes `{call}` through `{delegate}`, which is not in the tree")
+                    });
+                    assert!(
+                        names_in_production(delegate, dsrc, concat!("spawn_", "gate::")),
+                        "{caller} builds a `Command` and hands it to `{delegate}` to spawn, but \
+                         `{delegate}` does not name the gate — the delegation proof is broken and \
+                         BOTH files are ungated now"
+                    );
+                    used_delegates.insert(*caller);
                 }
-                false
-            });
-            if !gated {
-                ungated.push(rel.clone());
+                None => ungated.push(rel.clone()),
             }
         }
         assert!(
@@ -522,6 +572,19 @@ mod tests {
             "these files spawn a process without ever naming `spawn_gate::` — route the spawn \
              through `spawn_gate::spawn_std` / `spawn_tokio`, or wrap the third-party spawn call \
              in `spawn_gate::with_shared(|| ..)`: {ungated:#?}"
+        );
+        // Self-check, same rule as the exemption lists: a delegation row whose
+        // caller now names the gate itself (or no longer spawns at all) has
+        // outlived its reason and must be DELETED, not left to rot.
+        let stale: Vec<&str> = GATE_DELEGATES
+            .iter()
+            .map(|(caller, _, _)| *caller)
+            .filter(|c| !used_delegates.contains(c))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "these GATE_DELEGATES rows no longer describe a delegating spawn site — delete \
+             them: {stale:#?}"
         );
         // …and the sandbox is the ONE exclusive holder, by name.
         let sandbox = spawning

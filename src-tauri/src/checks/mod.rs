@@ -24,7 +24,6 @@ pub mod plugin;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -1057,119 +1056,76 @@ async fn spawn_capture(
         }
     }
 
+    // What makes this a CHECK spawn: the platform shell, carrying the
+    // operator-authored command line, in the check's own working directory.
+    // Everything below the process-creation flags is the boundary walk, which is
+    // no longer written here — see the `run_confined` call.
     let mut command = shell_command(cmd);
-    command
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        // Kill the child if this future is dropped, so an aborted `run` call
-        // never leaks an orphaned checker process.
-        .kill_on_drop(true);
-    // Force the configured env onto the child (values redacted in `Debug`).
-    for (k, v) in env {
-        command.env(k, v);
-    }
-    // Don't flash a console window for each spawned checker on Windows —
-    // same CREATE_NO_WINDOW convention as every other spawned subprocess
-    // (offload's `llama-server`, MCP host, `run_command`).
-    #[cfg(windows)]
-    command.creation_flags(crate::procutil::CREATE_NO_WINDOW);
-    // V33 C3: Unix-only — give the shell its own process group so the timeout
-    // path below can `killpg` the whole thing. A check command is a shell
-    // string, so the process cImp holds is `sh`, and everything the check
-    // actually runs is its child; without the group, killing `sh` leaves the
-    // real work running and holding the pipe write ends.
-    crate::procutil::own_process_group(&mut command);
+    command.current_dir(cwd);
 
-    // V33 Phase D — on Linux this IS the sandboxed path: Landlock is applied to
-    // the shell command built above rather than through a second spawn
-    // mechanism. Locked decision L4 still holds, and it is `apply` that
-    // enforces it — the confined shell gets the C2 minimal base, then
-    // `CheckDef::env`, then the sandbox's TMPDIR/HOME redirections last,
-    // replacing the inherit-and-force environment the plain path keeps. An
-    // error REFUSES the check rather than running it unconfined (decision D3).
-    #[cfg(target_os = "linux")]
-    if let crate::sandbox::Plan::Sandboxed(prepared) = &plan {
-        prepared
-            .apply(
-                &mut command,
-                &base_env,
-                env.iter().map(|(k, v)| (k.as_str(), v.as_str())),
-            )
-            .map_err(AppError::Checks)?;
-    }
+    // V42 R27 — **the boundary walk is shared with the audit seam.** The process
+    // group (which this seam needs most: the process cImp holds is `sh`, and
+    // everything the check actually runs is its child), the Landlock hook, the
+    // spawn gate, the reaper guard, the confirmation row, the two capped pumps,
+    // the whole-tree kill and the Linux denial row all live in
+    // [`crate::sandbox::confine`] now. The two seams ran them line for line, and
+    // a security boundary maintained in two copies is a boundary that gets fixed
+    // in one of them.
+    //
+    // What this seam still decides, and hands over: its 1 MiB cap (a checker's
+    // output is diagnostics to parse, not a report to transport), NO cancel
+    // token (a check run is bounded by its own timeout and by the caller
+    // dropping the future), the row identity — the CONFIGURED NAME as subject,
+    // never `sh`, for the reason `row_subject` documents — and the mapping back
+    // onto this function's `(exit_code, …, timed_out)` contract below.
+    let run = crate::sandbox::confine::run_confined(
+        &mut command,
+        crate::sandbox::confine::Confined {
+            plan: &plan,
+            seam: crate::sandbox::SEAM_RUN_CHECK,
+            root,
+            subject: &subject,
+            argv: &[cmd.to_string()],
+            sandbox,
+            base_env: &base_env,
+            env,
+            cap: MAX_OUTPUT_BYTES,
+            timeout,
+            cancel: None,
+        },
+    )
+    .await;
 
-    // Through the spawn gate like every other cImp spawn — see `spawn_gate`.
-    let mut child = crate::spawn_gate::spawn_tokio(&mut command)
-        .map_err(|e| AppError::Checks(format!("failed to spawn check `{cmd}`: {e}")))?;
-    // Backstop: reap this checker subprocess via the kill-on-job-close job if
-    // cImp dies hard before `kill_on_drop` can fire.
-    crate::process_guard::guard_child(&child);
-    // The confirmation row, once per CHECK per session — the subject is the
-    // configured name, never `sh`, for the reason `row_subject` documents.
-    #[cfg(target_os = "linux")]
-    if matches!(&plan, crate::sandbox::Plan::Sandboxed(_)) {
-        crate::sandbox::record_sandboxed(crate::sandbox::SEAM_RUN_CHECK, root, &subject, sandbox);
-    }
-
-    // Drain stdout/stderr on their own tasks so the buffers survive a timeout
-    // on `child.wait()` below — killing the child for a timeout only closes
-    // its pipes (which cleanly EOFs these readers), it doesn't discard what
-    // was already captured.
-    let out_task = tokio::spawn(crate::procutil::read_capped(
-        child.stdout.take(),
-        MAX_OUTPUT_BYTES,
-    ));
-    let err_task = tokio::spawn(crate::procutil::read_capped(
-        child.stderr.take(),
-        MAX_OUTPUT_BYTES,
-    ));
-
-    let (exit_code, timed_out) = match tokio::time::timeout(timeout, child.wait()).await {
-            Ok(Ok(status)) => (status.code(), false),
-            Ok(Err(e)) => return Err(AppError::Checks(format!("check `{cmd}` failed: {e}"))),
-            Err(_) => {
-                // Timed out: kill the whole tree (kill_on_drop is a backstop, not a
-                // guarantee the process is gone by the time we read the buffers
-                // below — and a checker's own children must not survive it) and reap.
-                crate::procutil::kill_tree(&mut child).await;
-                (None, true)
-            }
-        };
-
-    // Bounded: a checker grandchild still holding a pipe write end must not
-    // hang the check run forever (truncation is irrelevant here — parsers
-    // treat output as best-effort text).
-    let (stdout, _) = crate::procutil::drain_capture(out_task).await;
-    let (stderr, _) = crate::procutil::drain_capture(err_task).await;
-
-    // V33 Phase D — the Linux denial row, minted where the raw exit code and
-    // stderr still exist (a nonzero exit is data to this function's callers).
-    // Not for a timeout: a hang matches no access-denial signature, and
-    // guessing would put noise in the one lane that is supposed to mean
-    // something.
-    #[cfg(target_os = "linux")]
-    {
-        let confined_and_finished =
-            !timed_out && matches!(&plan, crate::sandbox::Plan::Sandboxed(_));
-        let class = confined_and_finished
-            .then(|| crate::sandbox::denial_signature(exit_code, &stderr, sandbox.allow_network))
-            .flatten();
-        if let Some(class) = class {
-            crate::sandbox::record_denial(
-                crate::sandbox::SEAM_RUN_CHECK,
-                root,
-                &subject,
-                &[cmd.to_string()],
-                exit_code,
-                &stderr,
-                class,
-                sandbox,
-            );
+    use crate::sandbox::confine::ConfinedOutcome;
+    // The plain path reports a timeout with NO exit code — the shape
+    // `spawn_capture_sandboxed` matches too, so the two produce the same
+    // `CheckReport`.
+    let (exit_code, timed_out) = match run.outcome {
+        ConfinedOutcome::Exited(code) => (code, false),
+        ConfinedOutcome::TimedOut => (None, true),
+        // Unreachable: this seam passes `cancel: None`, so the boundary has no
+        // cancel arm to resolve. Reported as a timeout rather than silently as a
+        // clean exit, because "the child was stopped and produced no code" is
+        // what actually happened.
+        ConfinedOutcome::Cancelled => (None, true),
+        // The boundary refused before the spawn (Landlock could not be
+        // installed): decision D3 says refuse, never run unconfined.
+        ConfinedOutcome::ApplyRefused(e) => return Err(AppError::Checks(e)),
+        ConfinedOutcome::SpawnFailed(e) => {
+            return Err(AppError::Checks(format!(
+                "failed to spawn check `{cmd}`: {e}"
+            )))
         }
-    }
-    Ok((exit_code, stdout, stderr, timed_out))
+        // V42 R27: the wait itself failed. The error the caller sees is
+        // unchanged; what changed is that the pumps are drained and the tree
+        // killed BEFORE it is returned, instead of two reader tasks being
+        // detached to run to EOF behind a check that already errored out.
+        ConfinedOutcome::WaitFailed(e) => {
+            return Err(AppError::Checks(format!("check `{cmd}` failed: {e}")))
+        }
+    };
+    // Truncation is irrelevant here — parsers treat output as best-effort text.
+    Ok((exit_code, run.stdout, run.stderr, timed_out))
 }
 
 /// Wrap `cmd` (a full command line, e.g. `"cargo check --message-format=json"`)

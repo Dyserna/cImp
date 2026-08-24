@@ -44,10 +44,6 @@
     // both restart-hint shapes below.
     spawnBakedInjectionL2,
     spawnBakedTabOverrides,
-    // V40 Phase B: the per-harness settings map. `harnessRow` answers the
-    // declared defaults for a key the file has never carried, so no control
-    // here has to know whether a harness has ever been saved.
-    harnessRow,
   } from './lib/settings/types';
   import {
     harnesses,
@@ -99,24 +95,19 @@
   import HarnessSection from './lib/settings/sections/HarnessSection.svelte';
   import GraphSection from './lib/settings/sections/GraphSection.svelte';
   import ShortcutsSection from './lib/settings/sections/ShortcutsSection.svelte';
+  import CodeAuditSection from './lib/settings/sections/CodeAuditSection.svelte';
   import BottomBarSection from './lib/settings/sections/BottomBarSection.svelte';
   import AvatarSection from './lib/settings/sections/AvatarSection.svelte';
   import AdvancedSection from './lib/settings/sections/AdvancedSection.svelte';
   import WorkbenchSection from './lib/settings/sections/WorkbenchSection.svelte';
-  import NumberField from './lib/settings/NumberField.svelte';
-  import Toggle from './lib/settings/Toggle.svelte';
   import TuiTitleBar from './lib/TuiTitleBar.svelte';
   // V37 Phase D: the MCP-servers section's body (contract C8), now inside the
   // section component #129 (c) extracted. The registry type stays here because
   // the two persistence callbacks below are still this window's.
   import type { McpRegistry } from './lib/settings/mcpEditor';
-  import {
-    AUDIT_PLUGIN_KEY,
-    setToolEnabled,
-    type PluginSet,
-  } from './lib/settings/toolPlugins';
+  import { AUDIT_PLUGIN_KEY, type PluginSet } from './lib/settings/toolPlugins';
   import { auditRefreshCensus } from './lib/codeAudit/ipc';
-  import { censusIsEmpty, qualityAutoSelection } from './lib/codeAudit/logic';
+  import { qualityAutoSelection } from './lib/codeAudit/logic';
   import type { AuditCensus } from './lib/codeAudit/types';
   import { themeRegistry } from './lib/themes/registry';
 
@@ -535,9 +526,10 @@
       stopHarnessPoll();
     }
   }
-  // Sidebar nav: which group is visible. The template gates each <section>
-  // on this so only one group renders at a time. Default lands on 'theme'
-  // (Appearance sits at the top of the nav order).
+  // Sidebar nav: which group is visible. Since #129 (c) the template is one
+  // chain of section COMPONENTS gated on this, so only one group is mounted at
+  // a time. Default lands on 'theme' (Appearance sits at the top of the nav
+  // order).
   type SectionId =
     | 'audio'
     | 'stt'
@@ -1100,21 +1092,6 @@
   // scan.
   let auditCensus = $state<AuditCensus>({ extensions: [], markers: [] });
 
-  // The "Auto-select for this project" button: back to automatic mode, and —
-  // when a census is already known — apply the project-language selection at
-  // once. The rule is `codeAudit/logic`'s mirror of the backend's, and the
-  // flags land in the tool-plugins container where the built-in scanners'
-  // state lives.
-  function applyQualityAutoSelect(): void {
-    patch((s) => {
-      s.code_audit.quality_auto_select = true;
-      if (censusIsEmpty(auditCensus)) return;
-      for (const { id, enabled } of qualityAutoSelection(auditCensus)) {
-        setToolEnabled(s, AUDIT_PLUGIN_KEY, id, enabled);
-      }
-    });
-  }
-
   // A manual edit of a BUILT-IN QUALITY tool's checkbox switches auto-selection
   // to manual mode, so the choice sticks across census refreshes instead of
   // being re-derived at the next scan. Only for that population: a user
@@ -1266,101 +1243,13 @@
       {:else if activeSection === 'checks'}
         <ChecksSection {snapshot} {patch} {harnessNamesProse} />
       {:else if activeSection === 'code-audit'}
-        <section>
-          <h2>Code Audit</h2>
-          <small class="hint top">
-            Aggregated security and quality scanning. cImp runs external
-            scanners against the project root and merges their findings into one
-            table. Nothing is bundled — each scanner resolves from the
-            <code>ebin\</code> drop-in folder first, then your PATH.
-            <strong>The scanners themselves are configured in
-            <button type="button" class="linkish" onclick={() => (activeSection = 'tool-plugins')}
-              >Tool Plugins</button
-            ></strong>: they are a plugin cImp ships, so they are enabled, pointed
-            at a binary and given their extra arguments in the same place as any
-            tool you drop in yourself. What is here is the feature.
-          </small>
-
-          <Toggle
-            label="Enable Code Audit (Tools → Code audit)"
-            checked={snapshot.code_audit.enabled}
-            onchange={(next) => patch((s) => (s.code_audit.enabled = next))}
-          />
-
-          <h3>Scan settings</h3>
-          <NumberField
-            label="Per-tool timeout (seconds)"
-            min="1"
-            value={snapshot.code_audit.timeout_secs}
-            event="input"
-            onchange={(next) =>
-              patch((s) => {
-                const v = Number(next);
-                if (Number.isFinite(v) && v >= 1)
-                  s.code_audit.timeout_secs = Math.floor(v);
-              })}
-          />
-
-          <h3>Quality tool selection</h3>
-          <small class="hint">
-            The quality scanners are language-gated: one only runs when the
-            project contains files it applies to. In <strong>automatic</strong>
-            mode cImp keeps their checkboxes following the project's languages
-            (the two that run a real build or need the network stay opt-in);
-            editing one of their checkboxes in Tool Plugins switches to manual so
-            your choice sticks. Security scanners are never touched.
-          </small>
-          {#if snapshot.code_audit.quality_auto_select}
-            <small class="hint audit-auto-note">
-              Selection: <strong>automatic</strong> — follows this project's
-              languages.
-            </small>
-          {:else}
-            <div class="audit-auto-row">
-              <button type="button" class="secondary" onclick={applyQualityAutoSelect}>
-                Auto-select for this project
-              </button>
-              <small class="hint">
-                re-select the scanners matching this project's languages and keep
-                them in sync automatically
-              </small>
-            </div>
-          {/if}
-
-          <h3>MCP exposure</h3>
-          <small class="hint">
-            Advertise the <code>cimp-code-audit</code> MCP server
-            (<code>security_audit</code> / <code>quality_audit</code>, native
-            worker tools for offload) so AI consumers can trigger audits
-            themselves. Each requires Code Audit enabled above. The server set
-            is injected when an AI tab starts — after enabling Code Audit or
-            flipping an exposure here, restart the {harnessNames} tab
-            (Tabs → Restart) for the tools to appear.
-          </small>
-<!-- V40 Phase B: one box per REGISTERED harness. It was a hand-written
-               two-harness pair, so Code Audit would have been unreachable from
-               a third harness until someone edited this file. -->
-          {#each $harnesses as h (h.id)}
-            <Toggle
-              checked={harnessRow(snapshot, h.id).expose_code_audit}
-              onchange={(next) =>
-                patch((s) => {
-                  const on = next;
-                  s.harness = {
-                    ...(s.harness ?? {}),
-                    [h.id]: { ...harnessRow(s, h.id), expose_code_audit: on },
-                  };
-                })}
-            >
-              Expose to {h.label}
-            </Toggle>
-          {/each}
-          <Toggle
-            label="Expose to offload worker"
-            checked={snapshot.code_audit.expose_offload}
-            onchange={(next) => patch((s) => (s.code_audit.expose_offload = next))}
-          />
-        </section>
+        <CodeAuditSection
+          {snapshot}
+          {patch}
+          {auditCensus}
+          {harnessNames}
+          onnavigate={(s) => (activeSection = s as SectionId)}
+        />
       {:else if activeSection === 'tool-plugins'}
         <ToolPluginsSection
           {snapshot}
@@ -1481,20 +1370,6 @@
   }
   /* The first h3 in a section sits right under the h2 — skip the divider
      so we don't double-up with the section's top edge. */
-  /* Quality auto-selection: the mode note (automatic) / re-apply row (manual). */
-  small.hint.audit-auto-note {
-    display: block;
-    margin: var(--space-2) 0 0;
-  }
-  .audit-auto-row {
-    display: flex;
-    align-items: center;
-    gap: var(--space-3);
-    margin-top: var(--space-2);
-  }
-  .audit-auto-row small.hint {
-    margin: 0;
-  }
 
 
   /* Narrow window: collapse sidebar to a horizontal strip on top so the

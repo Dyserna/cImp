@@ -1,4 +1,3 @@
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use tauri::ipc::Channel;
@@ -22,7 +21,7 @@ use crate::service::offload::{OffloadServerUseCases, OffloadServiceUseCases};
 use crate::service::usage::{AdvisorRules, AdvisorSnapshot, UsageService};
 use crate::service::workbench::WorkbenchUseCases;
 use crate::settings::{AiToolTabConfig, Settings, TabConfig};
-use crate::state::{ReadOnlySource, StateSignal, TabId, TabKind};
+use crate::state::{StateSignal, TabId, TabKind};
 
 /// V1.4-04 D: `pty_start` returns the persisted-scrollback bytes from the
 /// previous session (if any) — see [`PtyService::start`] for the whole
@@ -59,6 +58,9 @@ fn pty_service<'a>(state: &'a AppState) -> PtyService<'a> {
         &state.tts_segments,
         &state.launch.cwd,
         &state.launch.extra_args,
+        &state.read_only,
+        &state.input_lengths,
+        &state.state_signals,
     )
 }
 
@@ -107,287 +109,38 @@ pub async fn pty_rebind_channel(
 /// efficiency. Returns `NotStarted` if the tab has no live PTY.
 #[tauri::command]
 pub async fn pty_get_scrollback(state: State<'_, AppState>, tab: TabId) -> AppResult<Vec<u8>> {
-    let registry = state.tabs.lock().await;
-    registry.scrollback_snapshot(tab).await
+    pty_service(&state).scrollback(tab).await
 }
 
-#[tauri::command]
-pub async fn pty_write(state: State<'_, AppState>, tab: TabId, input: String) -> AppResult<()> {
-    // The reserved dashboard tabs are read-only — app-rendered with no PTY
-    // of their own — so swallow any write. Defense-in-depth behind the
-    // frontend's read-only guard; one shared predicate so a new reserved
-    // dashboard can't miss this swallow.
-    if tab.is_reserved_dashboard() {
-        return Ok(());
-    }
+/// Whether a write submits the turn. Re-exported from
+/// [`service::pty`](crate::service::pty) so the delegation engine keeps naming
+/// it beside the pipeline it calls.
+pub(crate) use crate::service::pty::Submit;
 
-    // V39 Phase A (locked decision 4): the read-only refusal. It sits here,
-    // ahead of EVERY side effect below — the TTS-marker registration, the
-    // typed-input accumulator, the keystroke/submit state signals — because a
-    // refused keystroke must leave no trace: an input that never reached the
-    // PTY must not have moved the avatar to Listening or armed a TTS-echo
-    // suppression for text the model never saw. This is the enforcement point;
-    // the xterm widget's own gate is a courtesy that keeps the round trip out
-    // of the common case, and is not what makes the lock hold.
-    //
-    // **Terminal protocol replies are exempt.** xterm answers the *program's*
-    // own queries (cursor-position reports, device attributes, focus in/out)
-    // on this same channel; they are the terminal talking to the TUI, not the
-    // user typing, and refusing them wedges a harness that is waiting for one
-    // — precisely while a delegation is driving it. Same predicate the
-    // keystroke bookkeeping below uses, so the two can't disagree about what
-    // counts as user input.
-    if let Some(source) = state.read_only.read_only(&tab) {
-        // The driver's *name* (not its id) is what the refusal says, and names
-        // live in the tab registry. Looked up only on the `Driven` branch so a
-        // plain user lock costs no registry lock.
-        let driver_name = match &source {
-            ReadOnlySource::User => None,
-            ReadOnlySource::Driven { by } => {
-                let registry = state.tabs.lock().await;
-                registry.name_of(by)
-            }
-        };
-        if let Some(reason) = read_only_refusal(&source, &input, driver_name.as_deref()) {
-            tracing::debug!(?tab, %reason, "pty_write refused: tab is read-only");
-            return Err(AppError::ReadOnly {
-                tab: tab.as_str().to_string(),
-                reason,
-            });
-        }
-    }
-
-    // The user's own keystrokes: whether this write submits is read off the
-    // bytes, exactly as it always was.
-    let submit = Submit::from_input(&input);
-    write_through_pipeline(&state, &tab, input, submit).await
-}
-
-/// **Does this write submit the turn?** (V39 review L-1.)
+/// The delegation engine's door into the input pipeline.
 ///
-/// It used to be inferred from the bytes in every case, and for a keyboard that
-/// is right — a person's Enter IS the submit. For the delegation engine it is
-/// not: the engine's PASTE contains the request's own newlines (a multi-line
-/// request is one bracketed paste), so `contains_enter` fired on the paste, one
-/// write EARLY. The `UserSubmit` that went out then cleared the worker's prompt
-/// mirror and zeroed its input counter for a turn that had not been submitted
-/// yet — while the engine's real submit, a lone CR a moment later, is what
-/// actually starts it.
-///
-/// So the caller says. `pty_write` keeps the old inference; the engine passes
-/// `No` for the paste and `Yes` for the submit.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum Submit {
-    Yes,
-    No,
-}
-
-impl Submit {
-    /// The keyboard's rule: any CR or LF in the bytes submits.
-    pub(crate) fn from_input(input: &str) -> Self {
-        if contains_enter(input) {
-            Submit::Yes
-        } else {
-            Submit::No
-        }
-    }
-
-    fn is_yes(self) -> bool {
-        self == Submit::Yes
-    }
-}
-
-/// **The one input pipeline** (V39 cross-module invariant): every byte that
-/// reaches a tab's PTY passes through here — the TTS-marker pre-registration,
-/// the typed-input accumulator, the keystroke/submit state signals, and the
-/// registry write, in that order and under one registry lock.
-///
-/// Split out of [`pty_write`] in V39 Phase B so the delegation engine can reuse
-/// it. What the engine skips is **only** the read-only check above, and only
-/// because that check is about the *user's keyboard*: the engine holds the
-/// `Driven` lock itself, so entering through `pty_write` would have it refuse
-/// its own write. Everything else it must not skip — a delegated turn that
-/// bypassed the TTS-marker registration would have the worker's echo of the
-/// task spoken aloud, and one that bypassed `UserSubmit` would leave the
-/// avatar in the wrong state for a turn that really did start.
-///
-/// Takes `&AppState` rather than `State<'_, AppState>` so both a Tauri command
-/// and a plain async caller reach the same body.
+/// Kept at this boundary, and kept taking `&AppState`, on purpose: the engine
+/// resolves its own state through `AppHandle::state::<AppState>()`, which is
+/// V42 Phase A2's cluster to unpick, not A1's. One line here means the engine's
+/// two call sites — and the source-scanned property that they disagree about
+/// `Submit` — are untouched by the mechanical wrap. When A2 injects the
+/// engine's handles, this adapter goes with it.
 pub(crate) async fn write_through_pipeline(
     state: &AppState,
     tab: &TabId,
     input: String,
-    // V39 review L-1: whether this write SUBMITS. See [`Submit`] — the engine's
-    // paste carries newlines, and inferring it from the bytes fired
-    // `UserSubmit` one write early.
     submit: Submit,
 ) -> AppResult<()> {
-    let tab = tab.clone();
-
-    // Take the registry lock once at the top so the keystroke / submit
-    // counter updates and the final write run inside the same critical
-    // section. Pre-V0.6 the counter Arc was cloned out under the read
-    // lock and used after dropping it, racing with `close_tab` which
-    // removes the counter. Holding the lock end-to-end eliminates that
-    // window: if the tab was just closed, `registry.write` errors out
-    // cleanly with `unknown tab` and no half-applied state remains.
-    let registry = state.tabs.lock().await;
-
-    let existing = {
-        // The counter is only the idle-Listening heuristic; a poisoned lock
-        // must NOT gate input delivery, or a prior panic would silently drop
-        // all keystrokes for the rest of the session. Recover the inner value
-        // (matches the poison-recovery pattern used in `tts_stop`/`mutate`).
-        let map = state
-            .input_lengths
-            .read()
-            .unwrap_or_else(|e| e.into_inner());
-        map.get(&tab).cloned()
-    };
-    let len_counter = match existing {
-        Some(c) => c,
-        None => {
-            // The state manager may not have drained `TabAdded` yet — there's
-            // no happens-before between `create_*_tab` returning and the
-            // manager inserting this tab's counter. A missing counter must NOT
-            // gate input delivery (it's only the idle-Listening heuristic), or
-            // the very first keystrokes into a just-created tab are silently
-            // dropped. Lazily insert one; the manager's own insert uses
-            // `or_insert_with`, so it won't clobber this.
-            let mut map = state
-                .input_lengths
-                .write()
-                .unwrap_or_else(|e| e.into_inner());
-            map.entry(tab.clone())
-                .or_insert_with(|| std::sync::Arc::new(std::sync::atomic::AtomicI32::new(0)))
-                .clone()
-        }
-    };
-
-    if !is_automatic_terminal_response(&input) {
-        if submit.is_yes() {
-            len_counter.store(0, Ordering::Relaxed);
-            let _ = state
-                .state_signals
-                .try_send(StateSignal::UserSubmit { tab: tab.clone() });
-        } else {
-            apply_input_delta(&input, &len_counter);
-            let _ = state
-                .state_signals
-                .try_send(StateSignal::UserKeystroke { tab: tab.clone() });
-            // Note: typing does NOT interrupt TTS. By design, in-flight
-            // speech is only stopped by Esc (`tts_stop`) or by switching
-            // tabs (so the previous tab's audio doesn't bleed into the new
-            // view). Keystrokes still drive avatar state via UserKeystroke.
-        }
-    }
-
-    registry.write(tab, input.into_bytes()).await
+    pty_service(state).write_through(tab, input, submit).await
 }
 
-/// V39 Phase A: the read-only decision for one write, as a value.
-///
-/// `Some(reason)` refuses; `None` lets the write through. Two rules, and the
-/// second is the one worth pinning in a test:
-///
-/// 1. A locked tab refuses the user's input, naming the source.
-/// 2. **Terminal protocol replies always pass.** xterm answers the running
-///    program's own queries — cursor-position reports, device attributes,
-///    focus in/out — over the same channel as keystrokes. Those are the
-///    terminal talking to the TUI, not a person typing; a harness that asked
-///    for the cursor position and never gets an answer can wedge, and it would
-///    wedge exactly while a delegation is driving it. The same predicate the
-///    keystroke bookkeeping uses decides this, so the two cannot disagree
-///    about what counts as user input.
-fn read_only_refusal(
-    source: &ReadOnlySource,
-    input: &str,
-    driver_name: Option<&str>,
-) -> Option<String> {
-    if read_only_exempt(input) {
-        return None;
-    }
-    Some(source.reason(driver_name))
-}
-
-/// Everything the read-only lock lets through. **Only** `read_only_refusal`
-/// asks this — `is_automatic_terminal_response` keeps its own, unchanged
-/// meaning for the keystroke/submit bookkeeping, which must go on treating a
-/// wheel report as the non-typing event it always was.
-///
-/// Two exemptions, for two different reasons:
-///
-/// 1. The terminal answering the running program (see `read_only_refusal`).
-/// 2. **Wheel reports: scrolling is reading.** A read-only tab exists so the
-///    user can watch it, and in an alt-screen TUI the wheel is not local
-///    scrollback — it is forwarded to the program as a mouse report, so a
-///    swallowed wheel means a tab the user is allowed to watch but not scroll.
-///    Mouse *clicks* stay refused: a click activates a control (choosing a
-///    permission option, for one), which is exactly the input the lock is for.
-fn read_only_exempt(input: &str) -> bool {
-    is_automatic_terminal_response(input) || is_mouse_wheel(input)
-}
-
-/// Whether `input` is *nothing but* mouse-wheel reports.
-///
-/// Whole-input, and repeat-until-exhausted rather than "starts with": a chunk
-/// that is a wheel report followed by typed text is refused, so the exemption
-/// cannot be used to smuggle a keystroke past the lock. Repeats are allowed
-/// because a fast scroll can arrive as several reports in one chunk, and
-/// letting only the first through would drop the rest silently.
-fn is_mouse_wheel(input: &str) -> bool {
-    let mut rest = input;
-    let mut seen = false;
-    while !rest.is_empty() {
-        match take_wheel_report(rest) {
-            Some(next) => {
-                seen = true;
-                rest = next;
-            }
-            None => return false,
-        }
-    }
-    seen
-}
-
-/// Consume one leading wheel report, returning what follows it.
-///
-/// Handles both encodings xterm can emit: SGR (`ESC [ < Cb ; Cx ; Cy M`) and
-/// the legacy X10/normal one (`ESC [ M` + three bytes, each offset by 32 —
-/// read as `char`s so xterm's UTF-8 extended coordinates don't split).
-///
-/// SGR wheel reports end in `M` only; xterm emits no release for a wheel, so a
-/// `…m` form is not recognized and is refused like any other click release.
-fn take_wheel_report(s: &str) -> Option<&str> {
-    if let Some(body) = s.strip_prefix("\x1b[<") {
-        let end = body.find('M')?;
-        let (params, after) = body.split_at(end);
-        let rest = &after['M'.len_utf8()..];
-        let mut parts = params.split(';');
-        let cb: u32 = parts.next()?.parse().ok()?;
-        let _x: u32 = parts.next()?.parse().ok()?;
-        let _y: u32 = parts.next()?.parse().ok()?;
-        if parts.next().is_some() {
-            return None;
-        }
-        return is_wheel_button(cb).then_some(rest);
-    }
-    if let Some(body) = s.strip_prefix("\x1b[M") {
-        let mut chars = body.chars();
-        let cb = (chars.next()? as u32).checked_sub(32)?;
-        let _x = chars.next()?;
-        let _y = chars.next()?;
-        return is_wheel_button(cb).then_some(chars.as_str());
-    }
-    None
-}
-
-/// The wheel bit is 64 (buttons 64/65 vertical, 66/67 horizontal). Bit 32 is
-/// motion, which a wheel never sets and a drag always does, so it must be
-/// clear. Modifier bits (shift 4, meta 8, ctrl 16) may be set — ctrl+wheel is
-/// still a wheel. Nothing at or above 128 is a mouse button.
-fn is_wheel_button(cb: u32) -> bool {
-    cb < 128 && (cb & 0b110_0000) == 0b100_0000
+/// Deliver one chunk of keyboard input to a tab's PTY. See
+/// [`PtyService::write`] for the read-only enforcement point and the terminal-
+/// protocol exemption, and [`PtyService::write_through`] for the pipeline every
+/// byte passes through.
+#[tauri::command]
+pub async fn pty_write(state: State<'_, AppState>, tab: TabId, input: String) -> AppResult<()> {
+    pty_service(&state).write(tab, input).await
 }
 
 /// V39 Phase A: set or clear a tab's **user** read-only lock (locked
@@ -684,44 +437,6 @@ pub async fn delegation_statuses() -> AppResult<Vec<(String, crate::delegation::
     Ok(crate::delegation::statuses())
 }
 
-fn contains_enter(input: &str) -> bool {
-    input.chars().any(|c| c == '\r' || c == '\n')
-}
-
-fn apply_input_delta(input: &str, length: &std::sync::atomic::AtomicI32) {
-    if input.starts_with('\x1b') {
-        return;
-    }
-    let mut current = length.load(Ordering::Relaxed);
-    for c in input.chars() {
-        match c {
-            '\x08' | '\x7f' => current = (current - 1).max(0),
-            '\x15' | '\x0b' => current = 0,
-            '\x17' => current = (current - 4).max(0),
-            c if c.is_control() => {}
-            _ => current += 1,
-        }
-    }
-    length.store(current, Ordering::Relaxed);
-}
-
-fn is_automatic_terminal_response(input: &str) -> bool {
-    if input == "\x1b[I" || input == "\x1b[O" {
-        return true;
-    }
-    let bytes = input.as_bytes();
-    if bytes.len() < 3 || bytes[0] != 0x1b || bytes[1] != b'[' {
-        return false;
-    }
-    let last = bytes[bytes.len() - 1];
-    if !matches!(last, b'R' | b'c' | b'n') {
-        return false;
-    }
-    bytes[2..bytes.len() - 1]
-        .iter()
-        .all(|&b| b.is_ascii_digit() || b == b';' || b == b'?')
-}
-
 /// Build the speech use cases over this app's handles. One place, so the five
 /// TTS commands cannot drift in what they hand them.
 fn audio_service(state: &AppState) -> AudioService<'_> {
@@ -880,8 +595,7 @@ pub async fn pty_resize(
     rows: u16,
     cols: u16,
 ) -> AppResult<()> {
-    let registry = state.tabs.lock().await;
-    registry.resize(tab, rows, cols).await
+    pty_service(&state).resize(tab, rows, cols).await
 }
 
 #[tauri::command]
@@ -2593,9 +2307,6 @@ pub async fn restart_shell_tab(app: AppHandle, tab: TabId) -> AppResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::is_automatic_terminal_response as auto_reply;
-    use super::read_only_refusal;
-    use crate::state::{ReadOnlySource, TabId};
 
     /// **The facade knobs are a NARROW write** (V39 review M-10).
     ///
@@ -2656,224 +2367,5 @@ mod tests {
         });
         assert_eq!(kept.name.as_deref(), Some("lan-worker-2"));
         assert_eq!(kept.declared_context, Some(64_000));
-    }
-
-    /// **The keyboard's submit rule is unchanged, and it is the wrong rule for
-    /// a paste** (V39 review L-1).
-    ///
-    /// A person's Enter IS the submit, so `pty_write` still reads it off the
-    /// bytes. A delegation's paste carries the request's own newlines, and
-    /// under the same rule it read as a submit one write early — which is why
-    /// the engine STATES it instead of letting it be inferred.
-    #[test]
-    fn a_submit_is_inferred_for_the_keyboard_and_stated_by_the_engine() {
-        use super::Submit;
-        assert_eq!(Submit::from_input("hello"), Submit::No);
-        assert_eq!(Submit::from_input(""), Submit::No);
-        assert_eq!(Submit::from_input("\r"), Submit::Yes);
-        assert_eq!(Submit::from_input("hello\n"), Submit::Yes);
-        // The trap, spelled out: a bracketed paste of a two-line request looks
-        // exactly like a submit to the byte rule.
-        let paste = "\u{1b}[200~line one\nline two\u{1b}[201~";
-        assert_eq!(
-            Submit::from_input(paste),
-            Submit::Yes,
-            "the byte rule cannot tell a pasted newline from a pressed Enter"
-        );
-    }
-
-    /// **V39 Phase A: a refusal always names why.** The frontend shows this
-    /// string verbatim in a toast, so an empty or generic one leaves the user
-    /// staring at a tab that has silently stopped accepting keys.
-    #[test]
-    fn a_read_only_write_is_refused_with_the_reason_named() {
-        assert_eq!(
-            read_only_refusal(&ReadOnlySource::User, "hello", None).as_deref(),
-            Some("read-only (user)")
-        );
-        assert_eq!(
-            read_only_refusal(
-                &ReadOnlySource::Driven {
-                    by: TabId::from_str("opencode")
-                },
-                "hello",
-                Some("api-work"),
-            )
-            .as_deref(),
-            Some("driven by api-work")
-        );
-    }
-
-    /// **The lock is on the user's keyboard, not on the terminal protocol.**
-    /// A TUI that queried the cursor position must still get its answer while
-    /// the tab is locked — otherwise the very tab a delegation is driving is
-    /// the one that wedges.
-    #[test]
-    fn terminal_protocol_replies_are_not_refused_by_the_lock() {
-        for reply in ["\x1b[24;80R", "\x1b[?1;2c", "\x1b[0n", "\x1b[I", "\x1b[O"] {
-            assert!(
-                auto_reply(reply),
-                "fixture must be an automatic reply: {reply:?}"
-            );
-            assert_eq!(
-                read_only_refusal(&ReadOnlySource::User, reply, None),
-                None,
-                "the terminal's own answer was refused: {reply:?}"
-            );
-        }
-    }
-
-    /// **Scrolling is reading.** A read-only tab exists so the user can WATCH
-    /// it, and in an alt-screen TUI the wheel is forwarded to the program as a
-    /// mouse report rather than scrolling xterm's own buffer — so a swallowed
-    /// wheel means a tab one may watch but not scroll.
-    ///
-    /// The fixture table is duplicated verbatim in
-    /// `src/lib/delegation.test.ts`: the courtesy gate and this enforcement
-    /// point must agree about every one of these, or one of them refuses a
-    /// scroll the other allowed.
-    #[test]
-    fn mouse_wheel_passes_the_lock_under_either_source() {
-        let driven = ReadOnlySource::Driven {
-            by: TabId::from_str("opencode"),
-        };
-        for wheel in [
-            "\x1b[<64;10;5M",              // wheel up (SGR)
-            "\x1b[<65;10;5M",              // wheel down
-            "\x1b[<66;1;1M",               // wheel left
-            "\x1b[<67;1;1M",               // wheel right
-            "\x1b[<80;3;4M",               // ctrl+wheel up (64 + modifier 16)
-            "\x1b[<68;3;4M",               // shift+wheel up (64 + modifier 4)
-            "\x1b[M`!!",                   // wheel up, legacy X10 encoding
-            "\x1b[Ma!!",                   // wheel down, legacy X10 encoding
-            "\x1b[<64;1;1M\x1b[<64;1;1M",  // a fast scroll, coalesced
-        ] {
-            assert!(
-                super::is_mouse_wheel(wheel),
-                "fixture must be a wheel report: {wheel:?}"
-            );
-            for source in [&ReadOnlySource::User, &driven] {
-                assert_eq!(
-                    read_only_refusal(source, wheel, Some("api-work")),
-                    None,
-                    "a locked tab refused a scroll ({source:?}): {wheel:?}"
-                );
-            }
-        }
-    }
-
-    /// **A click is input.** It activates whatever control is under it — a
-    /// permission option, for one — which is the whole reason the lock exists.
-    /// Drag and motion go with it: a drag is a held button.
-    #[test]
-    fn mouse_clicks_drags_and_pastes_are_still_refused() {
-        for click in [
-            "\x1b[<0;10;5M",   // left press
-            "\x1b[<0;10;5m",   // left release
-            "\x1b[<1;1;1M",    // middle press
-            "\x1b[<2;1;1M",    // right press
-            "\x1b[<32;5;5M",   // drag with button 0 held (motion bit)
-            "\x1b[<35;5;5M",   // bare motion
-            "\x1b[M !!",       // left press, legacy X10 encoding
-            "\x1b[M#!!",       // release, legacy X10 encoding
-            "\x1b[200~x\x1b[201~", // a bracketed paste
-        ] {
-            assert!(
-                !super::is_mouse_wheel(click),
-                "fixture must not be a wheel report: {click:?}"
-            );
-            assert!(
-                read_only_refusal(&ReadOnlySource::User, click, None).is_some(),
-                "mouse/paste input slipped through the lock: {click:?}"
-            );
-        }
-    }
-
-    /// **The exemption cannot carry a passenger.** A chunk that is a wheel
-    /// report *plus* typed text is not a wheel report — otherwise the lock
-    /// would be one concatenation away from open.
-    #[test]
-    fn a_wheel_report_with_anything_else_attached_is_refused() {
-        for smuggled in [
-            "\x1b[<64;1;1My",              // wheel then a keystroke
-            "y\x1b[<64;1;1M",              // keystroke then wheel
-            "\x1b[<64;1;1M\r",             // wheel then Enter
-            "\x1b[<64;1;1M\x1b[<0;1;1M",   // wheel then a click
-            "\x1b[<64;1;1",                // truncated: no terminator
-            "\x1b[M`!",                    // truncated X10: two coord bytes
-            "",
-        ] {
-            assert!(
-                !super::is_mouse_wheel(smuggled),
-                "fixture must not be a wheel report: {smuggled:?}"
-            );
-            assert!(
-                read_only_refusal(&ReadOnlySource::User, smuggled, None).is_some(),
-                "input smuggled past the lock behind a wheel report: {smuggled:?}"
-            );
-        }
-    }
-
-    /// The wheel exemption is `read_only_refusal`'s alone: the keystroke and
-    /// submit bookkeeping still sees a wheel report exactly as it always did
-    /// (not an automatic terminal response), so nothing about avatar state or
-    /// echo suppression moved with this.
-    #[test]
-    fn the_wheel_exemption_did_not_change_the_automatic_reply_predicate() {
-        for wheel in ["\x1b[<64;10;5M", "\x1b[M`!!"] {
-            assert!(!auto_reply(wheel), "{wheel:?}");
-        }
-    }
-
-    /// …and the exemption is narrow: an escape sequence a *person* produced
-    /// (arrow keys, Esc, a bracketed paste) is still input, and still refused.
-    #[test]
-    fn keyboard_escape_sequences_are_still_refused() {
-        for keys in ["\x1b[A", "\x1b", "\r", "y", "\x1b[200~pasted\x1b[201~"] {
-            assert!(
-                !auto_reply(keys),
-                "fixture must not be an automatic reply: {keys:?}"
-            );
-            assert!(
-                read_only_refusal(&ReadOnlySource::User, keys, None).is_some(),
-                "user input slipped through the lock: {keys:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn focus_events_are_auto() {
-        assert!(auto_reply("\x1b[I"));
-        assert!(auto_reply("\x1b[O"));
-    }
-
-    #[test]
-    fn da_and_cpr_replies_are_auto() {
-        assert!(auto_reply("\x1b[?1;2c"));
-        assert!(auto_reply("\x1b[?62;1;2;6;9;15;22c"));
-        assert!(auto_reply("\x1b[10;20R"));
-        assert!(auto_reply("\x1b[?1n"));
-        assert!(auto_reply("\x1b[5n"));
-    }
-
-    #[test]
-    fn arrow_keys_are_not_auto() {
-        assert!(!auto_reply("\x1b[A"));
-        assert!(!auto_reply("\x1b[B"));
-        assert!(!auto_reply("\x1b[C"));
-        assert!(!auto_reply("\x1b[D"));
-        assert!(!auto_reply("\x1b[H"));
-        assert!(!auto_reply("\x1b[1~"));
-    }
-
-    #[test]
-    fn printable_and_control_are_not_auto() {
-        assert!(!auto_reply("a"));
-        assert!(!auto_reply("hello"));
-        assert!(!auto_reply("\r"));
-        assert!(!auto_reply("\x7f"));
-        assert!(!auto_reply("\t"));
-        assert!(!auto_reply("\x1b"));
-        assert!(!auto_reply("\x1bf"));
     }
 }

@@ -168,6 +168,17 @@ interface UiStateFile {
 /// Never rejects. A backend that cannot answer leaves the window unhydrated:
 /// views render their defaults and nothing is written — strictly better than
 /// blocking the mount or persisting defaults over good state.
+///
+/// **Write-liveness is the LAST thing this sets** (V42 review, RV-4). It used
+/// to be set the moment the read landed, which left a window whose import then
+/// failed both write-live and holding a cache the import had not finished
+/// filling: the next `<details>` toggle would patch the file from a state
+/// nobody had finished assembling, and the un-imported values would never be
+/// tried again because a later launch would find the same half-story. The rule
+/// now is: this window may write only once the import has either committed or
+/// been confirmed unnecessary. A failed import means read-only for the session
+/// — the values are still in `localStorage`, the marker is still absent, and
+/// the next launch retries the whole thing.
 export async function hydrateUiState(): Promise<void> {
   let file: UiStateFile;
   try {
@@ -185,9 +196,13 @@ export async function hydrateUiState(): Promise<void> {
     if (typeof v === 'string') next[k] = v;
   }
   cache = next;
-  hydrated = true;
 
-  if (cache[IMPORT_MARKER_KEY] !== '1') await runOneTimeImport();
+  // Reads are live from here on regardless; only WRITES wait for the import.
+  if (cache[IMPORT_MARKER_KEY] === '1') {
+    hydrated = true; // no import owed — this project has been through one
+    return;
+  }
+  hydrated = await runOneTimeImport();
 }
 
 /// The saved value for `key`, or `null` when there is none. Synchronous by
@@ -283,22 +298,34 @@ if (typeof window !== 'undefined') {
 
 // ── One-time import ──────────────────────────────────────────────────────
 
-/// Move the durable `localStorage` values into `ui_state.json` once per
-/// project, then delete them.
+/// **Copy** the durable `localStorage` values into `ui_state.json` once per
+/// project, leaving the originals exactly where they are.
 ///
-/// Order matters: the keys are removed only *after* the backend has confirmed
-/// the write. A failed write leaves both the values and the absent marker
-/// alone, so the next launch simply tries again — the one thing that must
-/// never happen is deleting the only copy of a user's state because the file
-/// could not be written.
+/// Returns whether the project is now imported — which is what makes this
+/// window write-live (RV-4, see [`hydrateUiState`]).
+///
+/// **A copy, not a move** (V42 review, RV-1). It used to `removeItem` each key
+/// after the backend confirmed the write, and `localStorage` is per-*machine*
+/// while the marker that stops the import is per-*project*: the first checkout
+/// launched after upgrading therefore MOVED the machine-wide state into its own
+/// `ui_state.json`, and every other checkout on that machine imported nothing
+/// because there was nothing left to read. Leaving the keys makes the import
+/// lossless for all of them — each project takes its own copy of the same seed
+/// values and diverges from there.
+///
+/// The leftovers are inert: once a project's marker is set nothing in this
+/// module reads `localStorage` again, and the ephemeral prefs
+/// (`diff.expanded`, `code-audit.text`, …) that were always going to stay there
+/// mean the origin was never going to be emptied anyway. Their cost is a few
+/// kilobytes per install; the cost of the alternative is a user's other
+/// checkouts silently losing their view state, once, unrecoverably.
 ///
 /// Values are copied verbatim. A corrupt one (a truncated JSON string, a
 /// section id that no longer exists) is carried across unchanged and rejected
 /// by the same call-site validation that rejects it today — the import is a
-/// move, not a repair.
-async function runOneTimeImport(): Promise<void> {
+/// copy, not a repair.
+async function runOneTimeImport(): Promise<boolean> {
   const patch: Record<string, string> = {};
-  const moved: string[] = [];
   for (const key of IMPORTED_KEYS) {
     let raw: string | null = null;
     try {
@@ -310,7 +337,6 @@ async function runOneTimeImport(): Promise<void> {
     }
     if (raw === null) continue;
     patch[key] = raw;
-    moved.push(key);
   }
   // Recorded even when nothing moved — "this project has been through the
   // import" is what the marker means, not "something was imported".
@@ -319,20 +345,18 @@ async function runOneTimeImport(): Promise<void> {
   try {
     await invoke('ui_state_set', { patch });
   } catch (e) {
-    console.error('ui_state import failed; retrying next launch:', e);
-    return;
+    // Write-inert for the session (RV-4): the cache is missing whatever the
+    // import would have added, so a patch from this window would persist a
+    // partial picture. Nothing was deleted, the marker is still absent, and
+    // the next launch runs the whole import again.
+    console.error('ui_state import failed; view state is read-only until the next launch:', e);
+    return false;
   }
 
-  // Committed: adopt the values into the cache (this window is already past
-  // the point where they would have been read from `localStorage`) and drop
-  // the originals so the next launch is a plain hydrate.
+  // Committed: adopt the values into the cache, so this window — already past
+  // the point where they would have been read from `localStorage` — answers
+  // with them for the rest of the session. The originals stay put; see the
+  // doc comment.
   Object.assign(cache, patch);
-  for (const key of moved) {
-    try {
-      localStorage.removeItem(key);
-    } catch {
-      // A leftover key is inert — the marker means it will never be read
-      // again.
-    }
-  }
+  return true;
 }

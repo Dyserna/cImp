@@ -18,7 +18,7 @@ vi.mock('@tauri-apps/api/core', () => ({ invoke: (...a: unknown[]) => invoke(...
 /// so there is no DOM one.
 class FakeStorage {
   map = new Map<string, string>();
-  throwOn: 'none' | 'get' | 'remove' = 'none';
+  throwOn: 'none' | 'get' = 'none';
   getItem(k: string): string | null {
     if (this.throwOn === 'get') throw new Error('storage unavailable');
     return this.map.has(k) ? (this.map.get(k) as string) : null;
@@ -26,8 +26,10 @@ class FakeStorage {
   setItem(k: string, v: string): void {
     this.map.set(k, v);
   }
+  /// Present because the durable keys are still read through `viewSection.ts`'s
+  /// ephemeral path in these tests. The import itself must never call it — see
+  /// `the import never calls removeItem at all`.
   removeItem(k: string): void {
-    if (this.throwOn === 'remove') throw new Error('storage unavailable');
     this.map.delete(k);
   }
 }
@@ -342,7 +344,7 @@ describe('the durable/ephemeral split', () => {
 });
 
 describe('the one-time localStorage import', () => {
-  test('moves the durable values, marks the project, and deletes the originals', async () => {
+  test('copies the durable values, marks the project, and LEAVES the originals', async () => {
     store.map.set('cimp.view-section.v1.workbench', 'diff');
     store.map.set('cimp.hidden-tabs.v1', '["tab-9"]');
     store.map.set('cimp.view-pref.v1.events.col-widths', '{"ts":120}');
@@ -368,11 +370,41 @@ describe('the one-time localStorage import', () => {
     // Readable in the very same session, without a second hydrate.
     expect(m.getUiValue('cimp.view-section.v1.workbench')).toBe('diff');
 
-    // Originals gone; ephemeral keys left exactly where they were.
-    expect(store.map.has('cimp.view-section.v1.workbench')).toBe(false);
-    expect(store.map.has('cimp.hidden-tabs.v1')).toBe(false);
+    // V42 review RV-1: nothing is deleted. `localStorage` is per-MACHINE and
+    // the marker that stops the import is per-PROJECT, so removing the
+    // originals here would hand the first checkout launched after the upgrade
+    // the machine's only copy and leave every other checkout importing
+    // nothing.
+    expect(store.map.get('cimp.view-section.v1.workbench')).toBe('diff');
+    expect(store.map.get('cimp.hidden-tabs.v1')).toBe('["tab-9"]');
+    expect(store.map.get('cimp.view-pref.v1.events.col-widths')).toBe('{"ts":120}');
     expect(store.map.get('cimp.view-pref.v1.diff.expanded')).toBe('["a.rs"]');
     expect(store.map.get('cimp.view-pref.v1.code-audit.text')).toBe('unwrap');
+  });
+
+  test('a SECOND project imports the same seeds losslessly', async () => {
+    // The property RV-1 exists for, end to end: two checkouts, one machine,
+    // one `localStorage`. Each has its own `ui_state.json` and therefore its
+    // own marker, so each must get the full set.
+    store.map.set('cimp.view-section.v1.workbench', 'diff');
+    store.map.set('cimp.hidden-tabs.v1', '["tab-9"]');
+    invoke.mockImplementation((cmd: string) =>
+      cmd === 'ui_state_get' ? Promise.resolve({ version: 1, values: {} }) : Promise.resolve(),
+    );
+
+    const first = await freshModule();
+    await first.hydrateUiState();
+    const firstPatch = patchOf(1);
+
+    invoke.mockReset();
+    invoke.mockImplementation((cmd: string) =>
+      cmd === 'ui_state_get' ? Promise.resolve({ version: 1, values: {} }) : Promise.resolve(),
+    );
+    const second = await freshModule();
+    await second.hydrateUiState();
+
+    expect(patchOf(1)).toEqual(firstPatch);
+    expect(second.getUiValue('cimp.hidden-tabs.v1')).toBe('["tab-9"]');
   });
 
   test('a second boot does not re-import', async () => {
@@ -415,13 +447,18 @@ describe('the one-time localStorage import', () => {
     expect(patchOf(1)['cimp.view-section.v1.workbench']).toBe('a-section-that-was-renamed');
   });
 
-  test('a FAILED import deletes nothing and leaves the project unmarked', async () => {
+  test('a FAILED import leaves the project unmarked and the window WRITE-INERT', async () => {
     // The one thing that must never happen: dropping the only copy of a
     // user's state because the file could not be written.
+    //
+    // V42 review RV-4: `hydrated` used to be set before the import ran, so a
+    // failed import left the window write-LIVE over a cache the import had
+    // not finished filling — the next toggle would persist that half-story
+    // and the un-imported values would never be tried again.
     store.map.set('cimp.view-section.v1.workbench', 'diff');
     invoke.mockImplementation((cmd: string) =>
       cmd === 'ui_state_get'
-        ? Promise.resolve({ version: 1, values: {} })
+        ? Promise.resolve({ version: 1, values: { survivor: 'from-the-file' } })
         : Promise.reject(new Error('read-only volume')),
     );
     const m = await freshModule();
@@ -429,6 +466,45 @@ describe('the one-time localStorage import', () => {
 
     expect(store.map.get('cimp.view-section.v1.workbench')).toBe('diff');
     expect(m.getUiValue(MARKER)).toBeNull();
+
+    // Reads still work — the file WAS read, so the session is usable.
+    expect(m.getUiValue('survivor')).toBe('from-the-file');
+
+    // Writes do not. `ui_state_set` was called once (the failed import) and
+    // must not be called again.
+    invoke.mockReset();
+    invoke.mockResolvedValue(undefined);
+    m.setUiValue('cimp.view-section.v1.workbench', 'status');
+    await m.flushUiState();
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+  test('a project that needs no import is write-live immediately', async () => {
+    // The other side of RV-4: the marker is present, there is nothing to
+    // settle, and the window must not be left read-only by the new ordering.
+    invoke.mockResolvedValue(file());
+    const m = await freshModule();
+    await m.hydrateUiState();
+    invoke.mockReset();
+    invoke.mockResolvedValue(undefined);
+
+    m.setUiValue('k', 'v');
+    await m.flushUiState();
+    expect(patchOf(0)).toEqual({ k: 'v' });
+  });
+
+  test('a SUCCESSFUL import leaves the window write-live', async () => {
+    invoke.mockImplementation((cmd: string) =>
+      cmd === 'ui_state_get' ? Promise.resolve({ version: 1, values: {} }) : Promise.resolve(),
+    );
+    const m = await freshModule();
+    await m.hydrateUiState();
+    invoke.mockReset();
+    invoke.mockResolvedValue(undefined);
+
+    m.setUiValue('k', 'v');
+    await m.flushUiState();
+    expect(patchOf(0)).toEqual({ k: 'v' });
   });
 
   test('an unusable localStorage still marks the project instead of retrying forever', async () => {
@@ -441,17 +517,22 @@ describe('the one-time localStorage import', () => {
     expect(patchOf(1)).toEqual({ [MARKER]: '1' });
   });
 
-  test('a removeItem that throws does not undo a committed import', async () => {
+  test('the import never calls removeItem at all', async () => {
+    // The structural half of RV-1, stated where a future edit would trip over
+    // it: any deletion here is per-machine and destroys the seed every OTHER
+    // checkout on this machine still needs.
     store.map.set('cimp.view-section.v1.workbench', 'diff');
-    store.throwOn = 'remove';
+    const removed: string[] = [];
+    store.removeItem = (k: string) => {
+      removed.push(k);
+    };
     invoke.mockImplementation((cmd: string) =>
       cmd === 'ui_state_get' ? Promise.resolve({ version: 1, values: {} }) : Promise.resolve(),
     );
     const m = await freshModule();
     await expect(m.hydrateUiState()).resolves.toBeUndefined();
 
-    // The value is in the file and the marker is set; the leftover key is
-    // inert because nothing will ever read it again.
+    expect(removed).toEqual([]);
     expect(patchOf(1)['cimp.view-section.v1.workbench']).toBe('diff');
     expect(m.getUiValue(MARKER)).toBe('1');
   });

@@ -1942,16 +1942,19 @@ mod tests {
     ///
     /// The acceptance for item 4 is that a user who never picked a colour sees
     /// no change: lane 0 stays `#30363d` and lane 1 stays `#3b6ea5`. Those
-    /// values moved from `GraphSettings`'s defaults into a palette array in
-    /// `CodeIntelligenceView.svelte`, where no Rust test would otherwise see
-    /// them — so this reads the array out of the component, the same way
+    /// values moved from `GraphSettings`'s defaults into a palette array in the
+    /// Code Intelligence view, where no Rust test would otherwise see them — so
+    /// this reads the array out of the component, the same way
     /// `every_settings_reader_runs_the_harness_parse_boundary` reads a function
     /// body out of its own file.
     ///
     /// Newline-agnostic: CI checks this tree out with CRLF.
     #[test]
     fn the_first_two_lane_palette_slots_are_the_shipped_colours() {
-        let src = include_str!("../../../src/lib/CodeIntelligenceView.svelte").replace('\r', "");
+        // #130 split that component: the palette moved into the Overview
+        // section, the only reader it ever had.
+        let src =
+            include_str!("../../../src/lib/codeIntel/UsageOverview.svelte").replace('\r', "");
         let at = src
             .find("const LANE_PALETTE = [")
             .expect("`LANE_PALETTE` is gone — re-point this test");

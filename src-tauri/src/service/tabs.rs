@@ -338,6 +338,10 @@ pub(crate) enum Placement {
     /// A reserved AI builtin: inserted at its canonical rank among the other
     /// reserved AI tabs, and registered as a builtin. Keeps the AI tabs in
     /// canonical leading order regardless of which subset is enabled.
+    ///
+    /// Does NOT activate. Ticking a checkbox in Settings → Tabs is not a
+    /// request to go there — see the activation branch in
+    /// [`TabService::commit_new_tab`].
     AiBuiltin(AiTabId),
 }
 
@@ -380,7 +384,8 @@ impl<'a> TabService<'a> {
         }
     }
 
-    /// Commit a freshly-minted tab: persist, register, announce, activate.
+    /// Commit a freshly-minted tab: persist, register, announce, and — for a
+    /// user tab only — activate.
     ///
     /// The ordering is load-bearing and was previously restated at every call
     /// site. Settings is written BEFORE the registry entry so that when the
@@ -400,8 +405,9 @@ impl<'a> TabService<'a> {
     /// back, matching what the copies did.
     ///
     /// `placement` is the fourth copy's difference, named (decision 3): a
-    /// reserved AI builtin goes in at its canonical rank and registers as a
-    /// builtin, everything else appends and registers as a user tab.
+    /// reserved AI builtin goes in at its canonical rank, registers as a
+    /// builtin and is NOT activated; everything else appends, registers as a
+    /// user tab and takes focus.
     async fn commit_new_tab(
         &self,
         meta: &TabMeta,
@@ -467,7 +473,15 @@ impl<'a> TabService<'a> {
             return Err(TabLifecycleError::internal("state signal channel closed"));
         }
 
-        {
+        // Activation is the USER half of this sequence, not part of "commit a
+        // tab". A user tab is asked for by an act that means "take me there" —
+        // the + menu, a tool button, a worktree — and all four copies this
+        // helper absorbed activated. A reserved AI builtin is not: it appears
+        // because a checkbox in Settings → Tabs was ticked, `add_ai_builtin_tab`
+        // never activated it, and doing so both steals focus from the tab the
+        // user is standing in and moves the `active` that `set_enabled_ai`'s
+        // step 2 reads to decide whether the active tab is about to be closed.
+        if matches!(placement, Placement::User) {
             let mut registry = self.registry.lock().await;
             if let Err(e) = registry.activate(tab).await {
                 warn!(error = %e, "{what}: activate failed");
@@ -1894,6 +1908,47 @@ mod tests {
             .filter(|t| crate::settings::AiTabId::from_id(t.id()) == Some(id))
             .count();
         assert_eq!(entries, 1, "and it must not open the tab twice");
+    }
+
+    /// **Enabling an AI builtin never moves the user.**
+    ///
+    /// Ticking a harness in Settings → Tabs makes its tab exist; it does not
+    /// mean "and take me there". `add_ai_builtin_tab` never activated, and when
+    /// its body folded into [`TabService::commit_new_tab`] — whose other three
+    /// callers all DO activate — it nearly inherited one. Two things break if
+    /// it does: the user is yanked out of whatever tab they were in by a
+    /// checkbox in another window, and `set_enabled_ai`'s step 2 then reads an
+    /// `active` this very call moved, so its "is the active tab about to be
+    /// closed?" question is asked about the wrong tab.
+    #[tokio::test]
+    async fn enabling_an_ai_builtin_never_changes_the_active_tab() {
+        let Some(id) = crate::settings::canonical_ai_tab_order().first().copied() else {
+            return;
+        };
+        let mut fx = Fixture::new();
+        let seed = TabId::Shell("shell-seed".to_string());
+        assert_eq!(fx.registry.lock().await.active(), seed);
+
+        fx.service()
+            .set_enabled_ai(vec![id])
+            .await
+            .expect("enable one AI builtin");
+
+        let added = TabId::from_str(id.as_str());
+        assert!(
+            fx.registry.lock().await.has_tab(&added),
+            "the builtin's tab must exist"
+        );
+        assert_eq!(
+            fx.registry.lock().await.active(),
+            seed,
+            "a Settings checkbox must not steal focus"
+        );
+        assert_eq!(
+            fx.signal_names(),
+            vec!["TabAdded"],
+            "the frontend must see the tab appear and nothing else"
+        );
     }
 
     /// **A Shell tab's config round-trips through the Configure dialog's wire

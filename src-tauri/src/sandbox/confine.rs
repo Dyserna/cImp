@@ -21,6 +21,15 @@
 //! duplication guarantees. The payoff of this module is not fewer lines — it is
 //! that there is now ONE place to review and ONE place to fix.
 //!
+//! # Amendment: the walk is no longer step-for-step the audit original
+//!
+//! The extraction (#127) claimed, and was reviewed as, an identical step set.
+//! It is identical no longer, in exactly one step and deliberately: the
+//! `kill_tree` fires on EVERY abnormal outcome, where both originals fired it
+//! on cancel and timeout only. See [`needs_kill`] for what the missing case
+//! leaked. This is the first fix that lands in one place instead of two —
+//! which is the payoff above, being collected.
+//!
 //! # What it does NOT own
 //!
 //! Deliberately narrow. The unified walk starts at the process-creation flags
@@ -157,8 +166,9 @@ pub enum ConfinedOutcome {
     /// The spawn gate / the OS refused to start the child. Nothing ran.
     SpawnFailed(String),
     /// `child.wait()` itself failed — the child may have run and may have
-    /// printed something, so the pumps are still drained and whatever they
-    /// captured is returned alongside this.
+    /// printed something, so the tree is killed (see [`needs_kill`]) and the
+    /// pumps are still drained, and whatever they captured is returned
+    /// alongside this.
     WaitFailed(String),
 }
 
@@ -184,6 +194,34 @@ impl ConfinedRun {
             stderr: String::new(),
             outcome,
         }
+    }
+}
+
+/// Whether an outcome leaves a process tree that has to be reaped before the
+/// pumps are drained.
+///
+/// **Every abnormal outcome does** — which is a DELIBERATE HARDENING over the
+/// audit original this walk was extracted from (V42 #127). That copy killed on
+/// cancel and on timeout only, so a `WaitFailed` — `child.wait()` itself
+/// erroring — left the child and everything it forked alive, holding the pipe
+/// write ends the two drains are reading. The drains are bounded, so the seam
+/// does not hang; what it does instead is return `DRAIN_TIMEOUT` late with a
+/// half capture, and leak a process tree that goes on working. `kill_on_drop`
+/// is not the answer either: it is a backstop that fires when this future is
+/// dropped, and this future is not dropped — it returns.
+///
+/// The two variants that mean NOTHING WAS SPAWNED cannot reach the caller
+/// below (both return before a child exists), and are `false` here because
+/// "there is no tree" is the honest answer for them, not because they are
+/// unreachable. The match is exhaustive on purpose: a new outcome variant is a
+/// compile error here rather than a silently unreaped tree.
+fn needs_kill(outcome: &ConfinedOutcome) -> bool {
+    match outcome {
+        ConfinedOutcome::Exited(_) => false,
+        ConfinedOutcome::TimedOut | ConfinedOutcome::Cancelled | ConfinedOutcome::WaitFailed(_) => {
+            true
+        }
+        ConfinedOutcome::ApplyRefused(_) | ConfinedOutcome::SpawnFailed(_) => false,
     }
 }
 
@@ -291,10 +329,7 @@ pub async fn run_confined(cmd: &mut tokio::process::Command, c: Confined<'_>) ->
             Err(_) => ConfinedOutcome::TimedOut,
         },
     };
-    if matches!(
-        outcome,
-        ConfinedOutcome::Cancelled | ConfinedOutcome::TimedOut
-    ) {
+    if needs_kill(&outcome) {
         // Whole-tree kill: forked workers must not survive holding the pipe
         // write ends (they'd keep working and stall the drains). `kill_on_drop`
         // is a backstop, not a guarantee the process is gone by the time the
@@ -582,5 +617,27 @@ mod tests {
         }
         assert!(run.stdout.is_empty() && run.stderr.is_empty());
         assert!(!run.stdout_truncated);
+    }
+
+    /// **Every abnormal outcome reaps the tree.**
+    ///
+    /// A `WaitFailed` used to be the hole: it left the child and its forked
+    /// workers alive holding the pipe write ends, so the bounded drains came
+    /// back late with a half capture and the tree went on working. There is no
+    /// portable way to MAKE `child.wait()` fail, so the rule is pinned where it
+    /// is decided — one exhaustive predicate, asserted variant by variant, so
+    /// that a new outcome cannot be added without answering the question.
+    ///
+    /// The two "nothing was spawned" variants answer `false` because there is
+    /// no tree, not because they are unreachable here.
+    #[test]
+    fn every_abnormal_outcome_reaps_the_tree() {
+        assert!(!needs_kill(&ConfinedOutcome::Exited(Some(0))));
+        assert!(!needs_kill(&ConfinedOutcome::Exited(None)));
+        assert!(needs_kill(&ConfinedOutcome::TimedOut));
+        assert!(needs_kill(&ConfinedOutcome::Cancelled));
+        assert!(needs_kill(&ConfinedOutcome::WaitFailed("boom".into())));
+        assert!(!needs_kill(&ConfinedOutcome::SpawnFailed("boom".into())));
+        assert!(!needs_kill(&ConfinedOutcome::ApplyRefused("boom".into())));
     }
 }

@@ -300,15 +300,18 @@ const LITERAL_ALLOWLIST: &[(&str, &str)] = &[
     // from the request instead of picking a table by hand. `TABLE` now holds only
     // names cImp routes, which is what its unknown-⇒-EXTERNAL law is about.
     (
-        "graph/index.rs",
+        "graph/index/usage.rs",
         "A COLLISION, not a dependency — and one worth stating rather than silencing. `\"tool_result\"` \
          here is cImp's OWN discriminator in the usage-event table (`kind` column: `\"turn\"` vs \
          `\"tool_result\"`), chosen long before V35 and readable by cImp alone. It became a needle \
          in V35 Phase L, when `claude.hook.tool_result` declared the Claude payload field of the \
          same name, so the scan now sees two unrelated uses of one word. Renaming the column would \
          be a graph migration to fix a test's vocabulary; renaming the Claude field is not cImp's \
-         to do. The exemption is the honest third option — and it is narrow: `graph/index.rs` \
-         reads no harness payload at all.",
+         to do. The exemption is the honest third option — and it is narrow: this file reads no \
+         harness payload at all. V42 R13 made it narrower still: the row was keyed on \
+         `graph/index.rs`, and an entry exempts a WHOLE file, so it covered 9,000 lines of store \
+         for one discriminator string. The usage ring moved to its own module and the row came \
+         with it, to the file that actually holds `record_usage_event`.",
     ),
     // `graph/memory.rs` was listed here from Phase K as a FINDING rather than a
     // clean exemption: `classify_tool` matched BOTH harnesses' edit-tool ids
@@ -439,7 +442,7 @@ fn the_literal_scan_reads_the_same_code_on_every_platform() {
 /// literal allowlist had no equivalent, so its reasons could have rotted
 /// unobserved. An entry that no longer names any harness literal is not harmless:
 /// it exempts the WHOLE file from the scan, so the next feature that puts a
-/// Claude payload read in `graph/index.rs` inherits a pass.
+/// Claude payload read in `graph/index/usage.rs` inherits a pass.
 #[test]
 fn every_literal_allowlist_entry_is_still_earning_it() {
     let needles = harness_literals();

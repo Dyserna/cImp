@@ -71,10 +71,10 @@
 //!   Fixed by **removing the interpolation**: [`GraphIndex::mem_note_stage_row_count`]
 //!   spells the stage relation out, and `tests::no_interpolated_relation_atom`
 //!   makes a new one a red test. The residue: an interpolated atom is only
-//!   banned *here*. `graph/index.rs` legitimately has two (over `usage_stat` and
-//!   the session relations) and a blanket ban would be wrong there, so a future
+//!   banned *here*. The parent tree legitimately has two (over `usage_stat` and
+//!   the graph relations) and a blanket ban would be wrong there, so a future
 //!   parameterized read in the parent whose parameter happens to be this
-//!   relation is still covered by the module boundary alone — 8,800 lines of it.
+//!   relation is still covered by the module boundary alone.
 //!   Narrowing that is a type problem (a relation newtype), not a scan problem.
 //!
 //! - **Statements that name the relation without an atom.** `graph/index.rs`'s
@@ -801,9 +801,10 @@ mod tests {
     /// exactly the same reason, and unlike guard 4's subject this guard scans
     /// EVERY match in the file — including one sitting in its own doc comment.
     ///
-    /// Scoped to `SELF` on purpose. `graph/index.rs` has two legitimate
-    /// interpolated atoms over other relations (`usage_stat`'s row count, the
-    /// session migration's read), and banning the shape there would be wrong.
+    /// Scoped to `SELF` on purpose. The parent tree has two legitimate
+    /// interpolated atoms over other relations (`usage_stat`'s row count in
+    /// `index/usage.rs`, the per-relation count in `index.rs`'s `stats`), and
+    /// banning the shape there would be wrong.
     /// Banning it *here* is not: this file has exactly one relation to talk
     /// about, so an interpolated name in it is either this relation or a
     /// mistake, and both want the author to stop and write the name out.

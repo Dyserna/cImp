@@ -270,6 +270,12 @@ pub fn merge_ui_state(launch_cwd: &Path, patch: Map<String, Value>) -> AppResult
 /// paint, so there is no place for a per-key async read.
 ///
 /// On a blocking pool, like [`ui_state_set`] — see its note.
+///
+/// **Left as a direct call** (V42 Phase A): the body is one blocking hop over
+/// [`read_ui_state`], which is a free function in this module that the tests
+/// below already drive against a scratch project. Everything a service could
+/// hold — the version probe, the merge rule, the cross-process lock — is in
+/// those functions, not in the command.
 #[tauri::command]
 pub async fn ui_state_get(state: State<'_, AppState>) -> AppResult<UiState> {
     let cwd = state.launch.cwd.clone();
@@ -291,6 +297,10 @@ pub async fn ui_state_get(state: State<'_, AppState>) -> AppResult<UiState> {
 /// stalls every other future scheduled on it — for a `<details>` toggle. It
 /// also blocks the frontend's pre-mount `ui_state_get`, which is the one call
 /// with a deadline (V42 review RV-3).
+///
+/// **Left as a direct call**, for [`ui_state_get`]'s reason: [`merge_ui_state`]
+/// is where the patch semantics live, and it is already a free function with
+/// tests.
 #[tauri::command]
 pub async fn ui_state_set(state: State<'_, AppState>, patch: Map<String, Value>) -> AppResult<()> {
     let cwd = state.launch.cwd.clone();

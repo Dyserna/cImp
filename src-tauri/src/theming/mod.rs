@@ -374,12 +374,19 @@ fn load_palettes() -> Vec<PaletteWire> {
 /// Every verified theme found on disk. The frontend fetches this once at
 /// startup, injects each theme's CSS into <head>, and lists them in
 /// Settings → Appearance.
+///
+/// **Left as a direct call** (V42 Phase A): the body is one call on
+/// [`load_themes`], a free function in this module with its own tests. There is
+/// no `State`, no `AppHandle` and nothing to shape — this command was headless
+/// the day it was written. Same for [`palettes_list`].
 #[tauri::command]
 pub fn themes_list() -> Vec<ThemeWire> {
     load_themes()
 }
 
 /// Every verified terminal palette found on disk.
+///
+/// **Left as a direct call**, for [`themes_list`]'s reason.
 #[tauri::command]
 pub fn palettes_list() -> Vec<PaletteWire> {
     load_palettes()

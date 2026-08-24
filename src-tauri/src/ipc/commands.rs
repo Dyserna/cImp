@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use tauri::ipc::Channel;
-use tauri::{AppHandle, Emitter, EventTarget, State};
+use tauri::{AppHandle, State};
 
 use crate::error::{AppError, AppResult};
 use crate::ipc::windows::{open_or_focus_settings, SETTINGS_LABEL};
@@ -13,6 +13,7 @@ use crate::service::checks::{ApplySummary, ChecksService, ChecksSuggestion};
 use crate::service::delegation::DelegationControls;
 use crate::service::settings::SettingsService;
 use crate::service::sink::{OutputSink, TauriEventSink};
+use crate::service::window::{SettingsDeepLink, SettingsWindow};
 use crate::service::graph::{
     ArchResult, CodeIntelService, DeadExportRow, ImpactResult, PathResult, VizFileStatusRow,
     VizGraphResult,
@@ -22,7 +23,7 @@ use crate::service::offload::{OffloadServerUseCases, OffloadServiceUseCases};
 use crate::service::usage::{AdvisorRules, AdvisorSnapshot, UsageService};
 use crate::service::workbench::WorkbenchUseCases;
 use crate::settings::{AiToolTabConfig, Settings};
-use crate::state::{StateSignal, TabId};
+use crate::state::TabId;
 
 /// V1.4-04 D: `pty_start` returns the persisted-scrollback bytes from the
 /// previous session (if any) — see [`PtyService::start`] for the whole
@@ -432,17 +433,14 @@ pub async fn pty_resize(
     pty_service(&state).resize(tab, rows, cols).await
 }
 
+/// The compose overlay's non-empty edge. See
+/// [`TabService::compose_content_changed`](crate::service::tabs::TabService::compose_content_changed)
+/// for why the target tab is resolved on this side.
 #[tauri::command]
 pub async fn compose_content_changed(state: State<'_, AppState>, non_empty: bool) -> AppResult<()> {
-    // Compose targets the currently active tab — its non-empty edge promotes
-    // the active tab Idle→Listening and pins Listening while content remains.
-    let active = state.tabs.lock().await.active();
-    let _ = state
-        .state_signals
-        .try_send(StateSignal::ComposeContentChanged {
-            tab: active,
-            non_empty,
-        });
+    crate::ipc::tab_lifecycle::tab_service(&state)
+        .compose_content_changed(non_empty)
+        .await;
     Ok(())
 }
 
@@ -515,6 +513,11 @@ pub async fn compose_templates_project_get(
 /// the message text (`compose/attachments.ts`'s `appendAttachments`).
 /// Dropped image *files* (`tauri://drag-drop`) skip this command entirely —
 /// they're referenced in place, never copied here.
+///
+/// **Left as a direct call** (V42 Phase A): one call on
+/// [`crate::attach::save_png`], which owns the session-scoped directory rule
+/// and is already reachable from a test, plus the lossy path-to-string the wire
+/// needs.
 #[tauri::command]
 pub async fn compose_attach_image(state: State<'_, AppState>, bytes: Vec<u8>) -> AppResult<String> {
     let session = state.launch.launch_id.clone();
@@ -522,11 +525,11 @@ pub async fn compose_attach_image(state: State<'_, AppState>, bytes: Vec<u8>) ->
     Ok(path.to_string_lossy().into_owned())
 }
 
+/// The user dismissed a tab's error badge. See
+/// [`TabService::acknowledge_error`](crate::service::tabs::TabService::acknowledge_error).
 #[tauri::command]
 pub async fn acknowledge_error(state: State<'_, AppState>, tab: TabId) -> AppResult<()> {
-    let _ = state
-        .state_signals
-        .try_send(StateSignal::ErrorAcknowledged { tab });
+    crate::ipc::tab_lifecycle::tab_service(&state).acknowledge_error(tab);
     Ok(())
 }
 
@@ -559,8 +562,7 @@ pub async fn set_active_tab(state: State<'_, AppState>, tab: TabId) -> AppResult
 /// emissions could fire before the webview's listener attaches.
 #[tauri::command]
 pub async fn list_tabs(state: State<'_, AppState>) -> AppResult<Vec<crate::tabs::TabMetaWire>> {
-    let registry = state.tabs.lock().await;
-    Ok(registry.list())
+    Ok(crate::ipc::tab_lifecycle::tab_service(&state).list().await)
 }
 
 /// The live in-memory settings snapshot. See [`SettingsService::get`].
@@ -1947,6 +1949,11 @@ pub async fn graph_set_language_enabled(
 /// install. Windows uses `explorer.exe`; macOS `open`; Linux
 /// `xdg-open`. Errors are wrapped in `AppError::Settings` for a single
 /// IPC error type.
+///
+/// **Left as a direct call**, for [`detection_open_rules_folder`]'s reason:
+/// nothing to assert that does not assert `explorer.exe`, and
+/// [`spawn_ledger`](crate::spawn_ledger)'s row of record names this file as the
+/// spawn site.
 #[tauri::command]
 pub async fn content_open_folder() -> AppResult<()> {
     let dir = crate::content::dir();
@@ -1972,6 +1979,9 @@ pub async fn content_open_folder() -> AppResult<()> {
 /// Delete every file inside `<portable-root>/logs/content/`. Returns the
 /// count of removed files. Per-file failures are logged backend-side
 /// and do not abort the pass.
+///
+/// **Left as a direct call** (V42 Phase A): one call on
+/// [`crate::content::delete_all`], which owns the keep-going-on-failure rule.
 #[tauri::command]
 pub async fn content_clear() -> AppResult<u32> {
     Ok(crate::content::delete_all())
@@ -1985,11 +1995,23 @@ pub async fn list_voices() -> AppResult<Vec<String>> {
     crate::service::audio::voices()
 }
 
+/// Open the Settings window, or focus it if it is already open.
+///
+/// **Left as a direct call** (V42 Phase A): one call on the window helper. The
+/// two commands below are the same kind of thing — a host effect on a window,
+/// with no argument shaping, no ordering and nothing to return. A service in
+/// front of `DwmSetWindowAttribute` would be `AppHandle` with extra steps,
+/// which is the reason [`WebviewHost`](crate::service::sink::WebviewHost) is
+/// one method wide. The deep-link trio below is wrapped, because that one is a
+/// protocol rather than an effect.
 #[tauri::command]
 pub async fn open_settings_window(app: AppHandle) -> AppResult<()> {
     open_or_focus_settings(&app)
 }
 
+/// Close the Settings window if it is open.
+///
+/// **Left as a direct call**, for [`open_settings_window`]'s reason.
 #[tauri::command]
 pub async fn close_settings_window(app: AppHandle) -> AppResult<()> {
     use tauri::Manager;
@@ -2005,6 +2027,10 @@ pub async fn close_settings_window(app: AppHandle) -> AppResult<()> {
 /// look, so the frontend calls this with `square = true` when a TUI theme
 /// is active and `false` (default OS rounding) otherwise. No-op on
 /// non-Windows platforms.
+///
+/// **Left as a direct call**, for [`open_settings_window`]'s reason: the body
+/// is one `DwmSetWindowAttribute` behind a `cfg`, and nothing about it is
+/// checkable without a window manager.
 #[tauri::command]
 pub fn set_window_square_corners(app: AppHandle, square: bool) -> AppResult<()> {
     #[cfg(windows)]
@@ -2058,6 +2084,31 @@ pub fn set_window_square_corners(app: AppHandle, square: bool) -> AppResult<()> 
     Ok(())
 }
 
+/// Build the Settings deep-link use cases over this app's one-shot slot.
+fn settings_deep_link(state: &AppState) -> SettingsDeepLink<'_> {
+    SettingsDeepLink::new(&state.pending_settings_deep_link)
+}
+
+/// The real [`SettingsWindow`]: a Tauri app handle plus the label
+/// `ipc::windows` builds that window under.
+struct TauriSettingsWindow(AppHandle);
+
+impl TauriSettingsWindow {
+    fn new(app: AppHandle) -> Self {
+        Self(app)
+    }
+}
+
+impl SettingsWindow for TauriSettingsWindow {
+    fn open_or_focus(&self) -> AppResult<()> {
+        open_or_focus_settings(&self.0)
+    }
+
+    fn label(&self) -> &str {
+        SETTINGS_LABEL
+    }
+}
+
 /// V1.4-07 A: open the Settings window scrolled to a specific tab's
 /// section. The right-click "Configure tab" entry on AI tabs uses this
 /// instead of the shell-only `ConfigureTabDialog.svelte`. Cold-open is
@@ -2071,16 +2122,11 @@ pub async fn open_settings_window_to_tab(
     state: State<'_, AppState>,
     tab: String,
 ) -> AppResult<()> {
-    if let Ok(mut slot) = state.pending_settings_deep_link.lock() {
-        *slot = Some(tab.clone());
-    }
-    open_or_focus_settings(&app)?;
-    let _ = app.emit_to(
-        EventTarget::webview_window(SETTINGS_LABEL),
-        "settings-deep-link",
-        serde_json::json!({ "kind": "tab", "tab_id": tab }),
-    );
-    Ok(())
+    settings_deep_link(&state).to_tab(
+        &TauriSettingsWindow::new(app.clone()),
+        &TauriEventSink::new(app),
+        &tab,
+    )
 }
 
 /// V22 Phase E: open the Settings window scrolled to a top-level sidebar
@@ -2095,16 +2141,11 @@ pub async fn open_settings_window_to_section(
     state: State<'_, AppState>,
     section: String,
 ) -> AppResult<()> {
-    if let Ok(mut slot) = state.pending_settings_deep_link.lock() {
-        *slot = Some(format!("section:{section}"));
-    }
-    open_or_focus_settings(&app)?;
-    let _ = app.emit_to(
-        EventTarget::webview_window(SETTINGS_LABEL),
-        "settings-deep-link",
-        serde_json::json!({ "kind": "section", "section": section }),
-    );
-    Ok(())
+    settings_deep_link(&state).to_section(
+        &TauriSettingsWindow::new(app.clone()),
+        &TauriEventSink::new(app),
+        &section,
+    )
 }
 
 /// V1.4-07 A: pulled by `SettingsApp.svelte` on mount to read+clear any
@@ -2112,11 +2153,7 @@ pub async fn open_settings_window_to_section(
 /// Returns `None` when no target is pending.
 #[tauri::command]
 pub async fn consume_settings_deep_link(state: State<'_, AppState>) -> AppResult<Option<String>> {
-    Ok(state
-        .pending_settings_deep_link
-        .lock()
-        .ok()
-        .and_then(|mut g| g.take()))
+    Ok(settings_deep_link(&state).take())
 }
 
 /// Trigger a tab restart from another window (typically settings). The

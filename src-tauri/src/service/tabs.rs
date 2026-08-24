@@ -667,6 +667,37 @@ impl<'a> TabService<'a> {
     /// Activate a tab AND persist its id as `session.active_tab_id`, so the
     /// user's last-active tab is restored on next launch. The settings write is
     /// debounced, so a fast Ctrl+1/Ctrl+2 burst doesn't hammer the disk.
+    /// Every live tab in registry order — the tab strip's initial fill. Live
+    /// changes arrive as `tab-created` / `tab-closed` events; this is what a
+    /// view that mounts mid-session asks.
+    pub async fn list(&self) -> Vec<crate::tabs::TabMetaWire> {
+        self.registry.lock().await.list()
+    }
+
+    /// The compose overlay's non-empty edge.
+    ///
+    /// Compose targets the currently ACTIVE tab — its non-empty edge promotes
+    /// that tab Idle→Listening and pins Listening while content remains. The
+    /// active tab is resolved here rather than sent by the frontend for the
+    /// reason every other command in this module resolves it here: the overlay
+    /// has no tab of its own, and a stale id from a webview that has not yet
+    /// seen an activation would move the wrong tab's avatar.
+    pub async fn compose_content_changed(&self, non_empty: bool) {
+        let tab = self.registry.lock().await.active();
+        let _ = self
+            .signals
+            .try_send(StateSignal::ComposeContentChanged { tab, non_empty });
+    }
+
+    /// The user dismissed a tab's error badge.
+    ///
+    /// Best-effort like every other signal send here: a full or closed channel
+    /// means the state manager is gone, and there is nothing useful to tell a
+    /// user who just clicked an X.
+    pub fn acknowledge_error(&self, tab: TabId) {
+        let _ = self.signals.try_send(StateSignal::ErrorAcknowledged { tab });
+    }
+
     pub async fn set_active(&self, tab: TabId) -> AppResult<()> {
         let id_string = tab.as_str().to_string();
         {

@@ -46,22 +46,46 @@ pub fn ensure_note_file(launch_cwd: &Path) -> AppResult<PathBuf> {
     Ok(path)
 }
 
-/// Load the note's text, creating an empty file (and `.cimp` dir) on first
-/// open. A missing file therefore never surfaces as an error to the frontend.
+/// Load one project's note text, creating an empty file (and `.cimp` dir) on
+/// first open. A missing file therefore never surfaces as an error to the
+/// frontend.
+///
+/// **Bytes, then a lossy decode — never `read_to_string`.** The note is
+/// advertised as freely hand-editable, so a stray non-UTF-8 byte (an external
+/// editor saving latin-1, a tool appending raw bytes) must degrade to a
+/// replacement char. `read_to_string` would return `Err` instead, and the tab
+/// would report a load failure for a file the user can open perfectly well in
+/// any editor — locking them out of their own scratchpad with no way back but
+/// deleting it.
+///
+/// Split from the command (V42 Phase A1-3) so that rule is checkable. The
+/// command adds nothing but `AppState`, and the input that exercises the rule
+/// is a byte only the filesystem can plant — not something a WebView can be
+/// asked to produce.
+pub fn read_note_at(launch_cwd: &Path) -> AppResult<String> {
+    let path = ensure_note_file(launch_cwd)?;
+    std::fs::read(&path)
+        .map(|bytes| decode(&bytes))
+        .map_err(AppError::Io)
+}
+
+/// The note file's bytes as text, never failing. See [`read_note_at`].
+pub fn decode(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// Load the note's text. See [`read_note_at`] for the decode rule.
 #[tauri::command]
 pub async fn read_note(state: State<'_, AppState>) -> AppResult<String> {
-    let path = ensure_note_file(&state.launch.cwd)?;
-    // Read bytes and lossily decode: the note is advertised as freely
-    // hand-editable, so a stray non-UTF-8 byte (from an external editor or
-    // tool) must degrade to a replacement char rather than making
-    // `read_to_string` fail and lock the note out of the tab entirely.
-    std::fs::read(&path)
-        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-        .map_err(AppError::Io)
+    read_note_at(&state.launch.cwd)
 }
 
 /// Persist the note's text, replacing the file's contents atomically. The
 /// `.cimp` dir is created on demand. Called by the frontend autosave.
+///
+/// **Left as a direct call** (V42 Phase A): the body is [`note_path`] and one
+/// [`crate::settings::write_atomic`], both of which the tests below already
+/// drive without a WebView.
 #[tauri::command]
 pub async fn write_note(state: State<'_, AppState>, content: String) -> AppResult<()> {
     let path = note_path(&state.launch.cwd);
@@ -91,6 +115,40 @@ mod tests {
         assert_eq!(path, note_path(&dir));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
         assert!(dir.join(".cimp").is_dir(), ".cimp dir should exist");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A stray non-UTF-8 byte must not lock the user out of their own note.**
+    ///
+    /// The note is a plain `.txt` the user is invited to edit with anything, so
+    /// a latin-1 save or a tool that appended raw bytes is a normal event, not
+    /// a corruption. `read_to_string` would fail on it and the tab would report
+    /// a load error for a file every editor opens fine. This asserts the
+    /// degrade: the bad byte becomes U+FFFD and the text on BOTH sides of it
+    /// survives — a reader that stopped at the first bad byte would pass an
+    /// assertion about the prefix alone.
+    #[test]
+    fn a_stray_non_utf8_byte_degrades_and_never_locks_the_note_out() {
+        let dir = std::env::temp_dir().join(format!("cimp_note_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut planted = b"before ".to_vec();
+        planted.push(0xff);
+        planted.extend_from_slice(b" after");
+        assert!(
+            String::from_utf8(planted.clone()).is_err(),
+            "the fixture must not be valid UTF-8, or this proves nothing"
+        );
+        crate::settings::write_atomic(&note_path(&dir), &planted).unwrap();
+
+        let text = read_note_at(&dir).expect("a hand-edited note still loads");
+        assert_eq!(
+            text,
+            format!("before {} after", char::REPLACEMENT_CHARACTER)
+        );
+        // …and the decode is the same one whether or not a file is involved.
+        assert_eq!(decode(&planted), text);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

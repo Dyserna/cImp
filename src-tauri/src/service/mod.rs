@@ -52,6 +52,7 @@ pub mod sink;
 pub mod tabs;
 pub mod usage;
 pub mod view;
+pub mod window;
 pub mod workbench;
 
 /// Run a synchronous, potentially slow operation on tokio's blocking pool.

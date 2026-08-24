@@ -149,6 +149,9 @@ pub fn snapshot_or_scan() -> Arc<PluginSet> {
 ///
 /// Never scans: this is a read of the state the startup scan (or the last
 /// Rescan) produced, so opening settings cannot be a disk walk.
+/// **Left as a direct call** (V42 Phase A): one accessor on the store Tauri
+/// injected, with no argument shaping and no ordering. Same for
+/// [`plugins_project_key`].
 #[tauri::command]
 pub fn plugins_snapshot(state: State<'_, Arc<PluginStore>>) -> Arc<PluginSet> {
     state.snapshot()
@@ -162,6 +165,7 @@ pub fn plugins_snapshot(state: State<'_, Arc<PluginStore>>) -> Arc<PluginSet> {
 /// way every consumer will look it up, which is why this goes through
 /// [`registry::project_key`] rather than the frontend joining a path itself.
 /// Canonicalization touches the disk, so it belongs on this side of the wire.
+/// **Left as a direct call**, for [`plugins_snapshot`]'s reason.
 #[tauri::command]
 pub fn plugins_project_key(state: State<'_, crate::AppState>) -> String {
     registry::project_key(&state.settings.launch_cwd())
@@ -173,6 +177,14 @@ pub fn plugins_project_key(state: State<'_, crate::AppState>) -> String {
 ///
 /// On a blocking hop because it walks a directory and reads every file in it;
 /// `audit_refresh_census`'s precedent.
+///
+/// **Left as a direct call** (V42 Phase A), and this one is a deferral rather
+/// than a "nothing to test". The rule worth pinning is the last line — a rescan
+/// writes no settings, so without `signal_native_change` nothing would tell a
+/// live session its `run_check` tool list moved — but asserting it needs an
+/// [`OffloadService`](crate::offload::OffloadService), whose constructor takes
+/// an `AppHandle`. Wrapping this before Phase A2 injects that handle would move
+/// two lines and leave the rule exactly as unassertable as it is now.
 #[tauri::command]
 pub async fn plugins_rescan(
     state: State<'_, Arc<PluginStore>>,

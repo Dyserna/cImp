@@ -589,6 +589,7 @@ fn opencode_plugin_values(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::harness::fixtures::opencode_tab_inheriting;
     use crate::harness::render::template_keys;
     use std::collections::BTreeSet;
     use std::path::PathBuf;
@@ -2321,5 +2322,54 @@ console.log("OK: the swap reached neither the gate nor the beacon");
         assert!(off.contains("const CIMP_CHECKPOINT_ENABLED = false;"), "{off}");
     }
 
-
+    /// The E2 fail-open trap, Phase H edition: a gate the user switched ON must
+    /// not be deleted because the graph (or native-web visibility) was switched
+    /// off. `opencode_plugin_wanted` is the shared predicate that prevents it.
+    #[test]
+    fn the_gate_alone_is_enough_to_keep_the_plugin_on_disk() {
+        let mut s = Settings {
+            tabs: vec![opencode_tab_inheriting()],
+            ..Settings::default()
+        };
+        let id = match &s.tabs[0] {
+            TabConfig::AiTool(c) => c.id.clone(),
+            _ => unreachable!(),
+        };
+        s.graph.enabled = false;
+        s.set_native_web_mode_for_test(NativeWebMode::Off);
+        // V39 ships this L2 on, so the baseline has to state the `off` it is
+        // about rather than borrow a default that has moved.
+        s.set_l2_for_test(
+            crate::settings::injection::Feature::HarnessNativeGate,
+            false,
+        );
+        assert!(
+            !opencode_plugin_wanted(&s, &id),
+            "nothing wants it yet — the baseline"
+        );
+        s.set_l2_for_test(
+            crate::settings::injection::Feature::HarnessNativeGate,
+            true,
+        );
+        assert!(
+            opencode_plugin_wanted(&s, &id),
+            "the gate alone must keep the file on disk"
+        );
+        // …and a per-tab `On` over an app-wide `off` does the same, for that tab.
+        s.set_l2_for_test(
+            crate::settings::injection::Feature::HarnessNativeGate,
+            false,
+        );
+        s.set_tab_override_for_test(
+            &id,
+            crate::settings::injection::Feature::HarnessNativeGate,
+            crate::settings::injection::Override::On,
+        )
+        .expect("the OpenCode tab carries a native-gate cell");
+        assert!(opencode_plugin_wanted(&s, &id));
+        assert!(
+            !opencode_plugin_wanted(&s, "some-other-tab"),
+            "and only for that tab"
+        );
+    }
 }

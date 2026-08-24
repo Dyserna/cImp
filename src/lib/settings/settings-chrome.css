@@ -408,3 +408,27 @@
   font-size: 0.9em;
   gap: var(--space-1);
 }
+/* A small pill chip beside a name or a status line. Chrome because two
+   sections use it — the offload backend list's "consent required" and the
+   Harness health panel's verdicts — and #129 (c) moved only the second into a
+   child. Only the base and the `warn` variant are here; the health panel's own
+   variants (good / bad / quiet / tcb / tier) live with that section, where a
+   scoped `.badge.<variant>` outranks this at (0,3,0). */
+.settings-chrome .badge {
+  font-size: var(--font-size-sm);
+  padding: 0.05rem 0.4rem;
+  border-radius: 999px;
+  border: 1px solid var(--border-subtle);
+}
+.settings-chrome .badge.warn {
+  color: var(--text-warning, #d08770);
+  border-color: var(--border-warning, #d08770);
+}
+/* A rejected update, a rule set that lost its files, a component that last
+   failed: the old data is still live, so this is a warning the user should act
+   on rather than an error state for the whole section. A `small.hint` variant
+   like `.warn` and `.top` above, and used by three sections (Injection
+   protection, Sandboxing, Harness health), so it belongs beside them. */
+.settings-chrome small.hint.down {
+  color: var(--danger, #c9564b);
+}

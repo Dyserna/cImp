@@ -76,7 +76,7 @@ use url::{Host, Url};
 
 use crate::error::{AppError, AppResult};
 use crate::ipc::AppState;
-use crate::settings::{SettingsHandle, TabConfig};
+use crate::settings::SettingsHandle;
 
 /// Fallback URL for a freshly created Preview tab with no remembered
 /// `Settings::preview_last_url` — a generic dev-server port, not tied to any
@@ -296,14 +296,15 @@ pub async fn preview_open(
 ) -> AppResult<()> {
     let settings = state.settings.clone();
     let allow_remote = settings.current().preview_allow_remote;
-    if !is_allowed_preview_host(&url, allow_remote) {
-        open_external(&app, &url);
-        return Err(AppError::Preview(format!(
-            "{url} is outside the Preview tab's localhost/RFC-1918 policy; opened in your browser instead"
-        )));
-    }
-    let parsed = Url::parse(&url)
-        .map_err(|e| AppError::Preview(format!("invalid preview URL {url}: {e}")))?;
+    let parsed = match crate::service::preview::admit(&url, allow_remote) {
+        Ok(parsed) => parsed,
+        Err(refused) => {
+            if refused.open_externally {
+                open_external(&app, &url);
+            }
+            return Err(refused.error);
+        }
+    };
 
     // Re-opening an id that's already live (a stray double-mount, or a
     // pane-recreate under HMR) replaces rather than leaks a second child
@@ -355,14 +356,15 @@ pub async fn preview_navigate(
     url: String,
 ) -> AppResult<()> {
     let allow_remote = state.settings.current().preview_allow_remote;
-    if !is_allowed_preview_host(&url, allow_remote) {
-        open_external(&app, &url);
-        return Err(AppError::Preview(format!(
-            "{url} is outside the Preview tab's localhost/RFC-1918 policy; opened in your browser instead"
-        )));
-    }
-    let parsed = Url::parse(&url)
-        .map_err(|e| AppError::Preview(format!("invalid preview URL {url}: {e}")))?;
+    let parsed = match crate::service::preview::admit(&url, allow_remote) {
+        Ok(parsed) => parsed,
+        Err(refused) => {
+            if refused.open_externally {
+                open_external(&app, &url);
+            }
+            return Err(refused.error);
+        }
+    };
     let webview = registry
         .get(&tab_id)
         .ok_or_else(|| AppError::Preview(format!("no open preview webview for tab {tab_id}")))?;
@@ -376,6 +378,13 @@ pub async fn preview_navigate(
 /// this re-navigates to the webview's own current URL — equivalent for a
 /// Preview tab's purposes (there's no form-resubmission confirmation dialog
 /// concern here the way a general browser's reload has).
+///
+/// **Left as a direct call** (V42 Phase A): registry lookup, one method on
+/// the Tauri `Webview` it hands back, error wrap. A service in front of this
+/// would need a trait method per `Webview` method — `Webview` with extra
+/// steps, which is what `WebviewHost`'s doc refuses. The two decisions in
+/// these commands (the navigation policy, the toolbar's persistence) are
+/// `service::preview`'s; the effects stay here.
 #[tauri::command]
 pub async fn preview_reload(registry: State<'_, PreviewRegistry>, tab_id: String) -> AppResult<()> {
     let webview = registry
@@ -396,6 +405,8 @@ pub async fn preview_reload(registry: State<'_, PreviewRegistry>, tab_id: String
 /// matching `getBoundingClientRect()` regardless of the OS display scale
 /// factor, which is also what keeps a later [`preview_capture`] at
 /// CSS-pixel scale rather than a HiDPI-inflated one.
+///
+/// **Left as a direct call**, for [`preview_reload`]'s reason.
 #[tauri::command]
 pub async fn preview_set_rect(
     registry: State<'_, PreviewRegistry>,
@@ -420,6 +431,8 @@ pub async fn preview_set_rect(
 /// than tearing down and rebuilding the child webview on every tab flip, and
 /// preserves in-page state (scroll position, form input) the way a real
 /// browser tab would. Paired with [`preview_show`].
+///
+/// **Left as a direct call**, for [`preview_reload`]'s reason.
 #[tauri::command]
 pub async fn preview_hide(registry: State<'_, PreviewRegistry>, tab_id: String) -> AppResult<()> {
     let webview = registry
@@ -431,6 +444,8 @@ pub async fn preview_hide(registry: State<'_, PreviewRegistry>, tab_id: String) 
 }
 
 /// Show a previously-hidden Preview tab's webview on tab-switch-back.
+///
+/// **Left as a direct call**, for [`preview_reload`]'s reason.
 #[tauri::command]
 pub async fn preview_show(registry: State<'_, PreviewRegistry>, tab_id: String) -> AppResult<()> {
     let webview = registry
@@ -445,6 +460,8 @@ pub async fn preview_show(registry: State<'_, PreviewRegistry>, tab_id: String) 
 /// permanent — a closed Preview tab that gets reopened calls [`preview_open`]
 /// fresh). A missing `tab_id` is a no-op, not an error — closing an already-
 /// closed (or never-opened) tab is a normal race during teardown.
+///
+/// **Left as a direct call**, for [`preview_reload`]'s reason.
 #[tauri::command]
 pub async fn preview_close(registry: State<'_, PreviewRegistry>, tab_id: String) -> AppResult<()> {
     destroy_if_open(&registry, &tab_id);
@@ -502,14 +519,12 @@ pub async fn preview_update_config(
     device_width: Option<u32>,
     auto_reload: bool,
 ) -> AppResult<()> {
-    state.settings.mutate(move |snap| {
-        if let Some(TabConfig::Preview(cfg)) = snap.tabs.iter_mut().find(|t| t.id() == tab_id) {
-            cfg.url = url.clone();
-            cfg.device_width = device_width;
-            cfg.auto_reload = auto_reload;
-        }
-        snap.preview_last_url = Some(url.clone());
-    });
+    crate::service::preview::PreviewConfig::new(&state.settings).remember(
+        tab_id,
+        url,
+        device_width,
+        auto_reload,
+    );
     Ok(())
 }
 
@@ -525,6 +540,8 @@ pub async fn preview_update_config(
 /// a live WebView2 instance has not been exercised — see `preview::capture`'s
 /// doc comment for the specific COM call and why file-backed capture was
 /// chosen over in-memory `IStream` extraction.
+///
+/// **Left as a direct call**, for [`preview_reload`]'s reason.
 #[tauri::command]
 pub async fn preview_capture(
     state: State<'_, AppState>,

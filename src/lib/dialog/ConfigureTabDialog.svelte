@@ -7,9 +7,9 @@
   // Save calls `reconfigure_shell_tab`; the running PTY does NOT
   // restart — per design, the new config takes effect on next restart.
   // A footer note communicates this to the user.
-  import { onMount } from 'svelte';
   import { get } from 'svelte/store';
   import { closeDialog, dialogState } from './store';
+  import ModalShell from './ModalShell.svelte';
   import {
     getShellTabConfig,
     reconfigureShellTab,
@@ -342,174 +342,136 @@
       busy = false;
     }
   }
-
-  function onKeyDown(e: KeyboardEvent): void {
-    if (!isOpen) return;
-    if (e.key === 'Escape') {
-      e.preventDefault();
-      cancel();
-    } else if (e.key === 'Enter' && (e.target as HTMLElement)?.tagName !== 'BUTTON') {
-      e.preventDefault();
-      void save();
-    }
-  }
-
-  onMount(() => {
-    window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
-  });
 </script>
 
-{#if isOpen}
-  <div class="backdrop" onclick={cancel} role="presentation"></div>
-  <div class="card" role="dialog" aria-label="Configure tab">
-    <h2>Configure tab</h2>
-    <ShellTabFields
-      bind:name
-      bind:command
-      bind:argsString
-      bind:cwd
-      bind:notificationsError
-      bind:notificationsExited
-      {error}
-    />
-    <div class="env-field">
-      <span class="env-label">Environment variables</span>
-      <EnvEditor {env} onchange={(v) => (env = v)} />
-      <small class="hint-row no-indent">
-        Extra env vars for this shell's process. Applied on next restart.
-      </small>
-    </div>
-    {#if error && !['empty-name', 'command-not-found', 'cwd-not-found'].includes(error.kind)}
-      <div class="generic-error">
-        {#if error.kind === 'wrong-kind'}
-          This tab cannot be reconfigured.
-        {:else if error.kind === 'tab-not-found'}
-          Tab not found.
-        {:else if error.kind === 'internal'}
-          {error.message}
-        {:else}
-          {error.kind}
-        {/if}
-      </div>
-    {/if}
-
-    <h3 class="section-h">Appearance</h3>
-    <label class="appearance-row">
-      <span>Terminal palette</span>
-      <select
-        value={overrideSelection}
-        onchange={(e) =>
-          selectOverride((e.currentTarget as HTMLSelectElement).value)}
-      >
-        <option value="__inherit">Use global default (current: {globalThemeName})</option>
-        {#each $paletteRegistry as p}
-          <option value={p.name}>{p.name}</option>
-        {/each}
-        <option value="Custom">Custom…</option>
-      </select>
-      {#if themeOverride !== null}
-        <ThemeSwatch name={themeOverride.name} custom={themeOverride.custom} />
-      {/if}
-    </label>
-    {#if themeOverride && themeOverride.name === 'Custom' && themeOverride.custom}
-      <CustomThemeEditor
-        value={themeOverride.custom}
-        onchange={(next) => {
-          themeOverride = themeOverride
-            ? { ...themeOverride, custom: next }
-            : null;
-        }}
-      />
-    {/if}
-
-    <label class="appearance-row">
-      <span>Background</span>
-      <select
-        value={bgOverrideSelection}
-        onchange={(e) =>
-          selectBgOverride(
-            (e.currentTarget as HTMLSelectElement).value as BgOverrideMode,
-          )}
-      >
-        <option value="__inherit"
-          >Use global default (current: {globalBgSummary})</option
-        >
-        <option value="__disabled"
-          >Disabled — use theme background only</option
-        >
-        <option value="__custom">Custom for this tab</option>
-      </select>
-    </label>
-    {#if bgOverrideSelection === '__disabled'}
-      <small class="hint-row">
-        No observable effect when the global background is also "Theme
-        default."
-      </small>
-    {/if}
-    {#if bgOverrideSelection === '__custom' && backgroundOverride !== null && backgroundOverride !== 'disabled' && typeof backgroundOverride === 'object'}
-      <BackgroundConfigEditor
-        bind:config={
-          () => backgroundOverride as TerminalBackgroundSettings,
-          (v) => {
-            // V1.4-04 C: every editor change writes through to the
-            // store so the running terminal repaints live. The setter
-            // is async-fire-and-forget; the next read of
-            // `backgroundOverride` (which is $derived from the store)
-            // reflects the change once `applySettings` resolves.
-            void writeBackgroundOverride(v);
-          }
-        }
-      />
-      {#if pendingBackgroundOverride.kind === 'pending'}
-        <small class="hint-row">
-          Image / category change pending. Save to apply.
-        </small>
-      {/if}
-    {/if}
-
-    <small class="footer-note">
-      Changes apply on next shell restart. Palette changes apply
-      immediately.
+<ModalShell
+  open={isOpen}
+  label="Configure tab"
+  title="Configure tab"
+  width={560}
+  onCancel={cancel}
+  onEscape={cancel}
+  onEnter={() => void save()}
+>
+  <ShellTabFields
+    bind:name
+    bind:command
+    bind:argsString
+    bind:cwd
+    bind:notificationsError
+    bind:notificationsExited
+    {error}
+  />
+  <div class="env-field">
+    <span class="env-label">Environment variables</span>
+    <EnvEditor {env} onchange={(v) => (env = v)} />
+    <small class="hint-row no-indent">
+      Extra env vars for this shell's process. Applied on next restart.
     </small>
-    <div class="actions">
-      <button type="button" class="cancel" onclick={cancel} disabled={busy}>
-        Cancel
-      </button>
-      <button type="button" class="primary" onclick={save} disabled={busy}>
-        {busy ? 'Saving…' : 'Save'}
-      </button>
-    </div>
   </div>
-{/if}
+  {#if error && !['empty-name', 'command-not-found', 'cwd-not-found'].includes(error.kind)}
+    <div class="generic-error">
+      {#if error.kind === 'wrong-kind'}
+        This tab cannot be reconfigured.
+      {:else if error.kind === 'tab-not-found'}
+        Tab not found.
+      {:else if error.kind === 'internal'}
+        {error.message}
+      {:else}
+        {error.kind}
+      {/if}
+    </div>
+  {/if}
+
+  <h3 class="section-h">Appearance</h3>
+  <label class="appearance-row">
+    <span>Terminal palette</span>
+    <select
+      value={overrideSelection}
+      onchange={(e) =>
+        selectOverride((e.currentTarget as HTMLSelectElement).value)}
+    >
+      <option value="__inherit">Use global default (current: {globalThemeName})</option>
+      {#each $paletteRegistry as p}
+        <option value={p.name}>{p.name}</option>
+      {/each}
+      <option value="Custom">Custom…</option>
+    </select>
+    {#if themeOverride !== null}
+      <ThemeSwatch name={themeOverride.name} custom={themeOverride.custom} />
+    {/if}
+  </label>
+  {#if themeOverride && themeOverride.name === 'Custom' && themeOverride.custom}
+    <CustomThemeEditor
+      value={themeOverride.custom}
+      onchange={(next) => {
+        themeOverride = themeOverride
+          ? { ...themeOverride, custom: next }
+          : null;
+      }}
+    />
+  {/if}
+
+  <label class="appearance-row">
+    <span>Background</span>
+    <select
+      value={bgOverrideSelection}
+      onchange={(e) =>
+        selectBgOverride(
+          (e.currentTarget as HTMLSelectElement).value as BgOverrideMode,
+        )}
+    >
+      <option value="__inherit"
+        >Use global default (current: {globalBgSummary})</option
+      >
+      <option value="__disabled"
+        >Disabled — use theme background only</option
+      >
+      <option value="__custom">Custom for this tab</option>
+    </select>
+  </label>
+  {#if bgOverrideSelection === '__disabled'}
+    <small class="hint-row">
+      No observable effect when the global background is also "Theme
+      default."
+    </small>
+  {/if}
+  {#if bgOverrideSelection === '__custom' && backgroundOverride !== null && backgroundOverride !== 'disabled' && typeof backgroundOverride === 'object'}
+    <BackgroundConfigEditor
+      bind:config={
+        () => backgroundOverride as TerminalBackgroundSettings,
+        (v) => {
+          // V1.4-04 C: every editor change writes through to the
+          // store so the running terminal repaints live. The setter
+          // is async-fire-and-forget; the next read of
+          // `backgroundOverride` (which is $derived from the store)
+          // reflects the change once `applySettings` resolves.
+          void writeBackgroundOverride(v);
+        }
+      }
+    />
+    {#if pendingBackgroundOverride.kind === 'pending'}
+      <small class="hint-row">
+        Image / category change pending. Save to apply.
+      </small>
+    {/if}
+  {/if}
+
+  <small class="footer-note">
+    Changes apply on next shell restart. Palette changes apply
+    immediately.
+  </small>
+  {#snippet actions()}
+    <button type="button" class="cancel" onclick={cancel} disabled={busy}>
+      Cancel
+    </button>
+    <button type="button" class="primary" onclick={save} disabled={busy}>
+      {busy ? 'Saving…' : 'Save'}
+    </button>
+  {/snippet}
+</ModalShell>
 
 <style>
-  .backdrop {
-    position: fixed;
-    inset: 0;
-    background: rgba(0, 0, 0, 0.5);
-    z-index: 100;
-  }
-  .card {
-    position: fixed;
-    top: 50%;
-    left: 50%;
-    transform: translate(-50%, -50%);
-    background: var(--surface-3);
-    border: 1px solid var(--border-subtle);
-    border-radius: var(--radius-lg);
-    padding: 20px var(--space-5);
-    width: 560px;
-    max-width: calc(100vw - 40px);
-    color: var(--text-primary);
-    z-index: 101;
-    box-shadow: var(--shadow-lg);
-  }
-  h2 {
-    margin: 0 0 var(--space-4);
-    font-size: 16px;
-    font-weight: 600;
-  }
   .section-h {
     margin: var(--space-4) 0 var(--space-2) 0;
     font-size: var(--font-size-sm);
@@ -563,26 +525,6 @@
   .env-label {
     font-size: var(--font-size-sm);
     color: var(--text-quiet);
-  }
-  .actions {
-    display: flex;
-    justify-content: flex-end;
-    gap: var(--space-2);
-    margin-top: var(--space-4);
-  }
-  .actions button {
-    padding: 6px var(--space-4);
-    border-radius: var(--radius-md);
-    cursor: pointer;
-    font-size: var(--font-size-md);
-    border: 1px solid var(--border-default);
-    transition:
-      background var(--motion-fast) var(--easing-standard),
-      border-color var(--motion-fast) var(--easing-standard);
-  }
-  .actions button:focus-visible {
-    outline: 2px solid var(--accent);
-    outline-offset: 2px;
   }
   .cancel {
     background: var(--surface-4);

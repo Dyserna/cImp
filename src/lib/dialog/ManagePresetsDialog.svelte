@@ -4,8 +4,8 @@
   // reactively from the live `settings.layout_presets` array — every
   // CRUD action updates the array via the settings broadcast, no
   // local refresh needed.
-  import { onMount } from 'svelte';
   import { closeDialog, dialogState } from './store';
+  import ModalShell from './ModalShell.svelte';
   import { settings } from '../settings/store';
   import {
     deleteLayoutPreset,
@@ -109,26 +109,6 @@
     confirmingDelete = null;
   }
 
-  function onKeyDown(e: KeyboardEvent): void {
-    if (!isOpen) return;
-    if (e.key === 'Escape') {
-      // Let the inline edit/confirm handlers consume Escape first by
-      // checking for those states.
-      if (editingName !== null) {
-        e.preventDefault();
-        cancelEdit();
-        return;
-      }
-      if (confirmingDelete !== null) {
-        e.preventDefault();
-        cancelDelete();
-        return;
-      }
-      e.preventDefault();
-      close();
-    }
-  }
-
   function formatTimestamp(p: LayoutPreset): string {
     return p.created_at.replace('T', ' ').replace('Z', ' UTC').slice(0, 19);
   }
@@ -142,11 +122,6 @@
     node.select();
   }
 
-  onMount(() => {
-    window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
-  });
-
   $effect(() => {
     if (!isOpen) {
       editingName = null;
@@ -157,121 +132,111 @@
   });
 </script>
 
-{#if isOpen}
-  <div class="backdrop" onclick={close} role="presentation"></div>
-  <div class="card" role="dialog" aria-label="Manage layout presets">
-    <h2>Manage layout presets</h2>
-    {#if presets.length === 0}
-      <div class="empty">
-        No layout presets saved yet. Use “Save current layout as…” from the
-        Layouts menu to create one.
-      </div>
-    {:else}
-      <ul class="list">
-        {#each presets as preset (preset.name)}
-          <li class="row">
-            <div class="info">
-              {#if editingName === preset.name}
-                <input
-                  type="text"
-                  class="edit-input"
-                  bind:value={editValue}
-                  onkeydown={handleEditKey}
-                  onblur={() => void commitRename()}
-                  use:focusOnMount
-                />
-                {#if editError}
-                  <div class="row-error">{editError}</div>
-                {/if}
-              {:else}
-                <span class="name">{preset.name}</span>
-                <span class="timestamp">{formatTimestamp(preset)}</span>
-              {/if}
-            </div>
-            <div class="row-actions">
-              {#if confirmingDelete === preset.name}
-                <span class="confirm-label">Delete?</span>
-                <button
-                  type="button"
-                  class="danger"
-                  onclick={() => void performDelete()}
-                >
-                  Yes
-                </button>
-                <button
-                  type="button"
-                  class="cancel"
-                  onclick={cancelDelete}
-                >
-                  No
-                </button>
-              {:else}
-                <button
-                  type="button"
-                  class="action"
-                  onclick={() => handleRestore(preset)}
-                  disabled={editingName !== null}
-                >
-                  Restore
-                </button>
-                <button
-                  type="button"
-                  class="action"
-                  onclick={() => startEdit(preset)}
-                  disabled={editingName !== null}
-                >
-                  Rename
-                </button>
-                <button
-                  type="button"
-                  class="danger"
-                  onclick={() => askDelete(preset)}
-                  disabled={editingName !== null}
-                >
-                  Delete
-                </button>
-              {/if}
-            </div>
-          </li>
-        {/each}
-      </ul>
-    {/if}
-    <div class="actions">
-      <button type="button" class="primary" onclick={close}>Close</button>
+<ModalShell
+  open={isOpen}
+  label="Manage layout presets"
+  title="Manage layout presets"
+  width={520}
+  fit="column"
+  titleGap="md"
+  onCancel={close}
+  onEscape={() => {
+    // The inline rename and the delete confirm consume Escape first:
+    // closing the dialog out from under an open editor would be a
+    // surprise. This is now the only Escape handler in the file, so the
+    // ordering is a branch rather than two listeners racing.
+    if (editingName !== null) {
+      cancelEdit();
+      return;
+    }
+    if (confirmingDelete !== null) {
+      cancelDelete();
+      return;
+    }
+    close();
+  }}
+>
+  {#if presets.length === 0}
+    <div class="empty">
+      No layout presets saved yet. Use “Save current layout as…” from the
+      Layouts menu to create one.
     </div>
-  </div>
-{/if}
+  {:else}
+    <ul class="list">
+      {#each presets as preset (preset.name)}
+        <li class="row">
+          <div class="info">
+            {#if editingName === preset.name}
+              <input
+                type="text"
+                class="edit-input"
+                bind:value={editValue}
+                onkeydown={handleEditKey}
+                onblur={() => void commitRename()}
+                use:focusOnMount
+              />
+              {#if editError}
+                <div class="row-error">{editError}</div>
+              {/if}
+            {:else}
+              <span class="name">{preset.name}</span>
+              <span class="timestamp">{formatTimestamp(preset)}</span>
+            {/if}
+          </div>
+          <div class="row-actions">
+            {#if confirmingDelete === preset.name}
+              <span class="confirm-label">Delete?</span>
+              <button
+                type="button"
+                class="danger"
+                onclick={() => void performDelete()}
+              >
+                Yes
+              </button>
+              <button
+                type="button"
+                class="cancel"
+                onclick={cancelDelete}
+              >
+                No
+              </button>
+            {:else}
+              <button
+                type="button"
+                class="action"
+                onclick={() => handleRestore(preset)}
+                disabled={editingName !== null}
+              >
+                Restore
+              </button>
+              <button
+                type="button"
+                class="action"
+                onclick={() => startEdit(preset)}
+                disabled={editingName !== null}
+              >
+                Rename
+              </button>
+              <button
+                type="button"
+                class="danger"
+                onclick={() => askDelete(preset)}
+                disabled={editingName !== null}
+              >
+                Delete
+              </button>
+            {/if}
+          </div>
+        </li>
+      {/each}
+    </ul>
+  {/if}
+  {#snippet actions()}
+    <button type="button" class="primary" onclick={close}>Close</button>
+  {/snippet}
+</ModalShell>
 
 <style>
-  .backdrop {
-    position: fixed;
-    inset: 0;
-    background: rgba(0, 0, 0, 0.5);
-    z-index: 100;
-  }
-  .card {
-    position: fixed;
-    top: 50%;
-    left: 50%;
-    transform: translate(-50%, -50%);
-    background: var(--surface-3);
-    border: 1px solid var(--border-subtle);
-    border-radius: var(--radius-lg);
-    padding: 20px var(--space-5);
-    width: 520px;
-    max-width: calc(100vw - 40px);
-    max-height: calc(100vh - 80px);
-    color: var(--text-primary);
-    z-index: 101;
-    box-shadow: var(--shadow-lg);
-    display: flex;
-    flex-direction: column;
-  }
-  h2 {
-    margin: 0 0 var(--space-3);
-    font-size: 16px;
-    font-weight: 600;
-  }
   .empty {
     color: var(--text-tertiary);
     font-style: italic;
@@ -376,30 +341,23 @@
     font-size: var(--font-size-sm);
     color: var(--text-warning);
   }
-  .actions {
-    display: flex;
-    justify-content: flex-end;
-    margin-top: var(--space-4);
-  }
+  /* #128: this file used to re-declare the whole button (padding, radius,
+     border, transition) inside `.primary`, because it was the only dialog with
+     no `.actions button` base. `ModalShell` supplies that base now, so
+     `.primary` is the same four-line modifier the other six dialogs carry and
+     the focus ring comes from the shell. One consequence, deliberately
+     accepted: `.actions button` is (0,2,1) and `.primary` is (0,2,0), so the
+     shorthand `border` wins over `border-color` and this button's 1px ring is
+     `--border-default` rather than `--accent` — which is exactly what the
+     other six primaries already looked like. */
   .primary {
-    padding: 6px var(--space-4);
-    border-radius: var(--radius-md);
-    cursor: pointer;
-    font-size: var(--font-size-md);
-    border: 1px solid var(--accent);
     background: var(--accent);
     color: var(--accent-fg);
+    border-color: var(--accent);
     font-weight: var(--font-weight-semibold);
-    transition:
-      background var(--motion-fast) var(--easing-standard),
-      border-color var(--motion-fast) var(--easing-standard);
   }
-  .primary:hover {
+  .primary:hover:not([disabled]) {
     background: var(--accent-hover);
     border-color: var(--accent-hover);
-  }
-  .primary:focus-visible {
-    outline: 2px solid var(--accent);
-    outline-offset: 2px;
   }
 </style>

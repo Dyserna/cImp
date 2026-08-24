@@ -3,9 +3,9 @@
   // store's discriminator is `'new-shell-tab'`. Defaults are populated
   // from `default_shell_spec` on open. Submit calls `create_shell_tab`;
   // backend validation errors flow back into the shared field component.
-  import { onMount } from 'svelte';
   import { get } from 'svelte/store';
   import { closeDialog, dialogState } from './store';
+  import ModalShell from './ModalShell.svelte';
   import { createShellTab, defaultShellSpec, type TabLifecycleError } from '../ipc';
   import { cancelPlacement, requestTabIntoPane } from '../layout/store';
   import { tabs } from '../tabs/store';
@@ -116,92 +116,53 @@
       busy = false;
     }
   }
-
-  function onKeyDown(e: KeyboardEvent): void {
-    if (!isOpen) return;
-    if (e.key === 'Escape') {
-      e.preventDefault();
-      cancel();
-    } else if (e.key === 'Enter' && (e.target as HTMLElement)?.tagName !== 'BUTTON') {
-      // Enter on any input submits — convention for short modal forms.
-      e.preventDefault();
-      void submit();
-    }
-  }
-
-  onMount(() => {
-    window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
-  });
 </script>
 
-{#if isOpen}
-  <div class="backdrop" onclick={cancel} role="presentation"></div>
-  <div class="card" role="dialog" aria-label="New shell tab">
-    <h2>New shell tab</h2>
-    <ShellTabFields
-      bind:name
-      bind:command
-      bind:argsString
-      bind:cwd
-      bind:notificationsError
-      bind:notificationsExited
-      {error}
-      {showGitBashBanner}
-    />
-    <div class="env-field">
-      <span class="env-label">Environment variables</span>
-      <EnvEditor {env} onchange={(v) => (env = v)} />
-    </div>
-    {#if error && !['empty-name', 'command-not-found', 'cwd-not-found'].includes(error.kind)}
-      <div class="generic-error">
-        {#if error.kind === 'spawn-failed'}
-          Failed to spawn: {error.message}
-        {:else if error.kind === 'internal'}
-          {error.message}
-        {:else}
-          {error.kind}
-        {/if}
-      </div>
-    {/if}
-    <div class="actions">
-      <button type="button" class="cancel" onclick={cancel} disabled={busy}>
-        Cancel
-      </button>
-      <button type="button" class="primary" onclick={submit} disabled={busy}>
-        {busy ? 'Creating…' : 'Create'}
-      </button>
-    </div>
+<ModalShell
+  open={isOpen}
+  label="New shell tab"
+  title="New shell tab"
+  width={480}
+  onCancel={cancel}
+  onEscape={cancel}
+  onEnter={() => void submit()}
+>
+  <ShellTabFields
+    bind:name
+    bind:command
+    bind:argsString
+    bind:cwd
+    bind:notificationsError
+    bind:notificationsExited
+    {error}
+    {showGitBashBanner}
+  />
+  <div class="env-field">
+    <span class="env-label">Environment variables</span>
+    <EnvEditor {env} onchange={(v) => (env = v)} />
   </div>
-{/if}
+  {#if error && !['empty-name', 'command-not-found', 'cwd-not-found'].includes(error.kind)}
+    <div class="generic-error">
+      {#if error.kind === 'spawn-failed'}
+        Failed to spawn: {error.message}
+      {:else if error.kind === 'internal'}
+        {error.message}
+      {:else}
+        {error.kind}
+      {/if}
+    </div>
+  {/if}
+  {#snippet actions()}
+    <button type="button" class="cancel" onclick={cancel} disabled={busy}>
+      Cancel
+    </button>
+    <button type="button" class="primary" onclick={submit} disabled={busy}>
+      {busy ? 'Creating…' : 'Create'}
+    </button>
+  {/snippet}
+</ModalShell>
 
 <style>
-  .backdrop {
-    position: fixed;
-    inset: 0;
-    background: rgba(0, 0, 0, 0.5);
-    z-index: 100;
-  }
-  .card {
-    position: fixed;
-    top: 50%;
-    left: 50%;
-    transform: translate(-50%, -50%);
-    background: var(--surface-3);
-    border: 1px solid var(--border-subtle);
-    border-radius: var(--radius-lg);
-    padding: 20px var(--space-5);
-    width: 480px;
-    max-width: calc(100vw - 40px);
-    color: var(--text-primary);
-    z-index: 101;
-    box-shadow: var(--shadow-lg);
-  }
-  h2 {
-    margin: 0 0 var(--space-4);
-    font-size: 16px;
-    font-weight: 600;
-  }
   .env-field {
     display: flex;
     flex-direction: column;
@@ -211,26 +172,6 @@
   .env-label {
     font-size: var(--font-size-sm);
     color: var(--text-quiet);
-  }
-  .actions {
-    display: flex;
-    justify-content: flex-end;
-    gap: var(--space-2);
-    margin-top: var(--space-4);
-  }
-  .actions button {
-    padding: 6px var(--space-4);
-    border-radius: var(--radius-md);
-    cursor: pointer;
-    font-size: var(--font-size-md);
-    border: 1px solid var(--border-default);
-    transition:
-      background var(--motion-fast) var(--easing-standard),
-      border-color var(--motion-fast) var(--easing-standard);
-  }
-  .actions button:focus-visible {
-    outline: 2px solid var(--accent);
-    outline-offset: 2px;
   }
   .cancel {
     background: var(--surface-4);

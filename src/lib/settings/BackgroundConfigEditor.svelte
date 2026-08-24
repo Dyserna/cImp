@@ -290,6 +290,9 @@
     margin: 0;
   }
   .field > span:first-child {
+    /* #129 (a): `settings-chrome.css`'s `label > span:first-child` reaches
+       these now and would add a `margin-bottom` on top of `.field`'s gap. */
+    margin-bottom: 0;
     color: var(--text-quiet-strong);
     font-size: var(--font-size-sm);
     font-variant-numeric: tabular-nums;
@@ -325,7 +328,12 @@
     background: var(--surface-2);
     border-radius: var(--radius-md);
   }
-  .hint {
+  /* #129 (a): scoped under `.bg-editor` (0,3,0) so it outranks the hoisted
+     `settings-chrome.css` rule `small.hint` (0,2,1). This component's CSS lands
+     in the SHARED chunk, which the settings window loads BEFORE the chrome
+     sheet, so a specificity tie here would go to the chrome sheet, not to this
+     file — and this hint's line-height and margins differ from the chrome's. */
+  .bg-editor .hint {
     display: block;
     color: var(--text-tertiary);
     font-size: var(--font-size-xs);

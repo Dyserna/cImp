@@ -57,6 +57,33 @@ pub struct PtyLaunchSpec {
     pub harness: Option<crate::sandbox::tabs::Harness>,
 }
 
+/// Everything one PTY launch needs, in one value.
+///
+/// R25: [`PtyManager::start`] used to take these as nine positional
+/// parameters, which is how a `clippy::too_many_arguments` allow ends up on a
+/// 350-line function and how two callers that must pass the SAME things stop
+/// looking alike. A named field per argument also makes the two same-typed
+/// neighbours (`initial_rows` / `initial_cols`) impossible to transpose
+/// silently.
+///
+/// Construction is the caller's whole contribution: `start` destructures this
+/// on its first line and then runs exactly the body it ran before, so nothing
+/// here touches the synchronous stretch the H1-R3 note in that body protects.
+pub struct PtyStart {
+    pub app: AppHandle,
+    pub spec: PtyLaunchSpec,
+    pub output_channel: Channel<String>,
+    pub initial_rows: u16,
+    pub initial_cols: u16,
+    pub tts_segments: mpsc::Sender<TtsRequest>,
+    pub state_signals: mpsc::Sender<StateSignal>,
+    pub patterns: Arc<Vec<PermissionPattern>>,
+    /// V39 review R-5: the generation this start is filed under, from
+    /// `TabActivity::begin_start`. Every exit this start can produce carries
+    /// it, so an exit handled after a later restart is ignorable.
+    pub start_gen: u64,
+}
+
 pub struct PtyManager {
     inner: Arc<TokioMutex<Option<PtyHandle>>>,
 }
@@ -273,22 +300,18 @@ impl PtyManager {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub async fn start(
-        &self,
-        app: AppHandle,
-        spec: PtyLaunchSpec,
-        output_channel: Channel<String>,
-        initial_rows: u16,
-        initial_cols: u16,
-        tts_segments: mpsc::Sender<TtsRequest>,
-        state_signals: mpsc::Sender<StateSignal>,
-        patterns: Arc<Vec<PermissionPattern>>,
-        // V39 review R-5: the generation this start is filed under, from
-        // `TabActivity::begin_start`. Every exit this start can produce carries
-        // it, so an exit handled after a later restart is ignorable.
-        start_gen: u64,
-    ) -> AppResult<()> {
+    pub async fn start(&self, start: PtyStart) -> AppResult<()> {
+        let PtyStart {
+            app,
+            spec,
+            output_channel,
+            initial_rows,
+            initial_cols,
+            tts_segments,
+            state_signals,
+            patterns,
+            start_gen,
+        } = start;
         let mut guard = self.inner.lock().await;
         if guard.is_some() {
             return Err(AppError::AlreadyStarted);

@@ -372,49 +372,30 @@ pub(crate) fn tab_consumer(cfg: &AiToolTabConfig) -> Option<&'static str> {
 
 // ── V32 Phase F — native-web visibility (locked decision 14) ───────────────
 
-/// V32 Phase F: what cImp does about the harness's OWN web tools, applied per
-/// consumer at TAB SPAWN (locked decision 14).
-///
-/// All three modes act only at spawn, which is why
-/// [`spawn_inject_sig`] carries this value: a running tab keeps whatever it
-/// launched with, and the user is owed the restart hint.
-/// V32 Phase G moved the type itself into
-/// [`settings::injection`](crate::settings::injection) — the mode IS the
-/// native-web feature's L2, so parsing it and resolving the hierarchy over it
-/// had to live together or the two would drift. The alias keeps this module's
-/// (and its tests') vocabulary unchanged.
-pub(crate) use crate::settings::injection::NativeWebMode as NativeWebVisibility;
-
-/// The native-web mode in force **for one tab**.
-///
-/// V32 Phase G: no longer a plain settings read. The mode is resolved through
-/// the three-level hierarchy at this tab's scope, so the master switch and a
-/// per-tab override both reach it — see
-/// [`injection::native_web_mode`](crate::settings::injection::native_web_mode)
-/// for the composition, including what an L3 `On` means over an app-wide `off`.
-pub(crate) fn native_web_for(s: &Settings, agent: &str, tab: &str) -> NativeWebVisibility {
-    crate::settings::injection::native_web_mode(
-        s,
-        crate::settings::injection::Scope::Tab { agent, tab },
-    )
-}
-
-/// V32 Phase G: whether Phase D's consumer-hygiene injections apply to one tab
-/// (the pinned OpenCode permission block and the injection-hygiene guidance
-/// paragraph). Both are spawn-baked, so both ride `spawn_inject_sig`.
-pub(crate) fn consumer_hygiene_for(s: &Settings, agent: &str, tab: &str) -> bool {
-    crate::settings::injection::effective(
-        crate::settings::injection::Feature::ConsumerHygiene,
-        crate::settings::injection::Scope::Tab { agent, tab },
-        s,
-    )
-}
+// `native_web_for` and `consumer_hygiene_for` lived here until V42 (#124
+// R25), as four-line forwards to `settings::injection::{native_web_mode,
+// effective}` — plus a `NativeWebVisibility` alias for a type V32 Phase G had
+// already renamed `NativeWebMode` and moved to `settings::injection`. Their
+// callers were the two harness plugins — which V40 chartered to stop reaching
+// into core `tabs::` for what is a settings question — plus, for hygiene, ONE
+// caller in this file (`injection_hygiene_applies`). All of them resolve the
+// same three-level hierarchy through `injection` directly now; the in-file
+// one reads it inline, because a forward with a single caller in its own
+// module is a rename, not an abstraction.
+// The COMPOSITION those forwards documented is unchanged and documented where
+// it happens (`injection::native_web_mode`, `Feature::ConsumerHygiene`);
+// nothing about the modes, the scopes or the spawn-baked discipline moved.
+//
+// `tool_steering_for` below stays, and the difference is not caller count: it
+// is not a forward. It const-asserts `Feature::ToolSteering.baked_at_spawn()`,
+// so a feature that stopped being spawn-baked fails the BUILD here rather than
+// silently costing a mid-session tab its restart hint.
 
 /// Whether the managed-tool steering paragraph applies to one tab.
 ///
-/// The sibling of [`consumer_hygiene_for`] — same channel, same spawn-baked
-/// shape, same per-tab resolution — so the two switches are read the same way
-/// and neither can drift into a raw settings read.
+/// Resolved through [`injection::effective`](crate::settings::injection::effective)
+/// at this tab's scope, like every other spawn-baked injection switch — so it
+/// cannot drift into a raw settings read.
 ///
 /// `baked_at_spawn` is const-asserted because this value is written into a
 /// system-prompt addendum at launch: if the feature ever stopped reporting
@@ -633,21 +614,31 @@ pub(crate) fn compose_capability_guidance(cfg: &AiToolTabConfig, settings: &Sett
 /// window in which EXTERNAL content reaches a session that was never taught how
 /// to read it. Teaching it always is the fail-safe direction, and it is what the
 /// switch's OTHER half already does — `build_opencode_config` writes the pinned
-/// `permission` block on `consumer_hygiene_for` alone, with no advertise gate.
+/// `permission` block on `Feature::ConsumerHygiene` alone, with no advertise
+/// gate.
 ///
 /// The cost, stated: a user with every cImp feature off now gets one paragraph
 /// of `--append-system-prompt` (or one managed instructions file) per AI tab.
 /// Turning the consumer-hygiene control off is the escape hatch, exactly as it
 /// is for the permission pins.
 ///
-/// Still consumer-specific, because `consumer_hygiene_for` resolves per tab and
-/// per agent. **V40 Phase A**: a command that names no registered harness is
+/// Still consumer-specific, because the feature resolves per tab and per
+/// agent. **V40 Phase A**: a command that names no registered harness is
 /// no longer "treated as OpenCode" — it has no consumer, so it gets no
 /// paragraph, which is the same answer the rest of its launch path gives it.
 fn injection_hygiene_applies(cfg: &AiToolTabConfig, settings: &Settings) -> bool {
     // V40 Phase A: a tab that runs no registered harness has no consumer, so
     // there is no hygiene setting resolved for it and no paragraph to inject.
-    tab_consumer(cfg).is_some_and(|agent| consumer_hygiene_for(settings, agent, &cfg.id))
+    tab_consumer(cfg).is_some_and(|agent| {
+        crate::settings::injection::effective(
+            crate::settings::injection::Feature::ConsumerHygiene,
+            crate::settings::injection::Scope::Tab {
+                agent,
+                tab: &cfg.id,
+            },
+            settings,
+        )
+    })
 }
 
 /// V12 Phase E: the `## cImp project facts` launch-time addendum — PINNED
@@ -942,6 +933,9 @@ mod tests {
             .and_then(|p| p.resolve_oob(cfg, working_dir, extra_args, env))
     }
     use super::*;
+    // V42 (#124 R25): spelled from its own module now that this file's
+    // `NativeWebVisibility` alias is gone.
+    use crate::settings::injection::NativeWebMode;
 
     /// A registered harness by id — **tests only**. The spawn-signature map is
     /// keyed by `HarnessId` since V40 Phase B, and these tests were written
@@ -1134,7 +1128,7 @@ mod tests {
         // The read advisor is the only `PreToolUse` producer under test here;
         // V32 Phase F's sensor beacon is a second one, turned off so
         // "no PreToolUse hook" keeps meaning "no read advisor".
-        settings.set_native_web_mode_for_test(NativeWebVisibility::Off);
+        settings.set_native_web_mode_for_test(NativeWebMode::Off);
         let args = build_pre_args(&claude_cfg(), &settings, "claude", Some(&hook_endpoint()));
         let overlay = settings_overlay(&args).expect("overlay present");
         let entry = hook_entry(&overlay, "PreToolUse", 0);
@@ -1356,7 +1350,7 @@ mod tests {
         }];
         // Keep the sensor beacon out of `PreToolUse` so the entries below are
         // the read advisor's two matchers and nothing else.
-        settings.set_native_web_mode_for_test(NativeWebVisibility::Off);
+        settings.set_native_web_mode_for_test(NativeWebMode::Off);
 
         // Every hook object the overlay installs, flattened across events and
         // matchers — so a hook that stops being installed at all fails the
@@ -2377,7 +2371,7 @@ mod tests {
         let mut off = Settings::default();
         off.set_ext("claude", "statusline", serde_json::json!(false));
         off.graph.enabled = true;
-        off.set_native_web_mode_for_test(NativeWebVisibility::Off);
+        off.set_native_web_mode_for_test(NativeWebMode::Off);
         let args = build_pre_args(&claude_cfg(), &off, "claude", Some(&hook_endpoint()));
         let overlay = settings_overlay(&args).expect("overlay present");
         let hello = claude_hook::Hello::parse(
@@ -3847,19 +3841,25 @@ mod tests {
         // field (#48: the tri-mode IS `Feature::NativeWeb`'s L2, so it now sits
         // behind the same `pub(in crate::settings)` boundary as the rest).
         assert_eq!(
-            native_web_for(&Settings::default(), "opencode", "opencode"),
-            NativeWebVisibility::Sensor
+            crate::settings::injection::native_web_mode(
+                &Settings::default(),
+                crate::settings::injection::Scope::Tab {
+                    agent: "opencode",
+                    tab: "opencode",
+                },
+            ),
+            NativeWebMode::Sensor
         );
-        assert_eq!(NativeWebVisibility::parse("off"), NativeWebVisibility::Off);
+        assert_eq!(NativeWebMode::parse("off"), NativeWebMode::Off);
         assert_eq!(
-            NativeWebVisibility::parse(" sensor "),
-            NativeWebVisibility::Sensor
+            NativeWebMode::parse(" sensor "),
+            NativeWebMode::Sensor
         );
-        assert_eq!(NativeWebVisibility::parse("deny"), NativeWebVisibility::Deny);
+        assert_eq!(NativeWebMode::parse("deny"), NativeWebMode::Deny);
         for junk in ["", "OFF", "Deny", "denied", "sensr", "true"] {
             assert_eq!(
-                NativeWebVisibility::parse(junk),
-                NativeWebVisibility::Sensor,
+                NativeWebMode::parse(junk),
+                NativeWebMode::Sensor,
                 "{junk:?} must fall back to the default, not to off/deny"
             );
         }
@@ -3874,7 +3874,7 @@ mod tests {
         let base = spawn_inject_sig(&Settings::default());
         for mode in ["off", "deny"] {
             let mut s = Settings::default();
-            s.set_native_web_mode_for_test(NativeWebVisibility::parse(mode));
+            s.set_native_web_mode_for_test(NativeWebMode::parse(mode));
             let sig = spawn_inject_sig(&s);
             assert_ne!(sig[&h("claude")], base[&h("claude")], "claude signature must move for {mode}");
             assert_ne!(sig[&h("opencode")], base[&h("opencode")], "opencode signature must move for {mode}");
@@ -3960,7 +3960,7 @@ mod tests {
         // Hygiene off + native-web `deny`: the DENIALS survive, because they are
         // a different feature the user did not touch. The pins do not come back.
         let mut denied = off;
-        denied.set_native_web_mode_for_test(NativeWebVisibility::Deny);
+        denied.set_native_web_mode_for_test(NativeWebMode::Deny);
         let c = cfg(&denied);
         assert_eq!(c["agent"]["build"]["permission"]["webfetch"], "deny");
         assert_eq!(c["agent"]["build"]["permission"]["websearch"], "deny");
@@ -3986,7 +3986,7 @@ mod tests {
             ..Settings::default()
         };
         s.offload.enabled = true;
-        s.set_native_web_mode_for_test(NativeWebVisibility::Deny);
+        s.set_native_web_mode_for_test(NativeWebMode::Deny);
         s.set_master_for_test(false);
 
         let TabConfig::AiTool(claude) = &s.tabs[0] else {
@@ -4092,7 +4092,7 @@ mod tests {
         let pre_tool_use = |mode: &str| -> Vec<serde_json::Value> {
             let mut s = Settings::default();
             s.graph.enabled = true; // the loopback the beacon POSTs into
-            s.set_native_web_mode_for_test(NativeWebVisibility::parse(mode));
+            s.set_native_web_mode_for_test(NativeWebMode::parse(mode));
             let args = build_pre_args(&claude_cfg(), &s, "claude-2", Some(&hook_endpoint()));
             settings_overlay(&args)
                 .and_then(|o| o["hooks"]["PreToolUse"].as_array().cloned())
@@ -4140,8 +4140,14 @@ mod tests {
         let settings = Settings::default(); // offload + graph + audit all off
         assert!(!settings.loopback_needed());
         assert_eq!(
-            native_web_for(&settings, "claude", "claude"),
-            NativeWebVisibility::Sensor,
+            crate::settings::injection::native_web_mode(
+                &settings,
+                crate::settings::injection::Scope::Tab {
+                    agent: "claude",
+                    tab: "claude",
+                },
+            ),
+            NativeWebMode::Sensor,
             "the default mode is what makes this case worth pinning"
         );
         let args = build_pre_args(&claude_cfg(), &settings, "claude", Some(&hook_endpoint()));
@@ -4162,7 +4168,7 @@ mod tests {
         let overlay_for = |mode: &str| -> Option<serde_json::Value> {
             let mut s = Settings::default();
             s.graph.enabled = true;
-            s.set_native_web_mode_for_test(NativeWebVisibility::parse(mode));
+            s.set_native_web_mode_for_test(NativeWebMode::parse(mode));
             settings_overlay(&build_pre_args(&claude_cfg(), &s, "claude", Some(&hook_endpoint())))
         };
         let deny = overlay_for("deny").expect("overlay present");
@@ -4192,7 +4198,7 @@ mod tests {
     fn deny_mode_flips_only_the_web_keys_of_the_pinned_opencode_block() {
         let perm_for = |mode: &str| -> serde_json::Value {
             let mut s = Settings::default();
-            s.set_native_web_mode_for_test(NativeWebVisibility::parse(mode));
+            s.set_native_web_mode_for_test(NativeWebMode::parse(mode));
             build_opencode_config(&opencode_cfg(), &s, "opencode")["agent"]["build"]["permission"]
                 .clone()
         };
@@ -4239,7 +4245,7 @@ mod tests {
                 crate::settings::injection::Feature::HarnessNativeGate,
                 false,
             );
-            s.set_native_web_mode_for_test(NativeWebVisibility::parse(mode));
+            s.set_native_web_mode_for_test(NativeWebMode::parse(mode));
             opencode_plugin_wanted(&s, "opencode")
         };
         // The case the trap was: graph off, sensor on ⇒ still written.
@@ -4262,9 +4268,9 @@ mod tests {
             ..Settings::default()
         };
         off.graph.enabled = false;
-        off.set_native_web_mode_for_test(NativeWebVisibility::Off);
+        off.set_native_web_mode_for_test(NativeWebMode::Off);
         let mut sensor = off.clone();
-        sensor.set_native_web_mode_for_test(NativeWebVisibility::Sensor);
+        sensor.set_native_web_mode_for_test(NativeWebMode::Sensor);
         assert_ne!(
             spawn_inject_sig(&off)[&h("opencode")],
             spawn_inject_sig(&sensor)[&h("opencode")],
@@ -4281,7 +4287,7 @@ mod tests {
     fn opencode_env_carries_the_tab_id_for_the_plugin() {
         for mode in ["off", "sensor", "deny"] {
             let mut s = Settings::default();
-            s.set_native_web_mode_for_test(NativeWebVisibility::parse(mode));
+            s.set_native_web_mode_for_test(NativeWebMode::parse(mode));
             let env = compose_ai_env(&opencode_cfg(), &s, "opencode-3", Some(&hook_endpoint()));
             assert_eq!(
                 env.get("CIMP_TAB_ID").map(String::as_str),
@@ -4309,7 +4315,7 @@ mod tests {
             _ => unreachable!(),
         };
         s.graph.enabled = false;
-        s.set_native_web_mode_for_test(NativeWebVisibility::Off);
+        s.set_native_web_mode_for_test(NativeWebMode::Off);
         // V39 ships this L2 on, so the baseline has to state the `off` it is
         // about rather than borrow a default that has moved.
         s.set_l2_for_test(
@@ -4448,7 +4454,7 @@ mod tests {
             _ => unreachable!(),
         };
         s.graph.enabled = false;
-        s.set_native_web_mode_for_test(NativeWebVisibility::Off);
+        s.set_native_web_mode_for_test(NativeWebMode::Off);
         // The Phase H gate is a disjunct of its own and ships on since V39.
         s.set_l2_for_test(
             crate::settings::injection::Feature::HarnessNativeGate,

@@ -1181,530 +1181,759 @@ pub fn spawn_state_manager(
     });
 }
 
+/// The state manager's whole mutable world, plus one method per signal family.
+///
+/// R15 (V42): `run` used to be a single ~530-line `select!` arm that threaded
+/// six values — the app handle, the event sender, the two shared mirrors, the
+/// suppression flag and the tab map — into every branch by hand, while a
+/// ten-strong family of free `emit_*` forwards existed only to shorten the
+/// argument lists that threading produced. None of that was a *loop* concern;
+/// it was a struct with methods, spelled as a stack frame. What follows is the
+/// same code in the same order, one method per signal family, with nine of the
+/// ten forwards collapsed into [`Self::emit`] (the tenth, `avatar-error`, is a
+/// different Tauri event with no broadcast half and stays its own method).
+///
+/// **Two invariants live in here and nowhere else**, and both were comments in
+/// the old body:
+///
+///  * [`Self::on_signal`] runs `activity.note_signal` before it can return by
+///    any path — pinned structurally by
+///    `note_signal_is_mirrored_before_any_early_return`, because a signal
+///    handled by an early return must still reach the readers above the seam;
+///  * [`Self::on_tab_removed`] re-points `active` at a surviving tab, which is
+///    what keeps [`Self::on_tick`]'s `*tab != active` checks — and therefore
+///    the done-while-away badge — honest.
+struct Loop {
+    app: AppHandle,
+    /// The same `StateEvent`s the frontend receives, for the in-process
+    /// subscribers described on [`StateManagerWiring::state_events`].
+    events: broadcast::Sender<StateEvent>,
+    input_lengths: InputLengths,
+    activity: TabActivity,
+    ai_tts_suppressed: crate::tts::AiTtsSuppressed,
+    tabs: HashMap<TabId, TabState>,
+    active: TabId,
+}
+
+impl Loop {
+    /// Build the world from the wiring, handing back the launch seed so the
+    /// startup emits can walk it in order — `tab_metas` order is the registry's
+    /// tab order (both come from the same launch seed), and the frontend reads
+    /// the `TabCreated` positions from it.
+    fn new(app: AppHandle, wiring: StateManagerWiring) -> (Self, Vec<TabMeta>) {
+        let StateManagerWiring {
+            state_events,
+            input_lengths,
+            activity,
+            tab_metas,
+            initial_active,
+            ai_tts_suppressed,
+        } = wiring;
+        let tabs: HashMap<TabId, TabState> = tab_metas
+            .iter()
+            .cloned()
+            .map(|m| (m.id, TabState::new(m.kind, m.name)))
+            .collect();
+        (
+            Self {
+                app,
+                events: state_events,
+                input_lengths,
+                activity,
+                ai_tts_suppressed,
+                tabs,
+                active: initial_active,
+            },
+            tab_metas,
+        )
+    }
+
+    /// Publish one event to the frontend AND to the in-process broadcast.
+    ///
+    /// Every `StateEvent` this module produces goes through here — the nine
+    /// one-line `emit_*` forwards this replaced differed only in which variant
+    /// they built, which the call sites now say for themselves.
+    fn emit(&self, event: StateEvent) {
+        if let Err(e) = self.app.emit("avatar-state", &event) {
+            warn!(error = %e, "failed to emit avatar-state");
+        }
+        let _ = self.events.send(event);
+    }
+
+    /// The error channel is a separate Tauri event with no broadcast half — the
+    /// one emit that is not a [`StateEvent`].
+    fn emit_error(&self, info: &ErrorInfo) {
+        if let Err(e) = self.app.emit("avatar-error", info) {
+            warn!(error = %e, "failed to emit avatar-error");
+        }
+    }
+
+    /// Emit the initial Idle for each tab so the frontend has a baseline before
+    /// any signal arrives. The avatar component skips its first-render
+    /// transition so this doesn't play an unwanted animation. We also emit a
+    /// `TabCreated` for each seed tab so the frontend's tabs store has one
+    /// event-driven source of truth — no static frontend list needs to mirror
+    /// the backend's launch seed.
+    fn emit_startup_snapshot(&self, seed_metas: &[TabMeta]) {
+        for (position, meta) in seed_metas.iter().enumerate() {
+            self.emit(StateEvent::TabCreated {
+                tab: meta.id.clone(),
+                kind: (&meta.kind).into(),
+                name: meta.name.clone(),
+                builtin: meta.id.is_builtin(),
+                position,
+            });
+        }
+        for (tab, ts) in &self.tabs {
+            self.emit(StateEvent::StateChanged {
+                tab: tab.clone(),
+                state: ts.avatar_state,
+            });
+        }
+        self.emit(StateEvent::ActiveTabChanged {
+            tab: self.active.clone(),
+        });
+    }
+
+    /// One signal, start to finish.
+    fn on_signal(&mut self, signal: StateSignal) {
+        // V39 Phase B: mirror the prompt / output-burst / exit edges
+        // FIRST, ahead of every early return below, so a signal handled
+        // by one still reaches the readers above the seam
+        // (`crate::delegation`'s preflight and wait loop). Read-only
+        // fold, no side effects, cannot reject a signal — the loop
+        // behaves identically whether this line runs or not.
+        self.activity.note_signal(&signal);
+
+        // Runtime tab lifecycle (TabAdded / TabRemoved /
+        // TabRenameRequested) is handled before the per-tab
+        // transition routing because (a) the target TabState may
+        // not exist yet (TabAdded) or any longer (TabRemoved), and
+        // (b) the frontend needs the events emitted regardless of
+        // any avatar-state side effects. The registry computes the
+        // `position` field; we just relay it.
+        //
+        // Every arm that returns is one the old body ended with a `continue`;
+        // the two that fall through are the two it wrote as peeks.
+        match &signal {
+            StateSignal::TabAdded { meta, position } => {
+                return self.on_tab_added(meta.clone(), *position)
+            }
+            StateSignal::TabRemoved { tab } => return self.on_tab_removed(tab.clone()),
+            StateSignal::TabRenameRequested { tab, name } => {
+                return self.on_tab_rename(tab.clone(), name.clone())
+            }
+
+            // TabActivated isn't a per-tab transition — it just moves the
+            // active pointer and re-broadcasts. We DON'T re-emit the new
+            // tab's state there; the frontend listens for ActiveTabChanged
+            // and re-derives from the per-tab cache it already has.
+            StateSignal::TabActivated { tab } => return self.on_tab_activated(tab.clone()),
+
+            // New Claude output clears the Esc-driven AI-TTS suppression:
+            // the user stopped the *previous* burst's tagged speech, but a
+            // fresh burst should speak again. Done as a peek (no early return)
+            // so the signal still drives the avatar transition below.
+            //
+            // Only the ACTIVE tab's fresh output clears it: the suppression
+            // is global (one voice), but it was armed against the tab the
+            // user Esc-silenced while looking at it. Clearing on ANY tab's
+            // output would let a background tab's output un-silence that tab.
+            //
+            // The `active` test is a match GUARD rather than an `if` inside the
+            // arm: a non-active tab's `HarnessOutputStarted` falls to `_` and
+            // then, exactly as before, into the per-tab transition path.
+            StateSignal::HarnessOutputStarted { tab } if *tab == self.active => {
+                self.ai_tts_suppressed
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+
+            // Selection-read progress is a pure pass-through to the
+            // frontend — it carries no avatar-state meaning, so we relay
+            // it as an event and skip the per-tab transition routing.
+            StateSignal::TtsSelectionProgress { tab, session, index } => {
+                return self.emit(StateEvent::TtsSelectionProgress {
+                    tab: tab.clone(),
+                    session: *session,
+                    index: *index,
+                })
+            }
+
+            // A harness-pushed turn boundary is a pure pass-through too:
+            // it carries no avatar-state meaning (the activity heuristic
+            // keeps driving the visuals), so relay it as an event and skip
+            // the per-tab transition routing. `TabActivity::note_signal`
+            // above has already seen it and, correctly, says nothing about
+            // it — a turn ending is not one of the four facts it mirrors.
+            StateSignal::HarnessTurnEnded { tab } => {
+                return self.emit(StateEvent::TurnEnded { tab: tab.clone() })
+            }
+
+            // Permission-prompt edges are independent of the avatar state
+            // machine — they only flip `awaiting_permission`. Resolved
+            // and user-input both clear; the input clearing path in
+            // `on_tab_signal` handles UserKeystroke / UserSubmit.
+            StateSignal::PermissionPromptDetected { tab } => {
+                return self.set_awaiting_permission(
+                    tab.clone(),
+                    true,
+                    "awaiting permission: set",
+                )
+            }
+            StateSignal::PermissionPromptResolved { tab } => {
+                return self.set_awaiting_permission(
+                    tab.clone(),
+                    false,
+                    "awaiting permission: cleared (resolved)",
+                )
+            }
+            StateSignal::QuestionPromptDetected { tab } => {
+                return self.set_awaiting_question(tab.clone(), true, "awaiting question: set")
+            }
+            StateSignal::QuestionPromptResolved { tab } => {
+                return self.set_awaiting_question(
+                    tab.clone(),
+                    false,
+                    "awaiting question: cleared (resolved)",
+                )
+            }
+
+            // Shell tabs route SubprocessExited to the closed sub-state
+            // instead of Error; AI tabs answer `false` and fall through to
+            // the generic transition path below, where the existing v1 logic
+            // turns the signal into Error.
+            StateSignal::SubprocessExited { tab, code, .. } => {
+                let routed_to_closed = self.on_subprocess_exited(tab.clone(), *code);
+                if routed_to_closed {
+                    return;
+                }
+            }
+
+            StateSignal::ShellLaunchFailed { tab, message } => {
+                return self.on_shell_launch_failed(tab.clone(), message.clone())
+            }
+            StateSignal::ShellRestarted { tab } => return self.on_shell_restarted(tab.clone()),
+
+            _ => {}
+        }
+
+        // Compose signals always target the active tab (the compose
+        // overlay submits to whoever is on screen). The signal
+        // arrives tagged with `active` from the IPC handler, but we
+        // re-resolve here defensively in case anything ever changes.
+        let target_tab = match &signal {
+            StateSignal::ComposeContentChanged { .. } => self.active.clone(),
+            other => other.tab(),
+        };
+        self.on_tab_signal(signal, target_tab);
+    }
+
+    fn on_tab_added(&mut self, meta: TabMeta, position: usize) {
+        if self.tabs.contains_key(&meta.id) {
+            return;
+        }
+        self.tabs.insert(
+            meta.id.clone(),
+            TabState::new(meta.kind.clone(), meta.name.clone()),
+        );
+        if let Ok(mut g) = self.input_lengths.write() {
+            g.entry(meta.id.clone())
+                .or_insert_with(|| Arc::new(AtomicI32::new(0)));
+        }
+        // V39 Phase B: a fresh subprocess starts with clean
+        // flags — this is also what clears a latched `exited`
+        // when a tab is restarted into the same id.
+        self.activity.reset(&meta.id);
+        info!(tab = ?meta.id, position, "tab added");
+        self.emit(StateEvent::StateChanged {
+            tab: meta.id.clone(),
+            state: AvatarState::Idle,
+        });
+        self.emit(StateEvent::TabCreated {
+            tab: meta.id.clone(),
+            kind: (&meta.kind).into(),
+            name: meta.name,
+            builtin: meta.id.is_builtin(),
+            position,
+        });
+    }
+
+    fn on_tab_removed(&mut self, tab: TabId) {
+        if self.tabs.remove(&tab).is_none() {
+            return;
+        }
+        if let Ok(mut g) = self.input_lengths.write() {
+            g.remove(&tab);
+        }
+        // If the active tab was just removed, repoint `active` at
+        // a surviving tab. Leaving it on the dead id breaks the
+        // idle sweep's `*tab != active` checks, marking every
+        // survivor done-while-away (a spurious badge). The
+        // frontend's follow-up TabActivated sets the real one.
+        if let Some(next) = repoint_active_after(&self.active, &tab, &self.tabs) {
+            self.active = next;
+        }
+        self.activity.forget(&tab);
+        info!(?tab, "tab removed");
+        self.emit(StateEvent::TabClosed { tab });
+    }
+
+    fn on_tab_rename(&mut self, tab: TabId, name: String) {
+        let renamed = match self.tabs.get_mut(&tab) {
+            Some(ts) if ts.name != name => {
+                ts.name = name.clone();
+                true
+            }
+            _ => false,
+        };
+        if renamed {
+            info!(?tab, name = %name, "tab renamed");
+            self.emit(StateEvent::TabRenamed { tab, name });
+        }
+    }
+
+    fn on_tab_activated(&mut self, tab: TabId) {
+        // Never point `active` at a tab we don't know about: a stray
+        // or out-of-order activation would leave `active` dangling
+        // at a non-existent tab, breaking the idle sweep's
+        // `*tab != active` checks and done-while-away routing.
+        // `TabAdded` is always enqueued before its `TabActivated`,
+        // so a legitimate activation always finds the tab present.
+        if !self.tabs.contains_key(&tab) {
+            debug!(?tab, "ignoring TabActivated for unknown tab");
+            return;
+        }
+        if self.active == tab {
+            return;
+        }
+        info!(from = ?self.active, to = ?tab, "active tab");
+        self.active = tab.clone();
+        self.emit(StateEvent::ActiveTabChanged { tab: tab.clone() });
+        // Clear DoneWhileAway on the newly-active tab — the
+        // user's now looking at it, so the "you missed
+        // something" hint has served its purpose.
+        let cleared = match self.tabs.get_mut(&tab) {
+            Some(ts) if ts.done_while_away => {
+                ts.done_while_away = false;
+                true
+            }
+            _ => false,
+        };
+        if cleared {
+            self.emit(StateEvent::DoneWhileAwayChanged { tab, done: false });
+        }
+    }
+
+    /// Flip one tab's `awaiting_permission`, logging `msg` and emitting only on
+    /// a real edge — clearing an already-false flag is a no-op.
+    fn set_awaiting_permission(&mut self, tab: TabId, awaiting: bool, msg: &'static str) {
+        let changed = match self.tabs.get_mut(&tab) {
+            Some(ts) if ts.awaiting_permission != awaiting => {
+                ts.awaiting_permission = awaiting;
+                true
+            }
+            _ => false,
+        };
+        if changed {
+            info!(?tab, "{msg}");
+            self.emit(StateEvent::AwaitingPermissionChanged { tab, awaiting });
+        }
+    }
+
+    /// The question-prompt sibling of [`Self::set_awaiting_permission`].
+    fn set_awaiting_question(&mut self, tab: TabId, awaiting: bool, msg: &'static str) {
+        let changed = match self.tabs.get_mut(&tab) {
+            Some(ts) if ts.awaiting_question != awaiting => {
+                ts.awaiting_question = awaiting;
+                true
+            }
+            _ => false,
+        };
+        if changed {
+            info!(?tab, "{msg}");
+            self.emit(StateEvent::AwaitingQuestionChanged { tab, awaiting });
+        }
+    }
+
+    /// Shell tabs route `SubprocessExited` to the closed sub-state instead of
+    /// Error (per DESIGN.md § "Shell-Tab Closed Sub-State"). Returns whether
+    /// this signal was handled here. AI tabs answer `false` and fall through to
+    /// the generic transition path, where the existing v1 logic turns the
+    /// signal into Error. Spawn-time failures with `code = None` still hit this
+    /// same branch.
+    fn on_subprocess_exited(&mut self, tab: TabId, code: Option<i32>) -> bool {
+        let route_to_closed = self
+            .tabs
+            .get(&tab)
+            .map(|ts| matches!(ts.kind, TabKind::Shell))
+            .unwrap_or(false);
+        if !route_to_closed {
+            return false;
+        }
+        // A SubprocessExited landing on a tab that already
+        // has a closed_message (from ShellLaunchFailed)
+        // means the same launch failure is bubbling up
+        // twice — preserve the message so the user still
+        // sees "command not found" rather than the
+        // generic "exited" overlay.
+        let closed_message = match self.tabs.get_mut(&tab) {
+            Some(ts) if !ts.closed => {
+                ts.closed = true;
+                ts.closed_exit_code = code;
+                Some(ts.closed_message.clone())
+            }
+            _ => None,
+        };
+        if let Some(msg) = closed_message {
+            info!(?tab, ?code, "shell tab: closed");
+            self.emit(StateEvent::TabClosedStateChanged {
+                tab,
+                closed: true,
+                exit_code: code,
+                closed_message: msg,
+            });
+        }
+        true
+    }
+
+    /// Shell tab launch-failure: spawn-time error that should NOT
+    /// be retried by Enter (e.g. command not found). Routes to
+    /// the closed sub-state and stamps a custom message that the
+    /// frontend overlay displays in place of the standard text.
+    fn on_shell_launch_failed(&mut self, tab: TabId, message: String) {
+        let stamped = match self.tabs.get_mut(&tab) {
+            Some(ts) if matches!(ts.kind, TabKind::Shell) => {
+                ts.closed = true;
+                ts.closed_exit_code = None;
+                ts.closed_message = Some(message.clone());
+                true
+            }
+            _ => false,
+        };
+        if stamped {
+            info!(?tab, message = %message, "shell tab: launch failed");
+            self.emit(StateEvent::TabClosedStateChanged {
+                tab,
+                closed: true,
+                exit_code: None,
+                closed_message: Some(message),
+            });
+        }
+    }
+
+    /// Shell tab restart (Phase 6 emits this after a fresh PTY
+    /// has been bound). Clears the closed flag (and any custom
+    /// launch-failure message) so the overlay hides; AI tabs
+    /// ignore.
+    fn on_shell_restarted(&mut self, tab: TabId) {
+        let cleared = match self.tabs.get_mut(&tab) {
+            Some(ts) if matches!(ts.kind, TabKind::Shell) && ts.closed => {
+                ts.closed = false;
+                ts.closed_exit_code = None;
+                ts.closed_message = None;
+                true
+            }
+            _ => false,
+        };
+        if cleared {
+            info!(?tab, "shell tab: restarted");
+            self.emit(StateEvent::TabClosedStateChanged {
+                tab,
+                closed: false,
+                exit_code: None,
+                closed_message: None,
+            });
+        }
+    }
+
+    /// The per-tab transition path: every signal the lifecycle and pass-through
+    /// arms above did not claim, applied to `target_tab`.
+    fn on_tab_signal(&mut self, signal: StateSignal, target_tab: TabId) {
+        {
+            let Some(ts) = self.tabs.get_mut(&target_tab) else {
+                return;
+            };
+            match &signal {
+                StateSignal::UserKeystroke { .. } => {
+                    ts.has_unsent_input = true;
+                    ts.last_keystroke_at = Some(Instant::now());
+                }
+                StateSignal::UserSubmit { .. } => {
+                    ts.has_unsent_input = false;
+                    ts.last_keystroke_at = Some(Instant::now());
+                }
+                StateSignal::ComposeContentChanged { non_empty, .. } => {
+                    ts.composing = *non_empty;
+                    if *non_empty {
+                        ts.last_keystroke_at = Some(Instant::now());
+                    }
+                }
+                StateSignal::HarnessOutputStarted { .. } => {
+                    ts.harness_output_active = true;
+                }
+                StateSignal::HarnessOutputStopped { .. } => {
+                    ts.harness_output_active = false;
+                }
+                StateSignal::SubagentsActiveChanged { active, .. } => {
+                    ts.subagents_active = *active;
+                }
+                // Reset the output-active flag on any error edge / its
+                // acknowledgment. A HarnessOutputStarted with no matching
+                // Stopped (the subprocess crashed or exited mid-output —
+                // the normal exit path) would otherwise leave the flag
+                // stuck true, so a later normal speech cycle resolves to
+                // Thinking instead of Idle (avatar sticks; no idle
+                // announcement). Runs before `transition()` below. Clear
+                // `subagents_active` too — a crash mid-agent-run would
+                // otherwise leave the avatar wedged in Thinking forever.
+                StateSignal::SubprocessExited { .. }
+                | StateSignal::AudioError { .. }
+                | StateSignal::TtsError { .. }
+                | StateSignal::ErrorAcknowledged { .. } => {
+                    ts.harness_output_active = false;
+                    ts.subagents_active = false;
+                }
+                _ => {}
+            }
+        }
+
+        // Input-driven clearing of awaiting_permission /
+        // awaiting_question. The user typing into the prompt is the
+        // signal that the prompt is being answered; clearing an
+        // already-false flag is a no-op.
+        let is_input = matches!(
+            signal,
+            StateSignal::UserKeystroke { .. } | StateSignal::UserSubmit { .. }
+        );
+        if is_input {
+            self.set_awaiting_permission(
+                target_tab.clone(),
+                false,
+                "awaiting permission: cleared (input)",
+            );
+            self.set_awaiting_question(
+                target_tab.clone(),
+                false,
+                "awaiting question: cleared (input)",
+            );
+        }
+
+        let (prev_state, next) = {
+            let Some(ts) = self.tabs.get(&target_tab) else {
+                return;
+            };
+            let prev_state = ts.avatar_state;
+            // Shell tabs short-circuit transition — only Idle ↔ Error
+            // is reachable for them, and SubprocessExited has already
+            // been routed elsewhere. The remaining error edges
+            // (AudioError, TtsError, ErrorAcknowledged) come through
+            // here and use the same logic as AI tabs.
+            let is_shell = matches!(ts.kind, TabKind::Shell);
+            let next = if is_shell && !is_error_edge(&signal) {
+                prev_state
+            } else {
+                transition(
+                    prev_state,
+                    &signal,
+                    ts.has_unsent_input,
+                    ts.composing,
+                    ts.harness_output_active,
+                    ts.subagents_active,
+                )
+            };
+            (prev_state, next)
+        };
+        if next == prev_state {
+            return;
+        }
+        info!(tab = ?target_tab, from = ?prev_state, to = ?next, ?signal, "avatar state");
+        // The flag write and the `done_while_away` decision happen under one
+        // borrow; the emits below cannot hold it (they take `&self`), which is
+        // the one shape difference from the old inline body.
+        let bump_done_while_away = {
+            let Some(ts) = self.tabs.get_mut(&target_tab) else {
+                return;
+            };
+            ts.avatar_state = next;
+            let inactive = target_tab != self.active;
+            let bump = next == AvatarState::Idle && inactive && !ts.done_while_away;
+            if bump {
+                ts.done_while_away = true;
+            }
+            bump
+        };
+        self.emit(StateEvent::StateChanged {
+            tab: target_tab.clone(),
+            state: next,
+        });
+        if next == AvatarState::Error {
+            if let Some(info) = ErrorInfo::from_signal(&signal) {
+                self.emit_error(&info);
+            }
+        }
+        if bump_done_while_away {
+            info!(tab = ?target_tab, "done while away: set");
+            self.emit(StateEvent::DoneWhileAwayChanged {
+                tab: target_tab,
+                done: true,
+            });
+        }
+    }
+
+    /// The 500 ms sweep: the idle-Listening timeout and the agents-stall
+    /// backstop, per tab.
+    fn on_tick(&mut self) {
+        // Per-tab idle-Listening sweep. Each tab's input-length
+        // counter is independent. The RwLock read lock is held only
+        // long enough to clone the per-tab `Arc<AtomicI32>`s — the
+        // map is never mutated under it during the sweep.
+        let snapshot: HashMap<TabId, Arc<AtomicI32>> = match self.input_lengths.read() {
+            Ok(g) => g.clone(),
+            // Recover a poisoned lock rather than skipping the sweep —
+            // `continue` here would permanently break the idle→Idle
+            // avatar transition for the rest of the session if any
+            // writer ever panicked. The map only holds Arcs to atomics,
+            // so a poisoned writer can't leave it logically corrupt
+            // (this mirrors how `sysmon` recovers via `into_inner`).
+            Err(e) => e.into_inner().clone(),
+        };
+        // Walked over a snapshot of the KEYS rather than `iter_mut`, because
+        // the sweep emits from inside the walk and `emit` takes `&self`. Same
+        // rows, same order: nothing here inserts or removes a tab.
+        let sweep: Vec<TabId> = self.tabs.keys().cloned().collect();
+        for tab in sweep {
+            let Some(ts) = self.tabs.get_mut(&tab) else {
+                continue;
+            };
+            // Agents-stall backstop. Recover a tab wedged in Thinking by
+            // an `subagents_active` that never cleared (Task result missing
+            // after an Esc-interrupt, unparseable, or its edge dropped).
+            // Only arms while the parent is producing NO output — a live
+            // turn keeps `harness_output_active` true via the ~1 Hz footer
+            // repaint, so this can't clip real work. See
+            // `subagents_stall_timeout`.
+            if ts.avatar_state == AvatarState::Thinking
+                && ts.subagents_active
+                && !ts.harness_output_active
+            {
+                let since = *ts.subagents_stall_since.get_or_insert_with(Instant::now);
+                if since.elapsed() >= subagents_stall_timeout(&tab, &self.app) {
+                    info!(?tab, from = ?ts.avatar_state, to = ?AvatarState::Idle, signal = "AgentsStallTimeout", "avatar state");
+                    ts.subagents_active = false;
+                    ts.subagents_stall_since = None;
+                    ts.avatar_state = AvatarState::Idle;
+                    let state = ts.avatar_state;
+                    let bump = tab != self.active && !ts.done_while_away;
+                    if bump {
+                        ts.done_while_away = true;
+                    }
+                    self.emit(StateEvent::StateChanged {
+                        tab: tab.clone(),
+                        state,
+                    });
+                    if bump {
+                        info!(?tab, "done while away: set (agents stall)");
+                        self.emit(StateEvent::DoneWhileAwayChanged {
+                            tab: tab.clone(),
+                            done: true,
+                        });
+                    }
+                    continue;
+                }
+            } else {
+                ts.subagents_stall_since = None;
+            }
+
+            if ts.avatar_state != AvatarState::Listening {
+                continue;
+            }
+            if ts.composing {
+                continue;
+            }
+            let len = snapshot
+                .get(&tab)
+                .map(|c| c.load(Ordering::Relaxed))
+                .unwrap_or(0);
+            if len != 0 {
+                continue;
+            }
+            let idle_long_enough = ts
+                .last_keystroke_at
+                .map(|t| t.elapsed() >= EMPTY_INPUT_IDLE)
+                .unwrap_or(true);
+            if !idle_long_enough {
+                continue;
+            }
+            info!(?tab, from = ?ts.avatar_state, to = ?AvatarState::Idle, signal = "EmptyInputTimeout", "avatar state");
+            ts.avatar_state = AvatarState::Idle;
+            ts.has_unsent_input = false;
+            // Forced back to Idle by inactivity — clear any lingering
+            // output-active flag so it can't drive a later speech cycle
+            // to Thinking.
+            ts.harness_output_active = false;
+            let state = ts.avatar_state;
+            let bump = tab != self.active && !ts.done_while_away;
+            if bump {
+                ts.done_while_away = true;
+            }
+            self.emit(StateEvent::StateChanged {
+                tab: tab.clone(),
+                state,
+            });
+            if bump {
+                info!(?tab, "done while away: set (tick)");
+                self.emit(StateEvent::DoneWhileAwayChanged {
+                    tab: tab.clone(),
+                    done: true,
+                });
+            }
+        }
+    }
+}
+
 async fn run(app: AppHandle, mut rx: mpsc::Receiver<StateSignal>, wiring: StateManagerWiring) {
-    let StateManagerWiring {
-        state_events,
-        input_lengths,
-        activity,
-        tab_metas,
-        initial_active,
-        ai_tts_suppressed,
-    } = wiring;
     // Preserve tab_metas order so the startup TabCreated emit positions
     // match the registry's tab order (registry uses the same launch_seed).
-    let seed_metas: Vec<TabMeta> = tab_metas;
-    let mut tabs: HashMap<TabId, TabState> = seed_metas
-        .iter()
-        .cloned()
-        .map(|m| (m.id, TabState::new(m.kind, m.name)))
-        .collect();
-    let mut active = initial_active;
+    let (mut lp, seed_metas) = Loop::new(app, wiring);
 
     let mut tick = tokio::time::interval(TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-    // Emit the initial Idle for each tab so the frontend has a baseline before
-    // any signal arrives. The avatar component skips its first-render
-    // transition so this doesn't play an unwanted animation. We also emit a
-    // `TabCreated` for each seed tab so the frontend's tabs store has one
-    // event-driven source of truth — no static frontend list needs to mirror
-    // the backend's launch seed.
-    for (position, meta) in seed_metas.iter().enumerate() {
-        emit_tab_created(
-            &app,
-            &state_events,
-            meta.id.clone(),
-            (&meta.kind).into(),
-            meta.name.clone(),
-            meta.id.is_builtin(),
-            position,
-        );
-    }
-    for (tab, ts) in &tabs {
-        emit_state(&app, &state_events, tab.clone(), ts.avatar_state);
-    }
-    emit_active_tab(&app, &state_events, active.clone());
+    lp.emit_startup_snapshot(&seed_metas);
 
     loop {
         tokio::select! {
             maybe = rx.recv() => {
                 let Some(signal) = maybe else { break };
-
-                // V39 Phase B: mirror the prompt / output-burst / exit edges
-                // FIRST, ahead of every `continue` below, so a signal handled
-                // by an early return still reaches the readers above the seam
-                // (`crate::delegation`'s preflight and wait loop). Read-only
-                // fold, no side effects, cannot reject a signal — the loop
-                // behaves identically whether this line runs or not.
-                activity.note_signal(&signal);
-
-                // Runtime tab lifecycle (TabAdded / TabRemoved /
-                // TabRenameRequested) is handled before the per-tab
-                // transition routing because (a) the target TabState may
-                // not exist yet (TabAdded) or any longer (TabRemoved), and
-                // (b) the frontend needs the events emitted regardless of
-                // any avatar-state side effects. The registry computes the
-                // `position` field; we just relay it.
-                if let StateSignal::TabAdded { meta, position } = &signal {
-                    let meta = meta.clone();
-                    let position = *position;
-                    if !tabs.contains_key(&meta.id) {
-                        tabs.insert(
-                            meta.id.clone(),
-                            TabState::new(meta.kind.clone(), meta.name.clone()),
-                        );
-                        if let Ok(mut g) = input_lengths.write() {
-                            g.entry(meta.id.clone())
-                                .or_insert_with(|| Arc::new(AtomicI32::new(0)));
-                        }
-                        // V39 Phase B: a fresh subprocess starts with clean
-                        // flags — this is also what clears a latched `exited`
-                        // when a tab is restarted into the same id.
-                        activity.reset(&meta.id);
-                        info!(tab = ?meta.id, position, "tab added");
-                        emit_state(&app, &state_events, meta.id.clone(), AvatarState::Idle);
-                        emit_tab_created(
-                            &app,
-                            &state_events,
-                            meta.id.clone(),
-                            (&meta.kind).into(),
-                            meta.name,
-                            meta.id.is_builtin(),
-                            position,
-                        );
-                    }
-                    continue;
-                }
-                if let StateSignal::TabRemoved { tab } = &signal {
-                    let tab = tab.clone();
-                    if tabs.remove(&tab).is_some() {
-                        if let Ok(mut g) = input_lengths.write() {
-                            g.remove(&tab);
-                        }
-                        // If the active tab was just removed, repoint `active` at
-                        // a surviving tab. Leaving it on the dead id breaks the
-                        // idle sweep's `*tab != active` checks, marking every
-                        // survivor done-while-away (a spurious badge). The
-                        // frontend's follow-up TabActivated sets the real one.
-                        if active == tab {
-                            if let Some(next) = tabs.keys().next().cloned() {
-                                active = next;
-                            }
-                        }
-                        activity.forget(&tab);
-                        info!(?tab, "tab removed");
-                        emit_tab_closed_event(&app, &state_events, tab);
-                    }
-                    continue;
-                }
-                if let StateSignal::TabRenameRequested { tab, name } = &signal {
-                    let tab = tab.clone();
-                    let name = name.clone();
-                    if let Some(ts) = tabs.get_mut(&tab) {
-                        if ts.name != name {
-                            ts.name = name.clone();
-                            info!(?tab, name = %name, "tab renamed");
-                            emit_tab_renamed(&app, &state_events, tab, name);
-                        }
-                    }
-                    continue;
-                }
-
-                // TabActivated isn't a per-tab transition — it just moves the
-                // active pointer and re-broadcasts. We DON'T re-emit the new
-                // tab's state here; the frontend listens for ActiveTabChanged
-                // and re-derives from the per-tab cache it already has.
-                if let StateSignal::TabActivated { tab } = &signal {
-                    let tab = tab.clone();
-                    // Never point `active` at a tab we don't know about: a stray
-                    // or out-of-order activation would leave `active` dangling
-                    // at a non-existent tab, breaking the idle sweep's
-                    // `*tab != active` checks and done-while-away routing.
-                    // `TabAdded` is always enqueued before its `TabActivated`,
-                    // so a legitimate activation always finds the tab present.
-                    if !tabs.contains_key(&tab) {
-                        debug!(?tab, "ignoring TabActivated for unknown tab");
-                        continue;
-                    }
-                    if active != tab {
-                        info!(from = ?active, to = ?tab, "active tab");
-                        active = tab.clone();
-                        emit_active_tab(&app, &state_events, tab.clone());
-                        // Clear DoneWhileAway on the newly-active tab — the
-                        // user's now looking at it, so the "you missed
-                        // something" hint has served its purpose.
-                        if let Some(ts) = tabs.get_mut(&tab) {
-                            if ts.done_while_away {
-                                ts.done_while_away = false;
-                                emit_done_while_away(&app, &state_events, tab, false);
-                            }
-                        }
-                    }
-                    continue;
-                }
-
-                // New Claude output clears the Esc-driven AI-TTS suppression:
-                // the user stopped the *previous* burst's tagged speech, but a
-                // fresh burst should speak again. Done as a peek (no `continue`)
-                // so the signal still drives the avatar transition below.
-                //
-                // Only the ACTIVE tab's fresh output clears it: the suppression
-                // is global (one voice), but it was armed against the tab the
-                // user Esc-silenced while looking at it. Clearing on ANY tab's
-                // output would let a background tab's output un-silence that tab.
-                if let StateSignal::HarnessOutputStarted { tab } = &signal {
-                    if *tab == active {
-                        ai_tts_suppressed.store(false, std::sync::atomic::Ordering::SeqCst);
-                    }
-                }
-
-                // Selection-read progress is a pure pass-through to the
-                // frontend — it carries no avatar-state meaning, so we relay
-                // it as an event and skip the per-tab transition routing.
-                if let StateSignal::TtsSelectionProgress { tab, session, index } = &signal {
-                    dispatch(
-                        &app,
-                        &state_events,
-                        StateEvent::TtsSelectionProgress {
-                            tab: tab.clone(),
-                            session: *session,
-                            index: *index,
-                        },
-                    );
-                    continue;
-                }
-
-                // A harness-pushed turn boundary is a pure pass-through too:
-                // it carries no avatar-state meaning (the activity heuristic
-                // keeps driving the visuals), so relay it as an event and skip
-                // the per-tab transition routing. `TabActivity::note_signal`
-                // above has already seen it and, correctly, says nothing about
-                // it — a turn ending is not one of the four facts it mirrors.
-                if let StateSignal::HarnessTurnEnded { tab } = &signal {
-                    dispatch(
-                        &app,
-                        &state_events,
-                        StateEvent::TurnEnded { tab: tab.clone() },
-                    );
-                    continue;
-                }
-
-                // Permission-prompt edges are independent of the avatar state
-                // machine — they only flip `awaiting_permission`. Resolved
-                // and user-input both clear; the input clearing path below
-                // handles UserKeystroke / UserSubmit.
-                if let StateSignal::PermissionPromptDetected { tab } = &signal {
-                    let tab = tab.clone();
-                    if let Some(ts) = tabs.get_mut(&tab) {
-                        if !ts.awaiting_permission {
-                            ts.awaiting_permission = true;
-                            info!(?tab, "awaiting permission: set");
-                            emit_awaiting_permission(&app, &state_events, tab, true);
-                        }
-                    }
-                    continue;
-                }
-                if let StateSignal::PermissionPromptResolved { tab } = &signal {
-                    let tab = tab.clone();
-                    if let Some(ts) = tabs.get_mut(&tab) {
-                        if ts.awaiting_permission {
-                            ts.awaiting_permission = false;
-                            info!(?tab, "awaiting permission: cleared (resolved)");
-                            emit_awaiting_permission(&app, &state_events, tab, false);
-                        }
-                    }
-                    continue;
-                }
-                if let StateSignal::QuestionPromptDetected { tab } = &signal {
-                    let tab = tab.clone();
-                    if let Some(ts) = tabs.get_mut(&tab) {
-                        if !ts.awaiting_question {
-                            ts.awaiting_question = true;
-                            info!(?tab, "awaiting question: set");
-                            emit_awaiting_question(&app, &state_events, tab, true);
-                        }
-                    }
-                    continue;
-                }
-                if let StateSignal::QuestionPromptResolved { tab } = &signal {
-                    let tab = tab.clone();
-                    if let Some(ts) = tabs.get_mut(&tab) {
-                        if ts.awaiting_question {
-                            ts.awaiting_question = false;
-                            info!(?tab, "awaiting question: cleared (resolved)");
-                            emit_awaiting_question(&app, &state_events, tab, false);
-                        }
-                    }
-                    continue;
-                }
-
-                // Shell tabs route SubprocessExited to the closed sub-state
-                // instead of Error (per DESIGN.md § "Shell-Tab Closed
-                // Sub-State"). AI tabs fall through to the
-                // generic transition path below where the existing v1 logic
-                // turns the signal into Error. Spawn-time failures with
-                // `code = None` still hit this same branch.
-                if let StateSignal::SubprocessExited { tab, code, .. } = &signal {
-                    let tab = tab.clone();
-                    let code = *code;
-                    let route_to_closed = tabs
-                        .get(&tab)
-                        .map(|ts| matches!(ts.kind, TabKind::Shell))
-                        .unwrap_or(false);
-                    if route_to_closed {
-                        if let Some(ts) = tabs.get_mut(&tab) {
-                            // A SubprocessExited landing on a tab that already
-                            // has a closed_message (from ShellLaunchFailed)
-                            // means the same launch failure is bubbling up
-                            // twice — preserve the message so the user still
-                            // sees "command not found" rather than the
-                            // generic "exited" overlay.
-                            if !ts.closed {
-                                ts.closed = true;
-                                ts.closed_exit_code = code;
-                                let msg = ts.closed_message.clone();
-                                info!(?tab, ?code, "shell tab: closed");
-                                emit_tab_closed_state(&app, &state_events, tab, true, code, msg);
-                            }
-                        }
-                        continue;
-                    }
-                    // AI tab: fall through; the generic routing below feeds
-                    // the signal into transition() which produces Error.
-                }
-
-                // Shell tab launch-failure: spawn-time error that should NOT
-                // be retried by Enter (e.g. command not found). Routes to
-                // the closed sub-state and stamps a custom message that the
-                // frontend overlay displays in place of the standard text.
-                if let StateSignal::ShellLaunchFailed { tab, message } = &signal {
-                    let tab = tab.clone();
-                    let message = message.clone();
-                    if let Some(ts) = tabs.get_mut(&tab) {
-                        if matches!(ts.kind, TabKind::Shell) {
-                            ts.closed = true;
-                            ts.closed_exit_code = None;
-                            ts.closed_message = Some(message.clone());
-                            info!(?tab, message = %message, "shell tab: launch failed");
-                            emit_tab_closed_state(
-                                &app,
-                                &state_events,
-                                tab,
-                                true,
-                                None,
-                                Some(message),
-                            );
-                        }
-                    }
-                    continue;
-                }
-
-                // Shell tab restart (Phase 6 emits this after a fresh PTY
-                // has been bound). Clears the closed flag (and any custom
-                // launch-failure message) so the overlay hides; AI tabs
-                // ignore.
-                if let StateSignal::ShellRestarted { tab } = &signal {
-                    let tab = tab.clone();
-                    if let Some(ts) = tabs.get_mut(&tab) {
-                        if matches!(ts.kind, TabKind::Shell) && ts.closed {
-                            ts.closed = false;
-                            ts.closed_exit_code = None;
-                            ts.closed_message = None;
-                            info!(?tab, "shell tab: restarted");
-                            emit_tab_closed_state(&app, &state_events, tab, false, None, None);
-                        }
-                    }
-                    continue;
-                }
-
-                // Compose signals always target the active tab (the compose
-                // overlay submits to whoever is on screen). The signal
-                // arrives tagged with `active` from the IPC handler, but we
-                // re-resolve here defensively in case anything ever changes.
-                let target_tab = match &signal {
-                    StateSignal::ComposeContentChanged { .. } => active.clone(),
-                    other => other.tab(),
-                };
-
-                let Some(ts) = tabs.get_mut(&target_tab) else { continue };
-
-                match &signal {
-                    StateSignal::UserKeystroke { .. } => {
-                        ts.has_unsent_input = true;
-                        ts.last_keystroke_at = Some(Instant::now());
-                    }
-                    StateSignal::UserSubmit { .. } => {
-                        ts.has_unsent_input = false;
-                        ts.last_keystroke_at = Some(Instant::now());
-                    }
-                    StateSignal::ComposeContentChanged { non_empty, .. } => {
-                        ts.composing = *non_empty;
-                        if *non_empty {
-                            ts.last_keystroke_at = Some(Instant::now());
-                        }
-                    }
-                    StateSignal::HarnessOutputStarted { .. } => {
-                        ts.harness_output_active = true;
-                    }
-                    StateSignal::HarnessOutputStopped { .. } => {
-                        ts.harness_output_active = false;
-                    }
-                    StateSignal::SubagentsActiveChanged { active, .. } => {
-                        ts.subagents_active = *active;
-                    }
-                    // Reset the output-active flag on any error edge / its
-                    // acknowledgment. A HarnessOutputStarted with no matching
-                    // Stopped (the subprocess crashed or exited mid-output —
-                    // the normal exit path) would otherwise leave the flag
-                    // stuck true, so a later normal speech cycle resolves to
-                    // Thinking instead of Idle (avatar sticks; no idle
-                    // announcement). Runs before `transition()` below. Clear
-                    // `subagents_active` too — a crash mid-agent-run would
-                    // otherwise leave the avatar wedged in Thinking forever.
-                    StateSignal::SubprocessExited { .. }
-                    | StateSignal::AudioError { .. }
-                    | StateSignal::TtsError { .. }
-                    | StateSignal::ErrorAcknowledged { .. } => {
-                        ts.harness_output_active = false;
-                        ts.subagents_active = false;
-                    }
-                    _ => {}
-                }
-
-                // Input-driven clearing of awaiting_permission /
-                // awaiting_question. The user typing into the prompt is the
-                // signal that the prompt is being answered; clearing an
-                // already-false flag is a no-op.
-                let is_input = matches!(
-                    signal,
-                    StateSignal::UserKeystroke { .. } | StateSignal::UserSubmit { .. }
-                );
-                if is_input && ts.awaiting_permission {
-                    ts.awaiting_permission = false;
-                    info!(tab = ?target_tab, "awaiting permission: cleared (input)");
-                    emit_awaiting_permission(&app, &state_events, target_tab.clone(), false);
-                }
-                if is_input && ts.awaiting_question {
-                    ts.awaiting_question = false;
-                    info!(tab = ?target_tab, "awaiting question: cleared (input)");
-                    emit_awaiting_question(&app, &state_events, target_tab.clone(), false);
-                }
-
-                let prev_state = ts.avatar_state;
-                // Shell tabs short-circuit transition — only Idle ↔ Error
-                // is reachable for them, and SubprocessExited has already
-                // been routed elsewhere. The remaining error edges
-                // (AudioError, TtsError, ErrorAcknowledged) come through
-                // here and use the same logic as AI tabs.
-                let is_shell = matches!(ts.kind, TabKind::Shell);
-                let next = if is_shell && !is_error_edge(&signal) {
-                    prev_state
-                } else {
-                    transition(
-                        prev_state,
-                        &signal,
-                        ts.has_unsent_input,
-                        ts.composing,
-                        ts.harness_output_active,
-                        ts.subagents_active,
-                    )
-                };
-                if next != prev_state {
-                    info!(tab = ?target_tab, from = ?prev_state, to = ?next, ?signal, "avatar state");
-                    ts.avatar_state = next;
-                    let inactive = target_tab != active;
-                    let bump_done_while_away = next == AvatarState::Idle && inactive && !ts.done_while_away;
-                    if bump_done_while_away {
-                        ts.done_while_away = true;
-                    }
-                    emit_state(&app, &state_events, target_tab.clone(), next);
-                    if next == AvatarState::Error {
-                        if let Some(info) = ErrorInfo::from_signal(&signal) {
-                            emit_error(&app, &info);
-                        }
-                    }
-                    if bump_done_while_away {
-                        info!(tab = ?target_tab, "done while away: set");
-                        emit_done_while_away(&app, &state_events, target_tab, true);
-                    }
-                }
+                lp.on_signal(signal);
             }
-            _ = tick.tick() => {
-                // Per-tab idle-Listening sweep. Each tab's input-length
-                // counter is independent. The RwLock read lock is held only
-                // long enough to clone the per-tab `Arc<AtomicI32>`s — the
-                // map is never mutated under it during the sweep.
-                let snapshot: HashMap<TabId, Arc<AtomicI32>> = match input_lengths.read() {
-                    Ok(g) => g.clone(),
-                    // Recover a poisoned lock rather than skipping the sweep —
-                    // `continue` here would permanently break the idle→Idle
-                    // avatar transition for the rest of the session if any
-                    // writer ever panicked. The map only holds Arcs to atomics,
-                    // so a poisoned writer can't leave it logically corrupt
-                    // (this mirrors how `sysmon` recovers via `into_inner`).
-                    Err(e) => e.into_inner().clone(),
-                };
-                for (tab, ts) in tabs.iter_mut() {
-                    // Agents-stall backstop. Recover a tab wedged in Thinking by
-                    // an `subagents_active` that never cleared (Task result missing
-                    // after an Esc-interrupt, unparseable, or its edge dropped).
-                    // Only arms while the parent is producing NO output — a live
-                    // turn keeps `harness_output_active` true via the ~1 Hz footer
-                    // repaint, so this can't clip real work. See
-                    // `subagents_stall_timeout`.
-                    if ts.avatar_state == AvatarState::Thinking
-                        && ts.subagents_active
-                        && !ts.harness_output_active
-                    {
-                        let since = *ts.subagents_stall_since.get_or_insert_with(Instant::now);
-                        if since.elapsed() >= subagents_stall_timeout(tab, &app) {
-                            info!(?tab, from = ?ts.avatar_state, to = ?AvatarState::Idle, signal = "AgentsStallTimeout", "avatar state");
-                            ts.subagents_active = false;
-                            ts.subagents_stall_since = None;
-                            ts.avatar_state = AvatarState::Idle;
-                            emit_state(&app, &state_events, tab.clone(), ts.avatar_state);
-                            if *tab != active && !ts.done_while_away {
-                                ts.done_while_away = true;
-                                info!(?tab, "done while away: set (agents stall)");
-                                emit_done_while_away(&app, &state_events, tab.clone(), true);
-                            }
-                            continue;
-                        }
-                    } else {
-                        ts.subagents_stall_since = None;
-                    }
-
-                    if ts.avatar_state != AvatarState::Listening { continue; }
-                    if ts.composing { continue; }
-                    let len = snapshot
-                        .get(tab)
-                        .map(|c| c.load(Ordering::Relaxed))
-                        .unwrap_or(0);
-                    if len != 0 { continue; }
-                    let idle_long_enough = ts
-                        .last_keystroke_at
-                        .map(|t| t.elapsed() >= EMPTY_INPUT_IDLE)
-                        .unwrap_or(true);
-                    if !idle_long_enough { continue; }
-                    info!(?tab, from = ?ts.avatar_state, to = ?AvatarState::Idle, signal = "EmptyInputTimeout", "avatar state");
-                    ts.avatar_state = AvatarState::Idle;
-                    ts.has_unsent_input = false;
-                    // Forced back to Idle by inactivity — clear any lingering
-                    // output-active flag so it can't drive a later speech cycle
-                    // to Thinking.
-                    ts.harness_output_active = false;
-                    emit_state(&app, &state_events, tab.clone(), ts.avatar_state);
-                    if *tab != active && !ts.done_while_away {
-                        ts.done_while_away = true;
-                        info!(?tab, "done while away: set (tick)");
-                        emit_done_while_away(&app, &state_events, tab.clone(), true);
-                    }
-                }
-            }
+            _ = tick.tick() => lp.on_tick(),
         }
     }
 
     debug!("state manager: signal channel closed; exiting");
+}
+
+/// Where the `active` pointer lands once the tab named `removed` is closed, or
+/// `None` for "leave it where it is".
+///
+/// Split out of [`Loop::on_tab_removed`] so the rule can be tested at all: the
+/// cost of getting it wrong is invisible at the removal itself and shows up one
+/// tick later in [`Loop::on_tick`], whose `tab != active` checks would then
+/// mark EVERY surviving tab done-while-away — a badge on every tab, from a
+/// pointer left on a dead id.
+fn repoint_active_after(
+    active: &TabId,
+    removed: &TabId,
+    survivors: &HashMap<TabId, TabState>,
+) -> Option<TabId> {
+    if active != removed {
+        return None;
+    }
+    // The frontend's follow-up `TabActivated` sets the real one; this only has
+    // to be a LIVE tab. No survivors ⇒ nothing to point at, and the next
+    // `TabAdded` will be activated in its own right.
+    survivors.keys().next().cloned()
 }
 
 /// True when the signal is one of the cross-cutting error edges that apply
@@ -1813,122 +2042,6 @@ fn transition(
 /// Frontend `app.emit` + in-process broadcast share the same event payload.
 /// `broadcast::send` returns Err only when there are zero subscribers, which
 /// is the normal case at startup, so we drop that result silently.
-fn dispatch(app: &AppHandle, bcast: &broadcast::Sender<StateEvent>, event: StateEvent) {
-    if let Err(e) = app.emit("avatar-state", &event) {
-        warn!(error = %e, "failed to emit avatar-state");
-    }
-    let _ = bcast.send(event);
-}
-
-fn emit_state(
-    app: &AppHandle,
-    bcast: &broadcast::Sender<StateEvent>,
-    tab: TabId,
-    state: AvatarState,
-) {
-    dispatch(app, bcast, StateEvent::StateChanged { tab, state });
-}
-
-fn emit_active_tab(app: &AppHandle, bcast: &broadcast::Sender<StateEvent>, tab: TabId) {
-    dispatch(app, bcast, StateEvent::ActiveTabChanged { tab });
-}
-
-fn emit_error(app: &AppHandle, info: &ErrorInfo) {
-    if let Err(e) = app.emit("avatar-error", info) {
-        warn!(error = %e, "failed to emit avatar-error");
-    }
-}
-
-fn emit_awaiting_permission(
-    app: &AppHandle,
-    bcast: &broadcast::Sender<StateEvent>,
-    tab: TabId,
-    awaiting: bool,
-) {
-    dispatch(
-        app,
-        bcast,
-        StateEvent::AwaitingPermissionChanged { tab, awaiting },
-    );
-}
-
-fn emit_awaiting_question(
-    app: &AppHandle,
-    bcast: &broadcast::Sender<StateEvent>,
-    tab: TabId,
-    awaiting: bool,
-) {
-    dispatch(
-        app,
-        bcast,
-        StateEvent::AwaitingQuestionChanged { tab, awaiting },
-    );
-}
-
-fn emit_done_while_away(
-    app: &AppHandle,
-    bcast: &broadcast::Sender<StateEvent>,
-    tab: TabId,
-    done: bool,
-) {
-    dispatch(app, bcast, StateEvent::DoneWhileAwayChanged { tab, done });
-}
-
-fn emit_tab_closed_state(
-    app: &AppHandle,
-    bcast: &broadcast::Sender<StateEvent>,
-    tab: TabId,
-    closed: bool,
-    exit_code: Option<i32>,
-    closed_message: Option<String>,
-) {
-    dispatch(
-        app,
-        bcast,
-        StateEvent::TabClosedStateChanged {
-            tab,
-            closed,
-            exit_code,
-            closed_message,
-        },
-    );
-}
-
-fn emit_tab_created(
-    app: &AppHandle,
-    bcast: &broadcast::Sender<StateEvent>,
-    tab: TabId,
-    kind: TabKindWire,
-    name: String,
-    builtin: bool,
-    position: usize,
-) {
-    dispatch(
-        app,
-        bcast,
-        StateEvent::TabCreated {
-            tab,
-            kind,
-            name,
-            builtin,
-            position,
-        },
-    );
-}
-
-fn emit_tab_closed_event(app: &AppHandle, bcast: &broadcast::Sender<StateEvent>, tab: TabId) {
-    dispatch(app, bcast, StateEvent::TabClosed { tab });
-}
-
-fn emit_tab_renamed(
-    app: &AppHandle,
-    bcast: &broadcast::Sender<StateEvent>,
-    tab: TabId,
-    name: String,
-) {
-    dispatch(app, bcast, StateEvent::TabRenamed { tab, name });
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2408,6 +2521,94 @@ mod tests {
         assert!(!is_error_edge(&UserKeystroke { tab: tab() }));
         assert!(!is_error_edge(&UserSubmit { tab: tab() }));
         assert!(!is_error_edge(&TtsPlaybackStarted { tab: tab() }));
+    }
+
+    // ---- R15: the two invariants of the select loop -------------------------
+
+    /// **The activity mirror is fed before `on_signal` can return by any path**
+    /// (V39 Phase B's rule, pinned structurally by V42 R15).
+    ///
+    /// `Loop::on_signal` opens with `activity.note_signal(&signal)` and only
+    /// then starts returning early, one arm per signal family. Every one of
+    /// those returns was a `continue` in the old 530-line `select!` arm, and the
+    /// property is the one it was then: a signal a handler claims for itself
+    /// must STILL have reached the readers above the seam — `crate::delegation`'s
+    /// preflight and its wait loop read that mirror and nothing else.
+    ///
+    /// **Why the source and not the behaviour.** The mirror is a read-only fold:
+    /// no output of this loop differs between a run with it and a run without,
+    /// which is exactly what makes a reordering invisible to every other test in
+    /// this module — and driving the real loop needs a live `AppHandle` anyway.
+    /// Same reasoning, same shape as `delegation::engine`'s call-site scan.
+    #[test]
+    fn note_signal_is_mirrored_before_any_early_return() {
+        let src = include_str!("manager.rs").replace('\r', "");
+        // Comments and string literals blanked, byte offsets preserved — so a
+        // `return` inside a comment cannot move the answer.
+        let code = crate::rustsrc::code_of("state/manager.rs", &src);
+        let after = code
+            .split("fn on_signal(")
+            .nth(1)
+            .expect("Loop::on_signal exists");
+        // Stop at the next method: `find` must not answer with some later
+        // function's `return`.
+        let body = &after[..after.find("\n    fn ").unwrap_or(after.len())];
+        let note = body
+            .find("note_signal")
+            .expect("Loop::on_signal must mirror the signal");
+        // Everything `on_signal` can do to leave: the `return`s that replaced
+        // the old body's `continue`s, and the tail call that hands the signal on
+        // to the per-tab path.
+        for exit in ["return ", "self.on_tab_signal("] {
+            let at = body.find(exit).unwrap_or_else(|| {
+                panic!("`{exit}` is gone from Loop::on_signal — this test reads a shape that moved")
+            });
+            assert!(
+                note < at,
+                "`activity.note_signal` must run before the first `{exit}` in Loop::on_signal — a \
+                 signal handled by an early return still has to reach the delegation engine's \
+                 readers"
+            );
+        }
+    }
+
+    /// **A closed active tab re-points at a survivor** — the other invariant the
+    /// loop body carried as a comment.
+    ///
+    /// Leaving `active` on a dead id is silent at the removal and wrong one tick
+    /// later: [`Loop::on_tick`]'s `tab != active` test would then be true for
+    /// EVERY surviving tab, so the next idle sweep marks all of them
+    /// done-while-away — a badge on every tab in the window, from a stale
+    /// pointer.
+    #[test]
+    fn removing_the_active_tab_repoints_it_at_a_survivor() {
+        let mut survivors: HashMap<TabId, TabState> = HashMap::new();
+        survivors.insert(
+            other(),
+            TabState::new(TabKind::AiTool, "opencode".to_string()),
+        );
+
+        // The active tab is the one that closed ⇒ move to a live one.
+        let next = repoint_active_after(&tab(), &tab(), &survivors)
+            .expect("a survivor exists, so the pointer moves");
+        assert!(
+            survivors.contains_key(&next),
+            "`active` must land on a tab that still exists"
+        );
+
+        // Some other tab closed ⇒ the pointer is not touched.
+        assert_eq!(
+            repoint_active_after(&tab(), &other(), &survivors),
+            None,
+            "closing a background tab must not move the active pointer"
+        );
+
+        // The last tab closed ⇒ nothing to point at; the next `TabAdded` is
+        // activated in its own right.
+        assert_eq!(
+            repoint_active_after(&tab(), &tab(), &HashMap::new()),
+            None
+        );
     }
 
     // ---- V39 Phase A: per-tab read-only state -------------------------------

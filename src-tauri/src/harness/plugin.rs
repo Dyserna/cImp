@@ -1928,8 +1928,9 @@ pub fn read_advisor_gate_blocked(s: &Settings) -> bool {
 ///
 /// V32 Phase D's injection-hygiene paragraph has no entry of its own on
 /// purpose, and V37 Phase F changed WHICH entry covers it. Its gate used to be
-/// `advertises_offload_to_{claude,opencode}`; it is now `consumer_hygiene_for`
-/// alone, whose L1/L2/L3 cells all ride `injection::spawn_sig` — carried by the
+/// `advertises_offload_to_{claude,opencode}`; it is now
+/// `injection::Feature::ConsumerHygiene` alone, whose L1/L2/L3 cells all ride
+/// `injection::spawn_sig` — carried by the
 /// `"injection"` entry each plugin adds. A future addendum with an independent
 /// gate does need its own slot here.
 pub fn guidance_gates(s: &Settings) -> serde_json::Value {

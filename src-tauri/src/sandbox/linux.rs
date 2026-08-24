@@ -853,11 +853,8 @@ fn record_grants(prepared: &Prepared) {
 
     let summary = grant_summary(&prepared.grants);
     let key = format!("{}|{}", prepared.seam, summary);
-    if let Ok(mut guard) = EMITTED.lock() {
-        let set = guard.get_or_insert_with(HashSet::new);
-        if !set.insert(key) {
-            return;
-        }
+    if !super::once_per_session(&EMITTED, key) {
+        return;
     }
     super::record_event(
         &prepared.seam,

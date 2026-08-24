@@ -20,10 +20,10 @@
 //! only, `format!()`/`json!()` strings intact.
 
 use crate::harness::claude::hook as claude_hook;
-use crate::settings::injection::NativeWebMode as NativeWebVisibility;
+use crate::settings::injection::{native_web_mode, NativeWebMode, Scope};
 use crate::settings::{AiToolTabConfig, Settings};
 use crate::tabs::config::{
-    compose_capability_guidance, native_web_for, CHANNEL_PUSH_FLAG, CHANNEL_REGISTRATION_FLAG,
+    compose_capability_guidance, CHANNEL_PUSH_FLAG, CHANNEL_REGISTRATION_FLAG,
     CHANNEL_REGISTRATION_TARGET,
 };
 
@@ -270,7 +270,7 @@ pub(crate) fn build_pre_args(
         // permission denial below, and the two must never disagree.
         // V32 Phase G: resolved for THIS tab, so a per-tab override reaches
         // both halves together for the same reason.
-        let native_web = native_web_for(settings, "claude", tab);
+        let native_web = native_web_mode(settings, Scope::Tab { agent: "claude", tab });
         if super::settings::statusline_enabled(settings) {
             if let Some(command) = super::statusline::launch_command() {
                 // `refreshInterval` (seconds) re-runs the command on a timer in
@@ -385,7 +385,7 @@ pub(crate) fn build_pre_args(
             // which is precisely how an emitted artifact and its own hello come
             // to disagree; one binding each, read twice.
             let taint_beacon_hook =
-                native_web == NativeWebVisibility::Sensor && settings.loopback_needed();
+                native_web == NativeWebMode::Sensor && settings.loopback_needed();
             let checkpoint_hook = settings.workbench.checkpoints && settings.loopback_needed();
             // V32 Phase F: `PreToolUse` now has TWO independent producers (the
             // V11 read advisor and the Phase F web beacon), so its entries
@@ -749,7 +749,7 @@ pub(crate) fn build_pre_args(
         // Ungated by `loopback_needed()`, unlike the sensor hook — a denial
         // needs no app to talk to, and its whole point is to hold on the
         // installs where the proxy is not carrying the web traffic.
-        if native_web == NativeWebVisibility::Deny {
+        if native_web == NativeWebMode::Deny {
             overlay.insert(
                 "permissions".to_string(),
                 serde_json::json!({ "deny": CLAUDE_WEB_DENY_RULES }),

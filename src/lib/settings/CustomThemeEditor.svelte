@@ -140,22 +140,35 @@
     gap: var(--space-2);
   }
 
-  label {
+  /* #129 (a): these three used to be bare-element rules. `settings-chrome.css`
+     now carries `label`, `label > span:first-child` and `input[type='color']`
+     at the same specificity, and this component's CSS lands in the SHARED chunk
+     which the settings window loads BEFORE that sheet — so a tie would go to
+     the chrome sheet and this editor would lose its flex row, its swatch size
+     and its label metrics. Each selector is raised just past the chrome's. */
+  .custom-theme-editor label {
     display: flex;
     align-items: center;
     gap: var(--space-2);
     font-size: var(--font-size-xs);
     color: var(--text-secondary);
+    margin-bottom: 0;
   }
 
-  label span {
+  .custom-theme-editor .grid label span {
     flex: 1;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+    /* beats the chrome's `label > span:first-child` (0,2,2) at 0,3,2. Its
+       `display: block` is left alone deliberately — this span is a flex item,
+       so block is what it computed to anyway. */
+    margin-bottom: 0;
+    color: inherit;
+    font-size: inherit;
   }
 
-  input[type='color'] {
+  .custom-theme-editor input[type='color'] {
     width: 28px;
     height: 22px;
     padding: 0;

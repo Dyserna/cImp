@@ -677,6 +677,9 @@
     border: 1px solid var(--border-default);
     border-radius: var(--radius-md);
     background: var(--surface-card, var(--surface-2));
+    /* #129 (a): this is a <section>, so `settings-chrome.css`'s `section` rule
+       now reaches it and would add its bottom margin on top of the list gap. */
+    margin-bottom: 0;
   }
   .card-head {
     display: flex;
@@ -711,7 +714,10 @@
     border-radius: var(--radius-sm);
     font-size: 16px;
   }
-  .remove:hover {
+  /* #129 (a): scoped under `.checks-editor` so this beats the hoisted
+     `settings-chrome.css` rule `button:hover:not(:disabled)` (0,3,1); a bare
+     `.remove:hover` is 0,3,0 and would lose the danger colours. */
+  .checks-editor .remove:hover {
     background: var(--surface-danger-bg);
     color: var(--text-danger-pale);
     border-color: var(--border-danger-strong);
@@ -721,10 +727,17 @@
     display: flex;
     flex-direction: column;
     gap: 4px;
+    /* #129 (a): these are <label>s, and the hoisted `settings-chrome.css`
+       `label` rule now reaches them with a `margin-bottom`. Pin the margin the
+       browser gave them before. */
+    margin: 0;
   }
   .field > span {
     font-size: var(--font-size-sm);
     color: var(--text-quiet-strong);
+    /* #129 (a): `settings-chrome.css`'s `label > span:first-child` would add a
+       `margin-bottom` on top of `.field`'s own gap. */
+    margin-bottom: 0;
   }
   .field small {
     color: var(--text-tertiary);

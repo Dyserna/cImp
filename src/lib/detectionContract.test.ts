@@ -39,7 +39,11 @@ const ALLOWED = new Map<string, string>([
     'declares DetectionStatus and owns rulesHealth(), the single extractor every other consumer goes through',
   ],
   [
-    '/src/SettingsApp.svelte',
+    // #129 (c): the detection panel moved out of `SettingsApp.svelte` into its
+    // own section component. RE-POINTED, not relaxed — the row still names one
+    // file, and the third case below still fails loudly if this path stops
+    // existing or stops containing the read.
+    '/src/lib/settings/sections/InjectionSection.svelte',
     'the detection panel renders the raw read: `healthy` drives the dot (#48, N-3) and `armed` adds the "nothing to match with" clause beside the file counts',
   ],
 ]);

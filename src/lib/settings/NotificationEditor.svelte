@@ -111,6 +111,9 @@
     align-items: center;
     gap: 6px;
     cursor: pointer;
+    /* #129 (a): this is a <label>, and `settings-chrome.css`'s `label` rule
+       now reaches it with a `margin-bottom`. */
+    margin: 0;
   }
   .row-toggle input[type='checkbox'] {
     margin: 0;

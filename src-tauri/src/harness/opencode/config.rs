@@ -20,14 +20,11 @@
 
 use std::path::Path;
 
-use crate::settings::injection::NativeWebMode as NativeWebVisibility;
+use crate::settings::injection::{effective, native_web_mode, Feature, NativeWebMode, Scope};
 use crate::error::{AppError, AppResult};
 use crate::offload::server;
 use crate::settings::{AiToolTabConfig, LocalProviderBlock, Settings};
-use crate::tabs::config::{
-    compose_capability_guidance, consumer_hygiene_for,
-    native_web_for,
-};
+use crate::tabs::config::compose_capability_guidance;
 
 /// Deterministic path of the managed OpenCode instructions file for `cfg`.
 /// One file per tab id (the TTS toggle is per-tab) under a managed dir next to
@@ -451,9 +448,16 @@ pub(crate) fn build_opencode_config(
     // a deliberate denial, which is a different feature the user did not touch.
     // With both off, no `agent` key is written at all and OpenCode's own
     // defaults apply — exactly the pre-V32 posture the escape hatch promises.
-    let native_web = native_web_for(settings, "opencode", tab);
-    let hygiene = consumer_hygiene_for(settings, "opencode", tab);
-    let denied = native_web == NativeWebVisibility::Deny;
+    let native_web = native_web_mode(settings, Scope::Tab { agent: "opencode", tab });
+    let hygiene = effective(
+        Feature::ConsumerHygiene,
+        Scope::Tab {
+            agent: "opencode",
+            tab,
+        },
+        settings,
+    );
+    let denied = native_web == NativeWebMode::Deny;
     if hygiene || denied {
         let mut permission = serde_json::Map::new();
         if hygiene {

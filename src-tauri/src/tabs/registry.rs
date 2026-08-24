@@ -26,6 +26,30 @@ pub struct TabMetaWire {
     pub builtin: bool,
 }
 
+/// Everything one tab launch needs, in one value — the registry-level mirror
+/// of [`crate::pty::PtyStart`].
+///
+/// R25: [`TabRegistry::start_tab`] and [`TabRegistry::restart_tab`] take the
+/// same ten things and must keep taking the same ten things (the only
+/// difference between them is that the restart shuts the old session down
+/// first). As two positional lists that was an invariant nobody could see; as
+/// one struct the two signatures are *literally* identical and a field added to
+/// one is added to both.
+pub struct TabStart<'a> {
+    pub app: AppHandle,
+    pub tab: TabId,
+    pub output_channel: Channel<String>,
+    pub rows: u16,
+    pub cols: u16,
+    pub launch_cwd: &'a std::path::Path,
+    pub invocation_args: &'a [String],
+    pub tts_segments: mpsc::Sender<TtsRequest>,
+    pub settings: SettingsHandle,
+    /// V39 review R-5: this start's generation, from
+    /// `TabActivity::begin_start`.
+    pub start_gen: u64,
+}
+
 /// Owns one PtyManager per TabId plus the shared resources tabs read on
 /// activation (audio output, active-tab cell, state signal channel). All
 /// public methods are async because PtyManager.start/shutdown are.
@@ -268,22 +292,19 @@ impl TabRegistry {
 
     /// Spawn the subprocess for `tab` and bind it to `output_channel`. Each
     /// tab calls this once on first xterm mount.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn start_tab(
-        &self,
-        app: AppHandle,
-        tab: TabId,
-        output_channel: Channel<String>,
-        rows: u16,
-        cols: u16,
-        launch_cwd: &std::path::Path,
-        invocation_args: &[String],
-        tts_segments: mpsc::Sender<TtsRequest>,
-        settings: SettingsHandle,
-        // V39 review R-5: this start's generation, from
-        // `TabActivity::begin_start`.
-        start_gen: u64,
-    ) -> AppResult<()> {
+    pub async fn start_tab(&self, start: TabStart<'_>) -> AppResult<()> {
+        let TabStart {
+            app,
+            tab,
+            output_channel,
+            rows,
+            cols,
+            launch_cwd,
+            invocation_args,
+            tts_segments,
+            settings,
+            start_gen,
+        } = start;
         let manager = self
             .managers
             .get(&tab)
@@ -310,17 +331,17 @@ impl TabRegistry {
             }
         };
         let result = manager
-            .start(
+            .start(crate::pty::PtyStart {
                 app,
                 spec,
                 output_channel,
-                rows,
-                cols,
+                initial_rows: rows,
+                initial_cols: cols,
                 tts_segments,
-                self.state_signals.clone(),
-                self.patterns.clone(),
+                state_signals: self.state_signals.clone(),
+                patterns: self.patterns.clone(),
                 start_gen,
-            )
+            })
             .await;
         // On a successful Shell spawn, broadcast `ShellRestarted` so the
         // state manager clears the closed flag (no-op when the tab was
@@ -343,22 +364,19 @@ impl TabRegistry {
     /// Tear down + bring up the subprocess for `tab`. The frontend supplies a
     /// fresh output channel because the previous one is dropped with the
     /// previous session.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn restart_tab(
-        &self,
-        app: AppHandle,
-        tab: TabId,
-        output_channel: Channel<String>,
-        rows: u16,
-        cols: u16,
-        launch_cwd: &std::path::Path,
-        invocation_args: &[String],
-        tts_segments: mpsc::Sender<TtsRequest>,
-        settings: SettingsHandle,
-        // V39 review R-5: this start's generation, from
-        // `TabActivity::begin_start`.
-        start_gen: u64,
-    ) -> AppResult<()> {
+    pub async fn restart_tab(&self, start: TabStart<'_>) -> AppResult<()> {
+        let TabStart {
+            app,
+            tab,
+            output_channel,
+            rows,
+            cols,
+            launch_cwd,
+            invocation_args,
+            tts_segments,
+            settings,
+            start_gen,
+        } = start;
         let manager = self
             .managers
             .get(&tab)
@@ -376,17 +394,17 @@ impl TabRegistry {
             }
         };
         let result = manager
-            .start(
+            .start(crate::pty::PtyStart {
                 app,
                 spec,
                 output_channel,
-                rows,
-                cols,
+                initial_rows: rows,
+                initial_cols: cols,
                 tts_segments,
-                self.state_signals.clone(),
-                self.patterns.clone(),
+                state_signals: self.state_signals.clone(),
+                patterns: self.patterns.clone(),
                 start_gen,
-            )
+            })
             .await;
         if result.is_ok() && matches!(tab.kind(), TabKind::Shell) {
             // Backpressuring send (not try_send): a dropped ShellRestarted

@@ -223,7 +223,7 @@ fn ai_working_dir(cfg: &AiToolTabConfig, launch_cwd: &Path) -> std::path::PathBu
 /// request bodies carry a `cwd`, but that is the child's claim about itself,
 /// and the row's whole purpose is to be trustworthy after an incident. A tab id
 /// is config-derived and already validated against this same settings snapshot
-/// (`loopback::is_configured_tab`), so resolving the root *from the tab* keeps
+/// (`latch::is_configured_tab`), so resolving the root *from the tab* keeps
 /// the row's project attribution as trustworthy as its tab attribution.
 ///
 /// `None` for an id that names no configured AI tab — including a Shell or
@@ -299,7 +299,7 @@ pub(crate) fn harness_tab_dirs(
 /// would be typed into with OpenCode's paste profile. Every one of its callers
 /// now propagates the `None`.
 ///
-/// **V33 C5 (F-4) is why one spelling matters.** `loopback::is_configured_tab`
+/// **V33 C5 (F-4) is why one spelling matters.** `latch::is_configured_tab`
 /// verifies a caller's asserted `(consumer, tab)` pair against this, so a tab
 /// classified one way at spawn and another way at verification would be launched
 /// with hooks whose `--tab` its own beacons could not key. Classifying both ends
@@ -2284,6 +2284,7 @@ mod tests {
             // V42 R2 (#114) split the loopback module; the scan follows every
             // file it produced, or the needle could just move next door.
             ("offload/discovery.rs", include_str!("../offload/discovery.rs")),
+            ("offload/latch.rs", include_str!("../offload/latch.rs")),
         ] {
             // The needle is the JSON KEY form, so the prose and the assertions
             // that name the field (including this one) are not false positives —

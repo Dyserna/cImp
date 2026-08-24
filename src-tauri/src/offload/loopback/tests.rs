@@ -9,9 +9,15 @@
 
 use super::*;
 
-// V42 R2 (#114): the discovery half of this module now lives in
-// `offload::discovery`; these are the items only its tests reach for, so the
-// production `use` above stays exactly as wide as production needs.
+// V42 R2/R3 (#114) moved the discovery and taint-latch halves of this module
+// to `offload::discovery` and `offload::latch`. What follows is what only the
+// TESTS reach for, imported here so each production `use` stays exactly as
+// wide as production needs.
+use crate::offload::latch::{
+    override_row, unlatch_clear_row, ClearBasis, LatchOverride, TabLatch,
+};
+use crate::offload::toolclass::{Latch, ToolClass, WriteTaint};
+
 use crate::offload::discovery::{
     dispatch_discovery_report, report_skipped_to_app, resolve_external_root, responds,
     select_verified, ChildIdentity, DISCOVERY_REPORT_TIMEOUT, DISCOVERY_SKIPPED_PATH,
@@ -6866,6 +6872,7 @@ fn clearing_the_bit_does_not_promote_anything_already_quarantined() {
     for (file, src) in [
         ("offload/loopback.rs", include_str!("../loopback.rs")),
         ("offload/discovery.rs", include_str!("../discovery.rs")),
+        ("offload/latch.rs", include_str!("../latch.rs")),
     ] {
         for promotion in [
             concat!("mem_", "promote_note"),
@@ -8709,17 +8716,28 @@ fn no_http_route_can_reach_a_contamination_clear() {
     // `concat!` so this needle does not match itself in the source it
     // scans — the first version of this assertion counted 2 and was
     // "failing" on nothing but its own text.
+    //
+    // V42 R3 (#114) moved the override entry point and the registry to
+    // `offload/latch.rs`, so the count is taken over BOTH files: one entry
+    // point in the module that has it, and none in the module that answers
+    // HTTP. The door-shaped needles are scanned over both for the same reason
+    // — a parse-from-body added on either side is the same door.
+    let latch_src = include_str!("../latch.rs");
     assert_eq!(
-        src.matches(concat!("pub fn ", "apply_latch_override"))
-            .count(),
+        src.matches(concat!("pub fn ", "apply_latch_override")).count()
+            + latch_src
+                .matches(concat!("pub fn ", "apply_latch_override"))
+                .count(),
         1,
         "one entry point, or the doc's claim is unverifiable"
     );
-    assert!(
-        !src.contains(concat!("LatchOverride::", "parse(&body"))
-            && !src.contains(concat!("LatchOverride::", "parse(body")),
-        "an override action parsed from a request body is an HTTP door"
-    );
+    for (file, text) in [("offload/loopback.rs", src), ("offload/latch.rs", latch_src)] {
+        assert!(
+            !text.contains(concat!("LatchOverride::", "parse(&body"))
+                && !text.contains(concat!("LatchOverride::", "parse(body")),
+            "{file}: an override action parsed from a request body is an HTTP door"
+        );
+    }
 
     // 3. Behaviourally: the two registry entry points that ARE HTTP-reachable
     //    (`/latch/beacon` → `beacon`, `/latch/state` → `view_for`) can

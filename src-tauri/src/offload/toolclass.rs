@@ -679,7 +679,7 @@ pub const REFUSAL_EXTERNAL_BLOCKED: &str = "REFUSED (security boundary): this ta
 ///
 /// # Where it is selected, and why not here
 ///
-/// **In [`LatchRegistry::gate`](crate::offload::loopback::LatchRegistry), which
+/// **In [`LatchRegistry::gate`](crate::offload::latch::LatchRegistry), which
 /// holds `TabLatch::local_by_user_flip` — and NEVER inside [`Latch::refusal`].**
 /// `Latch::refusal` is a pure function over [`Latch`] that the **offload worker**
 /// also calls (`offload::agent`), and the worker has no user-flip concept to
@@ -791,8 +791,8 @@ pub const REFUSAL_NATIVE_WEB_TAINTED: &str = "REFUSED (security boundary): exter
 /// The fix is the one F-13 set the precedent for: a **fourth fixed constant**,
 /// not a dynamic message. What selects between them is a lookup on a fact cImp
 /// itself recorded when it applied the override
-/// (`loopback::TabLatch::local_by_user_flip`, set in the one arm that performs
-/// [`LatchOverride::FlipLocal`](crate::offload::loopback::LatchOverride) and
+/// (`latch::TabLatch::local_by_user_flip`, set in the one arm that performs
+/// [`LatchOverride::FlipLocal`](crate::offload::latch::LatchOverride) and
 /// published on `/latch/state`) — never anything the caller says about itself,
 /// and never composition from untrusted input.
 ///

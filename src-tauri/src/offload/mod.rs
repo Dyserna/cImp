@@ -45,6 +45,7 @@ pub mod backend_gate;
 pub mod detection;
 pub mod discovery;
 pub mod harness_tab;
+pub mod latch;
 pub mod loopback;
 pub mod mcp;
 pub mod mcp_host;

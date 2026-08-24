@@ -1182,7 +1182,7 @@ impl Budget {
     }
 
     /// Wipe the scope's spend (a tab's session rotated — see
-    /// `loopback::TabLatch::observe`). The flag resets too: the new scope is
+    /// `latch::TabLatch::observe`). The flag resets too: the new scope is
     /// entitled to its own report.
     pub fn reset(&mut self) {
         *self = Self::default();
@@ -2235,7 +2235,7 @@ pub const NO_TAB_IDENTITY: &str = "(no tab identity)";
 /// A latch scope, read as a row attribution (#51).
 ///
 /// **Only valid for a string that IS a scope** — a label
-/// `loopback::LatchScope::label` produced, or a worker task id from
+/// `latch::LatchScope::label` produced, or a worker task id from
 /// [`new_task_scope`]. #48 F-29: this used to be applied by [`flag_record`] to
 /// whatever a producer put in [`Flag::scope`], and the `_ => Headless` arm then
 /// made a positive "no tab" claim about two producers that pass a human-readable
@@ -2249,7 +2249,7 @@ pub const NO_TAB_IDENTITY: &str = "(no tab identity)";
 /// column the reader will interpret as a tab.
 ///
 /// No `Unrecognized` case: every scope reaching this module was resolved by
-/// `loopback::latch_scope`, which creates no scope for an id that names no
+/// `latch::latch_scope`, which creates no scope for an id that names no
 /// configured tab. An unrecognized id therefore never becomes a flag row in the
 /// first place — the state exists in [`Attribution`] for the recorders that
 /// *can* see one, not for this one.

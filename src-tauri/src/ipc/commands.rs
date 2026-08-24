@@ -1998,14 +1998,14 @@ pub async fn detection_open_rules_folder() -> AppResult<()> {
 /// the harness has already proved is *observed* on this poll rather than
 /// whenever the model next calls a cImp tool. That matters only for a tab whose
 /// user armed the one-shot contamination clear by restoring a checkpoint — see
-/// `loopback::TabLatch::awaiting_session_clear`. It grants nothing the next
+/// `latch::TabLatch::awaiting_session_clear`. It grants nothing the next
 /// gated call would not have granted anyway; it only decides when the same fact
 /// becomes visible.
 #[tauri::command]
 pub async fn latch_status(
     app: tauri::AppHandle,
-) -> AppResult<Vec<crate::offload::loopback::LatchStatus>> {
-    Ok(crate::offload::loopback::latch_snapshot(&app))
+) -> AppResult<Vec<crate::offload::latch::LatchStatus>> {
+    Ok(crate::offload::latch::latch_snapshot(&app))
 }
 
 /// V32 Phase G (locked decision 16): the RESOLVED state of every injection
@@ -2044,7 +2044,7 @@ pub async fn injection_status(state: State<'_, AppState>) -> AppResult<serde_jso
 /// **This is the only path that can release a contamination flag**, and since
 /// decision 15's 2026-08-10 amendment `"unlatch"` releases one too (restoring
 /// FULL access is the user's verdict; `"flip_local"` is a workflow step and
-/// keeps the flag). See `loopback::TabLatch::contaminated` for why a click in
+/// keeps the flag). See `latch::TabLatch::contaminated` for why a click in
 /// this app's own UI is a legitimate trust root where a transcript file is not.
 ///
 /// Errors carry a human-readable reason (unknown action, no latch to move, an
@@ -2061,8 +2061,8 @@ pub async fn latch_override(
     tab: String,
     consumer: String,
     action: String,
-) -> AppResult<crate::offload::loopback::LatchView> {
-    crate::offload::loopback::apply_latch_override(&app, &consumer, &tab, &action)
+) -> AppResult<crate::offload::latch::LatchView> {
+    crate::offload::latch::apply_latch_override(&app, &consumer, &tab, &action)
         .map_err(AppError::Offload)
 }
 

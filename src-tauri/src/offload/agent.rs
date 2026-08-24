@@ -31,7 +31,7 @@ use crate::error::{AppError, AppResult};
 use tokio_util::sync::CancellationToken;
 
 use super::backend_gate::BackendGate;
-use super::loopback::LatchRoute;
+use super::latch::LatchRoute;
 use super::metrics::CallRecord;
 use super::openai::{
     strip_think, ChatChunk, ChatMessage, ChatRequest, ChatResponse, StreamAccumulator, ToolDef,
@@ -4763,7 +4763,7 @@ mod tests {
     /// can catch is a future retry path *calling `for_task()` again* inside a
     /// ladder, which is exactly the shape of the original bug, so that half is
     /// watched here. (A source scan, and the weaker kind of guard — `Budget` must
-    /// keep `Default` for `loopback::TabLatch`, so the mint cannot be made
+    /// keep `Default` for `latch::TabLatch`, so the mint cannot be made
     /// unreachable.)
     #[test]
     fn only_the_task_entry_points_mint_a_task_scope() {

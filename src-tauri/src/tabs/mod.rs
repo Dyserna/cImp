@@ -19,7 +19,7 @@ pub(crate) use config::harness_tab_dirs;
 /// containment rows are recorded under — see [`config::ai_tab_dir`].
 pub(crate) use config::ai_tab_dir;
 /// V33 (C5, finding F-4): which consumer a configured AI tab belongs to, for
-/// `loopback::is_configured_tab`'s `(consumer, tab)` check — see
+/// `latch::is_configured_tab`'s `(consumer, tab)` check — see
 /// [`config::tab_consumer`] for why both ends must classify through one call.
 pub(crate) use config::tab_consumer;
 /// V40 Phase D: which harness a tab id runs, for the state manager's sub-agent

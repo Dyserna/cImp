@@ -95,10 +95,11 @@ use tracing::{debug, info, warn};
 use crate::error::AppResult;
 use crate::harness::plugin::{HookReply, RequestIdentity, Route, RouteFuture};
 use crate::offload::discovery::hook_tab_root;
+use crate::offload::latch::is_configured_tab;
 use crate::offload::loopback::{
     assistant_text_core, bounded_declarations, bounded_id, bounded_tool, claim_contract_drift,
     claim_hello, compaction_block, contract_drift_row, context_retrieve_core, hello_row,
-    hook_gate_admits, is_configured_tab, latch_beacon_for, live_settings,
+    hook_gate_admits, latch_beacon_for, live_settings,
     permission_tab_candidates, post_edit_diagnostics, send_permission_edge, send_turn_ended,
     should_read_verdict, subagent_core, tool_checkpoint_core, tool_result_core,
     ContextCompactionBody, ContextPostEditBody, ContextRetrieveBody, ContractDriftBody,

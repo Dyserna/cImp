@@ -1380,9 +1380,6 @@
     text-align: center;
     color: var(--text-tertiary);
   }
-  /* The first h3 in a section sits right under the h2 — skip the divider
-     so we don't double-up with the section's top edge. */
-
 
   /* Narrow window: collapse sidebar to a horizontal strip on top so the
      content area still gets full width. The Settings window can resize

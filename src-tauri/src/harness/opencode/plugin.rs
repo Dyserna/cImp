@@ -33,10 +33,9 @@
 
 use std::path::Path;
 
-use crate::settings::injection::NativeWebMode as NativeWebVisibility;
+use crate::settings::injection::{native_web_mode, NativeWebMode, Scope};
 use crate::settings::{Settings, TabConfig};
 use super::config::git_exclude_opencode;
-use crate::tabs::config::native_web_for;
 
 /// V32 Phase H (locked decision 17): whether the generated plugin file should
 /// carry its native-tool GATE, for one tab.
@@ -152,7 +151,8 @@ pub(crate) fn write_opencode_plugin(working_dir: &Path, settings: &Settings, tab
         OpencodePluginFlags {
             inject: inject_enabled,
             auto_check: auto_check_enabled,
-            beacon: native_web_for(settings, "opencode", tab) == NativeWebVisibility::Sensor,
+            beacon: native_web_mode(settings, Scope::Tab { agent: "opencode", tab })
+                == NativeWebMode::Sensor,
             native_gate: native_gate_for(settings, tab),
             // V33 Phase F: the app-wide checkpoint switch, the same one
             // `WorkbenchService::checkpoints_enabled` reads and the same one
@@ -237,7 +237,7 @@ pub(crate) fn opencode_plugin_wanted(s: &Settings, tab: &str) -> bool {
         // V32 Phase F: the native-web beacon (sensor mode only — `deny` needs
         // no plugin, the pinned permission block does that work, and `off`
         // wants nothing installed at all).
-        || native_web_for(s, "opencode", tab) == NativeWebVisibility::Sensor
+        || native_web_mode(s, Scope::Tab { agent: "opencode", tab }) == NativeWebMode::Sensor
         // V32 Phase H: the native-tool gate. Its own consumer of the same trap:
         // without this line, turning the graph off (and native-web to `off`)
         // would delete the file carrying a gate the user switched ON — the

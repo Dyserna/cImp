@@ -51,13 +51,11 @@
 // type-checks `src/**` without `@types/node`. Same reasoning, and the same
 // `node:fs` + walk shape, as `tests/cssTokens.test.ts`.
 
-import { readdirSync, readFileSync } from 'node:fs';
-import { dirname, join, relative, sep } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { join } from 'node:path';
 import { describe, expect, test } from 'vitest';
 
-// this file: <repo>/tests/settingsCssOrphans.test.ts
-const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
+import { read, rel, REPO_ROOT, walk } from './repoFiles';
+
 const SECTIONS_DIR = join(REPO_ROOT, 'src', 'lib', 'settings', 'sections');
 
 /**
@@ -97,30 +95,6 @@ const NO_RULE_EXPECTED = new Map<string, string>([
     'unstyled wrapper in Offload; only its child .policy-env-label carries a rule',
   ],
 ]);
-
-/** Read a source file line-ending agnostically (see the CRLF note above). */
-function read(file: string): string {
-  return readFileSync(file, 'utf8').replace(/\r/g, '');
-}
-
-function walk(dir: string, exts: string[]): string[] {
-  const out: string[] = [];
-  let entries;
-  try {
-    entries = readdirSync(dir, { withFileTypes: true });
-  } catch {
-    return out; // an optional tree (e.g. themes/) that isn't present
-  }
-  for (const entry of entries) {
-    if (entry.name === 'node_modules' || entry.name.startsWith('.')) continue;
-    const full = join(dir, entry.name);
-    if (entry.isDirectory()) out.push(...walk(full, exts));
-    else if (exts.some((ext) => entry.name.endsWith(ext))) out.push(full);
-  }
-  return out;
-}
-
-const rel = (file: string): string => relative(REPO_ROOT, file).split(sep).join('/');
 
 /** Everything from `\n<style>` on — a Svelte component's scoped rules. */
 function styleBlock(src: string): string {
@@ -229,9 +203,21 @@ function attributeValue(src: string, i: number): { text: string; braced: boolean
   return null;
 }
 
-/** Does `css` carry a rule naming `.cls`? (Permissive — see the header.) */
-function hasRule(css: string, cls: string): boolean {
-  return new RegExp(`\\.${cls.replace(/[-]/g, '\\-')}(?![\\w-])`).test(css);
+/**
+ * Every class name a stylesheet's text NAMES, as a set.
+ *
+ * Same permissive rule as the per-class `RegExp` this replaces (V42 tranche-2
+ * review, T2-10) — `.name` where the name runs to the first character outside
+ * the class charset, so `.foo` does not match a rule for `.foo-bar` — but built
+ * once per source and queried by lookup, rather than recompiled for every one
+ * of the ~250 classes the sections use. The charset is deliberately the one
+ * `classesUsed` collects, or the two halves could disagree about where a name
+ * ends.
+ */
+function classTokens(css: string): Set<string> {
+  const out = new Set<string>();
+  for (const m of css.matchAll(/\.([A-Za-z][\w-]*)/g)) out.add(m[1]);
+  return out;
 }
 
 /**
@@ -264,28 +250,41 @@ function unscopedCss(): string {
 
 type Finding = { section: string; cls: string; inParent: boolean };
 
-/** One pass over the sections: every class with no rule that can reach it. */
-function scan(): { findings: Finding[]; sections: number; classes: number } {
-  const shared = unscopedCss();
-  const parentScoped = styleBlock(read(join(REPO_ROOT, 'src', 'SettingsApp.svelte')));
+/**
+ * One pass over the sections: every class with no rule that can reach it.
+ *
+ * The shared-sheet token set is returned rather than recomputed by the vacuity
+ * guard below — reading every theme sheet and every `.svelte` file in the repo
+ * twice to answer the same question was the second half of T2-10.
+ */
+function scan(): {
+  findings: Finding[];
+  sections: number;
+  classes: number;
+  shared: Set<string>;
+} {
+  const shared = classTokens(unscopedCss());
+  const parentScoped = classTokens(
+    styleBlock(read(join(REPO_ROOT, 'src', 'SettingsApp.svelte'))),
+  );
   const findings: Finding[] = [];
   let classes = 0;
   const files = walk(SECTIONS_DIR, ['.svelte']);
   for (const file of files) {
     const src = read(file);
-    const own = styleBlock(src);
+    const own = classTokens(styleBlock(src));
     const used = classesUsed(markupOf(src));
     classes += used.size;
     for (const cls of used) {
-      if (hasRule(own, cls) || hasRule(shared, cls)) continue;
-      findings.push({ section: rel(file), cls, inParent: hasRule(parentScoped, cls) });
+      if (own.has(cls) || shared.has(cls)) continue;
+      findings.push({ section: rel(file), cls, inParent: parentScoped.has(cls) });
     }
   }
-  return { findings, sections: files.length, classes };
+  return { findings, sections: files.length, classes, shared };
 }
 
 describe('settings section CSS', () => {
-  const { findings, sections, classes } = scan();
+  const { findings, sections, classes, shared } = scan();
 
   test('the scan actually sees the sections (vacuity guard)', () => {
     // 21 sections and ~250 class uses at the time of writing. The floors are
@@ -297,9 +296,8 @@ describe('settings section CSS', () => {
     // The shared sheets must actually have been read: a typo in a path would
     // otherwise turn every styled class into a finding, and the allowlist
     // would grow to hide it.
-    const shared = unscopedCss();
-    expect(hasRule(shared, 'hint'), 'settings-chrome.css did not reach the scan').toBe(true);
-    expect(hasRule(shared, 'icon'), 'no injected theme sheet reached the scan').toBe(true);
+    expect(shared.has('hint'), 'settings-chrome.css did not reach the scan').toBe(true);
+    expect(shared.has('icon'), 'no injected theme sheet reached the scan').toBe(true);
   });
 
   test('no section uses a class whose rule stayed behind in SettingsApp (#129)', () => {

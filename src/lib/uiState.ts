@@ -24,11 +24,26 @@
 // ## Writes
 //
 // Write-through to the cache (so the next synchronous read is correct), then
-// a ~250 ms debounced, fire-and-forget `ui_state_set` carrying only the keys
-// touched since the last flush — the same "frontend coalesces, backend
-// commits" split `save_layout` uses. A failed write loses persistence and
-// nothing else, matching the posture of the `localStorage` code it replaces:
-// *losing view state must never break the UI.*
+// an immediate fire-and-forget `ui_state_set` carrying only the keys touched
+// since the last flush. A failed write loses persistence and nothing else,
+// matching the posture of the `localStorage` code it replaces: *losing view
+// state must never break the UI.*
+//
+// **No time-based debounce** (V42 review, RV-2). There was a 250 ms one, and
+// it re-introduced the closing race that the synchronous
+// `localStorage.setItem` this replaces did not have: a toggle followed within
+// 250 ms by the window closing was lost unless the `pagehide` flush won, and
+// `pagehide` is not guaranteed on every teardown path (a crash, a kill, a
+// webview the OS reclaims). `installLayoutPersistence`'s debounce was cited
+// here as precedent and is NOT one: the layout tree it coalesces is held by
+// the BACKEND, which flushes it on close from the Rust side, so a frontend
+// timer dropped at teardown there costs nothing. This data had no second copy.
+//
+// What is left is same-tick coalescing only: the writes one event handler
+// makes (an `$effect` that touches three keys does so in a single task) batch
+// through `queueMicrotask`, so one turn of the event loop is still one IPC
+// call. The `pagehide` flush stays as a belt for a patch queued in the last
+// microtask before teardown.
 //
 // ## Value domain
 //
@@ -182,9 +197,10 @@ export function getUiValue(key: string): string | null {
 }
 
 /// Save `key`, or remove it when `value` is `null`. Write-through to the
-/// cache, then a debounced flush. Fire-and-forget: the caller never learns
-/// whether the disk write worked, exactly as `localStorage.setItem` in a
-/// `try/catch` never told it either.
+/// cache, then an immediate flush (coalesced with anything else written in the
+/// same tick — see the module header). Fire-and-forget: the caller never
+/// learns whether the disk write worked, exactly as `localStorage.setItem` in
+/// a `try/catch` never told it either.
 export function setUiValue(key: string, value: string | null): void {
   if (!hydrated) return;
   if (value === null) {
@@ -198,35 +214,33 @@ export function setUiValue(key: string, value: string | null): void {
   scheduleFlush();
 }
 
-// ── Debounced flush ──────────────────────────────────────────────────────
+// ── Same-tick flush ──────────────────────────────────────────────────────
 
 /// Keys touched since the last flush. Only these are sent: the backend merges
 /// a patch rather than replacing the object, so a burst from one window can
 /// never drop a key another window wrote.
 const dirty = new Set<string>();
-let flushTimer: ReturnType<typeof setTimeout> | null = null;
 
-/// Matches `installLayoutPersistence`'s debounce. Long enough to coalesce a
-/// drag of the Events column splitter into one write, short enough that the
-/// value is on disk well before a user could close the window after a click.
-const FLUSH_DELAY_MS = 250;
+/// Whether a microtask is already queued to send `dirty`. Not a timer — see
+/// the module header on why the 250 ms debounce is gone (V42 review, RV-2).
+let flushQueued = false;
 
 function scheduleFlush(): void {
-  if (flushTimer !== null) return;
-  flushTimer = setTimeout(() => {
-    flushTimer = null;
+  if (flushQueued) return;
+  flushQueued = true;
+  // A microtask, so several `setUiValue`s inside one handler still cost one
+  // IPC call, but the call is on its way before the browser can run another
+  // task — including whatever teardown a close begins.
+  queueMicrotask(() => {
+    if (!flushQueued) return; // an explicit flush already took this batch
     void flushUiState();
-  }, FLUSH_DELAY_MS);
+  });
 }
 
-/// Send the pending patch now. Also the app-close hook — a pending debounce
-/// would otherwise lose the last toggle, which the synchronous
-/// `localStorage.setItem` this replaces could not.
+/// Send the pending patch now. Also the app-close hook, for the window between
+/// a `setUiValue` and its microtask.
 export async function flushUiState(): Promise<void> {
-  if (flushTimer !== null) {
-    clearTimeout(flushTimer);
-    flushTimer = null;
-  }
+  flushQueued = false;
   if (dirty.size === 0) return;
   const patch: Record<string, string | null> = {};
   for (const k of dirty) patch[k] = getUiValue(k);
@@ -237,8 +251,28 @@ export async function flushUiState(): Promise<void> {
     // Loses persistence, never breaks the UI. Not re-queued: the next toggle
     // of the same key will carry the current value anyway, and retrying a
     // failing backend on a timer would just multiply the noise.
-    console.error('ui_state_set failed; view state not persisted:', e);
+    reportWriteFailure(e);
   }
+}
+
+/// Write failures are reported ONCE per window.
+///
+/// Two of them repeat rather than resolve — a read-only volume, and the
+/// version refusal `ui_state_set` answers with when the file on disk is newer
+/// than this build understands (V42 review, RV-10). Both would otherwise put a
+/// console line behind every `<details>` toggle for the rest of the session,
+/// which is noise, not a signal. The cache stays live either way: this window
+/// keeps working, it just stops persisting.
+let writeFailureLogged = false;
+
+function reportWriteFailure(e: unknown): void {
+  if (writeFailureLogged) return;
+  writeFailureLogged = true;
+  console.error(
+    'ui_state_set failed; view state is not being persisted this session ' +
+      '(this is logged once):',
+    e,
+  );
 }
 
 if (typeof window !== 'undefined') {

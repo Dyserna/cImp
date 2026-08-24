@@ -47,9 +47,11 @@
 //! window that never hydrated would silently wipe the main window's state.
 //! Each patch is a read-modify-write under [`UI_STATE_LOCK`] so two concurrent
 //! callers can't lose each other's keys, committed through
-//! [`crate::settings::write_atomic`]. There is no backend debounce: the
-//! frontend already coalesces bursts (~250 ms) before it calls, the same
-//! division of labour `save_layout` uses.
+//! [`crate::settings::write_atomic`]. There is no backend debounce and no
+//! backend coalescing: the frontend batches the writes one event handler makes
+//! into a single patch — V42 review RV-2 replaced its 250 ms timer with a
+//! same-tick microtask, so a window closing can no longer eat the last toggle
+//! — and this side commits whatever arrives.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;

@@ -136,29 +136,70 @@ describe('setUiValue', () => {
     invoke.mockResolvedValue(undefined);
 
     m.setUiValue('k', 'v');
-    // Read back with the debounce still pending — an `$effect` writer
-    // followed by a remount must see the new value, not the old one.
+    // Read back before the microtask has run — an `$effect` writer followed by
+    // a remount must see the new value, not the old one.
     expect(m.getUiValue('k')).toBe('v');
 
     await m.flushUiState();
     expect(patchOf(0)).toEqual({ k: 'v' });
   });
 
-  test('a burst coalesces into ONE patch carrying only the touched keys', async () => {
+  test('a write goes out on the NEXT MICROTASK, with no timer to lose', async () => {
+    // V42 review RV-2. The 250 ms debounce this replaces meant a toggle
+    // followed by a close inside that window was lost unless `pagehide` won —
+    // the closing race the synchronous `localStorage.setItem` did not have.
+    // Fake timers here so a re-introduced `setTimeout` cannot be papered over
+    // by real time passing while the assertions are awaited.
     vi.useFakeTimers();
     const m = await freshModule();
     await m.hydrateUiState();
     invoke.mockReset();
     invoke.mockResolvedValue(undefined);
 
-    // A splitter drag: many writes to the same key inside the debounce.
+    m.setUiValue('k', 'v');
+    // Not synchronous: one handler touching three keys still costs one IPC.
+    expect(invoke).not.toHaveBeenCalled();
+
+    // No timer is advanced — draining the microtask queue is enough.
+    await Promise.resolve();
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(patchOf(0)).toEqual({ k: 'v' });
+  });
+
+  test('a burst inside ONE tick coalesces into a single patch', async () => {
+    vi.useFakeTimers();
+    const m = await freshModule();
+    await m.hydrateUiState();
+    invoke.mockReset();
+    invoke.mockResolvedValue(undefined);
+
+    // One handler writing the same key repeatedly, plus a neighbour.
     for (const w of ['100', '110', '120', '130']) m.setUiValue('cols', w);
     m.setUiValue('other', 'x');
     expect(invoke).not.toHaveBeenCalled();
 
-    await vi.advanceTimersByTimeAsync(300);
+    await Promise.resolve();
     expect(invoke).toHaveBeenCalledTimes(1);
     expect(patchOf(0)).toEqual({ cols: '130', other: 'x' });
+  });
+
+  test('writes in SEPARATE ticks are separate writes, not one deferred one', async () => {
+    // The other half of RV-2: a per-`pointermove` splitter drag emits one
+    // write per task, and each must reach the backend rather than waiting
+    // behind a window a close can end.
+    const m = await freshModule();
+    await m.hydrateUiState();
+    invoke.mockReset();
+    invoke.mockResolvedValue(undefined);
+
+    m.setUiValue('cols', '100');
+    await Promise.resolve();
+    m.setUiValue('cols', '110');
+    await Promise.resolve();
+
+    expect(invoke).toHaveBeenCalledTimes(2);
+    expect(patchOf(0)).toEqual({ cols: '100' });
+    expect(patchOf(1)).toEqual({ cols: '110' });
   });
 
   test('the patch carries ONLY touched keys, never the whole cache', async () => {

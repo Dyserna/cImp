@@ -1920,15 +1920,19 @@ mod tests {
     /// second `git` spawn is silent and a first `cargo` spawn is not.
     #[test]
     fn confirmation_rows_dedup_per_program_not_per_spawn() {
+        // R17: driven through the real `once_per_session`, against this test's
+        // OWN slot — which is exactly the per-site static the helper documents,
+        // and is why no test needs to reset a process-wide set.
+        static SEEN: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
+            std::sync::Mutex::new(None);
         let key = |p: &str| subject_key(&program_subject(Path::new(p)));
-        let mut set = std::collections::HashSet::new();
-        assert!(first_time(&mut set, key("C:/bin/git.exe")));
-        assert!(!first_time(&mut set, key("C:/bin/git.exe")));
+        assert!(once_per_session(&SEEN, key("C:/bin/git.exe")));
+        assert!(!once_per_session(&SEEN, key("C:/bin/git.exe")));
         // Same program, different path and case — still the same fact.
-        assert!(!first_time(&mut set, key("D:/other/GIT.EXE")));
+        assert!(!once_per_session(&SEEN, key("D:/other/GIT.EXE")));
         // A different program is a different fact and must be recorded.
-        assert!(first_time(&mut set, key("C:/bin/cargo.exe")));
-        assert_eq!(set.len(), 2);
+        assert!(once_per_session(&SEEN, key("C:/bin/cargo.exe")));
+        assert_eq!(SEEN.lock().unwrap().as_ref().map(|s| s.len()), Some(2));
     }
 
     /// …and the `run_check` seam's subject is the CHECK NAME, not the shell it
@@ -1937,13 +1941,14 @@ mod tests {
     /// check speak for all of them. Each configured check confirms once.
     #[test]
     fn a_check_is_identified_by_its_configured_name_not_by_the_shell() {
-        let mut set = std::collections::HashSet::new();
+        static SEEN: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
+            std::sync::Mutex::new(None);
         // Two different checks, one shell: two facts, two rows.
-        assert!(first_time(&mut set, subject_key("cargo")));
-        assert!(first_time(&mut set, subject_key("tsc")));
+        assert!(once_per_session(&SEEN, subject_key("cargo")));
+        assert!(once_per_session(&SEEN, subject_key("tsc")));
         // …and re-running a check is the same fact, whatever its case.
-        assert!(!first_time(&mut set, subject_key("Cargo")));
-        assert_eq!(set.len(), 2);
+        assert!(!once_per_session(&SEEN, subject_key("Cargo")));
+        assert_eq!(SEEN.lock().unwrap().as_ref().map(|s| s.len()), Some(2));
         // The row a user scans names the check, not `cmd.exe`.
         assert_eq!(state_target("sandboxed", "cargo"), "sandboxed — cargo");
         assert!(!state_target("sandboxed", "cargo").contains("cmd"));
@@ -1963,7 +1968,13 @@ mod tests {
         // the body is indented. (Line-ending-blind: `\r\n}` contains `\n}`.)
         let body = body.split("\n}").next().unwrap_or(body);
         assert!(
-            !body.contains("EMITTED") && !body.contains("first_time"),
+            // `once_per_session` joined this list when R17 wrote it: a "make
+            // this consistent with its siblings" refactor now reaches for THAT
+            // name, so a tripwire that only knew the old two would wave it
+            // through.
+            !body.contains("EMITTED")
+                && !body.contains("first_time")
+                && !body.contains("once_per_session"),
             "record_denial must record every occurrence — repeated boundary hits are the signal"
         );
     }

@@ -14,8 +14,50 @@ use std::path::Path;
 
 use super::{SandboxCfg, SkipReason};
 
+
+/// Run ONE call site's own once-per-session dedup, answering whether `key` is
+/// new (and therefore whether the caller should record its row).
+///
+/// # Why this exists
+///
+/// Nine sites across the crate opened with the same preamble — a function-local
+/// `static EMITTED: Mutex<Option<HashSet<String>>>`, a `lock()`, a
+/// `get_or_insert_with`, an `insert` and an early `return` — and by V42 they had
+/// drifted: some went through a `first_time` insert wrapper (folded in here),
+/// some called `set.insert` on the guard directly,
+/// one keys on a value its own doc line does not mention. R17 wrote the
+/// *mechanism* once. The KEY stays at the call site, because the key IS the
+/// policy: what counts as "the same fact" differs per row and belongs next to
+/// the row that answers it.
+///
+/// # The static stays per site, deliberately
+///
+/// `slot` is the caller's own `static`, never a shared one. A single
+/// process-wide set would merge every site's key namespace, so one row's key
+/// scheme could silence another row — and no test could see it happen, because
+/// a row that is never recorded looks exactly like a row that was correctly
+/// deduped.
+///
+/// # A poisoned lock records
+///
+/// `Err` reads as "first time", which is what the hand-written preamble did
+/// (`if let Ok(..)` simply fell through to the record): a duplicate row is a
+/// smaller harm than a lost one, and this lane is how sandbox degradation gets
+/// reported at all.
+pub(crate) fn once_per_session(
+    slot: &std::sync::Mutex<Option<std::collections::HashSet<String>>>,
+    key: String,
+) -> bool {
+    match slot.lock() {
+        Ok(mut guard) => guard
+            .get_or_insert_with(std::collections::HashSet::new)
+            .insert(key),
+        Err(_) => true,
+    }
+}
+
 /// Record one runtime need the boundary did **not** meet — once per
-/// (seam, runtime, subject) per session, for [`record_grant_refused`]'s reason:
+/// (seam, runtime, what) per session, for [`record_grant_refused`]'s reason:
 /// it is re-derived on every spawn and a line per spawn would push the rest of
 /// this lane out of its retention window.
 ///
@@ -28,11 +70,15 @@ pub fn record_runtime_gap(seam: &str, root: &Path, runtime: &str, what: &str, wh
     use std::collections::HashSet;
     use std::sync::Mutex;
     static EMITTED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
-    if let Ok(mut guard) = EMITTED.lock() {
-        let set = guard.get_or_insert_with(HashSet::new);
-        if !set.insert(format!("{seam}|{runtime}|{what}")) {
-            return;
-        }
+    // R17 note — this key is DRIFTED from its four siblings and is left
+    // exactly as it was. They key on `subject_key(subject)`; this function
+    // has no `subject` parameter at all and keys on `what` instead, uncased.
+    // So two programs of the same runtime missing the same pointer produce
+    // ONE row rather than one each, and a `what` differing only in case
+    // produces two. Changing that would change which rows a user sees, which
+    // is not what a motion commit is for.
+    if !once_per_session(&EMITTED, format!("{seam}|{runtime}|{what}")) {
+        return;
     }
     record_event(
         seam,
@@ -78,11 +124,8 @@ pub fn record_runtime_mismatch(
     use std::sync::Mutex;
     static EMITTED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
     let seen = inferred.join(", ");
-    if let Ok(mut guard) = EMITTED.lock() {
-        let set = guard.get_or_insert_with(HashSet::new);
-        if !first_time(set, format!("{seam}|{declared}|{seen}|{}", subject_key(subject))) {
-            return;
-        }
+    if !once_per_session(&EMITTED, format!("{seam}|{declared}|{seen}|{}", subject_key(subject))) {
+        return;
     }
     record_event(
         seam,
@@ -128,11 +171,8 @@ pub fn record_declared_unsandboxed(seam: &str, root: &Path, subject: &str) {
     use std::collections::HashSet;
     use std::sync::Mutex;
     static EMITTED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
-    if let Ok(mut guard) = EMITTED.lock() {
-        let set = guard.get_or_insert_with(HashSet::new);
-        if !first_time(set, format!("{seam}|{}", subject_key(subject))) {
-            return;
-        }
+    if !once_per_session(&EMITTED, format!("{seam}|{}", subject_key(subject))) {
+        return;
     }
     record_event(
         seam,
@@ -168,11 +208,8 @@ pub fn record_sandbox_required_refusal(seam: &str, root: &Path, subject: &str, w
     use std::collections::HashSet;
     use std::sync::Mutex;
     static EMITTED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
-    if let Ok(mut guard) = EMITTED.lock() {
-        let set = guard.get_or_insert_with(HashSet::new);
-        if !first_time(set, format!("{seam}|{why}|{}", subject_key(subject))) {
-            return;
-        }
+    if !once_per_session(&EMITTED, format!("{seam}|{why}|{}", subject_key(subject))) {
+        return;
     }
     record_event(
         seam,
@@ -244,11 +281,8 @@ pub fn record_grant_refused(
     // settings row and a manifest is two different things to fix, and deduping
     // them together would silence whichever arrived second.
     let key = format!("{seam}|{source:?}|{}", path.display());
-    if let Ok(mut guard) = EMITTED.lock() {
-        let set = guard.get_or_insert_with(HashSet::new);
-        if !set.insert(key) {
-            return;
-        }
+    if !once_per_session(&EMITTED, key) {
+        return;
     }
     record_event(
         seam,
@@ -319,11 +353,8 @@ pub fn record_skip_noting(
         SkipReason::OffUser => format!("{seam}|off"),
         SkipReason::Unavailable(r) => format!("{seam}|{r}"),
     };
-    if let Ok(mut guard) = EMITTED.lock() {
-        let set = guard.get_or_insert_with(HashSet::new);
-        if !set.insert(key) {
-            return;
-        }
+    if !once_per_session(&EMITTED, key) {
+        return;
     }
     // `off (user choice)` is still recorded — once — so the Events feed
     // answers "was this run sandboxed?" without the user having to remember
@@ -680,14 +711,6 @@ pub(super) fn subject_key(subject: &str) -> String {
     subject.to_ascii_lowercase()
 }
 
-/// Insert `key`, returning whether it was new. Split out from the statics so
-/// the dedup *policy* is testable without touching a process-wide set (which
-/// no test can reset, and which every other test in the binary shares).
-#[cfg_attr(not(windows), allow(dead_code))]
-pub(super) fn first_time(set: &mut std::collections::HashSet<String>, key: String) -> bool {
-    set.insert(key)
-}
-
 /// Record that a program is running INSIDE the sandbox — once per program per
 /// session, mirroring [`record_skip`]'s dedup and for the same reason: a row
 /// per spawn would let this lane crowd itself out of its retention window.
@@ -715,19 +738,16 @@ pub fn record_sandboxed(seam: &str, root: &Path, subject: &str, cfg: &SandboxCfg
     use std::collections::HashSet;
     use std::sync::Mutex;
     static EMITTED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
-    if let Ok(mut guard) = EMITTED.lock() {
-        let set = guard.get_or_insert_with(HashSet::new);
-        // Per subject per SEAM. Both halves earn their place:
-        //
-        // * the SEAM, because `run_check` and `run_command` can both spawn the
-        //   same program (`cmd.exe`) and "checks are sandboxed" is not the same
-        //   fact as "commands are sandboxed";
-        // * the SUBJECT, which is a program name for `run_command`/audit but the
-        //   CHECK NAME for `run_check` — so each configured check confirms once
-        //   per session instead of the first one speaking for all of them.
-        if !first_time(set, format!("{seam}|{}", subject_key(subject))) {
-            return;
-        }
+    // Per subject per SEAM. Both halves earn their place:
+    //
+    // * the SEAM, because `run_check` and `run_command` can both spawn the
+    //   same program (`cmd.exe`) and "checks are sandboxed" is not the same
+    //   fact as "commands are sandboxed";
+    // * the SUBJECT, which is a program name for `run_command`/audit but the
+    //   CHECK NAME for `run_check` — so each configured check confirms once
+    //   per session instead of the first one speaking for all of them.
+    if !once_per_session(&EMITTED, format!("{seam}|{}", subject_key(subject))) {
+        return;
     }
     record_event(
         seam,

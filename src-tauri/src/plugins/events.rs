@@ -183,11 +183,11 @@ pub fn record_command_skipped(tool_key: &str, label: &str, command: &str) {
     use std::collections::HashSet;
     use std::sync::Mutex;
     static EMITTED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
-    if let Ok(mut guard) = EMITTED.lock() {
-        let set = guard.get_or_insert_with(HashSet::new);
-        if !set.insert(format!("{tool_key}|{}", command.to_ascii_lowercase())) {
-            return;
-        }
+    if !crate::sandbox::once_per_session(
+        &EMITTED,
+        format!("{tool_key}|{}", command.to_ascii_lowercase()),
+    ) {
+        return;
     }
     crate::activity::record_bg(command_skipped_row(tool_key, label, command));
 }

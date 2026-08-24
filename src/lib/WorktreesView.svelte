@@ -22,7 +22,6 @@
   } from './workbench';
   import { createShellTab, defaultShellSpec } from './ipc';
   import { cancelPlacement, focusedPane, requestTabIntoPane } from './layout/store';
-  import { pairHunkLines } from './diffWords';
   import { errorMessage } from './errors';
   import { WORKBENCH_TAB_ID } from './tabs/types';
   import { onAppViewShown } from './appViewVisibility';
@@ -322,16 +321,16 @@
                     {:else}
                       {#each f.hunks as hunk, hi (hi)}
                         <div class="hunk-body">
-                          {#each pairHunkLines(hunk.lines) as group, gi (gi)}
+                          {#each hunk.groups as group, gi (gi)}
                             {#if group.type === 'ctx'}
-                              <div class="line ctx"><span class="marker"> </span><span class="text">{group.text}</span></div>
+                              <div class="line ctx"><span class="marker"> </span><span class="text">{hunk.lines[group.line][1]}</span></div>
                             {:else if group.type === 'del'}
-                              <div class="line del"><span class="marker">-</span><span class="text">{group.text}</span></div>
+                              <div class="line del"><span class="marker">-</span><span class="text">{hunk.lines[group.line][1]}</span></div>
                             {:else if group.type === 'add'}
-                              <div class="line add"><span class="marker">+</span><span class="text">{group.text}</span></div>
+                              <div class="line add"><span class="marker">+</span><span class="text">{hunk.lines[group.line][1]}</span></div>
                             {:else}
-                              <div class="line del"><span class="marker">-</span><span class="text">{group.oldText}</span></div>
-                              <div class="line add"><span class="marker">+</span><span class="text">{group.newText}</span></div>
+                              <div class="line del"><span class="marker">-</span><span class="text">{hunk.lines[group.old_line][1]}</span></div>
+                              <div class="line add"><span class="marker">+</span><span class="text">{hunk.lines[group.new_line][1]}</span></div>
                             {/if}
                           {/each}
                         </div>

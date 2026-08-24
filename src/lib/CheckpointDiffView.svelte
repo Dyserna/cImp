@@ -172,7 +172,7 @@
                   <div class="hunk">
                     <div class="hunk-header">{hunk.header}</div>
                     <div class="hunk-body">
-                      <HunkBody lines={hunk.lines} />
+                      <HunkBody lines={hunk.lines} groups={hunk.groups} />
                     </div>
                   </div>
                 {/each}

@@ -76,9 +76,48 @@ fn legacy_aider_v1_2_entry() -> Value {
 /// about, so the overlay cascade refuses to start below this.
 pub const MIN_OVERLAY_SCHEMA_VERSION: u64 = 10;
 
+/// The oldest schema version the **global** settings file may be loaded at.
+///
+/// [`MIN_OVERLAY_SCHEMA_VERSION`] exists because the pre-stamp detectors are
+/// presence archaeology that a *sparse* file trips by accident. This floor
+/// exists for a blunter reason: below it there is no ladder. The global path
+/// (`persistence::load_global` → [`migrate_if_needed`]) had **no floor at all**,
+/// which was survivable only while every step back to v1.0 was still present.
+///
+/// Left to the ordinary path, a below-floor file does not fail loudly — it
+/// succeeds quietly, which is worse. No detector matches it, so the cascade is a
+/// no-op; `Settings` carries a container-level `#[serde(default)]`, so it then
+/// deserializes cleanly with every field the deleted steps would have MOVED
+/// silently reset to a default (the v29 → v30 `run_check` tool scopes, the
+/// v33 → v34 audit roster, the v35 → v36 harness map); and the file is written
+/// back still stamped at its own old version, so no launch ever warns again.
+///
+/// So a file below this floor is not loaded at all: it is moved aside INTACT and
+/// defaults are reseeded in its place (`persistence::load_global`). That is the
+/// one outcome that neither discards the user's file nor lies about what was
+/// read. Raising this constant is the ONLY legal way to retire migration steps.
+pub const MIN_GLOBAL_SCHEMA_VERSION: u64 = 30;
+
 /// The `schema_version` a value states, if it states one.
 pub fn stated_schema_version(value: &Value) -> Option<u64> {
     value.get("schema_version").and_then(Value::as_u64)
+}
+
+/// Whether `value` — a global settings file that has already parsed as JSON —
+/// sits below [`MIN_GLOBAL_SCHEMA_VERSION`].
+///
+/// **A stated version of `None` counts as below.** `schema_version` arrived with
+/// the v1.9 → v1.10 step, so a file that states none is a pre-v1.10 file — which
+/// is precisely what the (now deleted) `looks_v1…` presence detectors existed to
+/// recognise. It is *not* the fresh-install case: a fresh install has no file at
+/// all, is seeded with defaults before this is ever consulted, and so never
+/// reaches here.
+///
+/// It is also not the *corrupt* case. Corrupt means the bytes did not parse;
+/// this value did. The two share a mechanism (move aside, reseed) and must not
+/// share their wording — see `persistence::reseed_below_floor`.
+pub fn below_global_floor(value: &Value) -> bool {
+    stated_schema_version(value).is_none_or(|v| v < MIN_GLOBAL_SCHEMA_VERSION)
 }
 
 /// **Run the cascade on a project OVERLAY** (V40 Phase I, issue #107 item 5).
@@ -159,14 +198,37 @@ pub fn migrate_overlay(overlay: &mut Value, from: u64, default_shell: &ShellSpec
 
 /// Detect file shape and run the appropriate transform on `value`. Returns
 /// `Ok(true)` if the file changed shape (caller should write back to disk),
-/// `Ok(false)` if the file was already v1.2, or `Err` if a backup write
-/// failed. Backup-write failure aborts migration loudly — we never proceed
-/// without a recoverable copy.
+/// `Ok(false)` if the file was already current — or is **below
+/// [`MIN_GLOBAL_SCHEMA_VERSION`]**, in which case nothing is migrated, backed
+/// up, or stamped and the caller is expected to have quarantined it already.
+/// `Err` if a backup write failed. Backup-write failure aborts migration
+/// loudly — we never proceed without a recoverable copy.
 pub fn migrate_if_needed(
     value: &mut Value,
     path: &Path,
     default_shell: &ShellSpec,
 ) -> AppResult<bool> {
+    // **The global floor, enforced here as well as at the call site** (V42 R9,
+    // issue #120). `persistence::load_global` quarantines a below-floor file
+    // before it ever reaches this function; this is the second lock, and it is
+    // the one that protects the fixpoint guard at the bottom. Without it an old
+    // file would fall through every remaining detector, reach the force-stamp,
+    // and be rewritten as CURRENT with everything the deleted steps would have
+    // moved silently defaulted — a file that now *claims* to be current and so
+    // can never be recognised as old again. Refusing without stamping leaves the
+    // file's own version on disk, so the next launch reaches the same verdict
+    // instead of a healed-looking lie.
+    if below_global_floor(value) {
+        tracing::error!(
+            stated = ?stated_schema_version(value),
+            floor = MIN_GLOBAL_SCHEMA_VERSION,
+            path = %path.display(),
+            "settings migration: file is below the migration floor; refusing to migrate it, \
+             back it up, or stamp it — the caller quarantines and reseeds"
+        );
+        return Ok(false);
+    }
+
     // Detect the entry-point version once, write *one* backup (named
     // after the entry version), then run every subsequent step without
     // its own backup. Pre-V0.6 each step wrote its own `.bak` file, so a
@@ -3636,20 +3698,28 @@ fn backup_path_for(path: &Path, suffix: &str) -> PathBuf {
     }
 }
 
-/// Move a corrupt settings file aside before resetting to defaults. Best-
-/// effort: a failed rename falls back to copy+remove (cross-volume
-/// rename fails on Windows when, e.g., the launch_cwd lives on a different
-/// drive than the user temp). A total failure just logs and returns — the
-/// caller still resets to defaults.
-pub fn quarantine_corrupt_file(path: &Path) {
+/// Move a settings file aside, verbatim, to `<name>.<infix>.<unix-secs>.bak`.
+///
+/// The shared mechanism behind [`quarantine_corrupt_file`] and
+/// [`quarantine_outdated_file`] — the two reasons a settings file gets set aside
+/// are different enough to need different words for the user, and identical in
+/// what has to happen to the bytes. Best-effort: a failed rename falls back to
+/// copy+remove (cross-volume rename fails on Windows when, e.g., the launch_cwd
+/// lives on a different drive than the user temp).
+///
+/// Returns `None` when there was no file to move, otherwise the target it aimed
+/// at and whether the move actually happened. The caller does the logging, so
+/// each reason keeps its own wording; a `Some((_, false))` caller must NOT go on
+/// to overwrite `path`, because the original is still sitting there.
+fn move_settings_file_aside(path: &Path, infix: &str) -> Option<(PathBuf, bool)> {
     if !path.exists() {
-        return;
+        return None;
     }
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let target = backup_path_for(path, &format!("corrupted.{ts}.bak"));
+    let target = backup_path_for(path, &format!("{infix}.{ts}.bak"));
     let renamed = fs::rename(path, &target).is_ok();
     let moved = if renamed {
         true
@@ -3659,17 +3729,58 @@ pub fn quarantine_corrupt_file(path: &Path) {
     } else {
         false
     };
+    Some((target, moved))
+}
+
+/// Move a corrupt settings file aside before resetting to defaults. A total
+/// failure just logs and returns `None` — the caller still resets to defaults.
+///
+/// "Corrupt" means the bytes did not parse. For a file that parsed perfectly
+/// well and is merely older than this build can migrate, use
+/// [`quarantine_outdated_file`] instead: telling a user their intact settings
+/// were corrupt sends them looking for the wrong problem.
+pub fn quarantine_corrupt_file(path: &Path) -> Option<PathBuf> {
+    let (target, moved) = move_settings_file_aside(path, "corrupted")?;
     if moved {
         tracing::warn!(
             quarantine = %target.display(),
             "settings: corrupt file moved aside; defaults will be written"
         );
+        Some(target)
     } else {
         tracing::warn!(
             path = %path.display(),
             target = %target.display(),
             "settings: could not quarantine corrupt file"
         );
+        None
+    }
+}
+
+/// Move a **valid but below-floor** settings file aside — one written by a cImp
+/// older than [`MIN_GLOBAL_SCHEMA_VERSION`], whose migration steps this build no
+/// longer carries. Same mechanism as [`quarantine_corrupt_file`], different name
+/// on disk (`.outdated.` rather than `.corrupted.`) and different words in the
+/// log, because it is a different thing that happened to the user.
+///
+/// Returns the quarantine path so the caller can name it in the error the user
+/// actually sees; `None` if the file could not be moved, which the caller must
+/// treat as "do not overwrite it".
+pub fn quarantine_outdated_file(path: &Path) -> Option<PathBuf> {
+    let (target, moved) = move_settings_file_aside(path, "outdated")?;
+    if moved {
+        tracing::warn!(
+            quarantine = %target.display(),
+            "settings: outdated file moved aside intact; defaults will be written"
+        );
+        Some(target)
+    } else {
+        tracing::warn!(
+            path = %path.display(),
+            target = %target.display(),
+            "settings: could not move the outdated file aside; leaving it in place"
+        );
+        None
     }
 }
 
@@ -3683,6 +3794,192 @@ mod tests {
             command: PathBuf::from("/bin/bash"),
             args: vec!["-i".to_string()],
         }
+    }
+
+    /// A scratch directory that removes itself, so a floor test can write a real
+    /// file and then look at what is beside it.
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("cimp_{tag}_{}", uuid::Uuid::new_v4()));
+            fs::create_dir_all(&dir).expect("create scratch dir");
+            Self(dir)
+        }
+        fn join(&self, name: &str) -> PathBuf {
+            self.0.join(name)
+        }
+        /// The `.bak` siblings of `settings.json`, by file name.
+        fn baks(&self) -> Vec<String> {
+            let mut out: Vec<String> = fs::read_dir(&self.0)
+                .expect("read scratch dir")
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.ends_with(".bak"))
+                .collect();
+            out.sort();
+            out
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    // ── The migration floor (V42 R9, issue #120) ───────────────────────────
+
+    /// **What counts as below the floor.** The `None` row is the one that needed
+    /// deciding: `schema_version` did not exist before the v1.9 → v1.10 step, so
+    /// a file that states none is a pre-v1.10 file — the case the deleted
+    /// `looks_v1…` presence detectors used to recognise — and not a fresh
+    /// install, which has no file at all and is seeded long before this is
+    /// asked.
+    #[test]
+    fn the_global_floor_covers_old_stamps_and_no_stamp_at_all() {
+        assert!(below_global_floor(&json!({ "schema_version": 20 })));
+        assert!(below_global_floor(&json!({
+            "schema_version": MIN_GLOBAL_SCHEMA_VERSION - 1
+        })));
+        // Pre-v1.10: no stamp to read. Below the floor, not "absent".
+        assert!(below_global_floor(&json!({ "claude_code": { "command": "claude" } })));
+        assert!(below_global_floor(&json!({})));
+        // A stamp that is not a number is not a stamp.
+        assert!(below_global_floor(&json!({ "schema_version": "30" })));
+
+        assert!(!below_global_floor(&json!({
+            "schema_version": MIN_GLOBAL_SCHEMA_VERSION
+        })));
+        assert!(!below_global_floor(&json!({
+            "schema_version": crate::settings::schema::CURRENT_SCHEMA_VERSION
+        })));
+    }
+
+    /// **The fixpoint guard must not force-stamp a below-floor file.**
+    ///
+    /// This is the whole hazard in one test. The guard at the bottom of
+    /// `migrate_if_needed` exists to stop a re-migrate loop, and it does that by
+    /// writing `CURRENT` over whatever the cascade left. Run it on a file whose
+    /// steps no longer exist and it converts "old file we can still recognise"
+    /// into "current file with everything defaulted" — permanently, because the
+    /// stamp is the only evidence left. So the refusal happens first, and it
+    /// leaves the file's own version, its own contents, and no backup behind.
+    #[test]
+    fn the_fixpoint_guard_does_not_stamp_a_below_floor_file() {
+        let dir = TempDir::new("floor_stamp");
+        let path = dir.join("settings.json");
+        let shell = fake_default_shell();
+
+        for original in [
+            json!({ "schema_version": 20, "tabs": [], "offload": {} }),
+            // No stamp at all — the pre-v1.10 shape.
+            json!({ "claude_code": { "command": "claude" } }),
+        ] {
+            let mut v = original.clone();
+            fs::write(&path, serde_json::to_vec_pretty(&v).unwrap()).unwrap();
+
+            assert!(
+                !migrate_if_needed(&mut v, &path, &shell).unwrap(),
+                "a below-floor file reports no change, so the caller does not write it back"
+            );
+            assert_eq!(
+                v, original,
+                "not migrated and NOT force-stamped: the version on disk is the only thing that \
+                 can still identify this file as old"
+            );
+            assert!(
+                dir.baks().is_empty(),
+                "no backup either — nothing was transformed to need one: {:?}",
+                dir.baks()
+            );
+            fs::remove_file(&path).unwrap();
+        }
+    }
+
+    /// The other side of the same guard: a file **at** the floor is ordinary
+    /// work. It cascades, it lands on `CURRENT`, and it gets its one backup.
+    #[test]
+    fn a_file_at_the_floor_still_migrates_normally() {
+        let dir = TempDir::new("floor_ok");
+        let path = dir.join("settings.json");
+        let shell = fake_default_shell();
+        let mut v = json!({
+            "schema_version": MIN_GLOBAL_SCHEMA_VERSION,
+            "tabs": [],
+            "offload": {},
+        });
+        fs::write(&path, serde_json::to_vec_pretty(&v).unwrap()).unwrap();
+
+        assert!(migrate_if_needed(&mut v, &path, &shell).unwrap());
+        assert_eq!(
+            v["schema_version"],
+            json!(crate::settings::schema::CURRENT_SCHEMA_VERSION),
+            "a file at the floor reaches the current schema — the floor retires steps, it does \
+             not stop the ladder"
+        );
+        assert_eq!(
+            dir.baks(),
+            vec![format!("settings.json.v{MIN_GLOBAL_SCHEMA_VERSION}.bak")],
+            "one backup, labelled with the version the user actually had"
+        );
+    }
+
+    /// **Quarantine preserves the original bytes.** The floor's promise to the
+    /// user is that their settings were set aside, not read and not deleted — so
+    /// the quarantined file must be byte-identical to what was on disk,
+    /// whitespace, key order, comments-that-are-not-comments and all.
+    #[test]
+    fn quarantining_an_outdated_file_preserves_it_byte_for_byte() {
+        let dir = TempDir::new("floor_bytes");
+        let path = dir.join("settings.json");
+        // Deliberately not what `serde_json` would emit: odd spacing, a key
+        // order nothing would reproduce, a trailing newline.
+        let original = b"{\r\n  \"tabs\":   [],\n\t\"schema_version\":20 }\n".to_vec();
+        fs::write(&path, &original).unwrap();
+
+        let target = quarantine_outdated_file(&path).expect("the file is moved aside");
+        assert!(!path.exists(), "the old file is no longer at the live path");
+        assert_eq!(
+            fs::read(&target).unwrap(),
+            original,
+            "the user's file must survive the floor unchanged — quarantine sets aside, it never \
+             rewrites and never deletes"
+        );
+        assert_eq!(
+            dir.baks().len(),
+            1,
+            "exactly one quarantine file: {:?}",
+            dir.baks()
+        );
+        assert!(
+            target
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains(".outdated."),
+            "the name says WHY, and 'outdated' is not 'corrupted': {}",
+            target.display()
+        );
+    }
+
+    /// The two quarantine reasons share one mechanism and nothing else. A
+    /// corrupt file and an outdated one must not land on the same name, or the
+    /// only durable record of which happened is gone.
+    #[test]
+    fn corrupt_and_outdated_quarantines_do_not_share_a_name() {
+        let dir = TempDir::new("floor_names");
+        let path = dir.join("settings.json");
+
+        fs::write(&path, b"{ not json").unwrap();
+        let corrupt = quarantine_corrupt_file(&path).expect("moved aside");
+        fs::write(&path, br#"{"schema_version": 20}"#).unwrap();
+        let outdated = quarantine_outdated_file(&path).expect("moved aside");
+
+        assert_ne!(corrupt, outdated);
+        assert!(corrupt.to_string_lossy().contains(".corrupted."));
+        assert!(outdated.to_string_lossy().contains(".outdated."));
+        // Neither is there to be quarantined twice.
+        assert_eq!(quarantine_corrupt_file(&path), None);
+        assert_eq!(quarantine_outdated_file(&path), None);
     }
 
     #[test]

@@ -768,6 +768,15 @@ fn load_global(default_shell: &ShellSpec) -> (Settings, Option<u64>) {
     // against is gone (see this function's doc comment).
     let stated = migration::stated_schema_version(&value);
 
+    // **The migration floor** (V42 R9, issue #120). Strictly after the
+    // fresh-install branch above — a file that is MISSING is seeded, never
+    // quarantined — and strictly before the cascade, which has no steps left for
+    // a file this old and would otherwise rewrite it as current with its
+    // contents silently defaulted.
+    if let Some(reseeded) = reseed_below_floor(&path, &value, default_shell) {
+        return (reseeded, None);
+    }
+
     // Migrate the global file in place. Backup is named after the global
     // file, which is the source of truth for the global baseline shape.
     let migrated = match migration::migrate_if_needed(&mut value, &path, default_shell) {
@@ -832,6 +841,69 @@ fn load_global(default_shell: &ShellSpec) -> (Settings, Option<u64>) {
         tracing::info!(path = %path.display(), "settings: global loaded");
     }
     (typed, stated)
+}
+
+/// **The global migration floor** (V42 R9, issue #120).
+///
+/// `value` is the global file at `path`, already read and parsed as JSON. If it
+/// states a schema below [`migration::MIN_GLOBAL_SCHEMA_VERSION`] — or states
+/// none at all, which is what a pre-v1.10 file looks like — it is moved aside
+/// INTACT, fresh defaults are written in its place, and those defaults are
+/// returned. `None` means the file is at or above the floor and the caller
+/// carries on into the cascade.
+///
+/// **Why not just parse it.** Because that succeeds. `Settings` carries a
+/// container-level `#[serde(default)]`, so an old file deserializes cleanly with
+/// every field the deleted v1.0 → v29 steps would have MOVED quietly reset to a
+/// default — and is then written back still stamped at its old version, so no
+/// later launch ever notices. Loud beats silent, and a file the user still has
+/// beats a file they do not.
+///
+/// **What is shared with the corrupt path, and what is not.** The mechanism is
+/// shared on purpose ([`migration::quarantine_outdated_file`] is
+/// [`migration::quarantine_corrupt_file`]'s twin over one helper): the outcome
+/// the user needs is the same — the app launches, their old file is still on
+/// disk. The WORDING is deliberately not shared. This file is valid JSON written
+/// by an older cImp, not a broken one, and calling a user's intact settings
+/// "corrupt" sends them looking for the wrong problem. The quarantine file says
+/// so too: `.outdated.` rather than `.corrupted.`.
+///
+/// **If the move fails, nothing is overwritten.** The corrupt path reseeds
+/// regardless (its bytes are unreadable anyway); here the bytes are the user's
+/// readable settings, so a failed move means we hand back defaults for this
+/// session and leave the file exactly where it is. It stays loud on every launch
+/// rather than becoming quiet and gone once.
+fn reseed_below_floor(path: &Path, value: &Value, default_shell: &ShellSpec) -> Option<Settings> {
+    if !migration::below_global_floor(value) {
+        return None;
+    }
+    let stated = migration::stated_schema_version(value);
+    let Some(quarantine) = migration::quarantine_outdated_file(path) else {
+        tracing::error!(
+            ?stated,
+            floor = migration::MIN_GLOBAL_SCHEMA_VERSION,
+            path = %path.display(),
+            "settings: the global settings file was written by a version of cImp too old for \
+             this build to upgrade, AND it could not be moved aside — running on defaults for \
+             this session and leaving the file untouched rather than overwriting it"
+        );
+        return Some(seeded_defaults(default_shell));
+    };
+    tracing::error!(
+        ?stated,
+        floor = migration::MIN_GLOBAL_SCHEMA_VERSION,
+        path = %path.display(),
+        quarantine = %quarantine.display(),
+        "settings: the global settings file was written by a version of cImp too old for this \
+         build to upgrade (its schema is below the migration floor). It has NOT been read and \
+         NOT been deleted: it was moved aside intact to the quarantine path below, and fresh \
+         defaults were written in its place"
+    );
+    let s = seeded_defaults(default_shell);
+    if let Err(e) = save_to(path, &s) {
+        tracing::warn!(error = %e, path = %path.display(), "settings: write global defaults after quarantine failed");
+    }
+    Some(s)
 }
 
 /// Read and parse the custom overlay file as a generic `Value`. Returns
@@ -4123,6 +4195,175 @@ mod tests {
             body_of("pub fn save(").contains("schema_version"),
             "`save` must stamp the overlay with the schema it was written in, or `load` has \
              nothing to enter the cascade at once the global file has moved on"
+        );
+    }
+
+    // ── The migration floor (V42 R9, issue #120) ───────────────────────────
+
+    /// A scratch directory that removes itself, so a floor test can write a real
+    /// global file and then look at what ends up beside it.
+    struct FloorDir(PathBuf);
+    impl FloorDir {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("cimp_{tag}_{}", uuid::Uuid::new_v4()));
+            fs::create_dir_all(&dir).expect("create scratch dir");
+            Self(dir)
+        }
+        fn settings_json(&self) -> PathBuf {
+            self.0.join("settings.json")
+        }
+        fn baks(&self) -> Vec<String> {
+            let mut out: Vec<String> = fs::read_dir(&self.0)
+                .expect("read scratch dir")
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.ends_with(".bak"))
+                .collect();
+            out.sort();
+            out
+        }
+    }
+    impl Drop for FloorDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn floor_shell() -> ShellSpec {
+        ShellSpec {
+            command: PathBuf::from("/bin/bash"),
+            args: vec!["-i".to_string()],
+        }
+    }
+
+    /// **A file too old to migrate is set aside, not read.**
+    ///
+    /// Both below-floor shapes at once — an old stamp, and (the case that needed
+    /// deciding) no stamp at all. Three claims, and the first is the one that
+    /// matters most to the user: their file still exists, byte for byte, at a
+    /// path the log names. Then: defaults are in its place, so the app launches.
+    /// And nothing of the old file leaked into them.
+    #[test]
+    fn a_below_floor_global_file_is_moved_aside_intact_and_defaults_reseeded() {
+        for (tag, original) in [
+            (
+                "floor_v20",
+                b"{\r\n \"schema_version\":20,\n\t\"tabs\": [] }\n".to_vec(),
+            ),
+            // Pre-v1.10: `schema_version` did not exist yet. Valid JSON, no
+            // stamp, and the shape the deleted `looks_v1` detector recognised.
+            (
+                "floor_nostamp",
+                br#"{"claude_code": {"command": "claude"}}"#.to_vec(),
+            ),
+        ] {
+            let dir = FloorDir::new(tag);
+            let path = dir.settings_json();
+            fs::write(&path, &original).unwrap();
+            let value: Value = serde_json::from_slice(&original).expect("valid JSON, just old");
+
+            let reseeded = reseed_below_floor(&path, &value, &floor_shell())
+                .expect("a below-floor file is handled here, not by the cascade");
+
+            let baks = dir.baks();
+            assert_eq!(baks.len(), 1, "exactly one quarantine file: {baks:?}");
+            assert!(
+                baks[0].contains(".outdated."),
+                "it says why it was set aside, and it does not say 'corrupted': {baks:?}"
+            );
+            assert_eq!(
+                fs::read(dir.0.join(&baks[0])).unwrap(),
+                original,
+                "the user's settings file must survive byte for byte — the floor sets it aside, \
+                 it never rewrites it and never deletes it"
+            );
+
+            // …and the app has something to launch on.
+            let on_disk: Settings =
+                serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(
+                on_disk.schema_version,
+                crate::settings::schema::CURRENT_SCHEMA_VERSION,
+                "the reseeded file is stamped CURRENT, so the next launch is an ordinary one"
+            );
+            assert_eq!(
+                serde_json::to_value(&on_disk).unwrap(),
+                serde_json::to_value(&reseeded).unwrap(),
+                "what was returned to the caller is what was written"
+            );
+            assert!(
+                !on_disk.tabs.is_empty(),
+                "seeded defaults, not a bare `Settings::default()`"
+            );
+        }
+    }
+
+    /// The floor retires steps; it does not stop the ladder. A file **at** the
+    /// floor is left alone here and goes on to the cascade like any other.
+    #[test]
+    fn a_global_file_at_or_above_the_floor_is_left_to_the_cascade() {
+        let dir = FloorDir::new("floor_ok");
+        let path = dir.settings_json();
+        for version in [
+            migration::MIN_GLOBAL_SCHEMA_VERSION,
+            crate::settings::schema::CURRENT_SCHEMA_VERSION as u64,
+        ] {
+            let original = format!(r#"{{"schema_version": {version}}}"#).into_bytes();
+            fs::write(&path, &original).unwrap();
+            let value: Value = serde_json::from_slice(&original).unwrap();
+
+            assert!(
+                reseed_below_floor(&path, &value, &floor_shell()).is_none(),
+                "v{version} is at or above the floor and must reach the migration cascade"
+            );
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                original,
+                "and it must not have been touched on the way"
+            );
+            assert!(dir.baks().is_empty(), "no quarantine: {:?}", dir.baks());
+        }
+    }
+
+    /// **A fresh install is not a quarantine case, and the ORDER is what makes
+    /// that true.**
+    ///
+    /// "States no schema version" is below the floor — that is the pre-v1.10
+    /// file. A brand-new install states no version either, for the entirely
+    /// different reason that it has no file. The two are told apart by position:
+    /// `load_global` seeds a missing file and returns before the floor is ever
+    /// consulted. Structural because there is no way to reach `load_global` from
+    /// a unit test — it resolves its own path from the running exe.
+    /// Newline-agnostic: CI checks this tree out with CRLF.
+    #[test]
+    fn the_fresh_install_branch_runs_before_the_floor() {
+        let src = include_str!("persistence.rs");
+        let start = src
+            .find("fn load_global(")
+            .expect("`load_global` is gone — re-point this test");
+        let body = &src[start..];
+        let body = &body[..body.find("\n}").unwrap_or(body.len())];
+
+        let seed_at = body
+            .find("if !path.exists()")
+            .expect("`load_global` must seed defaults for a missing file");
+        let floor_at = body
+            .find("reseed_below_floor")
+            .expect("`load_global` must enforce the migration floor, or a file it cannot migrate \
+                     is parsed anyway and silently defaulted");
+        let migrate_at = body
+            .find("migrate_if_needed")
+            .expect("`load_global` must still run the cascade");
+        assert!(
+            seed_at < floor_at,
+            "the fresh-install branch must come FIRST: an absent file states no schema version, \
+             which is exactly what a pre-v1.10 file looks like, and quarantining a brand-new \
+             install would be nonsense"
+        );
+        assert!(
+            floor_at < migrate_at,
+            "the floor must come BEFORE the cascade: after it, a below-floor file has already \
+             fallen through every remaining detector and been force-stamped as current"
         );
     }
 

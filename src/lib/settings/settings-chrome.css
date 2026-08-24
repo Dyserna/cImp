@@ -28,20 +28,11 @@
    keeps its own look. Do not move the import.
  */
 
-/* ORDER-PRESERVATION COMPANION (#129 (a)) — this rule is NOT chrome; it belongs
-   with the offload section when #129 (c) extracts it. It is here only because it
-   ties on specificity (0,3,1) with `.button-row + small.hint` further down, and
-   its single call site sits directly after a `.button-row` — so which of the two
-   wins is decided by source order alone. In the old single style block the
-   adjacency rule came last and won (the hint gets `--space-1`, not 1.5rem);
-   hoisting only the adjacency rule would have silently flipped that. Keep these
-   two in this relative order, or move both out together. */
-/* Offload local-backend card: 1 blank line between the provider buttons
-   (Add to <harness> / Auto-sync) and their description. Overrides the
-   default `small.hint` negative top margin. */
-.settings-chrome small.hint.provider-desc {
-  margin-top: 1.5rem;
-}
+/* (#129 (a)'s first ORDER-PRESERVATION COMPANION lived here — the offload
+   card's `small.hint.provider-desc`. (c) moved it into `OffloadSection.svelte`
+   with the rest of that section, and the order dependency it carried is now
+   WRITTEN DOWN there as an explicit `.button-row + small.hint.provider-desc`
+   rule rather than left to source order. Nothing to keep here.) */
 .settings-chrome h4 {
   font-size: var(--font-size-sm);
   font-weight: 600;
@@ -51,15 +42,22 @@
 .settings-chrome button.danger {
   color: var(--text-danger-soft, #d06b6b);
 }
-/* ORDER-PRESERVATION COMPANIONS (#129 (a)) — neither is chrome. Both tie at
-   0,3,1 with `button:hover:not(:disabled)` further down and both mark a button
-   that can be hovered, so which one paints a hovered-and-active button is
-   decided by source order alone. In the old single style block both came first
-   and LOST, so the generic hover won; they are kept ahead of it here so that
-   stays true. (Whether that is the look anyone wants is a separate question —
-   `.sidebar button:hover:not(.active)` right next to the second one suggests
-   not — but changing it is not this refactor's job.) Move each back to its
-   section in #129 (c), together with the hover rule or after re-deciding. */
+/* ORDER-PRESERVATION COMPANIONS (#129 (a)) — neither is chrome by nature. Both
+   tie at 0,3,1 with `button:hover:not(:disabled)` further down and both mark a
+   button that can be hovered, so which one paints a hovered-and-active button
+   is decided by source order alone. In the old single style block both came
+   first and LOST, so the generic hover won; they are kept ahead of it here so
+   that stays true.
+
+   #129 (c) DECISION: they STAY. `.sidebar` is the parent's own chrome, and
+   `.template-actions button.active` — whose markup did move, into
+   `OffloadSection.svelte` — keeps matching from here, because this sheet is
+   NOT Svelte-scoped: it reaches any markup rendered inside `.settings-chrome`.
+   Leaving it costs nothing and preserves the tie exactly, whereas restating
+   the exception in the child would mean spelling out a `:hover` interaction
+   (hovered-and-active vs hovered-and-disabled) to reproduce a look nobody has
+   decided they want. Re-deciding that look is a separate change, and the
+   comment below records what it would be re-deciding. */
 .settings-chrome .template-actions button.active {
   border-color: var(--accent, #d08770);
   color: var(--accent, #d08770);

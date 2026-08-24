@@ -13,6 +13,13 @@
 // Invariant: a tab is hidden ⇔ it is absent from the layout tree (while
 // still present in the tabs store). Everything that renders or indexes
 // pane.tab_ids therefore needs no hidden-awareness at all.
+//
+// This module owns the RUNTIME half of that invariant — hide, show, show-all,
+// reveal, and the lifecycle prunes. The boot-time half (a persisted tree does
+// not contain hidden tabs, but they are in settings.tabs and so look like
+// orphans to the layout repair) moved into the backend in V42 Phase B: the
+// repair reads this same set from `.cimp/ui_state.json` and never places them.
+// See `src-tauri/src/settings/layout.rs`.
 
 import { get, writable, type Writable } from 'svelte/store';
 import {
@@ -58,17 +65,20 @@ export const hiddenTabs: Writable<ReadonlySet<TabId>> = writable(new Set());
 
 /// Fill the hidden set from the hydrated UI-state cache.
 ///
-/// **Ordering invariant.** This must run before `App.svelte`'s
-/// `stripHiddenTabsFromLayout()`, which is what re-establishes "hidden ⇔ not
-/// in the layout tree" after layout hydration re-adds hidden tabs as orphans.
-/// If the set were still empty at that point, every hidden tab would come
-/// back visible and the user's hidden set would then be overwritten with the
-/// empty one by the popover's next write.
+/// **Ordering invariant**, weaker since V42 Phase B. The hidden set used to
+/// have to be filled before App's `onMount` ran `stripHiddenTabsFromLayout()`,
+/// because layout hydration re-added every hidden tab as an orphan and that
+/// call was what took them back out; an empty set at that moment un-hid
+/// everything and the popover's next write then persisted the emptiness. The
+/// backend reads the same set straight from `.cimp/ui_state.json` now and hands
+/// the main window a tree the hidden tabs were never in, so that failure mode
+/// is gone.
 ///
-/// `main.ts` guarantees it: `hydrateUiState()` then this, both awaited before
-/// `mount(App)`; `stripHiddenTabsFromLayout()` runs from App's `onMount`,
-/// which cannot fire before the mount call. Calling this twice is harmless —
-/// it is a pure read of the cache.
+/// What remains: App's `onMount` calls `isTabHidden` on the fresh-install path
+/// (no persisted tree exists for the backend to have repaired), and the popover
+/// renders from this store. `main.ts` still orders it — `hydrateUiState()` then
+/// this, both awaited before `mount(App)`. Calling this twice is harmless: it
+/// is a pure read of the cache.
 export function hydrateHiddenTabs(): void {
   hiddenTabs.set(load());
 }
@@ -151,14 +161,4 @@ export function revealTab(id: TabId): void {
 ///     life invisibly hidden.
 export function forgetHiddenTab(id: TabId): void {
   mark(id, false);
-}
-
-/// Remove every hidden tab from the just-hydrated layout tree. Startup
-/// hook: a saved layout never contains hidden tabs, but
-/// `validateAndRepairLayout` re-adds them as orphans (they ARE in
-/// settings.tabs), and the legacy no-layout path seeds every tab. Runs
-/// before the panes render; panes emptied by the strip collapse exactly as
-/// a live hide would.
-export function stripHiddenTabsFromLayout(): void {
-  for (const id of get(hiddenTabs)) applyTabClosedFromLayout(id);
 }

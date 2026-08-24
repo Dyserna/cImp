@@ -38,6 +38,7 @@
 //! `pty_rebind_channel`) and one poll view (`activity_list`). It is a real
 //! increment, not a prototype — but it is deliberately not the whole surface.
 
+pub mod layout;
 pub mod pty;
 pub mod settings;
 pub mod sink;

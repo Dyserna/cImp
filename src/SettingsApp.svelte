@@ -127,6 +127,7 @@
   import type { AiTabId } from './lib/tabs/types';
   import { SPRITE_SETS } from './lib/avatarConfig';
   import { version as appVersion } from '../package.json';
+  import Toggle from './lib/settings/Toggle.svelte';
   import ShortcutCapture from './lib/settings/ShortcutCapture.svelte';
   import TabSettingsSection from './lib/settings/TabSettingsSection.svelte';
   import ThemeSwatch from './lib/settings/ThemeSwatch.svelte';
@@ -2442,15 +2443,11 @@
       {#if activeSection === 'audio'}
         <section>
           <h2>TTS</h2>
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.tts.enabled}
-              onchange={(e) =>
-                patch((s) => (s.tts.enabled = (e.currentTarget as HTMLInputElement).checked))}
-            />
-            <span>Enable text-to-speech</span>
-          </label>
+          <Toggle
+            label="Enable text-to-speech"
+            checked={snapshot.tts.enabled}
+            onchange={(next) => patch((s) => (s.tts.enabled = next))}
+          />
           <small class="hint top">
             Loads the Kokoro voice model. Turn off to unload it and free
             memory — no AI output is spoken while disabled. (To keep the model
@@ -2511,16 +2508,12 @@
                 patch((s) => (s.tts.volume = +(e.currentTarget as HTMLInputElement).value))}
             />
           </label>
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.tts.mute}
-              disabled={!snapshot.tts.enabled}
-              onchange={(e) =>
-                patch((s) => (s.tts.mute = (e.currentTarget as HTMLInputElement).checked))}
-            />
-            <span>Mute</span>
-          </label>
+          <Toggle
+            label="Mute"
+            checked={snapshot.tts.mute}
+            disabled={!snapshot.tts.enabled}
+            onchange={(next) => patch((s) => (s.tts.mute = next))}
+          />
         </section>
 
         <section>
@@ -2529,38 +2522,26 @@
             TTS is only stopped by Esc (or by switching tabs) — typing never
             interrupts speech.
           </small>
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.behavior.auto_speak}
-              onchange={(e) =>
-                patch((s) => (s.behavior.auto_speak = (e.currentTarget as HTMLInputElement).checked))}
-            />
-            <span>Auto-speak detected segments</span>
-          </label>
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.behavior.follow_avatar}
-              onchange={(e) =>
-                patch((s) => (s.behavior.follow_avatar = (e.currentTarget as HTMLInputElement).checked))}
-            />
-            <span>Follow avatar visibility</span>
-          </label>
+          <Toggle
+            label="Auto-speak detected segments"
+            checked={snapshot.behavior.auto_speak}
+            onchange={(next) => patch((s) => (s.behavior.auto_speak = next))}
+          />
+          <Toggle
+            label="Follow avatar visibility"
+            checked={snapshot.behavior.follow_avatar}
+            onchange={(next) => patch((s) => (s.behavior.follow_avatar = next))}
+          />
           <small class="hint">
             When on, hiding the avatar mutes TTS and showing it unmutes —
             the Mute toggle tracks the avatar. Turn this off to control
             mute independently.
           </small>
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.behavior.announce_focused_tab}
-              onchange={(e) =>
-                patch((s) => (s.behavior.announce_focused_tab = (e.currentTarget as HTMLInputElement).checked))}
-            />
-            <span>Announce focused tab</span>
-          </label>
+          <Toggle
+            label="Announce focused tab"
+            checked={snapshot.behavior.announce_focused_tab}
+            onchange={(next) => patch((s) => (s.behavior.announce_focused_tab = next))}
+          />
           <small class="hint">
             Off by default — announcements (idle, awaiting permission, error,
             exit) only fire for background tabs. Turn on to hear them for the
@@ -2583,70 +2564,50 @@
             this. 0 announces every idle. Permission, question and error
             announcements are never gated.
           </small>
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.behavior.speak_background_tabs}
-              onchange={(e) =>
-                patch((s) => (s.behavior.speak_background_tabs = (e.currentTarget as HTMLInputElement).checked))}
-            />
-            <span>Speak tagged TTS from background tabs</span>
-          </label>
+          <Toggle
+            label="Speak tagged TTS from background tabs"
+            checked={snapshot.behavior.speak_background_tabs}
+            onchange={(next) => patch((s) => (s.behavior.speak_background_tabs = next))}
+          />
           <small class="hint">
             Off by default — tagged TTS segments (the spoken bits inside
             AI-tab output) only play for the active tab. Turn on to hear
             them from background tabs too. Announcements are unaffected.
           </small>
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.behavior.copy_on_select}
-              onchange={(e) =>
-                patch((s) => (s.behavior.copy_on_select = (e.currentTarget as HTMLInputElement).checked))}
-            />
-            <span>Copy on select</span>
-          </label>
+          <Toggle
+            label="Copy on select"
+            checked={snapshot.behavior.copy_on_select}
+            onchange={(next) => patch((s) => (s.behavior.copy_on_select = next))}
+          />
           <small class="hint">
             When on, text selected in any terminal is copied to the system
             clipboard automatically.
           </small>
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.behavior.paste_on_right_click}
-              onchange={(e) =>
-                patch((s) => (s.behavior.paste_on_right_click = (e.currentTarget as HTMLInputElement).checked))}
-            />
-            <span>Paste on right-click</span>
-          </label>
+          <Toggle
+            label="Paste on right-click"
+            checked={snapshot.behavior.paste_on_right_click}
+            onchange={(next) => patch((s) => (s.behavior.paste_on_right_click = next))}
+          />
           <small class="hint">
             When on, right-clicking inside any terminal pastes the system
             clipboard into the focused shell and suppresses the browser's
             default context menu.
           </small>
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.behavior.speak_selection_on_right_click}
-              onchange={(e) =>
-                patch((s) => (s.behavior.speak_selection_on_right_click = (e.currentTarget as HTMLInputElement).checked))}
-            />
-            <span>Speak selection on Ctrl+right-click</span>
-          </label>
+          <Toggle
+            label="Speak selection on Ctrl+right-click"
+            checked={snapshot.behavior.speak_selection_on_right_click}
+            onchange={(next) => patch((s) => (s.behavior.speak_selection_on_right_click = next))}
+          />
           <small class="hint">
             When on, Ctrl+right-clicking inside any terminal reads the
             selected text aloud through TTS. Holding Ctrl always suppresses
             paste, so the gesture never pastes the clipboard.
           </small>
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.tts.selection_highlight.enabled}
-              onchange={(e) =>
-                patch((s) => (s.tts.selection_highlight.enabled = (e.currentTarget as HTMLInputElement).checked))}
-            />
-            <span>Highlight selection while reading</span>
-          </label>
+          <Toggle
+            label="Highlight selection while reading"
+            checked={snapshot.tts.selection_highlight.enabled}
+            onchange={(next) => patch((s) => (s.tts.selection_highlight.enabled = next))}
+          />
           <small class="hint">
             While the selection is read aloud, it is recolored and the
             highlight recedes sentence-by-sentence as each is spoken. The
@@ -2688,15 +2649,11 @@
               </div>
             {/each}
           </div>
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.tts.show_selection_controls}
-              onchange={(e) =>
-                patch((s) => (s.tts.show_selection_controls = (e.currentTarget as HTMLInputElement).checked))}
-            />
-            <span>Show selection-TTS controls in the status bar</span>
-          </label>
+          <Toggle
+            label="Show selection-TTS controls in the status bar"
+            checked={snapshot.tts.show_selection_controls}
+            onchange={(next) => patch((s) => (s.tts.show_selection_controls = next))}
+          />
           <small class="hint">
             Adds play / pause / restart / stop buttons to the bottom bar for
             reading the current terminal selection aloud (play has the same
@@ -2749,15 +2706,11 @@
             transcribes your speech into the compose overlay for review before
             you send it. Nothing leaves your machine.
           </small>
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.stt.enabled}
-              onchange={(e) =>
-                patch((s) => (s.stt.enabled = (e.currentTarget as HTMLInputElement).checked))}
-            />
-            <span>Enable speech-to-text</span>
-          </label>
+          <Toggle
+            label="Enable speech-to-text"
+            checked={snapshot.stt.enabled}
+            onchange={(next) => patch((s) => (s.stt.enabled = next))}
+          />
           <small class="hint">
             Shows a microphone button in the bottom bar and enables the
             push-to-talk shortcut. Requires a model in the <code>models/</code> folder.
@@ -2839,15 +2792,11 @@
             </select>
           </label>
 
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.stt.translate_to_english}
-              onchange={(e) =>
-                patch((s) => (s.stt.translate_to_english = (e.currentTarget as HTMLInputElement).checked))}
-            />
-            <span>Translate to English</span>
-          </label>
+          <Toggle
+            label="Translate to English"
+            checked={snapshot.stt.translate_to_english}
+            onchange={(next) => patch((s) => (s.stt.translate_to_english = next))}
+          />
           <small class="hint">
             Transcribe non-English speech as English instead of verbatim.
           </small>
@@ -2873,15 +2822,11 @@
       {:else if activeSection === 'avatar'}
         <section>
           <h2>Avatar</h2>
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.avatar.visible}
-              onchange={(e) =>
-                patch((s) => (s.avatar.visible = (e.currentTarget as HTMLInputElement).checked))}
-            />
-            <span>Visible</span>
-          </label>
+          <Toggle
+            label="Visible"
+            checked={snapshot.avatar.visible}
+            onchange={(next) => patch((s) => (s.avatar.visible = next))}
+          />
           <label>
             <span>Type</span>
             <select
@@ -2989,15 +2934,11 @@
                 patch((s) => (s.avatar.opacity = +(e.currentTarget as HTMLInputElement).value))}
             />
           </label>
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.avatar.show_border}
-              onchange={(e) =>
-                patch((s) => (s.avatar.show_border = (e.currentTarget as HTMLInputElement).checked))}
-            />
-            <span>Show border</span>
-          </label>
+          <Toggle
+            label="Show border"
+            checked={snapshot.avatar.show_border}
+            onchange={(next) => patch((s) => (s.avatar.show_border = next))}
+          />
 
           {#if snapshot.avatar.kind !== 'sprite'}
           <h3>Per-state images</h3>
@@ -3051,15 +2992,11 @@
 
         <section>
           <h2>Waveform</h2>
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.avatar.waveform.visible}
-              onchange={(e) =>
-                patch((s) => (s.avatar.waveform.visible = (e.currentTarget as HTMLInputElement).checked))}
-            />
-            <span>Show waveform</span>
-          </label>
+          <Toggle
+            label="Show waveform"
+            checked={snapshot.avatar.waveform.visible}
+            onchange={(next) => patch((s) => (s.avatar.waveform.visible = next))}
+          />
           <div class="file-row">
             <span class="state-label">Color</span>
             <input
@@ -3380,20 +3317,11 @@
           {/if}
 
           <h3>Preview</h3>
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.terminal.background.preview_category_flips}
-              onchange={(e) =>
-                patch(
-                  (s) =>
-                    (s.terminal.background.preview_category_flips = (
-                      e.currentTarget as HTMLInputElement
-                    ).checked),
-                )}
-            />
-            <span>Preview image / category changes in Configure Tab dialog</span>
-          </label>
+          <Toggle
+            label="Preview image / category changes in Configure Tab dialog"
+            checked={snapshot.terminal.background.preview_category_flips}
+            onchange={(next) => patch((s) => (s.terminal.background.preview_category_flips = next))}
+          />
           <small class="hint">
             When off, image-toggle and category-flip changes wait for Save in
             the Configure Tab dialog. Color, opacity, blur, size, position,
@@ -3510,59 +3438,39 @@
             message; the widget hides until then, and dims when the last report
             gets old (tab closed, or idle too long).
           </small>
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.usage.enabled}
-              onchange={(e) =>
-                patch((s) => (s.usage.enabled = (e.currentTarget as HTMLInputElement).checked))}
-            />
-            <span>Show usage in the bottom bar</span>
-          </label>
+          <Toggle
+            label="Show usage in the bottom bar"
+            checked={snapshot.usage.enabled}
+            onchange={(next) => patch((s) => (s.usage.enabled = next))}
+          />
           <small class="hint">
             The toggles below pick which pieces of each window are shown
             (they apply to both the 5h and 7d readouts).
           </small>
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.usage.show_bar}
-              disabled={!snapshot.usage.enabled}
-              onchange={(e) =>
-                patch((s) => (s.usage.show_bar = (e.currentTarget as HTMLInputElement).checked))}
-            />
-            <span>Bar</span>
-          </label>
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.usage.show_percentage}
-              disabled={!snapshot.usage.enabled}
-              onchange={(e) =>
-                patch((s) => (s.usage.show_percentage = (e.currentTarget as HTMLInputElement).checked))}
-            />
-            <span>Percentage</span>
-          </label>
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.usage.show_countdown}
-              disabled={!snapshot.usage.enabled}
-              onchange={(e) =>
-                patch((s) => (s.usage.show_countdown = (e.currentTarget as HTMLInputElement).checked))}
-            />
-            <span>Countdown timer</span>
-          </label>
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.usage.show_reset_clock}
-              disabled={!snapshot.usage.enabled}
-              onchange={(e) =>
-                patch((s) => (s.usage.show_reset_clock = (e.currentTarget as HTMLInputElement).checked))}
-            />
-            <span>Reset clock (local time)</span>
-          </label>
+          <Toggle
+            label="Bar"
+            checked={snapshot.usage.show_bar}
+            disabled={!snapshot.usage.enabled}
+            onchange={(next) => patch((s) => (s.usage.show_bar = next))}
+          />
+          <Toggle
+            label="Percentage"
+            checked={snapshot.usage.show_percentage}
+            disabled={!snapshot.usage.enabled}
+            onchange={(next) => patch((s) => (s.usage.show_percentage = next))}
+          />
+          <Toggle
+            label="Countdown timer"
+            checked={snapshot.usage.show_countdown}
+            disabled={!snapshot.usage.enabled}
+            onchange={(next) => patch((s) => (s.usage.show_countdown = next))}
+          />
+          <Toggle
+            label="Reset clock (local time)"
+            checked={snapshot.usage.show_reset_clock}
+            disabled={!snapshot.usage.enabled}
+            onchange={(next) => patch((s) => (s.usage.show_reset_clock = next))}
+          />
           <label>
             <span>Poll interval (seconds)</span>
             <input
@@ -3590,68 +3498,44 @@
             Live CPU / memory / GPU / network panel in the bottom bar, right of
             the session usage meter.
           </small>
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.system_stats.enabled}
-              onchange={(e) =>
-                patch((s) => (s.system_stats.enabled = (e.currentTarget as HTMLInputElement).checked))}
-            />
-            <span>Show local machine information</span>
-          </label>
+          <Toggle
+            label="Show local machine information"
+            checked={snapshot.system_stats.enabled}
+            onchange={(next) => patch((s) => (s.system_stats.enabled = next))}
+          />
           <small class="hint">
             The toggles below pick which components are shown.
           </small>
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.system_stats.show_cpu}
-              disabled={!snapshot.system_stats.enabled}
-              onchange={(e) =>
-                patch((s) => (s.system_stats.show_cpu = (e.currentTarget as HTMLInputElement).checked))}
-            />
-            <span>CPU usage</span>
-          </label>
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.system_stats.show_memory}
-              disabled={!snapshot.system_stats.enabled}
-              onchange={(e) =>
-                patch((s) => (s.system_stats.show_memory = (e.currentTarget as HTMLInputElement).checked))}
-            />
-            <span>Memory</span>
-          </label>
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.system_stats.show_gpu}
-              disabled={!snapshot.system_stats.enabled}
-              onchange={(e) =>
-                patch((s) => (s.system_stats.show_gpu = (e.currentTarget as HTMLInputElement).checked))}
-            />
-            <span>GPU (usage + VRAM)</span>
-          </label>
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.system_stats.show_gpu_temp}
-              disabled={!snapshot.system_stats.enabled || !snapshot.system_stats.show_gpu}
-              onchange={(e) =>
-                patch((s) => (s.system_stats.show_gpu_temp = (e.currentTarget as HTMLInputElement).checked))}
-            />
-            <span>GPU temperature</span>
-          </label>
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.system_stats.show_network}
-              disabled={!snapshot.system_stats.enabled}
-              onchange={(e) =>
-                patch((s) => (s.system_stats.show_network = (e.currentTarget as HTMLInputElement).checked))}
-            />
-            <span>Network</span>
-          </label>
+          <Toggle
+            label="CPU usage"
+            checked={snapshot.system_stats.show_cpu}
+            disabled={!snapshot.system_stats.enabled}
+            onchange={(next) => patch((s) => (s.system_stats.show_cpu = next))}
+          />
+          <Toggle
+            label="Memory"
+            checked={snapshot.system_stats.show_memory}
+            disabled={!snapshot.system_stats.enabled}
+            onchange={(next) => patch((s) => (s.system_stats.show_memory = next))}
+          />
+          <Toggle
+            label="GPU (usage + VRAM)"
+            checked={snapshot.system_stats.show_gpu}
+            disabled={!snapshot.system_stats.enabled}
+            onchange={(next) => patch((s) => (s.system_stats.show_gpu = next))}
+          />
+          <Toggle
+            label="GPU temperature"
+            checked={snapshot.system_stats.show_gpu_temp}
+            disabled={!snapshot.system_stats.enabled || !snapshot.system_stats.show_gpu}
+            onchange={(next) => patch((s) => (s.system_stats.show_gpu_temp = next))}
+          />
+          <Toggle
+            label="Network"
+            checked={snapshot.system_stats.show_network}
+            disabled={!snapshot.system_stats.enabled}
+            onchange={(next) => patch((s) => (s.system_stats.show_network = next))}
+          />
           <label>
             <span>Poll interval (seconds)</span>
             <input
@@ -3844,50 +3728,35 @@
               <small class="error">{aiTabsError}</small>
             {/if}
           </fieldset>
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.ui.tool_activity_tab}
-              onchange={(e) =>
-                patch(
-                  (s) =>
-                    (s.ui.tool_activity_tab = (e.currentTarget as HTMLInputElement).checked),
-                )}
-            />
-            <span>Show the <strong>Tools</strong> tab</span>
-          </label>
+          <Toggle
+            checked={snapshot.ui.tool_activity_tab}
+            onchange={(next) => patch((s) => (s.ui.tool_activity_tab = next))}
+          >
+            Show the <strong>Tools</strong> tab
+          </Toggle>
           <small class="hint">
             One place to watch tool usage: a unified feed of code-intelligence
             graph calls and offload requests, plus the graph/offload tool
             reference lists.
           </small>
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.ui.events_tab}
-              onchange={(e) =>
-                patch((s) => (s.ui.events_tab = (e.currentTarget as HTMLInputElement).checked))}
-            />
-            <span>Show the <strong>Events</strong> tab</span>
-          </label>
+          <Toggle
+            checked={snapshot.ui.events_tab}
+            onchange={(next) => patch((s) => (s.ui.events_tab = next))}
+          >
+            Show the <strong>Events</strong> tab
+          </Toggle>
           <small class="hint">
             The same recorded activity, read as events: every row says which
             tab and which session it came from, and the feed filters by kind,
             source/screen and tab. Independent of the Tools tab — turning one
             off leaves the other alone.
           </small>
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.preview_allow_remote}
-              onchange={(e) =>
-                patch(
-                  (s) =>
-                    (s.preview_allow_remote = (e.currentTarget as HTMLInputElement).checked),
-                )}
-            />
-            <span>Allow <strong>Preview</strong> tabs to load remote URLs</span>
-          </label>
+          <Toggle
+            checked={snapshot.preview_allow_remote}
+            onchange={(next) => patch((s) => (s.preview_allow_remote = next))}
+          >
+            Allow <strong>Preview</strong> tabs to load remote URLs
+          </Toggle>
           <small class="hint">
             Off (default) restricts Preview-tab navigation to localhost and
             private-network (RFC&nbsp;1918) hosts — the tab is meant for your
@@ -4323,38 +4192,26 @@
             conserving its context window. Everything stays local. Off by
             default; the model is user-supplied (not bundled).
           </small>
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.offload.enabled}
-              onchange={(e) =>
-                patch((s) => (s.offload.enabled = (e.currentTarget as HTMLInputElement).checked))}
-            />
-            <span>Enable offload</span>
-          </label>
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.offload.inject_guidance}
-              onchange={(e) =>
-                patch((s) => (s.offload.inject_guidance = (e.currentTarget as HTMLInputElement).checked))}
-            />
-            <span>Inject offload guidance into the system prompt</span>
-          </label>
+          <Toggle
+            label="Enable offload"
+            checked={snapshot.offload.enabled}
+            onchange={(next) => patch((s) => (s.offload.enabled = next))}
+          />
+          <Toggle
+            label="Inject offload guidance into the system prompt"
+            checked={snapshot.offload.inject_guidance}
+            onchange={(next) => patch((s) => (s.offload.inject_guidance = next))}
+          />
           <small class="hint">
             The <code>offload_task</code> tool and its guidance are injected
             when an AI tab starts — restart the {harnessNames} tab
             (Tabs → Restart) after changing either toggle.
           </small>
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.offload.session_push}
-              onchange={(e) =>
-                patch((s) => (s.offload.session_push = (e.currentTarget as HTMLInputElement).checked))}
-            />
-            <span>Session push (experimental)</span>
-          </label>
+          <Toggle
+            label="Session push (experimental)"
+            checked={snapshot.offload.session_push}
+            onchange={(next) => patch((s) => (s.offload.session_push = next))}
+          />
           <small class="hint">
             Lets cImp push notices — offload results, audit and graph-index
             completions — straight into a live AI tab.
@@ -4510,18 +4367,15 @@
                     anything on your LAN without one.
                   </small>
                 </label>
-                <label class="checkbox">
-                  <input
-                    type="checkbox"
-                    checked={backend.kind.show_command_on_start}
-                    onchange={(e) =>
-                      updateBackend(i, (b) => {
-                        if (b.kind.type === 'local')
-                          b.kind.show_command_on_start = (e.currentTarget as HTMLInputElement).checked;
-                      })}
-                  />
-                  <span>Show command on start</span>
-                </label>
+                <Toggle
+                  label="Show command on start"
+                  checked={backend.kind.show_command_on_start}
+                  onchange={(next) =>
+                    updateBackend(i, (b) => {
+                      if (b.kind.type === 'local')
+                        b.kind.show_command_on_start = next;
+                    })}
+                />
                 <small class="hint">
                   The Start button in Tools → Offload server opens the
                   command in an editable popup first — edits apply to that
@@ -4713,14 +4567,11 @@
                   </div>
                 {/if}
                 <hr class="card-divider lg" />
-                <label class="checkbox">
-                  <input
-                    type="checkbox"
-                    checked={backend.kind.is_cloud}
-                    onchange={(e) => setBackendCloud(i, (e.currentTarget as HTMLInputElement).checked)}
-                  />
-                  <span>Cloud backend (data leaves this machine)</span>
-                </label>
+                <Toggle
+                  label="Cloud backend (data leaves this machine)"
+                  checked={backend.kind.is_cloud}
+                  onchange={(next) => setBackendCloud(i, next)}
+                />
                 {#if backend.kind.is_cloud}
                   <label class="checkbox cloud-consent">
                     <input
@@ -5021,18 +4872,11 @@
             </button>
           </div>
 
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.offload.escalate_partial}
-              onchange={(e) =>
-                patch(
-                  (s) =>
-                    (s.offload.escalate_partial = (e.currentTarget as HTMLInputElement).checked),
-                )}
-            />
-            <span>Escalate partial fast-tier answers to the quality backend</span>
-          </label>
+          <Toggle
+            label="Escalate partial fast-tier answers to the quality backend"
+            checked={snapshot.offload.escalate_partial}
+            onchange={(next) => patch((s) => (s.offload.escalate_partial = next))}
+          />
           <small class="hint">
             When a fast-tier offload comes back only partially verified, re-run it
             once on a distinct, ready quality backend and keep the better answer.
@@ -5040,54 +4884,33 @@
           </small>
           {:else}
           <h3>Native tools</h3>
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.offload.tools.read_file}
-              onchange={(e) =>
-                patch((s) => (s.offload.tools.read_file = (e.currentTarget as HTMLInputElement).checked))}
-            />
-            <span>read_file — bounded file reads</span>
-          </label>
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.offload.tools.list_dir}
-              onchange={(e) =>
-                patch((s) => (s.offload.tools.list_dir = (e.currentTarget as HTMLInputElement).checked))}
-            />
-            <span>list_dir — enumerate a directory (what files exist / how many)</span>
-          </label>
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.offload.tools.code_search}
-              onchange={(e) =>
-                patch((s) => (s.offload.tools.code_search = (e.currentTarget as HTMLInputElement).checked))}
-            />
-            <span>code_search — literal search across the roots</span>
-          </label>
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.offload.tools.run_command}
-              onchange={(e) =>
-                patch((s) => (s.offload.tools.run_command = (e.currentTarget as HTMLInputElement).checked))}
-            />
-            <span>run_command — allowlisted, read-only commands</span>
-          </label>
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.offload.tools.run_check}
-              onchange={(e) =>
-                patch((s) => (s.offload.tools.run_check = (e.currentTarget as HTMLInputElement).checked))}
-            />
-            <span
-              >run_check — run a configured project check (build/typecheck/lint/test).
-              Inert until the project's <code>checks</code> are configured.</span
-            >
-          </label>
+          <Toggle
+            label="read_file — bounded file reads"
+            checked={snapshot.offload.tools.read_file}
+            onchange={(next) => patch((s) => (s.offload.tools.read_file = next))}
+          />
+          <Toggle
+            label="list_dir — enumerate a directory (what files exist / how many)"
+            checked={snapshot.offload.tools.list_dir}
+            onchange={(next) => patch((s) => (s.offload.tools.list_dir = next))}
+          />
+          <Toggle
+            label="code_search — literal search across the roots"
+            checked={snapshot.offload.tools.code_search}
+            onchange={(next) => patch((s) => (s.offload.tools.code_search = next))}
+          />
+          <Toggle
+            label="run_command — allowlisted, read-only commands"
+            checked={snapshot.offload.tools.run_command}
+            onchange={(next) => patch((s) => (s.offload.tools.run_command = next))}
+          />
+          <Toggle
+            checked={snapshot.offload.tools.run_check}
+            onchange={(next) => patch((s) => (s.offload.tools.run_check = next))}
+          >
+            run_check — run a configured project check (build/typecheck/lint/test).
+            Inert until the project's <code>checks</code> are configured.
+          </Toggle>
 
           <label>
             <span>Allowed roots (one per line)</span>
@@ -5277,20 +5100,11 @@
             the two knobs that are not per tab. Every run is a row in the Events
             tab under <strong>delegation</strong>.
           </small>
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.delegation.auto_read_only}
-              onchange={(e) =>
-                patch(
-                  (s) =>
-                    (s.delegation.auto_read_only = (
-                      e.currentTarget as HTMLInputElement
-                    ).checked),
-                )}
-            />
-            <span>Lock a tab's keyboard while another harness is driving it</span>
-          </label>
+          <Toggle
+            label="Lock a tab's keyboard while another harness is driving it"
+            checked={snapshot.delegation.auto_read_only}
+            onchange={(next) => patch((s) => (s.delegation.auto_read_only = next))}
+          />
           <small class="hint">
             On by default. While cImp is typing into a tab, a stray keystroke of
             yours lands in the middle of someone else's turn. A courtesy lock over
@@ -5388,20 +5202,11 @@
             it is a token-efficiency nudge — so the master switch does not reach
             it; its own two switches still do.)
           </small>
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.offload.injection.protection}
-              onchange={(e) =>
-                patch(
-                  (s) =>
-                    (s.offload.injection.protection = (
-                      e.currentTarget as HTMLInputElement
-                    ).checked),
-                )}
-            />
-            <span>Injection protection (master switch)</span>
-          </label>
+          <Toggle
+            label="Injection protection (master switch)"
+            checked={snapshot.offload.injection.protection}
+            onchange={(next) => patch((s) => (s.offload.injection.protection = next))}
+          />
           {#if !snapshot.offload.injection.protection}
             <small class="hint down">
               ⚠ <strong>Every containment control is off</strong> — for every tab
@@ -5706,34 +5511,16 @@
             shipped bundle but never touches <code>local/</code>. A file that
             fails to compile is skipped and the rest still load.
           </small>
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.offload.detection_signature_enabled}
-              onchange={(e) =>
-                patch(
-                  (s) =>
-                    (s.offload.detection_signature_enabled = (
-                      e.currentTarget as HTMLInputElement
-                    ).checked),
-                )}
-            />
-            <span>Signature screen (YARA rules)</span>
-          </label>
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.offload.detection_classifier_enabled}
-              onchange={(e) =>
-                patch(
-                  (s) =>
-                    (s.offload.detection_classifier_enabled = (
-                      e.currentTarget as HTMLInputElement
-                    ).checked),
-                )}
-            />
-            <span>Classifier screen (Prompt Guard 2)</span>
-          </label>
+          <Toggle
+            label="Signature screen (YARA rules)"
+            checked={snapshot.offload.detection_signature_enabled}
+            onchange={(next) => patch((s) => (s.offload.detection_signature_enabled = next))}
+          />
+          <Toggle
+            label="Classifier screen (Prompt Guard 2)"
+            checked={snapshot.offload.detection_classifier_enabled}
+            onchange={(next) => patch((s) => (s.offload.detection_classifier_enabled = next))}
+          />
           {#if detection && !detection.classifier.present}
             <small class="hint">
               Optional and not bundled — cImp does not ship these weights, because
@@ -6016,15 +5803,11 @@
             <code>graph_*</code> tools (re-launch a tab to pick them up) instead
             of grepping. Off by default; everything stays on this machine.
           </small>
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.graph.enabled}
-              onchange={(e) =>
-                patch((s) => (s.graph.enabled = (e.currentTarget as HTMLInputElement).checked))}
-            />
-            <span>Enable code graph</span>
-          </label>
+          <Toggle
+            label="Enable code graph"
+            checked={snapshot.graph.enabled}
+            onchange={(next) => patch((s) => (s.graph.enabled = next))}
+          />
 
           {#if snapshot.graph.enabled}
             <hr class="card-divider lg" />
@@ -6115,15 +5898,11 @@
               Struct-search only (add to enable): <code>html</code>, <code>css</code>,
               <code>json</code>, <code>yaml</code>, <code>xml</code>, <code>asm</code>.
             </small>
-            <label class="checkbox">
-              <input
-                type="checkbox"
-                checked={snapshot.graph.index_docs}
-                onchange={(e) =>
-                  patch((s) => (s.graph.index_docs = (e.currentTarget as HTMLInputElement).checked))}
-              />
-              <span>Index Markdown docs + doc-comments (powers doc search)</span>
-            </label>
+            <Toggle
+              label="Index Markdown docs + doc-comments (powers doc search)"
+              checked={snapshot.graph.index_docs}
+              onchange={(next) => patch((s) => (s.graph.index_docs = next))}
+            />
             <label>
               <span>Max file size (bytes)</span>
               <input
@@ -6181,20 +5960,11 @@
             </div>
 
             <h3>Tool surface</h3>
-            <label class="checkbox">
-              <input
-                type="checkbox"
-                checked={snapshot.graph.lean_tools}
-                onchange={(e) =>
-                  patch(
-                    (s) =>
-                      (s.graph.lean_tools = (
-                        e.currentTarget as HTMLInputElement
-                      ).checked),
-                  )}
-              />
-              <span>Lean tool surface (hide cold-tail graph tools)</span>
-            </label>
+            <Toggle
+              label="Lean tool surface (hide cold-tail graph tools)"
+              checked={snapshot.graph.lean_tools}
+              onchange={(next) => patch((s) => (s.graph.lean_tools = next))}
+            />
             <small class="hint">
               Drop <code>graph_cycles</code>, <code>graph_dead_exports</code>,
               <code>graph_struct_search</code>, <code>graph_path</code>, and
@@ -6264,20 +6034,12 @@
             </label>
 
             <h3>Offload worker access</h3>
-            <label class="checkbox">
-              <input
-                type="checkbox"
-                checked={snapshot.graph.allow_remote_worker_access}
-                onchange={(e) =>
-                  patch(
-                    (s) =>
-                      (s.graph.allow_remote_worker_access = (
-                        e.currentTarget as HTMLInputElement
-                      ).checked),
-                  )}
-              />
-              <span>Allow a <strong>remote</strong> offload worker to query the graph</span>
-            </label>
+            <Toggle
+              checked={snapshot.graph.allow_remote_worker_access}
+              onchange={(next) => patch((s) => (s.graph.allow_remote_worker_access = next))}
+            >
+              Allow a <strong>remote</strong> offload worker to query the graph
+            </Toggle>
             <small class="hint">
               ⚠ <strong>Privacy:</strong> the local offload worker can always
               query the graph. A <strong>remote</strong> backend — whether a box
@@ -6289,18 +6051,11 @@
             </small>
             {:else if graphSubSection === 'semantic'}
             <h3>Semantic search</h3>
-            <label class="checkbox">
-              <input
-                type="checkbox"
-                checked={snapshot.graph.semantic_search}
-                onchange={(e) =>
-                  patch(
-                    (s) =>
-                      (s.graph.semantic_search = (e.currentTarget as HTMLInputElement).checked),
-                  )}
-              />
-              <span>Enable semantic (embedding) doc search</span>
-            </label>
+            <Toggle
+              label="Enable semantic (embedding) doc search"
+              checked={snapshot.graph.semantic_search}
+              onchange={(next) => patch((s) => (s.graph.semantic_search = next))}
+            />
             <small class="hint">
               Needs an OpenAI-compatible <code>/v1/embeddings</code> endpoint
               (e.g. a <code>llama-server --embedding</code> on a spare GPU box).
@@ -6410,18 +6165,11 @@
               </small>
             {:else if graphSubSection === 'efficiency'}
             <h3>Context injection</h3>
-            <label class="checkbox">
-              <input
-                type="checkbox"
-                checked={snapshot.graph.context_injection}
-                onchange={(e) =>
-                  patch(
-                    (s) =>
-                      (s.graph.context_injection = (e.currentTarget as HTMLInputElement).checked),
-                  )}
-              />
-              <span>Auto-inject relevant file digests into each prompt</span>
-            </label>
+            <Toggle
+              label="Auto-inject relevant file digests into each prompt"
+              checked={snapshot.graph.context_injection}
+              onchange={(next) => patch((s) => (s.graph.context_injection = next))}
+            />
             <small class="hint">
               Prepends a budget-bounded digest of the most relevant files to each
               prompt ({injectMechanisms}). Off by default — it
@@ -6477,20 +6225,11 @@
                     })}
                 />
               </label>
-              <label class="checkbox">
-                <input
-                  type="checkbox"
-                  checked={snapshot.graph.context_include_session}
-                  onchange={(e) =>
-                    patch(
-                      (s) =>
-                        (s.graph.context_include_session = (
-                          e.currentTarget as HTMLInputElement
-                        ).checked),
-                    )}
-                />
-                <span>Rank session-hot files first (from Memory)</span>
-              </label>
+              <Toggle
+                label="Rank session-hot files first (from Memory)"
+                checked={snapshot.graph.context_include_session}
+                onchange={(next) => patch((s) => (s.graph.context_include_session = next))}
+              />
               <label>
                 <span>Dedup TTL (turns, 0 = re-inject every turn)</span>
                 <input
@@ -6510,34 +6249,16 @@
                 A file injected in full is demoted to a one-line "unchanged"
                 reminder on later turns until it changes or this many turns pass.
               </small>
-              <label class="checkbox">
-                <input
-                  type="checkbox"
-                  checked={snapshot.graph.repo_map_on_session_start}
-                  onchange={(e) =>
-                    patch(
-                      (s) =>
-                        (s.graph.repo_map_on_session_start = (
-                          e.currentTarget as HTMLInputElement
-                        ).checked),
-                    )}
-                />
-                <span>Prepend the project map to each new session's first turn</span>
-              </label>
-              <label class="checkbox">
-                <input
-                  type="checkbox"
-                  checked={snapshot.graph.compaction_context}
-                  onchange={(e) =>
-                    patch(
-                      (s) =>
-                        (s.graph.compaction_context = (
-                          e.currentTarget as HTMLInputElement
-                        ).checked),
-                    )}
-                />
-                <span>Feed working set + pinned notes to the harness's compactor</span>
-              </label>
+              <Toggle
+                label="Prepend the project map to each new session's first turn"
+                checked={snapshot.graph.repo_map_on_session_start}
+                onchange={(next) => patch((s) => (s.graph.repo_map_on_session_start = next))}
+              />
+              <Toggle
+                label="Feed working set + pinned notes to the harness's compactor"
+                checked={snapshot.graph.compaction_context}
+                onchange={(next) => patch((s) => (s.graph.compaction_context = next))}
+              />
               <small class="hint">
                 On compaction (<code>PreCompact</code> hook) the session's working
                 set and pinned notes are handed to the summarizer so they survive.
@@ -6546,18 +6267,12 @@
               </small>
             {/if}
 
-            <label class="checkbox">
-              <input
-                type="checkbox"
-                checked={snapshot.graph.read_advisor}
-                disabled={e1Blocked}
-                onchange={(e) =>
-                  patch(
-                    (s) => (s.graph.read_advisor = (e.currentTarget as HTMLInputElement).checked),
-                  )}
-              />
-              <span>Redundant-read advisor</span>
-            </label>
+            <Toggle
+              label="Redundant-read advisor"
+              checked={snapshot.graph.read_advisor}
+              disabled={e1Blocked}
+              onchange={(next) => patch((s) => (s.graph.read_advisor = next))}
+            />
             {#if e1Gate}
               <!--
                 V35 Phase E: the sentence comes from the gate itself
@@ -6635,20 +6350,11 @@
                 long the agent's memory is trusted across context loss the
                 advisor can't observe (context editing, tool-result truncation).
               </small>
-              <label class="checkbox">
-                <input
-                  type="checkbox"
-                  checked={snapshot.graph.read_advisor_diffs}
-                  onchange={(e) =>
-                    patch(
-                      (s) =>
-                        (s.graph.read_advisor_diffs = (
-                          e.currentTarget as HTMLInputElement
-                        ).checked),
-                    )}
-                />
-                <span>Diff-substitute changed-file re-reads</span>
-              </label>
+              <Toggle
+                label="Diff-substitute changed-file re-reads"
+                checked={snapshot.graph.read_advisor_diffs}
+                onchange={(next) => patch((s) => (s.graph.read_advisor_diffs = next))}
+              />
               <small class="hint">
                 When you re-read a file <em>after it changed</em>, answer with a
                 line-level unified diff against what you last read instead of the
@@ -6656,20 +6362,11 @@
                 Falls back to a normal read when no snapshot survives or the diff
                 would be more than half the new file.
               </small>
-              <label class="checkbox">
-                <input
-                  type="checkbox"
-                  checked={snapshot.graph.read_advisor_shell}
-                  onchange={(e) =>
-                    patch(
-                      (s) =>
-                        (s.graph.read_advisor_shell = (
-                          e.currentTarget as HTMLInputElement
-                        ).checked),
-                    )}
-                />
-                <span>Intercept whole-file shell reads</span>
-              </label>
+              <Toggle
+                label="Intercept whole-file shell reads"
+                checked={snapshot.graph.read_advisor_shell}
+                onchange={(next) => patch((s) => (s.graph.read_advisor_shell = next))}
+              />
               <small class="hint">
                 Also advise on a whole-file shell read
                 (<code>cat</code>, <code>Get-Content</code>, <code>type</code>,
@@ -6705,21 +6402,12 @@
                 protection begins on the next. Off by default; try <code>256</code>.
               </small>
             {/if}
-            <label class="checkbox">
-              <input
-                type="checkbox"
-                checked={snapshot.graph.context_llm_digests}
-                disabled={!snapshot.graph.context_llm_digests && !localOffloadReady}
-                onchange={(e) =>
-                  patch(
-                    (s) =>
-                      (s.graph.context_llm_digests = (
-                        e.currentTarget as HTMLInputElement
-                      ).checked),
-                  )}
-              />
-              <span>Local-model digests for outline-poor files</span>
-            </label>
+            <Toggle
+              label="Local-model digests for outline-poor files"
+              checked={snapshot.graph.context_llm_digests}
+              disabled={!snapshot.graph.context_llm_digests && !localOffloadReady}
+              onchange={(next) => patch((s) => (s.graph.context_llm_digests = next))}
+            />
             <small class="hint">
               For files with no useful outline (docs, configs, long scripts), the
               <strong>local</strong> offload backend writes a 3-line semantic
@@ -6732,15 +6420,12 @@
             </small>
 
             {:else if graphSubSection === 'viz'}
-            <label class="checkbox">
-              <input
-                type="checkbox"
-                checked={snapshot.graph.graph_viz}
-                onchange={(e) =>
-                  patch((s) => (s.graph.graph_viz = (e.currentTarget as HTMLInputElement).checked))}
-              />
-              <span>Enable the <strong>Graph view</strong> (live 3D force graph)</span>
-            </label>
+            <Toggle
+              checked={snapshot.graph.graph_viz}
+              onchange={(next) => patch((s) => (s.graph.graph_viz = next))}
+            >
+              Enable the <strong>Graph view</strong> (live 3D force graph)
+            </Toggle>
             <small class="hint">
               Draws the code graph and pulses nodes as agents read/edit/query
               the codebase, in the Tools tab's "Graph view" section.
@@ -6862,20 +6547,12 @@
                not corrected here because the string is Rust-side and this pass
                may not edit `src-tauri/`. -->
           <h3>Offload worker access</h3>
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.checks_allow_remote_worker}
-              onchange={(e) =>
-                patch(
-                  (s) =>
-                    (s.checks_allow_remote_worker = (
-                      e.currentTarget as HTMLInputElement
-                    ).checked),
-                )}
-            />
-            <span>Allow a <strong>remote</strong> offload worker to run these checks</span>
-          </label>
+          <Toggle
+            checked={snapshot.checks_allow_remote_worker}
+            onchange={(next) => patch((s) => (s.checks_allow_remote_worker = next))}
+          >
+            Allow a <strong>remote</strong> offload worker to run these checks
+          </Toggle>
           <small class="hint">
             ⚠ <strong>Runs commands on this machine:</strong> the local offload
             worker can always run these checks. A <strong>remote</strong> backend —
@@ -6904,20 +6581,11 @@
             tool you drop in yourself. What is here is the feature.
           </small>
 
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.code_audit.enabled}
-              onchange={(e) =>
-                patch(
-                  (s) =>
-                    (s.code_audit.enabled = (
-                      e.currentTarget as HTMLInputElement
-                    ).checked),
-                )}
-            />
-            <span>Enable Code Audit (Tools → Code audit)</span>
-          </label>
+          <Toggle
+            label="Enable Code Audit (Tools → Code audit)"
+            checked={snapshot.code_audit.enabled}
+            onchange={(next) => patch((s) => (s.code_audit.enabled = next))}
+          />
 
           <h3>Scan settings</h3>
           <label>
@@ -6975,36 +6643,25 @@
                two-harness pair, so Code Audit would have been unreachable from
                a third harness until someone edited this file. -->
           {#each $harnesses as h (h.id)}
-            <label class="checkbox">
-              <input
-                type="checkbox"
-                checked={harnessRow(snapshot, h.id).expose_code_audit}
-                onchange={(e) =>
-                  patch((s) => {
-                    const on = (e.currentTarget as HTMLInputElement).checked;
-                    s.harness = {
-                      ...(s.harness ?? {}),
-                      [h.id]: { ...harnessRow(s, h.id), expose_code_audit: on },
-                    };
-                  })}
-              />
-              <span>Expose to {h.label}</span>
-            </label>
+            <Toggle
+              checked={harnessRow(snapshot, h.id).expose_code_audit}
+              onchange={(next) =>
+                patch((s) => {
+                  const on = next;
+                  s.harness = {
+                    ...(s.harness ?? {}),
+                    [h.id]: { ...harnessRow(s, h.id), expose_code_audit: on },
+                  };
+                })}
+            >
+              Expose to {h.label}
+            </Toggle>
           {/each}
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.code_audit.expose_offload}
-              onchange={(e) =>
-                patch(
-                  (s) =>
-                    (s.code_audit.expose_offload = (
-                      e.currentTarget as HTMLInputElement
-                    ).checked),
-                )}
-            />
-            <span>Expose to offload worker</span>
-          </label>
+          <Toggle
+            label="Expose to offload worker"
+            checked={snapshot.code_audit.expose_offload}
+            onchange={(next) => patch((s) => (s.code_audit.expose_offload = next))}
+          />
         </section>
       {:else if activeSection === 'tool-plugins'}
         <section>
@@ -7039,21 +6696,19 @@
 <!-- V40 Phase B: one box per registered harness, same reason as the
                Code Audit set above. -->
           {#each $harnesses as h (h.id)}
-            <label class="checkbox">
-              <input
-                type="checkbox"
-                checked={harnessRow(snapshot, h.id).expose_commands}
-                onchange={(e) =>
-                  patch((s) => {
-                    const on = (e.currentTarget as HTMLInputElement).checked;
-                    s.harness = {
-                      ...(s.harness ?? {}),
-                      [h.id]: { ...harnessRow(s, h.id), expose_commands: on },
-                    };
-                  })}
-              />
-              <span>Expose to {h.label}</span>
-            </label>
+            <Toggle
+              checked={harnessRow(snapshot, h.id).expose_commands}
+              onchange={(next) =>
+                patch((s) => {
+                  const on = next;
+                  s.harness = {
+                    ...(s.harness ?? {}),
+                    [h.id]: { ...harnessRow(s, h.id), expose_commands: on },
+                  };
+                })}
+            >
+              Expose to {h.label}
+            </Toggle>
           {/each}
 
           {#snippet toolPluginRow(plugin: PluginRow, tool: ToolRow)}
@@ -7594,18 +7249,11 @@
             file could switch off would be no boundary at all, since anything
             running inside the project root can write that file.
           </small>
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.sandbox.enabled}
-              onchange={(e) =>
-                patch(
-                  (s) =>
-                    (s.sandbox.enabled = (e.currentTarget as HTMLInputElement).checked),
-                )}
-            />
-            <span>Sandbox agent-started processes (master switch)</span>
-          </label>
+          <Toggle
+            label="Sandbox agent-started processes (master switch)"
+            checked={snapshot.sandbox.enabled}
+            onchange={(next) => patch((s) => (s.sandbox.enabled = next))}
+          />
           <small class="hint down">
             On Windows each allowlisted command runs inside an
             <strong>AppContainer</strong>: it can read and write the project root
@@ -7630,18 +7278,13 @@
             is on, and hence its own paragraph about what confining the agent
             itself costs.
           -->
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              disabled={!snapshot.sandbox.enabled}
-              checked={snapshot.sandbox.tabs}
-              onchange={(e) =>
-                patch(
-                  (s) => (s.sandbox.tabs = (e.currentTarget as HTMLInputElement).checked),
-                )}
-            />
-            <span>Also sandbox AI tabs ({harnessNames})</span>
-          </label>
+          <Toggle
+            checked={snapshot.sandbox.tabs}
+            disabled={!snapshot.sandbox.enabled}
+            onchange={(next) => patch((s) => (s.sandbox.tabs = next))}
+          >
+            Also sandbox AI tabs ({harnessNames})
+          </Toggle>
           <small class="hint down">
             The tab <em>is</em> the agent, so this confines everything it later
             runs. A sandboxed tab reads and writes the project and its own
@@ -7655,21 +7298,12 @@
             sandboxed — they are your own hands, not an agent seam. Changing this
             affects tabs started afterwards; running tabs need a restart.
           </small>
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              disabled={!snapshot.sandbox.enabled}
-              checked={snapshot.sandbox.allow_network}
-              onchange={(e) =>
-                patch(
-                  (s) =>
-                    (s.sandbox.allow_network = (
-                      e.currentTarget as HTMLInputElement
-                    ).checked),
-                )}
-            />
-            <span>Allow network access from sandboxed processes</span>
-          </label>
+          <Toggle
+            label="Allow network access from sandboxed processes"
+            checked={snapshot.sandbox.allow_network}
+            disabled={!snapshot.sandbox.enabled}
+            onchange={(next) => patch((s) => (s.sandbox.allow_network = next))}
+          />
           <small class="hint down">
             Off, a sandboxed command reaches no network at all — the right default
             for build and test probes. On, it reaches the internet <em>and</em>
@@ -8092,31 +7726,18 @@
             safely. The tab is cheap to keep around; checkpoints are a
             heavier, opt-in feature below.
           </small>
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.workbench.enabled}
-              onchange={(e) =>
-                patch(
-                  (s) => (s.workbench.enabled = (e.currentTarget as HTMLInputElement).checked),
-                )}
-            />
-            <span>Show the Workbench tab</span>
-          </label>
+          <Toggle
+            label="Show the Workbench tab"
+            checked={snapshot.workbench.enabled}
+            onchange={(next) => patch((s) => (s.workbench.enabled = next))}
+          />
 
           <h3>Checkpoints</h3>
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.workbench.checkpoints}
-              onchange={(e) =>
-                patch(
-                  (s) =>
-                    (s.workbench.checkpoints = (e.currentTarget as HTMLInputElement).checked),
-                )}
-            />
-            <span>Enable automatic checkpoints</span>
-          </label>
+          <Toggle
+            label="Enable automatic checkpoints"
+            checked={snapshot.workbench.checkpoints}
+            onchange={(next) => patch((s) => (s.workbench.checkpoints = next))}
+          />
           <small class="hint">
             Off by default in V1 — Diff and Worktrees work without it. When
             on, cImp periodically snapshots your working tree into a separate
@@ -8285,20 +7906,11 @@
             rotated daily. Output includes ANSI escape codes — pipe through
             <code>sed</code> or a viewer if you want plain text.
           </small>
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.logging.content_capture.enabled}
-              onchange={(e) =>
-                patch(
-                  (s) =>
-                    (s.logging.content_capture.enabled = (
-                      e.currentTarget as HTMLInputElement
-                    ).checked),
-                )}
-            />
-            <span>Capture full tab output</span>
-          </label>
+          <Toggle
+            label="Capture full tab output"
+            checked={snapshot.logging.content_capture.enabled}
+            onchange={(next) => patch((s) => (s.logging.content_capture.enabled = next))}
+          />
           <label>
             <span>Retention</span>
             <select
@@ -8370,40 +7982,22 @@
                 )}
             />
           </label>
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.terminal.scrollback.persist}
-              onchange={(e) =>
-                patch(
-                  (s) =>
-                    (s.terminal.scrollback.persist = (
-                      e.currentTarget as HTMLInputElement
-                    ).checked),
-                )}
-            />
-            <span>Save scrollback to disk on exit</span>
-          </label>
+          <Toggle
+            label="Save scrollback to disk on exit"
+            checked={snapshot.terminal.scrollback.persist}
+            onchange={(next) => patch((s) => (s.terminal.scrollback.persist = next))}
+          />
           <small class="hint">
             On graceful exit each tab's ring is written to
             <code>scrollback/&lt;tab-id&gt;.bin</code> in the config
             directory. Terminal output can contain sensitive text — leave
             off if that shouldn't touch disk.
           </small>
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.terminal.scrollback.restore_on_launch}
-              onchange={(e) =>
-                patch(
-                  (s) =>
-                    (s.terminal.scrollback.restore_on_launch = (
-                      e.currentTarget as HTMLInputElement
-                    ).checked),
-                )}
-            />
-            <span>Restore saved scrollback on launch</span>
-          </label>
+          <Toggle
+            label="Restore saved scrollback on launch"
+            checked={snapshot.terminal.scrollback.restore_on_launch}
+            onchange={(next) => patch((s) => (s.terminal.scrollback.restore_on_launch = next))}
+          />
           <small class="hint">
             Replays the persisted bytes into each tab before live output
             resumes on the next launch.

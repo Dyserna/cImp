@@ -179,17 +179,6 @@
   flex: 1;
   min-width: 0;
 }
-/* ORDER-PRESERVATION COMPANION (#129 (a)) — same story as
-   `small.hint.provider-desc` above: not chrome, belongs with the Tool Plugins
-   section, but it ties (0,3,1) with `.button-row + small.hint` below and one of
-   its call sites (the plugin-load error) follows a `.button-row`. Order kept so
-   the adjacency rule still wins there. `.audit-detect.ok` / `.bad` stay in
-   SettingsApp — they are 0,4,1 and win from anywhere. */
-.settings-chrome small.hint.audit-detect {
-  margin: 0;
-  font-family: var(--font-mono, monospace);
-  word-break: break-all;
-}
 .settings-chrome .input-with-action > button {
   flex-shrink: 0;
 }

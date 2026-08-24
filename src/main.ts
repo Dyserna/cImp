@@ -11,6 +11,8 @@ import { invoke } from '@tauri-apps/api/core';
 import './theme.css';
 import './app.css';
 import { loadHarnesses } from './lib/harness';
+import { hydrateUiState } from './lib/uiState';
+import { hydrateHiddenTabs } from './lib/tabs/visibility';
 
 // Set the active theme synchronously before Svelte mounts so the first
 // paint already reflects token values — avoids FOUC. The static
@@ -110,6 +112,26 @@ const target = document.getElementById('app');
 if (!target) {
   throw new Error('#app root element not found');
 }
+
+// V42 Phase C: per-view UI state (last-selected sections, expanded cards,
+// Events column widths, audit filters, the UI-hidden tab set) lives in the
+// per-project `.cimp/ui_state.json`. Its consumers all read synchronously
+// from `$state(...)` initialisers, before the first paint — so the one
+// asynchronous read happens HERE, blocking, and everything downstream reads a
+// filled cache. Two ordering guarantees hang off these two lines:
+//
+//   1. `mount(App)` must not run first, or every view would paint its default
+//      section/collapsed card and snap to the saved one a frame later.
+//   2. `hydrateHiddenTabs()` must not run later than App's `onMount`, where
+//      `stripHiddenTabsFromLayout()` re-establishes "hidden ⇔ absent from the
+//      layout tree". An empty set at that moment would un-hide every hidden
+//      tab — and the popover's next write would then persist the empty set,
+//      losing the user's choice for good.
+//
+// Neither call rejects: a backend that cannot answer leaves the window
+// unhydrated, which renders defaults and writes nothing (see `uiState.ts`).
+await hydrateUiState();
+hydrateHiddenTabs();
 
 const app = mount(App, { target });
 

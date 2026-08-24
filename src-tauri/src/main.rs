@@ -98,6 +98,7 @@ use crate::ipc::tab_lifecycle::{
     default_shell_spec, get_shell_tab_config, open_note_tab, open_tool_tab, reconfigure_shell_tab,
     rename_tab, set_enabled_ai_tabs,
 };
+use crate::ipc::ui_state::{ui_state_get, ui_state_set};
 use crate::ipc::{AppState, LaunchContext};
 use crate::preview::{
     preview_capture, preview_close, preview_hide, preview_navigate, preview_open, preview_reload,
@@ -1172,6 +1173,8 @@ fn main() {
             open_note_tab,
             read_note,
             write_note,
+            ui_state_get,
+            ui_state_set,
             set_window_square_corners,
             save_layout,
             save_layout_preset,

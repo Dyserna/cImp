@@ -150,25 +150,70 @@ use super::schema::{Settings, TabConfig};
 
 // ── Features ───────────────────────────────────────────────────────────────
 
-/// Declare [`Feature`] and [`Feature::ALL`] from one list, so the array cannot
-/// drift from the enum (#47).
+/// One [`Feature`]'s row in `Feature::ROWS`: the seven predicates that are pure
+/// per-feature DATA, in one place instead of seven parallel exhaustive matches.
 ///
-/// It used to be hand-written beside the enum, and a variant left out of it was
-/// invisible to `report`, [`protection_reduced`], [`spawn_sig`], the Settings
+/// Each of these used to be its own `match` over the whole enum, which is most
+/// of what made "eighteen greps to add one control" true — and six of the seven
+/// had nothing to say per variant beyond a single cell. Only the predicates that
+/// read no state are here. The two that DO read state stay as matches on
+/// purpose, because they are not tables: [`feature_l2`] names a settings FIELD
+/// per variant, and [`harness_reads`] asks the plugin registry a question for one
+/// of them.
+///
+/// The rows are emitted by [`declare_features`] from the same variant list that
+/// emits the enum and [`Feature::ALL`], so a row cannot go missing, go stale, or
+/// name a variant that does not exist: omitting a cell is a macro PARSE error,
+/// and so is adding a variant without cells. That is exactly the property the
+/// exhaustive matches bought (#47 — *a new control's answer is a decision, not a
+/// fall-through*), bought once instead of seven times.
+struct FeatureRow {
+    /// The variant this row is about. The accessors do not read it — they index
+    /// `Feature::ROWS` by discriminant — it is what
+    /// `every_feature_has_exactly_one_row` checks that indexing against.
+    feature: Feature,
+    key: &'static str,
+    label: &'static str,
+    default_enabled: bool,
+    master_gated: bool,
+    has_tab_scope: bool,
+    has_worker_scope: bool,
+    spawn_baked: bool,
+}
+
+/// Declare [`Feature`], [`Feature::ALL`] and the [`FeatureRow`] table from one
+/// list, so none of the three can drift from the others (#47, and R18).
+///
+/// `ALL` used to be hand-written beside the enum, and a variant left out of it
+/// was invisible to `report`, [`protection_reduced`], [`spawn_sig`], the Settings
 /// matrix **and** the test that was supposed to guard it — which iterated the
 /// array rather than the enum, so an omission removed the feature from its own
-/// coverage. The exhaustive matches below would still have caught the addition,
-/// but "the compiler makes you name it somewhere" is not the same property as
-/// "every surface that enumerates features sees it".
+/// coverage. The exhaustive matches would still have caught the addition, but
+/// "the compiler makes you name it somewhere" is not the same property as "every
+/// surface that enumerates features sees it".
 ///
-/// The invocation reads exactly like the enum declaration it replaces —
-/// attributes, doc comments and all — because the alternative (a bespoke
-/// list-of-variants syntax) trades one drift risk for a worse readability one.
+/// The invocation reads like the enum declaration it replaces — attributes, doc
+/// comments and all — with each variant followed by its row: a braced block
+/// naming every cell, so a reader sees one control's whole answer in one place
+/// and the compiler refuses a partial one. The alternative (a positional tuple,
+/// or the seven matches this replaced) trades one drift risk for a worse
+/// readability one.
 macro_rules! declare_features {
     (
         $(#[$enum_attr:meta])*
         pub enum $name:ident {
-            $( $(#[$variant_attr:meta])* $variant:ident ),+ $(,)?
+            $(
+                $(#[$variant_attr:meta])*
+                $variant:ident {
+                    key: $key:literal,
+                    label: $label:literal,
+                    default_enabled: $default_enabled:literal,
+                    master_gated: $master_gated:literal,
+                    has_tab_scope: $has_tab_scope:literal,
+                    has_worker_scope: $has_worker_scope:literal,
+                    spawn_baked: $spawn_baked:literal $(,)?
+                }
+            ),+ $(,)?
         }
     ) => {
         $(#[$enum_attr])*
@@ -184,6 +229,38 @@ macro_rules! declare_features {
             /// Derived from the variant list above, not written out: see
             /// [`declare_features`].
             pub const ALL: &'static [$name] = &[ $( $name::$variant, )+ ];
+
+            /// The seven derivable predicates, one [`FeatureRow`] per variant,
+            /// in the same declaration order as [`ALL`](Self::ALL) — emitted
+            /// from the same list, so the two cannot disagree about either the
+            /// membership or the order.
+            const ROWS: &'static [FeatureRow] = &[ $(
+                FeatureRow {
+                    feature: $name::$variant,
+                    key: $key,
+                    label: $label,
+                    default_enabled: $default_enabled,
+                    master_gated: $master_gated,
+                    has_tab_scope: $has_tab_scope,
+                    has_worker_scope: $has_worker_scope,
+                    spawn_baked: $spawn_baked,
+                },
+            )+ ];
+
+            /// This feature's row.
+            ///
+            /// Indexes by discriminant, which is sound because
+            /// [`ROWS`](Self::ROWS) and the enum are emitted from one list in
+            /// one order — and `every_feature_has_exactly_one_row` pins that
+            /// rather than assuming it.
+            ///
+            /// `const` so [`spawn_baked`](Self::spawn_baked) can stay a
+            /// `const fn` and [`baked_at_spawn`](Self::baked_at_spawn) can keep
+            /// turning a disagreement with a spawn-time call site into a BUILD
+            /// error.
+            const fn row(self) -> &'static FeatureRow {
+                &Self::ROWS[self as usize]
+            }
         }
     };
 }
@@ -200,29 +277,108 @@ declare_features! {
 pub enum Feature {
     /// The bidirectional taint latch: the worker's `latch_gate` + def filtering
     /// and the loopback proxy's `gate`.
-    TaintLatch,
+    TaintLatch {
+        key: "taint_latch",
+        label: "Taint latch",
+        default_enabled: true,
+        master_gated: true,
+        has_tab_scope: true,
+        has_worker_scope: true,
+        spawn_baked: false,
+    },
     /// The nonced data-not-instructions envelope on EXTERNAL results and on
     /// recalled memory.
-    Spotlighting,
+    Spotlighting {
+        key: "spotlighting",
+        label: "Spotlighting envelope",
+        default_enabled: true,
+        master_gated: true,
+        has_tab_scope: true,
+        has_worker_scope: true,
+        // #48 (M-3): baked by `fact_promotion_block` into the launch addendum.
+        // Also live at the proxy — the one control in both columns; see
+        // `Feature::spawn_baked` for why "does the user owe this a restart?" is
+        // the question that resolves it.
+        spawn_baked: true,
+    },
     /// The detection surface (signature + classifier), parent of the two
     /// existing per-layer sub-toggles.
-    Detection,
+    Detection {
+        key: "detection",
+        label: "Injection detection",
+        default_enabled: true,
+        master_gated: true,
+        has_tab_scope: true,
+        has_worker_scope: true,
+        spawn_baked: false,
+    },
     /// The outbound URL range screen at `McpHost::call_recorded`.
-    SsrfGuard,
+    SsrfGuard {
+        key: "ssrf_guard",
+        label: "SSRF guard",
+        default_enabled: true,
+        master_gated: true,
+        has_tab_scope: true,
+        has_worker_scope: true,
+        spawn_baked: false,
+    },
     /// Per-scope EXTERNAL call/byte caps. The existing numerics stay the tuning
     /// knobs; this is the on/off above them.
-    FetchBudgets,
+    FetchBudgets {
+        key: "fetch_budgets",
+        label: "Fetch budgets",
+        default_enabled: true,
+        master_gated: true,
+        has_tab_scope: true,
+        has_worker_scope: true,
+        spawn_baked: false,
+    },
     /// The in-band canary. Worker-only: consumers' system prompts are not
     /// cImp-authored, so there is nothing of ours in them to leak.
-    Canary,
+    Canary {
+        key: "canary",
+        label: "Canary (offload worker)",
+        default_enabled: true,
+        master_gated: true,
+        has_tab_scope: false,
+        has_worker_scope: true,
+        spawn_baked: false,
+    },
     /// Quarantine of `context_note` writes made by a contaminated conversation.
-    MemoryQuarantine,
+    MemoryQuarantine {
+        key: "memory_quarantine",
+        label: "Memory quarantine",
+        default_enabled: true,
+        master_gated: true,
+        has_tab_scope: true,
+        // The worker cannot dispatch `context_*` at all (issue #38) and serves a
+        // hard refusal instead, so a worker quarantine row would be a switch
+        // with no enforcement site behind it.
+        has_worker_scope: false,
+        spawn_baked: false,
+    },
     /// Native-web visibility (locked decision 14). Its L2 is the tri-mode
     /// itself — see the module docs.
-    NativeWeb,
+    NativeWeb {
+        key: "native_web",
+        label: "Native-web visibility",
+        default_enabled: true,
+        master_gated: true,
+        has_tab_scope: true,
+        has_worker_scope: false,
+        spawn_baked: true,
+    },
     /// The pinned OpenCode permission block + the injection-hygiene guidance
     /// addendum. Both spawn-baked.
-    ConsumerHygiene,
+    ConsumerHygiene {
+        key: "consumer_hygiene",
+        label: "Consumer hygiene",
+        default_enabled: true,
+        master_gated: true,
+        has_tab_scope: true,
+        has_worker_scope: false,
+        spawn_baked: true,
+    },
     /// V38 follow-up — the **managed-tool steering paragraph**: one fixed,
     /// generic nudge in the same guidance channel as
     /// [`Feature::ConsumerHygiene`]'s, asking the harness to prefer cImp's
@@ -235,7 +391,20 @@ pub enum Feature {
     /// self-describing and update live, an injected prompt cannot, and a
     /// paragraph that listed them would move the spawn signature on every
     /// registry edit.
-    ToolSteering,
+    ToolSteering {
+        key: "tool_steering",
+        label: "Managed-tool steering",
+        default_enabled: true,
+        // The one feature outside the L1 master switch — a token-efficiency
+        // preference, not a security posture. `Feature::master_gated` carries
+        // the whole reasoning.
+        master_gated: false,
+        has_tab_scope: true,
+        has_worker_scope: false,
+        // The steering paragraph is written into the launch addendum beside the
+        // hygiene one, so it owes the same restart hint.
+        spawn_baked: true,
+    },
     /// V32 Phase H (locked decision 17): a harness plugin's own
     /// `tool.execute.before`-style handler *denying* the harness's own native
     /// tools against the tab's taint latch, rather than only beaconing on them.
@@ -268,54 +437,70 @@ pub enum Feature {
     /// what says so, because the Settings matrix writes by key and reads back
     /// by serde.
     #[serde(rename = "opencode_native_gate")]
-    HarnessNativeGate,
+    HarnessNativeGate {
+        // A FROZEN wire key. It is a `TabInjectionOverrides` field name in every
+        // settings file, an `L2Flags` cell and a frontend mirror member;
+        // renaming it with the variant would have been a schema change for a
+        // rename. `Feature::key` is documented as the stable wire/UI key and
+        // this is what stable means.
+        key: "opencode_native_gate",
+        label: "Harness native-tool gating",
+        default_enabled: true,
+        master_gated: true,
+        has_tab_scope: true,
+        // The worker is not a harness — no native tools, no spawn config.
+        has_worker_scope: false,
+        spawn_baked: true,
+    },
     /// Stripping terminal control sequences out of external text cImp composes
     /// into non-HTML sinks. App-wide: TTS and toasts are global surfaces.
-    TerminalEscapeHygiene,
+    TerminalEscapeHygiene {
+        key: "terminal_escape_hygiene",
+        label: "Terminal escape hygiene",
+        default_enabled: true,
+        master_gated: true,
+        has_tab_scope: false,
+        has_worker_scope: false,
+        spawn_baked: false,
+    },
 }
 }
+
+/// `Feature::row` indexes `Feature::ROWS` by discriminant, and this is what says
+/// it may: row *i* is variant *i*, checked at COMPILE time rather than trusted.
+///
+/// It holds by construction today — [`declare_features`] emits the enum and the
+/// table from one list, in one order — but the accessors' correctness rests on
+/// it, so it is asserted rather than assumed. Reading `feature` here is also
+/// what keeps the cell honest: a row that named the wrong variant would be an
+/// unread field nobody could notice.
+const _: () = {
+    let mut i = 0;
+    while i < Feature::ROWS.len() {
+        assert!(
+            Feature::ROWS[i].feature as usize == i,
+            "`Feature::ROWS` must list every feature in enum-declaration order —              `Feature::row` indexes it by discriminant"
+        );
+        i += 1;
+    }
+};
 
 impl Feature {
     /// The stable wire/UI key. Fixed strings, pinned by a test: they key the
     /// Settings matrix and the `/status` rows, so a rename is a wire change.
+    ///
+    /// [`Feature::HarnessNativeGate`]'s is the frozen case that proves the
+    /// point — V40 Phase B renamed the VARIANT (core may not name a harness) and
+    /// deliberately did **not** rename the key, which is a
+    /// [`TabInjectionOverrides`] field in every settings file. That the two can
+    /// differ is why this exists rather than the variant's name in disguise.
     pub fn key(self) -> &'static str {
-        match self {
-            Feature::TaintLatch => "taint_latch",
-            Feature::Spotlighting => "spotlighting",
-            Feature::Detection => "detection",
-            Feature::SsrfGuard => "ssrf_guard",
-            Feature::FetchBudgets => "fetch_budgets",
-            Feature::Canary => "canary",
-            Feature::MemoryQuarantine => "memory_quarantine",
-            Feature::NativeWeb => "native_web",
-            Feature::ConsumerHygiene => "consumer_hygiene",
-            Feature::ToolSteering => "tool_steering",
-            // A FROZEN wire key. It is a `TabInjectionOverrides` field name in
-            // every settings file, an `L2Flags` cell and a frontend mirror
-            // member; renaming it with the variant would have been a schema
-            // change for a rename. `Feature::key` is documented as the stable
-            // wire/UI key and this is what stable means.
-            Feature::HarnessNativeGate => "opencode_native_gate",
-            Feature::TerminalEscapeHygiene => "terminal_escape_hygiene",
-        }
+        self.row().key
     }
 
     /// Human label for the Settings matrix and the badge popover.
     pub fn label(self) -> &'static str {
-        match self {
-            Feature::TaintLatch => "Taint latch",
-            Feature::Spotlighting => "Spotlighting envelope",
-            Feature::Detection => "Injection detection",
-            Feature::SsrfGuard => "SSRF guard",
-            Feature::FetchBudgets => "Fetch budgets",
-            Feature::Canary => "Canary (offload worker)",
-            Feature::MemoryQuarantine => "Memory quarantine",
-            Feature::NativeWeb => "Native-web visibility",
-            Feature::ConsumerHygiene => "Consumer hygiene",
-            Feature::ToolSteering => "Managed-tool steering",
-            Feature::HarnessNativeGate => "Harness native-tool gating",
-            Feature::TerminalEscapeHygiene => "Terminal escape hygiene",
-        }
+        self.row().label
     }
 
     /// This feature's **L2 default** — the value an untouched settings file
@@ -346,24 +531,11 @@ impl Feature {
     /// moment a future control ships off, that reading is already in place
     /// rather than something to rediscover.
     ///
-    /// An exhaustive `match` rather than a `matches!` (#47): a new control's
-    /// shipping default is a decision, and falling through to `true` would let
-    /// it be taken by omission.
+    /// A REQUIRED table cell rather than a `matches!` or a fall-through (#47): a
+    /// new control's shipping default is a decision, and a row that could omit
+    /// it would let the decision be taken by omission.
     pub fn default_enabled(self) -> bool {
-        match self {
-            Feature::TaintLatch
-            | Feature::Spotlighting
-            | Feature::Detection
-            | Feature::SsrfGuard
-            | Feature::FetchBudgets
-            | Feature::Canary
-            | Feature::MemoryQuarantine
-            | Feature::NativeWeb
-            | Feature::ConsumerHygiene
-            | Feature::ToolSteering
-            | Feature::HarnessNativeGate
-            | Feature::TerminalEscapeHygiene => true,
-        }
+        self.row().default_enabled
     }
 
     /// Whether the **L1 master switch** ([`InjectionSettings::protection`]) can
@@ -391,43 +563,18 @@ impl Feature {
     /// one — "reduced protection" is a claim about protection, and this is not
     /// one of those controls.
     ///
-    /// An exhaustive `match` rather than a `matches!` (#47): whether a new
-    /// control answers to the master switch is a decision, and defaulting to
-    /// either answer would let it be taken by omission.
+    /// A REQUIRED table cell rather than a `matches!` or a fall-through (#47):
+    /// whether a new control answers to the master switch is a decision, and a
+    /// row that could omit it would let either answer be taken by omission.
     pub fn master_gated(self) -> bool {
-        match self {
-            Feature::ToolSteering => false,
-            Feature::TaintLatch
-            | Feature::Spotlighting
-            | Feature::Detection
-            | Feature::SsrfGuard
-            | Feature::FetchBudgets
-            | Feature::Canary
-            | Feature::MemoryQuarantine
-            | Feature::NativeWeb
-            | Feature::ConsumerHygiene
-            | Feature::HarnessNativeGate
-            | Feature::TerminalEscapeHygiene => true,
-        }
+        self.row().master_gated
     }
 
     /// Whether this feature carries a per-TAB L3 row. Mirrors
-    /// [`TabInjectionOverrides`]'s field set (pinned by a test). Exhaustive so
-    /// a new feature must state its scopes rather than inherit them (#47).
+    /// [`TabInjectionOverrides`]'s field set (pinned by a test). A REQUIRED cell
+    /// so a new feature must state its scopes rather than inherit them (#47).
     pub fn has_tab_scope(self) -> bool {
-        match self {
-            Feature::TaintLatch
-            | Feature::Spotlighting
-            | Feature::Detection
-            | Feature::SsrfGuard
-            | Feature::FetchBudgets
-            | Feature::MemoryQuarantine
-            | Feature::NativeWeb
-            | Feature::ConsumerHygiene
-            | Feature::ToolSteering
-            | Feature::HarnessNativeGate => true,
-            Feature::Canary | Feature::TerminalEscapeHygiene => false,
-        }
+        self.row().has_tab_scope
     }
 
     /// Whether this feature carries the `offload-worker` L3 row. Mirrors
@@ -440,20 +587,7 @@ impl Feature {
     /// native gate are absent because the worker is not a harness — it has no
     /// native tools and no spawn config.
     pub fn has_worker_scope(self) -> bool {
-        match self {
-            Feature::TaintLatch
-            | Feature::Spotlighting
-            | Feature::Detection
-            | Feature::SsrfGuard
-            | Feature::FetchBudgets
-            | Feature::Canary => true,
-            Feature::MemoryQuarantine
-            | Feature::NativeWeb
-            | Feature::ConsumerHygiene
-            | Feature::ToolSteering
-            | Feature::HarnessNativeGate
-            | Feature::TerminalEscapeHygiene => false,
-        }
+        self.row().has_worker_scope
     }
 
     /// Whether this feature is applied at TAB SPAWN — so a change to it does not
@@ -481,8 +615,9 @@ impl Feature {
     /// baked into the generated OpenCode plugin, and the plugin is written at
     /// tab spawn.
     ///
-    /// `const` so [`baked_at_spawn`](Self::baked_at_spawn) can turn a
-    /// disagreement between this list and a spawn-time call site into a BUILD
+    /// `const` — through `Feature::row`, which is `const` for exactly this
+    /// reason — so [`baked_at_spawn`](Self::baked_at_spawn) can turn a
+    /// disagreement between this cell and a spawn-time call site into a BUILD
     /// ERROR rather than a source-scan test that only sees the half it scans.
     ///
     /// The **frontend** mirror of this predicate's output
@@ -493,24 +628,7 @@ impl Feature {
     /// instance — that array is what raises the in-window restart hint, and it had
     /// already gone stale twice over.
     pub const fn spawn_baked(self) -> bool {
-        match self {
-            Feature::NativeWeb
-            | Feature::ConsumerHygiene
-            // The steering paragraph is written into the launch addendum beside
-            // the hygiene one, so it owes the same restart hint.
-            | Feature::ToolSteering
-            | Feature::HarnessNativeGate
-            // #48 (M-3): baked by `fact_promotion_block` into the launch
-            // addendum. Also live at the proxy — see the note above.
-            | Feature::Spotlighting => true,
-            Feature::TaintLatch
-            | Feature::Detection
-            | Feature::SsrfGuard
-            | Feature::FetchBudgets
-            | Feature::Canary
-            | Feature::MemoryQuarantine
-            | Feature::TerminalEscapeHygiene => false,
-        }
+        self.row().spawn_baked
     }
 
     /// [`spawn_baked`](Self::spawn_baked) as a **compile-time assertion**, for
@@ -2926,6 +3044,32 @@ mod tests {
             let mut s = fresh_install();
             s.set_l2_for_test(*f, false);
             assert!(!protection_reduced(&s), "{f:?}");
+        }
+    }
+
+    /// **R18's pin.** The seven derivable predicates come from one table, and
+    /// the accessors reach it by discriminant — so the table must cover the
+    /// enum exactly, in both directions.
+    ///
+    /// * every variant has exactly ONE row — `ALL` and `ROWS` are the same
+    ///   length and agree entry by entry;
+    /// * every row names a REAL variant — carried by the type (`feature:
+    ///   Feature`), and checked to be the variant whose slot it occupies;
+    /// * and `Feature::row()` returns the row of the feature it was asked
+    ///   about, which is the assumption `key`/`label`/`spawn_baked`/… rest on.
+    ///
+    /// `declare_features!` makes all three true by construction and
+    /// `Feature::ROWS`' const assertion refuses to build otherwise, so this is
+    /// the belt to those braces: it is what still holds if the table is ever
+    /// hand-written again, which is how the old `ALL` array went stale (#47).
+    #[test]
+    fn every_feature_has_exactly_one_row() {
+        assert_eq!(Feature::ROWS.len(), Feature::ALL.len());
+        for (i, f) in Feature::ALL.iter().enumerate() {
+            assert_eq!(Feature::ROWS[i].feature, *f, "row {i} names another feature");
+            assert_eq!(f.row().feature, *f, "{f:?} looked up another feature's row");
+            assert!(!f.key().is_empty(), "{f:?}");
+            assert!(!f.label().is_empty(), "{f:?}");
         }
     }
 

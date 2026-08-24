@@ -100,9 +100,16 @@ pub struct Wiring {
 /// holds the service itself, so no Arc cycle.
 ///
 /// V38 Phase F: and the MCP host, for the audit runner's tier-2 provider tools.
+///
+/// V42 Phase A2: and the supervisor itself, which the graph service's memory
+/// distiller and file-digest cache run their local-only prompts through. That
+/// one used to be an `AppHandle::try_state` reach from inside `GraphService`;
+/// the handle travels the same way the push bus already did, and for the same
+/// reason — the producer is wired after the layer it needs.
 pub struct OffloadHandoff {
     pub pushes: Arc<PushRegistry>,
     pub mcp_host: Arc<McpHost>,
+    pub supervisor: Arc<crate::offload::OffloadSupervisor>,
 }
 
 impl Wiring {
@@ -302,9 +309,12 @@ impl Wiring {
         // V30 Phase C: hand the push bus to the producers below.
         // V38 Phase F: and the MCP host, for the audit runner's tier-2
         // provider tools.
+        // V42 Phase A2: and the supervisor, for the graph service's two
+        // local-only prompt paths.
         OffloadHandoff {
             pushes: service.push_registry(),
             mcp_host: service.mcp_host(),
+            supervisor,
         }
     }
 
@@ -313,7 +323,12 @@ impl Wiring {
     ///
     /// Managed unconditionally, and **before** [`Self::wire_graph`] — see the
     /// module docs and the call site.
-    pub fn wire_workbench(&self, app: &App) {
+    ///
+    /// V42 Phase A2: hands the service back, because `wire_graph` now
+    /// *constructs* the graph service with it rather than leaving it to find
+    /// one in the managed-state table on every watcher batch. That is what
+    /// makes the ordering above a hand-off instead of a race.
+    pub fn wire_workbench(&self, app: &App) -> Arc<crate::workbench::WorkbenchService> {
         let workbench_service = crate::workbench::WorkbenchService::new(
             std::sync::Arc::new(crate::service::sink::TauriEventSink::new(
                 app.handle().clone(),
@@ -330,7 +345,8 @@ impl Wiring {
                 svc.worktree_prune_at_startup(&root).await;
             });
         }
-        app.manage(workbench_service);
+        app.manage(workbench_service.clone());
+        workbench_service
     }
 
     /// V9-01 code knowledge graph: the app-owned graph service that
@@ -343,12 +359,24 @@ impl Wiring {
     /// Carries the Code Audit runner and the tool-plugin store with it: both
     /// are constructed from the same handoff and both are published as process
     /// globals before `manage` moves them, for the reason each states.
-    pub fn wire_graph(&self, app: &App, offload: &OffloadHandoff) {
+    pub fn wire_graph(
+        &self,
+        app: &App,
+        offload: &OffloadHandoff,
+        workbench: &Arc<crate::workbench::WorkbenchService>,
+    ) {
         let graph_service = crate::graph::GraphService::new(
-            app.handle().clone(),
+            Arc::new(crate::service::sink::TauriEventSink::new(
+                app.handle().clone(),
+            )),
             self.settings.clone(),
             // V30 Phase C: announce expensive full index builds.
             Some(offload.pushes.clone()),
+            // V42 Phase A2: the two `try_state` reaches this service used to
+            // make, as constructor arguments. Both are `Some` here — this is
+            // the only wiring that has an app to be wired into.
+            Some(offload.supervisor.clone()),
+            Some(workbench.clone()),
         );
         app.manage(graph_service.clone());
 

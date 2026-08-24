@@ -19,18 +19,19 @@
 //! [`GraphIndexHost`](crate::service::sink::GraphIndexHost) and
 //! [`ChecksLangStats`](crate::service::checks::ChecksLangStats) exist because
 //! the *settings* and *checks* use cases reach into the graph; a trait is what
-//! keeps another domain's capability out of their signature and their tests off
-//! an unconstructible `GraphService`. Here the index is not another domain's
-//! capability — it is this domain's own handle, the way `SettingsHandle` is the
-//! settings service's. Wrapping it would produce a `GraphHost` with a method per
-//! `GraphService` method, which is `GraphService` with extra steps and the exact
-//! shape `GraphIndexHost`'s own doc comment refuses.
+//! keeps another domain's capability out of their signature. Here the index is
+//! not another domain's capability — it is this domain's own handle, the way
+//! `SettingsHandle` is the settings service's. Wrapping it would produce a
+//! `GraphHost` with a method per `GraphService` method, which is `GraphService`
+//! with extra steps and the exact shape `GraphIndexHost`'s own doc comment
+//! refuses.
 //!
-//! That leaves these use cases un-runnable headlessly until `GraphService`
-//! itself is — its `AppHandle` covers five `state::<T>()` reaches, which is
-//! Phase A2's named cluster, not A1's. What A1 buys is that the shaping, the
-//! argument parsing and the root fallback are testable and callable without a
-//! WebView today, and that the day A2 lands, so is everything else here.
+//! **A2 landed, so these use cases run headlessly.**
+//! [`GraphService::new`](crate::graph::GraphService::new) took an `AppHandle`
+//! covering five `state::<T>()` reaches at A1; it takes an
+//! [`EventSink`](crate::service::sink::EventSink) and its three optional
+//! collaborators now, so a test can build the warm index over a scratch
+//! directory and drive a real use case end to end — see this module's tests.
 //!
 //! ## What did NOT change
 //!
@@ -733,6 +734,93 @@ pub async fn history(
 mod tests {
     use super::*;
     use crate::graph::EdgeKind;
+    use crate::service::sink::testing::RecordingEventSink;
+    use crate::settings::{Settings, SettingsHandle};
+
+    /// A throwaway directory that is both the settings store and the project
+    /// root, so the warm index mints its `.cimp/graph.db` somewhere disposable.
+    struct ScratchDir(PathBuf);
+
+    impl ScratchDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("cimp-graphsvc-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&path).expect("scratch dir");
+            Self(path)
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            // The index holds a SQLite handle until the service is dropped; on
+            // Windows that can outlive this call, so a failed remove is not a
+            // test failure — the temp dir is disposable either way.
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A real [`GraphService`] over a scratch project root — **no Tauri app**.
+    ///
+    /// This is the fixture V42 Phase A1 could not write and Phase A2 unlocked:
+    /// `GraphService::new` took an `AppHandle` (five `state::<T>()` reaches),
+    /// so every use case in this module was reachable only by clicking in the
+    /// running app. It now takes an [`EventSink`](crate::service::sink::EventSink)
+    /// and three optional collaborators, all of which a test can supply.
+    fn fixture() -> (ScratchDir, Arc<GraphService>) {
+        let scratch = ScratchDir::new();
+        let defaults = Settings::default();
+        let settings = SettingsHandle::new(defaults.clone(), defaults, scratch.0.clone());
+        let graph = GraphService::new(
+            Arc::new(RecordingEventSink::default()),
+            settings,
+            // No push bus, no local-offload supervisor, no Workbench — the
+            // three capabilities this service does without rather than fails
+            // over, which is exactly what an unresolved lookup used to mean.
+            None,
+            None,
+            None,
+        );
+        (scratch, graph)
+    }
+
+    /// **Previously "user clicks in the app".** The Facts pane's whole loop —
+    /// add a pinned fact, read it back, archive it, and be refused a typo'd
+    /// action — driven through [`CodeIntelService`] against a real warm index.
+    ///
+    /// The refusal is the half worth pinning: `fact_update` rejects an unknown
+    /// action rather than ignoring it, for [`CodeIntelService::note_review`]'s
+    /// stated reason — on a curation control a typo must not read as "done,
+    /// nothing happened".
+    #[test]
+    fn the_facts_pane_round_trips_through_a_headless_graph_service() {
+        let (scratch, graph) = fixture();
+        let svc = CodeIntelService::new(&graph);
+        let root = Some(scratch.0.to_string_lossy().into_owned());
+
+        svc.fact_add(root.clone(), "the loopback binds 127.0.0.1 only", Some(true))
+            .expect("add");
+        let facts = svc.facts(root.clone()).expect("list");
+        assert_eq!(facts.len(), 1, "the added fact must come back");
+        assert_eq!(facts[0].text, "the loopback binds 127.0.0.1 only");
+        assert!(facts[0].pinned, "`pin: Some(true)` must persist");
+        let id = facts[0].fact_id.clone();
+
+        assert!(
+            svc.fact_update(root.clone(), &id, "sanitise").is_err(),
+            "an unknown action is refused, never silently ignored"
+        );
+        assert_eq!(
+            svc.facts(root.clone()).expect("list").len(),
+            1,
+            "and the refusal changed nothing"
+        );
+
+        svc.fact_update(root.clone(), &id, "archive")
+            .expect("archive");
+        assert!(
+            svc.facts(root).expect("list").is_empty(),
+            "an archived fact leaves the pane's list"
+        );
+    }
 
     /// The ignore editor's glob shaping: root-relative + `/`-anchored with
     /// forward slashes, trailing `/` for folders, longest root wins, and an

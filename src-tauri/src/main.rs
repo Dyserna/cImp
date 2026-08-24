@@ -757,11 +757,12 @@ fn main() {
             // C, V38 Phase F), so it has to precede them.
             let offload = wiring.wire_offload(app);
             // The Workbench service is managed unconditionally and BEFORE the
-            // graph service below, since `GraphService::reindex_paths` looks it up
-            // via `AppHandle::state` on every watcher batch — construct it first
-            // so that lookup never races an empty state table during startup.
-            wiring.wire_workbench(app);
-            wiring.wire_graph(app, &offload);
+            // graph service below, which is CONSTRUCTED with it (V42 Phase A2 —
+            // `GraphService::reindex_paths` used to look it up via
+            // `AppHandle::state` on every watcher batch, which is what made the
+            // order a race rather than a hand-off).
+            let workbench = wiring.wire_workbench(app);
+            wiring.wire_graph(app, &offload, &workbench);
             wiring.wire_settings_broadcast(app);
             wiring.wire_detection_updater();
             wiring.wire_harness_verify();

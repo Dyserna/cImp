@@ -28,15 +28,15 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::{Duration, Instant};
 
 use ignore::gitignore::Gitignore;
 use ignore::WalkBuilder;
-use tauri::{AppHandle, Emitter, Manager};
 use tracing::{debug, info, warn};
 
 use crate::error::AppResult;
+use crate::service::sink::{EventSink, EventSinkExt};
 use crate::settings::{GraphSettings, SettingsHandle};
 
 use super::embed;
@@ -192,8 +192,36 @@ pub struct EmbedderProbe {
 
 /// The app-owned graph service. Held in `AppState` beside the offload service.
 pub struct GraphService {
-    app: AppHandle,
+    /// A weak handle on this same service, for the two paths that must give a
+    /// spawned task an OWNED `Arc<Self>`.
+    ///
+    /// V42 Phase A2. Both used to ask `AppHandle::try_state::<Arc<GraphService>>()`
+    /// — "find me in the managed-state table" — which answered the question
+    /// only for a service someone had `manage`d, and coupled the service to a
+    /// live Tauri app to learn its own identity. [`Arc::new_cyclic`] answers it
+    /// at construction, for every instance, and cannot resolve to a *different*
+    /// service than `self`.
+    me: Weak<GraphService>,
+    /// Where the `graph-status` / `graph-analyses` broadcasts go. V42 Phase A2:
+    /// was the `AppHandle` these three `emit` calls were the only UI use of.
+    events: Arc<dyn EventSink>,
     settings: SettingsHandle,
+    /// V42 Phase A2: the local-offload supervisor the memory distiller and the
+    /// file-digest cache run their prompts through — the two `try_state`
+    /// reaches on this service's slow paths. `None` (no offload layer wired)
+    /// means neither runs, exactly as an unresolved lookup did.
+    supervisor: Option<Arc<crate::offload::OffloadSupervisor>>,
+    /// V42 Phase A2: the Workbench service every watcher batch fans out to
+    /// before any graph-specific filtering.
+    ///
+    /// It used to be reached through `AppHandle::state` so that `graph` and
+    /// `workbench` "don't need to know about each other's lifecycle". They
+    /// still don't: this is an `Option` filled by the composition root, which
+    /// is the module that already owns the order (`wiring`'s docs make
+    /// `wire_workbench` precede `wire_graph` for exactly this hand-off).
+    /// `WorkbenchService` self-gates on `workbench.enabled`, so a wired-but-off
+    /// feature is the same cheap no-op it was.
+    workbench: Option<Arc<crate::workbench::WorkbenchService>>,
     /// Warm index handle per project root (one SQLite connection each), opened
     /// lazily on first build/status and reused.
     indices: StdMutex<HashMap<PathBuf, Arc<GraphIndex>>>,
@@ -531,15 +559,31 @@ impl GraphService {
     /// `None` disables the index-completion push entirely — the service is
     /// otherwise unchanged, so tests and standalone paths can construct it
     /// without an offload service.
+    ///
+    /// **V42 Phase A2**: takes its collaborators rather than an `AppHandle` to
+    /// look them up with. Every one of the four is a value a test can supply
+    /// ([`crate::service::sink::EventSink`] has a recording implementation), so
+    /// this service — and therefore
+    /// [`CodeIntelService`](crate::service::graph::CodeIntelService), which
+    /// borrows it — is constructible without a Tauri app. The last three are
+    /// `Option` for the same reason `pushes` always was: a layer that is not
+    /// wired is not an error, it is a capability the service does without.
     pub fn new(
-        app: AppHandle,
+        events: Arc<dyn EventSink>,
         settings: SettingsHandle,
         pushes: Option<Arc<crate::offload::service::PushRegistry>>,
+        supervisor: Option<Arc<crate::offload::OffloadSupervisor>>,
+        workbench: Option<Arc<crate::workbench::WorkbenchService>>,
     ) -> Arc<Self> {
-        Arc::new(Self {
-            app,
+        // `new_cyclic` rather than `new`: `me` is this service's own handle, and
+        // it has to exist before the `Arc` does.
+        Arc::new_cyclic(|me| Self {
+            me: me.clone(),
+            events,
             settings,
             pushes,
+            supervisor,
+            workbench,
             indices: StdMutex::new(HashMap::new()),
             status: StdMutex::new(HashMap::new()),
             watchers: StdMutex::new(HashMap::new()),
@@ -823,14 +867,12 @@ impl GraphService {
 
         if migrated {
             // A pre-upgrade store was emptied to fix its shape. Repopulate it now
-            // (via the managed service Arc) so a non-launch root touched only by a
-            // query or the memory tap doesn't stay silently empty.
-            if let Some(svc) = self.app.try_state::<Arc<GraphService>>() {
+            // (via this service's own owned Arc) so a non-launch root touched
+            // only by a query or the memory tap doesn't stay silently empty.
+            if let Some(svc) = self.me.upgrade() {
                 tracing::info!(root = %spelled.display(), "graph: schema migrated — rebuilding");
                 // Repair work nobody asked for — never announces itself.
-                svc.inner()
-                    .clone()
-                    .spawn_rebuild(spelled, RebuildOrigin::Automatic);
+                svc.spawn_rebuild(spelled, RebuildOrigin::Automatic);
             }
         }
         Ok(idx)
@@ -1683,13 +1725,9 @@ impl GraphService {
         if !self.settings.current().graph.memory_distillation {
             return;
         }
-        let Some(sup) = self
-            .app
-            .try_state::<Arc<crate::offload::OffloadSupervisor>>()
-        else {
+        let Some(sup) = self.supervisor.clone() else {
             return;
         };
-        let sup = sup.inner().clone();
 
         // Single-flight guard: `is_session_distilled` (below) and
         // `mark_session_distilled` (at the end) are check-then-act across a
@@ -1932,11 +1970,10 @@ impl GraphService {
                 return;
             }
         }
-        let Some(me) = self.app.try_state::<Arc<GraphService>>() else {
+        let Some(me) = self.me.upgrade() else {
             let _ = self.digest_inflight.lock().map(|mut g| g.remove(&key));
             return;
         };
-        let me = me.inner().clone();
         tokio::spawn(async move {
             // Guard removes the key on Drop — even if the compute panics.
             let _guard = InflightGuard {
@@ -1951,13 +1988,9 @@ impl GraphService {
     /// Silent on any failure (no local backend, read error, bad output) — the
     /// fallback digest keeps working and the item is simply not cached.
     async fn compute_and_cache_digest(&self, root: &Path, file: &str, content_hash: &str) {
-        let Some(sup) = self
-            .app
-            .try_state::<Arc<crate::offload::OffloadSupervisor>>()
-        else {
+        let Some(sup) = self.supervisor.clone() else {
             return;
         };
-        let sup = sup.inner().clone();
         // Read off the async worker — file I/O would otherwise block a tokio
         // thread for the duration.
         let path = root.join(file);
@@ -2619,7 +2652,7 @@ impl GraphService {
                 "dead_exports": dead,
                 "import_cycles": cycles,
             });
-            let _ = self.app.emit("graph-analyses", &payload);
+            let _ = self.events.emit("graph-analyses", &payload);
         }
     }
 
@@ -2736,7 +2769,7 @@ impl GraphService {
             building.watch_paused = self.paused.load(Ordering::Relaxed);
             building
         };
-        let _ = self.app.emit(GRAPH_STATUS_EVENT, &building);
+        let _ = self.events.emit(GRAPH_STATUS_EVENT, &building);
 
         let this = self.clone();
         let thread_root = root.clone();
@@ -2936,15 +2969,13 @@ impl GraphService {
         // backend subscribers) BEFORE any graph-specific filtering below — a
         // batch of paths the graph itself ignores (unsupported extension,
         // gitignored, graph disabled) can still be exactly what the diff pane
-        // or a future checkpoint burst trigger cares about. Reached via
-        // `AppHandle::state` rather than a constructor dependency so `graph`
-        // and `workbench` don't need to know about each other's lifecycle;
-        // `WorkbenchService` self-gates on `workbench.enabled`, so this is a
-        // cheap no-op when the feature is off.
-        if let Some(workbench) = self
-            .app
-            .try_state::<Arc<crate::workbench::WorkbenchService>>()
-        {
+        // or a future checkpoint burst trigger cares about. V42 Phase A2: a
+        // constructor dependency (see the `workbench` field) rather than an
+        // `AppHandle::state` lookup — the lifecycle order it used to dodge is
+        // the composition root's, and stated there. `WorkbenchService`
+        // self-gates on `workbench.enabled`, so this is a cheap no-op when the
+        // feature is off.
+        if let Some(workbench) = self.workbench.as_ref() {
             workbench.publish_fs_batch(root, &paths);
         }
 
@@ -3472,7 +3503,7 @@ impl GraphService {
         };
         let mut status = status;
         status.watch_paused = self.paused.load(Ordering::Relaxed);
-        let _ = self.app.emit(GRAPH_STATUS_EVENT, &status);
+        let _ = self.events.emit(GRAPH_STATUS_EVENT, &status);
     }
 
     /// Drop warm handles + watchers on shutdown (SQLite connections close on

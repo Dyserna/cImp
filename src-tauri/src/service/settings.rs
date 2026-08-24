@@ -20,11 +20,12 @@
 //!    only caller had one, which is why it now lives beside the rest of the
 //!    tab lifecycle as [`crate::service::tabs::sync_reserved_feature_tab`].
 //! 4. *The warm code-graph index*, for the `graph.ignore` resync edge. That one
-//!    is genuinely not constructible without a Tauri app
-//!    ([`GraphService::new`](crate::graph::GraphService::new) takes an
-//!    `AppHandle`), so it is the run's only new trait —
+//!    is another domain's whole capability, so it is the run's only new trait —
 //!    [`GraphIndexHost`](crate::service::sink::GraphIndexHost), one method, the
-//!    same shape and rationale as `WebviewHost`.
+//!    same shape and rationale as `WebviewHost`. (At A1 it was also literally
+//!    unconstructible in a test, because `GraphService::new` took an
+//!    `AppHandle`. V42 Phase A2 fixed that; the trait stays for the reason that
+//!    outlived it — see its own doc comment.)
 //!
 //! ## What did NOT change
 //!

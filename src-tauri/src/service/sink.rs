@@ -193,12 +193,18 @@ impl WebviewHost for crate::preview::PreviewRegistry {
 ///
 /// A second host trait rather than another method on [`WebviewHost`], and it
 /// exists for a different reason than that one. `GraphService` is not a UI
-/// concern at all — but it is not constructible without a Tauri app either
-/// ([`GraphService::new`](crate::graph::GraphService::new) takes an
-/// `AppHandle`), so a service that names it concretely is a service no test can
-/// build. One method, for the one effect a settings save has on the index; a
+/// concern at all — it is *another domain's* capability, and naming it
+/// concretely in the settings service would drag the whole code-graph surface
+/// into that service's signature and into every fixture that builds one. One
+/// method, for the one effect a settings save has on the index; a
 /// `GraphIndexHost` that grew a method per `GraphService` capability would be
 /// `GraphService` with extra steps.
+///
+/// (Until V42 Phase A2 there was a second, blunter reason:
+/// [`GraphService::new`](crate::graph::GraphService::new) took an `AppHandle`,
+/// so a service that named it was a service no test could build. That one is
+/// gone — the graph service takes its collaborators as values now. The reason
+/// above is the one that was always load-bearing.)
 pub trait GraphIndexHost: Send + Sync {
     /// Reconcile the live index against a changed `graph.ignore`: drop
     /// newly-excluded files, index newly-included ones. Returns immediately —

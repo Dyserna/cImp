@@ -68,6 +68,13 @@
 //! product, not a gate that bricks tool calls on a missing prerequisite.
 
 pub mod child_env;
+/// **The ONE confined spawn** (V42 R27) — the boundary walk every non-PTY agent
+/// seam makes, extracted from the two line-for-line copies that used to run it
+/// (`audit::runner::spawn_and_capture` and `checks::spawn_capture`). Declared
+/// next to the engines because it is what the engines are engines FOR: reviewing
+/// "how does cImp run a child inside the boundary" is now reading one file in
+/// this directory instead of diffing two seams.
+pub mod confine;
 /// The Linux engine. Declared on **every** platform, unlike [`windows`]: its
 /// grant ladder, environment redirection and posture wording are pure functions
 /// with their own tests, and the machine this project is developed on cannot

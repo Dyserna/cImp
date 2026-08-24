@@ -108,7 +108,12 @@ pub const CORE_LEDGER: &[SpawnSite] = &[
                  user configured for an enabled plugin tool, and its argv is the manifest's \
                  template rendered once (never re-scanned) plus the user's appended \
                  parameters. What does not change is that no shell is interposed and no \
-                 model input selects the file.",
+                 model input selects the file. V42 R27: the `Command` is still BUILT here — \
+                 which is what this row's count measures — but the boundary walk that spawns \
+                 it (process group, Landlock hook, spawn gate, reaper guard, capped pumps, \
+                 whole-tree kill, denial row) is now `sandbox::confine::run_confined`, shared \
+                 with the `checks/mod.rs` row below. `spawn_gate`'s `GATE_DELEGATES` VERIFIES \
+                 that hop rather than exempting it.",
     },
     SpawnSite {
         file: "checks/gitls.rs",
@@ -137,7 +142,12 @@ pub const CORE_LEDGER: &[SpawnSite] = &[
                  constructors are the PLAIN arm. Because the spawned program is the shell \
                  rather than the tool, this is the seam that needed grant INFERENCE — \
                  `check_program_hint` resolves the command's first token so `cargo`'s \
-                 install dir is granted, and `cmd.exe`'s own System32 home needs no ACE.",
+                 install dir is granted, and `cmd.exe`'s own System32 home needs no ACE. \
+                 V42 R27: both constructors are still HERE — which is what this row's count \
+                 measures — but the boundary walk that spawns them is now \
+                 `sandbox::confine::run_confined`, shared with the `audit/runner.rs` row \
+                 above; `spawn_gate`'s `GATE_DELEGATES` VERIFIES that hop rather than \
+                 exempting it.",
     },
     SpawnSite {
         file: "graph/gitcmd.rs",

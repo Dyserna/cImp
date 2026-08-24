@@ -306,32 +306,79 @@ mod tests {
         // Assembled with `concat!` so this file does not match its own needles.
         let job_by_handle = concat!("process_guard::", "guard_child(");
         let job_by_pid = concat!("process_guard::", "guard_pid(");
-        let own_group = concat!("own_process_", "group(&mut ");
+        // V42 R27 re-point: the needle was `own_process_group(&mut ` before the
+        // confined walk moved, and the `&mut ` never carried any meaning — the
+        // function takes `&mut tokio::process::Command`, so there is no other
+        // way to call it. `run_confined` already holds a `&mut` and passes it
+        // straight through. Dropping the two words is a spelling fix, not a
+        // looser check; `own_process_group_std` is still excluded by the paren.
+        let own_group = concat!("own_process_", "group(");
+        // …and `kill_tree` is what the timeout/cancel paths actually reach for.
+        // `run_command` used to settle for `kill_on_drop`, which kills the one
+        // process cImp holds and leaves a timed-out `cargo`/`npm` build running.
+        let kill_tree = concat!("procutil::", "kill_tree(&mut ");
 
-        // (file, source, the job-object entry point it must use)
-        let seams: [(&str, &str, &str); 4] = [
-            (
-                "audit/runner.rs",
-                include_str!("audit/runner.rs"),
-                job_by_handle,
-            ),
-            ("checks/mod.rs", include_str!("checks/mod.rs"), job_by_handle),
-            (
-                "offload/tools/run_command.rs",
-                include_str!("offload/tools/run_command.rs"),
-                job_by_handle,
-            ),
-            // The PTY child is not a `tokio::process::Child`; it is guarded by
-            // pid instead. That asymmetry IS contract C3.
-            ("pty/manager.rs", include_str!("pty/manager.rs"), job_by_pid),
+        // **V42 R27 — where each seam's spawn wiring LIVES.**
+        //
+        // `audit/runner.rs` and `checks/mod.rs` ran the confined walk line for
+        // line and now delegate it to `sandbox::confine::run_confined`, so the
+        // three needles below are in the DELEGATE, not in the seam. Rather than
+        // exempt the two seams — which would retire the invariant for exactly
+        // the seams it was written for — each row names the file that carries
+        // its wiring, and a delegating seam is checked TWICE: that it still
+        // delegates, and that the delegate is wired. That is strictly more than
+        // the pre-R27 check, which only ever asked whether the needle was
+        // somewhere in the seam's own text.
+        //
+        // `run_command` and the PTY seam still walk their own spawns, so their
+        // wiring file is themselves and nothing about them changes.
+        let delegate = concat!("confine::", "run_confined");
+        let confine = ("sandbox/confine.rs", include_str!("sandbox/confine.rs"));
+        let audit = ("audit/runner.rs", include_str!("audit/runner.rs"));
+        let checks = ("checks/mod.rs", include_str!("checks/mod.rs"));
+        let run_command = (
+            "offload/tools/run_command.rs",
+            include_str!("offload/tools/run_command.rs"),
+        );
+        let pty = ("pty/manager.rs", include_str!("pty/manager.rs"));
+
+        // (seam file, seam source, wiring file, wiring source). `wiring == seam`
+        // means the seam walks its own spawn.
+        let wired: [(&str, &str, &str, &str); 4] = [
+            (audit.0, audit.1, confine.0, confine.1),
+            (checks.0, checks.1, confine.0, confine.1),
+            (run_command.0, run_command.1, run_command.0, run_command.1),
+            (pty.0, pty.1, pty.0, pty.1),
         ];
 
-        for (file, src, guard) in seams {
+        // Half one of the delegation proof: a seam whose wiring lives elsewhere
+        // must still visibly hand its child over. Without this, a seam could go
+        // back to spawning raw and the needles below would keep passing on the
+        // delegate's text alone.
+        for (seam, src, wiring, _) in wired {
+            if seam != wiring {
+                assert!(
+                    src.contains(delegate),
+                    "{seam}'s process-tree wiring is supposed to live in {wiring}, but {seam} no \
+                     longer calls `{delegate}` — so either it spawns unguarded now, or this \
+                     table is stale (V33 contract C3, V42 R27)"
+                );
+            }
+        }
+
+        // The job object. The PTY child is not a `tokio::process::Child`; it is
+        // guarded by pid instead. That asymmetry IS contract C3.
+        for (seam, wiring, src, guard) in [
+            (audit.0, confine.0, confine.1, job_by_handle),
+            (checks.0, confine.0, confine.1, job_by_handle),
+            (run_command.0, run_command.0, run_command.1, job_by_handle),
+            (pty.0, pty.0, pty.1, job_by_pid),
+        ] {
             assert!(
                 src.contains(guard),
-                "{file} is an AgentSpawn seam (see `spawn_ledger::LEDGER`) but no longer calls \
-                 `{guard}` — its child is OUTSIDE the kill-on-job-close job and survives a hard \
-                 cImp death (V33 contract C3)"
+                "{seam} is an AgentSpawn seam (see `spawn_ledger::LEDGER`) but {wiring} no longer \
+                 calls `{guard}` — its child is OUTSIDE the kill-on-job-close job and survives a \
+                 hard cImp death (V33 contract C3)"
             );
         }
 
@@ -340,38 +387,29 @@ mod tests {
         // and group leader AND gives it a controlling terminal, so closing the
         // master fd hangs up the whole session. Adding `process_group` there
         // would be a no-op at best and would fight the PTY at worst.
-        for (file, src) in [
-            ("audit/runner.rs", include_str!("audit/runner.rs")),
-            ("checks/mod.rs", include_str!("checks/mod.rs")),
-            (
-                "offload/tools/run_command.rs",
-                include_str!("offload/tools/run_command.rs"),
-            ),
+        for (seam, wiring, src) in [
+            (audit.0, confine.0, confine.1),
+            (checks.0, confine.0, confine.1),
+            (run_command.0, run_command.0, run_command.1),
         ] {
             assert!(
                 src.contains(own_group),
-                "{file} no longer calls `procutil::{own_group}..)` — on Unix its grandchildren \
-                 survive a timeout/cancel kill, because `kill_tree`'s `killpg` only reaches a \
-                 child that leads its own process group (V33 contract C3)"
+                "{seam}'s spawn no longer calls `procutil::{own_group}..)` in {wiring} — on Unix \
+                 its grandchildren survive a timeout/cancel kill, because `kill_tree`'s `killpg` \
+                 only reaches a child that leads its own process group (V33 contract C3)"
             );
         }
 
-        // …and `kill_tree` is what the timeout/cancel paths actually reach for.
-        // `run_command` used to settle for `kill_on_drop`, which kills the one
-        // process cImp holds and leaves a timed-out `cargo`/`npm` build running.
-        let kill_tree = concat!("procutil::", "kill_tree(&mut ");
-        for (file, src) in [
-            ("audit/runner.rs", include_str!("audit/runner.rs")),
-            ("checks/mod.rs", include_str!("checks/mod.rs")),
-            (
-                "offload/tools/run_command.rs",
-                include_str!("offload/tools/run_command.rs"),
-            ),
+        for (seam, wiring, src) in [
+            (audit.0, confine.0, confine.1),
+            (checks.0, confine.0, confine.1),
+            (run_command.0, run_command.0, run_command.1),
         ] {
             assert!(
                 src.contains(kill_tree),
-                "{file} no longer reaps its child with `{kill_tree}..)`, so the process group / \
-                 pid tree established at spawn is never signalled (V33 contract C3)"
+                "{seam}'s child is no longer reaped with `{kill_tree}..)` in {wiring}, so the \
+                 process group / pid tree established at spawn is never signalled (V33 contract \
+                 C3)"
             );
         }
     }

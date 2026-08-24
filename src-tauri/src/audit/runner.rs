@@ -2265,130 +2265,59 @@ async fn spawn_and_capture(
         }
     }
 
+    // What makes this an AUDIT spawn: the scanner cImp resolved itself, the
+    // argv the adapter built in code, and the scan root as cwd. Everything
+    // below the process-creation flags is the boundary walk, which is no longer
+    // written here — see the `run_confined` call.
     let mut cmd = tokio::process::Command::new(resolved);
-    cmd.args(argv)
-        .current_dir(root)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
-    for (k, v) in env {
-        cmd.env(k, v);
-    }
-    // Don't flash a console window per spawned scanner on Windows.
-    #[cfg(windows)]
-    cmd.creation_flags(crate::procutil::CREATE_NO_WINDOW);
-    // V33 C3: Unix-only — own process group, so the cancel/timeout `kill_tree`
-    // below reaps semgrep's forked workers the same way `taskkill /T` does on
-    // Windows. This is the seam the whole-tree kill was written for.
-    crate::procutil::own_process_group(&mut cmd);
+    cmd.args(argv).current_dir(root);
 
-    // V33 Phase D — on Linux this IS the sandboxed path: Landlock is applied to
-    // the scanner command built above. Locked decision L4 is enforced by
-    // `apply`: the C2 minimal base, then the adapter's forced variables, then
-    // the sandbox's redirections last. A failure REFUSES the scanner (reported
-    // as a `SpawnError`, i.e. a failed tool chip that says why) rather than
-    // running it with the boundary quietly missing (decision D3).
-    #[cfg(target_os = "linux")]
-    if let crate::sandbox::Plan::Sandboxed(prepared) = &plan {
-        if let Err(e) = prepared.apply(&mut cmd, &base_env, env.iter().map(|(k, v)| (k.as_str(), v.as_str()))) {
-            return Capture {
-                stdout: String::new(),
-                stdout_truncated: false,
-                stderr: String::new(),
-                outcome: Outcome::SpawnError(e),
-            };
-        }
-    }
-
-    // Through the spawn gate like every other cImp spawn — see `spawn_gate`.
-    let mut child = match crate::spawn_gate::spawn_tokio(&mut cmd) {
-        Ok(c) => c,
-        Err(e) => {
-            return Capture {
-                stdout: String::new(),
-                stdout_truncated: false,
-                stderr: String::new(),
-                outcome: Outcome::SpawnError(e.to_string()),
-            }
-        }
-    };
-    // Backstop reaper if cImp dies hard before kill_on_drop fires.
-    crate::process_guard::guard_child(&child);
-    // The confirmation row, once per scanner per session.
-    #[cfg(target_os = "linux")]
-    if matches!(&plan, crate::sandbox::Plan::Sandboxed(_)) {
-        crate::sandbox::record_sandboxed(
-            &seam,
+    // V42 R27 — **the boundary walk is shared with `run_check`.** The process
+    // group, the Landlock hook, the spawn gate, the reaper guard, the
+    // confirmation row, the two capped pumps, the whole-tree kill and the Linux
+    // denial row all live in [`crate::sandbox::confine`] now, because this seam
+    // and that one ran them line for line and a security boundary maintained in
+    // two copies is a boundary that gets fixed in one of them.
+    //
+    // What this seam still decides, and hands over: its 16 MiB cap (a
+    // stdout-transport scanner's stdout IS its SARIF report), the cancel token
+    // it is the only seam to have, the row identity — the PROGRAM as subject,
+    // real argv on a denial row — and the [`Outcome`] mapping below.
+    let run = crate::sandbox::confine::run_confined(
+        &mut cmd,
+        crate::sandbox::confine::Confined {
+            plan: &plan,
+            seam: &seam,
             root,
-            &crate::sandbox::program_subject(resolved),
+            subject: &subject,
+            argv,
             sandbox,
-        );
-    }
-
-    let out_task = tokio::spawn(crate::procutil::read_capped(
-        child.stdout.take(),
-        MAX_OUTPUT_BYTES,
-    ));
-    let err_task = tokio::spawn(crate::procutil::read_capped(
-        child.stderr.take(),
-        MAX_OUTPUT_BYTES,
-    ));
-
-    let sleep = tokio::time::sleep(timeout);
-    tokio::pin!(sleep);
-    // Only the `child.wait()` branch borrows `child`, so `kill_tree` below is
-    // free to use it once the select resolves.
-    let outcome = tokio::select! {
-        _ = cancel.cancelled() => Outcome::Cancelled,
-        _ = &mut sleep => Outcome::TimedOut,
-        res = child.wait() => match res {
-            Ok(status) => Outcome::Exited(status.code()),
-            Err(e) => Outcome::SpawnError(e.to_string()),
+            base_env: &base_env,
+            env,
+            cap: MAX_OUTPUT_BYTES,
+            timeout,
+            cancel: Some(cancel),
         },
+    )
+    .await;
+
+    // Every way the boundary can fail this scanner is one thing to a tool chip:
+    // it did not run, and here is why. The raw string is carried through
+    // unchanged — the wording a user reads is written at the seam, not at the
+    // boundary, which is why `ConfinedOutcome` keeps the three apart at all.
+    use crate::sandbox::confine::ConfinedOutcome;
+    let outcome = match run.outcome {
+        ConfinedOutcome::Exited(code) => Outcome::Exited(code),
+        ConfinedOutcome::TimedOut => Outcome::TimedOut,
+        ConfinedOutcome::Cancelled => Outcome::Cancelled,
+        ConfinedOutcome::ApplyRefused(e)
+        | ConfinedOutcome::SpawnFailed(e)
+        | ConfinedOutcome::WaitFailed(e) => Outcome::SpawnError(e),
     };
-    if matches!(outcome, Outcome::Cancelled | Outcome::TimedOut) {
-        // Whole-tree kill: semgrep's forked workers must not survive holding
-        // the pipe write ends (they'd keep scanning and stall the drains).
-        crate::procutil::kill_tree(&mut child).await;
-    }
-
-    let (stdout, stdout_truncated) = crate::procutil::drain_capture(out_task).await;
-    let (stderr, _) = crate::procutil::drain_capture(err_task).await;
-
-    // V33 Phase D — the Linux denial row. Only for a scanner that actually ran
-    // to completion: a cancel and a timeout are not access-denial signatures,
-    // and `Outcome` is where that distinction already lives.
-    #[cfg(target_os = "linux")]
-    {
-        // Only a scanner that actually RAN, inside the boundary, can have hit
-        // it: a cancel, a timeout and a spawn failure are not access-denial
-        // signatures, and `Outcome` is where that distinction already lives.
-        let confined_exit = match &outcome {
-            Outcome::Exited(code) => {
-                matches!(&plan, crate::sandbox::Plan::Sandboxed(_)).then_some(*code)
-            }
-            _ => None,
-        };
-        let class = confined_exit
-            .and_then(|code| crate::sandbox::denial_signature(code, &stderr, sandbox.allow_network));
-        if let Some(class) = class {
-            crate::sandbox::record_denial(
-                &seam,
-                root,
-                &crate::sandbox::program_subject(resolved),
-                argv,
-                confined_exit.flatten(),
-                &stderr,
-                class,
-                sandbox,
-            );
-        }
-    }
     Capture {
-        stdout,
-        stdout_truncated,
-        stderr,
+        stdout: run.stdout,
+        stdout_truncated: run.stdout_truncated,
+        stderr: run.stderr,
         outcome,
     }
 }

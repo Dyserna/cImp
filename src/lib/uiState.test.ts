@@ -329,6 +329,30 @@ describe('setUiValue', () => {
     expect(m.getUiValue('k')).toBe('v');
   });
 
+  test('a refusal that repeats is logged ONCE and never retried in a loop', async () => {
+    // V42 review RV-10: `ui_state_set` refuses outright when the file on disk
+    // is a version this build does not understand, and that refusal repeats
+    // for the whole session. A console line behind every `<details>` toggle
+    // is noise; a retry timer would be worse. The cache stays live.
+    const m = await freshModule();
+    await m.hydrateUiState();
+    invoke.mockReset();
+    invoke.mockRejectedValue(
+      new Error('ui_state.json is version 999, newer than this build understands (1)'),
+    );
+
+    for (const v of ['a', 'b', 'c']) {
+      m.setUiValue('k', v);
+      await m.flushUiState();
+    }
+
+    expect(console.error).toHaveBeenCalledTimes(1);
+    // One IPC per mutation, none of them a retry of an earlier patch.
+    expect(invoke).toHaveBeenCalledTimes(3);
+    expect(patchOf(2)).toEqual({ k: 'c' });
+    expect(m.getUiValue('k')).toBe('c');
+  });
+
   test('values are stored verbatim, including JSON-inside-a-string', async () => {
     // `events.col-widths` is double-encoded. Nothing in this path may parse
     // or re-encode it.

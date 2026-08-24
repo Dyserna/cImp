@@ -722,11 +722,10 @@ pub struct TokenKinds(std::collections::BTreeMap<String, u64>);
 impl TokenKinds {
     /// The count reported for `id`, or `None` — **never zero for absent**.
     ///
-    /// Rust-side this is read by the tests that pin the absence rule; the
-    /// production consumer of a reading is the frontend, which receives the map
-    /// as JSON. Declared and kept under test anyway, so the next Rust consumer
-    /// reaches for an accessor that cannot spell `unwrap_or(0)` by accident.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// The accessor that cannot spell `unwrap_or(0)` by accident. Its first
+    /// production reader is `graph::index::usage::cache_hit_ratio` (V42), which
+    /// is exactly the case it was declared for: a ratio over two categories
+    /// where an undeclared one has to answer "no ratio", not "0%".
     pub fn get(&self, id: &str) -> Option<u64> {
         self.0.get(id).copied()
     }

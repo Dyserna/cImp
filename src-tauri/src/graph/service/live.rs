@@ -526,7 +526,7 @@ mod tests {
             agent: "claude".to_string(),
             totals: crate::harness::plugin::TokenKinds::default(),
             tool_chars: 0,
-            cache_hit_ratio: 0.0,
+            cache_hit_ratio: None,
             est_only: false,
             started_ms: 0,
             last_ms,

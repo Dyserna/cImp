@@ -566,9 +566,22 @@ pub struct SessionUsageRow {
     /// Total estimated tool-result chars for the session (sum of
     /// `usage_per_tool`'s values).
     pub tool_chars: u64,
-    /// `cache_read / (cache_read + in_tok)`; `0.0` when there's no
-    /// denominator (no turns recorded yet).
-    pub cache_hit_ratio: f64,
+    /// `cache_read / (cache_read + input)` — the honest cache-hit ratio the
+    /// Sessions table renders as a percentage.
+    ///
+    /// **`None` when there is no ratio to state**: either the session's harness
+    /// declares neither category (nothing to divide) or both are zero (no
+    /// denominator). Deliberately not `0.0` for those — "0% cache hit" is a
+    /// claim about a session that spent tokens, and a harness that does not bill
+    /// cache reads never made it.
+    ///
+    /// **V42.** This was an `f64` that always answered, and because a struct
+    /// that cannot carry absence cannot state that rule, the frontend re-derived
+    /// the whole formula from `totals` (`cacheHitRatio` in `usageMath.ts`) and
+    /// rendered THAT. Two implementations of one division, one of them read by
+    /// nobody. The `Option` is what let the duplicate go; the rule now lives
+    /// where the numbers do — see `index::usage::cache_hit_ratio`.
+    pub cache_hit_ratio: Option<f64>,
     /// True when this session recorded no real Turn tokens at all (every
     /// token column zero) — the table's "est" badge. V24 Phase E: derived
     /// from the totals, not the agent name, so a token-less pre-V24 OpenCode
@@ -662,7 +675,9 @@ impl SessionUsageDetail {
                 agent: String::new(),
                 totals: TokenKinds::default(),
                 tool_chars: 0,
-                cache_hit_ratio: 0.0,
+                // No categories declared and nothing spent: `None` is what the
+                // ratio says about a session there is no session for.
+                cache_hit_ratio: None,
                 est_only: true,
                 started_ms: 0,
                 last_ms: 0,

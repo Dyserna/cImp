@@ -111,7 +111,7 @@ pub(super) async fn handle_memory_event(
     // This body carries no `tab` — the memory POST never had one — so an
     // unresolvable cwd has nothing to fall back to and the event is dropped
     // rather than filed against a directory that is not a project.
-    let Some(cwd) = external_project_root(ctx.app(), &ctx.settings(), None, event.cwd.as_deref())
+    let Some(cwd) = external_project_root(ctx, &ctx.settings(), None, event.cwd.as_deref())
     else {
         return write_json(stream, 200, &ok).await;
     };

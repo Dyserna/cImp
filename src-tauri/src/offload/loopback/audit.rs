@@ -355,7 +355,7 @@ pub(super) async fn handle_audit_run(stream: &mut TcpStream, ctx: &RouteCtx, req
         &body,
         &state.root(),
         |c| state.consumer_exposed(c),
-        |agent, tab| latch_scope(ctx.app(), &settings, agent, Some(tab)),
+        |agent, tab| latch_scope(ctx, &settings, agent, Some(tab)),
         |scope| GatePolicy::resolve(&settings, scope),
     ) {
         Ok(c) => c,

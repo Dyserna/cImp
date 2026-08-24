@@ -156,7 +156,7 @@ pub(super) async fn handle_run(
         return write_json(stream, 400, &r).await;
     };
     let settings = ctx.settings();
-    let scoping = latch_scope(ctx.app(), &settings, run_agent, body.tab.as_deref());
+    let scoping = latch_scope(ctx, &settings, run_agent, body.tab.as_deref());
     if let LatchScoping::Unknown(tab) = &scoping {
         warn!(
             target: "offload",

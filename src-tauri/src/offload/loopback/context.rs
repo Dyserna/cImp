@@ -215,7 +215,7 @@ pub(crate) async fn context_retrieve_core(ctx: &RouteCtx, body: &ContextRetrieve
     // resolved to a real root first. `None` refuses BOTH: no checkpoint and no
     // retrieval for a directory that is no project (`empty` is this route's
     // established "nothing to say" answer).
-    let Some(cwd) = external_project_root(ctx.app(), &ctx.settings(), body.tab.as_deref(), body.cwd.as_deref())
+    let Some(cwd) = external_project_root(ctx, &ctx.settings(), body.tab.as_deref(), body.cwd.as_deref())
     else {
         return serde_json::json!({ "ok": true, "text": "", "files": [], "tokens_est": 0 });
     };
@@ -623,7 +623,7 @@ pub(crate) async fn tool_checkpoint_core(
     // #104: the checkpointer creates `<root>/<db_subdir>/shadow.git`, so a cwd
     // that resolves to no project takes no checkpoint rather than minting a
     // shadow repo inside one.
-    let Some(root) = external_project_root(ctx.app(), settings, tab, cwd) else {
+    let Some(root) = external_project_root(ctx, settings, tab, cwd) else {
         return false;
     };
     let origin = checkpoint_identity(settings, agent, session_id, tab);
@@ -698,7 +698,7 @@ pub(super) async fn handle_context_compaction(
         HOOK_TOOL_COMPACTION,
         hook_agent(body.agent.as_deref()),
         body.tab.as_deref(),
-        |agent, tab| latch_scope(ctx.app(), &settings, agent, tab),
+        |agent, tab| latch_scope(ctx, &settings, agent, tab),
         |scope| GatePolicy::resolve(&settings, scope),
     )
     .is_err()
@@ -724,7 +724,7 @@ pub(crate) fn compaction_block(ctx: &RouteCtx, body: &ContextCompactionBody) -> 
     // #104: `compaction_context` opens the project's store — resolve, never
     // trust the payload's cwd. No root ⇒ no carry-over block, the route's own
     // fail-safe.
-    let Some(root) = external_project_root(ctx.app(), &ctx.settings(), body.tab.as_deref(), body.cwd.as_deref())
+    let Some(root) = external_project_root(ctx, &ctx.settings(), body.tab.as_deref(), body.cwd.as_deref())
     else {
         return String::new();
     };
@@ -787,7 +787,7 @@ pub(super) async fn handle_should_read(
         HOOK_TOOL_SHOULD_READ,
         hook_agent(body.agent.as_deref()),
         body.tab.as_deref(),
-        |agent, tab| latch_scope(ctx.app(), &settings, agent, tab),
+        |agent, tab| latch_scope(ctx, &settings, agent, tab),
         |scope| GatePolicy::resolve(&settings, scope),
     )
     .is_err()
@@ -817,7 +817,7 @@ pub(crate) fn should_read_verdict(ctx: &RouteCtx, body: &ShouldReadBody) -> Opti
     // so it is the route that minted the stray state dirs. The root is resolved,
     // never taken from the payload; no root ⇒ pass the read through, which is
     // this route's fail-safe everywhere else too.
-    let root = external_project_root(ctx.app(), &ctx.settings(), body.tab.as_deref(), body.cwd.as_deref())?;
+    let root = external_project_root(ctx, &ctx.settings(), body.tab.as_deref(), body.cwd.as_deref())?;
     graph.should_read(
         &root,
         body.session_id.as_deref(),
@@ -986,7 +986,7 @@ pub(super) async fn handle_post_edit(stream: &mut TcpStream, ctx: &RouteCtx, req
         HOOK_TOOL_POST_EDIT,
         hook_agent(body.agent.as_deref()),
         body.tab.as_deref(),
-        |agent, tab| latch_scope(ctx.app(), &settings, agent, tab),
+        |agent, tab| latch_scope(ctx, &settings, agent, tab),
         |scope| GatePolicy::resolve(&settings, scope),
     )
     .is_err()
@@ -1030,7 +1030,7 @@ pub(crate) async fn post_edit_diagnostics(
     // answer**: the walk goes UP, and a resolved root above every served root
     // would run the operator's check commands one directory further out than
     // C4 admits. It never widens; on a miss the route takes its own fail-safe.
-    let root = external_project_root(ctx.app(), settings, body.tab.as_deref(), Some(&cwd.to_string_lossy()));
+    let root = external_project_root(ctx, settings, body.tab.as_deref(), Some(&cwd.to_string_lossy()));
     let Some(root) = root.filter(|r| {
         let r = canon(r);
         exec_roots.iter().any(|allowed| is_ancestor_or_equal(&canon(allowed), &r))

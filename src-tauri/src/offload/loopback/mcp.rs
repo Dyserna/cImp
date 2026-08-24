@@ -101,7 +101,7 @@ pub(super) async fn handle_mcp_call(
     // the fix is to thread `settings` into `mcp_call`. Do not restore the old
     // wording without making it true.
     let settings = ctx.settings();
-    let scoping = latch_scope(ctx.app(), &settings, agent, body.tab.as_deref());
+    let scoping = latch_scope(ctx, &settings, agent, body.tab.as_deref());
     // #48 F-20 — see `handle_graph_run`: resolved before the collapse. This is
     // the row that answers "which tab fetched that page", and it is the one the
     // finding says could not.

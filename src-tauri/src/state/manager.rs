@@ -4,7 +4,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter};
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
@@ -710,20 +710,22 @@ const EMPTY_INPUT_IDLE: Duration = Duration::from_secs(5);
 /// must wait at least as long as any real harness would, because the failure
 /// mode of waiting too long is a late Idle, and the failure mode of releasing
 /// too early is clipping live work.
-fn subagents_stall_timeout(tab: &TabId, app: &AppHandle) -> Duration {
-    tab_activity_tuning(tab, app)
+fn subagents_stall_timeout(tab: &TabId, settings: &crate::settings::Settings) -> Duration {
+    tab_activity_tuning(tab, settings)
         .map(|t| t.subagents_stall)
         .unwrap_or_else(longest_declared_stall)
 }
 
 /// The tuning declared by the harness running in `tab`, or `None` when the tab
 /// names no registered harness.
+/// V42 Phase A2: takes the settings snapshot rather than fishing `AppState` out
+/// of the managed-state table for it. That lookup was the last thing standing
+/// between this backstop and a test — the rest is a registry read.
 fn tab_activity_tuning(
     tab: &TabId,
-    app: &AppHandle,
+    settings: &crate::settings::Settings,
 ) -> Option<crate::harness::plugin::ActivityTuning> {
-    let settings = app.try_state::<crate::ipc::AppState>()?.settings.current();
-    let harness = crate::tabs::tab_harness_by_id(&settings, tab.as_str())?;
+    let harness = crate::tabs::tab_harness_by_id(settings, tab.as_str())?;
     match harness.plugin()?.activity_source() {
         crate::harness::plugin::ActivitySource::TuiMarkers(t) => Some(t),
         // An out-of-band harness declares no TUI timings; the backstop still
@@ -1167,6 +1169,10 @@ pub struct StateManagerWiring {
     pub initial_active: TabId,
     /// The per-tab AI-TTS suppression mirror.
     pub ai_tts_suppressed: crate::tts::AiTtsSuppressed,
+    /// V42 Phase A2: the live settings store, for the subagent-stall backstop's
+    /// per-harness tuning. Handed in rather than looked up through the
+    /// `AppHandle` on every tick.
+    pub settings: crate::settings::SettingsHandle,
 }
 
 /// Spawn the state-manager task. The channel is created at app startup so
@@ -1205,6 +1211,7 @@ pub fn spawn_state_manager(
 ///    the done-while-away badge — honest.
 struct Loop {
     app: AppHandle,
+    settings: crate::settings::SettingsHandle,
     /// The same `StateEvent`s the frontend receives, for the in-process
     /// subscribers described on [`StateManagerWiring::state_events`].
     events: broadcast::Sender<StateEvent>,
@@ -1228,6 +1235,7 @@ impl Loop {
             tab_metas,
             initial_active,
             ai_tts_suppressed,
+            settings,
         } = wiring;
         let tabs: HashMap<TabId, TabState> = tab_metas
             .iter()
@@ -1237,6 +1245,7 @@ impl Loop {
         (
             Self {
                 app,
+                settings,
                 events: state_events,
                 input_lengths,
                 activity,
@@ -1817,7 +1826,7 @@ impl Loop {
                 && !ts.harness_output_active
             {
                 let since = *ts.subagents_stall_since.get_or_insert_with(Instant::now);
-                if since.elapsed() >= subagents_stall_timeout(&tab, &self.app) {
+                if since.elapsed() >= subagents_stall_timeout(&tab, &self.settings.current()) {
                     info!(?tab, from = ?ts.avatar_state, to = ?AvatarState::Idle, signal = "AgentsStallTimeout", "avatar state");
                     ts.subagents_active = false;
                     ts.subagents_stall_since = None;

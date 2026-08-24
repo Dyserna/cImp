@@ -882,16 +882,23 @@ pub async fn detection_open_rules_folder() -> AppResult<()> {
 /// gated call would not have granted anyway; it only decides when the same fact
 /// becomes visible.
 ///
-/// **Left as a direct call** (V42 Phase A): one call on the `AppHandle` Tauri
-/// injected, and the reason it needs one — the latch scope resolves through the
-/// V28 live-session registry — is the seam V42 #114 (loopback: latch +
-/// discovery) exists to unpick. A service in front of it would have to be
-/// undone by that work. Same for [`latch_override`] and [`injection_status`].
+/// **Left as a direct call**, and V42 Phase A2 changed the reason. A1 deferred
+/// this one because the latch layer took an `AppHandle` (the scope resolves
+/// through the V28 live-session registry), so nothing in front of it would have
+/// been testable. A2 injected that layer:
+/// [`latch_snapshot`](crate::offload::latch::latch_snapshot) takes a
+/// [`RouteCtx`](crate::offload::host::RouteCtx) and is drivable in a test. What
+/// is left here is one call with no argument shaping and nothing to order,
+/// which is A1's own criterion for a leave. Same for [`latch_override`].
+///
+/// `RouteCtx::from_app` is the adapter, not a lookup: it resolves nothing until
+/// the snapshot asks.
 #[tauri::command]
 pub async fn latch_status(
     app: tauri::AppHandle,
 ) -> AppResult<Vec<crate::offload::latch::LatchStatus>> {
-    Ok(crate::offload::latch::latch_snapshot(&app))
+    let ctx = crate::offload::host::RouteCtx::from_app(&app);
+    Ok(crate::offload::latch::latch_snapshot(&ctx))
 }
 
 /// V32 Phase G (locked decision 16): the RESOLVED state of every injection
@@ -904,8 +911,12 @@ pub async fn latch_status(
 /// levels, "why is this tab not latching?" must be answerable without reading
 /// code.
 ///
-/// **Left as a direct call**, for [`latch_status`]'s reason: the resolver is
-/// `offload::loopback`'s, and #114 owns where it lives.
+/// **Left as a direct call**, and this one never needed A2: the resolver
+/// ([`crate::offload::loopback::injection_status`]) is a pure function of a
+/// `Settings`, already tested where it lives. A1's note said the leave was
+/// waiting on #114; that was about which module the resolver should live in,
+/// not about whether anything here is reachable. Nothing to shape, nothing to
+/// order.
 #[tauri::command]
 pub async fn injection_status(state: State<'_, AppState>) -> AppResult<serde_json::Value> {
     Ok(crate::offload::loopback::injection_status(
@@ -949,7 +960,9 @@ pub async fn injection_status(state: State<'_, AppState>) -> AppResult<serde_jso
 /// here: `offload::loopback`'s route scan asserts that the only caller of
 /// `apply_latch_override` is this command, by the exact spelling of the call
 /// below. That tripwire is the record of "the clearing path is not an HTTP
-/// door", so the call site does not move on a mechanical wrap.
+/// door", so the call site does not move on a mechanical wrap. (V42 Phase A2
+/// re-pointed the needle once, when the latch layer stopped taking an
+/// `AppHandle`; the property — one caller, and it is this one — is unchanged.)
 #[tauri::command]
 pub async fn latch_override(
     app: tauri::AppHandle,
@@ -957,7 +970,8 @@ pub async fn latch_override(
     consumer: String,
     action: String,
 ) -> AppResult<crate::offload::latch::LatchView> {
-    crate::offload::latch::apply_latch_override(&app, &consumer, &tab, &action)
+    let ctx = crate::offload::host::RouteCtx::from_app(&app);
+    crate::offload::latch::apply_latch_override(&ctx, &consumer, &tab, &action)
         .map_err(AppError::Offload)
 }
 

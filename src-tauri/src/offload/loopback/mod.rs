@@ -909,7 +909,7 @@ pub(crate) fn hook_gate_admits(
         tool,
         hook_agent(agent),
         tab,
-        |agent, tab| latch_scope(ctx.app(), settings, agent, tab),
+        |agent, tab| latch_scope(ctx, settings, agent, tab),
         |scope| GatePolicy::resolve(settings, scope),
     )
     .is_ok()

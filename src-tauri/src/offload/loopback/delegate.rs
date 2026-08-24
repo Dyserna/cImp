@@ -124,7 +124,7 @@ pub(super) async fn handle_delegate(
         DELEGATE_TOOL,
         agent,
         body.tab.as_deref(),
-        |a, t| latch_scope(ctx.app(), &settings, a, t),
+        |a, t| latch_scope(ctx, &settings, a, t),
         |scope| GatePolicy::resolve(&settings, scope),
     ) {
         let r = DelegateResult::failed(refusal.to_string());

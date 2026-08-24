@@ -100,7 +100,7 @@ pub(super) async fn handle_graph_run(stream: &mut TcpStream, ctx: &RouteCtx, req
     // configured commands from it — so the body's `cwd` is resolved to a real
     // root rather than used as one. A refusal is a tool-level error the model
     // can read and act on, not a silently different project.
-    let Some(cwd) = external_project_root(ctx.app(), &settings, body.tab.as_deref(), body.cwd.as_deref())
+    let Some(cwd) = external_project_root(ctx, &settings, body.tab.as_deref(), body.cwd.as_deref())
     else {
         let r = RunResult {
             ok: false,
@@ -114,7 +114,7 @@ pub(super) async fn handle_graph_run(stream: &mut TcpStream, ctx: &RouteCtx, req
         };
         return write_json(stream, 200, &r).await;
     };
-    let scoping = latch_scope(ctx.app(), &settings, consumer_source, body.tab.as_deref());
+    let scoping = latch_scope(ctx, &settings, consumer_source, body.tab.as_deref());
     // #48 F-20: resolved BEFORE `into_scope()` collapses `Anonymous` and
     // `Unknown` into one `None`. That collapse is right for the latch (both fail
     // open) and wrong for the row, which has to say which of the three this call

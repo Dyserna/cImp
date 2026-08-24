@@ -362,7 +362,7 @@ pub(super) fn note_discovery_skipped(ctx: &RouteCtx, raw: &[u8]) {
         &body,
         claim_discovery_report,
         |tab, agent| TabFacts {
-            root: tab_root_key(ctx.app(), &settings, tab),
+            root: tab_root_key(ctx, &settings, tab),
             session: ctx
                 .graph()
                 .and_then(|g| g.live_session_for_tab(tab, agent)),

@@ -24,7 +24,7 @@ pub(super) async fn handle_status(stream: &mut TcpStream, ctx: &RouteCtx) -> App
         &serde_json::json!({
             // Step 4: through `latch_snapshot`, so a hand-run `/status` and the
             // UI's badge poll see the same freshness rule rather than two.
-            "latches": latch_snapshot(ctx.app()),
+            "latches": latch_snapshot(ctx),
             "injection": injection_status(&ctx.settings()),
         }),
     )

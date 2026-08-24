@@ -34,19 +34,36 @@
 //!
 //! Phase 0 wrapped ten commands as a sizing spike. **Phase A1 finished the
 //! surface**: all 180 `#[tauri::command]`s in the crate are now either a
-//! wrapper over a use case here, or an explicit leave whose doc says why —
-//! 138 and 42 respectively.
+//! wrapper over a use case here, or an explicit leave whose doc says why.
 //!
 //! A leave is not a gap. The criterion is that the body is one call on a handle
 //! Tauri already injected, with no argument shaping, no ordering and nothing to
 //! return that a test could disagree with: `graph_status` (one accessor),
 //! `stt_start_recording` (one post to a capture thread), `themes_list` (a free
 //! function that was headless the day it was written), the six Preview commands
-//! that call one method on a Tauri `Webview`, the window effects. Three leaves
-//! are deferrals rather than "nothing to test", and say so: the latch commands
-//! and `injection_status` (V42 #114 owns that seam), and `plugins_rescan`
-//! (its rule needs an `OffloadService`, which Phase A2 has to make
-//! constructible first).
+//! that call one method on a Tauri `Webview`, the window effects.
+//!
+//! A1 recorded three leaves as *deferrals* — leaves that existed because the
+//! thing under them could not be built without a Tauri app. **Phase A2 closed
+//! all three**, and it is worth saying how, because the three answers differ:
+//!
+//! * `plugins_rescan` became a wrapper. The rule it could not pin — a rescan
+//!   writes no settings, so without the pulse ask nothing tells a live session
+//!   its `run_check` tool list moved — needed an `OffloadService`, whose
+//!   constructor took an `AppHandle`. It takes a
+//!   [`CoreHost`](host::CoreHost) now, so the two steps live together in
+//!   [`offload::OffloadServiceUseCases::rescan_plugins`].
+//! * The **latch commands stay leaves, for a new reason.** A2 injected the
+//!   latch layer itself ([`crate::offload::latch::latch_snapshot`] and
+//!   `apply_latch_override` take a
+//!   [`RouteCtx`](crate::offload::host::RouteCtx)), so the rules underneath are
+//!   drivable in a test and one is. What is left at the wire is one call with
+//!   nothing to shape — A1's own criterion for a leave, now satisfied honestly
+//!   instead of by deferral.
+//! * `injection_status` was never blocked on anything: its resolver is a pure
+//!   function of a `Settings`. A1's note pointed at #114, but that is a
+//!   question about which module the resolver should live in, not about
+//!   reachability.
 //!
 //! Two leaves have a different reason again: `content_open_folder` and
 //! `detection_open_rules_folder` are the crate's audited "reveal this folder"

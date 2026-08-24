@@ -169,6 +169,7 @@ impl Wiring {
                     tab_metas: self.tab_metas.clone(),
                     initial_active: self.initial_active.clone(),
                     ai_tts_suppressed: self.ai_tts_suppressed.clone(),
+                    settings: self.settings.clone(),
                 },
             );
         }
@@ -626,11 +627,14 @@ impl Wiring {
     /// ask the registry for its sanitized known IDs (matches
     /// exactly what `pty::scrollback::scrollback_file_for`
     /// writes).
-    pub fn wire_scrollback_prune(&self, app: &App) {
-        let app_handle = app.handle().clone();
+    ///
+    /// V42 Phase A2: reads the registry handle this struct already carries
+    /// rather than looking `AppState` up to find the same `Arc` — it does not
+    /// need an app at all, so it no longer takes one.
+    pub fn wire_scrollback_prune(&self) {
+        let tabs = self.tabs.clone();
         tauri::async_runtime::spawn(async move {
-            let state = app_handle.state::<crate::ipc::AppState>();
-            let registry = state.tabs.lock().await;
+            let registry = tabs.lock().await;
             let known = registry.known_scrollback_ids();
             drop(registry);
             crate::pty::scrollback::prune_orphans(&known);

@@ -30,7 +30,7 @@ use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Manager};
+use super::host::RouteCtx;
 use tracing::{debug, info, warn};
 
 /// Discovery-file name under the portable root (next to `settings.json`).
@@ -224,14 +224,14 @@ pub(super) fn is_ancestor_or_equal(root: &Path, hint: &Path) -> bool {
 /// asserted. `claude_hook_cwd` and [`external_project_root`] share it so the tab
 /// a hook claims resolves to the same place on both paths.
 pub(crate) fn hook_tab_root(
-    app: &AppHandle,
+    ctx: &RouteCtx,
     settings: &crate::settings::Settings,
     tab: Option<&str>,
 ) -> Option<PathBuf> {
     let tab = tab.map(str::trim).filter(|t| !t.is_empty())?;
-    let launch = app
-        .try_state::<crate::ipc::AppState>()
-        .map(|s| s.launch.cwd.clone())
+    let launch = ctx
+        .core()
+        .map(|s| s.launch_cwd.clone())
         .or_else(|| std::env::current_dir().ok())?;
     crate::tabs::ai_tab_dir(settings, tab, &launch)
 }
@@ -268,13 +268,13 @@ pub(crate) fn hook_tab_root(
 /// `rel_path`'s root-prefix strip and `activity::root_key` see the same form the
 /// tab configuration and the indexer use.
 pub(super) fn external_project_root(
-    app: &AppHandle,
+    ctx: &RouteCtx,
     settings: &crate::settings::Settings,
     tab: Option<&str>,
     cwd: Option<&str>,
 ) -> Option<PathBuf> {
     resolve_external_root(
-        hook_tab_root(app, settings, tab),
+        hook_tab_root(ctx, settings, tab),
         cwd,
         &settings.graph.effective_db_subdir(),
     )

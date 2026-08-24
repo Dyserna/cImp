@@ -708,6 +708,22 @@ impl<'a> TabService<'a> {
         // tab. The orphan-prune sweep at next launch would also catch it,
         // but cleaning up immediately keeps the disk-state consistent
         // with the user's mental model.
+        //
+        // ── V42 Phase A2, locked decision 6: **stays ambient, argued** ──────
+        //
+        // The criterion is the headless one: does injecting it buy a test
+        // anything? Here it does not. `scrollback::delete` resolves
+        // `<exe-dir>/scrollback/<tab>.bin` and no-ops when the file is absent,
+        // and under `cargo test` the exe is the test binary — so a service
+        // driven headlessly resolves a path under `target/`, finds nothing and
+        // returns `Ok`. There is no state to observe and none to corrupt.
+        // Wrapping it in a `ScrollbackStore` trait would add an interface with
+        // one method and one implementation, in front of a fire-and-forget
+        // cleanup whose only failure mode is already a `warn!`.
+        //
+        // What WOULD change the answer: a scrollback path that could resolve
+        // into a real installation from a test, or a caller that needed to
+        // assert the delete happened. Neither holds today.
         if let Err(e) = crate::pty::scrollback::delete(&tab) {
             warn!(?tab, error = %e, "close_tab: scrollback delete failed");
         }
@@ -722,6 +738,16 @@ impl<'a> TabService<'a> {
         // tab drops that row, so a closed tab reads exactly like an idle one — and
         // without it the driver would wait out its whole deadline on a tab that no
         // longer exists.
+        //
+        // ── V42 Phase A2, locked decision 6: **stays ambient, argued** ──────
+        //
+        // The other half of the same decision, and it passes the criterion for
+        // the opposite reason to the scrollback delete: this global is a pure
+        // in-process registry whose effect IS test-visible — `delegation`'s own
+        // tests call `note_worker_gone` and then read the flight back. An
+        // injected handle would be a second way to reach a `OnceLock` that has
+        // exactly one instance per process, and a test asserting through it
+        // would be asserting about the injection rather than about the rule.
         crate::delegation::note_worker_gone(&tab);
 
         // Remove the settings entry. Drop the active_tab_id pointer if it
@@ -1306,6 +1332,8 @@ impl<'a> TabService<'a> {
             return Ok(());
         }
 
+        // Both process-globals below stay ambient — the argument for each is
+        // recorded once, at `close`'s call sites (V42 Phase A2, decision 6).
         if let Err(e) = crate::pty::scrollback::delete(&tab) {
             warn!(?tab, error = %e, "set_enabled_ai_tabs: scrollback delete failed");
         }

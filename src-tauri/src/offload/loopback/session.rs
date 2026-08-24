@@ -561,7 +561,7 @@ pub(crate) fn tool_result_core(
     };
     // #104: `record_usage` opens the project's store. A sub-agent's cwd is not
     // a root; with no resolvable one there is nothing to attribute the usage to.
-    let Some(root) = external_project_root(ctx.app(), &ctx.settings(), Some(tab), Some(cwd)) else {
+    let Some(root) = external_project_root(ctx, &ctx.settings(), Some(tab), Some(cwd)) else {
         return false;
     };
     graph.record_usage(

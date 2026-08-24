@@ -172,7 +172,7 @@ pub(super) fn latch_beacon_core(
     tab: Option<&str>,
     tool: &str,
 ) -> Result<LatchView, String> {
-    let scoping = latch_scope(ctx.app(), settings, agent, tab);
+    let scoping = latch_scope(ctx, settings, agent, tab);
     if let LatchScoping::Unknown(tab) = scoping {
         return Err(tab);
     }
@@ -361,7 +361,7 @@ pub(super) async fn handle_latch_state(
     };
     let agent = wire_agent(LATCH_STATE_ROUTE, body.consumer.as_deref());
     let settings = ctx.settings();
-    let scoping = latch_scope(ctx.app(), &settings, agent, body.tab.as_deref());
+    let scoping = latch_scope(ctx, &settings, agent, body.tab.as_deref());
     // #48: the verdict comes from the resolved injection scope, which is
     // app-wide for both identity-less cases — NOT a hard `false`. #45 folded
     // "an id that names no configured tab" into `latch_scope`'s `None`, and

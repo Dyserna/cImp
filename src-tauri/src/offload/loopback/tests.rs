@@ -7734,6 +7734,92 @@ fn every_bad_body_reply_keeps_its_own_bytes() {
     );
 }
 
+/// **The latch's identity funnel, RUN rather than read** (V42 Phase A2).
+///
+/// `latch_scope` is *the* funnel every gated route resolves identity through —
+/// `/graph_run` and `/mcp/call` via `gate`, `/latch/beacon` via `beacon`, the
+/// three `/context/*` hooks and `/delegate` via `admit` — and the rule it
+/// enforces (V33 C5, #45) is that a scope comes from the user's own tab
+/// CONFIGURATION and never from the caller's assertion. It took an `AppHandle`
+/// (the V28 live-session lookup), so until A2 injected that reach the rule
+/// could only be read; now it can be driven:
+///
+/// * a configured tab of the asserted consumer resolves to a scope, whose
+///   `root` is derived from settings — never from anything on the wire;
+/// * an id that names no configured tab resolves to `Unknown`, which keys NO
+///   registry entry (#45's bound) and is deliberately not the same answer as
+///   "no id at all";
+/// * no id at all is `Anonymous`, the fail-open case a pre-`--tab` child hits.
+#[test]
+fn a_latch_scope_comes_from_the_configuration_and_never_from_the_caller() {
+    use crate::offload::host::testing::{route_ctx, FakeRouteServices};
+    use crate::offload::latch::LatchScoping;
+    use crate::service::host::testing::core_host;
+    use crate::settings::{AiToolTabConfig, Settings, SettingsHandle, TabConfig};
+
+    let scratch = root_tree("latch-scope");
+
+    #[allow(clippy::field_reassign_with_default)]
+    let mut cfg = AiToolTabConfig::default();
+    cfg.id = "ai-one".to_string();
+    cfg.name = "one".to_string();
+    cfg.command = crate::harness::DEFAULT_HARNESS.token().to_string();
+    let settings = Settings {
+        tabs: vec![TabConfig::AiTool(cfg)],
+        ..Default::default()
+    };
+
+    let mut core = core_host(SettingsHandle::new(
+        settings.clone(),
+        settings.clone(),
+        scratch.clone(),
+    ))
+    .host;
+    core.launch_cwd = scratch.clone();
+    // No graph service: the live-session lookup withholds, which is the
+    // `None` "absence of evidence" case `LatchScope::session` documents.
+    let ctx = route_ctx(FakeRouteServices {
+        core: Some(core),
+        ..Default::default()
+    });
+    let agent = crate::harness::DEFAULT_HARNESS.token();
+
+    match latch_scope(&ctx, &settings, agent, Some("ai-one")) {
+        LatchScoping::Scoped(s) => {
+            assert_eq!(s.tab, "ai-one");
+            assert_eq!(s.agent, agent);
+            assert_eq!(
+                s.session, None,
+                "no live-session registry means no session, never an invented one"
+            );
+            assert_eq!(
+                s.root,
+                tab_root_key(&ctx, &settings, "ai-one"),
+                "the root rides the scope and is derived from settings"
+            );
+            assert!(!s.root.is_empty(), "a resolvable root must not read as absent");
+        }
+        other => panic!("a configured tab must resolve to a scope, got {other:?}"),
+    }
+
+    assert!(
+        matches!(
+            latch_scope(&ctx, &settings, agent, Some("ai-forged")),
+            LatchScoping::Unknown(ref t) if t == "ai-forged"
+        ),
+        "an id naming no configured tab must be Unknown — it keys no registry entry"
+    );
+    assert!(
+        matches!(
+            latch_scope(&ctx, &settings, agent, None),
+            LatchScoping::Anonymous
+        ),
+        "no id at all is Anonymous, which is a different answer from Unknown"
+    );
+
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
 /// **V33 C4's allowlist, RUN rather than read** (V42 Phase A2).
 ///
 /// The scan below
@@ -9150,7 +9236,7 @@ fn no_http_route_can_reach_a_contamination_clear() {
     //    turns a string into one is called from the IPC command.
     let ipc = include_str!("../../ipc/commands.rs");
     assert!(
-        ipc.contains("apply_latch_override(&app, &consumer, &tab, &action)"),
+        ipc.contains("apply_latch_override(&ctx, &consumer, &tab, &action)"),
         "the IPC command is the caller of record"
     );
     // `concat!` so this needle does not match itself in the source it

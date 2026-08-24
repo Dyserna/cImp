@@ -776,7 +776,7 @@ fn main() {
             wiring.wire_detection_updater();
             wiring.wire_harness_verify();
             wiring.wire_window_title(app);
-            wiring.wire_scrollback_prune(app);
+            wiring.wire_scrollback_prune();
             Ok(())
         })
 
@@ -977,6 +977,12 @@ fn main() {
                 api.prevent_close();
                 let window = window.clone();
                 let app = window.app_handle().clone();
+                // V42 Phase A2 left every `app.state::<T>()` in this teardown
+                // where it is. This is the composition root's other end: the
+                // shutdown reaches every managed service exactly once, by type,
+                // and there is no seam to inject through — the alternative is a
+                // second registry of the same handles, kept in step with this
+                // one by hand.
                 tauri::async_runtime::spawn(async move {
                     let state = app.state::<AppState>();
                     // Flush any settings edit still inside the 500ms debounce

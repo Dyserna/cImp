@@ -30,10 +30,10 @@
 //! (the badge popover, over IPC — never over HTTP).
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::{Mutex, OnceLock, PoisonError};
 
 use serde::Serialize;
-use tauri::{AppHandle, Manager};
+use super::host::RouteCtx;
 use tracing::{info, warn};
 
 // V42 review (dropped-at-cap): these two used to come from `super::loopback` —
@@ -41,7 +41,7 @@ use tracing::{info, warn};
 // extracted from, and the reason this file could not be read as sitting below
 // the router. Both live in `offload` itself now; neither was ever about
 // routing.
-use super::{bounded_id, live_settings};
+use super::bounded_id;
 use super::outbound::{self, Budget};
 use super::toolclass::{self, Latch, ProxyGate, ToolClass, WriteTaint};
 
@@ -164,7 +164,7 @@ impl LatchScope {
 ///
 /// **The empty-list escape**, and why it is keyed on the WHOLE list rather than
 /// on this consumer's slice. With no AI tab configured at all the predicate
-/// accepts everything, because [`live_settings`] falls back to
+/// accepts everything, because [`RouteCtx::settings`] falls back to
 /// `Settings::default()` (whose `tabs` is empty) when managed state is not up
 /// yet — and a request arriving in that window must not be rejected on the
 /// strength of a list we could not read. That condition is "settings are
@@ -292,7 +292,7 @@ pub(super) fn tab_identity<'a>(
 /// resolves identity and policy under the SAME snapshot (the "ONE settings read
 /// for the whole call" discipline `/mcp/call` documents).
 pub(super) fn latch_scope(
-    app: &AppHandle,
+    ctx: &RouteCtx,
     settings: &crate::settings::Settings,
     agent: &'static str,
     tab: Option<&str>,
@@ -301,14 +301,14 @@ pub(super) fn latch_scope(
         TabIdentity::Anonymous => LatchScoping::Anonymous,
         TabIdentity::Unknown(tab) => LatchScoping::Unknown(tab.to_string()),
         TabIdentity::Configured(tab) => {
-            let session = app
-                .try_state::<Arc<crate::graph::GraphService>>()
+            let session = ctx
+                .graph()
                 .and_then(|g| g.live_session_for_tab(tab, agent));
             LatchScoping::Scoped(LatchScope {
                 agent,
                 tab: tab.to_string(),
                 session,
-                root: tab_root_key(app, settings, tab),
+                root: tab_root_key(ctx, settings, tab),
             })
         }
     }
@@ -332,10 +332,10 @@ pub(super) fn latch_scope(
 /// An empty string is possible only if even `current_dir()` fails (a deleted
 /// cwd). It is not papered over with a placeholder: a root that cannot be
 /// resolved must read as absent, not as some other project.
-pub(super) fn tab_root_key(app: &AppHandle, settings: &crate::settings::Settings, tab: &str) -> String {
-    let launch = app
-        .try_state::<crate::ipc::AppState>()
-        .map(|s| s.launch.cwd.clone())
+pub(super) fn tab_root_key(ctx: &RouteCtx, settings: &crate::settings::Settings, tab: &str) -> String {
+    let launch = ctx
+        .core()
+        .map(|s| s.launch_cwd.clone())
         .or_else(|| std::env::current_dir().ok());
     let Some(launch) = launch else {
         return String::new();
@@ -2779,15 +2779,15 @@ impl outbound::ScopeAudit for TabAudit<'_> {
 /// polls no `/latch/state`, so without this an armed one-shot would wait for the
 /// model to call a cImp tool rather than for the user's `/clear`. This is the
 /// same 4 s read the badge already makes; no second timer is introduced.
-pub fn latch_snapshot(app: &AppHandle) -> Vec<LatchStatus> {
+pub fn latch_snapshot(ctx: &RouteCtx) -> Vec<LatchStatus> {
     // Resolve scopes with the registry lock NOT held: `latch_scope` locks the
     // graph service for the live-session lookup.
-    let settings = live_settings(app);
+    let settings = ctx.settings();
     let scopes: Vec<LatchScope> = latches()
         .keys()
         .iter()
         .filter_map(|(agent, tab)| {
-            latch_scope(app, &settings, agent, Some(tab.as_str())).into_scope()
+            latch_scope(ctx, &settings, agent, Some(tab.as_str())).into_scope()
         })
         .collect();
     for cleared in latches().observe_all(&scopes) {
@@ -3006,7 +3006,7 @@ pub(super) fn unlatch_clear_row(
 /// a click. There is no HTTP path into this function now, so
 /// [`outbound::Origin::Ipc`] on the row is a fact rather than an assumption.
 pub fn apply_latch_override(
-    app: &AppHandle,
+    ctx: &RouteCtx,
     consumer: &str,
     tab: &str,
     action: &str,
@@ -3014,8 +3014,8 @@ pub fn apply_latch_override(
     let action = LatchOverride::parse(action)?;
     let agent = crate::graph::source_for_consumer(consumer);
     // One settings snapshot, shared with the tab-id check inside `latch_scope`.
-    let settings = live_settings(app);
-    let scope = latch_scope(app, &settings, agent, Some(tab))
+    let settings = ctx.settings();
+    let scope = latch_scope(ctx, &settings, agent, Some(tab))
         .into_scope()
         .ok_or_else(|| {
             // #45 folded "not a configured tab" into this refusal, so the

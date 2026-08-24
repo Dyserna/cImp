@@ -1349,7 +1349,7 @@ fn claude_hook_cwd(
     if !raw.is_empty() {
         return Some(raw.to_string());
     }
-    hook_tab_root(app, settings, tab).map(|d| d.to_string_lossy().into_owned())
+    hook_tab_root(&ctx(app), settings, tab).map(|d| d.to_string_lossy().into_owned())
 }
 
 /// Parse a Claude hook-input payload, or `None` when the body is not JSON.

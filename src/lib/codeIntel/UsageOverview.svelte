@@ -56,7 +56,6 @@
     agentBarClass,
     arcPath,
     barHeightPct,
-    cacheHitRatio,
     costGrandTotal,
     costOverrideForIdx,
     costRowState,
@@ -1941,7 +1940,9 @@
         <div class="rows scroll10">
           {#each usage.sessions as s (s.session_id)}
             {@const nCommits = commitCounts[s.session_id] ?? 0}
-            {@const hit = cacheHitRatio(s.totals)}
+            <!-- The ratio is a column on the row (V42): the backend divides,
+                 and `null` means it had no denominator to divide by. -->
+            {@const hit = s.cache_hit_ratio}
             {@const rowState = sessionRowState(s.session_id, selectedId, usage.active_session_ids)}
             <div class="sessrow-wrap">
               <button

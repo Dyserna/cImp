@@ -4,7 +4,6 @@ import {
   turnTotal,
   maxTurnTotal,
   barHeightPct,
-  cacheHitRatio,
   fmtTok,
   costUsd,
   sessionCost,
@@ -114,29 +113,10 @@ describe('barHeightPct', () => {
   });
 });
 
-describe('cacheHitRatio', () => {
-  test('matches the backend formula: cache_read / (cache_read + input)', () => {
-    expect(cacheHitRatio(kinds({ cache_read: 75, in_tok: 25 }))).toBe(0.75);
-    expect(cacheHitRatio(kinds({ cache_read: 0, in_tok: 100 }))).toBe(0);
-    expect(cacheHitRatio(kinds({ cache_read: 100, in_tok: 0 }))).toBe(1);
-  });
-
-  test('no denominator (nothing recorded yet) is null, not 0 and not NaN', () => {
-    expect(cacheHitRatio(kinds())).toBeNull();
-  });
-
-  test('a harness that declares neither category has no ratio at all', () => {
-    // V40 Phase G: absence is not zero. A harness billing one flat token
-    // number reports no `cache_read` and no `input`, and "0% cache hit" would
-    // be a claim it never made.
-    expect(cacheHitRatio({ output: 500 })).toBeNull();
-  });
-
-  test('a partially declared shape still divides by what it has', () => {
-    expect(cacheHitRatio({ input: 100 })).toBe(0);
-    expect(cacheHitRatio({ cache_read: 100 })).toBe(1);
-  });
-});
+// V42: `describe('cacheHitRatio')` stood here. The ratio is a column on
+// `SessionUsageRow` now, so its four cases — the formula, the empty map, the
+// harness that declares neither category, the partially declared shape — are
+// Rust tests beside the division, in `src-tauri/src/graph/index/usage.rs`.
 
 describe('fmtTok', () => {
   test('small counts stay exact', () => {
@@ -848,16 +828,16 @@ describe('V40 Phase G parity: a two-lane four-category session renders unchanged
     );
   });
 
-  test('the Sessions row: totals, cache-hit and cost are the same figures', () => {
+  test('the Sessions row: totals and cost are the same figures', () => {
     const rates: PriceRates = { input: 15, cache_write: 18.75, cache_read: 1.5, output: 75 };
     // The four cells the row prints.
     expect(fmtTok(totals.input)).toBe('3.2k');
     expect(fmtTok(totals.cache_write)).toBe('2.5k');
     expect(fmtTok(totals.cache_read)).toBe('106k');
     expect(fmtTok(totals.output)).toBe('2.2k');
-    // cache_read / (cache_read + input) — the pre-G formula, same inputs.
-    expect(cacheHitRatio(totals)).toBeCloseTo(106_000 / (106_000 + 3_180), 12);
-    expect(Math.round((cacheHitRatio(totals) ?? 0) * 100)).toBe(97);
+    // The row's fifth cell, cache-hit, is `SessionUsageRow.cache_hit_ratio`
+    // since V42 — the backend divides, and the Rust test beside it pins the
+    // 106k / (106k + 3.18k) ≈ 97% these same figures produce.
     // Cost: the direct key lookup bills each category at the rate the
     // hand-written `in_tok → input, cache_make → cache_write` mapping used to.
     const c = sessionCost(totals, rates);

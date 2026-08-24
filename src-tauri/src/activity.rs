@@ -328,6 +328,22 @@ macro_rules! declare_activity_kinds {
             pub const fn as_str(self) -> &'static str {
                 KINDS[self as usize].key
             }
+
+            /// The inverse of [`as_str`](Self::as_str): which kind a row that is
+            /// already on disk belongs to.
+            ///
+            /// `None` means "not a kind this build declares" — a row written by
+            /// a newer version, or under a wire value since retired. Readers
+            /// that classify a row by its lane (see [`RowStatus::classify`])
+            /// must be able to ask, and a `match` on the ENUM is what makes a
+            /// new kind's classification a compile-time decision rather than a
+            /// string comparison nobody added.
+            pub fn from_wire(kind: &str) -> Option<$name> {
+                match kind {
+                    $( $key => Some($name::$variant), )+
+                    _ => None,
+                }
+            }
         }
     };
 }
@@ -668,6 +684,379 @@ impl Attribution {
 
 }
 
+// ── Row status (#48, M-24) ─────────────────────────────────────────────────
+//
+// **Why this is here and not in either feed component.** Both the Tool Activity
+// tab and the Events tab render this store, and both collapsed every
+// `injection_flag` row into one treatment: Tool Activity painted the whole kind
+// chip danger-red ("the only kind with a tinted chip"), and Events mapped
+// `ok ? 'flagged' : 'denied'`. So `unscreened`, the two detector screens,
+// `memory_quarantine` and `latch_override` all arrived on screen as the same
+// alarm — and `unscreened`, whose entire meaning is *"we did not look at all of
+// it"*, read as *"we blocked something"*, which is the opposite of the truth.
+// `latch_override` — a user GRANTING capability back — read as containment
+// firing. One classifier, consumed by both feeds: the security vocabulary of
+// this app must not differ between two tabs showing the same rows.
+//
+// **Why it is here and not in `src/lib/activity.ts` (V42).** It was a ~120-line
+// pure function of one row, and every branch in it was a restatement of a rule
+// that lives on this side: [`Screen::is_denial`], the `updater` source written
+// outside `record_flag`, the transition verbs the lifecycle recorders mint,
+// `SCREEN_DROP_SOURCE`. A restatement cannot be checked against the thing it
+// restates — a screen added here simply fell through to the frontend's
+// "unknown" branch — so the classifier moved to where those rules are: it now
+// matches [`Screen`] exhaustively (a new screen must choose a word or the build
+// fails) and `every_denial_screen_and_only_a_denial_screen_reads_as_denied`
+// holds the vocabulary to `is_denial` itself. What stayed on the frontend is the
+// part that is genuinely presentation: the tooltip sentences (`STATUS_TITLE`)
+// and the chip's CSS.
+
+/// Sources that are TELEMETRY CHANNELS rather than tool invocations:
+/// `read_advisor` reports advisor reminders and full-file-`Read` bypasses,
+/// `harness` reports contract/sub-agent drift. Both record `ok: false` to mean
+/// "this signal fired", not "this call failed" — so painting them with the error
+/// colour made the feed read as mostly-broken when nothing had broken (20 of 28
+/// red rows on one machine were bypass canaries).
+const CANARY_SOURCES: [&str; 2] = ["read_advisor", "harness"];
+
+/// Declare [`RowStatus`], its wire words and [`RowStatus::ALL`] from one list,
+/// so the word a row carries, the class a chip is drawn with and the set the
+/// guards iterate cannot drift. Same shape as [`declare_activity_kinds`] above
+/// and `declare_screens!` two modules over, for the same reason.
+macro_rules! declare_row_statuses {
+    (
+        $(#[$enum_attr:meta])*
+        pub enum $name:ident {
+            $( $(#[$variant_attr:meta])* $variant:ident => $wire:literal ),+ $(,)?
+        }
+    ) => {
+        $(#[$enum_attr])*
+        pub enum $name {
+            $( $(#[$variant_attr])* $variant, )+
+        }
+
+        impl $name {
+            /// Every status, in declaration order — derived from the variant
+            /// list, not written beside it. Read by the guards that hold this
+            /// vocabulary to the frontend's.
+            #[cfg_attr(not(test), allow(dead_code))]
+            pub const ALL: &'static [$name] = &[ $( $name::$variant, )+ ];
+
+            /// The word itself: the serialized value, the chip's CSS class and
+            /// the label the feeds render. One string, because a status the
+            /// frontend has no word for cannot be drawn.
+            pub const fn as_str(self) -> &'static str {
+                match self { $( $name::$variant => $wire, )+ }
+            }
+        }
+    };
+}
+
+declare_row_statuses! {
+/// What one feed row actually reports, as one word.
+///
+/// Three plain call outcomes:
+/// * `ok` — the call worked.
+/// * `failed` — the call failed.
+/// * `signal` — a telemetry channel fired ([`CANARY_SOURCES`]); not a failure.
+///
+/// …and nine `injection_flag` outcomes, which are NOT interchangeable:
+/// * `denied` — a screen stopped the call. The only one that means "we blocked
+///   something", and the only one wearing danger. Reached by exactly the
+///   screens [`Screen::is_denial`] answers `true` for, which is a test, not a
+///   convention.
+/// * `flagged` — a detector matched and the result was delivered anyway
+///   (detection is surface-only, locked decision 5).
+/// * `unscreened` — part of the result was never looked at. Nothing found,
+///   nothing stopped: the absence of a verdict is not a verdict of absence.
+/// * `held` — a memory write was stored and withheld pending human review.
+/// * `engaged` — containment came ON for a tab (a native-web beacon; a
+///   conversation becoming contaminated). Nothing was refused.
+/// * `granted` — a user gave capability back (a latch override; a contamination
+///   flag cleared). A release, not a block — which is exactly why it must not
+///   share a treatment with one.
+/// * `update` / `rejected` — the detection auto-updater acted, or refused a
+///   bundle. Not a screen over a tool call at all.
+/// * `recorded` — a containment row this build has no category for.
+///   Deliberately NOT folded into `denied` or `flagged`: it must render as "we
+///   do not have a word for this" rather than inherit a claim.
+///
+/// …and four `offload_server` outcomes. `stopped` and `down` are the pair that
+/// must not merge, for the same reason `denied` and `granted` must not: cImp
+/// killing a server on purpose and a server failing to come up are opposite
+/// facts that both end with no process running, and only one of them is
+/// something going wrong.
+/// * `started` — the process was spawned. Says nothing about health yet.
+/// * `ready` — it answered `/health`; the window and slot count were read.
+/// * `stopped` — cImp stopped it deliberately (see the row's target for which
+///   intent: user, restart, or app shutdown). Not a failure.
+/// * `down` — it never came up, or it ended without cImp stopping it.
+///
+/// …and three `delegation` transitions that are not call outcomes at all, and
+/// so cannot borrow one. Under the plain `ok`/`failed` fallthrough a `start`
+/// row read "Call succeeded" before anything had happened, a `takeover` — the
+/// user reclaiming their own tab — read "Call failed", and a `role_moved` row,
+/// which is a configuration change, read as a call. Each is one fact and gets
+/// one word (the `plugin` lane's rule, applied in the direction it points: a
+/// kind whose outcomes really are two gets no synonyms; a kind whose rows are
+/// not outcomes gets its own words rather than a borrowed claim).
+///
+/// The `plugin` lane adds no word on purpose: a definition either loaded or it
+/// did not, and `ok`/`failed` say that exactly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowStatus {
+    /// The call worked.
+    Ok => "ok",
+    /// The call failed.
+    Failed => "failed",
+    /// A telemetry channel fired — not a failure. See [`CANARY_SOURCES`].
+    Signal => "signal",
+    /// An offload server process was spawned. Says nothing about health yet.
+    Started => "started",
+    /// An offload server answered `/health`.
+    Ready => "ready",
+    /// cImp stopped an offload server deliberately. Not a failure.
+    Stopped => "stopped",
+    /// An offload server never came up, or ended without cImp stopping it.
+    Down => "down",
+    /// V39: a delegation started — cImp typed the request and began waiting.
+    /// The row that says how it ended is the next one for that worker.
+    Driving => "driving",
+    /// V39: the user took the tab back mid-flight. Deliberate, and the worker
+    /// kept running: never a failure.
+    Takeover => "takeover",
+    /// V39: the Manual role for a harness moved off this tab. Configuration,
+    /// not traffic.
+    Moved => "moved",
+    /// A screen stopped the call — this app's one "we blocked something".
+    Denied => "denied",
+    /// A detector matched and the result was delivered anyway.
+    Flagged => "flagged",
+    /// Part of the result was never looked at.
+    Unscreened => "unscreened",
+    /// A memory write was stored and withheld pending human review.
+    Held => "held",
+    /// Containment came ON for a tab. Nothing was refused.
+    Engaged => "engaged",
+    /// A user gave capability back. A release, not a block.
+    Granted => "granted",
+    /// The detection auto-updater acted on a bundle.
+    Update => "update",
+    /// The detection auto-updater REFUSED a bundle. Not a blocked call.
+    Rejected => "rejected",
+    /// A containment row this build has no category for.
+    Recorded => "recorded",
+    /// V33 Phase A: a child ran outside the OS sandbox. Distinct from `denied`
+    /// (a model was refused) and from `failed` (the command itself broke) — the
+    /// command ran fine, the boundary was absent.
+    Unsandboxed => "unsandboxed",
+    /// A sandboxed child failed with output MATCHING an access-denial
+    /// signature.
+    ///
+    /// Its own word rather than `denied` or `failed`, because it is neither.
+    /// `denied` is this app's one "we stopped it" — filled red, a certainty cImp
+    /// does not have here: it cannot observe the OS's ACL decision, only the
+    /// exit code and stderr the child chose to print, so the backend words this
+    /// row as a labeled heuristic and the chip must not out-claim it. `failed`
+    /// is wrong the other way: the call itself returned normally (a nonzero exit
+    /// is still output the model receives), and reading a boundary hit as an
+    /// ordinary broken command is exactly the confusion this row exists to end.
+    Boundary => "boundary",
+    /// V37 C6: an MCP server was confirmed unhealthy (the flap guard tripped),
+    /// or an enabled one could not be connected at all.
+    ///
+    /// Its own word rather than `down`, whose tooltip is written about an
+    /// offload SERVER PROCESS cImp owns — an MCP server is somebody else's
+    /// process (or somebody else's URL), cImp neither started nor stopped it,
+    /// and reading one row's vocabulary onto the other would promise a lifecycle
+    /// this app does not have.
+    Unhealthy => "unhealthy",
+    /// V37 C6: an MCP server answered again after having been unhealthy. The
+    /// row contract C6 guarantees follows every error row about a server that
+    /// came back, so an error is never the lane's last word.
+    Recovered => "recovered",
+    /// V37 C9: an external server's tool was WITHHELD from every consumer's
+    /// advertised surface because description screening flagged its name or
+    /// description. It lives in the `mcp` lane beside call rows, but no call
+    /// ever happened.
+    ///
+    /// Its own word, and neither of the two it kept falling into: `failed`
+    /// claims a call that was never made, and `flagged` — whose whole promise is
+    /// "nothing was blocked" — reports the one place in cImp where detection
+    /// really does REMOVE something as a delivery.
+    Withheld => "withheld",
+}
+}
+
+impl serde::Serialize for RowStatus {
+    /// One word, from [`RowStatus::as_str`] — the same string the chip is
+    /// classed with. There is deliberately no `Deserialize`: the stored word is
+    /// never read back (see [`ActivityEntry::status`]).
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
+impl RowStatus {
+    /// The value `serde` leaves in [`ActivityEntry::status`] while parsing, and
+    /// **never a word anything renders**: the field is `skip_deserializing`, and
+    /// [`parse_line`] — the one function that turns a JSONL line into a record —
+    /// re-derives the real word immediately. It exists only because
+    /// `skip_deserializing` needs something to put there.
+    ///
+    /// `Recorded` rather than `Ok` or `Failed` on purpose: if a future reader
+    /// ever parses a row without re-deriving, it renders as "this build has no
+    /// word for it" — the one word in the vocabulary that claims nothing —
+    /// instead of asserting that a call succeeded or failed.
+    fn unclassified() -> RowStatus {
+        RowStatus::Recorded
+    }
+
+    /// Classify one row.
+    ///
+    /// `ok` is read as the denial predicate ONLY for the screens that follow it.
+    /// [`Screen::is_denial`] is the rule and
+    /// [`record_flag`](crate::offload::outbound::record_flag) publishes it as
+    /// `ok: false` — but `updater` rows are the one source written outside
+    /// `record_flag`, where `ok` is the bundle OUTCOME (`rejected ⇒ false`).
+    /// Reading `!ok` as "denied" there would report a refused rules bundle as a
+    /// blocked tool call, which is the same collapse this function exists to
+    /// undo, so `updater` is matched before `ok` is consulted at all.
+    ///
+    /// Every lane whose rows are TRANSITIONS is keyed on `tool` (the verb),
+    /// never on `ok` alone: `ok` is true for both a healthy start and a
+    /// deliberate stop, so reading it by itself would render "the server is
+    /// gone" and "the server is up" as one word.
+    pub fn classify(e: &ActivityEntry) -> RowStatus {
+        match ActivityKind::from_wire(&e.kind) {
+            Some(ActivityKind::OffloadServer) => match e.tool.as_str() {
+                "start" => RowStatus::Started,
+                "ready" => RowStatus::Ready,
+                "stop" => RowStatus::Stopped,
+                "fail" => RowStatus::Down,
+                // A transition added later than this reader. `ok` is documented
+                // as the transition's outcome, which is a claim we can still
+                // make; the verb it belongs to is not.
+                _ => {
+                    if e.ok {
+                        RowStatus::Ok
+                    } else {
+                        RowStatus::Down
+                    }
+                }
+            },
+            // `ok` here distinguishes a CHOSEN unsandboxed state (the switch is
+            // off) from an unavailable one, so it cannot also carry the verb.
+            // Locked decision 17 requires those two to stay visibly distinct,
+            // which the row's `target` text spells out ("off (user choice)" /
+            // "unavailable").
+            Some(ActivityKind::Sandbox) => match e.tool.as_str() {
+                "unsandboxed" => RowStatus::Unsandboxed,
+                // A child ran INSIDE the boundary. Deliberately quiet: this is
+                // the expected case, and the row exists to remove the empty-lane
+                // ambiguity ("everything was sandboxed" vs "nothing ever ran"),
+                // not to compete for attention.
+                "sandboxed" => RowStatus::Ok,
+                "denied" => RowStatus::Boundary,
+                // `grant`, drive mappings, and anything added later: `ok` is
+                // that event's outcome, which is a claim we can still make.
+                _ => Self::plain(e),
+            },
+            Some(ActivityKind::McpHealth) => match e.tool.as_str() {
+                "unhealthy" | "connect_failed" => RowStatus::Unhealthy,
+                "healthy" => RowStatus::Recovered,
+                _ => {
+                    if e.ok {
+                        RowStatus::Recovered
+                    } else {
+                        RowStatus::Unhealthy
+                    }
+                }
+            },
+            Some(ActivityKind::InjectionFlag) => Self::for_screen(e),
+            // V39 locked decision 14. Only the rows that are NOT call outcomes
+            // are named; `done`, `refused`, `timeout` and `worker_exited` fall
+            // through, where `ok`/`failed` say exactly what happened and a
+            // synonym would dilute the vocabulary.
+            Some(ActivityKind::Delegation) => match e.tool.as_str() {
+                "start" => RowStatus::Driving,
+                "takeover" => RowStatus::Takeover,
+                "role_moved" => RowStatus::Moved,
+                _ => Self::plain(e),
+            },
+            // V37 C9, and BEFORE the plain fallthrough on purpose: these rows
+            // are minted `ok: false` in the `mcp` lane, so without this a
+            // withheld tool renders as "Call failed" — a claim about a call that
+            // never happened. Keyed on the exact wire source, never on the kind
+            // alone: an ordinary failed call on the same lane stays `failed`.
+            Some(ActivityKind::Mcp) if e.source == crate::offload::mcp_host::SCREEN_DROP_SOURCE => {
+                RowStatus::Withheld
+            }
+            _ => Self::plain(e),
+        }
+    }
+
+    /// The three plain call outcomes — the tail every lane without a verb of its
+    /// own falls through to.
+    fn plain(e: &ActivityEntry) -> RowStatus {
+        if e.ok {
+            RowStatus::Ok
+        } else if CANARY_SOURCES.contains(&e.source.as_str()) {
+            RowStatus::Signal
+        } else {
+            RowStatus::Failed
+        }
+    }
+
+    /// One `injection_flag` row, by the [`Screen`] that wrote it.
+    ///
+    /// Exhaustive over the enum on purpose: a screen added to `declare_screens!`
+    /// does not compile until it has picked a word, which is the whole reason
+    /// this classification moved next to the screens. The four that read
+    /// `denied` are exactly [`Screen::is_denial`]'s set — pinned by
+    /// `every_denial_screen_and_only_a_denial_screen_reads_as_denied` rather
+    /// than by the two lists happening to agree.
+    fn for_screen(e: &ActivityEntry) -> RowStatus {
+        let Some(screen) = Screen::from_wire(&e.source) else {
+            // A screen a WRITER declares and this reader does not (a row from a
+            // newer build, or a wire value since retired). `ok: false` still
+            // carries `Screen::is_denial`, which is a claim we can make; a
+            // delivered one gets the no-category word rather than a borrowed
+            // one.
+            return if e.ok {
+                RowStatus::Recorded
+            } else {
+                RowStatus::Denied
+            };
+        };
+        match screen {
+            // Checked before `ok` is read as a denial: its `ok` is the bundle
+            // outcome (see this function's sibling doc).
+            Screen::Updater => {
+                if e.ok {
+                    RowStatus::Update
+                } else {
+                    RowStatus::Rejected
+                }
+            }
+            Screen::Signature | Screen::Classifier => RowStatus::Flagged,
+            Screen::Unscreened => RowStatus::Unscreened,
+            Screen::MemoryQuarantine => RowStatus::Held,
+            Screen::LatchBeacon | Screen::Contamination => RowStatus::Engaged,
+            Screen::LatchOverride | Screen::ContaminationCleared => RowStatus::Granted,
+            // Containment that WORKED: the child skipped a planted discovery
+            // entry and reached the real instance, so nothing was refused and
+            // nothing failed. It has no word of its own — `recorded` is what the
+            // frontend classifier gave it too, by falling through — and giving
+            // it one is a UI decision, not a refactoring one.
+            Screen::DiscoverySkipped => RowStatus::Recorded,
+            Screen::Ssrf | Screen::Budget | Screen::Canary | Screen::LatchRefusal => {
+                RowStatus::Denied
+            }
+        }
+    }
+}
+
 /// One recorded tool activity, WITHOUT payloads — the shape list consumers
 /// (the Tool Activity feed poll, the Graph View pulse feed) receive every
 /// couple of seconds, so it must stay light.
@@ -721,6 +1110,19 @@ pub struct ActivityEntry {
     pub ms: u64,
     /// Whether the call succeeded.
     pub ok: bool,
+    /// **What this row reports, as one word** — the chip both feeds render, and
+    /// the reading of `ok` that `ok` alone cannot give (see [`RowStatus`]).
+    ///
+    /// **Derived, never input.** [`ActivityEntry::new`] classifies at the
+    /// recording site, [`ActivityStore::record`] re-classifies whatever it is
+    /// handed, and [`parse_line`] re-derives it for every line it reads back —
+    /// so a row written by an older build renders in TODAY's vocabulary rather
+    /// than in the one it was written under. The word is serialized (a JSONL
+    /// line stays readable on its own) but `skip_deserializing` says the stored
+    /// copy is never trusted: the classifier is the authority, on disk as on the
+    /// wire.
+    #[serde(skip_deserializing, default = "RowStatus::unclassified")]
+    pub status: RowStatus,
     /// #51: which tab this row belongs to. See [`Attribution`] — an absent
     /// field (every row written before #51) reads as
     /// [`Attribution::Unattributed`], never as `Headless`.
@@ -796,7 +1198,7 @@ impl ActivityEntry {
         server: Option<String>,
         category: Option<String>,
     ) -> Self {
-        Self {
+        let mut entry = Self {
             id: 0,
             ts_ms,
             kind: kind.as_str().to_string(),
@@ -807,12 +1209,31 @@ impl ActivityEntry {
             chars,
             ms,
             ok,
+            // Classified two lines down, once the fields it reads are in place.
+            status: RowStatus::unclassified(),
             tab,
             session,
             server,
             category,
-        }
+        };
+        entry.status = RowStatus::classify(&entry);
+        entry
     }
+}
+
+/// Parse one stored JSONL line into a record, **re-deriving its status**.
+///
+/// The one function that turns a line into an [`ActivityRecord`], because the
+/// status is derived rather than stored (see [`ActivityEntry::status`]): a row
+/// written before the column existed has no word at all, and a row written by
+/// an older build may carry one that build's classifier chose. Both re-derive
+/// here, so what the feeds render is this build's reading of the row — which is
+/// behaviour-preserving for every file already on disk, since the classifier
+/// reads only columns those rows already carry.
+fn parse_line(line: &str) -> serde_json::Result<ActivityRecord> {
+    let mut rec: ActivityRecord = serde_json::from_str(line)?;
+    rec.entry.status = RowStatus::classify(&rec.entry);
+    Ok(rec)
 }
 
 fn default_kind() -> String {
@@ -874,6 +1295,10 @@ impl ActivityStore {
     pub fn record(&self, mut rec: ActivityRecord) {
         rec.request = truncate_chars(&rec.request, REQUEST_CAP_CHARS);
         rec.response = truncate_chars(&rec.response, RESPONSE_CAP_CHARS);
+        // Re-classified at the funnel, not trusted from the caller: a recorder
+        // that edits a field after `ActivityEntry::new` (the lane tests do)
+        // would otherwise store a word derived from the row it used to be.
+        rec.entry.status = RowStatus::classify(&rec.entry);
         let Ok(mut inner) = self.inner.lock() else {
             return;
         };
@@ -1009,7 +1434,7 @@ impl ActivityStore {
                 continue;
             }
             total_lines += 1;
-            match serde_json::from_str::<ActivityRecord>(line) {
+            match parse_line(line) {
                 Ok(rec) => inner.ring.push_back(rec),
                 Err(e) => {
                     repaired = true;
@@ -1054,7 +1479,7 @@ impl ActivityStore {
             if line.trim().is_empty() {
                 continue;
             }
-            let Ok(rec) = serde_json::from_str::<ActivityRecord>(line) else {
+            let Ok(rec) = parse_line(line) else {
                 continue;
             };
             // id 0 would collide as a set key; such lines only exist in
@@ -2315,5 +2740,647 @@ mod tests {
         assert!(full.response.contains("… [truncated 500 chars]"));
         assert!(full.response.chars().count() < RESPONSE_CAP_CHARS + 100);
         let _ = fs::remove_file(&store.path);
+    }
+
+    // ── Row status (#48, M-24; V42: ported from `src/lib/activity.test.ts`) ──
+    //
+    // The finding these came from: `unscreened`, the detector flags,
+    // `MemoryQuarantine` and `LatchOverride` all collapsed into ONE red chip, so
+    // "we did not look at all of it" read as "we blocked something" — the
+    // opposite of the truth — and a latch override the USER applied to hand
+    // capability back read as containment firing.
+    //
+    // They pin the DISTINCTIONS rather than the current words: what must not
+    // regress is that no two of these facts share a status, and that the only
+    // status meaning "we stopped it" is reached by the screens that actually
+    // did. One case per test in the deleted `describe`s, plus the two the move
+    // itself makes possible: the vocabulary is now checked against
+    // `Screen::is_denial` and against the frontend union it has to keep feeding.
+
+    /// One row as the classifier sees it — `kind`, `source`, `tool` and `ok` are
+    /// the only columns it reads. Built through [`ActivityEntry::new`], so every
+    /// case below also exercises the classification at the recording site.
+    fn row(kind: ActivityKind, source: &str, tool: &str, ok: bool) -> ActivityEntry {
+        ActivityEntry::new(
+            kind,
+            1,
+            "r".into(),
+            source.into(),
+            tool.into(),
+            "t".into(),
+            0,
+            0,
+            ok,
+            Attribution::Unattributed,
+            None,
+            None,
+            None,
+        )
+    }
+
+    fn status(kind: ActivityKind, source: &str, tool: &str, ok: bool) -> RowStatus {
+        row(kind, source, tool, ok).status
+    }
+
+    /// One `injection_flag` row for `screen`, with the `ok` `record_flag` would
+    /// publish for it.
+    fn flag(screen: Screen) -> RowStatus {
+        status(
+            ActivityKind::InjectionFlag,
+            screen.as_str(),
+            "WebFetch",
+            !screen.is_denial(),
+        )
+    }
+
+    #[test]
+    fn every_containment_screen_gets_its_own_status_and_no_two_collapse() {
+        // The four denials share `denied`, which is correct — they all stopped a
+        // call. The five that stopped nothing must each differ from that AND
+        // from one another.
+        for screen in [
+            Screen::Ssrf,
+            Screen::Budget,
+            Screen::Canary,
+            Screen::LatchRefusal,
+        ] {
+            assert_eq!(flag(screen), RowStatus::Denied, "{screen:?} stopped a call");
+        }
+        let non_denials = [
+            flag(Screen::Signature),
+            flag(Screen::Unscreened),
+            flag(Screen::MemoryQuarantine),
+            flag(Screen::LatchOverride),
+            flag(Screen::LatchBeacon),
+        ];
+        let distinct: std::collections::BTreeSet<&str> =
+            non_denials.iter().map(|s| s.as_str()).collect();
+        assert_eq!(
+            distinct.len(),
+            non_denials.len(),
+            "five screens that denied nothing, five different words: {non_denials:?}"
+        );
+        assert!(
+            !non_denials.contains(&RowStatus::Denied),
+            "nothing that stopped nothing may wear the word that means we stopped it"
+        );
+    }
+
+    /// **The invariant the frontend copy could only restate.**
+    ///
+    /// `denied` is this app's one "we blocked something", and the screens that
+    /// earn it are exactly the ones [`Screen::is_denial`] answers `true` for.
+    /// The classifier names them individually (so a new screen must choose a
+    /// word rather than inherit one) — this is what says the two lists agree,
+    /// rather than trusting that they happen to.
+    #[test]
+    fn every_denial_screen_and_only_a_denial_screen_reads_as_denied() {
+        for &screen in Screen::ALL {
+            assert_eq!(
+                flag(screen) == RowStatus::Denied,
+                screen.is_denial(),
+                "{screen:?}: `is_denial` says {} but the row reads `{}`",
+                screen.is_denial(),
+                flag(screen).as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn an_unscreened_result_is_never_a_denial_and_never_clean() {
+        // The whole finding in one assertion: an absent verdict is neither a
+        // verdict of absence nor an alarm.
+        let s = flag(Screen::Unscreened);
+        assert_eq!(s, RowStatus::Unscreened);
+        assert_ne!(s, RowStatus::Denied);
+        assert_ne!(s, RowStatus::Ok);
+    }
+
+    #[test]
+    fn a_user_latch_override_reads_as_a_grant_not_as_containment_firing() {
+        assert_eq!(flag(Screen::LatchOverride), RowStatus::Granted);
+        assert_eq!(flag(Screen::ContaminationCleared), RowStatus::Granted);
+        // A grant and a block must not share a word — a release that reads as a
+        // refusal is the inverted half of the same defect.
+        assert_ne!(flag(Screen::LatchOverride), RowStatus::Denied);
+    }
+
+    #[test]
+    fn a_held_memory_write_reads_as_held_not_as_a_refusal() {
+        assert_eq!(flag(Screen::MemoryQuarantine), RowStatus::Held);
+    }
+
+    #[test]
+    fn a_rejected_updater_bundle_is_not_a_blocked_call() {
+        // `updater` is the one source written outside `record_flag`: its `ok` is
+        // the bundle OUTCOME, not `Screen::is_denial`. Reading `!ok` as "denied"
+        // there reported a refused rules bundle as a blocked tool call.
+        let src = Screen::Updater.as_str();
+        assert_eq!(
+            status(ActivityKind::InjectionFlag, src, "rules", true),
+            RowStatus::Update
+        );
+        assert_eq!(
+            status(ActivityKind::InjectionFlag, src, "rules", false),
+            RowStatus::Rejected
+        );
+        assert_ne!(
+            status(ActivityKind::InjectionFlag, src, "rules", false),
+            RowStatus::Denied
+        );
+    }
+
+    #[test]
+    fn an_unknown_screen_gets_no_category_rather_than_a_borrowed_one() {
+        // A screen a WRITER declares and this reader does not. Delivered ⇒ we
+        // have no word for it; refused ⇒ `Screen::is_denial` is a claim we can
+        // still make.
+        let unknown = "some_future_screen";
+        assert_eq!(
+            status(ActivityKind::InjectionFlag, unknown, "WebFetch", true),
+            RowStatus::Recorded
+        );
+        assert_eq!(
+            status(ActivityKind::InjectionFlag, unknown, "WebFetch", false),
+            RowStatus::Denied
+        );
+    }
+
+    #[test]
+    fn the_three_plain_call_outcomes_are_intact() {
+        assert_eq!(
+            status(ActivityKind::Graph, "offload", "graph_outline", true),
+            RowStatus::Ok
+        );
+        assert_eq!(
+            status(ActivityKind::Graph, "offload", "graph_outline", false),
+            RowStatus::Failed
+        );
+        // Telemetry channels record ok:false to mean "this signal fired".
+        for source in CANARY_SOURCES {
+            assert_eq!(
+                status(ActivityKind::Graph, source, "graph_outline", false),
+                RowStatus::Signal,
+                "{source} is a telemetry channel, not a broken call"
+            );
+        }
+    }
+
+    // ── V37 C6: mcp_health rows ──────────────────────────────────────────
+
+    #[test]
+    fn the_health_lane_gives_the_down_transitions_and_the_recovery_different_words() {
+        assert_eq!(
+            status(ActivityKind::McpHealth, "probe", "unhealthy", false),
+            RowStatus::Unhealthy
+        );
+        assert_eq!(
+            status(ActivityKind::McpHealth, "connect", "connect_failed", false),
+            RowStatus::Unhealthy
+        );
+        assert_eq!(
+            status(ActivityKind::McpHealth, "probe", "healthy", true),
+            RowStatus::Recovered
+        );
+    }
+
+    #[test]
+    fn the_health_lane_never_borrows_the_offload_server_vocabulary() {
+        // `down`/`ready`/`stopped` are written about a process cImp owns and
+        // stopped; an MCP server is somebody else's.
+        let seen = [
+            status(ActivityKind::McpHealth, "probe", "unhealthy", false),
+            status(ActivityKind::McpHealth, "probe", "healthy", true),
+        ];
+        for borrowed in [RowStatus::Down, RowStatus::Ready, RowStatus::Stopped] {
+            assert!(!seen.contains(&borrowed), "{borrowed:?} belongs to the offload lane");
+        }
+    }
+
+    #[test]
+    fn an_unknown_health_transition_falls_back_on_ok() {
+        assert_eq!(
+            status(ActivityKind::McpHealth, "probe", "quarantined", false),
+            RowStatus::Unhealthy
+        );
+        assert_eq!(
+            status(ActivityKind::McpHealth, "probe", "quarantined", true),
+            RowStatus::Recovered
+        );
+    }
+
+    #[test]
+    fn an_ordinary_mcp_call_row_is_not_a_health_row() {
+        // The two kinds share a server but not a lane: a failed call is a failed
+        // call, not a server going down (that is what the flap guard is for).
+        assert_eq!(
+            status(ActivityKind::Mcp, "claude", "ddg__search", false),
+            RowStatus::Failed
+        );
+    }
+
+    // ── V37 C9: tools withheld by description screening ──────────────────
+
+    #[test]
+    fn a_withheld_tool_is_its_own_status_not_a_failed_call() {
+        // These rows land in the `mcp` lane with `ok: false`; with no branch for
+        // them the classifier fell through to `failed`, whose sentence is "Call
+        // failed" — a claim about a call that was never made.
+        let s = status(
+            ActivityKind::Mcp,
+            crate::offload::mcp_host::SCREEN_DROP_SOURCE,
+            "exfiltrate",
+            false,
+        );
+        assert_eq!(s, RowStatus::Withheld);
+        assert_ne!(s, RowStatus::Failed);
+        // `flagged` would be worse, not better: that word's whole promise is
+        // "nothing was blocked", and this is the one place in cImp where
+        // detection actually REMOVES something.
+        assert_ne!(s, RowStatus::Flagged);
+    }
+
+    #[test]
+    fn the_withheld_branch_keys_on_the_exact_wire_source_not_on_the_kind() {
+        // A near-miss source is not a screening row …
+        assert_eq!(
+            status(ActivityKind::Mcp, "screening", "x", false),
+            RowStatus::Failed
+        );
+        // … and the source alone does not hijack another lane.
+        assert_eq!(
+            status(
+                ActivityKind::Graph,
+                crate::offload::mcp_host::SCREEN_DROP_SOURCE,
+                "graph_outline",
+                false
+            ),
+            RowStatus::Failed
+        );
+    }
+
+    // ── offload_server lifecycle rows ────────────────────────────────────
+
+    #[test]
+    fn every_lifecycle_transition_gets_its_own_status() {
+        let seen = [
+            status(ActivityKind::OffloadServer, "big-local", "start", true),
+            status(ActivityKind::OffloadServer, "big-local", "ready", true),
+            status(ActivityKind::OffloadServer, "big-local", "stop", true),
+            status(ActivityKind::OffloadServer, "big-local", "fail", false),
+        ];
+        assert_eq!(
+            seen,
+            [
+                RowStatus::Started,
+                RowStatus::Ready,
+                RowStatus::Stopped,
+                RowStatus::Down
+            ]
+        );
+    }
+
+    #[test]
+    fn a_deliberate_stop_is_never_read_as_a_failure() {
+        // The backend records a stop as ok:true precisely so this holds; pinned
+        // here because the classifier must not re-derive it from `ok` either
+        // way. Both a healthy start and a stop are ok:true, so anything keyed on
+        // `ok` would render "the server is up" and "the server is gone" as one
+        // word.
+        let stop = status(ActivityKind::OffloadServer, "big-local", "stop", true);
+        assert_eq!(stop, RowStatus::Stopped);
+        assert_ne!(stop, RowStatus::Down);
+        assert_ne!(stop, RowStatus::Failed);
+        assert_ne!(
+            status(ActivityKind::OffloadServer, "big-local", "start", true),
+            stop
+        );
+    }
+
+    #[test]
+    fn a_server_failure_is_not_a_failed_tool_call() {
+        // `failed` is a call that errored; `down` is a backend that is not
+        // running. Sharing a word would put a crashed llama-server in the same
+        // bucket as a graph query that threw.
+        assert_eq!(
+            status(ActivityKind::OffloadServer, "big-local", "fail", false),
+            RowStatus::Down
+        );
+        assert_eq!(
+            status(ActivityKind::Graph, "offload", "graph_outline", false),
+            RowStatus::Failed
+        );
+    }
+
+    #[test]
+    fn an_unknown_lifecycle_transition_degrades_without_inventing_a_claim() {
+        assert_eq!(
+            status(ActivityKind::OffloadServer, "big-local", "paused", true),
+            RowStatus::Ok
+        );
+        assert_eq!(
+            status(ActivityKind::OffloadServer, "big-local", "paused", false),
+            RowStatus::Down
+        );
+    }
+
+    #[test]
+    fn an_offload_task_row_is_not_a_lifecycle_row() {
+        // The two kinds are one underscore apart and both carry a backend name
+        // in `source`; a prefix match instead of an equality check would swallow
+        // the task feed whole.
+        assert_eq!(
+            status(ActivityKind::Offload, "big-local", "offload_task", true),
+            RowStatus::Ok
+        );
+    }
+
+    // ── sandbox rows (V33 Phase A) ───────────────────────────────────────
+
+    #[test]
+    fn both_negative_sandbox_states_read_as_unsandboxed() {
+        // Locked decision 17 keeps "off (user choice)" and "unavailable" DISTINCT
+        // states; `ok` is which of the two it was, so it cannot also carry the
+        // verb, and the distinction the chip does not show lives in `target`.
+        let chosen = status(ActivityKind::Sandbox, "run_command", "unsandboxed", true);
+        let unavailable = status(ActivityKind::Sandbox, "run_command", "unsandboxed", false);
+        assert_eq!(chosen, RowStatus::Unsandboxed);
+        assert_eq!(unavailable, RowStatus::Unsandboxed);
+        // The command ran fine in both cases: this must never wear the words that
+        // mean "we stopped something" or "the call errored".
+        assert_ne!(chosen, RowStatus::Denied);
+        assert_ne!(unavailable, RowStatus::Failed);
+    }
+
+    #[test]
+    fn a_grant_event_is_not_an_unsandboxed_run() {
+        assert_eq!(
+            status(ActivityKind::Sandbox, "run_command", "grant", true),
+            RowStatus::Ok
+        );
+        assert_eq!(
+            status(ActivityKind::Sandbox, "run_command", "grant", false),
+            RowStatus::Failed
+        );
+    }
+
+    #[test]
+    fn a_sandboxed_run_reads_as_ordinary_traffic_not_as_an_alarm() {
+        // The confirmation row exists to answer "is this actually sandboxed?" —
+        // an empty lane used to mean either "everything was" or "nothing ran".
+        // Answering it must not cost the lane its signal-to-noise.
+        assert_eq!(
+            status(ActivityKind::Sandbox, "run_command", "sandboxed", true),
+            RowStatus::Ok
+        );
+    }
+
+    #[test]
+    fn a_suspected_boundary_hit_gets_its_own_word_neither_denied_nor_failed() {
+        let hit = status(ActivityKind::Sandbox, "run_command", "denied", false);
+        assert_eq!(hit, RowStatus::Boundary);
+        // `denied` is this app's one "we stopped it", and it is filled red. cImp
+        // cannot see the OS's ACL decision — the backend words this row as a
+        // heuristic, so the chip must not assert more than the row does.
+        assert_ne!(hit, RowStatus::Denied);
+        // `failed` is wrong the other way: the tool call itself returned output.
+        assert_ne!(hit, RowStatus::Failed);
+    }
+
+    #[test]
+    fn every_sandbox_row_type_stays_visibly_distinct() {
+        // One lane, four row types. If two of them ever render as the same word,
+        // the lane stops answering the question it was added to answer.
+        let words = [
+            status(ActivityKind::Sandbox, "run_command", "unsandboxed", true),
+            status(ActivityKind::Sandbox, "run_command", "sandboxed", true),
+            status(ActivityKind::Sandbox, "run_command", "denied", false),
+            status(ActivityKind::Sandbox, "run_command", "grant", false),
+        ];
+        let distinct: std::collections::BTreeSet<&str> = words.iter().map(|w| w.as_str()).collect();
+        assert_eq!(distinct.len(), words.len(), "{words:?}");
+    }
+
+    // ── plugin discovery rows (V38 Phase A) ──────────────────────────────
+
+    #[test]
+    fn a_rejected_manifest_is_a_plain_failure_never_a_blocked_call() {
+        // This lane deliberately adds NO new word: a definition either loaded or
+        // it did not. What it must not do is fall into any of the words that
+        // carry a security claim — a rejected manifest is a malformed FILE.
+        let rejected = status(ActivityKind::Plugin, "acme@1.0.0", "rejected", false);
+        assert_eq!(rejected, RowStatus::Failed);
+        for security_word in [RowStatus::Denied, RowStatus::Flagged, RowStatus::Boundary] {
+            assert_ne!(rejected, security_word);
+        }
+        assert_eq!(
+            status(ActivityKind::Plugin, "acme@1.0.0", "conflict", false),
+            RowStatus::Failed
+        );
+    }
+
+    #[test]
+    fn the_plugin_scan_summary_reports_the_folder_at_a_glance() {
+        // The backend sets `ok` on the summary to the FOLDER's health, so a
+        // clean folder is one green row and a folder with a rejected plugin is
+        // not.
+        assert_eq!(
+            status(ActivityKind::Plugin, "plugins", "rescan", true),
+            RowStatus::Ok
+        );
+        assert_eq!(
+            status(ActivityKind::Plugin, "plugins", "rescan", false),
+            RowStatus::Failed
+        );
+    }
+
+    // ── delegation rows (V39, locked decision 14) ────────────────────────
+
+    #[test]
+    fn the_three_non_outcome_delegation_transitions_get_their_own_word() {
+        // The lane where `ok` carries the least: a `start` row is ok:true before
+        // anything has happened, a `takeover` is ok:false because the user chose
+        // to end it, and a `role_moved` is not a call at all.
+        assert_eq!(
+            status(ActivityKind::Delegation, "some-harness", "start", true),
+            RowStatus::Driving
+        );
+        assert_eq!(
+            status(ActivityKind::Delegation, "some-harness", "takeover", false),
+            RowStatus::Takeover
+        );
+        assert_eq!(
+            status(ActivityKind::Delegation, "some-harness", "role_moved", true),
+            RowStatus::Moved
+        );
+        // The user reclaiming their own tab is deliberate, and the worker kept
+        // running: never a failure.
+        assert_ne!(
+            status(ActivityKind::Delegation, "some-harness", "takeover", false),
+            RowStatus::Failed
+        );
+        // Both a start and a completed reply are ok:true; anything keyed on `ok`
+        // would return one word for the two.
+        assert_ne!(
+            status(ActivityKind::Delegation, "some-harness", "start", true),
+            status(ActivityKind::Delegation, "some-harness", "done", true)
+        );
+    }
+
+    #[test]
+    fn the_real_delegation_outcomes_stay_ok_or_failed_rather_than_inventing_synonyms() {
+        assert_eq!(
+            status(ActivityKind::Delegation, "some-harness", "done", true),
+            RowStatus::Ok
+        );
+        // A completed turn whose text was not substantive is a `done` that
+        // FAILED (locked decision 13) — the worker really did run. `driver_gone`
+        // (V39 review L-7) and the reserved `cancelled` have no word of their own
+        // on purpose: `failed` plus the row's own reason says it, and a synonym
+        // would dilute the three words that DO mean something.
+        for tool in [
+            "done",
+            "refused",
+            "timeout",
+            "worker_exited",
+            "driver_gone",
+            "cancelled",
+        ] {
+            assert_eq!(
+                status(ActivityKind::Delegation, "some-harness", tool, false),
+                RowStatus::Failed,
+                "`{tool}` is a delegation that failed"
+            );
+        }
+        // An unknown transition degrades without inventing a claim.
+        assert_eq!(
+            status(ActivityKind::Delegation, "some-harness", "resumed", true),
+            RowStatus::Ok
+        );
+        assert_eq!(
+            status(ActivityKind::Delegation, "some-harness", "resumed", false),
+            RowStatus::Failed
+        );
+    }
+
+    #[test]
+    fn the_driver_harness_is_not_a_telemetry_channel() {
+        // `source` on a delegation row is a harness id, not a canary channel — a
+        // `refused` row must read as a failed delegation, not as a signal.
+        assert_eq!(
+            status(ActivityKind::Delegation, "some-harness", "refused", false),
+            RowStatus::Failed
+        );
+    }
+
+    // ── the status is derived, on the wire AND on disk ───────────────────
+
+    #[test]
+    fn a_row_written_before_the_status_column_gets_one_at_read() {
+        // Every row in an existing `tool-activity.jsonl` was written without the
+        // column. The classifier reads only fields those rows already carry, so
+        // deriving at read is behaviour-preserving for files already on disk —
+        // and it is what keeps an old row rendering in today's vocabulary.
+        let store = temp_store("legacy-status");
+        fs::create_dir_all(store.path.parent().expect("temp dir")).expect("mkdir");
+        fs::write(
+            &store.path,
+            "{\"id\":7,\"ts_ms\":1,\"kind\":\"injection_flag\",\"root\":\"r\",\
+             \"source\":\"unscreened\",\"tool\":\"WebFetch\",\"target\":\"x\",\
+             \"chars\":3,\"ms\":4,\"ok\":true}\n",
+        )
+        .expect("seed");
+        let snap = store.snapshot_since(0);
+        assert_eq!(snap.len(), 1);
+        assert_eq!(
+            snap[0].status,
+            RowStatus::Unscreened,
+            "a pre-column row is classified at read, not left at the placeholder"
+        );
+        let _ = fs::remove_file(&store.path);
+    }
+
+    #[test]
+    fn a_stored_status_is_never_read_back() {
+        // The word is serialized so a JSONL line reads on its own, but the
+        // stored copy is not evidence: a row written by an older build carries
+        // that build's reading, and a hand-edited file carries whatever was
+        // typed. The classifier is the authority on both sides of the disk.
+        let store = temp_store("stale-status");
+        fs::create_dir_all(store.path.parent().expect("temp dir")).expect("mkdir");
+        fs::write(
+            &store.path,
+            "{\"id\":8,\"ts_ms\":1,\"kind\":\"graph\",\"root\":\"r\",\"source\":\"claude\",\
+             \"tool\":\"graph_outline\",\"target\":\"x\",\"chars\":3,\"ms\":4,\"ok\":true,\
+             \"status\":\"denied\"}\n",
+        )
+        .expect("seed");
+        let snap = store.snapshot_since(0);
+        assert_eq!(snap.len(), 1);
+        assert_eq!(
+            snap[0].status,
+            RowStatus::Ok,
+            "a stored word must not be able to paint a successful call as a denial"
+        );
+        let _ = fs::remove_file(&store.path);
+    }
+
+    #[test]
+    fn the_status_a_row_carries_is_the_one_it_is_recorded_with() {
+        // `record` re-classifies at the funnel rather than trusting its caller,
+        // so a recorder that edits a column after `ActivityEntry::new` (the lane
+        // tests here do exactly that) still stores the word for the row it
+        // actually wrote.
+        let store = temp_store("record-status");
+        let mut r = rec_kind(ActivityKind::InjectionFlag, "held note");
+        r.entry.source = Screen::MemoryQuarantine.as_str().to_string();
+        store.record(r);
+        assert_eq!(store.snapshot_since(0)[0].status, RowStatus::Held);
+        let _ = fs::remove_file(&store.path);
+    }
+
+    /// **Every word this side can publish is a word the frontend can render**,
+    /// and nothing more.
+    ///
+    /// The TypeScript union is the rendering vocabulary: `STATUS_TITLE` is keyed
+    /// by it (a missing key is a tooltipless chip) and `StatusChip`'s scoped
+    /// style is classed with it (a missing rule is an unstyled one — the
+    /// F-V37-1 defect that shipped `unhealthy`/`recovered` styleless). Both of
+    /// those guards live in `activity.test.ts` and iterate the union, so the
+    /// union is what has to match what this side emits — a drift `cargo` and
+    /// `vitest` are each individually blind to.
+    ///
+    /// Newline-agnostic: CI checks this tree out with CRLF.
+    #[test]
+    fn the_status_vocabulary_matches_the_frontends() {
+        let ts = include_str!("../../src/lib/activity.ts").replace('\r', "");
+        let decl = "export type RowStatus =";
+        let at = ts.find(decl).expect(
+            "`export type RowStatus =` is gone from src/lib/activity.ts — the union moved or was \
+             renamed, and this guard is now watching nothing. Point it at the new name.",
+        );
+        let body_len = ts[at..].find(';').expect("the union is never terminated");
+        let mut declared: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        for line in ts[at..at + body_len].lines() {
+            if let Some(word) = line
+                .trim()
+                .strip_prefix("| '")
+                .and_then(|rest| rest.strip_suffix('\''))
+            {
+                declared.insert(word);
+            }
+        }
+        assert!(
+            !declared.is_empty(),
+            "parsed no words out of the `RowStatus` union"
+        );
+        let ours: std::collections::BTreeSet<&str> =
+            RowStatus::ALL.iter().map(|s| s.as_str()).collect();
+        assert_eq!(
+            ours, declared,
+            "the Rust and TypeScript `RowStatus` vocabularies have drifted — a word only Rust \
+             knows renders as an unstyled, tooltipless chip; a word only TypeScript knows is a \
+             sentence and a colour nothing can reach"
+        );
     }
 }

@@ -32,7 +32,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
-use tauri::{AppHandle, Emitter};
 use tokio::sync::broadcast;
 use tracing::warn;
 
@@ -72,7 +71,15 @@ pub struct FsBatch {
 /// worktree bookkeeping in Phase D) gates itself on the relevant settings
 /// flag rather than on whether the service exists at all.
 pub struct WorkbenchService {
-    app: AppHandle,
+    /// Where the fs-batch broadcast goes (V42 Phase A). It was an `AppHandle`,
+    /// which is the entire reason a checkpoint or a diff could not be exercised
+    /// without a WebView: the handle cannot be built outside a running Tauri
+    /// app, so every method on this service inherited that. The service reaches
+    /// the app for exactly ONE thing — `emit(FS_BATCH_EVENT, …)` in
+    /// [`Self::publish_fs_batch`] — so [`EventSink`](crate::service::sink::EventSink)
+    /// is the whole of the coupling, and with it gone the service is
+    /// constructible in a test.
+    events: Arc<dyn crate::service::sink::EventSink>,
     settings: SettingsHandle,
     fs_batch_tx: broadcast::Sender<FsBatch>,
     /// Phase C §C3: the `checkpoint_min_gap_s` gate every AUTOMATIC
@@ -472,10 +479,13 @@ impl WorkbenchService {
     /// the worst case for a long-running session across many projects.
     const WORKTREE_CHECK_CACHE_MAX_AGE_SECS: u64 = 24 * 3600;
 
-    pub fn new(app: AppHandle, settings: SettingsHandle) -> Arc<Self> {
+    pub fn new(
+        events: Arc<dyn crate::service::sink::EventSink>,
+        settings: SettingsHandle,
+    ) -> Arc<Self> {
         let (fs_batch_tx, _rx) = broadcast::channel(Self::BROADCAST_CAPACITY);
         let svc = Arc::new(Self {
-            app,
+            events,
             settings,
             fs_batch_tx,
             checkpoints: CheckpointScheduler::default(),
@@ -890,7 +900,7 @@ impl WorkbenchService {
         // Both sends are best-effort: no frontend window listening, or no
         // backend subscriber yet, are both normal (nothing has opened the
         // Workbench tab this session) — never a reason to log or fail.
-        let _ = self.app.emit(FS_BATCH_EVENT, &batch);
+        let _ = crate::service::sink::EventSinkExt::emit(&*self.events, FS_BATCH_EVENT, &batch);
         let _ = self.fs_batch_tx.send(batch);
     }
 

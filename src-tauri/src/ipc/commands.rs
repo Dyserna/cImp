@@ -13,6 +13,7 @@ use crate::service::pty::PtyService;
 use crate::service::checks::{ApplySummary, ChecksService, ChecksSuggestion};
 use crate::service::settings::SettingsService;
 use crate::service::sink::{OutputSink, TauriEventSink};
+use crate::service::workbench::WorkbenchUseCases;
 use crate::settings::{AiToolTabConfig, Settings, TabConfig};
 use crate::state::{ReadOnlySource, StateSignal, TabId, TabKind};
 
@@ -3179,72 +3180,40 @@ pub async fn advisor_mark_applied(
     Ok(())
 }
 
-/// V13 Phase A: resolve an optional `root` IPC argument to a project
-/// directory, falling back to the app's launch directory. Small, deliberate
-/// duplicate of `resolve_graph_root` (see the rationale in
-/// `checks/gitls.rs`'s doc comment for the sibling `run_git` split) — kept
-/// separate so `workbench` doesn't couple its root-resolution to `graph`'s.
-fn resolve_workbench_root(root: Option<String>) -> AppResult<std::path::PathBuf> {
-    match root {
-        Some(r) if !r.trim().is_empty() => {
-            let path = std::path::PathBuf::from(r);
-            if path.is_absolute() {
-                Ok(path)
-            } else {
-                // Absolutize a relative root here at the IPC boundary: the
-                // workbench layer joins sub-paths onto it AND hands it to
-                // spawned `git` as `current_dir`, and git resolves argument
-                // paths relative to that same cwd — a relative root would
-                // double up (`root/root/.cimp/…`).
-                std::env::current_dir()
-                    .map(|cwd| cwd.join(path))
-                    .map_err(|e| AppError::Settings(format!("cwd: {e}")))
-            }
-        }
-        _ => std::env::current_dir().map_err(|e| AppError::Settings(format!("cwd: {e}"))),
-    }
+/// Build the Workbench use cases over this app's handle. One place, so no
+/// command can drift in what it hands them.
+fn workbench_use_cases(
+    service: &std::sync::Arc<crate::workbench::WorkbenchService>,
+) -> WorkbenchUseCases<'_> {
+    WorkbenchUseCases::new(service)
 }
 
 /// V13 Phase A: the Workbench tab's top-of-view banner data — is `git` on
-/// PATH at all, and is `root` inside a working tree. `root` defaults to the
-/// launch directory. Cheap: `git_available` is a PATH lookup, `is_repo` a
-/// cached `rev-parse` probe (see `workbench::git::is_repo`).
+/// PATH at all, and is `root` inside a working tree. See
+/// [`WorkbenchUseCases::status`].
 #[tauri::command]
 pub async fn workbench_status(
     service: State<'_, std::sync::Arc<crate::workbench::WorkbenchService>>,
     root: Option<String>,
 ) -> AppResult<crate::workbench::WorkbenchStatus> {
-    let root = resolve_workbench_root(root)?;
-    Ok(service.status(&root).await)
+    workbench_use_cases(&service).status(root).await
 }
 
 /// V13 Phase B: the Diff section's file list — status/binary/too_large per
-/// file plus the readonly (mid-merge/-rebase) and source (git vs. — until
-/// Phase C — nothing) flags. `root` defaults to the launch directory.
+/// file plus the readonly (mid-merge/-rebase) and source flags. See
+/// [`WorkbenchUseCases::diff_summary`].
 #[tauri::command]
 pub async fn workbench_diff_summary(
     service: State<'_, std::sync::Arc<crate::workbench::WorkbenchService>>,
     root: Option<String>,
 ) -> AppResult<crate::workbench::diff::DiffSummary> {
-    let root = resolve_workbench_root(root)?;
-    service.diff_summary(&root).await
-}
-
-/// Clamp a frontend-supplied unified-context width for the Workbench diff
-/// commands: absent means git's default (3); the "full file" toggle sends a
-/// huge value, bounded by `diff::MAX_CONTEXT` so the argument can't be
-/// arbitrary.
-fn diff_context(context: Option<u32>) -> u32 {
-    context
-        .unwrap_or(crate::workbench::diff::DEFAULT_CONTEXT)
-        .min(crate::workbench::diff::MAX_CONTEXT)
+    workbench_use_cases(&service).diff_summary(root).await
 }
 
 /// V13 Phase B: one file's full parsed diff (hunks + lines), fetched only
-/// when the frontend expands that file's row (the file list itself is
-/// virtualized around this — see `workbench_diff_summary`). `context` is the
-/// unified-context width (default 3); the frontend's "full file" toggle
-/// passes a huge value so the whole file arrives as one hunk.
+/// when the frontend expands that file's row. `context` is the unified-context
+/// width (default 3); the frontend's "full file" toggle passes a huge value,
+/// clamped by the service. See [`WorkbenchUseCases::diff_file`].
 #[tauri::command]
 pub async fn workbench_diff_file(
     service: State<'_, std::sync::Arc<crate::workbench::WorkbenchService>>,
@@ -3252,17 +3221,16 @@ pub async fn workbench_diff_file(
     path: String,
     context: Option<u32>,
 ) -> AppResult<crate::workbench::diff::FileDiff> {
-    let root = resolve_workbench_root(root)?;
-    service.diff_file(&root, &path, diff_context(context)).await
+    workbench_use_cases(&service)
+        .diff_file(root, &path, context)
+        .await
 }
 
 /// V13 Phase B B2: revert one hunk. `hunk_hash` must match the hash of the
-/// hunk currently at `hunk_index` in the file's diff (`workbench::diff::hunk_hash`)
-/// — a mismatch means the file changed since the frontend last fetched it
-/// (an agent edit raced the diff view) and the revert is refused rather than
-/// applied against stale content. Also refused while the repo is
-/// mid-merge/-rebase. Returns the file's fresh diff after a successful
-/// revert.
+/// hunk currently at `hunk_index` — a mismatch means the file changed since
+/// the frontend last fetched it (an agent edit raced the diff view) and the
+/// revert is refused rather than applied against stale content. See
+/// [`WorkbenchUseCases::revert_hunk`].
 #[tauri::command]
 pub async fn workbench_revert_hunk(
     service: State<'_, std::sync::Arc<crate::workbench::WorkbenchService>>,
@@ -3271,15 +3239,14 @@ pub async fn workbench_revert_hunk(
     hunk_index: usize,
     hunk_hash: String,
 ) -> AppResult<crate::workbench::diff::FileDiff> {
-    let root = resolve_workbench_root(root)?;
-    service
-        .revert_hunk(&root, &path, hunk_index, &hunk_hash)
+    workbench_use_cases(&service)
+        .revert_hunk(root, &path, hunk_index, &hunk_hash)
         .await
 }
 
 /// V13 Phase B: format one hunk as a fenced code block + `path:line` header
-/// for the compose overlay's "Send to agent" hunk action. Returns plain text
-/// the frontend appends to the compose draft — the submit path is unchanged.
+/// for the compose overlay's "Send to agent" hunk action. See
+/// [`WorkbenchUseCases::send_hunk`].
 #[tauri::command]
 pub async fn workbench_send_hunk(
     service: State<'_, std::sync::Arc<crate::workbench::WorkbenchService>>,
@@ -3287,29 +3254,26 @@ pub async fn workbench_send_hunk(
     path: String,
     hunk_index: usize,
 ) -> AppResult<String> {
-    let root = resolve_workbench_root(root)?;
-    service.send_hunk(&root, &path, hunk_index).await
+    workbench_use_cases(&service)
+        .send_hunk(root, &path, hunk_index)
+        .await
 }
 
 /// V13 Phase C: the Timeline section's row list — every checkpoint currently
 /// retained in the shadow repo, oldest first. Empty (not an error) when
-/// checkpoints have never run for `root`. `root` defaults to the launch
-/// directory.
+/// checkpoints have never run for `root`. See
+/// [`WorkbenchUseCases::checkpoints`].
 #[tauri::command]
 pub async fn workbench_checkpoints(
     service: State<'_, std::sync::Arc<crate::workbench::WorkbenchService>>,
     root: Option<String>,
 ) -> AppResult<Vec<crate::workbench::shadow::Checkpoint>> {
-    let root = resolve_workbench_root(root)?;
-    service.checkpoints(&root).await
+    workbench_use_cases(&service).checkpoints(root).await
 }
 
-/// V13 Phase C: checkpoint `id` vs. the CURRENT working tree, parsed the same
-/// way `workbench_diff_file` is — powers both the Timeline's "Diff vs now"
-/// viewer and the restore confirmation dialog's dry-run file list (the same
-/// call backs both UI surfaces; the frontend just renders it read-only for
-/// the confirmation case, since these files describe the CHECKPOINT, not a
-/// revertable live hunk).
+/// V13 Phase C: checkpoint `id` vs. the CURRENT working tree — powers both the
+/// Timeline's "Diff vs now" viewer and the restore confirmation dialog's
+/// dry-run file list. See [`WorkbenchUseCases::checkpoint_diff`].
 #[tauri::command]
 pub async fn workbench_checkpoint_diff(
     service: State<'_, std::sync::Arc<crate::workbench::WorkbenchService>>,
@@ -3317,34 +3281,31 @@ pub async fn workbench_checkpoint_diff(
     id: String,
     context: Option<u32>,
 ) -> AppResult<Vec<crate::workbench::diff::FileDiff>> {
-    let root = resolve_workbench_root(root)?;
-    service
-        .checkpoint_diff(&root, &id, diff_context(context))
+    workbench_use_cases(&service)
+        .checkpoint_diff(root, &id, context)
         .await
 }
 
 /// V13 Phase C: the manual "Checkpoint now" action. `label` defaults to
-/// "manual checkpoint" when omitted. Unlike the automatic triggers this is
-/// NOT throttled by `checkpoint_min_gap_s` — an explicit click always
-/// produces a real checkpoint (or dedupes against an unchanged tree, per
-/// `shadow::snapshot`'s own contract) rather than being silently dropped.
+/// "manual checkpoint" when omitted. Unlike the automatic triggers this is NOT
+/// throttled by `checkpoint_min_gap_s`. See
+/// [`WorkbenchUseCases::checkpoint_now`].
 #[tauri::command]
 pub async fn workbench_checkpoint_now(
     service: State<'_, std::sync::Arc<crate::workbench::WorkbenchService>>,
     root: Option<String>,
     label: Option<String>,
 ) -> AppResult<crate::workbench::shadow::CheckpointId> {
-    let root = resolve_workbench_root(root)?;
-    service.checkpoint_now(&root, label).await
+    workbench_use_cases(&service)
+        .checkpoint_now(root, label)
+        .await
 }
 
 /// V13 Phase C: restore the working tree to checkpoint `id`.
 /// **Safety-critical**: `delete_new` MUST default to `false` on the frontend
 /// (the confirmation dialog's "delete files created since" checkbox starts
 /// unchecked) — see `shadow::restore`'s doc comment for the invariants this
-/// upholds (a pre-restore checkpoint is always taken first; the user's own
-/// `.git`, if any, is never touched). Returns the full changed/created/
-/// deleted file lists for the UI's post-restore report.
+/// upholds. See [`WorkbenchUseCases::restore`].
 #[tauri::command]
 pub async fn workbench_restore(
     service: State<'_, std::sync::Arc<crate::workbench::WorkbenchService>>,
@@ -3352,51 +3313,35 @@ pub async fn workbench_restore(
     id: String,
     delete_new: bool,
 ) -> AppResult<crate::workbench::shadow::RestoreReport> {
-    let root = resolve_workbench_root(root)?;
-    service.restore(&root, &id, delete_new).await
+    workbench_use_cases(&service)
+        .restore(root, &id, delete_new)
+        .await
 }
 
 /// V33 step 5: the contamination lifecycle the Workbench Timeline renders
-/// beside its checkpoints, plus the root those checkpoints belong to.
-///
-/// **A command of its own rather than `activity_list` + N × `activity_detail`.**
-/// The Timeline joins a contamination row to a checkpoint on `(agent, tab)`,
-/// and neither half is a column on `ActivityEntry` — the `agent:tab` scope
-/// lives only inside the row's request payload, so the list command cannot
-/// answer the question at all. The two ways to get there from `activity_list`
-/// are a `activity_detail` call per row (up to 128 locked reads of a store that
-/// does file I/O, to render a section that is usually empty) or parsing the
-/// scope back out of the entry's `target`, which is a *display* string. This
-/// resolves and parses once, backend-side, next to the writer.
-///
-/// It also returns `root`, which the frontend has no other way to learn: the
-/// rows are keyed by [`crate::activity::root_key`] and the Timeline's own root
-/// is resolved here from the launch cwd. Events for OTHER roots are returned
-/// too, deliberately — a tab running in a worktree writes its checkpoints and
-/// its contamination against that worktree, and the caller has to be able to
-/// say "there is history you are not seeing" rather than show nothing.
+/// beside its checkpoints, plus the root those checkpoints belong to. See
+/// [`service::workbench::contamination_events`](crate::service::workbench::contamination_events)
+/// for why this is a command of its own rather than `activity_list` + N ×
+/// `activity_detail`.
 #[tauri::command]
 pub async fn contamination_events(root: Option<String>) -> AppResult<serde_json::Value> {
-    let root = crate::activity::root_key(&resolve_workbench_root(root)?);
-    let events = run_on_blocking_pool(crate::offload::outbound::contamination_events).await?;
-    Ok(serde_json::json!({ "root": root, "events": events }))
+    crate::service::workbench::contamination_events(root).await
 }
 
 /// V13 Phase D: every cImp-managed worktree of `root`'s repo — slug, branch,
-/// base branch, ahead/behind vs that base, and whether an AI tab is
-/// currently pointed at it. `root` defaults to the launch directory.
+/// base branch, ahead/behind vs that base, and whether an AI tab is currently
+/// pointed at it. See [`WorkbenchUseCases::worktrees`].
 #[tauri::command]
 pub async fn workbench_worktrees(
     service: State<'_, std::sync::Arc<crate::workbench::WorkbenchService>>,
     root: Option<String>,
 ) -> AppResult<Vec<crate::workbench::worktree::WorktreeInfo>> {
-    let root = resolve_workbench_root(root)?;
-    service.worktrees(&root).await
+    workbench_use_cases(&service).worktrees(root).await
 }
 
 /// V13 Phase D D3: worktree `slug` vs. the base branch it was cut from
-/// (`git diff <base>...cimp/<slug>`), parsed the same way `workbench_diff_file`
-/// is. Read-only — there is no revert action on this diff.
+/// (`git diff <base>...cimp/<slug>`). Read-only — there is no revert action on
+/// this diff. See [`WorkbenchUseCases::worktree_diff`].
 #[tauri::command]
 pub async fn workbench_worktree_diff(
     service: State<'_, std::sync::Arc<crate::workbench::WorkbenchService>>,
@@ -3404,20 +3349,17 @@ pub async fn workbench_worktree_diff(
     slug: String,
     context: Option<u32>,
 ) -> AppResult<Vec<crate::workbench::diff::FileDiff>> {
-    let root = resolve_workbench_root(root)?;
-    service
-        .worktree_diff(&root, &slug, diff_context(context))
+    workbench_use_cases(&service)
+        .worktree_diff(root, &slug, context)
         .await
 }
 
 /// Session-commits section: the union of commits caught live from the
-/// session's transcript (the graph memory's `session_commit` provenance,
-/// flagged `tracked`) and commits whose committer time falls inside the
-/// session's window. The frontend's `from_ms..=to_ms` is only a fallback
-/// snapshot — when the graph's own `session` relation knows the session,
-/// its (fresher) window is merged in, so a commit made after the frontend's
-/// last poll still lands inside the window. Newest first. `root` defaults
-/// to the launch directory.
+/// session's transcript and commits whose committer time falls inside the
+/// session's window, newest first. The frontend's `from_ms..=to_ms` is only a
+/// fallback snapshot — see [`WorkbenchUseCases::session_commits`] and
+/// [`widen`](crate::service::workbench) for the union rule. This is the wire
+/// boundary only: it names the code graph as the session bookkeeping source.
 #[tauri::command]
 pub async fn workbench_session_commits(
     service: State<'_, std::sync::Arc<crate::workbench::WorkbenchService>>,
@@ -3427,24 +3369,16 @@ pub async fn workbench_session_commits(
     from_ms: i64,
     to_ms: i64,
 ) -> AppResult<crate::workbench::history::SessionCommits> {
-    let root = resolve_workbench_root(root)?;
-    let recorded = graph.session_commit_hashes(&root, &session_id);
-    let (from_ms, to_ms) = match graph.session_windows(&root).get(&session_id) {
-        Some((s, l)) => (from_ms.min(*s), to_ms.max(*l)),
-        None => (from_ms, to_ms),
-    };
-    service
-        .session_commits(&root, from_ms, to_ms, &recorded)
+    workbench_use_cases(&service)
+        .session_commits(root, &session_id, from_ms, to_ms, graph.inner())
         .await
 }
 
 /// Per-session commit counts (session_id → count) for the Sessions card's
-/// per-row "commits" button — a zero count disables it. One cached
-/// lightweight `git log` walk serves every window (see
-/// `WorkbenchService::session_commit_counts`); recorded transcript-caught
-/// commits count even when they fall outside a window. Frontend-supplied
-/// windows are widened with the graph's own canonical session windows, same
-/// as `workbench_session_commits`.
+/// per-row "commits" button — a zero count disables it. Frontend-supplied
+/// windows are widened with the graph's own canonical session windows, same as
+/// [`workbench_session_commits`]. See
+/// [`WorkbenchUseCases::session_commit_counts`].
 #[tauri::command]
 pub async fn workbench_session_commit_counts(
     service: State<'_, std::sync::Arc<crate::workbench::WorkbenchService>>,
@@ -3452,26 +3386,14 @@ pub async fn workbench_session_commit_counts(
     root: Option<String>,
     windows: Vec<crate::workbench::history::SessionWindow>,
 ) -> AppResult<std::collections::HashMap<String, u32>> {
-    let root = resolve_workbench_root(root)?;
-    let recorded = graph.session_commit_hashes_all(&root);
-    let canonical = graph.session_windows(&root);
-    let windows: Vec<_> = windows
-        .into_iter()
-        .map(|mut w| {
-            if let Some((s, l)) = canonical.get(&w.session_id) {
-                w.from_ms = w.from_ms.min(*s);
-                w.to_ms = w.to_ms.max(*l);
-            }
-            w
-        })
-        .collect();
-    service
-        .session_commit_counts(&root, &windows, &recorded)
+    workbench_use_cases(&service)
+        .session_commit_counts(root, windows, graph.inner())
         .await
 }
 
-/// One commit vs. its first parent, parsed the same way `workbench_diff_file`
-/// is — the Session-commits section's expanded-commit file list. Read-only.
+/// One commit vs. its first parent — the Session-commits section's
+/// expanded-commit file list. Read-only. See
+/// [`WorkbenchUseCases::commit_diff`].
 #[tauri::command]
 pub async fn workbench_commit_diff(
     service: State<'_, std::sync::Arc<crate::workbench::WorkbenchService>>,
@@ -3479,30 +3401,27 @@ pub async fn workbench_commit_diff(
     hash: String,
     context: Option<u32>,
 ) -> AppResult<Vec<crate::workbench::diff::FileDiff>> {
-    let root = resolve_workbench_root(root)?;
-    service
-        .commit_diff(&root, &hash, diff_context(context))
+    workbench_use_cases(&service)
+        .commit_diff(root, &hash, context)
         .await
 }
 
-/// The Git-graph section: up to `limit` commits from every ref in
-/// topological order (children before parents — what the frontend's lane
-/// layout needs) plus the current branch name.
+/// The Git-graph section: up to `limit` commits from every ref in topological
+/// order (children before parents — what the frontend's lane layout needs)
+/// plus the current branch name. See [`WorkbenchUseCases::git_graph`].
 #[tauri::command]
 pub async fn workbench_git_graph(
     service: State<'_, std::sync::Arc<crate::workbench::WorkbenchService>>,
     root: Option<String>,
     limit: Option<usize>,
 ) -> AppResult<crate::workbench::history::GitGraph> {
-    let root = resolve_workbench_root(root)?;
-    service.git_graph(&root, limit.unwrap_or(500)).await
+    workbench_use_cases(&service).git_graph(root, limit).await
 }
 
 /// V13 Phase D: create a bare worktree (no tab) for `slug` — the Worktrees
 /// section's own "create" affordance. Returns the new worktree's absolute
-/// path. See `workbench::worktree::create`'s doc comment for the full
-/// precondition sequence (nested-repo refusal, detached-HEAD refusal,
-/// duplicate-slug refusal) that surfaces as a typed error here.
+/// path. See [`WorkbenchUseCases::worktree_create`], which also holds the
+/// tab-lifecycle serializer this hands it and says why.
 #[tauri::command]
 pub async fn workbench_worktree_create(
     service: State<'_, std::sync::Arc<crate::workbench::WorkbenchService>>,
@@ -3510,72 +3429,66 @@ pub async fn workbench_worktree_create(
     root: Option<String>,
     slug: String,
 ) -> AppResult<String> {
-    // Same serializer `create_ai_tab_in_worktree` holds: two concurrent
-    // creates for one slug could otherwise both pass `worktree::create`'s
-    // existence check before either runs `git worktree add` (git's own
-    // locking makes the loser fail, but with an opaque "branch already
-    // exists" instead of the typed duplicate-slug error).
-    let _serializer = state.lifecycle_serializer.lock().await;
-    let root = resolve_workbench_root(root)?;
-    let path = service.worktree_create(&root, &slug).await?;
-    Ok(path.display().to_string())
+    workbench_use_cases(&service)
+        .worktree_create(&state.lifecycle_serializer, root, &slug)
+        .await
 }
 
-/// V13 Phase D: merge worktree `slug`'s branch back into the branch it was
-/// cut from. **Safety-critical** — see `workbench::worktree::merge`'s doc
-/// comment: on ANY failure past the preconditions (most notably a merge
-/// conflict), the merge is aborted before this returns, so the main working
-/// tree is either fully merged or completely untouched — never half-merged.
+/// V13 Phase D: merge worktree `slug`'s branch back into the branch it was cut
+/// from. **Safety-critical** — see `workbench::worktree::merge`'s doc comment:
+/// on ANY failure past the preconditions the merge is aborted before this
+/// returns. See [`WorkbenchUseCases::worktree_merge`].
 #[tauri::command]
 pub async fn workbench_worktree_merge(
     service: State<'_, std::sync::Arc<crate::workbench::WorkbenchService>>,
     root: Option<String>,
     slug: String,
 ) -> AppResult<crate::workbench::worktree::MergeReport> {
-    let root = resolve_workbench_root(root)?;
-    service.worktree_merge(&root, &slug).await
+    workbench_use_cases(&service)
+        .worktree_merge(root, &slug)
+        .await
 }
 
 /// V13 Phase D: remove worktree `slug`'s directory and delete its branch.
 /// **Double-confirmation is the frontend's job** — this call performs the
-/// removal unconditionally once invoked, and only ever acts on a
-/// cImp-created worktree (refuses a `slug` with no meta sidecar).
+/// removal unconditionally once invoked. See
+/// [`WorkbenchUseCases::worktree_discard`].
 #[tauri::command]
 pub async fn workbench_worktree_discard(
     service: State<'_, std::sync::Arc<crate::workbench::WorkbenchService>>,
     root: Option<String>,
     slug: String,
 ) -> AppResult<()> {
-    let root = resolve_workbench_root(root)?;
-    service.worktree_discard(&root, &slug).await
+    workbench_use_cases(&service)
+        .worktree_discard(root, &slug)
+        .await
 }
 
-/// V13 Phase D D3 (soft-dep V12 Phase A `checks::run`): the merge-readiness
-/// chip's "Run checks" action — runs every configured check with `cwd` = the
-/// worktree, caches the aggregate pass/fail, and returns it. See
-/// `WorktreeCheckStatus`'s doc comment for the `changed_only` rough edge this
-/// accepts for V1.
+/// V13 Phase D D3: the merge-readiness chip's "Run checks" action — runs every
+/// configured check with `cwd` = the worktree, caches the aggregate pass/fail,
+/// and returns it. See [`WorkbenchUseCases::worktree_run_checks`].
 #[tauri::command]
 pub async fn workbench_worktree_run_checks(
     service: State<'_, std::sync::Arc<crate::workbench::WorkbenchService>>,
     root: Option<String>,
     slug: String,
 ) -> AppResult<crate::workbench::WorktreeCheckStatus> {
-    let root = resolve_workbench_root(root)?;
-    service.worktree_run_checks(&root, &slug).await
+    workbench_use_cases(&service)
+        .worktree_run_checks(root, &slug)
+        .await
 }
 
 /// V13 Phase D D3: the merge-readiness chip's last cached result for `slug`,
 /// if any check has been run this session — `null` on the wire means "not
-/// checked yet", not a failure.
+/// checked yet", not a failure. See
+/// [`WorkbenchUseCases::worktree_check_status`].
 #[tauri::command]
 pub fn workbench_worktree_check_status(
     service: State<'_, std::sync::Arc<crate::workbench::WorkbenchService>>,
     root: Option<String>,
     slug: String,
 ) -> AppResult<Option<crate::workbench::WorktreeCheckStatus>> {
-    let root = resolve_workbench_root(root)?;
-    Ok(service.worktree_check_status(&root, &slug))
+    workbench_use_cases(&service).worktree_check_status(root, &slug)
 }
 
 /// V9-01: pause/resume the graph's incremental fs-watcher re-indexing. Paused

@@ -314,8 +314,12 @@ impl Wiring {
     /// Managed unconditionally, and **before** [`Self::wire_graph`] — see the
     /// module docs and the call site.
     pub fn wire_workbench(&self, app: &App) {
-        let workbench_service =
-            crate::workbench::WorkbenchService::new(app.handle().clone(), self.settings.clone());
+        let workbench_service = crate::workbench::WorkbenchService::new(
+            std::sync::Arc::new(crate::service::sink::TauriEventSink::new(
+                app.handle().clone(),
+            )),
+            self.settings.clone(),
+        );
         // V13 Phase D D3: reconcile git's worktree bookkeeping once at
         // startup (a worktree directory the user deleted out-of-band
         // since the last run). Best-effort/fire-and-forget — see

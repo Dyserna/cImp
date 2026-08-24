@@ -432,3 +432,17 @@
 .settings-chrome small.hint.down {
   color: var(--danger, #c9564b);
 }
+/* Blank vertical spacer between groups inside a card (the offload backend
+   editor's Server command / Tool scope / lifecycle-row gaps, and the Code
+   Intelligence sub-tab bar). No rule line — just breathing room. Chrome
+   because those two sections were split apart by #129 (c) and one of them is
+   still in `SettingsApp.svelte`. */
+.settings-chrome .card-divider {
+  border: none;
+  margin: 0;
+  height: 0.9rem;
+}
+/* Wider gap above the Server command and Tool scope groups. */
+.settings-chrome .card-divider.lg {
+  height: 1.8rem;
+}

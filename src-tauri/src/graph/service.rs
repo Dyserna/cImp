@@ -18,6 +18,12 @@
 //!
 //! What it still does *not* do: the warm loopback query path — the MCP child
 //! opens the db read-only itself (`super::mcp`).
+//!
+//! V42 R6 (#117) split three of the service's buckets into child modules —
+//! [`readadvisor`], [`live`] and [`walk`]. What stayed here is the index
+//! lifecycle, context injection, auto-check, distillation and drift, plus the
+//! `GraphService` struct itself: children see their parent's private fields,
+//! so all of the state is still declared in one place.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -806,6 +812,37 @@ impl GraphService {
         Ok(idx)
     }
 
+    /// Run `f` over `root`'s warm index, or hand back the return type's empty
+    /// value when the store cannot be opened.
+    ///
+    /// V42 R6 (#117). Ten of this file's read/record wrappers spelled the same
+    /// eight lines: open, log `graph: <what> open failed` at debug, return
+    /// nothing-shaped. `what` is the wrapper's own log name, so every site's
+    /// message is byte-identical to what it emitted before.
+    ///
+    /// Four neighbours deliberately do NOT use this, because their failure arm
+    /// is not log-and-default: [`Self::usage_all_sessions`] PROPAGATES the
+    /// error (a swallowed one renders as a healthy empty project),
+    /// [`Self::usage_snapshot`] reports it to the UI in `store_error`,
+    /// [`Self::drift_db_signals`] logs nothing at all, and `reindex_paths` /
+    /// `embed_backfill` warn rather than debug — one of them also patching the
+    /// root's status. A helper that quietly changed any of those would be
+    /// trading a real signal for four fewer lines.
+    fn with_index<T: Default>(
+        &self,
+        root: &Path,
+        what: &str,
+        f: impl FnOnce(&GraphIndex) -> T,
+    ) -> T {
+        match self.index_for(root) {
+            Ok(idx) => f(&idx),
+            Err(e) => {
+                debug!(error = %e, "graph: {what} open failed");
+                T::default()
+            }
+        }
+    }
+
     /// Every known root's status (the IPC list surface).
     pub fn statuses(&self) -> Vec<GraphStatus> {
         let paused = self.paused.load(Ordering::Relaxed);
@@ -949,16 +986,13 @@ impl GraphService {
         // paths). A pattern/command that isn't under root passes through.
         let rel = relativize_path(root, path);
         let ts = crate::activity::now_ms() as i64;
-        match self.index_for(root) {
-            Ok(idx) => {
-                if let Err(e) =
-                    idx.record_mem_event(session_id, agent, kind, &rel, symbol, line, ts, detail)
-                {
-                    debug!(error = %e, "graph: record_mem_event failed");
-                }
+        self.with_index(root, "record_mem_event", |idx| {
+            if let Err(e) =
+                idx.record_mem_event(session_id, agent, kind, &rel, symbol, line, ts, detail)
+            {
+                debug!(error = %e, "graph: record_mem_event failed");
             }
-            Err(e) => debug!(error = %e, "graph: record_mem_event open failed"),
-        }
+        })
     }
 
     /// Record one git commit caught live from an agent transcript (the OOB
@@ -971,29 +1005,21 @@ impl GraphService {
             return;
         }
         let ts = crate::activity::now_ms() as i64;
-        match self.index_for(root) {
-            Ok(idx) => {
-                if let Err(e) = idx.record_session_commit(session_id, hash, ts) {
-                    debug!(error = %e, "graph: record_session_commit failed");
-                }
+        self.with_index(root, "record_session_commit", |idx| {
+            if let Err(e) = idx.record_session_commit(session_id, hash, ts) {
+                debug!(error = %e, "graph: record_session_commit failed");
             }
-            Err(e) => debug!(error = %e, "graph: record_session_commit open failed"),
-        }
+        })
     }
 
     /// Every commit hash recorded for `session_id` (git-printed, usually
     /// short — match by prefix), oldest first. Empty on any store error.
     pub fn session_commit_hashes(&self, root: &Path, session_id: &str) -> Vec<String> {
-        let idx = match self.index_for(root) {
-            Ok(idx) => idx,
-            Err(e) => {
-                debug!(error = %e, "graph: session_commit_hashes open failed");
-                return Vec::new();
-            }
-        };
-        idx.session_commit_hashes(session_id)
-            .inspect_err(|e| debug!(error = %e, "graph: session_commit_hashes failed"))
-            .unwrap_or_default()
+        self.with_index(root, "session_commit_hashes", |idx| {
+            idx.session_commit_hashes(session_id)
+                .inspect_err(|e| debug!(error = %e, "graph: session_commit_hashes failed"))
+                .unwrap_or_default()
+        })
     }
 
     /// Recorded commit hashes for every session (session_id → hashes) in one
@@ -1002,35 +1028,25 @@ impl GraphService {
         &self,
         root: &Path,
     ) -> std::collections::HashMap<String, Vec<String>> {
-        let idx = match self.index_for(root) {
-            Ok(idx) => idx,
-            Err(e) => {
-                debug!(error = %e, "graph: session_commit_hashes_all open failed");
-                return Default::default();
-            }
-        };
-        idx.session_commit_hashes_all()
-            .inspect_err(|e| debug!(error = %e, "graph: session_commit_hashes_all failed"))
-            .unwrap_or_default()
+        self.with_index(root, "session_commit_hashes_all", |idx| {
+            idx.session_commit_hashes_all()
+                .inspect_err(|e| debug!(error = %e, "graph: session_commit_hashes_all failed"))
+                .unwrap_or_default()
+        })
     }
 
     /// The graph's own `(started_ms, last_ms)` window for every session —
     /// the CANONICAL session windows (the `session` relation), fresher than
     /// any frontend snapshot for the live session. Empty on any store error.
     pub fn session_windows(&self, root: &Path) -> std::collections::HashMap<String, (i64, i64)> {
-        let idx = match self.index_for(root) {
-            Ok(idx) => idx,
-            Err(e) => {
-                debug!(error = %e, "graph: session_windows open failed");
-                return Default::default();
-            }
-        };
-        idx.mem_sessions()
-            .inspect_err(|e| debug!(error = %e, "graph: session_windows failed"))
-            .unwrap_or_default()
-            .into_iter()
-            .map(|s| (s.session_id, (s.started_ms, s.last_ms)))
-            .collect()
+        self.with_index(root, "session_windows", |idx| {
+            idx.mem_sessions()
+                .inspect_err(|e| debug!(error = %e, "graph: session_windows failed"))
+                .unwrap_or_default()
+                .into_iter()
+                .map(|s| (s.session_id, (s.started_ms, s.last_ms)))
+                .collect()
+        })
     }
 
     // ── V14 Phase C: usage / cost accounting ──────────────────────────────
@@ -1047,16 +1063,11 @@ impl GraphService {
             return;
         }
         let ts = crate::activity::now_ms() as i64;
-        let idx = match self.index_for(root) {
-            Ok(idx) => idx,
-            Err(e) => {
-                debug!(error = %e, "graph: record_usage_event open failed");
-                return;
+        self.with_index(root, "record_usage_event", |idx| {
+            if let Err(e) = idx.record_usage_event(session_id, agent, &event, ts) {
+                debug!(error = %e, "graph: record_usage_event failed");
             }
-        };
-        if let Err(e) = idx.record_usage_event(session_id, agent, &event, ts) {
-            debug!(error = %e, "graph: record_usage_event failed");
-        }
+        })
     }
 
     /// Summed token totals for `session_id` ("turn" rows only), by the
@@ -1072,30 +1083,20 @@ impl GraphService {
         root: &Path,
         session_id: &str,
     ) -> crate::harness::plugin::TokenKinds {
-        let idx = match self.index_for(root) {
-            Ok(idx) => idx,
-            Err(e) => {
-                debug!(error = %e, "graph: usage_session_totals open failed");
-                return crate::harness::plugin::TokenKinds::default();
-            }
-        };
-        idx.usage_session_totals(session_id)
-            .inspect_err(|e| debug!(error = %e, "graph: usage_session_totals failed"))
-            .unwrap_or_default()
+        self.with_index(root, "usage_session_totals", |idx| {
+            idx.usage_session_totals(session_id)
+                .inspect_err(|e| debug!(error = %e, "graph: usage_session_totals failed"))
+                .unwrap_or_default()
+        })
     }
 
     /// Per-turn token/tool-char series for `session_id`, oldest → newest.
     pub fn usage_turn_series(&self, root: &Path, session_id: &str) -> Vec<TurnUsage> {
-        let idx = match self.index_for(root) {
-            Ok(idx) => idx,
-            Err(e) => {
-                debug!(error = %e, "graph: usage_turn_series open failed");
-                return Vec::new();
-            }
-        };
-        idx.usage_turn_series(session_id)
-            .inspect_err(|e| debug!(error = %e, "graph: usage_turn_series failed"))
-            .unwrap_or_default()
+        self.with_index(root, "usage_turn_series", |idx| {
+            idx.usage_turn_series(session_id)
+                .inspect_err(|e| debug!(error = %e, "graph: usage_turn_series failed"))
+                .unwrap_or_default()
+        })
     }
 
     /// Per-session usage totals + cache-hit ratio + `est_only` for every
@@ -1107,29 +1108,29 @@ impl GraphService {
     /// "0 sessions", which reads as a healthy empty project (see
     /// `usage_snapshot`'s `store_error`).
     pub fn usage_all_sessions(&self, root: &Path) -> AppResult<Vec<SessionUsageRow>> {
+        // Deliberately NOT [`Self::with_index`] (V42 R6, #117). Every sibling
+        // wrapper around it folds into that helper because its failure arm is
+        // log-and-default; this one's whole point is that it does NOT default,
+        // and folding it in would turn an unopenable store back into the
+        // "0 sessions" reading the doc above exists to rule out.
         self.index_for(root)?.usage_all_sessions()
     }
 
     /// V14 Phase D: per-tool ranking (est. tokens + call count) for
     /// `session_id`, descending.
     pub fn usage_tool_ranking(&self, root: &Path, session_id: &str) -> Vec<ToolUsage> {
-        let idx = match self.index_for(root) {
-            Ok(idx) => idx,
-            Err(e) => {
-                debug!(error = %e, "graph: usage_tool_ranking open failed");
-                return Vec::new();
-            }
-        };
-        idx.usage_tool_ranking(session_id)
-            .inspect_err(|e| debug!(error = %e, "graph: usage_tool_ranking failed"))
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(tool, chars, calls)| ToolUsage {
-                tool,
-                est_tokens: chars / 4,
-                calls,
-            })
-            .collect()
+        self.with_index(root, "usage_tool_ranking", |idx| {
+            idx.usage_tool_ranking(session_id)
+                .inspect_err(|e| debug!(error = %e, "graph: usage_tool_ranking failed"))
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(tool, chars, calls)| ToolUsage {
+                    tool,
+                    est_tokens: chars / 4,
+                    calls,
+                })
+                .collect()
+        })
     }
 
     /// V14 Phase D: the Usage section's on-demand payload for `root` — the
@@ -1231,16 +1232,11 @@ impl GraphService {
     /// V24 Phase B: per-model token totals + the per-lane split for
     /// `session_id`, ordered by tokens desc. Empty on any store error.
     pub fn usage_session_model_totals(&self, root: &Path, session_id: &str) -> Vec<ModelUsage> {
-        let idx = match self.index_for(root) {
-            Ok(idx) => idx,
-            Err(e) => {
-                debug!(error = %e, "graph: usage_session_model_totals open failed");
-                return Vec::new();
-            }
-        };
-        idx.usage_session_model_totals(session_id)
-            .inspect_err(|e| debug!(error = %e, "graph: usage_session_model_totals failed"))
-            .unwrap_or_default()
+        self.with_index(root, "usage_session_model_totals", |idx| {
+            idx.usage_session_model_totals(session_id)
+                .inspect_err(|e| debug!(error = %e, "graph: usage_session_model_totals failed"))
+                .unwrap_or_default()
+        })
     }
 
     /// V24 Phase B: the "open tabs + recency" active set for `sessions` at

@@ -7,6 +7,12 @@
   // transitions via the `graph-status` event. The graph indexer dashboard
   // (index cards + rebuild/pause actions) moved to Tool Activity → Graph
   // index (GraphIndexView.svelte).
+  // #130 (F4): the rules more than one section of this view needs live in a
+  // plain sheet keyed on the `.graph-monitor` class this component puts on its
+  // root, so a section child can be extracted without losing them to Svelte's
+  // per-component style scoping. This import stays FIRST — the sheet must be
+  // emitted ahead of every child's CSS so a child wins a specificity tie.
+  import './codeIntel/codeIntel.css';
   import { onMount, onDestroy } from 'svelte';
   import {
     graphStatus,
@@ -3305,32 +3311,6 @@
     margin: 0;
     font-size: 15px;
   }
-  .actions {
-    display: flex;
-    gap: 8px;
-  }
-  button {
-    padding: 4px 10px;
-    border-radius: 5px;
-    border: 1px solid var(--border-default, #444);
-    background: var(--accent, #3b6ea5);
-    color: var(--accent-fg, #fff);
-    cursor: pointer;
-    font-size: 12px;
-  }
-  button.secondary {
-    background: transparent;
-    color: var(--text-primary, #ddd);
-  }
-  button:disabled {
-    opacity: 0.5;
-    cursor: default;
-  }
-  .placeholder {
-    opacity: 0.6;
-    font-style: italic;
-    padding: 8px 2px;
-  }
   /* Transient inline notice (e.g. a vanished session) — a touch more present
      than a plain placeholder, accent-tinted so it reads as a status message. */
   .placeholder.notice {
@@ -3382,27 +3362,6 @@
     opacity: 1;
     background: rgba(255, 255, 255, 0.06);
   }
-  /* V12 Phase F (6c): "+N since last pass" badge on the Analyses tab + its
-     buttons — a small pill, never wraps, doesn't disturb button sizing. */
-  .badge {
-    display: inline-block;
-    margin-left: 6px;
-    padding: 0 6px;
-    border-radius: 999px;
-    background: var(--surface-warning, #c9820a);
-    color: var(--text-warning, #fff);
-    font-size: 10px;
-    font-weight: 600;
-    line-height: 16px;
-    vertical-align: middle;
-  }
-  .card {
-    border: 1px solid var(--border-subtle, #3a3a3a);
-    border-radius: 8px;
-    padding: 12px;
-    margin-bottom: 12px;
-    background: var(--surface-card, #1e1e1e);
-  }
   /* The Overview section's group divider (Usage). */
   .group-head {
     margin: 18px 0 8px;
@@ -3417,31 +3376,8 @@
   .group-head:first-of-type {
     margin-top: 0;
   }
-  .error {
-    color: var(--text-danger-soft, #ff8a80);
-    font-size: 12px;
-    margin: 6px 0 0;
-  }
-  .history-head {
-    font-weight: 600;
-    margin-bottom: 6px;
-  }
-  .muted {
-    opacity: 0.6;
-    font-weight: 400;
-  }
   .analyses .actions {
     margin-bottom: 12px;
-  }
-  .caveat {
-    font-size: 11px;
-    opacity: 0.65;
-    margin: 2px 0 8px;
-    line-height: 1.4;
-  }
-  .rows {
-    display: flex;
-    flex-direction: column;
   }
   /* Bounded lists: show ~N rows (an .arow is ~21.5px), scroll the rest.
      Horizontal overflow scrolls too — the sessrow stat columns are fixed-
@@ -3465,16 +3401,6 @@
   .rows.scroll10 {
     max-height: 215px;
   }
-  .arow {
-    display: grid;
-    grid-template-columns: 1fr 6rem 2fr;
-    gap: 8px;
-    align-items: baseline;
-    padding: 3px 4px;
-    border-bottom: 1px solid var(--border-faint, #2a2a2a);
-    font-size: 12px;
-    white-space: nowrap;
-  }
   .arow.cycle {
     display: block;
     font-family: monospace;
@@ -3484,22 +3410,6 @@
   }
   .arow.dep {
     grid-template-columns: 1fr 6rem 2fr auto;
-  }
-  .aname {
-    font-weight: 600;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-  .akind {
-    opacity: 0.7;
-    font-size: 11px;
-  }
-  .aloc {
-    font-family: monospace;
-    font-size: 11px;
-    opacity: 0.8;
-    overflow: hidden;
-    text-overflow: ellipsis;
   }
   .arow.note,
   .arow.sess,
@@ -3752,14 +3662,6 @@
   .fact-del:hover {
     opacity: 1;
   }
-  .pin-toggle {
-    display: flex;
-    align-items: center;
-    gap: 3px;
-    font-size: 12px;
-    cursor: pointer;
-    user-select: none;
-  }
   .arow.sess.current .aname {
     color: var(--accent, #3b6ea5);
     font-weight: 700;
@@ -3779,18 +3681,6 @@
   .pin.pinned {
     opacity: 1;
   }
-  .history-head {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-  .history-head .muted {
-    margin-right: auto;
-  }
-  button.mini {
-    padding: 2px 8px;
-    font-size: 11px;
-  }
   button.mini.danger {
     background: transparent;
     border-color: var(--border-danger, #b3261e);
@@ -3798,27 +3688,6 @@
   }
   button.mini.danger:hover {
     background: var(--surface-danger, rgba(179, 38, 30, 0.15));
-  }
-  .preview-in {
-    display: flex;
-    gap: 8px;
-    margin: 6px 0 10px;
-  }
-  .preview-in input {
-    flex: 1;
-    min-width: 0;
-    padding: 5px 8px;
-    border-radius: 5px;
-    border: 1px solid var(--border-default, #444);
-    background: var(--surface-input, #1e1e1e);
-    color: var(--text-primary, #ddd);
-    font-size: 12px;
-  }
-  .preview-meta {
-    font-size: 11px;
-    opacity: 0.75;
-    margin: 4px 0;
-    font-variant-numeric: tabular-nums;
   }
   .preview-md {
     background: rgba(0, 0, 0, 0.25);
@@ -4440,21 +4309,6 @@
     font-size: 11px;
     opacity: 0.7;
     line-height: 1.4;
-  }
-
-  /* ── V15: confidence badges (impact dependents, path edges) ──────────── */
-  .conf {
-    display: inline-block;
-    margin-left: 4px;
-    padding: 0 6px;
-    border-radius: 8px;
-    font-size: 9.5px;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.03em;
-    line-height: 15px;
-    vertical-align: middle;
-    white-space: nowrap;
   }
   .conf.extracted {
     background: rgba(255, 255, 255, 0.08);

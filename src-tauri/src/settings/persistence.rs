@@ -213,7 +213,7 @@ pub fn load(default_shell: &ShellSpec, launch_cwd: &Path) -> LoadOutcome {
         // Every machine-scope family, in one walk of [`MACHINE_SCOPED`] — drop
         // them before the merge so an overlay contaminated by a pre-guard
         // version can't shadow the global file. The whole-key bans go silently
-        // (see `OVERLAY_BANNED_KEYS`); the structured strips NAME what they
+        // (see [`strip_overlay_banned`]); the structured strips NAME what they
         // dropped, because a hand-edited config that sets a plugin's binary path
         // or one of the per-harness fields per repo is a reasonable thing to try
         // and a silent no-op is how that becomes "cImp ignores my config" an
@@ -1007,7 +1007,7 @@ enum OverlayStrip {
     /// `every_machine_scoped_family_fills_or_explains_every_cell`.
     Nothing,
     /// Covered by the wholesale [`strip_overlay_banned`] pass that runs at the
-    /// head of every strip leg — this row's keys are in [`OVERLAY_BANNED_KEYS`].
+    /// head of every strip leg, which reads this row's `keys` off the table.
     ///
     /// A marker rather than a hook, because the ban is ONE pass over the value
     /// for all of them and it has to run before the structured strips.
@@ -1092,7 +1092,7 @@ struct MachineScopedField {
 
 /// Every machine-scope settings family, in the order the legs walk them.
 const MACHINE_SCOPED: &[MachineScopedField] = &[
-    // The three whole-key bans first — see [`OVERLAY_BANNED_KEYS`] for why each
+    // The three whole-key bans first — see [`strip_overlay_banned`] for why each
     // is per-install state, and `sync_writer` for where an edit of it lands.
     MachineScopedField {
         name: "llm_pricing",
@@ -1289,6 +1289,26 @@ fn strip_machine_scope_from_diff(current: &mut Value, baseline: &mut Value) {
     }
 }
 
+/// **The wholesale ban.** Remove every [`OverlayStrip::Banned`] row's keys from
+/// `v` — the one pass that runs at the head of every strip leg, before any
+/// structured strip.
+///
+/// The banned set is READ OFF [`MACHINE_SCOPED`], not restated beside it. It was
+/// a hand-kept `OVERLAY_BANNED_KEYS` const until the V42 tranche-2 review
+/// (T2-9), with a test asserting the const and the `Banned` markers agreed:
+/// exactly the parallel-list shape issue #116 exists to delete, and one whose
+/// disagreement would not have been cosmetic — a row marked `Banned` whose key
+/// the const had never gained is a family stripped by nothing at all, since the
+/// marker is a marker and does no work of its own. The row is the declaration
+/// now.
+///
+/// Keyed on `overlay_strip` for all three legs, which is safe because
+/// `the_banned_rows_are_whole_top_level_keys_on_every_leg` holds a whole-key ban
+/// to all three legs or none — a family banned on one leg and merged on another
+/// is the leak the table exists to prevent.
+///
+/// # What is in the set, and why each is
+///
 /// Top-level `Settings` fields that are PER-INSTALL state, written straight
 /// to the physical global file by dedicated writers
 /// (`write_global_llm_pricing`, `mutate_global_harness_versions`) — and must
@@ -1350,12 +1370,16 @@ fn strip_machine_scope_from_diff(current: &mut Value, baseline: &mut Value) {
 // refactor, with the first post-upgrade save erasing the project's values and
 // no trace anywhere. The machine-scope half gets [`strip_overlay_harness`]
 // instead, which names what it drops.
-const OVERLAY_BANNED_KEYS: &[&str] = &["llm_pricing", "harness_versions", "sandbox"];
-
 fn strip_overlay_banned(v: &mut Value) {
-    if let Value::Object(map) = v {
-        for k in OVERLAY_BANNED_KEYS {
-            map.remove(*k);
+    let Value::Object(map) = v else {
+        return;
+    };
+    for row in MACHINE_SCOPED {
+        if !matches!(row.overlay_strip, OverlayStrip::Banned) {
+            continue;
+        }
+        for key in row.keys {
+            map.remove(*key);
         }
     }
 }
@@ -1363,7 +1387,7 @@ fn strip_overlay_banned(v: &mut Value) {
 /// SAVE write-through for the machine-scope `sandbox` block: copy the live
 /// value onto the on-disk global settings, returning true when it changed.
 ///
-/// `sandbox` is in [`OVERLAY_BANNED_KEYS`], so [`save`]'s diff can never carry
+/// `sandbox` is an [`OverlayStrip::Banned`] row, so [`save`]'s diff can never carry
 /// it into a project overlay — which would leave a Settings-window edit with
 /// nowhere to land if this did not exist. Same pattern as
 /// [`sync_tool_plugin_state_into`]: the pure half, so the caller decides
@@ -1648,7 +1672,7 @@ fn sync_offload_templates_into(disk_global: &mut Settings, current: &Settings) -
 // every sandboxed child, and a confined tool that could write its own
 // `.cimp/config.json` could then point cImp at a different binary — or flip its
 // own `enabled` — on the next run. A boundary a confined process can widen is
-// not a boundary. `sandbox` could be banned wholesale ([`OVERLAY_BANNED_KEYS`]);
+// not a boundary. `sandbox` could be banned wholesale (an [`OverlayStrip::Banned`] row);
 // this block cannot, because two of its leaves genuinely belong to the project.
 // So the strip is STRUCTURED instead of a key removal, and it is an ALLOW-list:
 // anything not named survives nowhere, including keys a future version adds.
@@ -5191,22 +5215,39 @@ mod tests {
         }
     }
 
-    /// The whole-key bans are a marker on the row plus one wholesale pass; this
-    /// keeps the two from drifting apart. A row marked
-    /// [`OverlayStrip::Banned`] whose key is not in [`OVERLAY_BANNED_KEYS`]
-    /// would not be stripped at all.
+    /// The two properties [`strip_overlay_banned`] relies on now that it reads
+    /// the banned set off the table instead of off a second list beside it
+    /// (V42 tranche-2 review, T2-9).
+    ///
+    /// The list-agreement half of this test went with the list. What it was
+    /// really asserting — that a `Banned` marker names something the wholesale
+    /// pass can actually remove — is asserted directly instead: the pass is
+    /// `map.remove(key)` on the object's TOP level, so a banned row's keys must
+    /// be top-level names. A dotted key there (`offload.mcp_servers`) would be a
+    /// family marked banned and stripped by nothing, which is exactly the
+    /// silent-hole shape the old test was aimed at.
     #[test]
-    fn the_banned_rows_and_overlay_banned_keys_agree() {
+    fn the_banned_rows_are_whole_top_level_keys_on_every_leg() {
         let banned: Vec<&str> = MACHINE_SCOPED
             .iter()
             .filter(|r| matches!(r.overlay_strip, OverlayStrip::Banned))
             .flat_map(|r| r.keys.iter().copied())
             .collect();
-        assert_eq!(
-            banned, OVERLAY_BANNED_KEYS,
-            "every `Banned` row's keys must be in `OVERLAY_BANNED_KEYS`, in the same order — the \
-             marker does not strip anything by itself"
+        // Vacuity: `strip_overlay_banned` derives its work from these rows, so
+        // an empty set would make it a no-op and every leg would merge them.
+        assert!(
+            !banned.is_empty(),
+            "no `Banned` rows at all — the wholesale ban now strips nothing, and `llm_pricing` / \
+             `harness_versions` / `sandbox` are merged from any overlay that carries them"
         );
+        for key in &banned {
+            assert!(
+                !key.contains('.'),
+                "`{key}` is a banned row's key but is not a top-level one — the wholesale ban is \
+                 a top-level `remove`, so this family would be marked banned and stripped by \
+                 nothing"
+            );
+        }
         for row in MACHINE_SCOPED {
             let is_banned = matches!(row.overlay_strip, OverlayStrip::Banned);
             assert_eq!(

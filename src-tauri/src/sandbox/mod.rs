@@ -345,8 +345,9 @@ pub(crate) const GRANT_REFUSAL_RULES: &[GrantRefusalRule] = &[
 /// This is the second of the two independent V33 mitigations for
 /// *"the settings file that configures the boundary lives inside the
 /// boundary"* (2026-08-18). The first is
-/// `settings::persistence::OVERLAY_BANNED_KEYS`, which stops a project overlay
-/// carrying a `sandbox` block at all. This one is what still holds if the
+/// the `OverlayStrip::Banned` row `settings::persistence`'s `MACHINE_SCOPED`
+/// table gives `sandbox`, which stops a project overlay carrying the block at
+/// all. This one is what still holds if the
 /// **global** settings file is the thing that goes wrong: whatever names the
 /// row, cImp runs as the user and `grant_dir` stamps a **durable, inheritable**
 /// ACE — so `extra_grant_dirs: ["C:\\Users\\<u>\\.ssh"]` would not merely let

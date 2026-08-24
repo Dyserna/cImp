@@ -46,18 +46,18 @@ pub async fn pty_start(
     {
         let registry = state.tabs.lock().await;
         registry
-            .start_tab(
+            .start_tab(crate::tabs::registry::TabStart {
                 app,
-                tab.clone(),
-                channel,
+                tab: tab.clone(),
+                output_channel: channel,
                 rows,
                 cols,
-                &cwd,
-                &invocation_args,
-                tts_tx,
+                launch_cwd: &cwd,
+                invocation_args: &invocation_args,
+                tts_segments: tts_tx,
                 settings,
                 start_gen,
-            )
+            })
             .await?;
     }
 
@@ -130,18 +130,18 @@ pub async fn pty_restart(
     let start_gen = state.tab_activity.begin_start(&tab);
     let registry = state.tabs.lock().await;
     let result = registry
-        .restart_tab(
+        .restart_tab(crate::tabs::registry::TabStart {
             app,
-            tab.clone(),
-            channel,
+            tab: tab.clone(),
+            output_channel: channel,
             rows,
             cols,
-            &cwd,
-            &invocation_args,
-            tts_tx,
+            launch_cwd: &cwd,
+            invocation_args: &invocation_args,
+            tts_segments: tts_tx,
             settings,
             start_gen,
-        )
+        })
         .await;
     // V39 review HIGH-3: re-seed the activity mirror for the fresh subprocess.
     //

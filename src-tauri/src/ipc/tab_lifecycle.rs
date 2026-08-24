@@ -8,12 +8,19 @@
 //! error shape the dialogs match on ([`TabLifecycleError`]) is re-exported
 //! from here so the frontend contract reads unchanged.
 //!
-//! Not everything moved: `reconfigure_shell_tab`, `set_enabled_ai_tabs`,
-//! `open_tool_tab`, `open_note_tab`, `create_ai_tab_in_worktree` and the
-//! reserved-feature-tab sync are outside the Phase 0 slice and still hold
-//! their own bodies. They share the validation helpers and the name-uniquing
-//! helpers with the service rather than keeping a second copy — those live in
-//! `service::tabs` now, one call away.
+//! **V42 Phase A1-3 finished the job.** `reconfigure_shell_tab`,
+//! `set_enabled_ai_tabs`, `open_tool_tab`, `open_note_tab` and
+//! `create_ai_tab_in_worktree` were outside the Phase 0 slice and held their
+//! own bodies; those are `service::tabs` methods now, and the three copies of
+//! the commit sequence they carried went into `commit_new_tab` with them (Phase
+//! 0 decision 3: the reserved-AI-builtin placement is a named parameter, not an
+//! accident). `default_shell_spec` is the one command left holding a body, and
+//! its doc says why.
+//!
+//! One ordering rule stayed at this boundary on purpose:
+//! `create_ai_tab_in_worktree` holds the lifecycle serializer itself, because it
+//! has to span the `git worktree add` between the service's template read and
+//! its commit.
 //!
 //! Every command still persists its mutation to settings via `SettingsHandle`,
 //! which broadcasts the new state to all listeners and triggers a debounced

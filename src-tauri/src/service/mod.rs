@@ -32,11 +32,27 @@
 //!
 //! ## Scope
 //!
-//! Phase 0 wraps ten commands (see the issue): the tab lifecycle
-//! (create shell / preview / ai, close, rename, activate, set-active,
-//! request-restart), the PTY streaming path (`pty_start` / `pty_restart` /
-//! `pty_rebind_channel`) and one poll view (`activity_list`). It is a real
-//! increment, not a prototype — but it is deliberately not the whole surface.
+//! Phase 0 wrapped ten commands as a sizing spike. **Phase A1 finished the
+//! surface**: all 180 `#[tauri::command]`s in the crate are now either a
+//! wrapper over a use case here, or an explicit leave whose doc says why —
+//! 138 and 42 respectively.
+//!
+//! A leave is not a gap. The criterion is that the body is one call on a handle
+//! Tauri already injected, with no argument shaping, no ordering and nothing to
+//! return that a test could disagree with: `graph_status` (one accessor),
+//! `stt_start_recording` (one post to a capture thread), `themes_list` (a free
+//! function that was headless the day it was written), the six Preview commands
+//! that call one method on a Tauri `Webview`, the window effects. Three leaves
+//! are deferrals rather than "nothing to test", and say so: the latch commands
+//! and `injection_status` (V42 #114 owns that seam), and `plugins_rescan`
+//! (its rule needs an `OffloadService`, which Phase A2 has to make
+//! constructible first).
+//!
+//! Two leaves have a different reason again: `content_open_folder` and
+//! `detection_open_rules_folder` are the crate's audited "reveal this folder"
+//! spawns, and [`crate::spawn_ledger`]'s row of record names `ipc/commands.rs`
+//! as the site. Moving an audited spawn to buy no testability is a worse trade
+//! than leaving it where the ledger says it is.
 
 pub mod audit;
 pub mod audio;

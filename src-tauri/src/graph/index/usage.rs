@@ -34,9 +34,8 @@ use crate::graph::memory::{
     MAX_USAGE_PER_SESSION,
 };
 
-use super::{
-    cell_i64, cell_str, dv_string, prune_sessions_in_tx, tx_put, tx_run, GraphIndex, StageAndSwap,
-};
+use super::memory::prune_sessions_in_tx;
+use super::{cell_i64, cell_str, dv_string, tx_put, tx_run, GraphIndex, StageAndSwap};
 
 impl GraphIndex {
     /// The `usage_stat` relation's `:create` DDL, parameterized by relation

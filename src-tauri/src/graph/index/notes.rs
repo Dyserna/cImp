@@ -23,9 +23,10 @@
 //! are private to `graph::index`, so no other module can reach the relation by
 //! any spelling. Nothing here adds to that half.
 //!
-//! **"Only ONE query applies the filter"** was not. `graph/index.rs` is ~8,800
-//! lines, "the second note query in this file is the bug" is not a property a
-//! reviewer can hold in their head, and the test that claimed to hold it passed
+//! **"Only ONE query applies the filter"** was not. `graph/index.rs` was ~8,800
+//! lines then (V42 R13 has since split it into submodules, this one included),
+//! "the second note query in this file is the bug" is not a property a reviewer
+//! can hold in their head, and the test that claimed to hold it passed
 //! **vacuously**: it lived in the very file it allowed and self-matched on its
 //! own doc comment and its own search literal, so renaming the relation would
 //! have left decision 10 unguarded with a green suite (V32 review, Part 4
@@ -41,8 +42,8 @@
 //! the retired scan, but over a few hundred lines instead of 8,800, and with
 //! the three self-guards the old one lacked.
 //!
-//! Deletes live here too, as the `RM_*` script constants `graph/index.rs`'s
-//! transaction paths use. They cannot leak a quarantined note (they remove
+//! Deletes live here too, as the `RM_*` script constants the parent's
+//! transaction cascades (`graph/index/memory.rs`) use. They cannot leak a quarantined note (they remove
 //! rows), but keeping their text here is what lets the scan assert "**no**
 //! query outside this module" instead of maintaining an exception list.
 //!
@@ -77,7 +78,7 @@
 //!   relation is still covered by the module boundary alone.
 //!   Narrowing that is a type problem (a relation newtype), not a scan problem.
 //!
-//! - **Statements that name the relation without an atom.** `graph/index.rs`'s
+//! - **Statements that name the relation without an atom.** The parent's
 //!   `#[cfg(test)] mod tests` ran four — a `::remove`, a pre-C2 `:create`, and
 //!   two `:put`s — to build the fixtures the migration tests need. None could
 //!   *read* a row (they are DDL and writes), so none could bypass the filter,
@@ -105,7 +106,7 @@ use crate::offload::toolclass::WriteTaint;
 
 use super::{cell_bool, cell_i64, cell_str, GraphIndex, StageAndSwap};
 
-// ── Delete scripts used by `graph/index.rs`'s transaction cascades ─────────
+// ── Delete scripts used by `graph/index/memory.rs`'s cascades ─────────────
 //
 // `session_id` is a VALUE column on this relation (the key is `note_id`), so
 // unlike the session-keyed relations there is no prefix bind to inline and the
@@ -671,9 +672,9 @@ fn decode_quarantine(raw: &str, note_id: &str) -> Option<NoteQuarantine> {
 
 // ── Migration-test fixture scripts (#48) ───────────────────────────────────
 //
-// `graph/index.rs`'s migration tests need to build a PRE-C2 store and an
-// interrupted-swap store, which means running DDL and writes that name the
-// relation. They lived in that file, which made the module docs' "every
+// The parent's migration tests (`graph/index/memory.rs`) need to build a PRE-C2
+// store and an interrupted-swap store, which means running DDL and writes that
+// name the relation. They lived in that file, which made the module docs' "every
 // statement naming the relation lives here" claim false by four.
 //
 // None of them can read a row, so none could ever bypass the quarantine filter
@@ -858,8 +859,8 @@ mod tests {
     ///    to check: that the filter still *works*. That is behaviour, and
     ///    behaviour is pinned by a behavioural test — see
     ///    `quarantined_notes_are_hidden_from_reads_until_promoted` in
-    ///    `graph/index.rs`. A source scan asserting that its own file contains
-    ///    some substring is satisfied by its own error message.
+    ///    `graph/index/memory.rs`. A source scan asserting that its own file
+    ///    contains some substring is satisfied by its own error message.
     /// 4. **Every match here must be a real query** — the file's house rule,
     ///    made executable (#48). Guard 3 counts occurrences and cannot tell
     ///    prose from code; when it shipped, `atom()`'s own doc comment spelled

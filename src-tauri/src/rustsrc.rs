@@ -18,6 +18,12 @@
 //!     `#[cfg(test)]` items in code and then act on the *unblanked* source, and
 //!     it is why [`test_regions`] returns ranges rather than a string.
 //!
+//! Since R11 the *walk* lives here too — [`src_root`] and [`source_files`], the
+//! one audited answer to "every `.rs` file in this crate". Same reason, same
+//! kind of incident: five copies of it disagreed about CR-stripping,
+//! dot-directory skipping and the vacuity floor, and the details are on
+//! [`source_files`].
+//!
 //! **Why this is a shared module and not a copy per caller.** The bug that
 //! created it: `harness::layering` had its own hand-rolled boundary finder
 //! (`text.match_indices("\n#[cfg(test)]\n").last()`) which was both
@@ -30,6 +36,128 @@
 //! checked the file out is the vacuous-canary class V35 exists to kill, so the
 //! answer is one audited implementation with controls
 //! (`spawn_ledger`'s `the_scanner_finds_what_it_claims_to_find`), not three.
+
+use std::path::{Path, PathBuf};
+
+/// The floor under [`source_files`]'s answer.
+///
+/// Every scanner built on this walk shares one failure mode: a walk that
+/// returns nothing finds no offender and reports `ok` while doing it. Three of
+/// the five copies R11 replaced asserted a floor of their own, two did not, and
+/// the two that did not are exactly the two whose scans are tree-wide security
+/// claims — so the floor lives here, once, where no caller can forget it. It is
+/// a vacuity floor, not a census: `src/` holds ~250 `.rs` files, and any answer
+/// under half of that is a broken walk rather than a smaller tree.
+const MIN_SOURCE_FILES: usize = 100;
+
+/// `<repo>/src-tauri/src`.
+///
+/// Resolved from `CARGO_MANIFEST_DIR` rather than the process cwd, so every
+/// scanner answers the same from any working directory (verified by running the
+/// suite from `C:\`), and asserted to exist: a scan whose root is missing has to
+/// say so rather than quietly walk nothing.
+pub(crate) fn src_root() -> PathBuf {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    assert!(
+        root.is_dir(),
+        "the source tree is missing at {} — a source scan cannot run",
+        root.display()
+    );
+    root
+}
+
+/// Every `.rs` file under [`src_root`], as `(slash-relative path, contents)` —
+/// sorted, `\r`-normalised, dot-directories skipped, guarded against vacuity.
+///
+/// # Why this is one function and not five (R11)
+///
+/// Five copies of this walk existed — in `harness::layering`, `spawn_gate`,
+/// `spawn_ledger`, `graph::index::notes` and `settings` — and they disagreed on
+/// exactly the three axes that decide what a *security* scan gets to see. The
+/// union is taken in the strict direction on every one, so no scanner reads
+/// fewer files, fewer bytes, or a different slice than it did before:
+///
+///  1. **`\r`.** `spawn_gate` stripped it, `layering` did not. That is the same
+///     fault the module docs above record from the other end — identical bytes,
+///     green on an LF working copy and red on a CRLF CI checkout — and the only
+///     place it can be fixed once is at the READ, before any caller takes an
+///     offset into the text. So this hands out LF, and no caller has to
+///     remember to.
+///  2. **Dot-directories.** `spawn_ledger` and `settings` skipped them; the
+///     other three walked in. A `.cimp/` under the crate holds a CozoDB graph
+///     database and a shadow git worktree — a whole second checkout of this
+///     tree, `.rs` files and all — so descending into it scans a stale copy of
+///     the crate and reports hits at paths nobody edits. (It is prophylactic
+///     today: the tree has no dot-directory under `src/` right now, and the
+///     point is that the day one appears no scan changes meaning.)
+///  3. **The vacuity floor.** See [`MIN_SOURCE_FILES`].
+///
+/// Sorting is the fourth, minor one: four of the five sorted and `spawn_ledger`
+/// did not, which made its failure messages depend on directory order.
+pub(crate) fn source_files() -> Vec<(String, String)> {
+    source_files_ext(&["rs"])
+}
+
+/// [`source_files`] over a caller-chosen extension set.
+///
+/// `settings`' pointer scan reads `.css` alongside `.rs` — a settings-path
+/// pointer is held to the same rule wherever it is written — and that is the
+/// only reason this parameter exists.
+pub(crate) fn source_files_ext(exts: &[&str]) -> Vec<(String, String)> {
+    let root = src_root();
+    let out = walk_tree(&root, exts);
+    assert!(
+        out.len() > MIN_SOURCE_FILES,
+        "the source walk found only {} {exts:?} files under {} — a walk that reads nothing finds \
+         no offender and passes, which is the one outcome a source scan may never have",
+        out.len(),
+        root.display()
+    );
+    out
+}
+
+/// The walk itself: an arbitrary root, no vacuity floor.
+///
+/// Split out so [`the_walk_skips_dot_dirs_normalises_line_endings_and_sorts`]
+/// can point it at a synthetic tree whose right answer is written down, rather
+/// than inferring the walker's behaviour from the crate it is walking.
+fn walk_tree(root: &Path, exts: &[&str]) -> Vec<(String, String)> {
+    fn walk(dir: &Path, root: &Path, exts: &[&str], out: &mut Vec<(String, String)>) {
+        let entries =
+            std::fs::read_dir(dir).unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()));
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .starts_with('.')
+            {
+                continue;
+            }
+            if path.is_dir() {
+                walk(&path, root, exts, out);
+            } else if path
+                .extension()
+                .and_then(|x| x.to_str())
+                .is_some_and(|x| exts.contains(&x))
+            {
+                let text = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|e| panic!("cannot read {} as UTF-8: {e}", path.display()));
+                let rel = path
+                    .strip_prefix(root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                out.push((rel, text.replace('\r', "")));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, root, exts, &mut out);
+    out.sort();
+    out
+}
 
 fn utf8_len(b: u8) -> usize {
     if b < 0x80 {
@@ -374,6 +502,97 @@ pub(crate) fn test_regions(code: &str) -> Vec<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The walker's controls (R11), on a synthetic tree whose right answer is
+    /// written down rather than read off the crate. Permanent, and one case per
+    /// divergence that made five copies of this walk disagree — a future edit
+    /// that reintroduces one fails here, rather than in a security assertion
+    /// that quietly stops matching anything.
+    #[test]
+    fn the_walk_skips_dot_dirs_normalises_line_endings_and_sorts() {
+        let root = std::env::temp_dir().join(format!("rustsrc-walk-{}", uuid::Uuid::new_v4()));
+        let write = |rel: &str, body: &str| {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().expect("every fixture has a parent"))
+                .expect("mkdir under temp");
+            std::fs::write(&p, body).expect("write a fixture");
+        };
+        // A CRLF file and an LF file with byte-identical content modulo the
+        // line ending — divergence 1.
+        write("z.rs", "fn z() {}\r\nfn zz() {}\r\n");
+        write("a/b.rs", "fn b() {}\n");
+        write("a/skip.txt", "not source\n");
+        write("theme.css", "a{}\n");
+        // Divergence 2, in its real shape: `.cimp/` holds a shadow worktree,
+        // i.e. a second checkout of the crate, `.rs` files and all.
+        write(".cimp/shadow/src/z.rs", "fn stale() {}\n");
+
+        let rs = walk_tree(&root, &["rs"]);
+        let paths: Vec<&str> = rs.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["a/b.rs", "z.rs"],
+            "the walk must be sorted, slash-separated, extension-filtered, and must not \
+             descend into a dot-directory"
+        );
+        assert!(
+            !rs.iter().any(|(_, t)| t.contains("stale")),
+            "a `.cimp/` shadow worktree was scanned as if it were the crate"
+        );
+        assert_eq!(
+            rs[1].1, "fn z() {}\nfn zz() {}\n",
+            "`\\r` must be stripped at the read, before any caller takes an offset"
+        );
+
+        let both = walk_tree(&root, &["rs", "css"]);
+        assert_eq!(
+            both.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>(),
+            vec!["a/b.rs", "theme.css", "z.rs"],
+            "widening the extension set must only ever add files"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// …and the same walk over the REAL tree is substantive and normalised.
+    ///
+    /// The synthetic control above proves the semantics; this one proves they
+    /// are the semantics the crate's scanners actually get, which is the half a
+    /// fixture can never establish.
+    #[test]
+    fn the_crate_walk_is_substantive_and_normalised() {
+        let files = source_files();
+        assert!(
+            files.len() > MIN_SOURCE_FILES,
+            "only {} files — the floor in `source_files_ext` should have fired first",
+            files.len()
+        );
+        assert!(
+            files.iter().any(|(p, _)| p == "rustsrc.rs"),
+            "the walk lost its own module, so it is not walking the crate root"
+        );
+        assert!(
+            files.iter().all(|(_, t)| !t.contains('\r')),
+            "a `\\r` reached a caller — on a CRLF checkout every offset-taking scan diverges"
+        );
+        assert!(
+            files
+                .iter()
+                .all(|(p, _)| !p.contains('\\') && !p.starts_with('/')),
+            "paths must be `src/`-relative with forward slashes: that is how the allowlists \
+             in `harness::layering` and the ledger rows in `spawn_ledger` are written"
+        );
+        let mut sorted = files.clone();
+        sorted.sort();
+        assert_eq!(files, sorted, "the walk must be sorted");
+
+        let widened = source_files_ext(&["rs", "css"]);
+        assert!(
+            widened.len() > files.len() && widened.iter().any(|(p, _)| p.ends_with(".css")),
+            "widening the extension set found no extra file — `settings`' pointer scan reads \
+             `.css` too, and would be silently reading less"
+        );
+    }
 
     /// The controls for [`uncommented`] (V42 review, RV-9). Each input is a
     /// shape a source scan can be fooled by, so a future edit to `blank_out`'s

@@ -14,7 +14,7 @@
 export const TUI_THEME_ID = 'tui';
 
 /// Default accent — the blue the pre-v28 `tui-blue` default theme used.
-/// Mirrors `DEFAULT_TUI_ACCENT` in `src-tauri/src/settings/schema.rs`.
+/// Mirrors `DEFAULT_TUI_ACCENT` in `src-tauri/src/settings/schema/ui.rs`.
 export const DEFAULT_TUI_ACCENT = '#7aa2f7';
 
 /// The four accents the legacy tui-* theme variants shipped with, offered
@@ -48,7 +48,7 @@ export function normalizeTuiAccent(value: string | null | undefined): string {
 // containment applies (`ui.latched_color` / `ui.contaminated_color`,
 // resolved through `latch.ts::taintColor`). Defaults mirror the TUI theme's
 // `--warning` / `--danger`, which is what the badge wore before the colors
-// became configurable; the Rust defaults in `settings/schema.rs` must match.
+// became configurable; the Rust defaults in `settings/schema/ui.rs` must match.
 
 export const DEFAULT_LATCHED_COLOR = '#fabd2f';
 export const DEFAULT_CONTAMINATED_COLOR = '#fb4934';

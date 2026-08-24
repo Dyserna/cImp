@@ -320,7 +320,7 @@ mod frontend_mirrors {
         assert!(
             missing.is_empty() && extra.is_empty(),
             "src/lib/settings/types.ts `LOCAL_DATA_TOOLS` has drifted from Rust's \
-             (settings/schema.rs). Missing from TypeScript: {missing:?}; present only in \
+             (settings/schema/mcp.rs). Missing from TypeScript: {missing:?}; present only in \
              TypeScript: {extra:?}. The Settings window WRITES this list into a backend's \
              tool_scope, so a stale copy silently narrows the exclusion (#48 F-27)."
         );

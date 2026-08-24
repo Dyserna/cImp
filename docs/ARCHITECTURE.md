@@ -203,7 +203,7 @@ engine (`src-tauri/src/graph/tags.rs`). **To add a language:**
    `tag_spec` and route the variant through the engine in `parse_file`. For a
    **markup/data** language, skip the query — registering it in `language_for`
    already enables `graph_struct_search`.
-4. Add the tag to the default `languages` list (`settings/schema.rs` +
+4. Add the tag to the default `languages` list (`settings/schema/graph.rs` +
    `lib/settings/types.ts`) if it should index by default, and to the Settings
    "Supported" hint in `SettingsApp.svelte`.
 5. Add a fixture test in `graph/tags.rs`; the `every_vendored_query_compiles`
@@ -793,7 +793,7 @@ tests in `harness/layering.rs` keep it that way:
   appear in production code outside `harness/`. Core may *hold* a `HarnessId`
   and pass it to the registry; it may not spell one and it may not branch on
   one. Exceptions are `IDENTITY_ALLOWLIST` — **two files today**
-  (`settings/schema.rs`, `state/manager.rs`), both for persisted wire forms —
+  (`settings/schema/mod.rs`, `state/manager.rs`), both for persisted wire forms —
   re-checked by `every_identity_allowlist_entry_is_still_earning_it`. The
   frontend has its own half: `src/lib/harnessIdentity.test.ts` runs the same
   scan over `src/`, with its own allowlist and its own both-directions check.
@@ -1175,7 +1175,7 @@ checkpoint) that Feature 2's design called for but Phase B initially missed.
 The **graph** schema stays at `GRAPH_SCHEMA_VERSION = 3` (`graph/schema.rs`):
 the new `usage_stat` relation (`graph/index.rs`) is additive/create-if-missing,
 the same pattern every V10–V13 store used. The **settings** schema, by
-contrast, bumps `CURRENT_SCHEMA_VERSION` 20 → 21 (`settings/schema.rs`) — the
+contrast, bumps `CURRENT_SCHEMA_VERSION` 20 → 21 (`settings/schema/mod.rs`) — the
 first schema move this file's V10–V13 sections haven't had to talk about,
 because it's the first milestone in the series to add a new *tab kind*
 (`TabConfig::Preview`) rather than a graph-side capability. The migration

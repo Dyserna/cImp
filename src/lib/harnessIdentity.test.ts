@@ -38,12 +38,12 @@ const ALLOWLIST: { file: string; reason: string }[] = [
       '`HARNESS_NATIVE_GATE_KEY` is a `TabInjectionOverrides` field in every settings file on ' +
       'disk and a `/status` row name, so renaming it is a migration. Which harness owns that ' +
       'feature is `harness_list`\'s `scoped_features` — nothing here reads the key as an ' +
-      'identity. Same rule Rust applies to `settings/schema.rs`.',
+      'identity. Same rule Rust applies to `settings/schema/`.',
   },
   {
     file: 'lib/settings/generated/settings.ts',
     reason:
-      'GENERATED, not written: V42 Phase E emits it from `src-tauri/src/settings/schema.rs` via ' +
+      'GENERATED, not written: V42 Phase E emits it from `src-tauri/src/settings/schema/` via ' +
       'ts-rs, doc comments included. Every name it carries is one the Rust IDENTITY_ALLOWLIST ' +
       'already rules on for that file (persisted wire forms, plus the prose beside them); nothing ' +
       'here is a second declaration, and nothing here is rendered to a user. Editing the file is ' +

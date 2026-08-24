@@ -24,7 +24,7 @@ import {
 import type { Settings, TabInjectionOverrides } from './types';
 
 // #48, findings F-12 / F-27. `LOCAL_DATA_TOOLS` is hand-mirrored from Rust
-// (`src-tauri/src/settings/schema.rs`) with no compile-time link, and the
+// (`src-tauri/src/settings/schema/`) with no compile-time link, and the
 // Settings window WRITES this list into a backend's `tool_scope`. These tests
 // cannot see Rust — a Rust-side `include_str!` tripwire over `types.ts` is owed
 // for that — but they do pin the two properties that made the stale mirror

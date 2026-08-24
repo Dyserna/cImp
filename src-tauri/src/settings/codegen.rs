@@ -23,7 +23,7 @@
 //!   does that when `skip_serializing_if` is present too, which this schema
 //!   never uses: the wire the frontend sees is always fully populated.
 //! * The remaining hand-written seams are the `#[cfg_attr(test, ts(type =
-//!   …))]` overrides in `schema.rs`, each commented `HAND-KEPT SEAM` — one per
+//!   …))]` overrides in the `schema/` tree, each commented `HAND-KEPT SEAM` — one per
 //!   type whose (de)serialize is hand-written, plus the deliberate handoff of
 //!   the layout tree to the frontend's own `LayoutNode` union.
 
@@ -78,7 +78,7 @@ fn settings_bindings_and_defaults_are_generated() {
     // otherwise emit `bigint`, which `JSON.parse` never produces.
     let cfg = Config::new().with_out_dir(&dir).with_large_int("number");
     Settings::export_all(&cfg).expect("export settings bindings");
-    // A second root: `LocalProviderBlock` is declared in `schema.rs` and
+    // A second root: `LocalProviderBlock` is declared in `schema/offload.rs` and
     // crosses the wire as an IPC return (`ipc::commands::opencode_derive_
     // provider`) and as an opaque `harness[<id>].ext` row, so it is NOT
     // reachable by walking `Settings`' fields — but the frontend imports it
@@ -139,7 +139,7 @@ fn regenerating_the_bindings_changes_nothing() {
 // generator generated is ceremony. But four types do NOT reach TypeScript
 // through the generator's own understanding of them. Their (de)serialize is
 // written by hand, ts-rs cannot read a wire word off a hand-written impl, and
-// the answer is a `#[cfg_attr(test, ts(...))]` override in `schema.rs` /
+// the answer is a `#[cfg_attr(test, ts(...))]` override in the `schema/` tree /
 // `injection.rs` that RESTATES what the impl does. Each of those is a
 // hand-written mirror of exactly the kind Phase E deleted — one line long and
 // inside an attribute — and after the retirement nothing checked any of them.
@@ -240,7 +240,7 @@ fn the_injection_override_union_is_exactly_what_the_enum_serializes() {
 /// literal `"disabled"` OR a config object**, mirrored by an explicit
 /// `ts(type = …)` on the field.
 ///
-/// Spelled at TWO sites in `schema.rs` (`AiToolTabFields`, `ShellTabFields`),
+/// Spelled at TWO sites in `schema/tabs.rs` (`AiToolTabFields`, `ShellTabFields`),
 /// which is the drift this catches: an override edited at one and not the
 /// other was invisible to everything.
 #[test]

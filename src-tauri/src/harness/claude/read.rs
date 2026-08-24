@@ -1893,7 +1893,7 @@ fn report_subagent_drift(project_dir: &Path, session_id: &str, summary: &str) {
 /// malformed line, not a mid-write read.
 ///
 /// **Review M10 — the skip contract needs a consumer at the shipped log level.**
-/// The default level is Info (`settings/schema.rs`), so a `debug!` made the one
+/// The default level is Info (`settings/schema/mod.rs`), so a `debug!` made the one
 /// failure mode this contract exists to detect — a format change that fails
 /// EVERY line — completely silent. The FIRST skip per transcript file now
 /// `warn!`s; later skips carry the running count at debug, so a single malformed

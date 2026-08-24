@@ -743,10 +743,10 @@ mod tests {
     /// Rust build instead of silently rendering `undefined`.
     ///
     /// **V42 Phase E RE-POINTED this scan, deliberately rather than retiring
-    /// it.** The phase generated the `settings/schema.rs` tree into
+    /// it.** The phase generated the `settings/schema/` tree into
     /// `src/lib/settings/generated/settings.ts` and deleted the hand-written
     /// mirror of THOSE types — but the health payload is `harness::health`'s,
-    /// not `schema.rs`', and it is still hand-mirrored in `types.ts`. Only
+    /// not the settings schema's, and it is still hand-mirrored in `types.ts`. Only
     /// `auto_verify` moved (it is a `HarnessSettings` field, so it is
     /// generated now), so the scan reads BOTH files: retiring it would have
     /// dropped a live tripwire over eleven still-hand-written names on the

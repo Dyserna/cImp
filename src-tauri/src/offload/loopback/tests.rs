@@ -155,7 +155,7 @@ fn files_containing(files: &[(&'static str, &'static str)], needle: &str) -> Vec
 /// to have it.
 #[test]
 fn files_containing_reads_code_and_not_prose() {
-    let needle = "fn hook_exec_roots(app: &AppHandle";
+    let needle = "fn hook_exec_roots(ctx: &RouteCtx";
     let commented = format!("// {needle}, settings: &S) -> Vec<PathBuf>\nfn other() {{}}\n");
     let real = format!("{needle}, settings: &S) -> Vec<PathBuf> {{\n}}\n");
 
@@ -7734,6 +7734,146 @@ fn every_bad_body_reply_keeps_its_own_bytes() {
     );
 }
 
+/// **V33 C4's allowlist, RUN rather than read** (V42 Phase A2).
+///
+/// The scan below
+/// ([`post_edit_takes_its_working_directory_from_the_app_not_from_the_body`])
+/// asserts that `hook_exec_roots` takes the context and the settings and NOT
+/// the request. What it could never assert is what the function ANSWERS,
+/// because it took an `AppHandle` and this crate has no `tauri::test` mock.
+/// With the handles injected it can be called, so the property `POST
+/// /context/post_edit` rests on — the directories it may run the project's
+/// configured check commands in are the served root and its configured tabs'
+/// directories, and nothing a caller names — is now a behavioural test:
+///
+/// * the launch directory is always admitted, and is the answer when the body
+///   names no cwd at all;
+/// * a configured tab's own `cwd` joins the list;
+/// * a sibling directory outside every root is REFUSED, which is the whole
+///   point — a hook payload's `cwd` is attacker-influenced (#104), and a miss
+///   must deny rather than fall back to "run it wherever you asked".
+#[test]
+fn the_post_edit_allowlist_is_the_served_root_and_its_tabs_and_nothing_else() {
+    use crate::offload::host::testing::{route_ctx, FakeRouteServices};
+    use crate::service::host::testing::core_host;
+    use crate::settings::{AiToolTabConfig, Settings, SettingsHandle, TabConfig};
+
+    let scratch = root_tree("exec-roots");
+    let served = scratch.join("served");
+    let tab_dir = scratch.join("worker");
+    let outside = scratch.join("elsewhere");
+    for d in [&served, &tab_dir, &outside] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+
+    // `AiToolTabConfig` has private fields (the injection overrides), so the
+    // seed is built by assignment — `service::delegation`'s fixture note.
+    #[allow(clippy::field_reassign_with_default)]
+    let mut cfg = AiToolTabConfig::default();
+    cfg.id = "ai-worker".to_string();
+    cfg.name = "worker".to_string();
+    cfg.cwd = Some(tab_dir.clone());
+    let settings = Settings {
+        tabs: vec![TabConfig::AiTool(cfg)],
+        ..Default::default()
+    };
+
+    let mut core = core_host(SettingsHandle::new(
+        settings.clone(),
+        settings.clone(),
+        scratch.clone(),
+    ))
+    .host;
+    core.launch_cwd = served.clone();
+    let ctx = route_ctx(FakeRouteServices {
+        core: Some(core),
+        ..Default::default()
+    });
+
+    let roots = super::hook_exec_roots(&ctx, &settings);
+    assert!(
+        roots.contains(&served),
+        "the served root must always be admitted: {roots:?}"
+    );
+    assert!(
+        roots.contains(&tab_dir),
+        "a configured tab's own directory must be admitted: {roots:?}"
+    );
+
+    assert_eq!(
+        super::admitted_hook_root(&roots, None),
+        Some(served.clone()),
+        "a body naming no cwd runs in the served root, not wherever the process happens to be"
+    );
+    assert_eq!(
+        super::admitted_hook_root(&roots, Some(&tab_dir.to_string_lossy())),
+        Some(tab_dir.clone()),
+    );
+    assert_eq!(
+        super::admitted_hook_root(&roots, Some(&outside.to_string_lossy())),
+        None,
+        "a directory outside every root must be REFUSED, not fallen back on"
+    );
+
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+/// **No route file reaches into managed state** (V42 Phase A2's tripwire).
+///
+/// Twenty-one `AppHandle::try_state::<T>()` calls used to sit in these files,
+/// resolving the settings, the code graph, the Workbench service and the audit
+/// runner. Each was a service-locator call inside a security boundary — code
+/// whose whole job is to answer "what may this request have?", also answering
+/// "and is that subsystem up?". They are one injected
+/// [`RouteCtx`](crate::offload::host::RouteCtx) now, resolved in
+/// `offload/host.rs`, which is deliberately NOT on the route surface.
+///
+/// This is the guard that cleanup earns, and it is structural rather than
+/// stylistic: a handler that can reach the managed-state table can reach ANY
+/// managed service, including ones no reviewer of this directory expects it to
+/// touch, and it can do so without changing a signature — so nothing else here
+/// would notice. Two layers, because either alone is one edit from useless:
+///
+/// 1. no lookup call, and
+/// 2. no `tauri::Manager` import — the trait those methods live on. Without it
+///    in scope a lookup does not compile, so a future edit has to defeat this
+///    test twice.
+///
+/// The scan reads CODE, not prose ([`files_containing`]), so the paragraphs
+/// above can name the thing they forbid.
+#[test]
+fn no_route_file_reaches_into_managed_state() {
+    for needle in ["try_state::<", ".state::<"] {
+        let offenders = files_containing(ROUTE_SOURCES, needle);
+        assert!(
+            offenders.is_empty(),
+            "`{needle}` is back on the route surface, in {offenders:?}. A route handler asks \
+             its `RouteCtx` for what it needs by name (`ctx.settings()`, `ctx.graph()`, \
+             `ctx.workbench()`, `ctx.audit()`, `ctx.core()`); the lookups behind those live in \
+             `offload/host.rs`, off the route surface, so that adding a NEW reach is a change \
+             to the declared context rather than an invisible line in a handler."
+        );
+    }
+    for needle in ["tauri::Manager", "Manager,", "Manager}", " Manager;"] {
+        let offenders = files_containing(ROUTE_SOURCES, needle);
+        assert!(
+            offenders.is_empty(),
+            "`{needle}` — the trait `state`/`try_state` live on — is imported by {offenders:?}. \
+             Keeping it out is layer 2 of this tripwire: a route file that cannot name the \
+             trait cannot call the lookup, whatever it calls the variable."
+        );
+    }
+    // The control: this scan is only worth anything if it CAN see a lookup, so
+    // assert it against a synthetic file rather than trusting that production
+    // text happens to be clean.
+    let planted = "async fn handle_probe(app: &AppHandle) {\n    app.try_state::<Thing>();\n}\n";
+    assert_eq!(
+        files_containing(&[("planted.rs", planted)], "try_state::<"),
+        vec!["planted.rs"],
+        "the scan stopped seeing a lookup, so its green above means nothing"
+    );
+}
+
 /// **The scanners see every file the routes are in.**
 ///
 /// [`ROUTE_SOURCES`] is what every source-scanning test below reads, and it is
@@ -8332,9 +8472,13 @@ fn post_edit_runs_only_in_a_directory_this_instance_serves() {
 ///
 /// 1. The work resolves its working directory through the pair, so the
 ///    check cannot be deleted while the route keeps running commands.
-/// 2. [`hook_exec_roots`] takes the `AppHandle` and the settings snapshot
+/// 2. [`hook_exec_roots`] takes the route context and the settings snapshot
 ///    and NOTHING ELSE — the request is not in scope, so no future edit can
-///    let a body widen the allowlist without changing this signature.
+///    let a body widen the allowlist without changing this signature. (V42
+///    Phase A2 replaced the `AppHandle` with a
+///    [`RouteCtx`](crate::offload::host::RouteCtx); the property is the same
+///    one — what is NOT in the signature is the request — and this scan is red
+///    until the needle follows the spelling.)
 ///
 /// **V35 Phase J moved the scan one frame down.** The admission now lives in
 /// [`post_edit_diagnostics`], the core BOTH post-edit transports call, and
@@ -8345,7 +8489,7 @@ fn post_edit_runs_only_in_a_directory_this_instance_serves() {
 fn post_edit_takes_its_working_directory_from_the_app_not_from_the_body() {
     let body = fn_body_in(ROUTE_SOURCES, "async fn post_edit_diagnostics(");
     assert!(
-        body.contains("admitted_hook_root(&hook_exec_roots(app, settings), body.cwd.as_deref())"),
+        body.contains("admitted_hook_root(&hook_exec_roots(ctx, settings), body.cwd.as_deref())"),
         "the route must resolve its cwd through the C4 allowlist: {body}"
     );
     assert!(
@@ -8364,7 +8508,7 @@ fn post_edit_takes_its_working_directory_from_the_app_not_from_the_body() {
     assert_eq!(
         files_containing(
             ROUTE_SOURCES,
-            "fn hook_exec_roots(app: &AppHandle, settings: &crate::settings::Settings) -> Vec<PathBuf>"
+            "fn hook_exec_roots(ctx: &RouteCtx, settings: &crate::settings::Settings) -> Vec<PathBuf>"
         )
         .len(),
         1,

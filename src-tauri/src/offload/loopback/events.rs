@@ -17,15 +17,15 @@ use super::*;
 /// it. With three levels, "why is this tab not latching?" has to be answerable
 /// without reading code — and `/status` is where the live-verification recipes
 /// already look.
-pub(super) async fn handle_status(stream: &mut TcpStream, app: &AppHandle) -> AppResult<()> {
+pub(super) async fn handle_status(stream: &mut TcpStream, ctx: &RouteCtx) -> AppResult<()> {
     write_json(
         stream,
         200,
         &serde_json::json!({
             // Step 4: through `latch_snapshot`, so a hand-run `/status` and the
             // UI's badge poll see the same freshness rule rather than two.
-            "latches": latch_snapshot(app),
-            "injection": injection_status(&live_settings(app)),
+            "latches": latch_snapshot(ctx.app()),
+            "injection": injection_status(&ctx.settings()),
         }),
     )
     .await

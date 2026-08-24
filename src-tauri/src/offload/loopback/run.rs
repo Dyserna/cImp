@@ -98,7 +98,7 @@ pub(super) fn offload_tool_name(raw: Option<&str>) -> &'static str {
 pub(super) async fn handle_run(
     stream: &mut TcpStream,
     service: &Arc<OffloadService>,
-    app: &AppHandle,
+    ctx: &RouteCtx,
     req: &Request,
 ) -> AppResult<()> {
     let Some(body) = decode::<RunBody, _>(stream, req, bad_body_result).await? else {
@@ -155,8 +155,8 @@ pub(super) async fn handle_run(
         };
         return write_json(stream, 400, &r).await;
     };
-    let settings = live_settings(app);
-    let scoping = latch_scope(app, &settings, run_agent, body.tab.as_deref());
+    let settings = ctx.settings();
+    let scoping = latch_scope(ctx.app(), &settings, run_agent, body.tab.as_deref());
     if let LatchScoping::Unknown(tab) = &scoping {
         warn!(
             target: "offload",

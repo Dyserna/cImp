@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tauri::{AppHandle, Manager};
+
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
@@ -62,15 +62,27 @@ use super::discovery::{
 //
 // What stays in this file is the LISTENER: the `Loopback` handle, the
 // hand-rolled HTTP/1.1 wire and its constant-time token check, the dispatch
-// `match`, and the few funnels every family shares — `live_settings` (the one
-// `AppHandle` → `Settings` point), `proxy_identity`, the `hook_admit` /
-// `delegate_admit` admission pair and the reply writers. Each family below
-// owns its own body types, helpers and handlers.
+// `match`, and the few funnels every family shares — `proxy_identity`, the
+// `hook_admit` / `delegate_admit` admission pair and the reply writers. Each
+// family below owns its own body types, helpers and handlers.
 //
-// The families are near-independent: the only shared mutable state is
-// `latches()` (in `offload::latch`), `live_settings(app)` and the
-// `Arc<OffloadService>` four routes take; everything else is resolved from
-// `AppHandle::try_state` at request time.
+// **V42 Phase A2: a handler is given a `RouteCtx`, not an `AppHandle`.**
+// Everything a route reaches beyond its own request — the settings snapshot,
+// the code graph, the Workbench service, the audit runner, the core handles —
+// is asked for by name on that context, and the four lookups behind it live in
+// `offload::host`, off this route surface. `ctx.settings()` is still the ONE
+// point a request turns into a `Settings` (V32 Phase G's `live_settings`,
+// which now delegates to it), for the reason it always was: two gated
+// neighbours must not resolve the hierarchy against different snapshots.
+// `tests::no_route_file_reaches_into_managed_state` is what keeps that true.
+//
+// A `ctx.app()` in a family file marks the residual: the three onward calls
+// that still take a Tauri handle (`offload::latch`'s scope resolution,
+// `offload::discovery`'s root resolution, and a harness plugin's own route
+// handler, whose signature is a declared contract). Those are #114/#115's
+// seam. The families are otherwise near-independent: the only shared mutable
+// state is `latches()` (in `offload::latch`) and the `Arc<OffloadService>`
+// four routes take.
 //
 // **The source-scanning tests read every file in this list**, not just this
 // one — see `tests::LOOPBACK_SRC`. A handler moved between families keeps
@@ -108,6 +120,12 @@ pub(crate) use self::latch_routes::*;
 use self::mcp::*;
 use self::delegate::*;
 pub use self::events::*;
+
+// V42 Phase A2: what a handler is given instead of an `AppHandle`. Defined in
+// `offload::host` — deliberately outside the route surface, because the four
+// `AppHandle` lookups it answers are what this phase took OUT of these files,
+// and `tests::no_route_file_reaches_into_managed_state` fails if one returns.
+pub(crate) use super::host::RouteCtx;
 
 // V42 review (dropped-at-cap): `bounded_id`, its bound, and `live_settings`
 // moved UP to `offload` — `offload::latch` imported them from here, which was a
@@ -151,8 +169,7 @@ impl Loopback {
     /// serves; children match their cwd against it (`read_discovery_for`).
     pub async fn start(
         service: Arc<OffloadService>,
-        app: AppHandle,
-        core: crate::service::host::CoreHost,
+        ctx: RouteCtx,
         root: &Path,
     ) -> AppResult<Arc<Self>> {
         let listener = TcpListener::bind(("127.0.0.1", 0))
@@ -190,11 +207,10 @@ impl Loopback {
                 match listener.accept().await {
                     Ok((stream, _peer)) => {
                         let svc = service.clone();
-                        let app = app.clone();
-                        let core = core.clone();
+                        let ctx = ctx.clone();
                         let tok = accept_token.clone();
                         tauri::async_runtime::spawn(async move {
-                            if let Err(e) = handle_conn(stream, svc, app, core, tok).await {
+                            if let Err(e) = handle_conn(stream, svc, ctx, tok).await {
                                 debug!(error = %e, "offload loopback: connection ended");
                             }
                         });
@@ -605,8 +621,7 @@ const LATCH_STATE_ROUTE: &str = "/latch/state";
 async fn handle_conn(
     mut stream: TcpStream,
     service: Arc<OffloadService>,
-    app: AppHandle,
-    core: crate::service::host::CoreHost,
+    ctx: RouteCtx,
     token: String,
 ) -> AppResult<()> {
     // Cap how long we'll wait for a complete request: a half-open or idle
@@ -630,22 +645,22 @@ async fn handle_conn(
     // body types stay byte-identical, which is this phase's exit criterion. It
     // reads only, answers nothing and cannot reject: a route's behaviour is the
     // same whether this line runs or not.
-    note_chp(&app, route, &req);
+    note_chp(&ctx, route, &req);
     match (req.method.as_str(), route) {
-        ("POST", "/run") => handle_run(&mut stream, &service, &app, &req).await,
-        ("POST", "/graph_run") => handle_graph_run(&mut stream, &app, &req).await,
-        ("POST", "/audit/run") => handle_audit_run(&mut stream, &app, &req).await,
-        ("POST", "/context/retrieve") => handle_context_retrieve(&mut stream, &app, &req).await,
-        ("POST", "/workbench/tool_checkpoint") => handle_tool_checkpoint(&mut stream, &app, &req).await,
-        ("POST", "/context/compaction") => handle_context_compaction(&mut stream, &app, &req).await,
-        ("POST", "/context/should_read") => handle_should_read(&mut stream, &app, &req).await,
-        ("POST", "/context/post_edit") => handle_post_edit(&mut stream, &app, &req).await,
-        ("POST", "/memory/event") => handle_memory_event(&mut stream, &app, &req).await,
+        ("POST", "/run") => handle_run(&mut stream, &service, &ctx, &req).await,
+        ("POST", "/graph_run") => handle_graph_run(&mut stream, &ctx, &req).await,
+        ("POST", "/audit/run") => handle_audit_run(&mut stream, &ctx, &req).await,
+        ("POST", "/context/retrieve") => handle_context_retrieve(&mut stream, &ctx, &req).await,
+        ("POST", "/workbench/tool_checkpoint") => handle_tool_checkpoint(&mut stream, &ctx, &req).await,
+        ("POST", "/context/compaction") => handle_context_compaction(&mut stream, &ctx, &req).await,
+        ("POST", "/context/should_read") => handle_should_read(&mut stream, &ctx, &req).await,
+        ("POST", "/context/post_edit") => handle_post_edit(&mut stream, &ctx, &req).await,
+        ("POST", "/memory/event") => handle_memory_event(&mut stream, &ctx, &req).await,
         ("POST", "/activity/contract_drift") => handle_contract_drift(&mut stream, &req).await,
-        ("POST", "/activity/discovery_skipped") => handle_discovery_skipped(&mut stream, &app, &req).await,
-        ("POST", "/latch/beacon") => handle_latch_beacon(&mut stream, &app, &req).await,
-        ("POST", "/latch/state") => handle_latch_state(&mut stream, &app, &req).await,
-        ("POST", "/session/hello") => handle_session_hello(&mut stream, &app, &req).await,
+        ("POST", "/activity/discovery_skipped") => handle_discovery_skipped(&mut stream, &ctx, &req).await,
+        ("POST", "/latch/beacon") => handle_latch_beacon(&mut stream, &ctx, &req).await,
+        ("POST", "/latch/state") => handle_latch_state(&mut stream, &ctx, &req).await,
+        ("POST", "/session/hello") => handle_session_hello(&mut stream, &ctx, &req).await,
         // ── V35 Phase L: the read path, as CHP pushes ────────────────────────
         //
         // The harness-neutral half of the three capabilities Phase L moves off
@@ -653,18 +668,18 @@ async fn handle_conn(
         // envelope reaches the same cores through its OWN routes, appended
         // below from the registry; these are what a harness whose plugin CAN
         // build a body posts to, and what the tests drive.
-        ("POST", "/session/assistant_text") => handle_session_assistant_text(&mut stream, &app, &req).await,
-        ("POST", "/session/tool_result") => handle_session_tool_result(&mut stream, &app, &req).await,
-        ("POST", "/session/subagent") => handle_session_subagent(&mut stream, &app, &req).await,
+        ("POST", "/session/assistant_text") => handle_session_assistant_text(&mut stream, &ctx, &req).await,
+        ("POST", "/session/tool_result") => handle_session_tool_result(&mut stream, &ctx, &req).await,
+        ("POST", "/session/subagent") => handle_session_subagent(&mut stream, &ctx, &req).await,
         // V40 Phase D (locked decisions 18 and 30): the neutral activity edges.
         // Phase C declared them; these are the producers, and what makes them
         // `live` in `chp::EVENTS`. A harness that reports its own turn
         // boundaries posts here instead of leaving core to infer them from the
         // terminal — which is the same fact `ActivitySource::OutOfBand`
         // declares at L1, arriving over the wire instead.
-        ("POST", "/session/output_started") => handle_harness_output(&mut stream, &app, &req, true).await,
-        ("POST", "/session/output_stopped") => handle_harness_output(&mut stream, &app, &req, false).await,
-        ("POST", "/session/subagents_active") => handle_subagents_active(&mut stream, &app, &req).await,
+        ("POST", "/session/output_started") => handle_harness_output(&mut stream, &ctx, &req, true).await,
+        ("POST", "/session/output_stopped") => handle_harness_output(&mut stream, &ctx, &req, false).await,
+        ("POST", "/session/subagents_active") => handle_subagents_active(&mut stream, &ctx, &req).await,
         // NOTE (#45): there is deliberately no `POST /latch/override`. The
         // manual override is a capability GRANT, and the bearer token gating
         // this listener is readable by every process running as the user, so an
@@ -676,9 +691,9 @@ async fn handle_conn(
         //
         // The app owns the tabs, so this is the only way in — the child has no
         // self-contained fallback and says so rather than inventing one.
-        ("POST", "/delegate") => handle_delegate(&mut stream, &app, &core, &req).await,
+        ("POST", "/delegate") => handle_delegate(&mut stream, &ctx, &req).await,
         ("POST", "/mcp/list") => handle_mcp_list(&mut stream, &service, &req).await,
-        ("POST", "/mcp/call") => handle_mcp_call(&mut stream, &service, &app, &req).await,
+        ("POST", "/mcp/call") => handle_mcp_call(&mut stream, &service, &ctx, &req).await,
         ("GET", "/describe") => {
             let text = service.describe().await;
             write_simple(
@@ -691,7 +706,7 @@ async fn handle_conn(
         }
         ("GET", "/events") => handle_events(stream, service, &req).await,
         ("GET", "/health") => write_simple(&mut stream, 200, "text/plain", b"ok").await,
-        ("GET", "/status") => handle_status(&mut stream, &app).await,
+        ("GET", "/status") => handle_status(&mut stream, &ctx).await,
         // ── V40 Phase C: the plugin-owned routes (locked decisions 15, 22) ───
         //
         // Every registered harness's `routes()`, matched **after** every arm
@@ -705,7 +720,7 @@ async fn handle_conn(
         // for a path nobody serves.
         _ => match crate::harness::ingress::route(req.method.as_str(), route) {
             Some(r) => {
-                let reply = (r.handler)(&app, &req).await?;
+                let reply = (r.handler)(ctx.app(), &req).await?;
                 write_json(&mut stream, reply.status, &reply.body).await
             }
             None => write_simple(&mut stream, 404, "text/plain", b"not found").await,
@@ -883,7 +898,7 @@ fn delegate_admit(
 /// Same decision, same ledger, same `CallProvenance::http()`; only the surface
 /// is narrower. `false` means refused.
 pub(crate) fn hook_gate_admits(
-    app: &AppHandle,
+    ctx: &RouteCtx,
     settings: &crate::settings::Settings,
     tool: &'static str,
     agent: Option<&str>,
@@ -894,7 +909,7 @@ pub(crate) fn hook_gate_admits(
         tool,
         hook_agent(agent),
         tab,
-        |agent, tab| latch_scope(app, settings, agent, tab),
+        |agent, tab| latch_scope(ctx.app(), settings, agent, tab),
         |scope| GatePolicy::resolve(settings, scope),
     )
     .is_ok()
@@ -985,7 +1000,7 @@ fn wire_agent(route: &str, token: Option<&str>) -> &'static str {
 /// class this milestone exists to delete. The reader stays suppressed while the
 /// hello's claim stands; the silence gets a `drift.payload.v1` row instead,
 /// under the same token that capability's payload drift uses.
-fn note_chp(app: &AppHandle, route: &str, req: &Request) {
+fn note_chp(ctx: &RouteCtx, route: &str, req: &Request) {
     // **V40 Phase C, locked decision 22.** This used to read
     // `hook::is_hook_route(route)` — core deciding, by naming one
     // harness, where a request's identity lives. The question is now asked of
@@ -1027,7 +1042,7 @@ fn note_chp(app: &AppHandle, route: &str, req: &Request) {
     if crate::harness::chp::already_seen(agent, &tab, chp) {
         return;
     }
-    let settings = live_settings(app);
+    let settings = ctx.settings();
     if !is_configured_tab(&settings, agent, &tab) {
         return;
     }

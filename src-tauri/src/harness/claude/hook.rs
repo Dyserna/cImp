@@ -99,7 +99,7 @@ use crate::offload::latch::is_configured_tab;
 use crate::offload::loopback::{
     assistant_text_core, bounded_declarations, bounded_id, bounded_tool, claim_contract_drift,
     claim_hello, compaction_block, contract_drift_row, context_retrieve_core, hello_row,
-    hook_gate_admits, latch_beacon_for, live_settings,
+    hook_gate_admits, latch_beacon_for, live_settings, RouteCtx,
     permission_tab_candidates, post_edit_diagnostics, send_permission_edge, send_turn_ended,
     should_read_verdict, subagent_core, tool_checkpoint_core, tool_result_core,
     ContextCompactionBody, ContextPostEditBody, ContextRetrieveBody, ContractDriftBody,
@@ -1124,6 +1124,21 @@ pub fn http_hook_entry(
     })
 }
 
+/// This handler's **route context**, from the `AppHandle` the plugin contract
+/// hands it.
+///
+/// V42 Phase A2 took the `AppHandle::try_state` lookups out of the loopback's
+/// route files: the `*_core` functions these hook handlers share with the
+/// loopback's own routes take a [`RouteCtx`] now. A plugin route handler is
+/// still `fn(&AppHandle, &Request)` — that is a declared contract
+/// ([`crate::harness::plugin::RouteHandler`], V40 locked decision 15), and
+/// changing it is V42 #114/#115's business — so this one line is the adapter
+/// between them. Cheap: two handle clones and one `Arc`, resolving nothing
+/// until something is asked for.
+fn ctx(app: &AppHandle) -> RouteCtx {
+    RouteCtx::from_app(app)
+}
+
 // ── the route table core appends (locked decision 15) ───────────────────────
 
 /// Wrap one `async fn(&AppHandle, &Request) -> AppResult<HookReply>` as the
@@ -1514,7 +1529,7 @@ async fn handle_claude_user_prompt_submit(
     let tab = claude_hook_tab(&settings, req);
     let cwd = claude_hook_cwd(app, &settings, tab.as_deref(), &input.cwd);
     let body = retrieve_body_from_hook(&input, tab, cwd);
-    let answer = context_retrieve_core(app, &body).await;
+    let answer = context_retrieve_core(&ctx(app), &body).await;
     let text = answer.get("text").and_then(Value::as_str).unwrap_or("");
     if text.trim().is_empty() {
         return Ok(HookReply::ok(no_op()));
@@ -1543,7 +1558,7 @@ async fn handle_claude_pre_compact(
     let cwd = claude_hook_cwd(app, &settings, tab.as_deref(), &input.cwd);
     let body = compaction_body_from_hook(&input, tab, cwd);
     if !hook_gate_admits(
-        app,
+        &ctx(app),
         &settings,
         HOOK_TOOL_COMPACTION,
         body.agent.as_deref(),
@@ -1551,7 +1566,7 @@ async fn handle_claude_pre_compact(
     ) {
         return Ok(HookReply::ok(no_op()));
     }
-    let block = compaction_block(app, &body);
+    let block = compaction_block(&ctx(app), &body);
     if block.trim().is_empty() {
         return Ok(HookReply::ok(no_op()));
     }
@@ -1593,7 +1608,7 @@ async fn handle_claude_pre_tool_use(
     };
     let body = should_read_body_from_hook(&input, &reqst, tab, cwd);
     if !hook_gate_admits(
-        app,
+        &ctx(app),
         &settings,
         HOOK_TOOL_SHOULD_READ,
         body.agent.as_deref(),
@@ -1601,7 +1616,7 @@ async fn handle_claude_pre_tool_use(
     ) {
         return Ok(HookReply::ok(no_op()));
     }
-    let Some(text) = should_read_verdict(app, &body) else {
+    let Some(text) = should_read_verdict(&ctx(app), &body) else {
         return Ok(HookReply::ok(no_op()));
     };
     if text.trim().is_empty() {
@@ -1639,7 +1654,7 @@ async fn handle_claude_post_tool_use(
     let cwd = claude_hook_cwd(app, &settings, tab.as_deref(), &input.cwd);
     let body = post_edit_body_from_hook(&input, tab, cwd);
     if !hook_gate_admits(
-        app,
+        &ctx(app),
         &settings,
         HOOK_TOOL_POST_EDIT,
         body.agent.as_deref(),
@@ -1647,7 +1662,7 @@ async fn handle_claude_post_tool_use(
     ) {
         return Ok(HookReply::ok(no_op()));
     }
-    let text = post_edit_diagnostics(app, &settings, &body).await;
+    let text = post_edit_diagnostics(&ctx(app), &settings, &body).await;
     if text.trim().is_empty() {
         return Ok(HookReply::ok(no_op()));
     }
@@ -1808,8 +1823,8 @@ async fn handle_claude_stop(
         // Receiving this POST at all is the proof that it did, which is the
         // whole reason `HarnessPlugin::turn_end_push` is a declaration about
         // the harness rather than about one payload field.
-        send_turn_ended(app, &tab).await;
-        assistant_text_core(app, "claude", &tab, &input.last_assistant_message).await;
+        send_turn_ended(&ctx(app), &tab).await;
+        assistant_text_core(&ctx(app), "claude", &tab, &input.last_assistant_message).await;
     }
     Ok(HookReply::ok(no_op.clone()))
 }
@@ -1837,7 +1852,7 @@ async fn handle_claude_tool_result(
         let chars = u32::try_from(tool_result_chars(&input.tool_result))
             .unwrap_or(u32::MAX);
         tool_result_core(
-            app,
+            &ctx(app),
             "claude",
             &tab,
             cwd.as_deref(),
@@ -1872,7 +1887,7 @@ async fn handle_claude_subagent(
     let settings = live_settings(app);
     if let Some(tab) = claude_hook_tab(&settings, req) {
         let active = input.is_subagent_start();
-        subagent_core(app, "claude", &tab, &input.agent_id, active);
+        subagent_core(&ctx(app), "claude", &tab, &input.agent_id, active);
         debug!(
             target: "offload",
             %tab,
@@ -1930,7 +1945,7 @@ async fn handle_claude_tool_failure(
         let chars =
             u32::try_from(tool_result_chars(&input.error)).unwrap_or(u32::MAX);
         let recorded = tool_result_core(
-            app,
+            &ctx(app),
             "claude",
             &tab,
             cwd.as_deref(),
@@ -1980,7 +1995,7 @@ async fn handle_claude_taint_beacon(
     // engagement, exactly as the shim did.
     let tool = bounded_tool(input.tool_name.as_deref());
     match latch_beacon_for(
-        app,
+        &ctx(app),
         &settings,
         "claude",
         req.cimp.tab.as_deref(),
@@ -2047,7 +2062,7 @@ async fn handle_claude_checkpoint(
     let tab = claude_hook_tab(&settings, req);
     let cwd = claude_hook_cwd(app, &settings, tab.as_deref(), &input.cwd);
     let checkpointed = tool_checkpoint_core(
-        app,
+        &ctx(app),
         &settings,
         Some("claude"),
         tool,
@@ -2309,7 +2324,7 @@ async fn permission_signal(app: &AppHandle, body: &PermissionEventBody) -> Permi
     // Core owns the candidate set and the signal; this harness owns the
     // MATCHING rule, which is the half that reads its transcript path and its
     // session-id conventions (V40 Phase C, locked decision 21).
-    let candidates = permission_tab_candidates(app, super::plugin::me());
+    let candidates = permission_tab_candidates(&ctx(app), super::plugin::me());
     let Some(tab) = resolve_permission_tab(&candidates, &session_id, &transcript_path, &cwd) else {
         debug!(
             event = %body.event,
@@ -2319,7 +2334,7 @@ async fn permission_signal(app: &AppHandle, body: &PermissionEventBody) -> Permi
         );
         return PermissionOutcome::Unmapped("no tab");
     };
-    if !send_permission_edge(app, &tab, edge).await {
+    if !send_permission_edge(&ctx(app), &tab, edge).await {
         return PermissionOutcome::Unmapped("no tab");
     }
     info!(

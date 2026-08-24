@@ -321,7 +321,7 @@ pub(super) fn audit_admit(
 /// in progress"`) flow through as the final `{ok:false, error}` line over HTTP
 /// 200 — the child renders them as a readable tool error, mirroring
 /// [`handle_graph_run`]. Only a malformed body is a 400.
-pub(super) async fn handle_audit_run(stream: &mut TcpStream, app: &AppHandle, req: &Request) -> AppResult<()> {
+pub(super) async fn handle_audit_run(stream: &mut TcpStream, ctx: &RouteCtx, req: &Request) -> AppResult<()> {
     // Malformed body / unknown category → 400 (the child treats any
     // non-200 as a hard failure), mirroring `handle_graph_run`.
     let Some(body) = decode::<AuditRunBody, _>(stream, req, bad_body_result).await? else {
@@ -333,8 +333,8 @@ pub(super) async fn handle_audit_run(stream: &mut TcpStream, app: &AppHandle, re
     // audit-vs-loopback startup order). `main.rs` manages it as `Arc<AuditState>`
     // (and publishes the same handle via `audit::set_global`). Not ready → a
     // single `ok:false` line over 200, same shape as `handle_graph_run`.
-    let state = match app.try_state::<Arc<crate::audit::AuditState>>() {
-        Some(s) => s.inner().clone(),
+    let state = match ctx.audit() {
+        Some(s) => s,
         None => {
             let r = RunResult {
                 ok: false,
@@ -349,13 +349,13 @@ pub(super) async fn handle_audit_run(stream: &mut TcpStream, app: &AppHandle, re
     // settings read for identity + policy (the `/mcp/call` discipline) — see
     // [`audit_admit`], which owns the ordering rationale and the four refusal
     // messages.
-    let settings = live_settings(app);
+    let settings = ctx.settings();
     let consumer = match audit_admit(
         latches(),
         &body,
         &state.root(),
         |c| state.consumer_exposed(c),
-        |agent, tab| latch_scope(app, &settings, agent, Some(tab)),
+        |agent, tab| latch_scope(ctx.app(), &settings, agent, Some(tab)),
         |scope| GatePolicy::resolve(&settings, scope),
     ) {
         Ok(c) => c,
@@ -421,7 +421,7 @@ pub(super) async fn handle_audit_run(stream: &mut TcpStream, app: &AppHandle, re
             text: Some(
                 report
                     .deliver(crate::audit::mcp::Delivery {
-                        settings: &live_settings(app),
+                        settings: &ctx.settings(),
                         scope: crate::settings::injection::Scope::for_tab(
                             crate::graph::source_for_consumer(consumer),
                             body.tab.as_deref(),

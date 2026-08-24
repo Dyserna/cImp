@@ -24,7 +24,7 @@ use super::*;
 /// unregistered `agent` likewise writes nothing — fail closed.
 ///
 /// `mark` is the registry write, taken as a parameter rather than reached
-/// through a `GraphService` this crate has no `AppHandle` to build — the same
+/// through a whole `GraphService` — the same
 /// reasoning #48 gave for the function this replaces: a bound asserted *beside*
 /// its enforcement point survives deleting the call, so the test drives this
 /// function and observes whether (and into which space) the write happened.
@@ -71,7 +71,7 @@ pub(super) fn mark_live_session_from_body(
 /// live-session registry.
 pub(super) async fn handle_memory_event(
     stream: &mut TcpStream,
-    app: &AppHandle,
+    ctx: &RouteCtx,
     req: &Request,
 ) -> AppResult<()> {
     use crate::harness::plugin::MemoryEventKind;
@@ -103,16 +103,15 @@ pub(super) async fn handle_memory_event(
         }
     };
 
-    let Some(graph) = app.try_state::<Arc<crate::graph::GraphService>>() else {
+    let Some(graph) = ctx.graph() else {
         return write_json(stream, 200, &ok).await;
     };
-    let graph = graph.inner().clone();
     // #104: every arm below opens the project's store (memory rows, usage
     // totals), so the plugin-supplied `cwd` is resolved to a real root first.
     // This body carries no `tab` — the memory POST never had one — so an
     // unresolvable cwd has nothing to fall back to and the event is dropped
     // rather than filed against a directory that is not a project.
-    let Some(cwd) = external_project_root(app, &live_settings(app), None, event.cwd.as_deref())
+    let Some(cwd) = external_project_root(ctx.app(), &ctx.settings(), None, event.cwd.as_deref())
     else {
         return write_json(stream, 200, &ok).await;
     };

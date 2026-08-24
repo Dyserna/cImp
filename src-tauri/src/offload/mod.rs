@@ -45,6 +45,7 @@ pub mod backend_gate;
 pub mod detection;
 pub mod discovery;
 pub mod harness_tab;
+pub mod host;
 pub mod latch;
 pub mod loopback;
 pub mod mcp;
@@ -154,17 +155,22 @@ pub(crate) fn bounded_id(raw: &str) -> String {
     out
 }
 
-/// V32 Phase G: read the app's live settings from managed state.
+/// V32 Phase G: the app's live settings — **still the one point**, now over an
+/// injected handle.
 ///
-/// Every gated loopback handler already holds an `AppHandle`; this is the one
-/// place that turns it into a `Settings`, so a handler cannot accidentally
-/// resolve the hierarchy against a different snapshot than its neighbour. The
-/// fallback is `Settings::default()` — all protection ON — because a request
-/// arriving before managed state is up must not be the moment containment
-/// silently lapses.
+/// The property this exists for is unchanged: there is exactly ONE place a
+/// request turns into a `Settings`, so two gated neighbours cannot resolve the
+/// three-level hierarchy against different snapshots. So is the fallback —
+/// `Settings::default()`, all protection ON — because a request arriving before
+/// the tab layer is up must not be the moment containment silently lapses.
+///
+/// V42 Phase A2 moved the *implementation* to
+/// [`RouteCtx::settings`](crate::offload::host::RouteCtx::settings), which
+/// reads the settings handle it was given rather than fishing `AppState` out of
+/// the managed-state table. This wrapper stays because the callers that still
+/// hold only an `AppHandle` — `harness::claude::hook`'s plugin routes and
+/// `offload::latch` — are #114/#115's seam, not this phase's; it delegates, so
+/// there is one implementation and not two spellings of one rule.
 pub(crate) fn live_settings(app: &tauri::AppHandle) -> crate::settings::Settings {
-    use tauri::Manager;
-    app.try_state::<crate::ipc::AppState>()
-        .map(|s| s.settings.current())
-        .unwrap_or_default()
+    crate::offload::host::RouteCtx::from_app(app).settings()
 }

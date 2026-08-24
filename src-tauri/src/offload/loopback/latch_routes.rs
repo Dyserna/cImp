@@ -81,7 +81,7 @@ pub(super) struct LatchStateBody {
 /// rejected tab id gets a 400 it will never read.
 pub(super) async fn handle_latch_beacon(
     stream: &mut TcpStream,
-    app: &AppHandle,
+    ctx: &RouteCtx,
     req: &Request,
 ) -> AppResult<()> {
     let Some(body) = decode::<LatchBeaconBody, _>(stream, req, bad_body_result).await? else {
@@ -91,7 +91,7 @@ pub(super) async fn handle_latch_beacon(
         crate::graph::source_for_consumer(body.consumer.as_deref().unwrap_or(crate::harness::DEFAULT_HARNESS.token()));
     // ONE settings read for the whole request: the tab-id check, `latch_scope`
     // and the policy must not resolve against three different snapshots.
-    let settings = live_settings(app);
+    let settings = ctx.settings();
     // #45: reject an unknown tab id explicitly rather than letting it fall into
     // `latch_scope`'s fail-open `None`. The two are the same for the registry
     // (nothing is created either way), but they are not the same for a reader:
@@ -108,7 +108,7 @@ pub(super) async fn handle_latch_beacon(
     // second `is_configured_tab` call beside it — two spellings of one rule are
     // two things to keep in step.
     let tool = bounded_tool(body.tool.as_deref());
-    match latch_beacon_core(latches(), app, &settings, agent, body.tab.as_deref(), &tool) {
+    match latch_beacon_core(latches(), ctx, &settings, agent, body.tab.as_deref(), &tool) {
         Ok(view) => write_json(stream, 200, &serde_json::json!({ "ok": true, "latch": view })).await,
         Err(tab) => {
             warn!(
@@ -155,24 +155,24 @@ pub(super) async fn handle_latch_beacon(
 /// same #45 narrowing — `Err(tab)` still means "named no configured tab, nothing
 /// engaged".
 pub(crate) fn latch_beacon_for(
-    app: &AppHandle,
+    ctx: &RouteCtx,
     settings: &crate::settings::Settings,
     agent: &'static str,
     tab: Option<&str>,
     tool: &str,
 ) -> Result<LatchView, String> {
-    latch_beacon_core(latches(), app, settings, agent, tab, tool)
+    latch_beacon_core(latches(), ctx, settings, agent, tab, tool)
 }
 
 pub(super) fn latch_beacon_core(
     reg: &LatchRegistry,
-    app: &AppHandle,
+    ctx: &RouteCtx,
     settings: &crate::settings::Settings,
     agent: &'static str,
     tab: Option<&str>,
     tool: &str,
 ) -> Result<LatchView, String> {
-    let scoping = latch_scope(app, settings, agent, tab);
+    let scoping = latch_scope(ctx.app(), settings, agent, tab);
     if let LatchScoping::Unknown(tab) = scoping {
         return Err(tab);
     }
@@ -353,15 +353,15 @@ pub(super) fn native_gate_verdict(
 /// collapsed `Option`. Closing it properly needs H-2: a per-tab plugin file.
 pub(super) async fn handle_latch_state(
     stream: &mut TcpStream,
-    app: &AppHandle,
+    ctx: &RouteCtx,
     req: &Request,
 ) -> AppResult<()> {
     let Some(body) = decode::<LatchStateBody, _>(stream, req, bad_body_result).await? else {
         return Ok(());
     };
     let agent = wire_agent(LATCH_STATE_ROUTE, body.consumer.as_deref());
-    let settings = live_settings(app);
-    let scoping = latch_scope(app, &settings, agent, body.tab.as_deref());
+    let settings = ctx.settings();
+    let scoping = latch_scope(ctx.app(), &settings, agent, body.tab.as_deref());
     // #48: the verdict comes from the resolved injection scope, which is
     // app-wide for both identity-less cases — NOT a hard `false`. #45 folded
     // "an id that names no configured tab" into `latch_scope`'s `None`, and

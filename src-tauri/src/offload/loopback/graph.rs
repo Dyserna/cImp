@@ -47,12 +47,12 @@ pub(super) struct GraphRunBody {
 /// (single shared connection — no second cross-process open of the SQLite store)
 /// and return its text. The `GraphService` is resolved from managed state at
 /// request time, so this is robust against the graph-vs-loopback startup order.
-pub(super) async fn handle_graph_run(stream: &mut TcpStream, app: &AppHandle, req: &Request) -> AppResult<()> {
+pub(super) async fn handle_graph_run(stream: &mut TcpStream, ctx: &RouteCtx, req: &Request) -> AppResult<()> {
     let Some(body) = decode::<GraphRunBody, _>(stream, req, bad_body_result).await? else {
         return Ok(());
     };
-    let graph = match app.try_state::<Arc<crate::graph::GraphService>>() {
-        Some(g) => g.inner().clone(),
+    let graph = match ctx.graph() {
+        Some(g) => g,
         None => {
             let r = RunResult {
                 ok: false,
@@ -94,13 +94,13 @@ pub(super) async fn handle_graph_run(stream: &mut TcpStream, app: &AppHandle, re
     // on `/mcp/call`). #45 pulls it above the scope resolution, because the tab
     // id is now validated against the configured tab list and that check must
     // use the same snapshot as the policy it feeds.
-    let settings = live_settings(app);
+    let settings = ctx.settings();
     // #104: the tools this route serves take a project root — `run_command`
     // creates its marker directory under it and `run_check` runs the project's
     // configured commands from it — so the body's `cwd` is resolved to a real
     // root rather than used as one. A refusal is a tool-level error the model
     // can read and act on, not a silently different project.
-    let Some(cwd) = external_project_root(app, &settings, body.tab.as_deref(), body.cwd.as_deref())
+    let Some(cwd) = external_project_root(ctx.app(), &settings, body.tab.as_deref(), body.cwd.as_deref())
     else {
         let r = RunResult {
             ok: false,
@@ -114,7 +114,7 @@ pub(super) async fn handle_graph_run(stream: &mut TcpStream, app: &AppHandle, re
         };
         return write_json(stream, 200, &r).await;
     };
-    let scoping = latch_scope(app, &settings, consumer_source, body.tab.as_deref());
+    let scoping = latch_scope(ctx.app(), &settings, consumer_source, body.tab.as_deref());
     // #48 F-20: resolved BEFORE `into_scope()` collapses `Anonymous` and
     // `Unknown` into one `None`. That collapse is right for the latch (both fail
     // open) and wrong for the row, which has to say which of the three this call

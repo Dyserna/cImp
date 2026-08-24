@@ -65,7 +65,7 @@ pub(super) async fn handle_mcp_list(
 pub(super) async fn handle_mcp_call(
     stream: &mut TcpStream,
     service: &Arc<OffloadService>,
-    app: &AppHandle,
+    ctx: &RouteCtx,
     req: &Request,
 ) -> AppResult<()> {
     let Some(body) = decode::<McpCallBody, _>(stream, req, bad_body_result).await? else {
@@ -100,8 +100,8 @@ pub(super) async fn handle_mcp_call(
     // recorded as an accepted residual in the V32 spec rather than fixed here;
     // the fix is to thread `settings` into `mcp_call`. Do not restore the old
     // wording without making it true.
-    let settings = live_settings(app);
-    let scoping = latch_scope(app, &settings, agent, body.tab.as_deref());
+    let settings = ctx.settings();
+    let scoping = latch_scope(ctx.app(), &settings, agent, body.tab.as_deref());
     // #48 F-20 — see `handle_graph_run`: resolved before the collapse. This is
     // the row that answers "which tab fetched that page", and it is the one the
     // finding says could not.

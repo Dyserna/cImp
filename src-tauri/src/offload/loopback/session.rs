@@ -191,7 +191,7 @@ pub(crate) fn hello_row(
 /// rejected tab is a fact worth a log line.
 pub(super) async fn handle_session_hello(
     stream: &mut TcpStream,
-    app: &AppHandle,
+    ctx: &RouteCtx,
     req: &Request,
 ) -> AppResult<()> {
     let Some(body) = decode::<SessionHelloBody, _>(stream, req, bad_body_result).await? else {
@@ -199,7 +199,7 @@ pub(super) async fn handle_session_hello(
     };
     let agent = crate::graph::source_for_consumer(body.agent.as_deref().unwrap_or(crate::harness::DEFAULT_HARNESS.token()));
     let tab = body.tab.as_deref().map(str::trim).unwrap_or("");
-    let settings = live_settings(app);
+    let settings = ctx.settings();
     if tab.is_empty() || !is_configured_tab(&settings, agent, tab) {
         warn!(
             target: "offload",
@@ -392,20 +392,20 @@ pub(super) struct SubagentsActiveBody {
 /// for its tabs.
 pub(super) async fn handle_harness_output(
     stream: &mut TcpStream,
-    app: &AppHandle,
+    ctx: &RouteCtx,
     req: &Request,
     started: bool,
 ) -> AppResult<()> {
     // `_body`: this route's whole payload is the identity plus the boundary,
     // and the boundary is the dispatch arm's own `started` argument.
-    let Some((agent, tab, _body)) = push_admit::<HarnessOutputBody>(stream, app, req, |b| {
+    let Some((agent, tab, _body)) = push_admit::<HarnessOutputBody>(stream, ctx, req, |b| {
         (b.agent.as_deref(), b.tab.as_deref())
     })
     .await?
     else {
         return Ok(());
     };
-    harness_output_core(app, agent, &tab, started);
+    harness_output_core(ctx, agent, &tab, started);
     push_ok(stream).await
 }
 
@@ -414,7 +414,7 @@ pub(super) async fn handle_harness_output(
 /// Returns whether it acted, the same shape the other pushed cores answer with
 /// so the arbitration tests can assert an exact complement.
 pub(crate) fn harness_output_core(
-    app: &AppHandle,
+    ctx: &RouteCtx,
     agent: &'static str,
     tab: &str,
     started: bool,
@@ -427,7 +427,7 @@ pub(crate) fn harness_output_core(
     if !crate::harness::chp::served(agent, tab, event) {
         return false;
     }
-    let Some(state) = app.try_state::<crate::ipc::AppState>() else {
+    let Some(state) = ctx.core() else {
         return false;
     };
     let tab = crate::state::TabId::from_str(tab);
@@ -444,17 +444,17 @@ pub(crate) fn harness_output_core(
 /// sub-agent count.
 pub(super) async fn handle_subagents_active(
     stream: &mut TcpStream,
-    app: &AppHandle,
+    ctx: &RouteCtx,
     req: &Request,
 ) -> AppResult<()> {
-    let Some((agent, tab, body)) = push_admit::<SubagentsActiveBody>(stream, app, req, |b| {
+    let Some((agent, tab, body)) = push_admit::<SubagentsActiveBody>(stream, ctx, req, |b| {
         (b.agent.as_deref(), b.tab.as_deref())
     })
     .await?
     else {
         return Ok(());
     };
-    subagents_active_core(app, agent, &tab, body.active);
+    subagents_active_core(ctx, agent, &tab, body.active);
     push_ok(stream).await
 }
 
@@ -464,7 +464,7 @@ pub(super) async fn handle_subagents_active(
 /// from individual lifecycles, so the state manager sees one signal shape
 /// whichever path produced it.
 pub(crate) fn subagents_active_core(
-    app: &AppHandle,
+    ctx: &RouteCtx,
     agent: &'static str,
     tab: &str,
     active: bool,
@@ -472,7 +472,7 @@ pub(crate) fn subagents_active_core(
     if !crate::harness::chp::served(agent, tab, crate::harness::chp::EV_SUBAGENTS_ACTIVE) {
         return false;
     }
-    let Some(state) = app.try_state::<crate::ipc::AppState>() else {
+    let Some(state) = ctx.core() else {
         return false;
     };
     let _ = state
@@ -489,7 +489,7 @@ pub(crate) fn subagents_active_core(
 /// Returns whether it acted, which is what the arbitration tests assert on:
 /// for one `(agent, tab, capability)` the answer here and the fallback reader's
 /// `ctx.pushed(..)` are exact complements.
-pub(crate) async fn assistant_text_core(app: &AppHandle, agent: &'static str, tab: &str, text: &str) -> bool {
+pub(crate) async fn assistant_text_core(ctx: &RouteCtx, agent: &'static str, tab: &str, text: &str) -> bool {
     if !crate::harness::chp::served(agent, tab, crate::harness::chp::EV_ASSISTANT_TEXT) {
         // Not declared by THIS tab's artifact ⇒ its reader is still speaking,
         // and speaking here too is the double-speak this phase must not ship.
@@ -517,7 +517,7 @@ pub(crate) async fn assistant_text_core(app: &AppHandle, agent: &'static str, ta
     if text.trim().is_empty() {
         return false;
     }
-    let Some(state) = app.try_state::<crate::ipc::AppState>() else {
+    let Some(state) = ctx.core() else {
         return false;
     };
     crate::tts::speak_prose(
@@ -539,7 +539,7 @@ pub(crate) async fn assistant_text_core(app: &AppHandle, agent: &'static str, ta
 /// path produced it, which is the point: the migration is of the SOURCE, not of
 /// the data model.
 pub(crate) fn tool_result_core(
-    app: &AppHandle,
+    ctx: &RouteCtx,
     agent: &'static str,
     tab: &str,
     cwd: Option<&str>,
@@ -556,12 +556,12 @@ pub(crate) fn tool_result_core(
         // this is the push path's own honest floor.
         return false;
     };
-    let Some(graph) = app.try_state::<Arc<crate::graph::GraphService>>() else {
+    let Some(graph) = ctx.graph() else {
         return false;
     };
     // #104: `record_usage` opens the project's store. A sub-agent's cwd is not
     // a root; with no resolvable one there is nothing to attribute the usage to.
-    let Some(root) = external_project_root(app, &live_settings(app), Some(tab), Some(cwd)) else {
+    let Some(root) = external_project_root(ctx.app(), &ctx.settings(), Some(tab), Some(cwd)) else {
         return false;
     };
     graph.record_usage(
@@ -598,7 +598,7 @@ pub(super) static PUSHED_SUBAGENTS: OnceLock<Mutex<SubagentSets>> = OnceLock::ne
 /// exactly as `harness::claude::read::update_agents` does, so the state manager
 /// sees the same signal shape whichever path produced it.
 pub(crate) fn subagent_core(
-    app: &AppHandle,
+    ctx: &RouteCtx,
     agent: &'static str,
     tab: &str,
     agent_id: &str,
@@ -630,7 +630,7 @@ pub(crate) fn subagent_core(
     if was_active == now_active {
         return true; // recorded, but not an edge — no signal.
     }
-    if let Some(state) = app.try_state::<crate::ipc::AppState>() {
+    if let Some(state) = ctx.core() {
         let _ = state
             .state_signals
             .try_send(crate::state::StateSignal::SubagentsActiveChanged {
@@ -648,7 +648,7 @@ pub(crate) fn subagent_core(
 /// `agent` normalizes through `source_for_consumer` like every other route's
 /// discriminator, and `tab` must name a configured AI tab for that agent.
 pub(super) fn session_push_identity(
-    app: &AppHandle,
+    ctx: &RouteCtx,
     agent: Option<&str>,
     tab: Option<&str>,
 ) -> Option<(&'static str, String)> {
@@ -657,7 +657,7 @@ pub(super) fn session_push_identity(
     if tab.is_empty() {
         return None;
     }
-    let settings = live_settings(app);
+    let settings = ctx.settings();
     if !is_configured_tab(&settings, agent, tab) {
         return None;
     }
@@ -686,7 +686,7 @@ pub(super) fn session_push_identity(
 /// envelope reads visible AT the route.
 async fn push_admit<T: serde::de::DeserializeOwned>(
     stream: &mut TcpStream,
-    app: &AppHandle,
+    ctx: &RouteCtx,
     req: &Request,
     identity: impl FnOnce(&T) -> (Option<&str>, Option<&str>),
 ) -> AppResult<Option<(&'static str, String, T)>> {
@@ -695,7 +695,7 @@ async fn push_admit<T: serde::de::DeserializeOwned>(
         return Ok(None);
     };
     let (agent, tab) = identity(&body);
-    let Some((agent, tab)) = session_push_identity(app, agent, tab) else {
+    let Some((agent, tab)) = session_push_identity(ctx, agent, tab) else {
         push_ok(stream).await?;
         return Ok(None);
     };
@@ -719,27 +719,27 @@ async fn push_ok(stream: &mut TcpStream) -> AppResult<()> {
 /// `POST /session/assistant_text` — one complete assistant message, spoken.
 pub(super) async fn handle_session_assistant_text(
     stream: &mut TcpStream,
-    app: &AppHandle,
+    ctx: &RouteCtx,
     req: &Request,
 ) -> AppResult<()> {
-    let Some((agent, tab, body)) = push_admit::<SessionAssistantTextBody>(stream, app, req, |b| {
+    let Some((agent, tab, body)) = push_admit::<SessionAssistantTextBody>(stream, ctx, req, |b| {
         (b.agent.as_deref(), b.tab.as_deref())
     })
     .await?
     else {
         return Ok(());
     };
-    assistant_text_core(app, agent, &tab, &body.text).await;
+    assistant_text_core(ctx, agent, &tab, &body.text).await;
     push_ok(stream).await
 }
 
 /// `POST /session/tool_result` — one tool result's size, recorded.
 pub(super) async fn handle_session_tool_result(
     stream: &mut TcpStream,
-    app: &AppHandle,
+    ctx: &RouteCtx,
     req: &Request,
 ) -> AppResult<()> {
-    let Some((agent, tab, body)) = push_admit::<SessionToolResultBody>(stream, app, req, |b| {
+    let Some((agent, tab, body)) = push_admit::<SessionToolResultBody>(stream, ctx, req, |b| {
         (b.agent.as_deref(), b.tab.as_deref())
     })
     .await?
@@ -747,7 +747,7 @@ pub(super) async fn handle_session_tool_result(
         return Ok(());
     };
     tool_result_core(
-        app,
+        ctx,
         agent,
         &tab,
         body.cwd.as_deref(),
@@ -761,16 +761,16 @@ pub(super) async fn handle_session_tool_result(
 /// `POST /session/subagent` — one sub-agent lifecycle edge.
 pub(super) async fn handle_session_subagent(
     stream: &mut TcpStream,
-    app: &AppHandle,
+    ctx: &RouteCtx,
     req: &Request,
 ) -> AppResult<()> {
-    let Some((agent, tab, body)) = push_admit::<SessionSubagentBody>(stream, app, req, |b| {
+    let Some((agent, tab, body)) = push_admit::<SessionSubagentBody>(stream, ctx, req, |b| {
         (b.agent.as_deref(), b.tab.as_deref())
     })
     .await?
     else {
         return Ok(());
     };
-    subagent_core(app, agent, &tab, &body.agent_id, body.active);
+    subagent_core(ctx, agent, &tab, &body.agent_id, body.active);
     push_ok(stream).await
 }

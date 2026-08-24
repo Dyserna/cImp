@@ -668,14 +668,17 @@ fn start_offload_runtime(
         // V42 Phase A2: read off the injected handles rather than re-resolved
         // from the managed-state table — the same value, one fewer lookup.
         let root = core.launch_cwd.clone();
-        match crate::offload::loopback::Loopback::start(
-            service.clone(),
+        // V42 Phase A2: the listener is handed the context its handlers run on
+        // — the app handle for the three onward calls that still need one, and
+        // the four services they used to fish out of the managed-state table.
+        let ctx = crate::offload::host::RouteCtx::new(
             app_handle.clone(),
-            core,
-            &root,
-        )
-        .await
-        {
+            std::sync::Arc::new(crate::offload::host::TauriRouteServices::new(
+                app_handle.clone(),
+                Some(core),
+            )),
+        );
+        match crate::offload::loopback::Loopback::start(service.clone(), ctx, &root).await {
             Ok(lb) => {
                 app_handle.manage(lb);
             }

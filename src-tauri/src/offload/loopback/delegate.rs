@@ -78,8 +78,7 @@ impl DelegateResult {
 /// nothing it could get wrong on its own.
 pub(super) async fn handle_delegate(
     stream: &mut TcpStream,
-    app: &AppHandle,
-    core: &crate::service::host::CoreHost,
+    ctx: &RouteCtx,
     req: &Request,
 ) -> AppResult<()> {
     let Some(body) = decode::<DelegateBody, _>(stream, req, |e| {
@@ -94,7 +93,7 @@ pub(super) async fn handle_delegate(
         return write_json(stream, 400, &r).await;
     }
 
-    let settings = live_settings(app);
+    let settings = ctx.settings();
     let agent = crate::graph::source_for_consumer(body.consumer.as_deref().unwrap_or(crate::harness::DEFAULT_HARNESS.token()));
     // The calling tab must be a CONFIGURED tab of this consumer. An anonymous
     // or unrecognized id is refused rather than fail-open: unlike a latch (where
@@ -125,12 +124,23 @@ pub(super) async fn handle_delegate(
         DELEGATE_TOOL,
         agent,
         body.tab.as_deref(),
-        |a, t| latch_scope(app, &settings, a, t),
+        |a, t| latch_scope(ctx.app(), &settings, a, t),
         |scope| GatePolicy::resolve(&settings, scope),
     ) {
         let r = DelegateResult::failed(refusal.to_string());
         return write_json(stream, 200, &r).await;
     }
+
+    // V42 Phase A2: the engine's handles, which used to be the
+    // `AppHandle::state::<AppState>()` `drive` opened with. The refusal text is
+    // the engine's own, verbatim — this is the same unreachable-in-the-app
+    // "there is no tab layer" case, answered one frame earlier.
+    let Some(core) = ctx.core() else {
+        let r = DelegateResult::failed(
+            "cImp's tab layer is not running, so no tab can be driven".into(),
+        );
+        return write_json(stream, 200, &r).await;
+    };
 
     let harness = body.harness.trim();
     let Some(worker_id) = manual_tab_for(&settings, harness) else {
@@ -174,7 +184,7 @@ pub(super) async fn handle_delegate(
     };
     let reply = {
         let (mut rd, _wr) = stream.split();
-        let flight = crate::delegation::drive_watching(core, drive_req, &cancel);
+        let flight = crate::delegation::drive_watching(&core, drive_req, &cancel);
         tokio::pin!(flight);
         loop {
             let mut probe = [0u8; 1];

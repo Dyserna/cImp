@@ -109,13 +109,13 @@ pub(super) fn checkpoint_identity(
 /// (never blocks a turn) when injection is off or nothing clears the threshold.
 pub(super) async fn handle_context_retrieve(
     stream: &mut TcpStream,
-    app: &AppHandle,
+    ctx: &RouteCtx,
     req: &Request,
 ) -> AppResult<()> {
     let Some(body) = decode::<ContextRetrieveBody, _>(stream, req, bad_body_json).await? else {
         return Ok(());
     };
-    let answer = context_retrieve_core(app, &body).await;
+    let answer = context_retrieve_core(ctx, &body).await;
     write_json(stream, 200, &answer).await
 }
 
@@ -209,13 +209,13 @@ pub(super) fn merge_files_used(parked: Vec<String>, fresh: Vec<String>) -> Vec<S
 /// once-per-session greeting and the drained auto-check block are destructive
 /// reads (consumed exactly once), and both are cheap — no embed, no network —
 /// so a slow retrieval can never cost the session its project map.
-pub(crate) async fn context_retrieve_core(app: &AppHandle, body: &ContextRetrieveBody) -> serde_json::Value {
+pub(crate) async fn context_retrieve_core(ctx: &RouteCtx, body: &ContextRetrieveBody) -> serde_json::Value {
     // #104: both consumers below create per-project state — the workbench's
     // `<db_subdir>/shadow.git` and the graph store — so the payload's `cwd` is
     // resolved to a real root first. `None` refuses BOTH: no checkpoint and no
     // retrieval for a directory that is no project (`empty` is this route's
     // established "nothing to say" answer).
-    let Some(cwd) = external_project_root(app, &live_settings(app), body.tab.as_deref(), body.cwd.as_deref())
+    let Some(cwd) = external_project_root(ctx.app(), &ctx.settings(), body.tab.as_deref(), body.cwd.as_deref())
     else {
         return serde_json::json!({ "ok": true, "text": "", "files": [], "tokens_est": 0 });
     };
@@ -233,14 +233,13 @@ pub(crate) async fn context_retrieve_core(app: &AppHandle, body: &ContextRetriev
     // spawned for every single prompt, which is needless per-prompt work
     // (a task spawn plus a settings read) for a feature the user has
     // disabled.
-    if let Some(workbench) = app.try_state::<Arc<crate::workbench::WorkbenchService>>() {
-        let workbench = workbench.inner().clone();
+    if let Some(workbench) = ctx.workbench() {
         if workbench.checkpoints_enabled() {
             let root = cwd.clone();
             // V33: the identity the Timeline is joined on. The settings read
             // sits INSIDE the `checkpoints_enabled` gate for FIX 8's reason —
             // a user with checkpoints off pays nothing for this.
-            let origin = checkpoint_origin(&live_settings(app), body);
+            let origin = checkpoint_origin(&ctx.settings(), body);
             let prompt_head: String = body.prompt.chars().take(80).collect();
             tauri::async_runtime::spawn(async move {
                 workbench.on_prompt(&root, origin, &prompt_head).await;
@@ -249,10 +248,9 @@ pub(crate) async fn context_retrieve_core(app: &AppHandle, body: &ContextRetriev
     }
 
     let empty = serde_json::json!({ "ok": true, "text": "", "files": [], "tokens_est": 0 });
-    let Some(graph) = app.try_state::<Arc<crate::graph::GraphService>>() else {
+    let Some(graph) = ctx.graph() else {
         return empty;
     };
-    let graph = graph.inner().clone();
     // The injection toggle is enforced here (the service's retrieve does not) so
     // the preview surface can reuse the same core while injection is off.
     if !graph.context_injection_enabled() {
@@ -532,7 +530,7 @@ pub(super) fn checkpoint_source_admits(agent: Option<&str>) -> Result<&'static s
 /// `workbench` / `checkpoint_missed`, not this boolean.
 pub(super) async fn handle_tool_checkpoint(
     stream: &mut TcpStream,
-    app: &AppHandle,
+    ctx: &RouteCtx,
     req: &Request,
 ) -> AppResult<()> {
     let Some(body) = decode::<ToolCheckpointBody, _>(stream, req, bad_body_json).await? else {
@@ -562,8 +560,8 @@ pub(super) async fn handle_tool_checkpoint(
         .await;
     }
     let checkpointed = tool_checkpoint_core(
-        app,
-        &live_settings(app),
+        ctx,
+        &ctx.settings(),
         body.agent.as_deref(),
         tool,
         body.cwd.as_deref(),
@@ -597,7 +595,7 @@ pub(super) async fn handle_tool_checkpoint(
 /// rather than read here so a handler resolves identity and policy under ONE
 /// snapshot.
 pub(crate) async fn tool_checkpoint_core(
-    app: &AppHandle,
+    ctx: &RouteCtx,
     settings: &crate::settings::Settings,
     agent: Option<&str>,
     tool: &str,
@@ -616,17 +614,16 @@ pub(crate) async fn tool_checkpoint_core(
         // non-mutating matched call and would be unbounded chatter.
         return false;
     }
-    let Some(workbench) = app.try_state::<Arc<crate::workbench::WorkbenchService>>() else {
+    let Some(workbench) = ctx.workbench() else {
         return false;
     };
-    let workbench = workbench.inner().clone();
     if !workbench.checkpoints_enabled() {
         return false;
     }
     // #104: the checkpointer creates `<root>/<db_subdir>/shadow.git`, so a cwd
     // that resolves to no project takes no checkpoint rather than minting a
     // shadow repo inside one.
-    let Some(root) = external_project_root(app, settings, tab, cwd) else {
+    let Some(root) = external_project_root(ctx.app(), settings, tab, cwd) else {
         return false;
     };
     let origin = checkpoint_identity(settings, agent, session_id, tab);
@@ -688,27 +685,27 @@ pub(crate) struct ContextCompactionBody {
 /// text, no source text, with quarantined notes already excluded.
 pub(super) async fn handle_context_compaction(
     stream: &mut TcpStream,
-    app: &AppHandle,
+    ctx: &RouteCtx,
     req: &Request,
 ) -> AppResult<()> {
     let Some(body) = decode::<ContextCompactionBody, _>(stream, req, bad_body_json).await? else {
         return Ok(());
     };
     let empty = serde_json::json!({ "ok": true, "text": "" });
-    let settings = live_settings(app);
+    let settings = ctx.settings();
     if hook_admit(
         latches(),
         HOOK_TOOL_COMPACTION,
         hook_agent(body.agent.as_deref()),
         body.tab.as_deref(),
-        |agent, tab| latch_scope(app, &settings, agent, tab),
+        |agent, tab| latch_scope(ctx.app(), &settings, agent, tab),
         |scope| GatePolicy::resolve(&settings, scope),
     )
     .is_err()
     {
         return write_json(stream, 200, &empty).await;
     }
-    let block = compaction_block(app, &body);
+    let block = compaction_block(ctx, &body);
     write_json(stream, 200, &serde_json::json!({ "ok": true, "text": block })).await
 }
 
@@ -720,15 +717,14 @@ pub(super) async fn handle_context_compaction(
 /// about_the_latch`) checks each handler's own body for its `hook_admit(latches(),
 /// …)` call, and a gate that a route merely inherits from a helper is a gate a
 /// reviewer cannot see at the route.
-pub(crate) fn compaction_block(app: &AppHandle, body: &ContextCompactionBody) -> String {
-    let Some(graph) = app.try_state::<Arc<crate::graph::GraphService>>() else {
+pub(crate) fn compaction_block(ctx: &RouteCtx, body: &ContextCompactionBody) -> String {
+    let Some(graph) = ctx.graph() else {
         return String::new();
     };
-    let graph = graph.inner().clone();
     // #104: `compaction_context` opens the project's store — resolve, never
     // trust the payload's cwd. No root ⇒ no carry-over block, the route's own
     // fail-safe.
-    let Some(root) = external_project_root(app, &live_settings(app), body.tab.as_deref(), body.cwd.as_deref())
+    let Some(root) = external_project_root(ctx.app(), &ctx.settings(), body.tab.as_deref(), body.cwd.as_deref())
     else {
         return String::new();
     };
@@ -778,27 +774,27 @@ pub(crate) struct ShouldReadBody {
 /// fewer of them.
 pub(super) async fn handle_should_read(
     stream: &mut TcpStream,
-    app: &AppHandle,
+    ctx: &RouteCtx,
     req: &Request,
 ) -> AppResult<()> {
     let pass = serde_json::json!({ "ok": true, "verdict": "pass" });
     let Some(body) = decode::<ShouldReadBody, _>(stream, req, bad_body_json).await? else {
         return Ok(());
     };
-    let settings = live_settings(app);
+    let settings = ctx.settings();
     if hook_admit(
         latches(),
         HOOK_TOOL_SHOULD_READ,
         hook_agent(body.agent.as_deref()),
         body.tab.as_deref(),
-        |agent, tab| latch_scope(app, &settings, agent, tab),
+        |agent, tab| latch_scope(ctx.app(), &settings, agent, tab),
         |scope| GatePolicy::resolve(&settings, scope),
     )
     .is_err()
     {
         return write_json(stream, 200, &pass).await;
     }
-    match should_read_verdict(app, &body) {
+    match should_read_verdict(ctx, &body) {
         Some(text) => {
             write_json(
                 stream,
@@ -815,14 +811,13 @@ pub(super) async fn handle_should_read(
 /// `remind`, `None` for a `pass`. Shared by `/context/should_read` and
 /// [`crate::harness::claude::hook::ROUTE_PRE_TOOL_USE`]; see [`compaction_block`] for why the
 /// gate stays at each route rather than moving in here.
-pub(crate) fn should_read_verdict(app: &AppHandle, body: &ShouldReadBody) -> Option<String> {
-    let graph = app.try_state::<Arc<crate::graph::GraphService>>()?;
-    let graph = graph.inner().clone();
+pub(crate) fn should_read_verdict(ctx: &RouteCtx, body: &ShouldReadBody) -> Option<String> {
+    let graph = ctx.graph()?;
     // #104: the advisor OPENS (and therefore creates) the project's graph store,
     // so it is the route that minted the stray state dirs. The root is resolved,
     // never taken from the payload; no root ⇒ pass the read through, which is
     // this route's fail-safe everywhere else too.
-    let root = external_project_root(app, &live_settings(app), body.tab.as_deref(), body.cwd.as_deref())?;
+    let root = external_project_root(ctx.app(), &ctx.settings(), body.tab.as_deref(), body.cwd.as_deref())?;
     graph.should_read(
         &root,
         body.session_id.as_deref(),
@@ -879,10 +874,10 @@ pub(crate) struct ContextPostEditBody {
 /// `current_dir()` fails (a deleted cwd). It denies everything, which is the
 /// correct answer: a root that cannot be resolved must read as absent, never as
 /// "allow whatever was asked for".
-pub(super) fn hook_exec_roots(app: &AppHandle, settings: &crate::settings::Settings) -> Vec<PathBuf> {
-    let launch = app
-        .try_state::<crate::ipc::AppState>()
-        .map(|s| s.launch.cwd.clone())
+pub(super) fn hook_exec_roots(ctx: &RouteCtx, settings: &crate::settings::Settings) -> Vec<PathBuf> {
+    let launch = ctx
+        .core()
+        .map(|s| s.launch_cwd.clone())
         .or_else(|| std::env::current_dir().ok());
     let Some(launch) = launch else {
         return Vec::new();
@@ -980,25 +975,25 @@ pub(super) fn admitted_hook_root(roots: &[PathBuf], requested: Option<&str>) -> 
 /// is no command to run in a directory a caller names, so there is nothing for
 /// a root allowlist to contain. If either ever grows a spawn, it inherits this
 /// route's treatment.
-pub(super) async fn handle_post_edit(stream: &mut TcpStream, app: &AppHandle, req: &Request) -> AppResult<()> {
+pub(super) async fn handle_post_edit(stream: &mut TcpStream, ctx: &RouteCtx, req: &Request) -> AppResult<()> {
     let empty = serde_json::json!({ "ok": true, "text": "" });
     let Some(body) = decode::<ContextPostEditBody, _>(stream, req, bad_body_json).await? else {
         return Ok(());
     };
-    let settings = live_settings(app);
+    let settings = ctx.settings();
     if hook_admit(
         latches(),
         HOOK_TOOL_POST_EDIT,
         hook_agent(body.agent.as_deref()),
         body.tab.as_deref(),
-        |agent, tab| latch_scope(app, &settings, agent, tab),
+        |agent, tab| latch_scope(ctx.app(), &settings, agent, tab),
         |scope| GatePolicy::resolve(&settings, scope),
     )
     .is_err()
     {
         return write_json(stream, 200, &empty).await;
     }
-    let text = post_edit_diagnostics(app, &settings, &body).await;
+    let text = post_edit_diagnostics(ctx, &settings, &body).await;
     write_json(stream, 200, &serde_json::json!({ "ok": true, "text": text })).await
 }
 
@@ -1007,14 +1002,14 @@ pub(super) async fn handle_post_edit(stream: &mut TcpStream, app: &AppHandle, re
 /// Shared by `/context/post_edit` and [`crate::harness::claude::hook::ROUTE_POST_TOOL_USE`]; see
 /// [`compaction_block`] for why the latch gate stays at each route.
 pub(crate) async fn post_edit_diagnostics(
-    app: &AppHandle,
+    ctx: &RouteCtx,
     settings: &crate::settings::Settings,
     body: &ContextPostEditBody,
 ) -> String {
     // V33 C4: decide WHERE before deciding whether there is anything to run —
     // the roots are app-derived, so this cannot be moved by the body.
-    let exec_roots = hook_exec_roots(app, settings);
-    let Some(cwd) = admitted_hook_root(&hook_exec_roots(app, settings), body.cwd.as_deref()) else {
+    let exec_roots = hook_exec_roots(ctx, settings);
+    let Some(cwd) = admitted_hook_root(&hook_exec_roots(ctx, settings), body.cwd.as_deref()) else {
         // Bounded: the rejected string is caller-chosen and unbounded on the
         // wire, and this is the one place it reaches an operator-facing line.
         warn!(
@@ -1026,7 +1021,7 @@ pub(crate) async fn post_edit_diagnostics(
         );
         return String::new();
     };
-    let Some(graph) = app.try_state::<Arc<crate::graph::GraphService>>() else {
+    let Some(graph) = ctx.graph() else {
         return String::new();
     };
     // #104: admitted is not the same as *is a project root* — a sub-agent's cwd
@@ -1035,7 +1030,7 @@ pub(crate) async fn post_edit_diagnostics(
     // answer**: the walk goes UP, and a resolved root above every served root
     // would run the operator's check commands one directory further out than
     // C4 admits. It never widens; on a miss the route takes its own fail-safe.
-    let root = external_project_root(app, settings, body.tab.as_deref(), Some(&cwd.to_string_lossy()));
+    let root = external_project_root(ctx.app(), settings, body.tab.as_deref(), Some(&cwd.to_string_lossy()));
     let Some(root) = root.filter(|r| {
         let r = canon(r);
         exec_roots.iter().any(|allowed| is_ancestor_or_equal(&canon(allowed), &r))
@@ -1050,7 +1045,6 @@ pub(crate) async fn post_edit_diagnostics(
         );
         return String::new();
     };
-    let graph = graph.inner().clone();
     graph
         .post_edit(&root, body.session_id.as_deref(), &body.file_path)
         .await

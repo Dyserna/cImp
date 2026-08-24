@@ -317,12 +317,12 @@ pub(super) const DISCOVERY_TOOL: &str = "discovery";
 /// (the operator consumer), and the child's own unchanged `eprintln!`.
 pub(super) async fn handle_discovery_skipped(
     stream: &mut TcpStream,
-    app: &AppHandle,
+    ctx: &RouteCtx,
     req: &Request,
 ) -> AppResult<()> {
     // Everything that can vary happens in here and returns `()`. No `?`, no
     // early return, no branch on the outcome.
-    note_discovery_skipped(app, &req.body);
+    note_discovery_skipped(ctx, &req.body);
     write_simple(
         stream,
         200,
@@ -348,7 +348,7 @@ pub(super) struct TabFacts {
 /// `AppHandle` (which this crate cannot mock) is one thin frame that injects the
 /// two app-derived facts into [`record_discovery_skipped`] as a closure — the
 /// same seam `mark_live_session_from_event` uses.
-pub(super) fn note_discovery_skipped(app: &AppHandle, raw: &[u8]) {
+pub(super) fn note_discovery_skipped(ctx: &RouteCtx, raw: &[u8]) {
     // A parse failure is NOT an error path here: it degrades to a default body,
     // whose `skipped: 0` writes no row. Answering 400 would have been a second
     // response shape, i.e. the oracle this route exists without.
@@ -356,15 +356,15 @@ pub(super) fn note_discovery_skipped(app: &AppHandle, raw: &[u8]) {
     // ONE settings read for the whole request, the discipline `/mcp/call`
     // documents: the tab-identity check and the root resolution must not run
     // against two snapshots.
-    let settings = live_settings(app);
+    let settings = ctx.settings();
     record_discovery_skipped(
         &settings,
         &body,
         claim_discovery_report,
         |tab, agent| TabFacts {
-            root: tab_root_key(app, &settings, tab),
-            session: app
-                .try_state::<Arc<crate::graph::GraphService>>()
+            root: tab_root_key(ctx.app(), &settings, tab),
+            session: ctx
+                .graph()
                 .and_then(|g| g.live_session_for_tab(tab, agent)),
         },
     );
@@ -681,23 +681,23 @@ pub(crate) enum PermissionOutcome {
 /// Every tab a permission edge could be attributed to, with the session each is
 /// currently running.
 ///
-/// Snapshots what is needed from managed state and drops the guards — nothing
-/// borrowed from `AppHandle` is held across a response write. An empty answer
-/// (no `AppState`, no configured tabs) is not an error: it makes the resolution
+/// Snapshots what it needs off the route context and owns it — nothing borrowed
+/// is held across a response write. An empty answer (no core handles, no
+/// configured tabs) is not an error: it makes the resolution
 /// find nothing, which is the same "drop it rather than guess" outcome an
 /// ambiguous match produces.
 pub(crate) fn permission_tab_candidates(
-    app: &AppHandle,
+    ctx: &RouteCtx,
     harness: crate::harness::HarnessId,
 ) -> Vec<PermissionTabCandidate> {
-    let Some(state) = app.try_state::<crate::ipc::AppState>() else {
+    let Some(state) = ctx.core() else {
         return Vec::new();
     };
-    let sessions: Vec<(String, String)> = app
-        .try_state::<Arc<crate::graph::GraphService>>()
+    let sessions: Vec<(String, String)> = ctx
+        .graph()
         .map(|g| g.live_sessions_for(harness))
         .unwrap_or_default();
-    crate::tabs::harness_tab_dirs(&state.settings.current(), &state.launch.cwd, harness)
+    crate::tabs::harness_tab_dirs(&state.settings.current(), &state.launch_cwd, harness)
         .into_iter()
         .map(|(tab, dir)| PermissionTabCandidate {
             session_id: sessions
@@ -720,12 +720,12 @@ pub(crate) fn permission_tab_candidates(
 /// a full channel means the state manager is saturated, and the regex detector's
 /// next scan re-raises the edge anyway.
 pub(crate) async fn send_permission_edge(
-    app: &AppHandle,
+    ctx: &RouteCtx,
     tab: &str,
     edge: crate::harness::plugin::PermissionEdge,
 ) -> bool {
     use crate::harness::plugin::PermissionEdge;
-    let Some(state) = app.try_state::<crate::ipc::AppState>() else {
+    let Some(state) = ctx.core() else {
         return false;
     };
     let signals = state.state_signals.clone();
@@ -765,8 +765,8 @@ pub(crate) async fn send_permission_edge(
 /// Only a harness whose plugin declares
 /// [`crate::harness::plugin::HarnessPlugin::turn_end_push`] has a producer for
 /// this; see that method for why the Idle edge is not the same thing.
-pub(crate) async fn send_turn_ended(app: &AppHandle, tab: &str) -> bool {
-    let Some(state) = app.try_state::<crate::ipc::AppState>() else {
+pub(crate) async fn send_turn_ended(ctx: &RouteCtx, tab: &str) -> bool {
+    let Some(state) = ctx.core() else {
         return false;
     };
     let signal = crate::state::StateSignal::HarnessTurnEnded {

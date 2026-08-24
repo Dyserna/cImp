@@ -36,7 +36,7 @@
   import { openSettingsWindow, setActiveTab as setActiveTabIpc } from './lib/settings/ipc';
   import { activeTab, switchTab } from './lib/tabs/state';
   import { applyTabCreated } from './lib/tabs/store';
-  import { stripHiddenTabsFromLayout } from './lib/tabs/visibility';
+  import { isTabHidden } from './lib/tabs/visibility';
   import {
     applyTabCreatedToLayout,
     closeFocusedPane,
@@ -49,10 +49,7 @@
     setPaneActiveTab,
   } from './lib/layout/store';
   import { splitFocusedPaneWithNewShell } from './lib/layout/actions';
-  import {
-    installLayoutPersistence,
-    validateAndRepairLayout,
-  } from './lib/layout/persistence';
+  import { installLayoutPersistence } from './lib/layout/persistence';
   import { createTerminal } from './lib/terminals';
   import { stopAllTts, isSelectionTtsActive, playSelectionTts } from './lib/selectionTts';
   import { listTabs } from './lib/ipc';
@@ -162,21 +159,27 @@
         });
 
         if (persistedLayout) {
-          // V4-04: hydrate the layout tree from settings. The integrity
-          // sieve adapts the persisted shape to the live tab list —
-          // dropping tabs the user deleted between launches and placing
-          // newly-created tabs as orphans in the focused pane.
-          const repaired = validateAndRepairLayout(
-            persistedLayout,
-            get(settings).tabs,
-          );
-          layout.set(repaired);
+          // V4-04: hydrate the layout tree from settings. Taken VERBATIM
+          // since V42 Phase B — the backend's `settings::layout` ran the
+          // integrity walk before this window ever saw the settings, so
+          // the tree already matches the live tab list (deleted tabs
+          // dropped, new ones placed as orphans, hidden ones absent).
+          // Repairing again here would be a second copy of rules that
+          // have to exist once.
+          layout.set(persistedLayout);
         } else {
           // Fresh-install / pre-V4-04 path: every tab goes into the
           // store-built single root pane via `applyTabCreatedToLayout`,
           // and the previously-active tab (if any) is restored from
           // the legacy session.active_tab_id field.
-          snapshot.forEach((m) => applyTabCreatedToLayout(m.id));
+          //
+          // Hidden tabs are skipped rather than seeded-then-stripped:
+          // there is no persisted tree for the backend to have repaired,
+          // so this is the one boot path that has to keep "hidden ⇔ absent
+          // from the layout tree" on its own.
+          snapshot
+            .filter((m) => !isTabHidden(m.id))
+            .forEach((m) => applyTabCreatedToLayout(m.id));
           const sessionActive = get(settings).session.active_tab_id;
           if (sessionActive) {
             setFocusedPaneActiveTab(sessionActive);
@@ -185,15 +188,10 @@
       } catch (e) {
         console.error('list_tabs failed:', e);
       }
-      // Hydration re-adds UI-hidden tabs to the tree (the repair step
-      // places them as orphans since they ARE in settings.tabs; the legacy
-      // path seeds every tab). Strip them again before the panes render —
-      // hidden tabs live outside the layout so their space stays freed.
-      stripHiddenTabsFromLayout();
       if (disposed) return;
-      // Install the debounced save subscription AFTER hydration so the
-      // first emission (the just-set layout from settings) is the one
-      // it swallows. If we install earlier, the subscription would
+      // Install the save subscription AFTER hydration so the first
+      // emission (the just-set layout from settings) is the one it
+      // swallows. If we install earlier, the subscription would
       // round-trip the hydrated layout straight back to the backend on
       // launch — harmless (would write the same state) but wasteful.
       unsubLayoutSave = installLayoutPersistence();

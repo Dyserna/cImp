@@ -95,7 +95,8 @@ use crate::ipc::commands::{
     workbench_worktree_run_checks, workbench_worktrees,
 };
 use crate::ipc::layout::{
-    delete_layout_preset, rename_layout_preset, save_layout, save_layout_preset,
+    delete_layout_preset, rename_layout_preset, restore_layout_preset, save_layout,
+    save_layout_preset,
 };
 use crate::ipc::note::{read_note, write_note};
 use crate::ipc::tab_lifecycle::{
@@ -848,6 +849,7 @@ fn main() {
             save_layout_preset,
             delete_layout_preset,
             rename_layout_preset,
+            restore_layout_preset,
             content_open_folder,
             content_clear,
             offload_status,
@@ -1080,10 +1082,17 @@ fn project_label_for(cwd: &Path) -> String {
         .to_string()
 }
 
-/// Find the persisted layout's focused pane and return its active tab
-/// id. Returns `None` if the focused-pane id doesn't match any pane
-/// (the integrity check at load time normally repairs this) or if the
-/// focused pane has no active tab (transient empty pane).
+/// Find the persisted layout's focused pane and return its active tab id.
+/// Returns `None` if the focused-pane id doesn't match any pane or if the
+/// focused pane has no active tab.
+///
+/// Both fallbacks are dead weight against a layout that came through
+/// `integrity_check`, which since V42 Phase B validates `focused_pane_id`
+/// against the tree and re-points a pane's `active_tab_id` at one of its own
+/// tabs. They stay because this reads a `&LayoutPersisted` it was handed, and a
+/// helper that panics on a shape someone else vouched for is a worse trade than
+/// one that answers `None` and lets the caller fall through to
+/// `session.active_tab_id`.
 fn layout_focused_active_tab_id(layout: &LayoutPersisted) -> Option<String> {
     fn find<'a>(node: &'a LayoutNodePersisted, target: &str) -> Option<&'a Option<String>> {
         match node {

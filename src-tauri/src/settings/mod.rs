@@ -21,6 +21,11 @@ mod codegen;
 /// enforcement site reads a raw settings field" only works if there is a
 /// visible, obvious place for them to read instead.
 pub mod injection;
+/// V42 Phase B: the hydration-time layout-tree integrity pass, ported from the
+/// frontend so the tree the backend hands out is already correct. Public
+/// because the preset-restore command runs the same rules — restoring a preset
+/// is a hydration, and the rules must exist exactly once.
+pub mod layout;
 mod migration;
 mod persistence;
 mod schema;

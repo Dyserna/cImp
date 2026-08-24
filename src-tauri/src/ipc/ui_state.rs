@@ -53,6 +53,7 @@
 //! same-tick microtask, so a window closing can no longer eat the last toggle
 //! — and this side commits whatever arrives.
 
+use std::collections::HashSet;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -191,6 +192,40 @@ pub fn read_ui_state(launch_cwd: &Path) -> UiState {
         // payload is disposable view state; a future migration hooks in here.
         _ => UiState::default(),
     }
+}
+
+/// The frontend key holding the UI-hidden tab set. Owned by
+/// `src/lib/tabs/visibility.ts`; named here because the layout repair reads it
+/// (see [`read_hidden_tabs`]).
+pub const HIDDEN_TABS_KEY: &str = "cimp.hidden-tabs.v1";
+
+/// The project's UI-hidden tab ids.
+///
+/// **The one value this layer interprets** (V42 Phase B). Everything else in
+/// `values` is opaque — see the module docs — but the layout tree's integrity
+/// pass has to know which tabs are hidden, because "hidden" means "absent from
+/// the layout tree while still present in `settings.tabs`", and a repair that
+/// did not know it would place every hidden tab back as an orphan on every
+/// launch. That reconciliation used to run in the frontend, so the coupling is
+/// new to this file, not to the app.
+///
+/// The stored shape is the frontend's: a JSON array **encoded as a string**.
+/// Tolerance matches `visibility.ts`'s reader exactly — a missing key, a
+/// non-string value, unparseable JSON, a non-array, or a non-string element all
+/// read as "nothing hidden". Losing the hidden set un-hides tabs for one
+/// launch; refusing to boot over it would be the worse trade.
+pub fn read_hidden_tabs(launch_cwd: &Path) -> HashSet<String> {
+    let state = read_ui_state(launch_cwd);
+    let Some(Value::String(raw)) = state.values.get(HIDDEN_TABS_KEY) else {
+        return HashSet::new();
+    };
+    let Ok(Value::Array(items)) = serde_json::from_str::<Value>(raw) else {
+        return HashSet::new();
+    };
+    items
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect()
 }
 
 /// The `version` stamped on the file **as bytes on disk**, when there is one.
@@ -536,6 +571,81 @@ mod tests {
             second.try_lock().is_ok(),
             "the lock outlived its holder"
         );
+    }
+
+    /// V42 Phase B. The hidden set is a JSON array **encoded as a string** —
+    /// the frontend's own shape, which this layer stores verbatim — so the
+    /// reader has to parse the inner JSON, not just read the value.
+    #[test]
+    fn the_hidden_tab_set_round_trips_from_its_json_in_a_string() {
+        let p = Project::new();
+        assert!(
+            read_hidden_tabs(p.path()).is_empty(),
+            "a project with no file has nothing hidden"
+        );
+
+        merge_ui_state(
+            p.path(),
+            patch(&[(HIDDEN_TABS_KEY, json!("[\"workbench-1\",\"events\"]"))]),
+        )
+        .unwrap();
+        let hidden = read_hidden_tabs(p.path());
+        assert_eq!(hidden.len(), 2);
+        assert!(hidden.contains("workbench-1"));
+        assert!(hidden.contains("events"));
+    }
+
+    /// Losing the hidden set un-hides tabs for one launch; refusing to boot
+    /// over it would be the worse trade. Every malformed shape the frontend's
+    /// own reader tolerates has to read as "nothing hidden" here too.
+    #[test]
+    fn a_malformed_hidden_tab_value_reads_as_nothing_hidden() {
+        let p = Project::new();
+        for bad in [
+            json!("not json at all"),
+            json!("{\"not\":\"an array\"}"),
+            json!("[]"),
+            // Not a string at all — the frontend writes one, a hand-edit need
+            // not.
+            json!(["workbench-1"]),
+            json!(7),
+            json!(null),
+        ] {
+            merge_ui_state(p.path(), patch(&[(HIDDEN_TABS_KEY, bad.clone())])).unwrap();
+            assert!(
+                read_hidden_tabs(p.path()).is_empty(),
+                "{bad} should read as nothing hidden"
+            );
+        }
+    }
+
+    /// The key is a literal shared across the IPC boundary: the frontend
+    /// writes it, this side reads it, and nothing at runtime would notice them
+    /// drifting apart — the hidden set would just silently stop applying to the
+    /// layout. Pin it against the frontend's declaration.
+    #[test]
+    fn the_hidden_tabs_key_matches_the_frontends_declaration() {
+        let ts = include_str!("../../../src/lib/uiState.ts");
+        assert!(
+            ts.contains(&format!("HIDDEN_TABS_KEY = '{HIDDEN_TABS_KEY}'")),
+            "`{HIDDEN_TABS_KEY}` is not what src/lib/uiState.ts declares — the backend would read \
+             a key nobody writes and every hidden tab would come back on the next launch"
+        );
+    }
+
+    /// A non-string element is dropped, not fatal — the surviving ids still
+    /// hide their tabs.
+    #[test]
+    fn a_non_string_element_is_dropped_and_the_rest_survive() {
+        let p = Project::new();
+        merge_ui_state(
+            p.path(),
+            patch(&[(HIDDEN_TABS_KEY, json!("[\"events\", 7, null]"))]),
+        )
+        .unwrap();
+        let hidden = read_hidden_tabs(p.path());
+        assert_eq!(hidden.len(), 1);
+        assert!(hidden.contains("events"));
     }
 
     #[test]

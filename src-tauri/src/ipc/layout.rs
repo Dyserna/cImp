@@ -7,10 +7,12 @@
 //! debounced disk save. Presets live in a separate `layout_presets`
 //! field; CRUD ops below upsert / rename / delete by name.
 //!
-//! No layout-tree validation happens here at runtime — the frontend's
-//! `validateAndRepairLayout` covers integrity for restored presets, and
-//! `persistence::integrity_check` covers the load-from-disk path. The
-//! commands below trust their inputs.
+//! `save_layout` trusts its input: the frontend just built that tree with the
+//! tree ops, and re-validating every splitter frame would buy nothing. The two
+//! places a tree arrives from somewhere the frontend did NOT just build it —
+//! the settings file at load, and a preset saved against a different tab list —
+//! both run `settings::layout`'s integrity walk: `persistence::integrity_check`
+//! for the first, [`restore_layout_preset`] for the second.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -20,15 +22,26 @@ use crate::error::{AppError, AppResult};
 use crate::ipc::AppState;
 use crate::settings::{LayoutNodePersisted, LayoutPersisted, LayoutPreset};
 
-/// Persist the full layout tree + focused-pane id. Called by the
-/// frontend on every layout mutation, debounced 250ms there to coalesce
-/// splitter drags. The backend's settings handle does its own 500ms
-/// debounce on the disk write, so a fast burst writes the file once.
+/// Persist the full layout tree + focused-pane id. Called by the frontend on
+/// EVERY layout-store mutation — no frontend debounce, deliberately (see
+/// `installLayoutPersistence`: the 250 ms one it used to have left a
+/// closing-race window where the last edit before teardown was dropped). A
+/// splitter drag therefore lands here once per pointer event.
+///
+/// Coalescing is the settings handle's 500 ms debounce on the disk write, so a
+/// fast burst writes the file once.
+///
+/// **Quiet write.** `mutate_quiet` instead of `mutate`: the in-memory store is
+/// updated and the save is requested, but no `settings-changed` is broadcast.
+/// Nothing consumes a layout change through that channel — see
+/// `SettingsHandle::mutate_quiet` for the audit — and broadcasting cloned the
+/// whole `Settings` struct to every webview per pointer event to deliver a
+/// value none of them read.
 #[tauri::command]
 pub async fn save_layout(state: State<'_, AppState>, layout: LayoutPersisted) -> AppResult<()> {
     // Atomic mutate so a concurrent tab create/close or settings_update can't
     // clobber the layout with a stale whole-struct snapshot (lost-update).
-    state.settings.mutate(move |snap| {
+    state.settings.mutate_quiet(move |snap| {
         snap.layout = Some(layout);
     });
     Ok(())
@@ -62,6 +75,51 @@ pub async fn save_layout_preset(
         }
     });
     Ok(())
+}
+
+/// Restore a preset: return its tree adapted to the live tab list, ready for
+/// the frontend to drop straight into the layout store.
+///
+/// A preset carries a tree and nothing else — no focus (restoring one is "set
+/// up panes this way"; focus follows the user's next click) and no promise that
+/// the tabs it names still exist. Adapting it is exactly the hydration problem:
+/// drop tabs deleted since the save, place tabs created since it as orphans,
+/// leave hidden tabs out, clamp ratios, collapse whatever that emptied. So it
+/// runs the same [`crate::settings::layout::repair`] the load path runs, which
+/// is the point of doing it here — V42 Phase B, the repair rules exist exactly
+/// once, and the frontend copy that used to run at this call site is gone.
+///
+/// Focus is seeded from the leftmost leaf before the repair, which then
+/// validates it like any other persisted focus.
+///
+/// **Reads, never writes.** The restored layout reaches settings through the
+/// frontend's ordinary save-on-change path, like any other layout mutation — a
+/// preset restore is not a special kind of write.
+#[tauri::command]
+pub async fn restore_layout_preset(
+    state: State<'_, AppState>,
+    name: String,
+) -> AppResult<LayoutPersisted> {
+    let snap = state.settings.current();
+    let Some(preset) = snap.layout_presets.iter().find(|p| p.name == name) else {
+        return Err(AppError::Settings(format!(
+            "restore_layout_preset: no preset named '{name}'"
+        )));
+    };
+    let mut layout = LayoutPersisted {
+        focused_pane_id: crate::settings::layout::leftmost_pane_id(&preset.tree),
+        tree: preset.tree.clone(),
+    };
+    let tab_ids: Vec<&str> = snap.tabs.iter().map(|t| t.id()).collect();
+    // The hidden set is a small per-project file read; off the async worker for
+    // the same reason `ui_state_get` is (see its note).
+    let cwd = state.launch.cwd.clone();
+    let hidden =
+        tauri::async_runtime::spawn_blocking(move || crate::ipc::ui_state::read_hidden_tabs(&cwd))
+            .await
+            .map_err(|e| AppError::Settings(format!("hidden-tab read task failed: {e}")))?;
+    crate::settings::layout::repair(&mut layout, &tab_ids, &hidden);
+    Ok(layout)
 }
 
 /// Delete a preset by name. No-op if the name doesn't exist (callers
@@ -184,6 +242,29 @@ fn epoch_to_ymdhms(secs: i64) -> (i32, u32, u32, u32, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// V42 Phase B. Structural because the thing worth defending is which
+    /// handle method this command calls, and there is no way to observe that
+    /// from a unit test without an `AppState`. Swapping it back to `mutate`
+    /// would restore a whole-`Settings` broadcast to every webview once per
+    /// pointer event during a splitter drag — see the doc comments on both
+    /// sides for why nothing is listening. Newline-agnostic: CI checks this
+    /// tree out with CRLF.
+    #[test]
+    fn save_layout_writes_quietly() {
+        let src = include_str!("layout.rs");
+        let start = src
+            .find("pub async fn save_layout(")
+            .expect("`save_layout` is gone — re-point this test");
+        let body = &src[start..];
+        let body = &body[..body.find("\n}").unwrap_or(body.len())];
+        assert!(
+            body.contains("mutate_quiet"),
+            "`save_layout` must use `mutate_quiet`: it runs once per pointer event during a \
+             splitter drag, and `mutate` clones and broadcasts the whole Settings struct to \
+             every window each time"
+        );
+    }
 
     #[test]
     fn epoch_zero_is_unix_epoch() {

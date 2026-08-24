@@ -373,3 +373,39 @@
   border-bottom: 1px solid var(--border-subtle);
   border-radius: var(--radius-md) var(--radius-md) 0 0;
 }
+/* Read-only saved-item lists — the Compose section's project templates and the
+   offload section's saved server / backend templates. Chrome rather than one
+   section's rule: two sections use them, and #129 (c) moves those sections into
+   children at different times, so the declaration has to live somewhere both
+   can see. Moved out of `SettingsApp.svelte` unchanged. */
+.settings-chrome .template-list {
+  list-style: none;
+  padding: 0;
+  margin: 0 0 var(--space-2);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.settings-chrome .template-list li {
+  display: flex;
+  gap: var(--space-2);
+  align-items: center;
+}
+.settings-chrome .template-list .template-name {
+  flex: 0 1 auto;
+  max-width: 40%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* Dimmed secondary line (e.g. a remote endpoint's base URL) that fills the
+   remaining row width and truncates before the trailing action button. */
+.settings-chrome .template-list .template-sub {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: var(--font-size-xs);
+  opacity: 0.6;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

@@ -130,6 +130,7 @@
   import ChecksSection from './lib/settings/sections/ChecksSection.svelte';
   import McpSection from './lib/settings/sections/McpSection.svelte';
   import PricingSection from './lib/settings/sections/PricingSection.svelte';
+  import ComposeSection from './lib/settings/sections/ComposeSection.svelte';
   import NumberField from './lib/settings/NumberField.svelte';
   import SelectField from './lib/settings/SelectField.svelte';
   import Toggle from './lib/settings/Toggle.svelte';
@@ -318,21 +319,11 @@
       composeTemplatesLoading = false;
     }
   }
-
-  function addGlobalTemplate(): void {
-    globalTemplates = [...globalTemplates, { name: `template-${globalTemplates.length + 1}`, body: '' }];
-    composeTemplatesDirty = true;
-  }
-  function renameGlobalTemplate(i: number, name: string): void {
-    globalTemplates = globalTemplates.map((t, idx) => (idx === i ? { ...t, name } : t));
-    composeTemplatesDirty = true;
-  }
-  function editGlobalTemplateBody(i: number, body: string): void {
-    globalTemplates = globalTemplates.map((t, idx) => (idx === i ? { ...t, body } : t));
-    composeTemplatesDirty = true;
-  }
-  function deleteGlobalTemplate(i: number): void {
-    globalTemplates = globalTemplates.filter((_, idx) => idx !== i);
+  /// The one place a compose edit marks the list dirty. `ComposeSection` owns
+  /// the four row transforms — pure functions of the current list — and hands
+  /// the result back here.
+  function setGlobalTemplates(next: PromptTemplate[]): void {
+    globalTemplates = next;
     composeTemplatesDirty = true;
   }
   async function saveGlobalTemplates(): Promise<void> {
@@ -4014,93 +4005,15 @@
           </small>
         </section>
       {:else if activeSection === 'compose'}
-        <section>
-          <h2>Compose</h2>
-          <small class="hint top">
-            Saved prompt templates, insertable from the compose overlay's
-            <code>/</code> picker (type <code>/</code> on an empty line, or
-            click the 📋 button beside the textarea). Variables:
-            <code>{'{selection}'}</code> (the focused pane's terminal
-            selection) and <code>{'{clipboard}'}</code> (the system
-            clipboard) are filled in immediately; any other
-            <code>{'{name}'}</code> becomes a tab-stop you Tab between and
-            overtype after inserting.
-          </small>
-
-          <h3>Global templates</h3>
-          <small class="hint">
-            Available from every project. Saved directly to the global
-            settings file, not this project's overlay.
-          </small>
-          {#if composeTemplatesLoading}
-            <small class="hint">Loading…</small>
-          {:else}
-            {#if globalTemplates.length === 0}
-              <small class="hint">No templates yet — add one below.</small>
-            {:else}
-              <ul class="template-list compose-template-list">
-                {#each globalTemplates as t, i (i)}
-                  <li class="compose-template-row">
-                    <input
-                      type="text"
-                      class="compose-template-name"
-                      placeholder="name"
-                      value={t.name}
-                      oninput={(e) =>
-                        renameGlobalTemplate(i, (e.currentTarget as HTMLInputElement).value)}
-                    />
-                    <textarea
-                      class="compose-template-body"
-                      placeholder={'Template body — use {selection}, {clipboard}, or {any-name} for tab-stops'}
-                      rows="2"
-                      value={t.body}
-                      oninput={(e) =>
-                        editGlobalTemplateBody(i, (e.currentTarget as HTMLTextAreaElement).value)}
-                    ></textarea>
-                    <button type="button" class="danger" onclick={() => deleteGlobalTemplate(i)}
-                      >Delete</button
-                    >
-                  </li>
-                {/each}
-              </ul>
-            {/if}
-            <div class="button-row">
-              <button type="button" onclick={addGlobalTemplate}>Add template</button>
-              <button
-                type="button"
-                disabled={!composeTemplatesDirty}
-                onclick={() => void saveGlobalTemplates()}
-                >Save</button
-              >
-              {#if composeTemplatesDirty}
-                <small class="hint">Unsaved changes</small>
-              {/if}
-            </div>
-            {#if composeTemplatesError}
-              <small class="error">{composeTemplatesError}</small>
-            {/if}
-          {/if}
-
-          <h3>Project templates</h3>
-          <small class="hint">
-            Read-only here — project-scope templates live in this project's
-            <code>.cimp/config.json</code> (a top-level
-            <code>prompt_templates</code> array), edited by hand or committed
-            for team sharing. A project template shadows a global one of the
-            same name.
-          </small>
-          {#if projectTemplates.length === 0}
-            <small class="hint">None for this project.</small>
-          {:else}
-            <ul class="template-list">
-              {#each projectTemplates as t (t.name)}
-                <li>
-                  <span class="template-name" title={t.body}>{t.name}</span>
-                </li>
-              {/each}
-            </ul>
-          {/if}
-        </section>
+        <ComposeSection
+          globals={globalTemplates}
+          projects={projectTemplates}
+          loading={composeTemplatesLoading}
+          dirty={composeTemplatesDirty}
+          error={composeTemplatesError}
+          onglobals={setGlobalTemplates}
+          onsave={() => void saveGlobalTemplates()}
+        />
       {:else if activeSection === 'offload'}
         <section>
           <h2>Local task offload</h2>
@@ -8111,58 +8024,6 @@
   .template-save input[type='text'] {
     flex: 1 1 10rem;
     min-width: 8rem;
-  }
-  .template-list {
-    list-style: none;
-    padding: 0;
-    margin: 0 0 var(--space-2);
-    display: flex;
-    flex-direction: column;
-    gap: var(--space-2);
-  }
-  .template-list li {
-    display: flex;
-    gap: var(--space-2);
-    align-items: center;
-  }
-  .template-list .template-name {
-    flex: 0 1 auto;
-    max-width: 40%;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  /* Dimmed secondary line (e.g. a remote endpoint's base URL) that fills the
-     remaining row width and truncates before the trailing action button. */
-  .template-list .template-sub {
-    flex: 1 1 auto;
-    min-width: 0;
-    font-size: var(--font-size-xs);
-    opacity: 0.6;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  /* V14 Phase A: Compose section's global-template editor rows — a name
-     field, a growable body textarea, and a delete button. Unlike the
-     read-only `.template-list` rows above, each entry here is directly
-     editable. */
-  .compose-template-list {
-    gap: var(--space-3);
-  }
-  .compose-template-row {
-    align-items: flex-start !important;
-  }
-  .compose-template-name {
-    flex: 0 0 10rem;
-  }
-  .compose-template-body {
-    flex: 1 1 auto;
-    min-width: 0;
-    font-family: inherit;
-    font-size: var(--font-size-sm, 13px);
-    resize: vertical;
-    padding: 6px 8px;
   }
   /* Two-column layout: fixed sidebar on the left, scrollable content on
      the right. The settings page lives inside #app, which app.css pins to

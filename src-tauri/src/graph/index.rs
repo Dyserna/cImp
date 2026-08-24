@@ -457,11 +457,7 @@ impl GraphIndex {
     /// migration) store from a fresh/empty one. The `file` relation's shape is
     /// stable across schema versions, so this is safe to read on a stale store.
     fn count_files(&self) -> AppResult<u64> {
-        let rows = self.run(
-            "?[count(path)] := *file{path}",
-            BTreeMap::new(),
-            ScriptMutability::Immutable,
-        )?;
+        let rows = self.query("?[count(path)] := *file{path}")?;
         Ok(rows
             .rows
             .first()
@@ -479,7 +475,7 @@ impl GraphIndex {
         let existing = self.existing_relations()?;
         for (name, _) in RELATIONS {
             if existing.contains(*name) {
-                self.run_mut(&format!("::remove {name}"), BTreeMap::new())?;
+                self.exec(&format!("::remove {name}"))?;
             }
         }
         // The lazily-created vector stores aren't in RELATIONS, so a bare reset
@@ -496,7 +492,7 @@ impl GraphIndex {
         let existing = self.existing_relations()?;
         for (name, create) in RELATIONS {
             if !existing.contains(*name) {
-                self.run_mut(create, BTreeMap::new())?;
+                self.exec(create)?;
             }
         }
         Ok(())
@@ -504,10 +500,7 @@ impl GraphIndex {
 
     fn ensure_schema_meta(&self) -> AppResult<()> {
         if !self.existing_relations()?.contains("schema_meta") {
-            self.run_mut(
-                "?[key, value] <- []\n:create schema_meta {key: String => value: Int}",
-                BTreeMap::new(),
-            )?;
+            self.exec("?[key, value] <- []\n:create schema_meta {key: String => value: Int}")?;
         }
         Ok(())
     }
@@ -537,7 +530,7 @@ impl GraphIndex {
     }
 
     fn existing_relations(&self) -> AppResult<HashSet<String>> {
-        let rows = self.run("::relations", BTreeMap::new(), ScriptMutability::Immutable)?;
+        let rows = self.query("::relations")?;
         // Fail loudly rather than silently reading column 0 if a future CozoDB
         // changes the `::relations` shape — guessing the wrong column would make
         // every schema-existence check misfire (re-create conflicts on startup,
@@ -898,7 +891,7 @@ impl GraphIndex {
         // symbols (new/default/fmt/…) consume the budget and then get stripped,
         // yielding far fewer than `max` (or zero). The candidate set (public AND
         // unreferenced) is naturally small, so an unbounded query is cheap.
-        let rows = self.run(
+        let rows = self.query(
             r#"call_dst[dst] := *edge{kind: k, src, dst}, k == "call"
 ?[id, name, kind, file, start_line, signature, visibility, end_line, is_test] :=
     *symbol{id, name, kind, file, start_line, signature, visibility, end_line, is_test},
@@ -906,8 +899,6 @@ impl GraphIndex {
     not *ref{name: name},
     not call_dst[name],
     not call_dst[id]"#,
-            BTreeMap::new(),
-            ScriptMutability::Immutable,
         )?;
         let mut syms = rows_to_symbols(&rows);
         syms.retain(|s| !is_entrypoint_name(&s.name));
@@ -925,11 +916,7 @@ impl GraphIndex {
     /// report cycles, which is honest rather than wrong.
     pub fn import_cycles(&self, max: usize) -> AppResult<Vec<Vec<String>>> {
         // file → lang tag, so the resolver can pick per-language rules.
-        let file_rows = self.run(
-            "?[path, lang] := *file{path, lang}",
-            BTreeMap::new(),
-            ScriptMutability::Immutable,
-        )?;
+        let file_rows = self.query("?[path, lang] := *file{path, lang}")?;
         let mut lang_of: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
         let mut known: HashSet<String> = HashSet::new();
@@ -940,11 +927,7 @@ impl GraphIndex {
         }
 
         // Every import edge (src file → raw module string).
-        let import_rows = self.run(
-            r#"?[src, dst] := *edge{kind: k, src, dst}, k == "import""#,
-            BTreeMap::new(),
-            ScriptMutability::Immutable,
-        )?;
+        let import_rows = self.query(r#"?[src, dst] := *edge{kind: k, src, dst}, k == "import""#)?;
 
         // Resolve each to a file→file adjacency (indices into `files`).
         let files: Vec<String> = known.iter().cloned().collect();
@@ -1026,11 +1009,7 @@ impl GraphIndex {
     /// whose every name-keyed resolution is `Ambiguous`. One aggregate scan,
     /// shared by the impact BFS and any other multi-hop confidence pass.
     pub fn multi_candidate_names(&self) -> AppResult<HashSet<String>> {
-        let rows = self.run(
-            "?[name, count(id)] := *symbol{id, name}",
-            BTreeMap::new(),
-            ScriptMutability::Immutable,
-        )?;
+        let rows = self.query("?[name, count(id)] := *symbol{id, name}")?;
         Ok(rows
             .rows
             .iter()
@@ -1098,11 +1077,7 @@ impl GraphIndex {
     /// (`GraphService::spawn_ignore_resync`), which must test each stored file
     /// against the new `graph.ignore` globs to drop the now-excluded ones.
     pub fn all_file_paths(&self) -> AppResult<Vec<String>> {
-        let rows = self.run(
-            "?[path] := *file{path}",
-            BTreeMap::new(),
-            ScriptMutability::Immutable,
-        )?;
+        let rows = self.query("?[path] := *file{path}")?;
         Ok(rows.rows.iter().map(|r| cell_str(r, 0)).collect())
     }
 
@@ -1117,10 +1092,8 @@ impl GraphIndex {
         // of same-named symbols in the target file (e.g. `A::new` + `B::new` in
         // one file both match `dst == "new"`), inflating that file's centrality.
         // The distinct projection collapses those duplicate matches to one row.
-        let rows = self.run(
+        let rows = self.query(
             r#"?[file, src, dst] := *edge{kind: k, src, dst}, k == "call", *symbol{name: dst, file}"#,
-            BTreeMap::new(),
-            ScriptMutability::Immutable,
         )?;
         let mut counts: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
         for r in &rows.rows {
@@ -1196,10 +1169,8 @@ reach[x] := reach[z], calls[x, z]"#
 
         // One scan of every name-level call edge: (caller name, callee name,
         // stored edge confidence).
-        let rows = self.run(
+        let rows = self.query(
             r#"?[caller, callee, conf] := *symbol{id: cid, name: caller}, *edge{kind: ek, src: cid, dst: callee, confidence: conf}, ek == "call""#,
-            BTreeMap::new(),
-            ScriptMutability::Immutable,
         )?;
         // Names defined by more than one symbol: any call edge targeting such a
         // name is `Ambiguous` regardless of its stored confidence (we can't tell
@@ -1347,10 +1318,8 @@ reach[x] := reach[z], calls[x, z]"#
         let want_contains = kinds.contains(&EdgeKind::Contains);
 
         // 1. Symbols → node metadata + name→ids map.
-        let sym_rows = self.run(
+        let sym_rows = self.query(
             "?[id, name, kind, file, start_line] := *symbol{id, name, kind, file, start_line}",
-            BTreeMap::new(),
-            ScriptMutability::Immutable,
         )?;
         let mut meta: HashMap<String, PathNode> = HashMap::new();
         let mut name_to_ids: HashMap<String, Vec<String>> = HashMap::new();
@@ -1377,11 +1346,7 @@ reach[x] := reach[z], calls[x, z]"#
         let multi = self.multi_candidate_names()?;
 
         // 2. Files → node metadata + lang table (for import resolution).
-        let file_rows = self.run(
-            "?[path, lang] := *file{path, lang}",
-            BTreeMap::new(),
-            ScriptMutability::Immutable,
-        )?;
+        let file_rows = self.query("?[path, lang] := *file{path, lang}")?;
         let mut file_lang: HashMap<String, String> = HashMap::new();
         let mut known_files: HashSet<String> = HashSet::new();
         for r in &file_rows.rows {
@@ -1421,10 +1386,8 @@ reach[x] := reach[z], calls[x, z]"#
             };
 
             if want_call {
-                let rows = self.run(
+                let rows = self.query(
                     r#"?[src, dst, conf] := *edge{kind: k, src, dst, confidence: conf}, k == "call""#,
-                    BTreeMap::new(),
-                    ScriptMutability::Immutable,
                 )?;
                 for r in &rows.rows {
                     let src = cell_str(r, 0);
@@ -1445,10 +1408,8 @@ reach[x] := reach[z], calls[x, z]"#
                 }
             }
             if want_contains {
-                let rows = self.run(
+                let rows = self.query(
                     r#"?[src, dst] := *edge{kind: k, src, dst}, k == "contains""#,
-                    BTreeMap::new(),
-                    ScriptMutability::Immutable,
                 )?;
                 for r in &rows.rows {
                     let (src, dst) = (cell_str(r, 0), cell_str(r, 1));
@@ -1468,10 +1429,8 @@ reach[x] := reach[z], calls[x, z]"#
                 }
             }
             if want_import {
-                let rows = self.run(
+                let rows = self.query(
                     r#"?[src, dst, conf] := *edge{kind: k, src, dst, confidence: conf}, k == "import""#,
-                    BTreeMap::new(),
-                    ScriptMutability::Immutable,
                 )?;
                 for r in &rows.rows {
                     let from_file = cell_str(r, 0);
@@ -1673,10 +1632,8 @@ reach[x] := reach[z], calls[x, z]"#
         max_rows: usize,
         max_snippet: usize,
     ) -> AppResult<Vec<DocHit>> {
-        let rows = self.run(
+        let rows = self.query(
             "?[source_path, anchor, text] := *doc_chunk{source_path, anchor, text}",
-            BTreeMap::new(),
-            ScriptMutability::Immutable,
         )?;
         let needle = query.to_lowercase();
         let mut hits = Vec::new();
@@ -1713,10 +1670,8 @@ reach[x] := reach[z], calls[x, z]"#
         if needles.is_empty() {
             return Ok(out);
         }
-        let rows = self.run(
+        let rows = self.query(
             "?[source_path, anchor, text] := *doc_chunk{source_path, anchor, text}",
-            BTreeMap::new(),
-            ScriptMutability::Immutable,
         )?;
         for r in &rows.rows {
             let source_path = cell_str(r, 0);
@@ -1733,7 +1688,7 @@ reach[x] := reach[z], calls[x, z]"#
     pub fn stats(&self) -> AppResult<GraphStats> {
         let count = |rel: &str| -> AppResult<u64> {
             let script = format!("?[count(x)] := *{rel}{{}}, x = 1");
-            let rows = self.run(&script, BTreeMap::new(), ScriptMutability::Immutable)?;
+            let rows = self.query(&script)?;
             Ok(rows
                 .rows
                 .first()
@@ -1753,11 +1708,7 @@ reach[x] := reach[z], calls[x, z]"#
     /// name so the order is stable across scans). Feeds the monitor tab's
     /// per-language table.
     fn files_by_lang(&self) -> AppResult<Vec<LangCount>> {
-        let rows = self.run(
-            "?[lang, count(path)] := *file{path, lang}",
-            BTreeMap::new(),
-            ScriptMutability::Immutable,
-        )?;
+        let rows = self.query("?[lang, count(path)] := *file{path, lang}")?;
         let mut out: Vec<LangCount> = rows
             .rows
             .iter()
@@ -1768,6 +1719,22 @@ reach[x] := reach[z], calls[x, z]"#
             .collect();
         out.sort_by(|a, b| b.files.cmp(&a.files).then_with(|| a.lang.cmp(&b.lang)));
         Ok(out)
+    }
+
+    /// A read-only script with **no parameters** — the shape most queries in
+    /// this store have (V42 R13). It is [`Self::run`] with the two arguments
+    /// that were always the same spelled once here instead of at 60-odd call
+    /// sites, where `BTreeMap::new(), ScriptMutability::Immutable` was two
+    /// lines of noise between the reader and the datalog.
+    fn query(&self, script: &str) -> AppResult<cozo::NamedRows> {
+        self.run(script, BTreeMap::new(), ScriptMutability::Immutable)
+    }
+
+    /// A mutating script with **no parameters** — DDL (`:create`, `::remove`,
+    /// `::rename`, `::index`) and the `:rm`s that bind nothing.
+    /// [`Self::query`]'s twin over [`Self::run_mut`].
+    fn exec(&self, script: &str) -> AppResult<cozo::NamedRows> {
+        self.run_mut(script, BTreeMap::new())
     }
 
     fn put(&self, script: &str, rows: Vec<DataValue>) -> AppResult<()> {
@@ -1849,7 +1816,7 @@ reach[x] := reach[z], calls[x, z]"#
         // Forward migration. Read every old-shape row, then build a
         // fully-populated new-shape stage, verify it captured every row, and
         // only THEN drop the original and promote the stage.
-        let rows = self.run(m.read_script, BTreeMap::new(), ScriptMutability::Immutable)?;
+        let rows = self.query(m.read_script)?;
         let expected = rows.rows.len();
         let migrated: Vec<DataValue> = rows
             .rows
@@ -1864,7 +1831,7 @@ reach[x] := reach[z], calls[x, z]"#
         // empty source has no rows to lose, so create the stage empty in that
         // case (avoids feeding `<- $rows` an empty list).
         if migrated.is_empty() {
-            self.run_mut(m.stage_ddl, BTreeMap::new())?;
+            self.exec(m.stage_ddl)?;
         } else {
             let mut p = BTreeMap::new();
             p.insert("rows".to_string(), DataValue::List(migrated));
@@ -1876,7 +1843,7 @@ reach[x] := reach[z], calls[x, z]"#
         // Verify the stage captured every old row before dropping the original.
         let staged = (m.count_stage)()?;
         if staged != expected {
-            self.run_mut(&format!("::remove {}", m.stage), BTreeMap::new())?;
+            self.exec(&format!("::remove {}", m.stage))?;
             return Err(AppError::Graph(format!(
                 "{} migration stage captured {staged} of {expected} rows; aborting",
                 m.live
@@ -1891,11 +1858,7 @@ reach[x] := reach[z], calls[x, z]"#
     /// idempotence probe, so both the V24 `usage_stat` and V32 `mem_note`
     /// migrations can detect "already migrated" and calling either is safe.
     fn relation_has_column(&self, rel: &str, col_name: &str) -> AppResult<bool> {
-        let rows = self.run(
-            &format!("::columns {rel}"),
-            BTreeMap::new(),
-            ScriptMutability::Immutable,
-        )?;
+        let rows = self.query(&format!("::columns {rel}"))?;
         let col = rows
             .headers
             .iter()
@@ -1918,6 +1881,13 @@ fn tx_run(
 ) -> AppResult<cozo::NamedRows> {
     tx.run_script(script, params)
         .map_err(|e| AppError::Graph(format!("query failed: {e}")))
+}
+
+/// Run one **parameterless** script inside a multi-transaction — the
+/// transaction-scoped twin of [`GraphIndex::exec`], and what every step of the
+/// eviction cascades is (V42 R13).
+fn tx_exec(tx: &MultiTransaction, script: &str) -> AppResult<cozo::NamedRows> {
+    tx_run(tx, script, BTreeMap::new())
 }
 
 /// `:put` a batch of rows (bound to `$rows`) inside a multi-transaction.

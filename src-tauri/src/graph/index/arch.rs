@@ -13,9 +13,7 @@
 //! is declared. `impl GraphIndex` continues here, exactly as
 //! [`super::notes`] does it.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
-
-use cozo::ScriptMutability;
+use std::collections::{HashMap, HashSet};
 
 use crate::error::AppResult;
 
@@ -38,10 +36,8 @@ impl GraphIndex {
         max_rows: usize,
     ) -> AppResult<ArchReport> {
         // Symbol tables.
-        let sym_rows = self.run(
+        let sym_rows = self.query(
             "?[id, name, kind, file, start_line] := *symbol{id, name, kind, file, start_line}",
-            BTreeMap::new(),
-            ScriptMutability::Immutable,
         )?;
         let mut sym_file: HashMap<String, String> = HashMap::new(); // id → file
         let mut name_files: HashMap<String, Vec<String>> = HashMap::new(); // name → files
@@ -74,11 +70,7 @@ impl GraphIndex {
         }
 
         // File langs (for import resolution).
-        let file_rows = self.run(
-            "?[path, lang] := *file{path, lang}",
-            BTreeMap::new(),
-            ScriptMutability::Immutable,
-        )?;
+        let file_rows = self.query("?[path, lang] := *file{path, lang}")?;
         let mut file_lang: HashMap<String, String> = HashMap::new();
         let mut known_files: HashSet<String> = HashSet::new();
         for r in &file_rows.rows {
@@ -119,11 +111,7 @@ impl GraphIndex {
 
         // Call edges → caller file ↔ each callee-name's file(s). Also inbound
         // call counts per callee name (feeds god nodes).
-        let call_rows = self.run(
-            r#"?[src, dst] := *edge{kind: k, src, dst}, k == "call""#,
-            BTreeMap::new(),
-            ScriptMutability::Immutable,
-        )?;
+        let call_rows = self.query(r#"?[src, dst] := *edge{kind: k, src, dst}, k == "call""#)?;
         let mut inbound_calls: HashMap<String, u64> = HashMap::new();
         for r in &call_rows.rows {
             let src = cell_str(r, 0);
@@ -140,11 +128,7 @@ impl GraphIndex {
         }
 
         // Import edges → file ↔ resolved-target file.
-        let import_rows = self.run(
-            r#"?[src, dst] := *edge{kind: k, src, dst}, k == "import""#,
-            BTreeMap::new(),
-            ScriptMutability::Immutable,
-        )?;
+        let import_rows = self.query(r#"?[src, dst] := *edge{kind: k, src, dst}, k == "import""#)?;
         for r in &import_rows.rows {
             let from_file = cell_str(r, 0);
             let module = cell_str(r, 1);

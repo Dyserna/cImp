@@ -46,7 +46,7 @@ use crate::graph::memory::{
     MAX_SESSIONS_PER_ROOT, SESSION_RETENTION_DAYS,
 };
 
-use super::{cell_bool, cell_i64, cell_str, int, notes, tx_put, tx_run, GraphIndex};
+use super::{cell_bool, cell_i64, cell_str, int, notes, tx_exec, tx_put, tx_run, GraphIndex};
 
 impl GraphIndex {
     /// Ensure the memory relations exist. Idempotent; called at every open.
@@ -116,7 +116,7 @@ impl GraphIndex {
         ];
         for (name, create) in defs {
             if !existing.contains(*name) {
-                self.run_mut(create, BTreeMap::new())?;
+                self.exec(create)?;
             }
         }
         // V14 Phase C: token/cost accounting ring (the X-ray backend). Additive,
@@ -126,7 +126,7 @@ impl GraphIndex {
         // the shared [`Self::usage_stat_create_ddl`] so this def and the V24
         // migration stage (`migrate_usage_stat_origin`) can never drift.
         if !existing.contains("usage_stat") {
-            self.run_mut(&Self::usage_stat_create_ddl("usage_stat"), BTreeMap::new())?;
+            self.exec(&Self::usage_stat_create_ddl("usage_stat"))?;
         }
         // V32 Phase C2: the quarantined-notes relation. Ensured by [`notes`],
         // which owns every statement that names it (#47) — same additive
@@ -276,11 +276,7 @@ impl GraphIndex {
     pub fn session_commit_hashes_all(
         &self,
     ) -> AppResult<std::collections::HashMap<String, Vec<String>>> {
-        let rows = self.run(
-            "?[session_id, hash] := *session_commit{session_id, hash}",
-            BTreeMap::new(),
-            ScriptMutability::Immutable,
-        )?;
+        let rows = self.query("?[session_id, hash] := *session_commit{session_id, hash}")?;
         let mut out: std::collections::HashMap<String, Vec<String>> =
             std::collections::HashMap::new();
         for r in &rows.rows {
@@ -309,10 +305,8 @@ impl GraphIndex {
                     ScriptMutability::Immutable,
                 )?
             }
-            None => self.run(
+            None => self.query(
                 "?[session_id, last_ms] := *session{session_id, last_ms}\n:order -last_ms\n:limit 1",
-                BTreeMap::new(),
-                ScriptMutability::Immutable,
             )?,
         };
         Ok(rows.rows.first().map(|r| cell_str(r, 0)))
@@ -363,18 +357,14 @@ impl GraphIndex {
     /// ever fired for this project (the read advisor is off, or never
     /// qualified a file).
     pub fn advisor_reread_rate(&self) -> AppResult<Option<(f64, u64)>> {
-        let reminds = self.run(
+        let reminds = self.query(
             "?[session_id, path, ts_ms] := *mem_event{session_id, kind, path, ts_ms}, kind == \"remind\"",
-            BTreeMap::new(),
-            ScriptMutability::Immutable,
         )?;
         if reminds.rows.is_empty() {
             return Ok(None);
         }
-        let reads = self.run(
+        let reads = self.query(
             "?[session_id, path, ts_ms] := *mem_event{session_id, kind, path, ts_ms}, kind == \"read\"",
-            BTreeMap::new(),
-            ScriptMutability::Immutable,
         )?;
         let mut reads_by_key: HashMap<(String, String), Vec<i64>> = HashMap::new();
         for r in &reads.rows {
@@ -422,18 +412,14 @@ impl GraphIndex {
         min_lines: u32,
         last_sessions: usize,
     ) -> AppResult<Option<(u64, u64)>> {
-        let reads = self.run(
+        let reads = self.query(
             "?[session_id, path, ts_ms] := *mem_event{session_id, kind, path, ts_ms}, kind == \"read\"",
-            BTreeMap::new(),
-            ScriptMutability::Immutable,
         )?;
         if reads.rows.is_empty() {
             return Ok(None);
         }
-        let edits = self.run(
+        let edits = self.query(
             "?[session_id, path, ts_ms] := *mem_event{session_id, kind, path, ts_ms}, kind == \"edit\"",
-            BTreeMap::new(),
-            ScriptMutability::Immutable,
         )?;
 
         // Window: the `last_sessions` sessions with the most recent read.
@@ -456,11 +442,7 @@ impl GraphIndex {
         }
 
         // Size proxy: max symbol `end_line` per file (same as `large_reread_pairs`).
-        let spans = self.run(
-            "?[file, l] := *symbol{file, end_line: l}",
-            BTreeMap::new(),
-            ScriptMutability::Immutable,
-        )?;
+        let spans = self.query("?[file, l] := *symbol{file, end_line: l}")?;
         let mut max_line: HashMap<String, i64> = HashMap::new();
         for r in &spans.rows {
             let file = cell_str(r, 0);
@@ -555,12 +537,10 @@ impl GraphIndex {
         if session_ids.is_empty() {
             return Ok((0, 0));
         }
-        let rows = self.run(
+        let rows = self.query(
             "?[session_id, in_tok, out_tok, cache_read, cache_make] := \
                 *usage_stat{session_id, kind, in_tok, out_tok, cache_read, cache_make}, \
                 kind != \"tool_result\"",
-            BTreeMap::new(),
-            ScriptMutability::Immutable,
         )?;
         let mut token_sum: HashMap<String, u64> = HashMap::new();
         for r in &rows.rows {
@@ -585,10 +565,8 @@ impl GraphIndex {
     /// retroactively — both under-count, which is the safe direction for a
     /// breakage detector.
     pub fn large_reread_pairs(&self, min_lines: u32) -> AppResult<u64> {
-        let reads = self.run(
+        let reads = self.query(
             "?[session_id, path, seq] := *mem_event{session_id, seq, kind, path}, kind == \"read\"",
-            BTreeMap::new(),
-            ScriptMutability::Immutable,
         )?;
         if reads.rows.is_empty() {
             return Ok(0);
@@ -599,11 +577,7 @@ impl GraphIndex {
                 .entry((cell_str(r, 0), cell_str(r, 1)))
                 .or_default() += 1;
         }
-        let spans = self.run(
-            "?[file, l] := *symbol{file, end_line: l}",
-            BTreeMap::new(),
-            ScriptMutability::Immutable,
-        )?;
+        let spans = self.query("?[file, l] := *symbol{file, end_line: l}")?;
         let mut max_line: HashMap<String, i64> = HashMap::new();
         for r in &spans.rows {
             let file = cell_str(r, 0);
@@ -705,17 +679,11 @@ impl GraphIndex {
 
     /// All known sessions with their event counts, newest activity first.
     pub fn mem_sessions(&self) -> AppResult<Vec<SessionInfo>> {
-        let srows = self.run(
+        let srows = self.query(
             "?[session_id, agent, started_ms, last_ms] := \
                 *session{session_id, agent, started_ms, last_ms}\n:order -last_ms",
-            BTreeMap::new(),
-            ScriptMutability::Immutable,
         )?;
-        let crows = self.run(
-            "?[session_id, count(seq)] := *mem_event{session_id, seq}",
-            BTreeMap::new(),
-            ScriptMutability::Immutable,
-        )?;
+        let crows = self.query("?[session_id, count(seq)] := *mem_event{session_id, seq}")?;
         let mut counts: HashMap<String, u32> = HashMap::new();
         for r in &crows.rows {
             counts.insert(cell_str(r, 0), cell_i64(r, 1) as u32);
@@ -761,12 +729,12 @@ impl GraphIndex {
                     tx_run(tx, "?[session_id] := *session{session_id: $sid, agent}, session_id = $sid\n:rm session {session_id}", p)?;
                 }
                 None => {
-                    tx_run(tx, "?[session_id, seq] := *mem_event{session_id, seq}\n:rm mem_event {session_id, seq}", BTreeMap::new())?;
-                    tx_run(tx, "?[session_id, seq] := *usage_stat{session_id, seq}\n:rm usage_stat {session_id, seq}", BTreeMap::new())?;
-                    tx_run(tx, "?[session_id, hash] := *session_commit{session_id, hash}\n:rm session_commit {session_id, hash}", BTreeMap::new())?;
-                    tx_run(tx, notes::RM_ALL, BTreeMap::new())?;
-                    tx_run(tx, "?[session_id] := *session_distilled{session_id}\n:rm session_distilled {session_id}", BTreeMap::new())?;
-                    tx_run(tx, "?[session_id] := *session{session_id}\n:rm session {session_id}", BTreeMap::new())?;
+                    tx_exec(tx, "?[session_id, seq] := *mem_event{session_id, seq}\n:rm mem_event {session_id, seq}")?;
+                    tx_exec(tx, "?[session_id, seq] := *usage_stat{session_id, seq}\n:rm usage_stat {session_id, seq}")?;
+                    tx_exec(tx, "?[session_id, hash] := *session_commit{session_id, hash}\n:rm session_commit {session_id, hash}")?;
+                    tx_exec(tx, notes::RM_ALL)?;
+                    tx_exec(tx, "?[session_id] := *session_distilled{session_id}\n:rm session_distilled {session_id}")?;
+                    tx_exec(tx, "?[session_id] := *session{session_id}\n:rm session {session_id}")?;
                 }
             }
             Ok(())
@@ -808,10 +776,9 @@ impl GraphIndex {
                 vec![row],
             )?;
 
-            let rows = tx_run(
+            let rows = tx_exec(
                 tx,
                 "?[fact_id, ts_ms, pinned] := *project_fact{fact_id, ts_ms, pinned, archived}, archived == false",
-                BTreeMap::new(),
             )?;
             let live: Vec<(String, i64, bool)> = rows
                 .rows
@@ -839,7 +806,7 @@ impl GraphIndex {
             "?[fact_id, text, source_session, ts_ms, pinned, archived] := \
                 *project_fact{fact_id, text, source_session, ts_ms, pinned, archived}, archived == false"
         };
-        let rows = self.run(script, BTreeMap::new(), ScriptMutability::Immutable)?;
+        let rows = self.query(script)?;
         let mut facts: Vec<ProjectFact> = rows
             .rows
             .iter()
@@ -964,10 +931,8 @@ impl GraphIndex {
         if idle.is_empty() {
             return Ok(idle);
         }
-        let d_rows = self.run(
+        let d_rows = self.query(
             "?[session_id, distilled] := *session_distilled{session_id, distilled}",
-            BTreeMap::new(),
-            ScriptMutability::Immutable,
         )?;
         let distilled: HashSet<String> = d_rows
             .rows
@@ -1147,10 +1112,9 @@ fn kind_weight(kind: &str) -> f64 {
 /// cascading each evicted session's events, usage rows (V14 Phase C), and
 /// **unpinned** notes; its pinned notes and their rows survive project-wide.
 pub(super) fn prune_sessions_in_tx(tx: &MultiTransaction) -> AppResult<()> {
-    let rows = tx_run(
+    let rows = tx_exec(
         tx,
         "?[session_id, last_ms] := *session{session_id, last_ms}\n:order -last_ms",
-        BTreeMap::new(),
     )?;
     let ids: Vec<String> = rows.rows.iter().map(|r| cell_str(r, 0)).collect();
     if ids.len() <= MAX_SESSIONS_PER_ROOT {

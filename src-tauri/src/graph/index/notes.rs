@@ -155,7 +155,7 @@ impl GraphIndex {
     /// shapes cannot drift.
     pub(super) fn ensure_mem_note_relation(&self, existing: &HashSet<String>) -> AppResult<()> {
         if !existing.contains("mem_note") {
-            self.run_mut(&Self::mem_note_create_ddl("mem_note"), BTreeMap::new())?;
+            self.exec(&Self::mem_note_create_ddl("mem_note"))?;
         }
         Ok(())
     }
@@ -269,12 +269,9 @@ impl GraphIndex {
     /// Idempotent on retry, exactly like [`Self::promote_usage_stat_stage`].
     fn promote_mem_note_stage(&self) -> AppResult<()> {
         if self.existing_relations()?.contains("mem_note") {
-            self.run_mut("::remove mem_note", BTreeMap::new())?;
+            self.exec("::remove mem_note")?;
         }
-        self.run_mut(
-            &format!("::rename {} -> mem_note", Self::MEM_NOTE_STAGE),
-            BTreeMap::new(),
-        )?;
+        self.exec(&format!("::rename {} -> mem_note", Self::MEM_NOTE_STAGE))?;
         Ok(())
     }
 
@@ -294,11 +291,7 @@ impl GraphIndex {
     /// [`tests::the_stage_literal_matches_the_constant`] is what keeps the two
     /// spellings from drifting.
     fn mem_note_stage_row_count(&self) -> AppResult<usize> {
-        let rows = self.run(
-            "?[note_id] := *mem_note_v32{note_id}",
-            BTreeMap::new(),
-            ScriptMutability::Immutable,
-        )?;
+        let rows = self.query("?[note_id] := *mem_note_v32{note_id}")?;
         Ok(rows.rows.len())
     }
 
@@ -530,12 +523,10 @@ impl GraphIndex {
     /// [`QuarantineReview`]'s docs for why bounding a count with this token would
     /// hand one to the model-facing caller and make the capability meaningless.
     pub fn mem_quarantined_notes(&self, _review: QuarantineReview) -> AppResult<Vec<MemNote>> {
-        let rows = self.run(
+        let rows = self.query(
             "?[note_id, session_id, text, ts_ms, pinned, quarantine] := \
                 *mem_note{note_id, session_id, text, ts_ms, pinned, tainted, quarantine}, \
                 tainted == true",
-            BTreeMap::new(),
-            ScriptMutability::Immutable,
         )?;
         let mut notes: Vec<MemNote> = rows
             .rows
@@ -604,11 +595,7 @@ impl GraphIndex {
     ///   argument bounding the sibling is about the *values*; a count is already
     ///   published to the model on purpose, and locked decision 22 wants it to be.
     pub fn mem_quarantined_count(&self) -> AppResult<usize> {
-        let rows = self.run(
-            "?[note_id] := *mem_note{note_id, tainted}, tainted == true",
-            BTreeMap::new(),
-            ScriptMutability::Immutable,
-        )?;
+        let rows = self.query("?[note_id] := *mem_note{note_id, tainted}, tainted == true")?;
         Ok(rows.rows.len())
     }
 }

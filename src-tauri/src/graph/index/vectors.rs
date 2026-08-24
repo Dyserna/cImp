@@ -94,16 +94,14 @@ impl GraphIndex {
                 self.drop_store(s)?;
                 reset = true;
             }
-            self.run_mut(
+            self.exec(
                 &format!("?[chunk_id, epoch, hash, vec] <- []\n:create {} {{chunk_id: String, epoch: String => hash: String, vec: <F32; {dim}>}}", s.vecs),
-                BTreeMap::new(),
             )?;
-            self.run_mut(
+            self.exec(
                 &format!(
                     "::hnsw create {}:vec_idx {{dim: {dim}, m: 16, dtype: F32, fields: [vec], distance: Cosine, ef_construction: 50}}",
                     s.vecs
                 ),
-                BTreeMap::new(),
             )?;
         }
 
@@ -137,8 +135,8 @@ impl GraphIndex {
     /// is absent (a partially-created store), leaving the relation removal to
     /// surface any real error.
     fn drop_store(&self, s: VecStore) -> AppResult<()> {
-        let _ = self.run_mut(&format!("::index drop {}:vec_idx", s.vecs), BTreeMap::new());
-        self.run_mut(&format!("::remove {}", s.vecs), BTreeMap::new())?;
+        let _ = self.exec(&format!("::index drop {}:vec_idx", s.vecs));
+        self.exec(&format!("::remove {}", s.vecs))?;
         Ok(())
     }
 
@@ -151,13 +149,11 @@ impl GraphIndex {
         }
         // Count first — a `:rm` returns a status row, not the deleted rows.
         let n = {
-            let rows = self.run(
+            let rows = self.query(
                 &format!(
                     "?[count(chunk_id)] := *{}{{chunk_id, epoch}}, not *{}{{id: chunk_id}}",
                     s.vecs, s.chunks
                 ),
-                BTreeMap::new(),
-                ScriptMutability::Immutable,
             )?;
             rows.rows
                 .first()
@@ -166,13 +162,12 @@ impl GraphIndex {
                 .unwrap_or(0) as u64
         };
         if n > 0 {
-            self.run_mut(
+            self.exec(
                 &format!(
                     "?[chunk_id, epoch] := *{}{{chunk_id, epoch}}, not *{}{{id: chunk_id}}\n\
                      :rm {} {{chunk_id, epoch}}",
                     s.vecs, s.chunks, s.vecs
                 ),
-                BTreeMap::new(),
             )?;
         }
         Ok(n)
@@ -181,9 +176,8 @@ impl GraphIndex {
     /// Ensure `s`'s `model`/`dim`/`epoch` singleton relation exists.
     fn ensure_meta(&self, s: VecStore) -> AppResult<()> {
         if !self.existing_relations()?.contains(s.meta) {
-            self.run_mut(
+            self.exec(
                 &format!("?[id, model, dim, epoch] <- []\n:create {} {{id: String => model: String, dim: Int, epoch: String}}", s.meta),
-                BTreeMap::new(),
             )?;
         }
         Ok(())
@@ -195,11 +189,7 @@ impl GraphIndex {
         if !self.existing_relations()?.contains(s.meta) {
             return Ok(None);
         }
-        let rows = self.run(
-            &format!("?[dim] := *{}{{dim}}", s.meta),
-            BTreeMap::new(),
-            ScriptMutability::Immutable,
-        )?;
+        let rows = self.query(&format!("?[dim] := *{}{{dim}}", s.meta))?;
         Ok(rows.rows.first().map(|r| cell_i64(r, 0) as usize))
     }
 
@@ -208,11 +198,7 @@ impl GraphIndex {
         if !self.existing_relations()?.contains(s.meta) {
             return Ok(None);
         }
-        let rows = self.run(
-            &format!("?[epoch] := *{}{{epoch}}", s.meta),
-            BTreeMap::new(),
-            ScriptMutability::Immutable,
-        )?;
+        let rows = self.query(&format!("?[epoch] := *{}{{epoch}}", s.meta))?;
         Ok(rows.rows.first().map(|r| cell_str(r, 0)))
     }
 
@@ -302,11 +288,7 @@ impl GraphIndex {
                 embedded.insert(cell_str(r, 0), cell_str(r, 1));
             }
         }
-        let rows = self.run(
-            "?[id, text] := *doc_chunk{id, text}",
-            BTreeMap::new(),
-            ScriptMutability::Immutable,
-        )?;
+        let rows = self.query("?[id, text] := *doc_chunk{id, text}")?;
         let mut out = Vec::new();
         for r in &rows.rows {
             let id = cell_str(r, 0);
@@ -375,11 +357,7 @@ impl GraphIndex {
     /// `(embedded_current_epoch, total_doc_chunks)` for the coverage readout.
     pub fn embedding_coverage(&self, epoch: &str) -> AppResult<(u64, u64)> {
         let total = {
-            let rows = self.run(
-                "?[count(id)] := *doc_chunk{id}",
-                BTreeMap::new(),
-                ScriptMutability::Immutable,
-            )?;
+            let rows = self.query("?[count(id)] := *doc_chunk{id}")?;
             rows.rows
                 .first()
                 .and_then(|r| r.first())
@@ -496,11 +474,7 @@ impl GraphIndex {
                 embedded.insert(cell_str(r, 0), cell_str(r, 1));
             }
         }
-        let rows = self.run(
-            "?[id, text] := *code_chunk{id, text}",
-            BTreeMap::new(),
-            ScriptMutability::Immutable,
-        )?;
+        let rows = self.query("?[id, text] := *code_chunk{id, text}")?;
         let mut out = Vec::new();
         for r in &rows.rows {
             let id = cell_str(r, 0);
@@ -578,11 +552,7 @@ impl GraphIndex {
     /// `(embedded_current_epoch, total_code_chunks)` for the coverage readout.
     pub fn code_embedding_coverage(&self, epoch: &str) -> AppResult<(u64, u64)> {
         let total = {
-            let rows = self.run(
-                "?[count(id)] := *code_chunk{id}",
-                BTreeMap::new(),
-                ScriptMutability::Immutable,
-            )?;
+            let rows = self.query("?[count(id)] := *code_chunk{id}")?;
             rows.rows
                 .first()
                 .and_then(|r| r.first())
@@ -666,11 +636,7 @@ impl GraphIndex {
         if !self.existing_relations()?.contains("digest") {
             return Ok(0);
         }
-        let rows = self.run(
-            "?[count(file)] := *digest{file, content_hash}",
-            BTreeMap::new(),
-            ScriptMutability::Immutable,
-        )?;
+        let rows = self.query("?[count(file)] := *digest{file, content_hash}")?;
         Ok(rows
             .rows
             .first()
@@ -686,10 +652,8 @@ impl GraphIndex {
             return Ok(0);
         }
         let n = {
-            let rows = self.run(
+            let rows = self.query(
                 "?[count(file)] := *digest{file, content_hash}, not *file{path: file}",
-                BTreeMap::new(),
-                ScriptMutability::Immutable,
             )?;
             rows.rows
                 .first()
@@ -698,10 +662,9 @@ impl GraphIndex {
                 .unwrap_or(0) as u64
         };
         if n > 0 {
-            self.run_mut(
+            self.exec(
                 "?[file, content_hash] := *digest{file, content_hash}, not *file{path: file}\n\
                  :rm digest {file, content_hash}",
-                BTreeMap::new(),
             )?;
         }
         Ok(n)

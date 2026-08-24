@@ -97,12 +97,9 @@ impl GraphIndex {
     /// which the next open re-promotes.
     fn promote_usage_stat_stage(&self) -> AppResult<()> {
         if self.existing_relations()?.contains("usage_stat") {
-            self.run_mut("::remove usage_stat", BTreeMap::new())?;
+            self.exec("::remove usage_stat")?;
         }
-        self.run_mut(
-            &format!("::rename {} -> usage_stat", Self::USAGE_STAT_STAGE),
-            BTreeMap::new(),
-        )?;
+        self.exec(&format!("::rename {} -> usage_stat", Self::USAGE_STAT_STAGE))?;
         Ok(())
     }
 
@@ -112,11 +109,7 @@ impl GraphIndex {
     /// distinct reasoning on [`Self::usage_session_totals`]). Only used for
     /// migration verification.
     fn usage_stat_row_count(&self, name: &str) -> AppResult<usize> {
-        let rows = self.run(
-            &format!("?[session_id, seq] := *{name}{{session_id, seq}}"),
-            BTreeMap::new(),
-            ScriptMutability::Immutable,
-        )?;
+        let rows = self.query(&format!("?[session_id, seq] := *{name}{{session_id, seq}}"))?;
         Ok(rows.rows.len())
     }
 

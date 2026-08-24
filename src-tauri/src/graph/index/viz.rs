@@ -15,9 +15,7 @@
 //! the parent, where `graph::service` already names them; the private rollup
 //! tuple alias came along, since only this module can spell it.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
-
-use cozo::ScriptMutability;
+use std::collections::{HashMap, HashSet};
 
 use crate::error::AppResult;
 
@@ -251,11 +249,7 @@ impl GraphIndex {
     fn viz_rollup(&self) -> AppResult<VizRollup> {
         // Symbol table — not nodes anymore, just the lookups that resolve a
         // call edge (symbol-id src, callee-NAME dst) to its file endpoints.
-        let sym_rows = self.run(
-            "?[id, name, file] := *symbol{id, name, file}",
-            BTreeMap::new(),
-            ScriptMutability::Immutable,
-        )?;
+        let sym_rows = self.query("?[id, name, file] := *symbol{id, name, file}")?;
         let mut sym_file: HashMap<String, String> = HashMap::new();
         let mut name_to_files: HashMap<String, Vec<String>> = HashMap::new();
         for r in &sym_rows.rows {
@@ -265,11 +259,7 @@ impl GraphIndex {
             name_to_files.entry(name).or_default().push(file.clone());
             sym_file.insert(id, file);
         }
-        let file_rows = self.run(
-            "?[path, lang] := *file{path, lang}",
-            BTreeMap::new(),
-            ScriptMutability::Immutable,
-        )?;
+        let file_rows = self.query("?[path, lang] := *file{path, lang}")?;
         let mut meta: HashMap<String, VizNode> = HashMap::new();
         let mut file_lang: HashMap<String, String> = HashMap::new();
         let mut known_files: HashSet<String> = HashSet::new();
@@ -337,10 +327,8 @@ impl GraphIndex {
         };
 
         // Call edges (name-resolved), rolled up to file→file.
-        let call_rows = self.run(
+        let call_rows = self.query(
             r#"?[src, dst, conf] := *edge{kind: k, src, dst, confidence: conf}, k == "call""#,
-            BTreeMap::new(),
-            ScriptMutability::Immutable,
         )?;
         for r in &call_rows.rows {
             let src = cell_str(r, 0);
@@ -373,10 +361,8 @@ impl GraphIndex {
             }
         }
         // Import edges (resolved file→file).
-        let import_rows = self.run(
+        let import_rows = self.query(
             r#"?[src, dst, conf] := *edge{kind: k, src, dst, confidence: conf}, k == "import""#,
-            BTreeMap::new(),
-            ScriptMutability::Immutable,
         )?;
         for r in &import_rows.rows {
             let from_file = cell_str(r, 0);

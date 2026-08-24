@@ -524,6 +524,16 @@ pub struct AgentConfig {
 }
 
 /// The task to run.
+///
+/// V42 R21 (#126): built ONCE, at the entry of
+/// [`OffloadService::run`](crate::offload::service::OffloadService::run), and
+/// passed down the retry ladder as one value.
+/// It used to be assembled at the BOTTOM of that chain, which is why every
+/// frame in between carried its five fields as five positional parameters. The
+/// derive is what lets the ladder hand each attempt its own copy — the same
+/// clones the old call sites made by hand, in one place — and the On→Auto
+/// retry spell its one difference as `OffloadTask { thinking: …, ..task }`.
+#[derive(Clone)]
 pub struct OffloadTask {
     pub instructions: String,
     pub context: Option<String>,

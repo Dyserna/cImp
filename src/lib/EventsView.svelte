@@ -26,7 +26,6 @@
     filterEntries,
     matchesTabFilter,
     mergeEntries,
-    rowStatus,
     tabFilterValue,
     FILTER_ANY,
     NO_FILTER,
@@ -538,9 +537,9 @@
   }
 
   // `ok` alone does not mean "the call worked" in this store, so the status
-  // column untangles the overlapping conventions instead of painting a bare
-  // pass/fail. The rule itself now lives in `activity.ts::rowStatus` and is
-  // rendered by `StatusChip`, shared with the Tool Activity feed.
+  // chip renders `r.status` — the row's own untangled word — instead of a bare
+  // pass/fail. Same chip in both feeds: the security vocabulary of this app must
+  // not differ between two tabs rendering the same rows.
   //
   // **What moved and why** (#48, M-24). The local version here was
   // `e.ok ? 'flagged' : 'denied'` for every `injection_flag` row, so five
@@ -552,9 +551,10 @@
   // `!ok` as "denied" for `updater` rows, whose `ok` is a bundle outcome — so a
   // rejected rules bundle reported as a blocked tool call.
   //
-  // Kept in a `.ts` file because `.svelte` has no test harness here, and shared
-  // with the other feed because the security vocabulary of this app must not
-  // differ between two tabs rendering the same rows.
+  // It became one classifier in `activity.ts`, then (V42) a computed column on
+  // the row itself: every branch of it was restating a backend rule, and a
+  // restatement of `Screen::is_denial` is exactly what cannot be checked against
+  // `Screen::is_denial`. See the header of `activity.ts` for the split.
 
   function rowTool(e: ActivityEntry): string {
     // mcp tools are namespaced `<server>__<tool>` — render the first `__` as
@@ -803,7 +803,7 @@
                 >{/if}
               {#if visible.tool}<span class="etool" title={r.tool}>{rowTool(r)}</span>{/if}
               {#if visible.target}<span class="etarget" title={r.target}>{r.target}</span>{/if}
-              {#if visible.status}<StatusChip status={rowStatus(r)} />{/if}
+              {#if visible.status}<StatusChip status={r.status} />{/if}
               {#if visible.tab}<span class="eattr attr-{attrState(r.tab)}" title={attrTitle(r.tab)}
                   >{attrLabel(r.tab)}</span
                 >{/if}
@@ -964,7 +964,7 @@
         <div class="detail-title">
           <span class="ekind {detail.kind}">{detail.kind}</span>
           <span class="detail-tool">{detail.tool}</span>
-          <StatusChip status={rowStatus(detail)} />
+          <StatusChip status={detail.status} />
         </div>
         <button type="button" class="detail-close icon" onclick={closeDetail} aria-label="Close"
           >×</button

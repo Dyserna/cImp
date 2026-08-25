@@ -172,7 +172,9 @@ pub async fn run(port: u16, auth: Option<String>, ctx: OobContext) {
                     // (#142). Reversed the moment a connect succeeds.
                     crate::harness::reader::note_reader_source_unreachable(&ctx.tab);
                 }
-                if never && (failures == NEVER_UP || (failures > NEVER_UP && failures % REPEAT == 0))
+                if never
+                    && (failures == NEVER_UP
+                        || (failures > NEVER_UP && failures.is_multiple_of(REPEAT)))
                 {
                     warn!(
                         tab = ?ctx.tab,

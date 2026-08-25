@@ -572,6 +572,16 @@
       }
     } catch (e) {
       console.warn('graph_session_usage (cost card) failed', e);
+      // Un-stamp the snapshot, or this card never fetches again (V42 Phase-F
+      // review, F-10). The key is written BEFORE the await as an in-flight
+      // guard; leaving it set after a failure says "this snapshot is being
+      // fetched" about a fetch that is over. The effect below only retries on
+      // a key CHANGE, and an idle session's key never changes — so a single
+      // failed fetch left the Cost/Dashboard card on its placeholder until the
+      // user took another turn. Clearing it retries on the next poll tick,
+      // which is the same "a dropped tick is never a permanently stale card"
+      // rule the selected-session path follows.
+      liveFetchKey = '';
     }
   }
 

@@ -101,42 +101,43 @@ const IMPORTED_CARDS = [
 /// The `<view>.<key>` pref names that persist per project.
 ///
 /// The pref family is the one that is *split*: everything else under
-/// `cimp.view-pref.v1.` is deliberately ephemeral (`diff.expanded`,
-/// `diff.full-view`, `worktrees.expanded-diff`, `worktrees.full-diff`,
-/// `session-commits.expanded`, `git-graph.selected`, `timeline.open-diff`,
-/// `code-audit.text`, `code-quality.text`). Those are per-keystroke or
-/// unbounded-growth values whose staleness is by design; they stay in
-/// `localStorage` and never reach the backend.
+/// `cimp.view-pref.v1.` is deliberately ephemeral — per-keystroke or
+/// unbounded-growth values whose staleness is by design, which stay in
+/// `localStorage` and never reach the backend. They are enumerated, with a
+/// reason each, in `tests/durableViewPrefs.test.ts`; naming them here as well
+/// would be a second list to keep, and the one over there is the one that is
+/// checked.
 ///
 /// `code-audit.*` / `code-quality.*` keep their legacy namespaces verbatim —
 /// they are the `view` prop `CodeAuditView` passes to the two `AuditPanel`
 /// instances, and renaming them would silently drop users' saved filters.
 ///
-/// ## The allowlist is hand-kept, and nothing checks it (accepted)
+/// ## The allowlist is hand-kept, and a guard checks it
 ///
-/// V42 review, DEFERRED with this note. Two consequences, both real:
+/// Two consequences were recorded here as accepted. The first is now closed.
 ///
-///   1. **Adding a durable pref means editing this set.** A `saveViewString`
-///      call with a name that is not here routes to `localStorage` and stays
-///      per-machine. It fails quietly — the value persists, just in the wrong
-///      place and the wrong scope — so nothing goes red and no user sees an
-///      error. The only signal is a reviewer noticing.
+///   1. **A durable pref that is not in this set fails quietly.** A
+///      `saveViewString` call with a name that is not here routes to
+///      `localStorage` and stays per-machine: the value persists, just in the
+///      wrong store and the wrong scope, so nothing goes red. CLOSED by
+///      `tests/durableViewPrefs.test.ts` (V42 Phase-F review, F-6), the
+///      build-time name-join DEF-2 asked for: it scans every view for the
+///      pref names they actually read and write, and fails until each one is
+///      in this set or on that file's ephemeral roster. It joins the other
+///      way too — a name in here that no view uses is an orphan, and
+///      [`IMPORTED_KEYS`] would carry it into the one-time import forever.
+///      What it cannot check is INTENT; what it does is make the choice
+///      explicit at the moment the pref is added.
 ///   2. **A pref promoted AFTER a project's marker is set never gets
 ///      imported.** [`IMPORT_MARKER_KEY`] records "this project has been
 ///      through the import", not "these keys have been". A key added to this
 ///      set in a later release therefore starts empty on every project that
 ///      already ran the import, and whatever the user had set for it stays
-///      stranded in `localStorage`.
-///
-/// Both are accepted rather than fixed. The set has been stable since the
-/// move, promotions are a deliberate, reviewed act (the whole point of the
-/// durable/ephemeral split is that most of this family is *supposed* to be
-/// throwaway), and the cost of the alternative — a per-key marker set, or a
-/// re-import pass keyed on which names are new — is real machinery guarding a
-/// once-a-year event whose failure mode is one view toggle reverting to its
-/// default. The mechanism that would close (1) properly is the same
-/// build-time name-join the `cssTokens` guard does for CSS tokens, and that
-/// idea rides with the codegen work in #131 rather than being invented here.
+///      stranded in `localStorage`. Still accepted: promotions are a
+///      deliberate, reviewed act, and the alternative — a per-key marker set,
+///      or a re-import pass keyed on which names are new — is real machinery
+///      guarding a once-a-year event whose failure mode is one view toggle
+///      reverting to its default.
 ///
 /// If a key IS promoted later and its value matters, the honest fix at that
 /// point is a one-off migration that reads it from `localStorage` — not a

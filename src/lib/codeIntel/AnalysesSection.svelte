@@ -19,10 +19,17 @@
   ///
   /// Styles: `.card` / `.rows` / `.arow` / `.aname` / `.akind` / `.aloc` /
   /// `.muted` / `.caveat` / `.placeholder` / `.error` / `.badge` / `.actions` /
-  /// `.conf` all come from `codeIntel.css`, keyed on the parent's
-  /// `.graph-monitor` root. Only the rules no other section can reach —
-  /// `.analyses .actions`, `.arow.cycle`, `.arow.dep` and the three
-  /// `.conf.<confidence>` fills — travelled here.
+  /// `.conf` — INCLUDING the three `.conf.<confidence>` fills — all come from
+  /// `codeIntel.css`, keyed on the parent's `.graph-monitor` root. Only the
+  /// rules no other section can reach — `.analyses .actions`, `.arow.cycle`,
+  /// `.arow.dep` — travelled here.
+  ///
+  /// The fills were listed as section-exclusive and moved here with the rest.
+  /// They are not: `TracePathSection` renders the same badge on every path
+  /// edge, and Svelte scoping keeps a component's rules off another
+  /// component's markup, so those badges rendered with the shared `.conf`
+  /// SHAPE and no fill at all. Anything more than one section renders belongs
+  /// in the sheet (V42 Phase-F review, F-2).
   import {
     graphCycles,
     graphDeadExports,
@@ -239,19 +246,6 @@
   }
   .arow.dep {
     grid-template-columns: 1fr 6rem 2fr auto;
-  }
-  .conf.extracted {
-    background: rgba(255, 255, 255, 0.08);
-    color: var(--text-primary, #ddd);
-    opacity: 0.75;
-  }
-  .conf.inferred {
-    background: var(--surface-warning, rgba(178, 106, 0, 0.28));
-    color: var(--text-warning, #f0c674);
-  }
-  .conf.ambiguous {
-    background: var(--surface-danger, rgba(179, 38, 30, 0.28));
-    color: var(--text-danger-soft, #ffb4ab);
   }
   .arow.dep {
     grid-template-columns: 1fr 6rem 2fr auto auto;

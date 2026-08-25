@@ -117,6 +117,67 @@ pub(crate) fn source_files() -> &'static [(String, String)] {
 static RS_SOURCE_FILES: std::sync::LazyLock<Vec<(String, String)>> =
     std::sync::LazyLock::new(|| source_files_ext(&["rs"]));
 
+/// The files that exist only in a TEST build, derived from `main.rs`.
+///
+/// `main.rs` declares two of its modules under `#[cfg(test)]`
+/// (`rustsrc` itself, and `testutil`). Their contents are not in the shipped
+/// binary at all — but they ARE `.rs` files under `src/` with no inner
+/// `#[cfg(test)]` marker, so a scanner that defines "production code" as
+/// "everything before the first `#[cfg(test)]` item" reads the whole of each
+/// one as production. That is a false positive with teeth: the spawn-gate and
+/// spawn-ledger tripwires would demand a security ledger row for a test
+/// fixture's `git`, and the pressure that puts on the next author is to weaken
+/// a scanner rather than to be honest.
+///
+/// Parsed from the declaration rather than hand-kept, so a module that stops
+/// being test-only stops being exempt on the same commit. A `mod x;` matches
+/// `x.rs` and everything under `x/`.
+///
+/// Vacuity is guarded from both ends: the set must be non-empty (main.rs has
+/// always had at least one such module, and a parser that silently found none
+/// would exempt nothing while looking like it worked) and every name in it
+/// must match at least one walked file.
+pub(crate) fn test_only_files() -> std::collections::BTreeSet<String> {
+    let main = std::fs::read_to_string(src_root().join("main.rs"))
+        .expect("main.rs is readable — the module declarations are the source of this answer");
+    let main = main.replace('\r', "");
+    let mut mods: Vec<String> = Vec::new();
+    let mut armed = false;
+    for line in main.lines() {
+        let line = line.trim();
+        if line == "#[cfg(test)]" {
+            armed = true;
+            continue;
+        }
+        if armed {
+            if let Some(name) = line.strip_prefix("mod ").and_then(|r| r.strip_suffix(';')) {
+                mods.push(name.to_string());
+            }
+            armed = false;
+        }
+    }
+    assert!(
+        !mods.is_empty(),
+        "no `#[cfg(test)] mod` found in main.rs — the parser has drifted from the file, and a \
+         scanner exemption that silently covers nothing is worse than no exemption"
+    );
+    let files = source_files();
+    let mut out = std::collections::BTreeSet::new();
+    for m in mods {
+        let own = format!("{m}.rs");
+        let dir = format!("{m}/");
+        let mut hit = false;
+        for (rel, _) in files {
+            if rel == &own || rel.starts_with(&dir) {
+                out.insert(rel.clone());
+                hit = true;
+            }
+        }
+        assert!(hit, "`#[cfg(test)] mod {m};` matches no file under src/");
+    }
+    out
+}
+
 /// [`source_files`] over a caller-chosen extension set.
 ///
 /// `settings`' pointer scan reads `.css` alongside `.rs` — a settings-path
@@ -714,6 +775,34 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **The test-only exemption is derived, and it is narrow.**
+    ///
+    /// Two scanners (`spawn_gate`, `spawn_ledger`) skip these files, so the
+    /// failure that matters is the set growing: an exemption that covers the
+    /// tree silences the tripwire it is attached to. Pinned from both ends —
+    /// it names the modules `main.rs` actually declares under `#[cfg(test)]`,
+    /// and it stays a rounding error against the walk.
+    #[test]
+    fn the_test_only_set_is_the_cfg_test_modules_and_nothing_else() {
+        let set = test_only_files();
+        assert!(
+            set.contains("testutil.rs") && set.contains("rustsrc.rs"),
+            "the two `#[cfg(test)] mod` declarations in main.rs are missing: {set:?}"
+        );
+        for shipped in ["main.rs", "spawn_gate.rs", "spawn_ledger.rs", "sandbox/confine.rs"] {
+            assert!(
+                !set.contains(shipped),
+                "{shipped} ships in the binary and must stay policed"
+            );
+        }
+        assert!(
+            set.len() * 10 < source_files().len(),
+            "the exemption covers {} of {} files — that is not an exemption any more",
+            set.len(),
+            source_files().len()
+        );
     }
 
     /// …and the same walk over the REAL tree is substantive and normalised.

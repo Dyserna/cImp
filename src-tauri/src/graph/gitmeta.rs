@@ -272,8 +272,8 @@ fn is_git_repo(root: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use crate::testutil::git;
     use super::*;
-    use std::process::Command as StdCommand;
 
     // ── pure parser tests (no git needed) ─────────────────────────────────
 
@@ -378,19 +378,6 @@ mod tests {
     }
 
     // ── real-git integration (collect / collect_for / non-repo degrade) ───
-
-    fn git(dir: &Path, args: &[&str]) {
-        let out = StdCommand::new("git")
-            .args(args)
-            .current_dir(dir)
-            .output()
-            .expect("git");
-        assert!(
-            out.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
 
     #[test]
     fn collect_not_a_repo_returns_empty_not_an_error() {

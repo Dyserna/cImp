@@ -454,9 +454,14 @@ mod tests {
     /// Files that construct a process in production code — the only files a
     /// spawn call can live in.
     fn spawning_files(files: &[(String, String)]) -> BTreeMap<String, String> {
+        // Modules `main.rs` declares under `#[cfg(test)]` are not in the
+        // shipped binary, and have no inner `#[cfg(test)]` marker for
+        // `production_hits` to cut at — see `rustsrc::test_only_files`.
+        let test_only = crate::rustsrc::test_only_files();
         files
             .iter()
             .filter(|(rel, _)| rel != "spawn_gate.rs")
+            .filter(|(rel, _)| !test_only.contains(rel))
             .filter(|(rel, src)| !production_hits(rel, src, CTOR_NEEDLES).1.is_empty())
             .map(|(rel, src)| (rel.clone(), src.clone()))
             .collect()

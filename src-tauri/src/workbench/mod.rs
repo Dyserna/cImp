@@ -1385,24 +1385,8 @@ pub async fn revert_hunk(
 
 #[cfg(test)]
 mod tests {
+    use crate::testutil::{git, has_git};
     use super::*;
-
-    fn has_git() -> bool {
-        crate::pty::resolve_command("git").is_ok()
-    }
-
-    fn git(dir: &Path, args: &[&str]) {
-        let out = std::process::Command::new("git")
-            .args(args)
-            .current_dir(dir)
-            .output()
-            .expect("git");
-        assert!(
-            out.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
 
     // ---- V33 per-`(root, tab)` checkpoint throttle -------------------------
     //

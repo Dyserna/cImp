@@ -40,6 +40,10 @@ mod state;
 mod stt;
 mod sysmon;
 mod tabs;
+/// Test-only: the scratch directory and the real-git driver this crate’s
+/// suites share (V42 Phase-F review, F-8).
+#[cfg(test)]
+mod testutil;
 mod theming;
 mod tts;
 /// R16 (V42): the startup wiring `main`'s `setup` hook used to hold inline.

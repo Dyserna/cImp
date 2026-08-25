@@ -1516,6 +1516,7 @@ pub(crate) async fn sync_reserved_feature_tab(
 
 #[cfg(test)]
 mod tests {
+    use crate::testutil::ScratchDir;
     use super::*;
     use crate::service::sink::testing::{NoWebviews, RecordingEventSink};
     use crate::state::TabMeta;
@@ -1539,36 +1540,11 @@ mod tests {
         _scratch: ScratchDir,
     }
 
-    /// A throwaway directory to point [`SettingsHandle`] at, so the debounced
-    /// saver writes its `.cimp/config.json` somewhere disposable instead of
-    /// into the real temp root (these tests DO mutate settings, unlike the
-    /// existing `SettingsHandle` fixtures, which never trigger a save).
-    ///
-    /// Hand-rolled rather than a `tempfile` dev-dependency: one `Drop` is
-    /// cheaper than a new crate in the lock file. Removal is best-effort — the
-    /// saver task lives on Tauri's runtime and may land its write after the
-    /// test's own runtime is gone.
-    struct ScratchDir(PathBuf);
-
-    impl ScratchDir {
-        fn new() -> Self {
-            let path = std::env::temp_dir().join(format!("cimp-tabsvc-{}", Uuid::new_v4()));
-            std::fs::create_dir_all(&path).expect("scratch dir");
-            Self(path)
-        }
-    }
-
-    impl Drop for ScratchDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
     impl Fixture {
         /// One seed tab, marked builtin in settings so the "builtins are not
         /// closable" rule has something to refuse.
         fn new() -> Self {
-            let scratch = ScratchDir::new();
+            let scratch = ScratchDir::new("tabsvc");
             let mut defaults = Settings::default();
             let seed_id = TabId::Shell("shell-seed".to_string());
             defaults.tabs = vec![TabConfig::Shell(ShellTabSettings {

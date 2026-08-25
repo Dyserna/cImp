@@ -363,28 +363,8 @@ pub async fn git_graph(root: &Path, limit: usize) -> AppResult<GitGraph> {
 
 #[cfg(test)]
 mod tests {
+    use crate::testutil::{git, has_git};
     use super::*;
-
-    fn has_git() -> bool {
-        crate::pty::resolve_command("git").is_ok()
-    }
-
-    fn git(dir: &Path, args: &[&str]) {
-        let out = std::process::Command::new("git")
-            .args(args)
-            .current_dir(dir)
-            .env("GIT_AUTHOR_NAME", "t")
-            .env("GIT_AUTHOR_EMAIL", "t@example.com")
-            .env("GIT_COMMITTER_NAME", "t")
-            .env("GIT_COMMITTER_EMAIL", "t@example.com")
-            .output()
-            .expect("git spawns");
-        assert!(
-            out.status.success(),
-            "git {args:?}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
 
     fn setup_repo(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("cimp-history-{tag}-{}", std::process::id()));

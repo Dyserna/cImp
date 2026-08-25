@@ -199,29 +199,10 @@ pub fn validate_pattern(pattern: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    use crate::testutil::ScratchDir;
     use super::*;
     use crate::checks::{CheckDef, ParserKind};
     use crate::settings::Settings;
-    use std::path::PathBuf;
-    use uuid::Uuid;
-
-    /// A throwaway directory to point [`SettingsHandle`] at, so the debounced
-    /// saver writes its `.cimp/config.json` somewhere disposable.
-    struct ScratchDir(PathBuf);
-
-    impl ScratchDir {
-        fn new() -> Self {
-            let path = std::env::temp_dir().join(format!("cimp-chksvc-{}", Uuid::new_v4()));
-            std::fs::create_dir_all(&path).expect("scratch dir");
-            Self(path)
-        }
-    }
-
-    impl Drop for ScratchDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
 
     struct Fixture {
         settings: SettingsHandle,
@@ -230,7 +211,7 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
-            let scratch = ScratchDir::new();
+            let scratch = ScratchDir::new("chksvc");
             let defaults = Settings::default();
             let settings = SettingsHandle::new(defaults.clone(), defaults, scratch.0.clone());
             Self { settings, scratch }

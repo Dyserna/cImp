@@ -267,7 +267,7 @@ fn literal_offenders(files: &[(String, String)]) -> BTreeMap<String, BTreeSet<St
 
 #[test]
 fn no_harness_literals_outside_harness() {
-    let offenders = literal_offenders(&source_files());
+    let offenders = literal_offenders(source_files());
     assert!(
         offenders.is_empty(),
         "harness-owned literals outside `harness/` — move the code that reads them into \
@@ -298,7 +298,7 @@ fn the_literal_scan_reads_the_same_code_on_every_platform() {
         .map(|(p, t)| (p.clone(), t.replace('\n', "\r\n")))
         .collect();
     assert_eq!(
-        literal_offenders(&lf),
+        literal_offenders(lf),
         literal_offenders(&crlf),
         "the literal scan sees different code in a CRLF checkout than in an LF one — the \
          `#[cfg(test)]` boundary is line-ending-sensitive again, and the test now reports on how \
@@ -360,7 +360,10 @@ fn the_literal_scan_reads_the_same_code_on_every_platform() {
 #[test]
 fn every_literal_allowlist_entry_is_still_earning_it() {
     let needles = harness_literals();
-    let files: BTreeMap<String, String> = source_files().into_iter().collect();
+    let files: BTreeMap<&str, &str> = source_files()
+        .iter()
+        .map(|(p, t)| (p.as_str(), t.as_str()))
+        .collect();
     let mut stale = Vec::new();
     for (path, _reason) in LITERAL_ALLOWLIST {
         let Some(text) = files.get(*path) else {
@@ -921,7 +924,7 @@ fn harness_modules_do_not_import_capabilities() {
         if !path.starts_with("harness/") || path == "harness/layering.rs" {
             continue;
         }
-        let body = executable_text(&path, &text);
+        let body = executable_text(path, text);
         let found: BTreeSet<String> = CAPABILITY_MODULES
             .iter()
             .filter(|m| body.contains(**m))
@@ -931,9 +934,9 @@ fn harness_modules_do_not_import_capabilities() {
             continue;
         }
         if exempt.contains_key(path.as_str()) {
-            still_needed.insert(path);
+            still_needed.insert(path.clone());
         } else {
-            violations.insert(path, found);
+            violations.insert(path.clone(), found);
         }
     }
 
@@ -1128,7 +1131,7 @@ fn identity_offenders(files: &[(String, String)]) -> BTreeMap<String, BTreeSet<S
 /// ids exist for persisted wire forms, and those are what the allowlist is for.
 #[test]
 fn no_harness_identity_outside_registry() {
-    let offenders = identity_offenders(&source_files());
+    let offenders = identity_offenders(source_files());
     assert!(
         offenders.is_empty(),
         "harness identity outside `harness/` — resolve it through \
@@ -1145,7 +1148,10 @@ fn no_harness_identity_outside_registry() {
 /// [`every_literal_allowlist_entry_is_still_earning_it`] was written for.
 #[test]
 fn every_identity_allowlist_entry_is_still_earning_it() {
-    let files: BTreeMap<String, String> = source_files().into_iter().collect();
+    let files: BTreeMap<&str, &str> = source_files()
+        .iter()
+        .map(|(p, t)| (p.as_str(), t.as_str()))
+        .collect();
     let needles = identity_needles();
     let mut stale: Vec<&str> = Vec::new();
     let mut duplicated: Vec<&str> = Vec::new();

@@ -454,9 +454,14 @@ mod tests {
     /// Files that construct a process in production code — the only files a
     /// spawn call can live in.
     fn spawning_files(files: &[(String, String)]) -> BTreeMap<String, String> {
+        // Modules `main.rs` declares under `#[cfg(test)]` are not in the
+        // shipped binary, and have no inner `#[cfg(test)]` marker for
+        // `production_hits` to cut at — see `rustsrc::test_only_files`.
+        let test_only = crate::rustsrc::test_only_files();
         files
             .iter()
             .filter(|(rel, _)| rel != "spawn_gate.rs")
+            .filter(|(rel, _)| !test_only.contains(rel))
             .filter(|(rel, src)| !production_hits(rel, src, CTOR_NEEDLES).1.is_empty())
             .map(|(rel, src)| (rel.clone(), src.clone()))
             .collect()
@@ -475,7 +480,7 @@ mod tests {
     #[test]
     fn the_scanned_file_set_is_exactly_the_spawn_ledgers() {
         let files = source_files();
-        let scanned: BTreeSet<String> = spawning_files(&files).into_keys().collect();
+        let scanned: BTreeSet<String> = spawning_files(files).into_keys().collect();
         let ledgered: BTreeSet<String> = crate::spawn_ledger::ledger()
             .iter()
             .map(|s| s.file.to_string())
@@ -537,7 +542,7 @@ mod tests {
     #[test]
     fn every_spawning_file_routes_through_the_spawn_gate() {
         let files = source_files();
-        let spawning = spawning_files(&files);
+        let spawning = spawning_files(files);
         let by_path: BTreeMap<&str, &String> =
             files.iter().map(|(r, s)| (r.as_str(), s)).collect();
         let mut ungated = Vec::new();
@@ -621,7 +626,7 @@ mod tests {
     #[test]
     fn no_process_spawn_call_escapes_the_gate() {
         let files = source_files();
-        let spawning = spawning_files(&files);
+        let spawning = spawning_files(files);
         let file_exempt: BTreeMap<&str, &str> = FILE_EXEMPT.iter().copied().collect();
 
         let mut violations: Vec<String> = Vec::new();

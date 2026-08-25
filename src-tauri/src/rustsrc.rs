@@ -69,6 +69,10 @@ pub(crate) fn src_root() -> PathBuf {
 /// Every `.rs` file under [`src_root`], as `(slash-relative path, contents)` —
 /// sorted, `\r`-normalised, dot-directories skipped, guarded against vacuity.
 ///
+/// Walked ONCE per process and borrowed thereafter — see [`RS_SOURCE_FILES`].
+/// [`source_files_ext`] below is deliberately NOT memoized: a bespoke extension
+/// set has one caller, and the walk it does is that caller's alone.
+///
 /// # Why this is one function and not five (R11)
 ///
 /// Five copies of this walk existed — in `harness::layering`, `spawn_gate`,
@@ -94,8 +98,84 @@ pub(crate) fn src_root() -> PathBuf {
 ///
 /// Sorting is the fourth, minor one: four of the five sorted and `spawn_ledger`
 /// did not, which made its failure messages depend on directory order.
-pub(crate) fn source_files() -> Vec<(String, String)> {
-    source_files_ext(&["rs"])
+pub(crate) fn source_files() -> &'static [(String, String)] {
+    &RS_SOURCE_FILES
+}
+
+/// The memo behind [`source_files`].
+///
+/// The `.rs` answer is IDENTICAL for every caller — same root, same extension
+/// set, same process — and roughly fifteen scanners ask for it in one `cargo
+/// test` run, each paying ~250 file reads plus a sort for a tree that cannot
+/// have changed since the binary was built. Computed once, borrowed after.
+///
+/// One consequence worth knowing: [`MIN_SOURCE_FILES`]'s vacuity assert now
+/// fires inside this initializer, so a broken walk panics with its own message
+/// in whichever test touches it FIRST, and every later test reports a poisoned
+/// `LazyLock` instead. The diagnosis is in the first failure; the rest are
+/// echoes of it.
+static RS_SOURCE_FILES: std::sync::LazyLock<Vec<(String, String)>> =
+    std::sync::LazyLock::new(|| source_files_ext(&["rs"]));
+
+/// The files that exist only in a TEST build, derived from `main.rs`.
+///
+/// `main.rs` declares two of its modules under `#[cfg(test)]`
+/// (`rustsrc` itself, and `testutil`). Their contents are not in the shipped
+/// binary at all — but they ARE `.rs` files under `src/` with no inner
+/// `#[cfg(test)]` marker, so a scanner that defines "production code" as
+/// "everything before the first `#[cfg(test)]` item" reads the whole of each
+/// one as production. That is a false positive with teeth: the spawn-gate and
+/// spawn-ledger tripwires would demand a security ledger row for a test
+/// fixture's `git`, and the pressure that puts on the next author is to weaken
+/// a scanner rather than to be honest.
+///
+/// Parsed from the declaration rather than hand-kept, so a module that stops
+/// being test-only stops being exempt on the same commit. A `mod x;` matches
+/// `x.rs` and everything under `x/`.
+///
+/// Vacuity is guarded from both ends: the set must be non-empty (main.rs has
+/// always had at least one such module, and a parser that silently found none
+/// would exempt nothing while looking like it worked) and every name in it
+/// must match at least one walked file.
+pub(crate) fn test_only_files() -> std::collections::BTreeSet<String> {
+    let main = std::fs::read_to_string(src_root().join("main.rs"))
+        .expect("main.rs is readable — the module declarations are the source of this answer");
+    let main = main.replace('\r', "");
+    let mut mods: Vec<String> = Vec::new();
+    let mut armed = false;
+    for line in main.lines() {
+        let line = line.trim();
+        if line == "#[cfg(test)]" {
+            armed = true;
+            continue;
+        }
+        if armed {
+            if let Some(name) = line.strip_prefix("mod ").and_then(|r| r.strip_suffix(';')) {
+                mods.push(name.to_string());
+            }
+            armed = false;
+        }
+    }
+    assert!(
+        !mods.is_empty(),
+        "no `#[cfg(test)] mod` found in main.rs — the parser has drifted from the file, and a \
+         scanner exemption that silently covers nothing is worse than no exemption"
+    );
+    let files = source_files();
+    let mut out = std::collections::BTreeSet::new();
+    for m in mods {
+        let own = format!("{m}.rs");
+        let dir = format!("{m}/");
+        let mut hit = false;
+        for (rel, _) in files {
+            if rel == &own || rel.starts_with(&dir) {
+                out.insert(rel.clone());
+                hit = true;
+            }
+        }
+        assert!(hit, "`#[cfg(test)] mod {m};` matches no file under src/");
+    }
+    out
 }
 
 /// [`source_files`] over a caller-chosen extension set.
@@ -697,6 +777,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// **The test-only exemption is derived, and it is narrow.**
+    ///
+    /// Two scanners (`spawn_gate`, `spawn_ledger`) skip these files, so the
+    /// failure that matters is the set growing: an exemption that covers the
+    /// tree silences the tripwire it is attached to. Pinned from both ends —
+    /// it names the modules `main.rs` actually declares under `#[cfg(test)]`,
+    /// and it stays a rounding error against the walk.
+    #[test]
+    fn the_test_only_set_is_the_cfg_test_modules_and_nothing_else() {
+        let set = test_only_files();
+        assert!(
+            set.contains("testutil.rs") && set.contains("rustsrc.rs"),
+            "the two `#[cfg(test)] mod` declarations in main.rs are missing: {set:?}"
+        );
+        for shipped in ["main.rs", "spawn_gate.rs", "spawn_ledger.rs", "sandbox/confine.rs"] {
+            assert!(
+                !set.contains(shipped),
+                "{shipped} ships in the binary and must stay policed"
+            );
+        }
+        assert!(
+            set.len() * 10 < source_files().len(),
+            "the exemption covers {} of {} files — that is not an exemption any more",
+            set.len(),
+            source_files().len()
+        );
+    }
+
     /// …and the same walk over the REAL tree is substantive and normalised.
     ///
     /// The synthetic control above proves the semantics; this one proves they
@@ -725,9 +833,17 @@ mod tests {
             "paths must be `src/`-relative with forward slashes: that is how the allowlists \
              in `harness::layering` and the ledger rows in `spawn_ledger` are written"
         );
-        let mut sorted = files.clone();
+        let mut sorted = files.to_vec();
         sorted.sort();
         assert_eq!(files, sorted, "the walk must be sorted");
+
+        // ...and it is walked once. Fifteen scanners ask for this in one
+        // `cargo test` run; the answer cannot change inside a process, so
+        // they share one. Same backing allocation = the memo is live.
+        assert!(
+            std::ptr::eq(files.as_ptr(), source_files().as_ptr()),
+            "the crate walk is re-reading ~250 files for every caller"
+        );
 
         let widened = source_files_ext(&["rs", "css"]);
         assert!(

@@ -760,24 +760,8 @@ pub async fn prune(root: &Path) -> AppResult<()> {
 
 #[cfg(test)]
 mod tests {
+    use crate::testutil::{git, has_git};
     use super::*;
-
-    fn has_git() -> bool {
-        crate::pty::resolve_command("git").is_ok()
-    }
-
-    fn git(dir: &Path, args: &[&str]) {
-        let out = std::process::Command::new("git")
-            .args(args)
-            .current_dir(dir)
-            .output()
-            .expect("git");
-        assert!(
-            out.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
 
     fn user_repo(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("wb-wt-{tag}-{}", uuid::Uuid::new_v4()));

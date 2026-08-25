@@ -286,6 +286,7 @@ pub(crate) fn apply_backend_patch(cfg: &mut AiToolTabConfig, backend: Delegation
 
 #[cfg(test)]
 mod tests {
+    use crate::testutil::ScratchDir;
     use super::*;
     use crate::settings::Settings;
     use crate::state::StateSignal;
@@ -364,26 +365,6 @@ mod tests {
         _scratch: ScratchDir,
     }
 
-    /// A throwaway settings directory, for the same reason
-    /// [`crate::service::tabs`]'s tests have one: these tests DO mutate
-    /// settings, so the debounced saver must write somewhere disposable.
-    struct ScratchDir(std::path::PathBuf);
-
-    impl ScratchDir {
-        fn new() -> Self {
-            let path =
-                std::env::temp_dir().join(format!("cimp-delegsvc-{}", uuid::Uuid::new_v4()));
-            std::fs::create_dir_all(&path).expect("scratch dir");
-            Self(path)
-        }
-    }
-
-    impl Drop for ScratchDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
     /// The harness every seeded tab runs. Taken from the registry rather than
     /// spelled, so this fixture does not pin one product's id: what the move
     /// rule is about is "same harness", and the test needs any harness that
@@ -402,7 +383,7 @@ mod tests {
         #[allow(clippy::field_reassign_with_default)]
         fn new(harness: &'static str) -> Self {
             use crate::state::{TabKind, TabMeta};
-            let scratch = ScratchDir::new();
+            let scratch = ScratchDir::new("delegsvc");
             let mut defaults = Settings::default();
             defaults.tabs = ["ai-one", "ai-two"]
                 .into_iter()

@@ -438,7 +438,7 @@ mod tests {
         let mut scanned = 0usize;
         let mut offenders: Vec<String> = Vec::new();
 
-        for (rel, src) in &files {
+        for (rel, src) in files {
             if LITERAL_EMIT_ALLOWED.iter().any(|(f, _)| f == rel) {
                 continue;
             }

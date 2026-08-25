@@ -413,26 +413,10 @@ pub async fn contamination_events(root: Option<String>) -> AppResult<serde_json:
 
 #[cfg(test)]
 mod tests {
+    use crate::testutil::{git, has_git};
     use super::*;
     use crate::service::sink::testing::RecordingEventSink;
     use crate::settings::{Settings, SettingsHandle};
-
-    fn has_git() -> bool {
-        crate::pty::resolve_command("git").is_ok()
-    }
-
-    fn git(dir: &Path, args: &[&str]) {
-        let out = std::process::Command::new("git")
-            .args(args)
-            .current_dir(dir)
-            .output()
-            .expect("git");
-        assert!(
-            out.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
 
     /// A throwaway project directory with a real user git repo in it — the same
     /// fixture shape `workbench::shadow`'s own tests use, so a checkpoint here

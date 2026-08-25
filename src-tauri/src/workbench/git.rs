@@ -391,10 +391,7 @@ pub fn invalidate_is_repo_cache(root: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn has_git() -> bool {
-        crate::pty::resolve_command("git").is_ok()
-    }
+    use crate::testutil::has_git;
 
     #[test]
     fn env_overrides_pass_through_set_values() {

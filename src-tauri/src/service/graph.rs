@@ -732,31 +732,11 @@ pub async fn history(
 
 #[cfg(test)]
 mod tests {
+    use crate::testutil::ScratchDir;
     use super::*;
     use crate::graph::EdgeKind;
     use crate::service::sink::testing::RecordingEventSink;
     use crate::settings::{Settings, SettingsHandle};
-
-    /// A throwaway directory that is both the settings store and the project
-    /// root, so the warm index mints its `.cimp/graph.db` somewhere disposable.
-    struct ScratchDir(PathBuf);
-
-    impl ScratchDir {
-        fn new() -> Self {
-            let path = std::env::temp_dir().join(format!("cimp-graphsvc-{}", uuid::Uuid::new_v4()));
-            std::fs::create_dir_all(&path).expect("scratch dir");
-            Self(path)
-        }
-    }
-
-    impl Drop for ScratchDir {
-        fn drop(&mut self) {
-            // The index holds a SQLite handle until the service is dropped; on
-            // Windows that can outlive this call, so a failed remove is not a
-            // test failure — the temp dir is disposable either way.
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
 
     /// A real [`GraphService`] over a scratch project root — **no Tauri app**.
     ///
@@ -766,7 +746,7 @@ mod tests {
     /// running app. It now takes an [`EventSink`](crate::service::sink::EventSink)
     /// and three optional collaborators, all of which a test can supply.
     fn fixture() -> (ScratchDir, Arc<GraphService>) {
-        let scratch = ScratchDir::new();
+        let scratch = ScratchDir::new("graphsvc");
         let defaults = Settings::default();
         let settings = SettingsHandle::new(defaults.clone(), defaults, scratch.0.clone());
         let graph = GraphService::new(

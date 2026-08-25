@@ -591,7 +591,19 @@ mod tests {
         //    `rustsrc::source_files` — audited once for every scanner that
         //    gates on it (R11), and resolved from the manifest rather than the
         //    cwd so it answers the same from any working directory.
-        let all = crate::rustsrc::source_files();
+        // Modules `main.rs` declares under `#[cfg(test)]` never reach the
+        // shipped binary, and carry no inner `#[cfg(test)]` marker for
+        // `production_hits` to cut at, so the walk hands them over as if
+        // they were production. A test fixture's `git` is not a spawn seam
+        // and must not be given a row in a security ledger to silence a
+        // scanner — see `rustsrc::test_only_files`, which derives the set
+        // from the declarations rather than keeping a second list.
+        let test_only = crate::rustsrc::test_only_files();
+        let all: Vec<(String, String)> = crate::rustsrc::source_files()
+            .iter()
+            .filter(|(rel, _)| !test_only.contains(rel))
+            .cloned()
+            .collect();
         match audit_against(&all, &expected) {
             Ok(n) => assert!(n > 0, "the tree walk counted zero spawns"),
             Err(problems) => panic!(

@@ -256,9 +256,9 @@ fn parse_hunk_new_range(rest: &str) -> Option<(u32, u32)> {
 
 #[cfg(test)]
 mod tests {
+    use crate::testutil::git;
     use super::*;
     use crate::graph::{parse_file, GraphIndex, Lang};
-    use std::process::Command as StdCommand;
 
     // ── hunk-header / diff parsing ─────────────────────────────────────
 
@@ -376,19 +376,6 @@ diff --git a/src/a.rs b/src/a.rs
     }
 
     // ── git plumbing + changed_symbols ─────────────────────────────────
-
-    fn git(dir: &Path, args: &[&str]) {
-        let out = StdCommand::new("git")
-            .args(args)
-            .current_dir(dir)
-            .output()
-            .expect("git");
-        assert!(
-            out.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
 
     /// A throwaway git repo + graph index, with `commit_src` committed as
     /// `src/lib.rs` and the working tree containing whatever the caller

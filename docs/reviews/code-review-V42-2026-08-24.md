@@ -623,3 +623,314 @@ test-covered:
   monospace and the `×` hover is fully red, not half. Tabs → the harness page: the
   declared-settings block reads as a group inside the Tabs card, not as a card
   inside a card, and keeps LV-20's label / checkbox / hint chrome.
+
+---
+
+# Phase F — review of `3542dad..develop`, 2026-08-25
+
+The **final** review pass of the milestone, at **high** effort, over everything
+that landed after tranche 2: the tab-lifecycle service (#136/A1), the offload
+latch/discovery seams (A2), the unified confined spawn (#127), the Rust word
+diff (#139), the codegen of the tool reference and event names (#131), and the
+CSS/Code-Intelligence split.
+
+**Reviewer output:** 10 findings verified, 2 refuted, 1 dropped at cap.
+**Disposition: all 10 CLOSED.** Every gate green at `f6292bc`:
+
+| Gate | Baseline (`568eabd`) | After |
+|---|---|---|
+| `cargo test --bin cimp` | 2997 passed · 0 failed · 7 ignored | **3002 · 0 · 7** |
+| `cargo clippy --all-targets` | clean | **clean** |
+| `npx vitest run` | 930 tests · 53 files | **935 · 54** |
+| `npm run check` | 0 errors · 0 warnings · 407 files | **0 · 0 · 407** |
+| `npm run build` | clean | **clean** |
+
+The generated directories are byte-identical after a full `cargo test` (the
+tree is clean), and `Cargo.lock` did not move. The five new tests are the five
+fixes that could be pinned mechanically; the two that could not (F-2, F-10) are
+on the runbook instead, and say why.
+
+## The ten
+
+### F-1 — `reconfigure_shell` dropped the lifecycle serializer (`7efc5e2`)
+
+`service/tabs.rs`. The A1 fold moved the command's body into `TabService` but
+left `let _serializer = state.lifecycle_serializer.lock().await` behind at the
+call site, making this the one mutating method on the struct that ran
+unserialized — against the struct's own documented invariant ("held for the
+whole of every mutating method below, exactly as the commands held it").
+
+The race is a silent data loss, not a crash: a `close_tab` landing between the
+"settings still holds a Shell entry for this tab" check and the `mutate` makes
+the closure's re-check find nothing, so the Configure dialog's edit is dropped
+and the user is told `Ok`.
+
+**Fixed:** taken at the top of the body — where the command took it, and where
+`create_shell` (the sibling method with the same `validate_inputs` call) takes
+it. That keeps the `which::which` PATH probe inside the hold; the doc comment
+now states that as a decision and says why the alternative (validate outside,
+re-check inside) buys a shorter hold at the cost of a second copy of the checks
+on a path the user drives one dialog at a time.
+
+**Test:** `reconfigure_shell_waits_on_the_lifecycle_serializer` holds the
+serializer, pins the call's future, asserts no progress, drops the guard and
+asserts the edit lands. Probed red by deleting the lock line.
+
+### F-2 — Trace path's confidence badges lost their colour in the CSS split (`31373ce`)
+
+`codeIntel/AnalysesSection.svelte`. The split moved `.conf.extracted` /
+`.conf.inferred` / `.conf.ambiguous` into that component's SCOPED `<style>`,
+described there as rules "no other section can reach". Two sections render the
+badge: Analyses on each impact dependent, and Trace path on every edge of a
+traced chain. Svelte scoping keeps a component's rules off another component's
+markup, so the Trace path badges kept the shared `.conf` shape — pill,
+uppercase, tabular — and lost the fill: an `ambiguous` edge and an `extracted`
+edge looked identical, which is the whole of what the badge carries.
+
+**Fixed:** the three fills move to `codeIntel.css`, `.graph-monitor`-prefixed
+like every rule there. Specificity is preserved exactly — (0,3,0) against the
+base rule's (0,2,0), the same margin the scoped `.conf.extracted.svelte-HASH`
+had — and nothing else in the app declares these classes. Both section docs
+corrected: one claimed exclusivity it never had, the other claimed the shared
+rules reached it, which is now true.
+
+No test can see this — the classes are present in both markups either way, and
+what changed is which stylesheet resolves them. **Eyes-on: LV-41.**
+
+### F-3 — enabling an AI builtin stole focus (`0f823bf`)
+
+`service/tabs.rs`. `commit_new_tab` absorbed four copies of the commit
+sequence, three of which activated the new tab. The fourth,
+`add_ai_builtin_tab`, never did — and the fold gave it one. Ticking a harness
+in Settings → Tabs therefore yanked the user out of whatever tab they were
+standing in, from another window.
+
+The second consequence is inside `set_enabled_ai`: its step 2 reads
+`registry.active()` to decide whether the active tab is about to be closed and
+needs handing off first. With step 1 activating each tab it adds, that question
+was being asked about a tab the same call had just moved to, so the hand-off it
+exists to perform could not fire.
+
+**Fixed:** `Placement::AiBuiltin` does not activate, restoring the pre-fold
+behaviour. The branch says why activation is the user-tab half of the sequence
+("take me there") rather than part of "commit a tab".
+
+**Test:** `enabling_an_ai_builtin_never_changes_the_active_tab` pins the active
+tab across a `set_enabled_ai` AND the signal sequence the frontend reconciles
+from (`TabAdded` alone). Probed red with the branch forced true.
+
+### F-4 — the confined walk leaked the tree on a failed wait (`80a57ff`)
+
+`sandbox/confine.rs`, and this one is TCB. `kill_tree` fired on `Cancelled |
+TimedOut`. A `WaitFailed` — `child.wait()` itself erroring — left the child and
+everything it had forked alive, holding the pipe write ends the two drains are
+reading. The drains are bounded, so nothing hangs; what happens instead is the
+seam returns `DRAIN_TIMEOUT` late with a half capture while the tree goes on
+working. `kill_on_drop` does not cover it: that fires when the future is
+dropped, and this future returns.
+
+**Fixed, as a deliberate hardening:** the predicate is now `needs_kill`, an
+exhaustive match — every abnormal outcome reaps, and a new `ConfinedOutcome`
+variant is a compile error rather than a silently unreaped tree.
+`ApplyRefused`/`SpawnFailed` answer `false` because nothing was spawned, not
+because they are unreachable there.
+
+**Amendment to the #127 extraction proof.** That extraction was claimed, and
+reviewed, as a step-for-step identical walk over both originals. It is
+identical no longer, in exactly this step — both originals had the same hole.
+The module doc records the amendment where a reader of the proof will meet it.
+It is also the first fix to land in one place instead of two, which is the
+payoff the extraction was for. The checks seam's own comment ("the pumps are
+drained and the tree killed BEFORE it is returned") was ahead of the code and
+is now true as written, unchanged.
+
+**Test:** `every_abnormal_outcome_reaps_the_tree` asserts the verdict variant
+by variant — there is no portable way to make `child.wait()` fail, so the rule
+is pinned where it is decided. Named suites green: `sandbox::` 97, `audit::`
+109, `checks::` 142. **LV-B8 is the live half** and gets a sharper expectation.
+
+### F-5 — the diff-summary poll paid for a word diff nobody renders (`4669be1`)
+
+`workbench/diff.rs` + `workbench/mod.rs`. Phase D moved the intra-line word
+diff into the parse, so `parse_unified` ran the O(n·m) LCS for every changed
+line pair unconditionally. One caller renders nothing: `diff_summary`'s FIX 7
+shadow-repo fallback parses one whole-repo blob purely to count each file's
+added/removed lines, and drops every hunk a line later. For a non-git project
+with checkpoints on, that is the entire working tree word-diffed on every save,
+and thrown away.
+
+**Fixed:** groups are a mode. `parse_unified` computes them — it is the parse
+whose result is rendered, and every other caller (`diff_file`, the shadow
+`diff_file` fallback, `checkpoint_diff`, history's commit diff) is one of
+those. `file_metas_from_unified` is the count-only path and the sole way to ask
+for the skip, so a group-less `FileDiff` cannot leave the module: what comes
+back is `FileDiffMeta`, which has no `groups` to be missing. Nothing on the
+wire changes shape.
+
+**Also corrected:** `worddiff.rs`'s "a full-file diff is therefore NOT doubled
+in size" was true only of the context-dominated case it names. A pair-heavy
+diff does grow — each paired line's text is carried again as spans. The module
+doc says so now, and names the two limits that bound it (`MAX_DP_CELLS`'
+whole-line fallback, `MAX_DIFF_FILE_BYTES`).
+
+**Test:** `the_meta_parse_skips_the_word_diff_but_not_the_hash` pins both
+halves — the render parse still emits a `Pair`, the count-only parse emits no
+groups, the hunk hash is identical across modes (it is a function of the parsed
+content, not of the mode), and the rows come out the same either way. The 18
+#139 word-diff cases are green and untouched.
+
+### F-6 — DEF-2's name-join, orphaned by #131, written (`f6292bc`)
+
+`uiState.ts`. DEF-2 recorded `DURABLE_VIEW_PREFS` as a hand-kept allowlist
+nothing checks, accepted with a note, and pointed at "the same build-time
+name-join the `cssTokens` guard does" as the real fix — riding with #131. #131
+closed without it. A deferral whose owner closes without it is not deferred, it
+is dropped, so it is written here.
+
+The hazard is silent by construction: `saveViewString(view, key, …)` with a
+name that is not in the set does not fail or warn. It routes to `localStorage`
+and the value persists — per machine, in the wrong store, at the wrong scope.
+
+**Fixed:** `tests/durableViewPrefs.test.ts` scans every view for the pref names
+they read and write, and joins both ways. Every name written must be classified
+(the durable set, or the guard's ephemeral roster, with a reason); every name
+in the durable set must be one some view uses, because `IMPORTED_KEYS` is
+derived from it and an orphan is a dead key in the one-time import forever.
+Prop-driven views resolve: `AuditPanel` takes its `view` as a prop, so the scan
+expands it over the values it is mounted with and checks both panels rather
+than neither — and a `view` argument it cannot resolve is its own failure
+rather than a silent skip.
+
+No second hand-kept copy: the durable set ships (the routing reads it), the
+ephemeral roster is a test fixture, and `uiState.ts`'s module docs point at the
+guard instead of restating those names in prose. DEF-2's SECOND consequence — a
+pref promoted after a project's import marker is set is never imported — stays
+accepted, and the doc says so.
+
+**Probed:** planting `git-graph.probe-key` in a view fails the classification
+join naming it and its file; adding `nowhere.at-all` to the durable set fails
+the orphan join. Both reverted.
+
+### F-7 — the keep-alive poll guard had two holes (`28a833d`)
+
+`tests/keepAlivePolls.test.ts`. Both let through exactly the bug the guard
+exists for.
+
+**Per-FILE excuses.** The check was `src.includes('pollWhileVisible')`, so one
+correct helper call — or one mention of `isAppViewVisible` — excused every
+other interval in the same file. A component that polls properly through the
+helper and then starts a second, bare `setInterval` three functions down was
+green. `pollWhileVisible` now accounts for NOTHING bare: it gates the interval
+it starts inside itself, and says nothing about one the component starts.
+`isAppViewVisible` accounts for at most one call site, the one it plausibly
+gates.
+
+**`.svelte` only.** A poll started in an imported `.ts` runs on the same
+schedule and lives just as long, and nothing was looking. The walk takes `.ts`
+too (minus `*.test.ts`, where an interval runs under vitest and never in the
+app), which brought five real polls into scope: `appViewVisibility.ts` (the
+helper itself), `delegationState.ts`, `latch.ts`, `spritePlayer.ts`,
+`workbenchDiff.ts`. Each excuse was re-derived by reading the code, not carried
+over. The vacuity floor gained a third clause, so a walk that regresses to
+`.svelte` fails instead of quietly taking those five back out of scope.
+
+**Probed:** a second bare `setInterval` planted in `EventsView.svelte` (a
+helper user) and one planted in `src/lib/graph.ts` both fail the guard, named;
+both were invisible to the previous version. Reverted.
+
+### F-8 — nine byte-alike test fixtures, in the milestone that removed duplication (`150185c`)
+
+The service split gave eight test modules the same two needs and each grew its
+own copy of the answer: eight `ScratchDir`s (one calling itself `TempCwd`),
+each with the same `Drop`; eight `fn git`s, seven identical and the eighth
+quietly different; nine `has_git`s.
+
+**Fixed:** `crate::testutil`, a `#[cfg(test)]` module, with the per-suite tag
+kept as a parameter so a leftover temp directory still names the suite that
+made it. The divergent `git` copy is the one that won — it forced a
+deterministic author/committer identity in the environment, which works whether
+or not the fixture remembered to `git config` and cannot pick up a developer's
+global identity. No test in this crate asserts on a commit's author.
+
+**The enabling change, and why this was not a two-line move.** `main.rs`
+declares `rustsrc` and `testutil` under `#[cfg(test)]`, so neither reaches the
+shipped binary — but both are `.rs` files under `src/` with no INNER
+`#[cfg(test)]` marker, and the spawn-gate and spawn-ledger tripwires define
+production code as "everything before the first `#[cfg(test)]` item". They
+therefore read a test fixture's `git` as a production spawn seam and demand a
+security ledger row for it. Giving one would put a lie in the ledger — the
+ledger's subject is what the shipped binary spawns — and adding a bare
+exemption teaches the next author to weaken a scanner. The fix is
+`rustsrc::test_only_files()`, which DERIVES the exempt set from those
+declarations in `main.rs`: no second hand-kept list, and a module that stops
+being test-only stops being exempt on the same commit.
+
+**Test:** `the_test_only_set_is_the_cfg_test_modules_and_nothing_else` pins the
+exemption from both ends — it names the two real ones, refuses to cover files
+that ship, and must stay a rounding error against the walk, because an
+exemption that covers the tree silences the tripwire it rides on. Suite count
+unchanged by the consolidation itself, which is the point: the fixtures moved,
+no coverage did.
+
+### F-9 — the crate source walk ran once per scanner (`5ce5104`)
+
+`rustsrc.rs`. `source_files()` re-walked and re-read ~250 `.rs` files on every
+call, and roughly fifteen source-scanning tests call it in one `cargo test`
+run. The answer cannot change inside a process — same root, same extension set,
+same binary.
+
+**Fixed:** a `LazyLock` computed once, borrowed after. `source_files_ext` stays
+uncached: a bespoke extension set has one caller, and the walk it does is that
+caller's alone. The synthetic-tree control is unaffected — it drives
+`walk_tree` against its own root, which is exactly why that split exists. One
+consequence is documented at the static: the vacuity floor's assert now fires
+inside the initializer, so a broken walk panics with its real message in the
+first test to touch it and later tests report a poisoned lock; the diagnosis is
+in the first failure.
+
+**Test:** the crate-walk control also asserts both calls share a backing
+allocation, so the memo cannot silently stop being one. Wall clock on the full
+suite: 273s → 248s.
+
+### F-10 — a failed live-usage fetch stranded the Cost card (`5cdf978`)
+
+`codeIntel/UsageOverview.svelte`. `liveFetchKey` is stamped with the
+`sid:turns` snapshot BEFORE the await, as an in-flight guard, and was never
+cleared when the fetch threw. The effect only refetches when that key changes,
+and an idle session's key never changes — so one failed `graph_session_usage`
+left the Cost and Dashboard cards on their "no per-model data" placeholder
+until the user took another turn, in the exact case (an idle session) where
+they never would.
+
+**Fixed:** cleared in the catch, so the next 2s poll tick retries — the same
+rule the selected-session path follows, where a failed fetch undoes its state
+rather than leaving a stamp claiming the fetch happened. The failure it
+recovers from is transient by nature (the store being rebuilt, the graph
+briefly off).
+
+Carried over from before this milestone, in range because the file is new: the
+split moved this code, and moving it is when it was last read. **Eyes-on:
+LV-43.**
+
+## Refuted — do not re-raise
+
+1. **`set_role`'s double snapshot.** The two reads are of different things at
+   different moments; there is no window between them that the second read
+   could be wrong about.
+2. **`service`'s AI-tab duplication.** `commit_ai_duplicate` and
+   `add_ai_builtin` share the commit helper and differ in placement and
+   naming, which is the difference the helper's `Placement` parameter exists to
+   name — not two copies of one thing.
+
+## Dropped at cap — recorded, not actioned
+
+One cosmetic finding was below the bar and is written down rather than fixed: a
+test string spells a carriage return as an escape where the surrounding cases
+spell it literally. It reads oddly; it asserts correctly.
+
+## New live-verify items
+
+Two fixes are eyes-on rather than test-covered (F-2, F-10), two more have a
+user-visible half worth confirming in the app (F-3, F-5), and one existing
+MANDATORY item gains a sharper expectation. They are on the runbook as
+**LV-41 … LV-44** and in the amendment note under **LV-B8**.

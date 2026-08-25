@@ -253,30 +253,9 @@ fn epoch_to_ymdhms(secs: i64) -> (i32, u32, u32, u32, u32, u32) {
 
 #[cfg(test)]
 mod tests {
+    use crate::testutil::ScratchDir;
     use super::*;
     use crate::settings::Settings;
-    use std::path::PathBuf;
-    use uuid::Uuid;
-
-    /// A throwaway directory to point [`SettingsHandle`] at, so the debounced
-    /// saver writes its `.cimp/config.json` somewhere disposable. Same
-    /// hand-rolled shape (and the same best-effort removal) as the tab and
-    /// settings services'.
-    struct ScratchDir(PathBuf);
-
-    impl ScratchDir {
-        fn new() -> Self {
-            let path = std::env::temp_dir().join(format!("cimp-laysvc-{}", Uuid::new_v4()));
-            std::fs::create_dir_all(&path).expect("scratch dir");
-            Self(path)
-        }
-    }
-
-    impl Drop for ScratchDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
 
     /// One handle and a scratch dir — the whole cost of making the layout
     /// popover headless.
@@ -287,7 +266,7 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
-            let scratch = ScratchDir::new();
+            let scratch = ScratchDir::new("laysvc");
             let defaults = Settings::default();
             let settings = SettingsHandle::new(defaults.clone(), defaults, scratch.0.clone());
             Self {

@@ -832,7 +832,7 @@ mod tests {
         let mut mine: Option<usize> = None;
         let mut prose: Vec<String> = Vec::new();
         let mut offenders: Vec<String> = Vec::new();
-        for (rel, text) in &files {
+        for (rel, text) in files {
             let hits = re.find_iter(text).count();
             if rel == SELF {
                 mine = Some(hits);

@@ -497,12 +497,11 @@ fn advisor_snapshot_blocking(
 
 #[cfg(test)]
 mod tests {
+    use crate::testutil::ScratchDir;
     use super::*;
     use crate::activity::{ActivityEntry, ActivityKind};
     use crate::advisor::HIDEABLE_RECENCY_WINDOW_MS;
     use crate::settings::Settings;
-    use std::path::PathBuf as StdPathBuf;
-    use uuid::Uuid;
 
     fn hidden_call(ts_ms: u64) -> ActivityEntry {
         // `graph_cycles` is one of graph::LEAN_HIDDEN.
@@ -564,24 +563,6 @@ mod tests {
         );
     }
 
-    /// A throwaway directory to point [`SettingsHandle`] at, so the debounced
-    /// saver writes its `.cimp/config.json` somewhere disposable.
-    struct ScratchDir(StdPathBuf);
-
-    impl ScratchDir {
-        fn new() -> Self {
-            let path = std::env::temp_dir().join(format!("cimp-usagesvc-{}", Uuid::new_v4()));
-            std::fs::create_dir_all(&path).expect("scratch dir");
-            Self(path)
-        }
-    }
-
-    impl Drop for ScratchDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
     fn handle(scratch: &ScratchDir) -> SettingsHandle {
         let defaults = Settings::default();
         SettingsHandle::new(defaults.clone(), defaults, scratch.0.clone())
@@ -594,7 +575,7 @@ mod tests {
     /// when the numbers were different.
     #[test]
     fn dismissing_is_idempotent_per_signature_and_a_new_bucket_is_a_new_record() {
-        let scratch = ScratchDir::new();
+        let scratch = ScratchDir::new("usagesvc");
         let settings = handle(&scratch);
 
         dismiss(&settings, "surface.lean.v1".into(), "hi".into()).expect("dismiss");

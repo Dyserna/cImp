@@ -216,3 +216,27 @@
   vertical-align: middle;
   white-space: nowrap;
 }
+
+/* The three fills. They lived in `AnalysesSection`'s scoped block until the
+   V42 Phase-F review (F-2), listed there as rules "no other section can
+   reach" — but `TracePathSection` puts the same badge on every path edge, and
+   Svelte scoping kept the fills off it, so those badges rendered as the shape
+   with no colour. Both sections read them from here now.
+
+   Specificity: `.graph-monitor .conf.extracted` is (0,3,0) against the base
+   rule's (0,2,0), which is the same margin the scoped `.conf.extracted.svelte-HASH`
+   had over `.graph-monitor .conf` — the fills win, and nothing else in the app
+   declares them. */
+.graph-monitor .conf.extracted {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text-primary, #ddd);
+  opacity: 0.75;
+}
+.graph-monitor .conf.inferred {
+  background: var(--surface-warning, rgba(178, 106, 0, 0.28));
+  color: var(--text-warning, #f0c674);
+}
+.graph-monitor .conf.ambiguous {
+  background: var(--surface-danger, rgba(179, 38, 30, 0.28));
+  color: var(--text-danger-soft, #ffb4ab);
+}

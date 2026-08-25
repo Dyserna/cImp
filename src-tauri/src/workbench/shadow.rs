@@ -1517,6 +1517,7 @@ pub async fn gc(root: &Path, max: u32, max_age_days: u32) -> AppResult<()> {
 
 #[cfg(test)]
 mod tests {
+    use crate::testutil::{git, has_git};
     use super::*;
 
     #[test]
@@ -1539,28 +1540,11 @@ mod tests {
         assert_eq!(out, "one two three four ");
     }
 
-    fn has_git() -> bool {
-        crate::pty::resolve_command("git").is_ok()
-    }
-
     /// The pre-V33 origin shape: a harness name and nothing else. Used by the
     /// tests that predate the identity fields, so they keep exercising the
     /// "agent only" row a burst-era build produced.
     fn agent_origin(agent: &str) -> Origin {
         Origin::new(Some(agent.to_string()), None, None)
-    }
-
-    fn git(dir: &Path, args: &[&str]) {
-        let out = std::process::Command::new("git")
-            .args(args)
-            .current_dir(dir)
-            .output()
-            .expect("git");
-        assert!(
-            out.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
     }
 
     fn tempdir(tag: &str) -> PathBuf {

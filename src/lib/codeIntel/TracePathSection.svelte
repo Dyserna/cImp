@@ -6,7 +6,11 @@
   /// result, and no poll drives it — a trace happens when the user asks. The
   /// `.preview-in` / `.preview-meta` / `.pin-toggle` / `.conf` rules it shares
   /// with Memory and Context are in `codeIntel.css` and reach this markup
-  /// through the DOM; only the `.path-*` family travelled with it.
+  /// through the DOM; only the `.path-*` family travelled with it. The
+  /// `.conf.<confidence>` FILLS are part of that — they were left in
+  /// `AnalysesSection`'s scoped block by the split, where nothing here could
+  /// match them, so an edge's confidence badge had its shape and none of its
+  /// colour (V42 Phase-F review, F-2).
   ///
   /// `active` gates the MARKUP only, and the parent mounts this component
   /// unconditionally: the two endpoints someone typed and the trace they ran

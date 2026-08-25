@@ -338,6 +338,10 @@ pub(crate) enum Placement {
     /// A reserved AI builtin: inserted at its canonical rank among the other
     /// reserved AI tabs, and registered as a builtin. Keeps the AI tabs in
     /// canonical leading order regardless of which subset is enabled.
+    ///
+    /// Does NOT activate. Ticking a checkbox in Settings → Tabs is not a
+    /// request to go there — see the activation branch in
+    /// [`TabService::commit_new_tab`].
     AiBuiltin(AiTabId),
 }
 
@@ -380,7 +384,8 @@ impl<'a> TabService<'a> {
         }
     }
 
-    /// Commit a freshly-minted tab: persist, register, announce, activate.
+    /// Commit a freshly-minted tab: persist, register, announce, and — for a
+    /// user tab only — activate.
     ///
     /// The ordering is load-bearing and was previously restated at every call
     /// site. Settings is written BEFORE the registry entry so that when the
@@ -400,8 +405,9 @@ impl<'a> TabService<'a> {
     /// back, matching what the copies did.
     ///
     /// `placement` is the fourth copy's difference, named (decision 3): a
-    /// reserved AI builtin goes in at its canonical rank and registers as a
-    /// builtin, everything else appends and registers as a user tab.
+    /// reserved AI builtin goes in at its canonical rank, registers as a
+    /// builtin and is NOT activated; everything else appends, registers as a
+    /// user tab and takes focus.
     async fn commit_new_tab(
         &self,
         meta: &TabMeta,
@@ -467,7 +473,15 @@ impl<'a> TabService<'a> {
             return Err(TabLifecycleError::internal("state signal channel closed"));
         }
 
-        {
+        // Activation is the USER half of this sequence, not part of "commit a
+        // tab". A user tab is asked for by an act that means "take me there" —
+        // the + menu, a tool button, a worktree — and all four copies this
+        // helper absorbed activated. A reserved AI builtin is not: it appears
+        // because a checkbox in Settings → Tabs was ticked, `add_ai_builtin_tab`
+        // never activated it, and doing so both steals focus from the tab the
+        // user is standing in and moves the `active` that `set_enabled_ai`'s
+        // step 2 reads to decide whether the active tab is about to be closed.
+        if matches!(placement, Placement::User) {
             let mut registry = self.registry.lock().await;
             if let Err(e) = registry.activate(tab).await {
                 warn!(error = %e, "{what}: activate failed");
@@ -948,6 +962,18 @@ impl<'a> TabService<'a> {
     /// registry AND sends `TabRenameRequested`, and doing both for an unchanged
     /// name would make every Configure-dialog OK look like a rename to every
     /// subscriber.
+    ///
+    /// Takes the lifecycle serializer for the whole body, like every other
+    /// mutating method here and exactly as the command did before the fold.
+    /// Without it, a `close_tab` interleaving between the "settings still holds
+    /// a Shell entry for this tab" check and the `mutate` makes the closure's
+    /// re-check find nothing and drop the edit on the floor — and the user is
+    /// told `Ok`. The `which::which` probe inside `validate_inputs` runs under
+    /// the lock deliberately: the alternative is validating outside it and
+    /// re-checking inside, which buys a shorter hold on a path the user drives
+    /// one dialog at a time, at the cost of a second copy of the checks. The
+    /// probe is bounded (one PATH resolution) and lifecycle commands are not
+    /// concurrent in practice, so the whole body stays inside.
     #[allow(clippy::too_many_arguments)]
     pub async fn reconfigure_shell(
         &self,
@@ -962,6 +988,7 @@ impl<'a> TabService<'a> {
         theme_override: Option<crate::settings::TerminalThemeSettings>,
         background_override: Option<crate::settings::BackgroundOverride>,
     ) -> Result<(), TabLifecycleError> {
+        let _serializer = self.serializer.lock().await;
         if !matches!(tab.kind(), TabKind::Shell) {
             return Err(TabLifecycleError::WrongKind);
         }
@@ -1489,6 +1516,7 @@ pub(crate) async fn sync_reserved_feature_tab(
 
 #[cfg(test)]
 mod tests {
+    use crate::testutil::ScratchDir;
     use super::*;
     use crate::service::sink::testing::{NoWebviews, RecordingEventSink};
     use crate::state::TabMeta;
@@ -1512,36 +1540,11 @@ mod tests {
         _scratch: ScratchDir,
     }
 
-    /// A throwaway directory to point [`SettingsHandle`] at, so the debounced
-    /// saver writes its `.cimp/config.json` somewhere disposable instead of
-    /// into the real temp root (these tests DO mutate settings, unlike the
-    /// existing `SettingsHandle` fixtures, which never trigger a save).
-    ///
-    /// Hand-rolled rather than a `tempfile` dev-dependency: one `Drop` is
-    /// cheaper than a new crate in the lock file. Removal is best-effort — the
-    /// saver task lives on Tauri's runtime and may land its write after the
-    /// test's own runtime is gone.
-    struct ScratchDir(PathBuf);
-
-    impl ScratchDir {
-        fn new() -> Self {
-            let path = std::env::temp_dir().join(format!("cimp-tabsvc-{}", Uuid::new_v4()));
-            std::fs::create_dir_all(&path).expect("scratch dir");
-            Self(path)
-        }
-    }
-
-    impl Drop for ScratchDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
     impl Fixture {
         /// One seed tab, marked builtin in settings so the "builtins are not
         /// closable" rule has something to refuse.
         fn new() -> Self {
-            let scratch = ScratchDir::new();
+            let scratch = ScratchDir::new("tabsvc");
             let mut defaults = Settings::default();
             let seed_id = TabId::Shell("shell-seed".to_string());
             defaults.tabs = vec![TabConfig::Shell(ShellTabSettings {
@@ -1883,6 +1886,47 @@ mod tests {
         assert_eq!(entries, 1, "and it must not open the tab twice");
     }
 
+    /// **Enabling an AI builtin never moves the user.**
+    ///
+    /// Ticking a harness in Settings → Tabs makes its tab exist; it does not
+    /// mean "and take me there". `add_ai_builtin_tab` never activated, and when
+    /// its body folded into [`TabService::commit_new_tab`] — whose other three
+    /// callers all DO activate — it nearly inherited one. Two things break if
+    /// it does: the user is yanked out of whatever tab they were in by a
+    /// checkbox in another window, and `set_enabled_ai`'s step 2 then reads an
+    /// `active` this very call moved, so its "is the active tab about to be
+    /// closed?" question is asked about the wrong tab.
+    #[tokio::test]
+    async fn enabling_an_ai_builtin_never_changes_the_active_tab() {
+        let Some(id) = crate::settings::canonical_ai_tab_order().first().copied() else {
+            return;
+        };
+        let mut fx = Fixture::new();
+        let seed = TabId::Shell("shell-seed".to_string());
+        assert_eq!(fx.registry.lock().await.active(), seed);
+
+        fx.service()
+            .set_enabled_ai(vec![id])
+            .await
+            .expect("enable one AI builtin");
+
+        let added = TabId::from_str(id.as_str());
+        assert!(
+            fx.registry.lock().await.has_tab(&added),
+            "the builtin's tab must exist"
+        );
+        assert_eq!(
+            fx.registry.lock().await.active(),
+            seed,
+            "a Settings checkbox must not steal focus"
+        );
+        assert_eq!(
+            fx.signal_names(),
+            vec!["TabAdded"],
+            "the frontend must see the tab appear and nothing else"
+        );
+    }
+
     /// **A Shell tab's config round-trips through the Configure dialog's wire
     /// shape**, args included — they are joined with spaces here and re-split
     /// with `shlex` on submit, so an argument containing a space has to survive
@@ -1910,5 +1954,46 @@ mod tests {
                 .shell_tab_config(&TabId::Shell("shell-nope".to_string())),
             Err(TabLifecycleError::TabNotFound { .. })
         ));
+    }
+
+    /// **`reconfigure_shell` serializes against the other lifecycle commands.**
+    ///
+    /// The struct's documented invariant — "held for the whole of every
+    /// mutating method" — is the reason a `close_tab` cannot land between this
+    /// method's "settings still holds a Shell entry" check and its `mutate`,
+    /// where the closure's re-check would silently drop the edit and still
+    /// return `Ok`. Nothing else observes that hold, so it is pinned directly:
+    /// while the serializer is held elsewhere the call must not make progress,
+    /// and it must complete once the holder lets go.
+    #[tokio::test]
+    async fn reconfigure_shell_waits_on_the_lifecycle_serializer() {
+        let fx = Fixture::new();
+        let seed = TabId::Shell("shell-seed".to_string());
+        let guard = fx.serializer.lock().await;
+
+        let svc = fx.service();
+        let call = svc.reconfigure_shell(
+            seed.clone(),
+            "Reconfigured".to_string(),
+            a_real_command(),
+            String::new(),
+            None,
+            HashMap::new(),
+            "err".to_string(),
+            "exit".to_string(),
+            None,
+            None,
+        );
+        tokio::pin!(call);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(150), &mut call)
+                .await
+                .is_err(),
+            "reconfigure_shell ran without the lifecycle serializer"
+        );
+
+        drop(guard);
+        call.await.expect("reconfigure once the serializer is free");
+        assert!(fx.tab_names().contains(&"Reconfigured".to_string()));
     }
 }

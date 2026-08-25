@@ -964,10 +964,10 @@ impl WorkbenchService {
             diff::DEFAULT_CONTEXT,
         )
         .await?;
-        let mut files: Vec<diff::FileDiffMeta> = diff::parse_unified(&text)
-            .iter()
-            .map(diff::file_diff_meta_from_parsed)
-            .collect();
+        // The count-only parse (V42 Phase-F review, F-5): this is a POLL, and
+        // every hunk it builds is dropped once its added/removed lines are counted,
+        // so it must not spend the word-diff DP on the whole working tree.
+        let mut files: Vec<diff::FileDiffMeta> = diff::file_metas_from_unified(&text);
         files.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(diff::DiffSummary {
             files,
@@ -1385,24 +1385,8 @@ pub async fn revert_hunk(
 
 #[cfg(test)]
 mod tests {
+    use crate::testutil::{git, has_git};
     use super::*;
-
-    fn has_git() -> bool {
-        crate::pty::resolve_command("git").is_ok()
-    }
-
-    fn git(dir: &Path, args: &[&str]) {
-        let out = std::process::Command::new("git")
-            .args(args)
-            .current_dir(dir)
-            .output()
-            .expect("git");
-        assert!(
-            out.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
 
     // ---- V33 per-`(root, tab)` checkpoint throttle -------------------------
     //

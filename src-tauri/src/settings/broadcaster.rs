@@ -313,26 +313,9 @@ fn spawn_saver(
 
 #[cfg(test)]
 mod tests {
+    use crate::testutil::ScratchDir;
     use super::*;
     use crate::settings::LogLevel;
-
-    /// A scratch launch dir so the debounced saver can't write an overlay into
-    /// the repo if it fires before the test ends.
-    struct TempCwd(PathBuf);
-
-    impl TempCwd {
-        fn new(tag: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!("cimp-{tag}-{}", uuid::Uuid::new_v4()));
-            std::fs::create_dir_all(&dir).unwrap();
-            Self(dir)
-        }
-    }
-
-    impl Drop for TempCwd {
-        fn drop(&mut self) {
-            std::fs::remove_dir_all(&self.0).ok();
-        }
-    }
 
     /// V42 Phase B. `mutate_quiet` must land the write and request the save —
     /// it is a real mutation, not a dry run — while sending nothing to
@@ -341,7 +324,7 @@ mod tests {
     /// at that rate, for a field none of them read.
     #[test]
     fn mutate_quiet_updates_the_store_without_broadcasting() {
-        let tmp = TempCwd::new("quiet-test");
+        let tmp = ScratchDir::new("quiet-test");
         let handle = SettingsHandle::new(Settings::default(), Settings::default(), tmp.0.clone());
         let mut rx = handle.subscribe();
 

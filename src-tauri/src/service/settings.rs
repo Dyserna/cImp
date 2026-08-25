@@ -499,14 +499,13 @@ pub fn set_llm_pricing(
 
 #[cfg(test)]
 mod tests {
+    use crate::testutil::ScratchDir;
     use super::*;
     use crate::service::sink::testing::{NoGraphIndex, RecordingEventSink};
     use crate::settings::PromptTemplate;
     use crate::state::{TabKind, TabMeta};
     use crate::tabs::TabRegistry;
-    use std::path::PathBuf;
     use std::sync::{Arc, RwLock};
-    use uuid::Uuid;
 
     /// Everything [`SettingsService`] borrows, owned on the stack — the same
     /// six-handle fixture the tab-lifecycle slice proved, plus the STT handle
@@ -523,29 +522,9 @@ mod tests {
         _scratch: ScratchDir,
     }
 
-    /// A throwaway directory to point [`SettingsHandle`] at, so the debounced
-    /// saver writes its `.cimp/config.json` somewhere disposable. Same
-    /// hand-rolled shape (and the same best-effort removal) as the tab
-    /// service's.
-    struct ScratchDir(PathBuf);
-
-    impl ScratchDir {
-        fn new() -> Self {
-            let path = std::env::temp_dir().join(format!("cimp-setsvc-{}", Uuid::new_v4()));
-            std::fs::create_dir_all(&path).expect("scratch dir");
-            Self(path)
-        }
-    }
-
-    impl Drop for ScratchDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
     impl Fixture {
         fn new() -> Self {
-            let scratch = ScratchDir::new();
+            let scratch = ScratchDir::new("setsvc");
             let defaults = Settings::default();
             let settings =
                 SettingsHandle::new(defaults.clone(), defaults, scratch.0.clone());

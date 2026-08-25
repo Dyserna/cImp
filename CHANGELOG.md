@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.54.0-rc.3] — 2026-08-26
+
+_Delegation and session-push resilience, from the rc.2 live-verify session
+(#142, #143). No schema change (still 38)._
+
+### Fixed
+
+- **Sessions no longer keep a stale tool list forever after a
+  delegation-role change.** The per-tab MCP child's `/events` relay is now
+  supervised (an unexpected exit re-enters instead of going silent for the
+  tab's life), and a connected relay re-announces `tools/list_changed`
+  every 5 minutes as a bounded self-heal for any lost frame.
+- **A delegation can no longer drive a worker tab that can never report a
+  turn end.** The OpenCode event tap records a positive "unreachable"
+  verdict after ~30 s of never having connected, and the delegation
+  preflight refuses such a worker with a reason naming the problem — a
+  booting tab is still accepted, and one successful connect clears the
+  verdict with no restart.
+
+### Changed
+
+- The OpenCode tap now says when it cannot read its tab (WARN with status
+  and credential presence on a refused stream; INFO on connect) instead of
+  looping silently at trace level — the failure that made #142
+  undiagnosable after the fact.
+- `/events` subscriber register/drop are logged at INFO with the live
+  subscriber count, so a dead session-push relay is one `cimp.log` line
+  instead of a `netstat` investigation.
+
 ## [0.54.0-rc.2] — 2026-08-25
 
 _rc.1 was dead on CI (never published): a Linux-only compile error from the

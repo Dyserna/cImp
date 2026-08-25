@@ -7,6 +7,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.54.0-rc.1] — 2026-08-25
+
+_The V42 milestone: headless core + repo-wide refactoring (#106, #113–#140).
+Overwhelmingly behaviour-preserving — 343 files reshaped, three adversarial
+review passes (47 findings, all closed). Settings schema unchanged at 38.
+The changes a user can notice:_
+
+### Changed
+
+- **Per-view UI state is per-project now.** Sub-tab selections, card
+  open/collapsed state, Events column layout, audit filters and UI-hidden
+  tabs move from browser storage into `<project>/.cimp/ui_state.json`.
+  Existing values are imported once (copied, never deleted — other
+  checkouts import their own copy). Hiding a tab in one project no longer
+  hides it everywhere.
+- **Settings files older than schema v30 (pre-May) are no longer
+  migratable.** A below-floor `settings.json` is moved aside intact
+  (`*.outdated.<ts>.bak`), defaults are reseeded, and a loud error names
+  the preserved file. Migration steps v1.0–v29 are deleted.
+- **Dragging a pane splitter no longer rebroadcasts the whole settings
+  object per mouse-move** — layout writes are quiet; everything else
+  still broadcasts as before.
+- Layout integrity/repair (corrupt ratios, dead or duplicated tab ids,
+  bogus focus) now runs in Rust before the window boots, and restoring a
+  layout preset repairs through the same single path.
+- A session whose harness declares neither cache-read nor input tokens
+  shows no cache-hit ratio instead of a misleading 0%.
+- The Tools reference is generated from the Rust tool registry — it can
+  no longer drift from the real surface (`offload_batch` was missing; it
+  is documented now).
+
+### Fixed
+
+- Per-harness declared settings fields render as normal form rows (their
+  styling was silently unreachable before) — and no longer draw a
+  card-inside-a-card.
+- Validation error text renders red in Settings and Events (the tokens it
+  referenced were never declared).
+- Two Settings lost-update races: the graph ignore-list commit and
+  *Reset to defaults* now take the same draft-sync gate as every other
+  settings write.
+- An idle session's Cost/Dashboard card no longer sticks on an empty
+  placeholder after one failed usage fetch.
+- A check child whose wait errors is now drained and its process tree
+  killed (previously two reader tasks detached and grandchildren could
+  survive).
+
+### Internal
+
+- One Rust service layer under every Tauri command (180 commands; the
+  crate constructs headlessly — ~80 flows that were "click in the app"
+  are tests now); `loopback.rs` (18.7k lines) split into route families
+  with the taint-latch and discovery extracted; `settings/schema.rs`,
+  `graph/service.rs`, `graph/index.rs`, `sandbox/mod.rs`, `main.rs`,
+  `SettingsApp.svelte` (9.9k → 1.4k) and `CodeIntelligenceView` all
+  split along audited seams; TypeScript settings types + defaults + tool
+  reference + event names generated from Rust (hand-kept mirrors
+  deleted); one confined-spawn boundary walk for audit + checks; machine
+  scope, Feature, ActivityKind and notification matrices are tables with
+  coverage tripwires; migration floor; ~740 tests added (3,002 cargo /
+  935 vitest). Toolchain: rust-version 1.89.
+- Live-verify: `docs/reviews/live-verify-V42-runbook.md` — 43 items plus
+  a mandatory 10-item sandbox battery for this RC.
+
 ## [0.53.0-rc.10] — 2026-08-23
 
 _rc.9 live-verify fixes (#100, first half). Settings schema 37 → 38._

@@ -339,16 +339,38 @@ fn worker_profile(
 /// `assistant_text` for THIS tab, or it has a fallback reader attached. Without
 /// one the engine would type into a tab it cannot read back from, which is the
 /// silent-swallow decision 12 exists to prevent.
+///
+/// **#142 split "attached" from "working".** A reader is registered the instant
+/// a tab's PTY spawns, before it has read anything — so a tab whose reader can
+/// never reach its source passed this check and the delegation ran to its
+/// deadline with the slot held and the worker's answer sitting on screen. The
+/// second clause refuses on the tap's own POSITIVE verdict
+/// ([`reader_source_unreachable`]), never on the mere absence of a connection:
+/// a harness that is still booting has no connection either, and refusing that
+/// would break every delegation into a tab the user just opened.
+///
+/// Only the reader half is judged. A tab served by CHP push needs no reader at
+/// all, so an unreachable tap on such a tab is a missing passenger, not a
+/// missing completion signal.
+///
+/// [`reader_source_unreachable`]: crate::harness::reader::reader_source_unreachable
 fn worker_completion_source(agent: &str, worker: &TabId, worker_name: &str) -> Result<(), String> {
     let pushed = crate::harness::chp::served(
         agent,
         worker.as_str(),
         crate::harness::chp::EV_ASSISTANT_TEXT,
     );
-    let reader = crate::harness::reader::has_live_reader(worker);
-    if !pushed && !reader {
+    if pushed {
+        return Ok(());
+    }
+    if !crate::harness::reader::has_live_reader(worker) {
         return Err(format!(
             "worker tab `{worker_name}` has no way to report the end of a turn (its harness pushes              no assistant text for this tab and no fallback reader is attached), so cImp could not              read the answer back — restart the tab and try again"
+        ));
+    }
+    if crate::harness::reader::reader_source_unreachable(worker) {
+        return Err(format!(
+            "worker tab `{worker_name}` has a reader that has never been able to read it — its              harness is not serving the event stream cImp launched it with, so the end of a turn              could never be observed. Restart the tab; if it keeps happening, check `cimp.log` for              the tab's OOB reader warning"
         ));
     }
     Ok(())
@@ -1139,6 +1161,46 @@ mod tests {
         // Order: a tab that is mid-turn AND has text typed reports the turn,
         // because that is the one the user cannot simply clear.
         assert_eq!(busy_reason(true, false, 12, "api-work"), Some(mid));
+    }
+
+    /// **#142 — preflight 11 judges whether the reader WORKS, not whether one
+    /// was registered.**
+    ///
+    /// The three states a reader-served worker can be in, and only the last is a
+    /// refusal: no reader (nothing can report a turn end), a reader that has not
+    /// connected yet (a booting tab — refusing here would refuse every tab the
+    /// user just opened), and a reader whose tap has POSITIVELY concluded its
+    /// source is not there (the duplicated OpenCode tab of #142, whose
+    /// delegation held the slot until the deadline while its answer sat on
+    /// screen).
+    #[test]
+    fn a_worker_whose_reader_can_never_read_it_is_refused() {
+        use crate::harness::reader as rdr;
+        // Not a registered CHP peer, so the push half is off and the reader half
+        // decides — which is the case this test is about.
+        let tab = TabId::from_str("ai-preflight-142");
+
+        let none = worker_completion_source("opencode", &tab, "OpenCode 2")
+            .expect_err("a tab with no reader at all cannot report a turn end");
+        assert!(none.contains("no fallback reader is attached"), "{none}");
+
+        let _reader = rdr::test_reader(&tab);
+        assert!(
+            worker_completion_source("opencode", &tab, "OpenCode 2").is_ok(),
+            "an attached-but-not-yet-connected reader is a booting tab, not a broken one"
+        );
+
+        rdr::note_reader_source_unreachable(&tab);
+        let dead = worker_completion_source("opencode", &tab, "OpenCode 2")
+            .expect_err("a reader that has proved it cannot read must refuse the delegation");
+        assert!(
+            dead.contains("never been able to read it"),
+            "the refusal must name the problem, not just decline: {dead}"
+        );
+
+        // One successful connect and the tab is a worker again — no restart.
+        rdr::note_reader_source(&tab);
+        assert!(worker_completion_source("opencode", &tab, "OpenCode 2").is_ok());
     }
 
     /// **The task is typed verbatim** (locked decision 2a/10). No header, no

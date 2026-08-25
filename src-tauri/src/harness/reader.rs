@@ -175,8 +175,136 @@ fn deregister_reader(tab: &str, epoch: u64) {
 /// difference between a slow turn and a dead tap is a timeout, which is what
 /// the engine's deadline is for. What it does rule out is the case worth
 /// ruling out — a tab that never had a reader and never will.
+///
+/// **#142 is what the gap between attached and healthy costs**, so ask
+/// [`reader_source_reached`] beside this one wherever the answer decides
+/// whether to START something: a duplicated OpenCode tab had a registered
+/// reader from the instant its PTY spawned and never once reached its event
+/// stream, so preflight 11 waved through a delegation that could not observe a
+/// turn end and the slot stayed claimed until the deadline.
 pub fn has_live_reader(tab: &crate::state::TabId) -> bool {
     live_readers(|s| s.contains_key(tab.as_str()))
+}
+
+/// What a tab's CURRENT reader knows about its own source (#142).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SourceState {
+    /// The tap is reading: the OpenCode SSE stream answered `200`, the Claude
+    /// transcript tail attached to a file.
+    Reached,
+    /// The tap has tried long enough, and hard enough, to call it: the source it
+    /// was told to read does not exist and is not coming. **Positive evidence**,
+    /// which is the whole design of this signal — see [`reader_source_unreachable`].
+    Unreachable,
+}
+
+/// Per-tab source state, keyed by the same per-spawn epoch as [`LIVE_READERS`]
+/// and for the same reason: a restarted tab's stale cleanup must not erase the
+/// successor's fact, and a fact recorded by a previous spawn must not vouch for
+/// — or condemn — this one.
+#[allow(clippy::type_complexity)]
+static READER_SOURCES: std::sync::Mutex<
+    Option<std::collections::BTreeMap<String, (u64, SourceState)>>,
+> = std::sync::Mutex::new(None);
+
+fn reader_sources<T>(
+    f: impl FnOnce(&mut std::collections::BTreeMap<String, (u64, SourceState)>) -> T,
+) -> T {
+    let mut g = READER_SOURCES.lock().unwrap_or_else(|e| e.into_inner());
+    f(g.get_or_insert_with(Default::default))
+}
+
+/// Record `state` against `tab`'s CURRENT reader registration. A no-op for a tab
+/// with no registered reader — the only writers are readers, and a reader that
+/// has been deregistered is one whose tab is gone.
+fn note_reader_state(tab: &crate::state::TabId, state: SourceState) {
+    if let Some(epoch) = live_readers(|m| m.get(tab.as_str()).copied()) {
+        reader_sources(|m| m.insert(tab.as_str().to_string(), (epoch, state)));
+    }
+}
+
+/// Record that `tab`'s reader has reached its source.
+///
+/// Idempotent, and called on every (re)connect rather than only the first:
+/// the fact being recorded is "this source is there", not "this is the first
+/// time" — and it is also what CLEARS a previous [`Unreachable`] verdict when a
+/// server finally comes up.
+///
+/// [`Unreachable`]: SourceState::Unreachable
+pub fn note_reader_source(tab: &crate::state::TabId) {
+    note_reader_state(tab, SourceState::Reached);
+}
+
+/// Record that `tab`'s reader has concluded its source will not come up.
+///
+/// The caller owns the threshold, because only the tap knows what "long enough"
+/// means for its transport. Reversible: one successful connect calls
+/// [`note_reader_source`] and the tab is a worker again without a restart.
+pub fn note_reader_source_unreachable(tab: &crate::state::TabId) {
+    note_reader_state(tab, SourceState::Unreachable);
+}
+
+/// Whether `tab`'s reader has **proved** it cannot read this tab (#142).
+///
+/// Deliberately not the negation of "has reached its source": *absence* of a
+/// connection is the normal state of a tab whose harness is still booting, and
+/// a preflight that refused on absence would refuse every freshly opened tab
+/// for its first seconds. This answers `true` only on positive evidence
+/// recorded by the tap itself — which is exactly #142's case, a duplicated
+/// OpenCode tab whose event stream never existed for the tab's whole life while
+/// [`has_live_reader`] cheerfully answered `true`.
+pub fn reader_source_unreachable(tab: &crate::state::TabId) -> bool {
+    match live_readers(|m| m.get(tab.as_str()).copied()) {
+        Some(epoch) => reader_sources(|m| {
+            m.get(tab.as_str()) == Some(&(epoch, SourceState::Unreachable))
+        }),
+        None => false,
+    }
+}
+
+/// **TEST-ONLY**: register a reader for `tab` and deregister it on drop.
+///
+/// The registry is process-wide, so a test that registered without unwinding it
+/// would leak a reader into every later test in the binary — and the fact these
+/// registries carry ("can this tab report a turn end") is exactly the sort a
+/// leak makes another test pass for the wrong reason. Lives here rather than in
+/// a `mod tests` because `delegation::engine`'s preflight test needs it and
+/// `register_reader` is private.
+#[cfg(test)]
+pub(crate) fn test_reader(tab: &crate::state::TabId) -> TestReader {
+    TestReader {
+        tab: tab.as_str().to_string(),
+        epoch: register_reader(tab.as_str()),
+    }
+}
+
+/// The guard [`test_reader`] returns.
+#[cfg(test)]
+pub(crate) struct TestReader {
+    tab: String,
+    epoch: u64,
+}
+
+#[cfg(test)]
+impl Drop for TestReader {
+    fn drop(&mut self) {
+        deregister_reader(&self.tab, self.epoch);
+        reader_sources(|m| m.remove(&self.tab));
+    }
+}
+
+/// Whether `tab`'s currently-registered reader has ever reached its source.
+///
+/// The tap's own view of itself — used by a reader to decide whether a failure
+/// is "the server went away" or "it was never there". The epoch comparison is
+/// what keeps a previous spawn's success from vouching for the current one.
+pub fn reader_source_reached(tab: &crate::state::TabId) -> bool {
+    match live_readers(|m| m.get(tab.as_str()).copied()) {
+        Some(epoch) => {
+            reader_sources(|m| m.get(tab.as_str()) == Some(&(epoch, SourceState::Reached)))
+        }
+        None => false,
+    }
 }
 
 /// Spawn the adapter described by `spec`, tied to `ctx.cancel`. Non-blocking:
@@ -295,6 +423,13 @@ impl OobContext {
             text,
         )
         .await;
+    }
+
+    /// #142 — **this reader has its source**: called by a tap the moment it is
+    /// actually reading (an accepted SSE response, an opened transcript), on
+    /// every reconnect. See [`note_reader_source`] and [`reader_source_reached`].
+    pub fn note_source(&self) {
+        note_reader_source(&self.tab);
     }
 
     /// Emit a state signal, ignoring a full/closed channel (state is
@@ -511,6 +646,54 @@ mod tests {
         // …and is idempotent.
         deregister_reader(tab.as_str(), second);
         assert!(!has_live_reader(&tab));
+    }
+
+    /// **#142 — "attached" and "reading" are different facts, and the second one
+    /// is epoch-keyed like the first.**
+    ///
+    /// A duplicated OpenCode tab had a registered reader from its PTY's first
+    /// millisecond and never once reached its event stream; preflight 11 read
+    /// the registration as a completion signal and let a delegation run to its
+    /// deadline. The verdict is POSITIVE evidence recorded by the tap — never
+    /// the absence of a connection, which is also what a booting tab looks like.
+    #[test]
+    fn a_readers_source_verdict_is_positive_evidence_and_dies_with_its_spawn() {
+        let tab = TabId::from_str("ai-reader-source");
+        // No reader at all: neither verdict is available to claim.
+        assert!(!reader_source_reached(&tab));
+        assert!(!reader_source_unreachable(&tab));
+
+        let first = register_reader(tab.as_str());
+        // Attached but silent — a tab whose harness is still booting. Refusing
+        // here would refuse every freshly opened tab.
+        assert!(has_live_reader(&tab));
+        assert!(!reader_source_unreachable(&tab), "silence is not a verdict");
+
+        note_reader_source_unreachable(&tab);
+        assert!(reader_source_unreachable(&tab));
+        assert!(!reader_source_reached(&tab));
+
+        // …and it is reversible without a restart: one successful connect makes
+        // the tab a worker again.
+        note_reader_source(&tab);
+        assert!(reader_source_reached(&tab));
+        assert!(!reader_source_unreachable(&tab));
+
+        // A RESTART must not inherit the predecessor's verdict in either
+        // direction — the new tap has its own server to reach.
+        let second = register_reader(tab.as_str());
+        assert_ne!(first, second);
+        assert!(
+            !reader_source_reached(&tab),
+            "a previous spawn's success must not vouch for this one"
+        );
+        assert!(!reader_source_unreachable(&tab));
+
+        // A reader that is gone answers neither.
+        deregister_reader(tab.as_str(), second);
+        note_reader_source(&tab);
+        assert!(!reader_source_reached(&tab));
+        assert!(!reader_source_unreachable(&tab));
     }
 
     #[tokio::test]

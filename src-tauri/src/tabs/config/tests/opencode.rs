@@ -106,6 +106,62 @@ fn a_per_tab_server_password_override_is_honoured_by_the_tap_too() {
     assert_eq!(auth.as_deref(), server_basic_auth("mine-not-cimps").as_deref());
 }
 
+/// **#142 — a DUPLICATED OpenCode tab is an OpenCode tab.** The `+` copy keeps
+/// the template's `command` and gets a fresh `ai-<uuid>` id and `builtin:
+/// false`, so every harness decision on the launch path must still be taken
+/// from the command. A duplicate that resolved no `OobSpec` would run with no
+/// event tap at all: no turn boundaries, no TTS, no usage — and a delegation
+/// into it could never observe the turn end (the symptom filed as #142).
+///
+/// Asserts the whole per-tab shape, because "an OpenCode tab" is not enough:
+/// the port must be the duplicate's OWN (never the template's) and the
+/// credential must be the one THIS spawn's environment carries.
+#[test]
+fn a_duplicated_opencode_tab_still_resolves_its_own_event_tap() {
+    use crate::harness::opencode::config::{server_basic_auth, SERVER_PASSWORD_ENV};
+    let settings = Settings::default();
+    // Exactly what `service::tabs::commit_ai_duplicate` writes: same command,
+    // new id, not builtin.
+    let mut dup = opencode_cfg();
+    dup.id = "ai-ac0f0268-eb5d-44d0-8bbc-54bb5b7fb990".to_string();
+    dup.builtin = false;
+    dup.name = "OpenCode 2".to_string();
+
+    let env = compose_ai_env(&dup, &settings, &dup.id, Some(&hook_endpoint()));
+    let password = env
+        .get(SERVER_PASSWORD_ENV)
+        .expect("a duplicated OpenCode tab is spawned authenticated too");
+    let mut extra: Vec<String> = Vec::new();
+    let Some(crate::harness::OobSpec::OpenCodeEvent { port, auth }) =
+        resolve_oob_source(&dup, Path::new("C:/proj"), &mut extra, &env)
+    else {
+        panic!("a duplicated OpenCode tab must resolve an event source (#142)");
+    };
+    assert_eq!(
+        auth.as_deref(),
+        server_basic_auth(password).as_deref(),
+        "the duplicate's tap must present the duplicate's own credential"
+    );
+    // The port the TUI is told to host on is the port the tap will dial.
+    let at = extra
+        .iter()
+        .position(|a| a == "--port")
+        .expect("a duplicated OpenCode tab must be launched with --port");
+    assert_eq!(extra.get(at + 1).map(String::as_str), Some(port.to_string().as_str()));
+    assert!(extra.iter().any(|a| a == "--hostname"));
+
+    // …and it is its OWN port: two duplicates of one template must not be
+    // handed the same server to tap.
+    let mut extra2: Vec<String> = Vec::new();
+    let env2 = compose_ai_env(&dup, &settings, &dup.id, Some(&hook_endpoint()));
+    let Some(crate::harness::OobSpec::OpenCodeEvent { port: port2, .. }) =
+        resolve_oob_source(&dup, Path::new("C:/proj"), &mut extra2, &env2)
+    else {
+        panic!("a duplicated OpenCode tab must resolve an event source (#142)");
+    };
+    assert_ne!(port, port2, "each spawn reserves its own loopback port");
+}
+
 // ---- V19: OpenCode launch spine ----
 
 #[test]

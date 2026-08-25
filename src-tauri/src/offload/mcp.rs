@@ -334,7 +334,7 @@ async fn serve() {
     // self-healing — it reconnects when the app comes/goes.
     {
         let stdout = stdout.clone();
-        tokio::spawn(async move { events_relay(stdout).await });
+        tokio::spawn(async move { events_relay_supervised(stdout).await });
     }
 
     // The shared stdio JSON-RPC loop (`mcp_stdio`): spawns each request so
@@ -1790,6 +1790,48 @@ async fn proxy_mcp_call(params: &Value) -> Result<Value, (i64, String)> {
     }
 }
 
+/// Backoff before [`events_relay`] is re-entered, and the same 2 s the relay's
+/// own reconnect loop uses.
+const RELAY_REENTRY_BACKOFF: Duration = Duration::from_secs(2);
+
+/// How often a CONNECTED relay re-announces the tool list unprompted (#143).
+///
+/// The relay already announces on every (re)connect, which heals a gap it
+/// noticed. This heals the gap it did not: a `change` frame lost anywhere
+/// between the app's fan-out and the client's re-query leaves the session with a
+/// stale tool list for the rest of the tab's life, and nothing in the system
+/// ever asks again. `tools/list_changed` is idempotent — the client answers with
+/// one `tools/list` — so the cost of being wrong is one cheap round trip every
+/// five minutes and the cost of NOT doing it is an eternally stale session.
+const RELAY_REANNOUNCE: Duration = Duration::from_secs(300);
+
+/// Keep [`events_relay`] running for this child's whole life (#143).
+///
+/// The relay is an infinite loop, so *every* way out of it is a way this
+/// session stops receiving `tools/list_changed` forever — with the request loop
+/// still answering `tools/list` normally, which is precisely what makes the
+/// failure invisible from outside. Re-entering costs one `await_initialize`
+/// (which returns immediately once `INITIALIZE_ANSWERED` is set, so a re-entry
+/// never re-parks) and one reconnect.
+///
+/// **Not a panic supervisor, and deliberately not written as one.** The release
+/// profile is `panic = "abort"`, so a panic inside the relay takes the whole
+/// child process down — visibly, as an MCP server disconnect the harness
+/// reports — rather than quietly killing one task. `catch_unwind` around this
+/// would be dead code in every shipped build. What this DOES cover is an
+/// unexpected *return*: today the early `return` on a failed
+/// `reqwest::Client::builder()`, and whatever a future edit adds.
+async fn events_relay_supervised(stdout: Arc<TokioMutex<tokio::io::Stdout>>) {
+    loop {
+        events_relay(stdout.clone()).await;
+        eprintln!(
+            "cimp-offload: /events relay returned unexpectedly; re-entering in {}s",
+            RELAY_REENTRY_BACKOFF.as_secs()
+        );
+        tokio::time::sleep(RELAY_REENTRY_BACKOFF).await;
+    }
+}
+
 /// Long-lived task: while the app's loopback endpoint is reachable, hold a
 /// `GET /events` SSE connection and dispatch its frames —
 ///
@@ -1846,6 +1888,12 @@ async fn events_relay(stdout: Arc<TokioMutex<tokio::io::Stdout>>) {
                     // above parks this task until the handshake reply is on the
                     // wire.
                     emit_list_changed(&stdout).await;
+                    // #143: one line per connection edge, on stderr because this
+                    // child has no tracing subscriber — the harness's MCP log is
+                    // where it lands, and it is the only place a dead relay is
+                    // visible at all. Single-line, `cimp-offload:`-prefixed like
+                    // every other diagnostic here.
+                    eprintln!("cimp-offload: /events relay connected ({query})");
                     // Parse the SSE byte stream frame by frame. The parser owns
                     // the chunk-boundary problem end to end (TCP can split
                     // anywhere, including mid-line and mid-frame), which the
@@ -1858,18 +1906,34 @@ async fn events_relay(stdout: Arc<TokioMutex<tokio::io::Stdout>>) {
                     // list_changed notifications would stop reaching Claude.
                     const READ_IDLE: Duration = Duration::from_secs(60);
                     let mut parser = SseParser::default();
+                    let mut last_announce = Instant::now();
                     while let Ok(Ok(Some(chunk))) =
                         tokio::time::timeout(READ_IDLE, resp.chunk()).await
                     {
                         for frame in parser.feed(&chunk) {
                             dispatch_sse_frame(&stdout, &frame).await;
                         }
+                        // #143: bounded self-heal for a `change` frame that was
+                        // emitted, fanned out and still never reached the
+                        // client's tool list. Checked here rather than on a
+                        // second task because the app's 20s keep-alive means
+                        // this loop wakes at least that often on an idle
+                        // stream — so the period is honoured to within one
+                        // keep-alive without a timer of its own.
+                        if last_announce.elapsed() >= RELAY_REANNOUNCE {
+                            last_announce = Instant::now();
+                            emit_list_changed(&stdout).await;
+                        }
                     }
+                    eprintln!(
+                        "cimp-offload: /events stream lost (no data for 60s, or the app closed it); \
+                         reconnecting"
+                    );
                 }
             }
         }
         // App down or stream ended — back off and retry.
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::time::sleep(RELAY_REENTRY_BACKOFF).await;
     }
 }
 

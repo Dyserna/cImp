@@ -63,6 +63,51 @@ fn query_param_reads_the_events_identity() {
     ));
 }
 
+/// **#143 — the 20 s SSE keep-alive on `/events` is load-bearing, in both
+/// directions.**
+///
+/// The child bounds each read at `READ_IDLE = 60s` and breaks to reconnect when
+/// it expires, so a stream that goes quiet for longer than that is torn down and
+/// rebuilt — churn on every idle minute, and a window in each gap where a
+/// `change` frame is simply lost (the relay is the only channel one travels on).
+/// The keep-alive is what makes a quiet stream *idle* rather than *dead*, and it
+/// must stay under the child's watchdog with room to spare.
+///
+/// Pinned by reading this file: the tick lives inside a `tokio::select!` around a
+/// live `TcpStream`, which has no seam a unit test can drive without a socket.
+/// Every needle is single-line on purpose — the tree is CRLF locally and LF on
+/// the Linux runner.
+#[test]
+fn the_events_stream_writes_a_keep_alive_every_twenty_seconds() {
+    let src = include_str!("../events.rs");
+    let body = src
+        .split("pub(super) async fn handle_events(")
+        .nth(1)
+        .expect("handle_events exists");
+    assert!(
+        body.contains("let tick = tokio::time::sleep(Duration::from_secs(20));"),
+        "the /events loop must arm a 20s tick on every iteration — an idle stream \
+         that sends nothing is torn down by the child's 60s read watchdog"
+    );
+    let tick = body
+        .find("let tick = tokio::time::sleep(Duration::from_secs(20));")
+        .expect("the tick is armed");
+    let write = body
+        .find(r#"stream.write_all(b": keep-alive\n\n")"#)
+        .expect("the tick must write an SSE comment frame");
+    assert!(
+        tick < write,
+        "the keep-alive write belongs to the tick arm, after the timer is armed"
+    );
+    // The tick is armed INSIDE the loop, so any other frame resets it — a busy
+    // stream must not also pay for keep-alives it does not need.
+    let loop_at = body.find("loop {").expect("the fan-out loop exists");
+    assert!(
+        loop_at < tick,
+        "the tick must be re-armed per iteration, not once before the loop"
+    );
+}
+
 // ── V40 review H-1: ONE identity per grant-bearing route ──────────────
 
 /// The grant a call is served under and the taint latch that judges it

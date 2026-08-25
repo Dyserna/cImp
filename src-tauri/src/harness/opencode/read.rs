@@ -59,7 +59,7 @@ use std::time::Duration;
 use serde_json::Value;
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::sleep;
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use super::super::OobContext;
 use crate::offload::service::{valid_meta_key, PushGuard, PushNotice};
@@ -138,20 +138,54 @@ pub async fn run(port: u16, auth: Option<String>, ctx: OobContext) {
         ));
     }
 
+    // #142: how many consecutive attempts have failed WITHOUT this tap ever
+    // reading a byte. A tab whose server never comes up on the port cImp gave it
+    // looks, from every other angle, like a tab nobody has typed into — so the
+    // reconnect loop says so once it is past any plausible TUI boot, and again
+    // rarely enough not to spam a log.
+    let mut failures: u64 = 0;
     loop {
         if ctx.cancel.is_cancelled() {
             return;
         }
-        match consume(&client, port, &ctx, &sessions).await {
+        match consume(&client, port, auth.is_some(), &ctx, &sessions).await {
             Ok(StreamEnd::Cancelled) => return,
             Ok(StreamEnd::Closed) => {
                 // A live SSE stream never ends gracefully in normal operation,
                 // so a clean close means the server went away (e.g. the TUI
                 // restarted its HTTP server) — reconnect, don't stop.
+                failures = 0;
                 trace!(tab = ?ctx.tab, "OpenCode OOB: stream closed; reconnecting");
             }
             Err(e) => {
-                trace!(tab = ?ctx.tab, error = %e, "OpenCode OOB: stream ended; reconnecting");
+                failures += 1;
+                // The tap has never once reached this tab's server. `NEVER_UP`
+                // attempts at `RECONNECT_DELAY` is ~30 s — past the slowest TUI
+                // boot observed — and the repeat is every ~5 min after that.
+                const NEVER_UP: u64 = 60;
+                const REPEAT: u64 = 600;
+                let never = !crate::harness::reader::reader_source_reached(&ctx.tab);
+                if never && failures >= NEVER_UP {
+                    // Positive evidence, for the delegation preflight: this tab
+                    // cannot report the end of a turn, so a delegation into it
+                    // must be refused rather than left to run to its deadline
+                    // (#142). Reversed the moment a connect succeeds.
+                    crate::harness::reader::note_reader_source_unreachable(&ctx.tab);
+                }
+                if never && (failures == NEVER_UP || (failures > NEVER_UP && failures % REPEAT == 0))
+                {
+                    warn!(
+                        tab = ?ctx.tab,
+                        port,
+                        attempts = failures,
+                        authenticated = auth.is_some(),
+                        error = %e,
+                        "OpenCode OOB: this tab's event stream has never come up — the tab has no \
+                         turn boundaries, no TTS and cannot be a delegation worker"
+                    );
+                } else {
+                    trace!(tab = ?ctx.tab, error = %e, "OpenCode OOB: stream ended; reconnecting");
+                }
             }
         }
         tokio::select! {
@@ -211,6 +245,9 @@ enum StreamEnd {
 async fn consume(
     client: &reqwest::Client,
     port: u16,
+    // Whether the tap carries a credential, for the 401 diagnosis below. A fact
+    // about the launch, so it is passed rather than re-derived.
+    authenticated: bool,
     ctx: &OobContext,
     sessions: &SharedSessions,
 ) -> reqwest::Result<StreamEnd> {
@@ -219,8 +256,30 @@ async fn consume(
         _ = ctx.cancel.cancelled() => return Ok(StreamEnd::Cancelled),
         r = client.get(&url).send() => r?,
     };
+    // #142: a non-2xx here is the one failure that LOOKS like a healthy quiet
+    // tab — a 401 (this tab's server password and the tap's header disagree) or
+    // a 404 (a build whose route moved) 401s forever behind a 500 ms reconnect
+    // loop, and every symptom lands somewhere else: no turn boundaries, no TTS,
+    // no usage, and a delegation into the tab that never completes. Named
+    // before `error_for_status` swallows it into a `reqwest::Error` the caller
+    // logs at `trace`.
+    let status = resp.status();
+    if !status.is_success() {
+        warn!(
+            tab = ?ctx.tab,
+            port,
+            %status,
+            authenticated,
+            "OpenCode OOB: the tab's event stream refused the tap — this tab has no turn \
+             boundaries, no TTS and cannot be a delegation worker"
+        );
+    }
     let mut resp = resp.error_for_status()?;
-    debug!(tab = ?ctx.tab, "OpenCode OOB: event stream connected");
+    // #142: the reader is attached from the instant the PTY spawns, but only
+    // THIS line means it is actually reading — `delegation`'s preflight 11 asks
+    // for it before driving a worker (`reader::reader_source_reached`).
+    ctx.note_source();
+    info!(tab = ?ctx.tab, port, "OpenCode OOB: event stream connected");
 
     // The tracker's speech/part buffers are per connection; its SESSION facts
     // are not — they live in `sessions`, which outlives every reconnect.
@@ -2291,7 +2350,7 @@ mod tests {
         let client = reqwest::Client::new();
         let end = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            consume(&client, port, &ctx, &SharedSessions::default()),
+            consume(&client, port, false, &ctx, &SharedSessions::default()),
         )
         .await
         .expect("consume must return when the stream closes")

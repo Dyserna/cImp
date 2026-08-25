@@ -102,6 +102,31 @@ pub(in crate::offload) fn push_frame(notice: &PushNotice) -> Vec<u8> {
     format!("event: push\ndata: {data}\n\n").into_bytes()
 }
 
+/// #143: logs one child's departure from the push registry, on every exit path
+/// [`handle_events`] has — including task cancellation, which is how a tab
+/// closing takes its subscriber with it.
+///
+/// A guard rather than a line at the end of the loop, for the same reason
+/// [`PushGuard`](super::service::PushGuard) is one: the loop has six `break`s
+/// and a `?`, and a departure line that only some of them reach is worse than
+/// none — it reads as "still subscribed".
+struct SubscriberLog {
+    service: Arc<OffloadService>,
+    tab: Option<String>,
+    consumer: String,
+}
+
+impl Drop for SubscriberLog {
+    fn drop(&mut self) {
+        info!(
+            tab = ?self.tab,
+            consumer = %self.consumer,
+            subscribers = self.service.push_registry().subscriber_count(),
+            "offload loopback: /events subscriber dropped"
+        );
+    }
+}
+
 /// `GET /events`: an SSE stream carrying two event types to one per-tab
 /// `--offload-mcp` child —
 ///
@@ -152,13 +177,28 @@ pub(super) async fn handle_events(
     // Anything but an explicit affirmative means "no channels" — a pre-V30
     // child sends no `channels` param at all and must never be pushed to.
     let channels = matches!(query_param(&req.path, "channels"), Some("1") | Some("true"));
-    debug!(
+    // #143: INFO, not DEBUG, and both edges. The subscriber set IS the session
+    // push surface — a child that is not on this list cannot receive a
+    // `tools/list_changed`, and the tab's model keeps a stale tool list until it
+    // is restarted. A ship-level log carries the set as it changes; a DEBUG one
+    // is absent from every log a user actually sends.
+    // Declared BEFORE `_push_guard` so it drops AFTER it (locals drop in reverse
+    // declaration order): the count in the departure line is then the set as it
+    // stands WITHOUT this child, which is the number the reader wants.
+    let _log_drop = SubscriberLog {
+        service: service.clone(),
+        tab: tab.clone(),
+        consumer: consumer.clone(),
+    };
+    let (_push_guard, mut push_rx) =
+        service.register_push_subscriber(tab.clone(), consumer.clone(), channels);
+    info!(
         tab = ?tab,
         consumer = %consumer,
         channels,
-        "offload loopback: /events subscriber connected"
+        subscribers = service.push_registry().subscriber_count(),
+        "offload loopback: /events subscriber registered"
     );
-    let (_push_guard, mut push_rx) = service.register_push_subscriber(tab, consumer, channels);
 
     let mut rx = service.subscribe_changes();
     loop {

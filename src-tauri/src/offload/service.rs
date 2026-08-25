@@ -594,10 +594,13 @@ impl PushRegistry {
             .remove(&id);
     }
 
-    /// Live subscriber count. Test-only: the diagnostic wrapper on
-    /// `OffloadService` went away with the Phase 0 `/push_test` rig, and the
-    /// registry's real consumers count deliveries, not subscribers.
-    #[cfg(test)]
+    /// Live subscriber count.
+    ///
+    /// #143 gave it a production consumer: `loopback::handle_events` logs it on
+    /// every register/drop, so `cimp.log` carries the live child set as it
+    /// changes. Without that, "which of my tabs still has a session-push relay?"
+    /// was answerable only by reading `netstat` against the loopback port — which
+    /// is how a dead relay cost an evening of bisection.
     pub fn subscriber_count(&self) -> usize {
         self.subs.lock().unwrap_or_else(|p| p.into_inner()).len()
     }

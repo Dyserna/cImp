@@ -474,6 +474,11 @@ pub async fn run(project_dir: PathBuf, pinned_session: Option<String>, ctx: OobC
                 // mid-session ⇒ pre-existing agent transcripts seek to EOF.
                 subs.reset(first_attach);
                 first_attach = false;
+                // #142: a transcript to tail IS this tap's source. Recorded on
+                // every rotation, not only the first: `reader_source_reached`
+                // asks about the CURRENT registration, and rotation is the one
+                // edge that proves the source still exists.
+                ctx.note_source();
                 cur = Some(path);
                 // Any agents we were tracking belonged to the previous session
                 // file; a new file is a new session. Clear and, if we had

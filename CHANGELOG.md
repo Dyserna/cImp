@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.54.0-rc.2] — 2026-08-25
+
+_rc.1 was dead on CI (never published): a Linux-only compile error from the
+sandbox split (a bare `linux::` path only resolvable pre-split) and the CI
+ignored-set tripwire correctly refusing Phase 0's new release-profile
+measurement test. No functional change over rc.1's intent._
+
 ## [0.54.0-rc.1] — 2026-08-25
 
 _The V42 milestone: headless core + repo-wide refactoring (#106, #113–#140).

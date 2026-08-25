@@ -652,7 +652,7 @@ pub fn denial_signature(
 ///
 /// The first clause is what the USER asked for and reads the same everywhere.
 /// On Linux a second clause states what the KERNEL is actually enforcing
-/// ([`linux::posture_note`]) — the ABI, and which of the two network holes
+/// ([`super::linux::posture_note`]) — the ABI, and which of the two network holes
 /// applies — because `network=off` on a Landlock box means "TCP is scoped, UDP
 /// is not" or, below ABI 4, "nothing is scoped", and a posture line that stops
 /// at `off` would be promising confinement the kernel is not providing.
@@ -671,12 +671,12 @@ pub(super) fn posture(cfg: &SandboxCfg) -> String {
 ///
 /// Empty on Windows on purpose: an AppContainer's `internetClient` capability
 /// is all-or-nothing and `network=on/off` says the whole truth about it. Linux
-/// is the platform where it does not — see [`linux::posture_note`].
+/// is the platform where it does not — see [`super::linux::posture_note`].
 #[cfg_attr(not(windows), allow(dead_code))]
 fn engine_posture(cfg: &SandboxCfg) -> String {
     #[cfg(target_os = "linux")]
     {
-        linux::posture_note(cfg.allow_network)
+        super::linux::posture_note(cfg.allow_network)
     }
     #[cfg(not(target_os = "linux"))]
     {

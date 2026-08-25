@@ -244,6 +244,9 @@ jobs:
             'harness::opencode::plugin::tests::the_gate_and_beacon_survive_a_fetch_swap_after_load'
           )
           $expected = ($nodeBacked + @(
+            # V42 Phase 0: the PTY-sink dispatch measurement — only meaningful at
+            # the release profile; its own doc says dev/CI numbers are noise.
+            'service::sink::tests::measure_output_sink_dispatch_overhead',
             'tts::engine::tests::synthesizes',
             'tts::phonemize::tests::espeak_fallback_engages_on_oov'
           )) | Sort-Object

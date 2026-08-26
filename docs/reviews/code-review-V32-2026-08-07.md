@@ -1,7 +1,7 @@
-# Code review — V32 injection hardening (033b36e…f5fb221)
+# Code review — V32 injection hardening (f4b0a03…b002c6b)
 
 **Date:** 2026-08-07
-**Range:** `033b36e~1..HEAD` on `develop` — 14 commits, 76 files, ~23.4k insertions.
+**Range:** `f4b0a03~1..HEAD` on `develop` — 14 commits, 76 files, ~23.4k insertions.
 **Method:** 9 parallel Opus 5 agents, one per phase/domain plus a build-verification leg,
 each briefed with the locked decisions from `MILESTONE-V32-injection-hardening.md` and
 tasked to treat every "as built" spec claim as a hypothesis to falsify. Orchestrator

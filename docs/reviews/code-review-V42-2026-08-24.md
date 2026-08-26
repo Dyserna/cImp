@@ -1,19 +1,19 @@
-# Code review — V42 (`develop..f30b0cf`), 2026-08-24
+# Code review — V42 (`develop..84cde16`), 2026-08-24
 
 Adversarial review at **high** effort over the V42 refactoring milestone's
 diff: Phase C (per-project UI state), Phase D (loopback route split, latch
 extraction), Phase E (generated settings bindings), plus the CI gate that
-landed with them. The five CSS-consolidation commits after `f30b0cf`
-(`59bad07`…`8372e3e`) were **out of scope** and are untouched.
+landed with them. The five CSS-consolidation commits after `84cde16`
+(`3499133`…`b5f479a`) were **out of scope** and are untouched.
 
 **Reviewer output:** 44 raw findings → 31 unique → **27 verified** (23
 CONFIRMED, 4 PLAUSIBLE). Four were **refuted** on inspection and are recorded
 at the end so they are not re-raised.
 
 **Disposition:** 25 CLOSED in this pass, 2 DEFERRED with an owner. Every CLOSE
-carries its commit below. All four gates green at `8c7b786`:
+carries its commit below. All four gates green at `327ff35`:
 
-| Gate | Baseline (`8372e3e`) | After |
+| Gate | Baseline (`b5f479a`) | After |
 |---|---|---|
 | `cargo test --bin cimp` | 2896 passed · 0 failed · 6 ignored | **2907 · 0 · 6** |
 | `npx vitest run` | 887 tests · 45 files | **896 · 45** |
@@ -44,7 +44,7 @@ anyway. Module docs rewritten; the test that asserted removal now asserts
 retention, plus a two-checkout test and a structural "the import calls
 `removeItem` zero times" assertion.
 
-**Commit:** `728d955`
+**Commit:** `fa259ad`
 
 ### RV-2 — the 250 ms debounce re-introduced the closing race
 
@@ -62,7 +62,7 @@ drag sends per task. `pagehide` stays as a belt. The inaccurate comments are
 corrected here and in `ipc/ui_state.rs`. Tests use fake timers so a
 re-introduced `setTimeout` cannot be papered over by real time passing.
 
-**Commit:** `7f11f70`
+**Commit:** `81ecbd3`
 
 ### RV-3 — `mount(App)` was gated on an unbounded file read
 
@@ -80,7 +80,7 @@ what keeps `main.ts`'s hidden-tab ordering guarantee intact — an empty
 hidden-tab set can un-hide tabs for that session, but the popover's write
 cannot persist the emptiness back over the user's choice.
 
-**Commit:** `6dc17fe`
+**Commit:** `67dcd29`
 
 ### RV-4 — `hydrated = true` was set before the import ran
 
@@ -95,7 +95,7 @@ nothing is deleted, the marker stays absent, the next launch runs the whole
 import. Both write-live paths (marker already present, import just committed)
 have their own tests.
 
-**Commit:** `728d955`
+**Commit:** `fa259ad`
 
 ### RV-5 — two instances on one project root clobber each other
 
@@ -121,7 +121,7 @@ for two), then to succeed once the first is dropped.
 primitive, no supply-chain surface, no license to review. The declared MSRV is
 not verified by CI either way (documented gap, `tests.yml` header).
 
-**Commit:** `4f935de`
+**Commit:** `1e168e8`
 
 ### RV-6 — no CI job ran `svelte-check`
 
@@ -141,7 +141,7 @@ maintain re-proving one result. `npm run build` already ran on **both** jobs
 caught a real break during this milestone. `docs/MAINTENANCE.md`'s CI-coverage
 table is updated to match.
 
-**Commit:** `22c4f3d`
+**Commit:** `7cff6e9`
 
 ### RV-7 — the route-file join could not see `pub(crate) mod`
 
@@ -166,7 +166,7 @@ scrape keeps it and the assertion fails naming the missing row. Five permanent
 assertions pin the spellings that must be seen, four the shapes that must not
 (prose, a nested `mod`, an inline module, a lookalike identifier).
 
-**Commit:** `8d0f1cb`
+**Commit:** `67f7628`
 
 ### RV-8 — the hand-written serde seams were verified by nothing
 
@@ -203,7 +203,7 @@ tests fail naming the drift (`["INHERIT","OFF","ON"]` vs
 what Vite bundles and what CI checks out), and the note on `GENERATED_TS`
 records the one-build latency and why it is not a gap.
 
-**Commit:** `66f5669`
+**Commit:** `b214d50`
 
 ### RV-9 — a presence scan a comment could satisfy
 
@@ -228,7 +228,7 @@ five cases in `rustsrc::tests`, three in
 commented fixture *does* contain the needle as raw text — so the control cannot
 pass on nothing.
 
-**Commit:** `8d0f1cb`
+**Commit:** `67f7628`
 
 ### RV-10 — a downgraded build destroyed a future `ui_state.json`
 
@@ -246,7 +246,7 @@ swallowed — the write-failure path logs **once** per window and nothing is
 re-queued, so an old build stays perfectly usable on such a project and simply
 stops persisting.
 
-**Commits:** `4f935de` (Rust refusal + tests), `7f11f70` (frontend log-once)
+**Commits:** `1e168e8` (Rust refusal + tests), `81ecbd3` (frontend log-once)
 
 ---
 
@@ -254,15 +254,15 @@ stops persisting.
 
 | # | Finding | Fix | Commit |
 |---|---|---|---|
-| D-1 | The `cssTokens` guard read `SRC_FILES` only, so the theme sheets that DECLARE the tokens were never asked whether the tokens *they* consume resolve — the defect-D2 shape one layer below where #113 was looking. | One list in both roles. Vacuity guard gains a clause asserting theme sheets actually reached the scan (`walk` swallows a missing directory). Negative control: `var(--rv-probe-undeclared)` in `tui_theme.css` fails naming file, line and token. | `8c7b786` |
-| D-2 | `harness/health.rs`'s field tripwire was re-pointed at `concat!(types.ts, generated/settings.ts)` with a plain `.contains` — ~1,900 lines of generated prose behind every needle. `auto_verify` is satisfied by two doc comments about `claude_auto_verify` that would survive a rename of the field. | Hand-written names checked against `types.ts` alone; `auto_verify` against the sliced `HarnessSettings` declaration and by declaration form (`name: `). Two permanent controls. | `f0ecac7` |
-| D-3 | The CI bindings gate ran `git diff --exit-code`, which sees TRACKED files only — a generator emitting a NEW file leaves it untracked and the gate stays green. | Both jobs also run `git ls-files --others` over the directory, without `--exclude-standard` so a `.gitignore` cannot hide it, with actionable `::error::` on either half. | `22c4f3d` |
-| D-4 | `write_if_changed(&ts_path, &generated)` in `settings::codegen` was dead: `generated` had just been read from that same file, so the comparison always matched. | The read-back becomes the check it stood in for — a CR byte in ts-rs's output would fail CI's byte-exact diff on every Windows run. | `66f5669` |
-| D-5 | `ui_state`'s file I/O — including `write_atomic`'s real `sync_all()` and two unbounded waits — ran on a tokio worker. | Both commands on `spawn_blocking`. | `4f935de` |
-| D-6 | A third private copy of the `.cimp` path constant (`settings::persistence`, `ipc::note`, `ipc::ui_state`), plus a fourth literal in `fsutil`. | One `fsutil::CIMP_DIR_NAME`; the name is a filesystem-layout fact, so it belongs in the path module all of them already depend on rather than in the settings module none of them wanted to depend on. | `8c387e4` |
-| D-7 | `top_level_fn` was a byte-identical copy of `fn_body`, described as its "non-`async` twin" (it never was — the signature is a parameter). | Deleted; two copies of a scanner primitive is one copy that gets hardened. | `8d0f1cb` |
-| D-8 | `bad_body_result` re-spelled `bad_request`'s three fields one function away from it. | It delegates; the parse detail in the message is the only difference. | `8d0f1cb` |
-| D-9 | `offload::latch` imported `bounded_id` and `live_settings` from `offload::loopback` — a back-edge from the module V42 R3 extracted to the module it was extracted from. | Neither is about routing; both move up to `offload`, and `loopback` re-exports them for its family files' `use super::*` and for `harness::claude::hook`. | `8d0f1cb` |
+| D-1 | The `cssTokens` guard read `SRC_FILES` only, so the theme sheets that DECLARE the tokens were never asked whether the tokens *they* consume resolve — the defect-D2 shape one layer below where #113 was looking. | One list in both roles. Vacuity guard gains a clause asserting theme sheets actually reached the scan (`walk` swallows a missing directory). Negative control: `var(--rv-probe-undeclared)` in `tui_theme.css` fails naming file, line and token. | `327ff35` |
+| D-2 | `harness/health.rs`'s field tripwire was re-pointed at `concat!(types.ts, generated/settings.ts)` with a plain `.contains` — ~1,900 lines of generated prose behind every needle. `auto_verify` is satisfied by two doc comments about `claude_auto_verify` that would survive a rename of the field. | Hand-written names checked against `types.ts` alone; `auto_verify` against the sliced `HarnessSettings` declaration and by declaration form (`name: `). Two permanent controls. | `d9c8cc9` |
+| D-3 | The CI bindings gate ran `git diff --exit-code`, which sees TRACKED files only — a generator emitting a NEW file leaves it untracked and the gate stays green. | Both jobs also run `git ls-files --others` over the directory, without `--exclude-standard` so a `.gitignore` cannot hide it, with actionable `::error::` on either half. | `7cff6e9` |
+| D-4 | `write_if_changed(&ts_path, &generated)` in `settings::codegen` was dead: `generated` had just been read from that same file, so the comparison always matched. | The read-back becomes the check it stood in for — a CR byte in ts-rs's output would fail CI's byte-exact diff on every Windows run. | `b214d50` |
+| D-5 | `ui_state`'s file I/O — including `write_atomic`'s real `sync_all()` and two unbounded waits — ran on a tokio worker. | Both commands on `spawn_blocking`. | `1e168e8` |
+| D-6 | A third private copy of the `.cimp` path constant (`settings::persistence`, `ipc::note`, `ipc::ui_state`), plus a fourth literal in `fsutil`. | One `fsutil::CIMP_DIR_NAME`; the name is a filesystem-layout fact, so it belongs in the path module all of them already depend on rather than in the settings module none of them wanted to depend on. | `0055f59` |
+| D-7 | `top_level_fn` was a byte-identical copy of `fn_body`, described as its "non-`async` twin" (it never was — the signature is a parameter). | Deleted; two copies of a scanner primitive is one copy that gets hardened. | `67f7628` |
+| D-8 | `bad_body_result` re-spelled `bad_request`'s three fields one function away from it. | It delegates; the parse detail in the message is the only difference. | `67f7628` |
+| D-9 | `offload::latch` imported `bounded_id` and `live_settings` from `offload::loopback` — a back-edge from the module V42 R3 extracted to the module it was extracted from. | Neither is about routing; both move up to `offload`, and `loopback` re-exports them for its family files' `use super::*` and for `harness::claude::hook`. | `67f7628` |
 
 ### One claim not reproduced
 
@@ -283,7 +283,7 @@ test's second render is the point of that test and stays. Recorded rather than
 | # | Finding | Ruling |
 |---|---|---|
 | DEF-1 | `ToolActivityView`'s tool-list tripwire — the D1 stopgap is not its real fix. | **Deferred to #131 (codegen).** Codegen is the actual fix; a note is on that issue. Not touched here. |
-| DEF-2 | `DURABLE_VIEW_PREFS` is a hand-kept allowlist nothing checks, and the permanent import marker orphans any key promoted later. | **Accepted and documented** in `uiState.ts`'s module docs (`a916d69`): adding a durable pref means editing the set, and a missing name routes to `localStorage` quietly (the value persists, in the wrong scope); a pref promoted after a project's marker is set is never imported, because the marker means "this project has been through the import", not "these keys have been". Both accepted — the set has been stable, promotions are a deliberate reviewed act, and the alternative is machinery guarding a once-a-year event whose failure mode is one toggle reverting to its default. The honest fix if it bites is a one-off migration for that key, never a change to the marker's meaning. The build-time name-join that would close the first properly is the same shape as the `cssTokens` guard and rides with #131. |
+| DEF-2 | `DURABLE_VIEW_PREFS` is a hand-kept allowlist nothing checks, and the permanent import marker orphans any key promoted later. | **Accepted and documented** in `uiState.ts`'s module docs (`c1a0de9`): adding a durable pref means editing the set, and a missing name routes to `localStorage` quietly (the value persists, in the wrong scope); a pref promoted after a project's marker is set is never imported, because the marker means "this project has been through the import", not "these keys have been". Both accepted — the set has been stable, promotions are a deliberate reviewed act, and the alternative is machinery guarding a once-a-year event whose failure mode is one toggle reverting to its default. The honest fix if it bites is a one-off migration for that key, never a change to the marker's meaning. The build-time name-join that would close the first properly is the same shape as the `cssTokens` guard and rides with #131. |
 
 ---
 
@@ -345,11 +345,11 @@ the module's stated posture — *loses persistence, never breaks the UI*.
 identical primitive (`flock` on Unix, `LockFileEx` on Windows), no new crate in
 `Cargo.lock`, no license or build impact. The cost is `rust-version` 1.88 →
 1.89, recorded in `src-tauri/Cargo.toml` and in `docs/MAINTENANCE.md`'s
-not-covered-by-CI list. `Cargo.lock` is byte-identical to `8372e3e`.
+not-covered-by-CI list. `Cargo.lock` is byte-identical to `b5f479a`.
 
 ---
 
-# Tranche 2 — review of `ed1e93e..develop`, 2026-08-24
+# Tranche 2 — review of `a87ad7d..develop`, 2026-08-24
 
 A second adversarial pass, at **high** effort, over the V42 **tranche-2** merges
 — lane A (machine-scope table #116, migration floor + step deletion #120, schema
@@ -362,7 +362,7 @@ objects #126 R26).
 below so they are not re-raised. **Every one of the ten was ruled CLOSE**, and
 every one carries its commit here.
 
-| Gate | Baseline (`3542dad`) | After (`a2da0a0`) |
+| Gate | Baseline (`5cfa3d9`) | After (`085b6b9`) |
 |---|---|---|
 | `cargo test --all-targets` | 2834 passed · 0 failed · 6 ignored | **2838 · 0 · 6** |
 | `cargo clippy --all-targets` | clean | **clean** |
@@ -374,8 +374,8 @@ Known flakes, unchanged by this pass: `sandbox::windows`'s mapped-drive case,
 and the gitignored census check (#135 — intermittent in a full run, green in
 isolation).
 
-One commit in the range is not a finding: `3e2bd94` regenerates
-`src/lib/settings/generated/settings.ts` after `0447d77`'s prose re-point, which
+One commit in the range is not a finding: `0854924` regenerates
+`src/lib/settings/generated/settings.ts` after `04f47ba`'s prose re-point, which
 changed a Rust doc comment mirrored into the generated bindings without
 regenerating them — the CI bindings diff would have gone red on the next run.
 The sentence itself was re-wrapped too: it ran past the column and closed a
@@ -392,7 +392,7 @@ defaults become the live `Settings`, and the next write of the global file —
 out-of-band writers — put them straight over the user's ONE remaining copy of
 settings this build could not read and could not move aside.
 
-**Fixed** (`526bd91`): the failure latches the path (`PRESERVED_GLOBAL`, one
+**Fixed** (`2ddace7`): the failure latches the path (`PRESERVED_GLOBAL`, one
 slot, path-keyed) and `save_to` — the single write path every global writer
 funnels through — refuses it loudly for the rest of the session, returning an
 error so each caller's own "save failed" log fires too. A successful quarantine
@@ -419,7 +419,7 @@ DEFAULTS baseline, and serde silently dropped every key the deleted steps would
 have MOVED — the invisible per-project loss V40 Phase I closed, arriving through
 the floor.
 
-**Fixed** (`123cb6b`): `load_global` answers with a
+**Fixed** (`9379ee6`): `load_global` answers with a
 `GlobalLoad { settings, stated, below_floor }`, and `overlay_entry_version` is
 the one place the entry version is decided — own stamp, else the version the
 global file stated beside it, else CURRENT, except when the global was
@@ -439,7 +439,7 @@ unstamped-refused, and the two ordinary ones.
 the form chrome out of `SettingsApp.svelte` unscoped it, so it reaches markup no
 scoped rule ever could. #129 audited the sections; these two are what it did not.
 
-**Fixed** (`a2da0a0`):
+**Fixed** (`085b6b9`):
 
 * `EnvEditor`'s `.remove:hover` (0,3,0) lost background and border-colour to the
   chrome's `button:hover:not(:disabled)` (0,3,1) and kept only the danger
@@ -474,7 +474,7 @@ them. A name comparison re-added there is a dispatch surface with no row, whose
 tool classifies EXTERNAL and is waved past the latch on a native route (finding
 M-2, and M-8 for why `run_check` sitting in one of those bodies mattered).
 
-**Fixed** (`dd0762f`) with the opposite assertion, which is the stronger one
+**Fixed** (`d1f231c`) with the opposite assertion, which is the stronger one
 here: `NAME_BLIND_ENTRY_POINTS` names both bodies and the test asserts they
 compare no tool name (`name == "x"`, `match name`, `matches!(name`), still call
 `dispatch_rootless`, and that the table holds both.
@@ -490,7 +490,7 @@ this was the monolith's own state and lived as long as the window; the split
 moved it into the children by default and turned "come back to it later" into
 "start again" — silently, because nothing that survives a REMOUNT was involved.
 
-**Fixed** (`b8eb050`): hoisted back to `SettingsApp`, reaching their section as
+**Fixed** (`03fd66b`): hoisted back to `SettingsApp`, reaching their section as
 props + callbacks (the pattern `tabsSubSection` already used) — the offload test
 box's prompt and result plus its sub-tab, the Appearance save-preset dialog
 (open / name / error, as one value: the three are always written together), the
@@ -507,7 +507,7 @@ most to lose — a probe is an IPC round trip the user asked for.
 built to catch (#129's ungated `commitGraphIgnore`) could therefore be reopened
 in any of the other twenty-one with the guard still passing.
 
-**Fixed** (`26e86c7`) by making the pair inseparable rather than by scanning more
+**Fixed** (`0ac7e42`) by making the pair inseparable rather than by scanning more
 files for it. `pushDraft(sync, next)` registers the push, sends it, and settles
 the window in either direction; the window's four pushers route through it and
 `SettingsApp` no longer imports `applySettings` at all. The structural scan is
@@ -531,7 +531,7 @@ relation's staged rows over its own live relation — the direction that loses
 rows, performed by the branch that exists to prevent losing them. The engine sees
 one call at a time, so the property is across call sites and had no owner.
 
-**Fixed** (`10749b5`): a scan of the two constructing files resolves each site's
+**Fixed** (`2786b75`): a scan of the two constructing files resolves each site's
 `live`/`stage` (a literal or a `Self::CONST` declared in the same file, panicking
 on anything it cannot read) and asserts the stages are pairwise distinct, differ
 from their own live relation, and collide with no other site's live relation.
@@ -549,7 +549,7 @@ left the parameter behind: `persistence::load` threaded it into
 `migrate_if_needed` and `migrate_overlay`, which handed it to eight wrappers
 whose entire body was to drop it.
 
-**Fixed** (`072ce44`): steps are `fn(&mut Value)`, the eight wrappers are gone
+**Fixed** (`563bd74`): steps are `fn(&mut Value)`, the eight wrappers are gone
 and `MIGRATION_STEPS` points at the transforms directly, both public entry points
 lose the parameter as do their two call sites, and `fake_default_shell` plus its
 thirteen `let shell = …` lines go with them — as does the comment claiming the
@@ -563,7 +563,7 @@ test asserting the two agreed. The disagreement it guarded against was not
 cosmetic: the marker does no work of its own, so a `Banned` row whose key the
 const never gained is a family stripped by nothing on all three legs.
 
-**Fixed** (`1d68120`): `strip_overlay_banned` walks the table itself. The const
+**Fixed** (`f1af436`): `strip_overlay_banned` walks the table itself. The const
 is gone, and with it the agreement half of the test; what that half was really
 asserting is asserted directly instead — a banned row's keys must be TOP-LEVEL
 names, because the pass is a top-level `remove` — plus a vacuity guard. The
@@ -585,7 +585,7 @@ from `tests/cssTokens.test.ts`. Two copies of a walk is one copy that can grow a
 exclusion the other never hears about — a guard that quietly stops looking at
 part of the tree, which is the failure mode both of these exist to prevent.
 
-**Fixed** (`4b249a0`): they live in `tests/repoFiles.ts` (not a `*.test.ts`, so
+**Fixed** (`224e541`): they live in `tests/repoFiles.ts` (not a `*.test.ts`, so
 vitest does not collect it), with the reason they are outside `src/` written down
 once. Two costs in the orphan scan went with the duplication: `unscopedCss()` —
 every theme sheet plus every `.svelte` file in the repo, for the `:global(…)`
@@ -626,7 +626,7 @@ test-covered:
 
 ---
 
-# Phase F — review of `3542dad..develop`, 2026-08-25
+# Phase F — review of `5cfa3d9..develop`, 2026-08-25
 
 The **final** review pass of the milestone, at **high** effort, over everything
 that landed after tranche 2: the tab-lifecycle service (#136/A1), the offload
@@ -635,9 +635,9 @@ diff (#139), the codegen of the tool reference and event names (#131), and the
 CSS/Code-Intelligence split.
 
 **Reviewer output:** 10 findings verified, 2 refuted, 1 dropped at cap.
-**Disposition: all 10 CLOSED.** Every gate green at `f6292bc`:
+**Disposition: all 10 CLOSED.** Every gate green at `976288c`:
 
-| Gate | Baseline (`568eabd`) | After |
+| Gate | Baseline (`85dea26`) | After |
 |---|---|---|
 | `cargo test --bin cimp` | 2997 passed · 0 failed · 7 ignored | **3002 · 0 · 7** |
 | `cargo clippy --all-targets` | clean | **clean** |
@@ -652,7 +652,7 @@ on the runbook instead, and say why.
 
 ## The ten
 
-### F-1 — `reconfigure_shell` dropped the lifecycle serializer (`7efc5e2`)
+### F-1 — `reconfigure_shell` dropped the lifecycle serializer (`d666022`)
 
 `service/tabs.rs`. The A1 fold moved the command's body into `TabService` but
 left `let _serializer = state.lifecycle_serializer.lock().await` behind at the
@@ -676,7 +676,7 @@ on a path the user drives one dialog at a time.
 serializer, pins the call's future, asserts no progress, drops the guard and
 asserts the edit lands. Probed red by deleting the lock line.
 
-### F-2 — Trace path's confidence badges lost their colour in the CSS split (`31373ce`)
+### F-2 — Trace path's confidence badges lost their colour in the CSS split (`3fcf510`)
 
 `codeIntel/AnalysesSection.svelte`. The split moved `.conf.extracted` /
 `.conf.inferred` / `.conf.ambiguous` into that component's SCOPED `<style>`,
@@ -697,7 +697,7 @@ rules reached it, which is now true.
 No test can see this — the classes are present in both markups either way, and
 what changed is which stylesheet resolves them. **Eyes-on: LV-41.**
 
-### F-3 — enabling an AI builtin stole focus (`0f823bf`)
+### F-3 — enabling an AI builtin stole focus (`ec808e5`)
 
 `service/tabs.rs`. `commit_new_tab` absorbed four copies of the commit
 sequence, three of which activated the new tab. The fourth,
@@ -719,7 +719,7 @@ behaviour. The branch says why activation is the user-tab half of the sequence
 tab across a `set_enabled_ai` AND the signal sequence the frontend reconciles
 from (`TabAdded` alone). Probed red with the branch forced true.
 
-### F-4 — the confined walk leaked the tree on a failed wait (`80a57ff`)
+### F-4 — the confined walk leaked the tree on a failed wait (`d7bae46`)
 
 `sandbox/confine.rs`, and this one is TCB. `kill_tree` fired on `Cancelled |
 TimedOut`. A `WaitFailed` — `child.wait()` itself erroring — left the child and
@@ -749,7 +749,7 @@ by variant — there is no portable way to make `child.wait()` fail, so the rule
 is pinned where it is decided. Named suites green: `sandbox::` 97, `audit::`
 109, `checks::` 142. **LV-B8 is the live half** and gets a sharper expectation.
 
-### F-5 — the diff-summary poll paid for a word diff nobody renders (`4669be1`)
+### F-5 — the diff-summary poll paid for a word diff nobody renders (`23aff2f`)
 
 `workbench/diff.rs` + `workbench/mod.rs`. Phase D moved the intra-line word
 diff into the parse, so `parse_unified` ran the O(n·m) LCS for every changed
@@ -779,7 +779,7 @@ groups, the hunk hash is identical across modes (it is a function of the parsed
 content, not of the mode), and the rows come out the same either way. The 18
 #139 word-diff cases are green and untouched.
 
-### F-6 — DEF-2's name-join, orphaned by #131, written (`f6292bc`)
+### F-6 — DEF-2's name-join, orphaned by #131, written (`976288c`)
 
 `uiState.ts`. DEF-2 recorded `DURABLE_VIEW_PREFS` as a hand-kept allowlist
 nothing checks, accepted with a note, and pointed at "the same build-time
@@ -811,7 +811,7 @@ accepted, and the doc says so.
 join naming it and its file; adding `nowhere.at-all` to the durable set fails
 the orphan join. Both reverted.
 
-### F-7 — the keep-alive poll guard had two holes (`28a833d`)
+### F-7 — the keep-alive poll guard had two holes (`a7f9505`)
 
 `tests/keepAlivePolls.test.ts`. Both let through exactly the bug the guard
 exists for.
@@ -838,7 +838,7 @@ over. The vacuity floor gained a third clause, so a walk that regresses to
 helper user) and one planted in `src/lib/graph.ts` both fail the guard, named;
 both were invisible to the previous version. Reverted.
 
-### F-8 — nine byte-alike test fixtures, in the milestone that removed duplication (`150185c`)
+### F-8 — nine byte-alike test fixtures, in the milestone that removed duplication (`c374942`)
 
 The service split gave eight test modules the same two needs and each grew its
 own copy of the answer: eight `ScratchDir`s (one calling itself `TempCwd`),
@@ -872,7 +872,7 @@ exemption that covers the tree silences the tripwire it rides on. Suite count
 unchanged by the consolidation itself, which is the point: the fixtures moved,
 no coverage did.
 
-### F-9 — the crate source walk ran once per scanner (`5ce5104`)
+### F-9 — the crate source walk ran once per scanner (`34fd9fc`)
 
 `rustsrc.rs`. `source_files()` re-walked and re-read ~250 `.rs` files on every
 call, and roughly fifteen source-scanning tests call it in one `cargo test`
@@ -892,7 +892,7 @@ in the first failure.
 allocation, so the memo cannot silently stop being one. Wall clock on the full
 suite: 273s → 248s.
 
-### F-10 — a failed live-usage fetch stranded the Cost card (`5cdf978`)
+### F-10 — a failed live-usage fetch stranded the Cost card (`d3ecf6c`)
 
 `codeIntel/UsageOverview.svelte`. `liveFetchKey` is stamped with the
 `sid:turns` snapshot BEFORE the await, as an in-flight guard, and was never

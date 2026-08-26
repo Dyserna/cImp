@@ -9,7 +9,7 @@ Live-verify tracked in #72. GitHub: milestone 6, umbrella #30.
 > trusting any earlier sentence in this document about what the sandbox can do.**
 >
 > 1. **A contained process CAN spawn children.** A round-2 claim that it cannot
->    (shipped briefly in `e632847`) was FALSE and is retracted in code. A full
+>    (shipped briefly in `002210c`) was FALSE and is retracted in code. A full
 >    bisect reproducing cImp's exact production spawn shape — profile, handle
 >    list, `bInheritHandles`, kill-on-close job, minimal env, piped stdio — found
 >    grandchildren work under every combination, including a real
@@ -54,7 +54,7 @@ Live-verify tracked in #72. GitHub: milestone 6, umbrella #30.
 > a runtime and are candidates for a per-tool `sandbox: required|optional|
 > unsupported` declaration when V38 makes tools manifest-driven.
 **Amendments:** 2026-08-09 — Phase F's throttling note, made false by V32's
-`946d7d1` (checkpoint throttle re-keyed per `(root, tab)`). **2026-08-13 — a
+`f8e1097` (checkpoint throttle re-keyed per `(root, tab)`). **2026-08-13 — a
 six-agent investigation verified this spec against the live tree and found
 several of its load-bearing claims false**; each correction is dated in place
 under the claim it corrects — the "Builds on" line below, decision 1, decision 7,
@@ -77,7 +77,7 @@ step beyond per-process sandboxing, and its platform story diverges — WSL2 and
 Windows Sandbox do not exist on Linux, where the same tier is a rootless
 container; V36 carries the Windows (`.wsb`) and Linux (podman/bwrap) legs as
 first-class peers. **V33 closes on per-process OS sandboxing alone:** Phase A
-(implemented `15ad514`, live-verified 2026-08-18 on v0.52.0-rc.8 in both
+(implemented `787ade0`, live-verified 2026-08-18 on v0.52.0-rc.8 in both
 network modes), the `run_check`/`audit` seam increment, Phase B (S3-gated tab
 spawns), Phase D's Landlock half, and live-verify #72. The moved sections below
 (§ Max Paranoia Mode — platform designs, S4/S5, Phase C, decisions 4/9's
@@ -858,9 +858,9 @@ F-7 is closed and stays closed.
   only, documented). No new throttling: shares `checkpoint_min_gap_s` and
   the identical-tree dedupe.
 
-  > **Amendment 2026-08-09 (V32 `946d7d1`).** The parenthetical here used to
+  > **Amendment 2026-08-09 (V32 `f8e1097`).** The parenthetical here used to
   > read "(first call after a prompt no-ops naturally)". That was true when the
-  > `checkpoint_min_gap_s` throttle was keyed per **root**; `946d7d1` re-keyed
+  > `checkpoint_min_gap_s` throttle was keyed per **root**; `f8e1097` re-keyed
   > it per **(root, tab)** — see `workbench::CheckpointKey` and
   > `Workbench::maybe_snapshot`. A Phase F pre-tool checkpoint carries a tab,
   > so it lands in that tab's bucket: still debounced by that tab's own
@@ -873,7 +873,7 @@ F-7 is closed and stays closed.
   > **Design consequence for whoever schedules Phase F** (flagged, not
   > redesigned): the worst case is N tabs on one root each taking their own
   > pre-tool checkpoint inside one `checkpoint_min_gap_s` window, where the
-  > pre-`946d7d1` reading of this line promised one. Every one of those is
+  > pre-`f8e1097` reading of this line promised one. Every one of those is
   > deduped away *if* the tree is unchanged, so the cost only appears when the
   > tabs are genuinely interleaving edits on a shared root — which is also the
   > case where per-tab attribution is the point of the feature. Decide

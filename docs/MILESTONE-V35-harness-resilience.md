@@ -1,9 +1,9 @@
 # V35 — Harness Resilience (capability matrix + drift canaries)
 
 **Status:** ALL PHASES A–M IMPLEMENTED (A–H 2026-08-16; I–M 2026-08-17:
-`82c0da2`, `7a4262a`, `7610255`, `ee3ac18`, `d5eb95d`, `6a8c3f7`,
-`4e1c519`, `347c938`, `27b6241`, `8fcce94`, `74a5152`, `e2b9cee`,
-`8ca599c`). Final gates: cargo 2217/0/6, clippy clean, vitest 643,
+`85de36f`, `24c75e5`, `1f985dd`, `7100e68`, `4dce9a2`, `c62bbfd`,
+`ee068cf`, `aaf69f8`, `7f84efe`, `ba79436`, `8dcc5f5`, `1738fce`,
+`4ce21e0`). Final gates: cargo 2217/0/6, clippy clean, vitest 643,
 svelte-check 333/0/0, ignored 6/6. GitHub milestone 8: #55–#63 +
 #66–#70 closed; #54 is the live-verify tracker; #64, #71 open; #73, #74
 filed. **Remaining = live-verify recipes** (user-side, in a fresh tab
@@ -221,7 +221,7 @@ Following the existing `include_str!` two-sources-of-truth pattern:
 
 ## Implementation record
 
-**Phase A (`82c0da2`, 2026-08-16).** Registry seeded (18 rows), four tests
+**Phase A (`85de36f`, 2026-08-16).** Registry seeded (18 rows), four tests
 (the three below + `tcb_controls_are_declared_exactly_once`), MAINTENANCE.md
 drift table gained a leading **"Capability id(s)"** column + one new row
 (*Transcript tap — shape beyond usage*) for the four ids that had no prose row.
@@ -262,7 +262,7 @@ Findings out of Phase A (close-or-defer decided 2026-08-16):
    behavior** (a vanished flag kills the tab loudly instead) — Phase E must
    implement it or downgrade the row.
 
-**Phase B (`7a4262a`, 2026-08-16).** Five tests in `harness/canary.rs`
+**Phase B (`24c75e5`, 2026-08-16).** Five tests in `harness/canary.rs`
 (`#[cfg(test)]`): the four Tier-C capability canaries + the
 manifest-required-everywhere walker. Fixtures under
 `src-tauri/fixtures/harness/{claude/2.1.232, opencode/1.18.13}/`, synthetic,
@@ -288,7 +288,7 @@ canaries. Decisions binding later phases:
   under-declares what `extract_context`/`render` read — reconciled in
   Phase C.
 
-**Phase C (`7610255`, 2026-08-16).** Four negative canaries (fixtures under
+**Phase C (`1f985dd`, 2026-08-16).** Four negative canaries (fixtures under
 `fixtures/harness/<harness>/_synthetic/`, each byte-identical to its positive
 twin except one renamed field) + the matrix↔canary cross-check
 (`canaries_and_the_matrix_agree`) + statusline `depends_on` reconciliation.
@@ -316,7 +316,7 @@ Decisions:
   `rate_limits` — the loss is partial, which is exactly the silent-partial
   degradation class the canaries exist to catch.
 
-**Phase D (`ee3ac18`, 2026-08-16).** `cimp --harness-canary [--json]` in
+**Phase D (`7100e68`, 2026-08-16).** `cimp --harness-canary [--json]` in
 `harness/probe.rs`; outcome model Pass / Fail / Unknown / Transition, exit
 non-zero iff ≥1 Fail. Probed live on claude 2.1.232 / opencode 1.18.13:
 **7 pass, 0 fail, 11 unknown (declared, each with a why), exit 0**; negative
@@ -353,7 +353,7 @@ recipe 5's no-CLI leg gave all-unknown, exit 0. Decisions:
   its own issue. `GET /session/<unknown>` answers 500, not 404. Phase A
   finding 4 closed (the route is now actually called).
 
-**Phase E (`d5eb95d`, 2026-08-16).** The registry's first runtime consumers.
+**Phase E (`4dce9a2`, 2026-08-16).** The registry's first runtime consumers.
 `contract::gate(id, &settings)` owns the E1 fail-closed logic (byte-for-byte,
 pinned); `e1_blocked()` deleted; the two `tabs/config.rs` call sites go
 through the gate; `harness_versions_get` returns
@@ -389,7 +389,7 @@ Decisions:
   **Phase I** when CHP names that route surface. "One notice source" holds
   for every matrix-covered drift signal.
 
-**Phase F (`6a8c3f7`, 2026-08-16).** Auto-verify on version change.
+**Phase F (`c62bbfd`, 2026-08-16).** Auto-verify on version change.
 `harness/verify.rs` runs embedded L1 (the four positive canaries became
 runtime functions with `include_str!`-embedded synthetic fixtures; the
 cargo tests are now wrappers over the same code path) + the L2 probes for
@@ -421,7 +421,7 @@ vitest 643, svelte-check 0/0. Decisions:
   install, and an unreachable CLI advances on L1 evidence alone. The Tier-D
   spike statuses (`e1_status`/`d0_status`) remain human-owned and untouched.
 
-**Phase G (`4e1c519`, 2026-08-16).** Settings → **Harness health**:
+**Phase G (`ee068cf`, 2026-08-16).** Settings → **Harness health**:
 `harness/health.rs` read-model rendered by a new sidebar category (the V33
 Sandboxing registration pattern), grouped by harness, tier D first, showing
 per row: id (verbatim — matches Advisor cards by eye), tier badge, contract
@@ -446,7 +446,7 @@ cargo 2150/0/6, clippy clean, vitest 643, svelte-check 0/0. Decisions:
 - The F-18 tripwire (`every_settings_pointer_names_a_real_sidebar_section`)
   caught a markdown-emphasis pointer during this phase — it works.
 
-**Phase H (`347c938`, 2026-08-16).** Capture-on-success corpus in
+**Phase H (`aaf69f8`, 2026-08-16).** Capture-on-success corpus in
 `harness/capture.rs`: zero-Fail probe runs (background, panel button, and
 `--harness-canary` alike) write scrubbed, version-stamped observed payloads
 to `%LOCALAPPDATA%\cimp\harness-captures\<harness>\<version>\` with a
@@ -486,7 +486,7 @@ cargo 2162/0/6, clippy clean. Findings + rulings:
   why the corpus is bounded (3 lines per capability), machine-local, and
   promotion to a committed fixture stays a manual reviewed step.
 
-**Phase I (`27b6241`, 2026-08-17).** CHP declared: `docs/CHP.md` (the
+**Phase I (`7f84efe`, 2026-08-17).** CHP declared: `docs/CHP.md` (the
 versioned wire contract, documenting the REAL bodies — see finding below),
 `harness/chp.rs` (`CHP_VERSION = 1`, hello registry, staleness
 classification), `/session/hello` route, `chp` baked into every generated
@@ -520,7 +520,7 @@ ignored node-driven plugin tests were also run green. Findings + rulings:
   `tool:"chp_hello"`), beside `contract_drift` — no new retention lane for
   a once-per-tab-launch row.
 
-**Phase J (`8fcce94`, 2026-08-17).** The five `*_hook.rs` shims are DELETED
+**Phase J (`ba79436`, 2026-08-17).** The five `*_hook.rs` shims are DELETED
 (1053 lines); Claude hooks are `type:"http"` at `/claude/hook/<event>`,
 timeout 1s pinned at generation (the shims' shared 600ms budget, ceil'd),
 bearer token via `$CIMP_HOOK_TOKEN` + `allowedEnvVars` (in the child env,
@@ -556,7 +556,7 @@ command hooks (timeout 5s — checkpoint genuinely waits 2s). cargo
   header substitution reads the child env — the one assumption unit tests
   cannot settle; fallback is a one-line literal-token switch.
 
-**Phase K (`74a5152`, 2026-08-17).** Pure-refactor relocation, one commit:
+**Phase K (`8dcc5f5`, 2026-08-17).** Pure-refactor relocation, one commit:
 `oob/` → `harness/{claude,opencode}/read.rs` + `harness/reader.rs` (spawn
 seam), statusline parsing → `harness/claude/statusline.rs`, both OpenCode
 tool tables → `harness/opencode/tools.rs`, the generators out of
@@ -588,7 +588,7 @@ ignored 6/6, no TS. Decisions + findings:
 - MAINTENANCE prose still names `oob/` in ~4 places outside the drift
   table — folded into Phase L's scoped doc edits.
 
-**Phase L (`e2b9cee`, 2026-08-17).** The read path pushed where payloads
+**Phase L (`1738fce`, 2026-08-17).** The read path pushed where payloads
 allow. Claude: `assistant_text` (from `Stop.last_assistant_message` —
 complete-at-finish, cadence preserved by construction; `MessageDisplay`
 deliberately NOT wired), `tool_result` (second matcher-`""` PostToolUse
@@ -630,7 +630,7 @@ fallback. cargo 2204/0/6, clippy clean, ignored 6/6 (correction: that is
 - Deploy note: overlay is spawn-baked — a FRESH TAB is required to
   exercise Phase L; old tabs keep the Phase J hook set and their readers.
 
-**Phase M (`8ca599c`, 2026-08-17).** The OpenCode plugin is a real 645-line
+**Phase M (`4ce21e0`, 2026-08-17).** The OpenCode plugin is a real 645-line
 `harness/opencode/templates/plugin.js` (`include_str!` + `harness/render.rs`
 substituting an 18-key set, every value a whole serde literal via
 `json_lit`). Three-way key enforcement (template ⊆ declared, declared ⊆

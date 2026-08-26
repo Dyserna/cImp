@@ -1,11 +1,11 @@
-# Code review — develop, a0abeb7..f532b3e (2026-08-05)
+# Code review — develop, f192cf0..88dff66 (2026-08-05)
 
 Scope: all 35 commits since the last merge to main (v0.49.1) — the 2026-08-04 maintenance
 run (#3–#27), V28 per-session MCP identity, V29 xterm 6, and V30 session-push Phases 0–D.
 87 files, ~10.9k insertions. Method: seven parallel subsystem reviews (offload core, oob
 producers/fanout, V28 identity + graph/audit, permission detection, usage/context bar,
 xterm 6 + settings, deps/CI), every finding verified against callers; the two HIGHs were
-re-verified independently at source by the orchestrator. Line numbers are at HEAD (f532b3e).
+re-verified independently at source by the orchestrator. Line numbers are at HEAD (88dff66).
 
 Severity counts: **2 HIGH, 16 MEDIUM (after dedup), ~15 LOW.** No finding blocks a build;
 several block the V30/V28 live-verifies or invert a milestone's stated contract.
@@ -141,7 +141,7 @@ Claude tabs inheriting `CLAUDE_CODE_CHILD_SESSION=1` → no transcript, no histo
 tail: no TTS, no usage, no live-session registry entry, no V28 scoping — all silent.
 Cheap fix: explicit strip list at spawn (needs an `env_remove` on `PtyLaunchSpec`).
 
-### M10 — The 7e1f721 skip-log contract has no consumer at the shipped log level
+### M10 — The 2cdfc55 skip-log contract has no consumer at the shipped log level
 `oob/claude.rs:1257` logs skipped transcript lines at `debug!`; default level is Info
 (`settings/schema.rs:606-615`). A format change that fails every line — the drift this
 contract exists to detect — produces zero visible output. Same gap, unlogged entirely,
@@ -169,7 +169,7 @@ because for the permission case ignored *is* silence. Fall through to the prose 
 `patterns_file.rs:83-98` documents "append the outgoing default set";
 `current_defaults_are_not_a_legacy_set` (`:437-449`) fails only if you add the *current*
 set. Forgetting the append means installs that took the interim release hold a list
-matching no snapshot and never receive future default fixes — the exact 199221b bug,
+matching no snapshot and never receive future default fixes — the exact cfcec66 bug,
 reintroducible silently.
 
 ## MEDIUM — usage/context bar (#14)
@@ -207,10 +207,10 @@ spec never considers context count; zero test coverage of `@xterm/*`.
 
 ### M18 — MAINTENANCE.md contradicts itself about the ort re-gate and MSRV
 `docs/MAINTENANCE.md:297-305` still says `webgpu` is on the dep unconditionally and
-"treat `tts-cuda` as untested until re-gated" (it was re-gated in c67adf5;
+"treat `tts-cuda` as untested until re-gated" (it was re-gated in b82040d;
 `Cargo.toml:150` and MAINTENANCE.md:164 say so); `:226` still declares MSRV 1.82 with the
 correction listed as outstanding (`Cargo.toml:7` is 1.88, resolver v3 active). Both
-directly mislead the next maintenance run, which is briefed off this file — c67adf5's
+directly mislead the next maintenance run, which is briefed off this file — b82040d's
 message claims these were fixed.
 
 ### M19 — CI blind spots: clippy lints default features only; no CI job runs any test
@@ -224,7 +224,7 @@ closes the lint gap; a test job closes the rest. Related: the webgpu+cuda mutual
 silent-failure mode (`Cargo.toml:52-59`) is documented but not enforced
 (`compile_error!` absent; `engine.rs:34-48` makes the combo compile and *log* a GPU
 backend while running CPU-only ORT), and the shipped feature set has not been compiled by
-anything since the ort dep changed (last release build predates c67adf5).
+anything since the ort dep changed (last release build predates b82040d).
 
 ---
 
@@ -288,7 +288,7 @@ anything since the ort dep changed (last release build predates c67adf5).
 - Hook + regex double-fire collapses to one TTS/notification (edge-guarded flag).
 - rodio 0.22/cpal 0.17 lockstep held (single cpal in lock); ort re-gate correct, default
   build shows no CPU-fallback warning; RUSTSEC baseline justifications verified accurate.
-- Clippy sweep (2af88c4): every hunk checked in graph/audit/workbench/stt/tts/audio/
+- Clippy sweep (76e4f13): every hunk checked in graph/audit/workbench/stt/tts/audio/
   advisor/build.rs is semantically inert (incl. the `&&` short-circuit at `main.rs:659-667`
   that would have been a bug with `&`); cpal `name()` ≡ `description().name()` on WASAPI.
 - Test suites: `npx vitest run` 465/465 pass; contextMeter 15/15. (Cargo tests not run by

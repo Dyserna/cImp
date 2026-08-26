@@ -12,7 +12,7 @@ Phases: **A** (diff-substitute) → **B** (shell interception) → **C**
 advisor release; D, E, F are independent and can land in any order or in
 parallel.
 
-Grounding anchors (verified against current `develop`, post-V16 f3fac3d):
+Grounding anchors (verified against current `develop`, post-V16 1c34566):
 
 - **Verdict path:** `GraphService::should_read` at `graph/service.rs:1556-1696`.
   Order today: gates → post-compaction pass → `reminded` short-circuit

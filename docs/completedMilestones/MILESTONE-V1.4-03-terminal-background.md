@@ -11,7 +11,7 @@ V1.4-03 closes both. The per-tab UI is a refactor + a new dialog row. Scrollback
 
 ## What This Milestone Delivers
 
-1. **`BackgroundConfigEditor.svelte`** — extracted from `SettingsApp.svelte:587–729`. A self-contained component bound to a `TerminalBackgroundSettingsWire` value, owning the mode toggle (Theme default / Solid color / Image), the conditional color picker / file picker / opacity / blur / size / position / tint controls, and the user-driven-`bgMode` initialization pattern from `c6e3e8a`. No behavior change for the global path; the existing Settings → Appearance subsection swaps to consume the new component.
+1. **`BackgroundConfigEditor.svelte`** — extracted from `SettingsApp.svelte:587–729`. A self-contained component bound to a `TerminalBackgroundSettingsWire` value, owning the mode toggle (Theme default / Solid color / Image), the conditional color picker / file picker / opacity / blur / size / position / tint controls, and the user-driven-`bgMode` initialization pattern from `a4d973a`. No behavior change for the global path; the existing Settings → Appearance subsection swaps to consume the new component.
 2. **Per-tab Background row — two consumers, mirroring how V1.4-01 themes shipped:**
    - **Shell tabs** — `ConfigureTabDialog.svelte` gains a Background section using the three-state radio shape from V1.4-01's theme row at `:74–120`. Save flows through `reconfigure_shell_tab`.
    - **AI tabs** (Claude, aider) — `TabSettingsSection.svelte` gains the same Background section, sitting next to the existing `selectThemeOverride` block at `:61–88`. Save flows through `applySettings` (which calls `settings_update` IPC and the backend broadcasts back). No new Tauri command for AI tabs — the whole-Settings serializer already covers `background_override`.
@@ -62,7 +62,7 @@ export let onChange: (next: TerminalBackgroundSettingsWire) => void;
 
 Two-way bind via `bind:config` from each consumer; the component owns `bgMode` as internal state.
 
-The c6e3e8a fix — *"keep bgMode user-driven after first snapshot load"* — is the load-bearing piece. Preserve the pattern exactly:
+The a4d973a fix — *"keep bgMode user-driven after first snapshot load"* — is the load-bearing piece. Preserve the pattern exactly:
 
 ```svelte
 <script lang="ts">
@@ -72,7 +72,7 @@ The c6e3e8a fix — *"keep bgMode user-driven after first snapshot load"* — is
   // bgMode is intent; (config.image, config.color) are state. After first
   // load, user clicks set bgMode; settings snapshots do not re-derive it.
   // This prevents the click-Image-then-snapshot-flip-back regression that
-  // c6e3e8a fixed.
+  // a4d973a fixed.
 
   function setMode(next: 'theme' | 'color' | 'image'): void {
     bgMode = next;

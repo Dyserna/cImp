@@ -3,7 +3,7 @@
 Run record for the V37 MCP Management implementation
 (`feature/v37-mcp-management`; design authority
 `docs/IMPL-PLAN-V37-mcp-management.md`). Two seam reviews ran: after Phase A,
-and after Phase E over the whole diff `9515c6d..54ef238`. This file is the
+and after Phase E over the whole diff `16b99a3..0c9575c`. This file is the
 decision log; every finding below is CLOSED or consciously deferred with an
 owner.
 
@@ -11,12 +11,12 @@ owner.
 
 | Phase | Commit | Suites after |
 |---|---|---|
-| Plan | `9515c6d` | — |
-| A — registry + activation + enforcement | `9fce295` | cargo 2355/0/6, vitest 629 |
-| B — fingerprint + pulse gate + F1–F5 | `eea79e0` | cargo 2366/0/6 |
-| D — management UI | `499b3a9` | vitest 652, check 336/0/0 |
-| C — health checker + Events | `098e197` | cargo 2380/0/6, vitest 663 |
-| E — description screening + recovery retry | `54ef238` | cargo 2391/0/6 |
+| Plan | `16b99a3` | — |
+| A — registry + activation + enforcement | `011878e` | cargo 2355/0/6, vitest 629 |
+| B — fingerprint + pulse gate + F1–F5 | `122c6c0` | cargo 2366/0/6 |
+| D — management UI | `c49b018` | vitest 652, check 336/0/0 |
+| C — health checker + Events | `caffaa9` | cargo 2380/0/6, vitest 663 |
+| E — description screening + recovery retry | `0c9575c` | cargo 2391/0/6 |
 | Fix — `withheld` row status (E-2) | see git log | — |
 
 Branch-point baselines: cargo 2343/0/6, vitest 629 (32 files), svelte-check
@@ -29,7 +29,7 @@ C1–C4 PASS. Findings F1 (disabled_owner false-refusal vs a live
 consumers, LOW), F3 (overstated in-flight claim, doc), F4 (shutdown left
 `disabled` stale, LOW), F5 (registry arrays not actually global-only —
 overlay pinned them wholesale, MED) — **all five fixed in Phase B**
-(`eea79e0`). F6 (cosmetic readers + SSRF endpoint allowlist ignore `enabled`)
+(`122c6c0`). F6 (cosmetic readers + SSRF endpoint allowlist ignore `enabled`)
 ACCEPTED: labels aren't enforcement; configuring an endpoint is the trust
 statement, deactivating is not distrust.
 

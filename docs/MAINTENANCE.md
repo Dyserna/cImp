@@ -106,7 +106,7 @@ orchestrating session.
 
 | Date | App version | Claude / OpenCode | Outcome |
 |---|---|---|---|
-| 2026-08-04 | v0.49.1 (develop) | 2.1.221 / 1.18.1 | First formalized run. Report: `docs/reviews/maintenance-run-2026-08-04.md` (10 contract-drift items, 8 adoption candidates, bump batches, 9 decisions). Doc split → `ARCHITECTURE.md`; inventory refreshed; ort/MSRV/schema facts corrected. *Verification tail closed 2026-08-21:* milestone 2 issues #4/#5/#9/#13/#14 closed by owner decision after three RC cycles of daily use (#13 delivered as V28/V34, #14 shipped `381ddd4`, #5 hook-primary detection `9d969d6`; D0 spike and payload-shape capture left to ambient use). |
+| 2026-08-04 | v0.49.1 (develop) | 2.1.221 / 1.18.1 | First formalized run. Report: `docs/reviews/maintenance-run-2026-08-04.md` (10 contract-drift items, 8 adoption candidates, bump batches, 9 decisions). Doc split → `ARCHITECTURE.md`; inventory refreshed; ort/MSRV/schema facts corrected. *Verification tail closed 2026-08-21:* milestone 2 issues #4/#5/#9/#13/#14 closed by owner decision after three RC cycles of daily use (#13 delivered as V28/V34, #14 shipped `099a634`, #5 hook-primary detection `7fbe41b`; D0 spike and payload-shape capture left to ambient use). |
 
 Next run due **~2026-09-04** (monthly cadence), or sooner after any visible
 Claude Code / OpenCode update.
@@ -118,8 +118,8 @@ Claude Code / OpenCode update.
 A complete, scannable inventory of everything cImp depends on, for periodic
 "is there a newer version?" passes. Version columns reflect the pins in
 `src-tauri/Cargo.toml` and `package.json` on **develop as of 2026-08-05**, i.e.
-*after* the 2026-08-04 run's bump batches (`b6f0883`, `c67adf5`, `3f50a3a`,
-`1ee71e0`) — not the v0.49.1 tag, which predates them. The
+*after* the 2026-08-04 run's bump batches (`65283f9`, `b82040d`, `fcb7e2c`,
+`7b12c87`) — not the v0.49.1 tag, which predates them. The
 *Dependencies to track* sections below cover the gotchas for the hairy ones
 (`ort`, `whisper-rs`, and the Claude Code / OpenCode CLI contracts); the
 per-feature check-on-change items are in *Feature-area maintenance notes*
@@ -177,8 +177,8 @@ version edit — `cargo update` will not move them.
 | `serde` / `serde_json` | `1` / `1` | (De)serialization everywhere | Stable; rarely needs attention. |
 | `tokio` | `1` | Async runtime | Feature-rich pin (`rt-multi-thread,macros,sync,io-*,time,fs,process,net`). |
 | `tokio-util` | `0.7` | `rt` helpers | — |
-| `portable-pty` | `0.9` | PTY for the embedded terminals | Pre-1.0; check changelog on bump. Moved 0.8 → 0.9 in the 2026-08-04 run (`3f50a3a`). |
-| `thiserror` | `2` | Error derives | Major bump in the 2026-08-04 run (`1ee71e0`); derive syntax unchanged for our uses. |
+| `portable-pty` | `0.9` | PTY for the embedded terminals | Pre-1.0; check changelog on bump. Moved 0.8 → 0.9 in the 2026-08-04 run (`fcb7e2c`). |
+| `thiserror` | `2` | Error derives | Major bump in the 2026-08-04 run (`7b12c87`); derive syntax unchanged for our uses. |
 | `regex` | `1` | `run_check` diagnostic parsers (tsc / gcc-style `file:line:col:`) | Pure Rust, no C deps. |
 | `quick-xml` | `0.41` | Streaming XML reader for the `junit-xml` check parser | Default features; promoted from a transitive dep. Pre-1.0 — check the changelog on bump. |
 | `chrono` | `0.4` | Epoch → ISO-8601 for the usage widget's `rate_limits.resets_at` | `default-features = false` + `std` only (no clock/timezone use — keeps the tz-data churn out of the tree). |
@@ -195,7 +195,7 @@ version edit — `cargo update` will not move them.
 | `misaki-rs` | `0.3` | TTS G2P phonemizer | **Pulls espeak-ng → binary is GPLv3** (see `NOTICE`); needs libclang to build. |
 | `ort` | `=2.0.0-rc.11` | ONNX Runtime bindings (Kokoro TTS) | **Exact-pinned.** The dep carries only `download-binaries` — **no EP feature**; EPs come from cImp's own mutually-exclusive `tts-webgpu`/`tts-cuda` features (`ort/webgpu` / `ort/cuda`, re-gated 2026-08-04, D-5). `cuda`+`webgpu` share no prebuilt — that combo makes ort-sys warn and silently link the CPU-only dist, so since 2026-08-05 it is a **`compile_error!`** in `tts/engine.rs` rather than a build that looks fine and runs on CPU. Wraps ORT 1.23.2; see the deep `ort` section. |
 | `bytemuck` | `1` | Zero-copy casts | — |
-| `cpal` / `rodio` | `0.17` / `0.22` | Audio output | Pre-1.0; device-enumeration behavior changes across versions. **Bump these two in LOCKSTEP** — `rodio 0.22` depends on `cpal ^0.17`, so a mismatched `cpal` resolves a SECOND cpal into the tree (two WASAPI hosts, two copies of the `windows` bindings, no shared types between STT capture and TTS playback). `rodio` is `default-features = false` + `playback` only (cImp never decodes a container — TTS hands it raw f32 PCM via `TappedSource`). Both moved in the 2026-08-04 run (`1ee71e0`). |
+| `cpal` / `rodio` | `0.17` / `0.22` | Audio output | Pre-1.0; device-enumeration behavior changes across versions. **Bump these two in LOCKSTEP** — `rodio 0.22` depends on `cpal ^0.17`, so a mismatched `cpal` resolves a SECOND cpal into the tree (two WASAPI hosts, two copies of the `windows` bindings, no shared types between STT capture and TTS playback). `rodio` is `default-features = false` + `playback` only (cImp never decodes a container — TTS hands it raw f32 PCM via `TappedSource`). Both moved in the 2026-08-04 run (`7b12c87`). |
 | `whisper-rs` | `0.16` | STT (whisper.cpp bindings) | → `whisper-rs-sys 0.15`. See the deep `whisper-rs` section + build toolchain. |
 | `rubato` | `0.16` | Mic resample → 16 kHz mono | — |
 | `tree-sitter` | `0.26.9` | Code-graph parsing core | Grammar crates ride the `tree-sitter-language` shim, so they need not match this exactly — only the parser ABI must. |
@@ -258,7 +258,7 @@ upstream cadence worth watching.
 
 | Tool | Version / location | Needed for |
 |---|---|---|
-| Rust | edition 2021, MSRV **1.88** (`Cargo.toml rust-version`) + `resolver = "3"` — corrected 2026-08-04 (`b6f0883`) from a stale 1.82 declaration; 1.88 is the real floor (`ort`/`ort-sys` rc.11 and `whisper-rs-sys` 0.15 all declare it). Resolver v3 makes `cargo update`/`cargo add` MSRV-aware, so a bump of `rust-version` is now also a dependency-resolution change. **Not verified by CI** — the clippy/test workflows run floating stable (accepted gap, 2026-08-05); an MSRV break surfaces only on a machine running 1.88 exactly. | everything |
+| Rust | edition 2021, MSRV **1.88** (`Cargo.toml rust-version`) + `resolver = "3"` — corrected 2026-08-04 (`65283f9`) from a stale 1.82 declaration; 1.88 is the real floor (`ort`/`ort-sys` rc.11 and `whisper-rs-sys` 0.15 all declare it). Resolver v3 makes `cargo update`/`cargo add` MSRV-aware, so a bump of `rust-version` is now also a dependency-resolution change. **Not verified by CI** — the clippy/test workflows run floating stable (accepted gap, 2026-08-05); an MSRV break surfaces only on a machine running 1.88 exactly. | everything |
 | Node + npm | LTS (CI: `windows-latest`) | frontend build |
 | MSVC | VS 2026, `_MSC_VER` 1950 (`cl.exe`, auto-found by `cc`) | native crates, GPU builds |
 | CMake | VS-bundled 4.2.3, on PATH | whisper.cpp + espeak builds |
@@ -361,7 +361,7 @@ cargo/npm — check their sources manually.
 
 ### `ort` / ONNX Runtime — GPU TTS via the WebGPU EP (shipped); CUDA broken on Blackwell
 
-- **Current pin:** `ort = "=2.0.0-rc.11"` (`src-tauri/Cargo.toml`), with `features = ["download-binaries"]` and **no EP feature on the dependency** — the EP comes from cImp's own mutually-exclusive `tts-webgpu` / `tts-cuda` cargo features (`ort/webgpu` / `ort/cuda`). See the inventory row for `ort` above; `webgpu` was pinned unconditionally on the dep until it was **re-gated 2026-08-04 (decision D-5, commit `c67adf5`)**. Wraps **ORT 1.23.2** (verified 2026-08-04 via `ort-sys` `ORT_API_VERSION = 23`; rc.12 wraps 1.24.2, rc.13 wraps 1.28.0). The rc.11 `cuda` prebuilt is hard-linked to CUDA major 12 (`onnxruntime_providers_cuda.dll` references `cudart64_12.dll`, `cublas64_12.dll`, `cublasLt64_12.dll`, `cufft64_11.dll`, `cudnn64_9.dll`); CUDA 13.x won't load with this version.
+- **Current pin:** `ort = "=2.0.0-rc.11"` (`src-tauri/Cargo.toml`), with `features = ["download-binaries"]` and **no EP feature on the dependency** — the EP comes from cImp's own mutually-exclusive `tts-webgpu` / `tts-cuda` cargo features (`ort/webgpu` / `ort/cuda`). See the inventory row for `ort` above; `webgpu` was pinned unconditionally on the dep until it was **re-gated 2026-08-04 (decision D-5, commit `b82040d`)**. Wraps **ORT 1.23.2** (verified 2026-08-04 via `ort-sys` `ORT_API_VERSION = 23`; rc.12 wraps 1.24.2, rc.13 wraps 1.28.0). The rc.11 `cuda` prebuilt is hard-linked to CUDA major 12 (`onnxruntime_providers_cuda.dll` references `cudart64_12.dll`, `cublas64_12.dll`, `cublasLt64_12.dll`, `cufft64_11.dll`, `cudnn64_9.dll`); CUDA 13.x won't load with this version.
 
 - **IMPLEMENTED — `tts-webgpu` is the shipped GPU TTS backend.** Kokoro runs on ONNX Runtime's native **WebGPU EP** (Dawn-backed → D3D12 on Windows, Vulkan on Linux, Metal on macOS). Validated on the dev box (RTX 5090 / Blackwell) 2026-06-15: correct output matching the CPU reference, genuinely on-GPU (ORT node-placement logs show WebGPU shader programs for every op, incl. the `ConvTranspose2D` that broke DirectML), **~5× faster than CPU** at steady state. Wired in `tts/engine.rs` as GPU-by-default with automatic CPU fallback, selectable GPU/CPU at runtime via the `tts.device` setting (*Settings → Text-to-speech → TTS → Process on*) — mirrors `stt/engine.rs`. Runtime deps: three Dawn dylibs (`webgpu_dawn.dll`, `dxcompiler.dll`, `dxil.dll`) staged into the zip by `release.yml`; `download-binaries` static-links core ONNX Runtime into `cimp.exe` (no `onnxruntime.dll`). Full write-up: `docs/features/FEATURE-tts-webgpu.md`.
 

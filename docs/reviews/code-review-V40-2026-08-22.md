@@ -1,6 +1,6 @@
 # V40 harness-registry — adversarial review record
 
-**Branch:** `feat/v40-harness-registry` (review base `16aa8e9`)
+**Branch:** `feat/v40-harness-registry` (review base `b1bea91`)
 **Worktree:** `P:\Documents\AI-private\cc-avatar\cctts-v40`
 **Date:** 2026-08-22 · **Fix pass:** 2026-08-23
 
@@ -27,46 +27,46 @@ warnings**.
 
 | # | Sev | File | One line | Status |
 |---|-----|------|----------|--------|
-| **H-1** | HIGH | `offload/loopback.rs`, `offload/mcp_host.rs`, `offload/service.rs` | `?consumer=offload` was served Claude's granted MCP servers while its taint-latch key resolved to an activity source that names no configured tab — grant and identity split on one request, with the EXTERNAL budget uncharged | FIXED `f53679e` |
-| **M-1** | MEDIUM | `settings/persistence.rs`, `ipc/commands.rs` | The declared parse boundary for `harness.*.ext` never ran on the load path, so a hand-edited value reached the launch path as one thing and the Settings window rendered another | FIXED `93ec761` |
-| **M-2** | MEDIUM | `settings/persistence.rs` | `harness` joined `OVERLAY_BANNED_KEYS`, silently narrowing five per-project settings to machine scope and deleting their project values on the first post-upgrade save | FIXED `883156d` |
-| **M-3** | MEDIUM | `settings/schema.rs`, `harness/layering.rs` | `AiTabId` / `TabId` / `default_ai_tab` are closed enums keyed to the two shipped harnesses and 10(b) did not police the join — a third descriptor would compile, pass every test, and be silently dropped from the tab machinery | FIXED `9fe16be` |
-| **M-4** | MEDIUM | `offload/loopback.rs` | An **empty** (not absent) agent discriminator resolved to `unknown`, switching off CHP stale-artifact recording and the quiet-capability detector for exactly the pre-upgrade artifacts they exist to catch | FIXED `62d3a44` |
-| **M-5** | MEDIUM | `settings/migration.rs` | The 35→36 merge replaced an existing `harness.<id>.ext` object wholesale, so a partial `ext` discarded every key the step had just carried over | FIXED `d86ead4` |
-| **F-1** / FE-M-1 | MEDIUM | `lib/settings/types.ts`, `SettingsApp.svelte` | The frontend spawn-signature mirror answered a hardcoded `true` while the roster loaded, and the Settings window captured its restart baseline inside that window | FIXED `aa979c3` |
-| **F-2** / FE-H-1 | MEDIUM | `lib/harness.ts`, `SettingsApp.svelte` | `reservedAiTabIds` bootstraps and `labelForTabId` did not, so the pre-roster window rendered **unlabelled** AI-tab enable checkboxes — destructive controls, a tick kills a PTY — and the comment claiming otherwise was false | FIXED `aa979c3` |
-| **F-3** / FE-H-2 | MEDIUM | `lib/harness.ts`, `SettingsApp.svelte` | A failed `harness_list` was silent, unretried and indistinguishable from "still loading"; several controls simply vanished for the window's lifetime | FIXED `aa979c3` |
-| **F-4** / P-M-5 | MEDIUM | `lib/CodeIntelligenceView.svelte` | Declared turn lanes were unioned across harnesses, first-id-wins, and rendered for every session | FIXED `aa979c3` |
-| **F-5** / FE-M-5 | MEDIUM | `lib/harness.test.ts`, `lib/settings/HarnessExtForm.svelte` | The parity test stopped at the container, so `fields[]` / `scoped_features[]` and `SettingKind` were unchecked — and the form's `{:else}` rendered an unknown kind as a text box that writes the wrong type | FIXED `aa979c3` |
-| **F-6** / FE-M-3 | MEDIUM | `SettingsApp.svelte`, `harness/plugin.rs`, `harness/info.rs`, `harness/opencode/harness_plugin.rs` | The Offload section wrote two `ext` keys by hardcoded string rather than by declaration | FIXED `aa979c3` |
-| **FE-M-4** | MEDIUM | `lib/settings/types.ts`, `SettingsApp.svelte`, `harness/contract.rs` | `gated_controls?.[CONTROL] ?? ''` fails **open**: a control renamed in Rust silently un-gated the toggle that installs a `PreToolUse` hook | FIXED `aa979c3` |
-| **FE-M-7** | MEDIUM | `lib/settings/HarnessExtForm.svelte` | The spawn-baked restart warning hid inside `{#if field.hint}`; an emptied `int` was dropped on the floor; an out-of-range `enum` silently rendered the first option | FIXED `aa979c3` |
-| **P-M-1** | MEDIUM | `harness/verify.rs` | A failing first harness starved every harness behind it — the worker answered its already-run memo with `return`, and a failed run leaves the harness pending forever | FIXED `9d6b8d9` |
-| **P-M-2** | MEDIUM | `harness/verify.rs`, `settings/persistence.rs` | The first post-upgrade launch spawned a harness's own CLI to probe it even when its tab had never been enabled, because the migration leaves `last_seen` set and `last_verified` empty | FIXED `9d6b8d9` |
-| **P-M-3** | MEDIUM | `lib/tabs/state.ts` | The `activeTab` placeholder re-seed could walk back a restored/broadcast tab id (and, as written, was dead code guarding on a value that can never occur) — same site as `L-18` | FIXED `aa979c3` |
-| **P-M-4** | MEDIUM | `harness/plugin.rs`, `harness/claude/plugin.rs`, `harness/claude/settings.rs`, `tabs/config.rs` | Declaring the three `local.*` rows `spawn_baked` folded them into the signature unconditionally, so editing the local proxy URL with no local-provider tab raised the restart hint for a change that changes nothing | FIXED `9d6b8d9` |
-| **P-M-6** | MEDIUM | `offload/loopback.rs` | A forged `/workbench/tool_checkpoint` from an unregistered agent minted a snapshot for any tool name — `mutates_fs` fails closed for an unknown *vocabulary*, which is the wrong answer to "may this *caller*" | FIXED `9d6b8d9` |
-| **P-M-7** | MEDIUM | `offload/toolclass.rs`, `harness/native.rs` | Harness-native names lost their declared class, so `classify("Edit")` fell to EXTERNAL — which the latch **admits** under an EXTERNAL latch and which marks an open tab externally-contaminated | FIXED `9d6b8d9` |
-| **L-1** | LOW | `ipc/commands.rs` | Out-of-band field preservation iterated `cur.harness`, so a registered harness with no live row took `last_seen`/`last_verified`/`auto_verify` from a frontend-fabricated snapshot | FIXED `93ec761` |
-| **L-2** | LOW | `offload/loopback.rs` | `core_route_paths()` scraped the whole file and had to skip what it could not parse, so a wrapped dispatch arm would drop out with the shadow test still green | FIXED `ee66e83` |
-| **L-3** | LOW | `harness/registry.rs` | Plugin subcommands had neither the collision guard nor the core-shadow guard plugin routes have | FIXED `ee66e83` |
-| **L-4** | LOW | `main.rs` | `resolve_consumer` accepted `offload` for `--code-audit-mcp`, whose every scan is then refused at `/audit/run` | FIXED `ee66e83` |
-| **L-5** | LOW | `sandbox/tabs.rs` | `HarnessId::ANY` is a type-valid sandbox harness with no grant table | FIXED `ee66e83` |
-| **L-6** | LOW | `settings/migration.rs` | The frozen migration's `ext` key literals were untied to the plugins' declarations | FIXED `d86ead4` |
-| **L-7** | LOW | `settings/persistence.rs` | `sync_harness_into` rewrote the global file on essentially every save after the migration | FIXED `93ec761` (gone with M-1 + M-2) |
-| **L-8** | LOW | `offload/outbound.rs` | The "unattributed" audit lane is shared by `offload`, `audit` and forged callers, so the doc's "its own lane" is true only against other harnesses | FIXED `ee66e83` (doc) |
+| **H-1** | HIGH | `offload/loopback.rs`, `offload/mcp_host.rs`, `offload/service.rs` | `?consumer=offload` was served Claude's granted MCP servers while its taint-latch key resolved to an activity source that names no configured tab — grant and identity split on one request, with the EXTERNAL budget uncharged | FIXED `7756975` |
+| **M-1** | MEDIUM | `settings/persistence.rs`, `ipc/commands.rs` | The declared parse boundary for `harness.*.ext` never ran on the load path, so a hand-edited value reached the launch path as one thing and the Settings window rendered another | FIXED `6970cfe` |
+| **M-2** | MEDIUM | `settings/persistence.rs` | `harness` joined `OVERLAY_BANNED_KEYS`, silently narrowing five per-project settings to machine scope and deleting their project values on the first post-upgrade save | FIXED `66757a8` |
+| **M-3** | MEDIUM | `settings/schema.rs`, `harness/layering.rs` | `AiTabId` / `TabId` / `default_ai_tab` are closed enums keyed to the two shipped harnesses and 10(b) did not police the join — a third descriptor would compile, pass every test, and be silently dropped from the tab machinery | FIXED `adecd1b` |
+| **M-4** | MEDIUM | `offload/loopback.rs` | An **empty** (not absent) agent discriminator resolved to `unknown`, switching off CHP stale-artifact recording and the quiet-capability detector for exactly the pre-upgrade artifacts they exist to catch | FIXED `05b20df` |
+| **M-5** | MEDIUM | `settings/migration.rs` | The 35→36 merge replaced an existing `harness.<id>.ext` object wholesale, so a partial `ext` discarded every key the step had just carried over | FIXED `c02a326` |
+| **F-1** / FE-M-1 | MEDIUM | `lib/settings/types.ts`, `SettingsApp.svelte` | The frontend spawn-signature mirror answered a hardcoded `true` while the roster loaded, and the Settings window captured its restart baseline inside that window | FIXED `f5cde79` |
+| **F-2** / FE-H-1 | MEDIUM | `lib/harness.ts`, `SettingsApp.svelte` | `reservedAiTabIds` bootstraps and `labelForTabId` did not, so the pre-roster window rendered **unlabelled** AI-tab enable checkboxes — destructive controls, a tick kills a PTY — and the comment claiming otherwise was false | FIXED `f5cde79` |
+| **F-3** / FE-H-2 | MEDIUM | `lib/harness.ts`, `SettingsApp.svelte` | A failed `harness_list` was silent, unretried and indistinguishable from "still loading"; several controls simply vanished for the window's lifetime | FIXED `f5cde79` |
+| **F-4** / P-M-5 | MEDIUM | `lib/CodeIntelligenceView.svelte` | Declared turn lanes were unioned across harnesses, first-id-wins, and rendered for every session | FIXED `f5cde79` |
+| **F-5** / FE-M-5 | MEDIUM | `lib/harness.test.ts`, `lib/settings/HarnessExtForm.svelte` | The parity test stopped at the container, so `fields[]` / `scoped_features[]` and `SettingKind` were unchecked — and the form's `{:else}` rendered an unknown kind as a text box that writes the wrong type | FIXED `f5cde79` |
+| **F-6** / FE-M-3 | MEDIUM | `SettingsApp.svelte`, `harness/plugin.rs`, `harness/info.rs`, `harness/opencode/harness_plugin.rs` | The Offload section wrote two `ext` keys by hardcoded string rather than by declaration | FIXED `f5cde79` |
+| **FE-M-4** | MEDIUM | `lib/settings/types.ts`, `SettingsApp.svelte`, `harness/contract.rs` | `gated_controls?.[CONTROL] ?? ''` fails **open**: a control renamed in Rust silently un-gated the toggle that installs a `PreToolUse` hook | FIXED `f5cde79` |
+| **FE-M-7** | MEDIUM | `lib/settings/HarnessExtForm.svelte` | The spawn-baked restart warning hid inside `{#if field.hint}`; an emptied `int` was dropped on the floor; an out-of-range `enum` silently rendered the first option | FIXED `f5cde79` |
+| **P-M-1** | MEDIUM | `harness/verify.rs` | A failing first harness starved every harness behind it — the worker answered its already-run memo with `return`, and a failed run leaves the harness pending forever | FIXED `2748c77` |
+| **P-M-2** | MEDIUM | `harness/verify.rs`, `settings/persistence.rs` | The first post-upgrade launch spawned a harness's own CLI to probe it even when its tab had never been enabled, because the migration leaves `last_seen` set and `last_verified` empty | FIXED `2748c77` |
+| **P-M-3** | MEDIUM | `lib/tabs/state.ts` | The `activeTab` placeholder re-seed could walk back a restored/broadcast tab id (and, as written, was dead code guarding on a value that can never occur) — same site as `L-18` | FIXED `f5cde79` |
+| **P-M-4** | MEDIUM | `harness/plugin.rs`, `harness/claude/plugin.rs`, `harness/claude/settings.rs`, `tabs/config.rs` | Declaring the three `local.*` rows `spawn_baked` folded them into the signature unconditionally, so editing the local proxy URL with no local-provider tab raised the restart hint for a change that changes nothing | FIXED `2748c77` |
+| **P-M-6** | MEDIUM | `offload/loopback.rs` | A forged `/workbench/tool_checkpoint` from an unregistered agent minted a snapshot for any tool name — `mutates_fs` fails closed for an unknown *vocabulary*, which is the wrong answer to "may this *caller*" | FIXED `2748c77` |
+| **P-M-7** | MEDIUM | `offload/toolclass.rs`, `harness/native.rs` | Harness-native names lost their declared class, so `classify("Edit")` fell to EXTERNAL — which the latch **admits** under an EXTERNAL latch and which marks an open tab externally-contaminated | FIXED `2748c77` |
+| **L-1** | LOW | `ipc/commands.rs` | Out-of-band field preservation iterated `cur.harness`, so a registered harness with no live row took `last_seen`/`last_verified`/`auto_verify` from a frontend-fabricated snapshot | FIXED `6970cfe` |
+| **L-2** | LOW | `offload/loopback.rs` | `core_route_paths()` scraped the whole file and had to skip what it could not parse, so a wrapped dispatch arm would drop out with the shadow test still green | FIXED `2a2860f` |
+| **L-3** | LOW | `harness/registry.rs` | Plugin subcommands had neither the collision guard nor the core-shadow guard plugin routes have | FIXED `2a2860f` |
+| **L-4** | LOW | `main.rs` | `resolve_consumer` accepted `offload` for `--code-audit-mcp`, whose every scan is then refused at `/audit/run` | FIXED `2a2860f` |
+| **L-5** | LOW | `sandbox/tabs.rs` | `HarnessId::ANY` is a type-valid sandbox harness with no grant table | FIXED `2a2860f` |
+| **L-6** | LOW | `settings/migration.rs` | The frozen migration's `ext` key literals were untied to the plugins' declarations | FIXED `c02a326` |
+| **L-7** | LOW | `settings/persistence.rs` | `sync_harness_into` rewrote the global file on essentially every save after the migration | FIXED `6970cfe` (gone with M-1 + M-2) |
+| **L-8** | LOW | `offload/outbound.rs` | The "unattributed" audit lane is shared by `offload`, `audit` and forged callers, so the doc's "its own lane" is true only against other harnesses | FIXED `2a2860f` (doc) |
 | **L-9** | LOW | `offload/loopback.rs` | `/latch/state` with a mismatched consumer degrades to `latch:"open", contaminated:false` where develop answered the Claude tab's real view | **DECLINED** — see below |
-| **L-10** | LOW | `harness/verify.rs` | Stale doc: "`Harness` is a two-value enum in practice" | FIXED `ee66e83` |
-| **L-11** | LOW | `lib/harness.ts` | The two `from_command` implementations disagree on a trailing space and a Windows path read on POSIX | FIXED `aa979c3` (documented + pinned as deliberate) |
-| **L-12** | LOW | `lib/DelegationPopover.svelte` | A tab with an unknown command rendered `delegate_task_` and its Manual radio was not disabled | FIXED `aa979c3` |
-| **L-13** | LOW | `lib/terminals.ts` | A startup `pty_exit` wrote "**Shell** failed to start." into a reserved AI tab's error card | FIXED `aa979c3` |
-| **L-14** | LOW | `lib/composeState.ts` | Attachment format for a spawned `ai-<uuid>` duplicate always fell to the default | FIXED `aa979c3` |
+| **L-10** | LOW | `harness/verify.rs` | Stale doc: "`Harness` is a two-value enum in practice" | FIXED `2a2860f` |
+| **L-11** | LOW | `lib/harness.ts` | The two `from_command` implementations disagree on a trailing space and a Windows path read on POSIX | FIXED `f5cde79` (documented + pinned as deliberate) |
+| **L-12** | LOW | `lib/DelegationPopover.svelte` | A tab with an unknown command rendered `delegate_task_` and its Manual radio was not disabled | FIXED `f5cde79` |
+| **L-13** | LOW | `lib/terminals.ts` | A startup `pty_exit` wrote "**Shell** failed to start." into a reserved AI tab's error card | FIXED `f5cde79` |
+| **L-14** | LOW | `lib/composeState.ts` | Attachment format for a spawned `ai-<uuid>` duplicate always fell to the default | FIXED `f5cde79` |
 | **L-15** | LOW | `lib/tabs/types.ts` | `isShellTab` answers `true` for every `ai-<uuid>` duplicate, so those tabs lose AI mouse/wheel handling | **DEFERRED** — see below |
-| **L-16** | LOW | `lib/harnessIdentity.test.ts` | The identity scan's regex was word-boundary only, so it would have passed on develop's own `getClaudeUsage` | FIXED `aa979c3` |
-| **L-17** | LOW | `lib/settings/harness.test.ts` | Not a parity test: the `ext` keys were hand-typed | FIXED `aa979c3` |
-| **L-18** | LOW | `lib/tabs/state.ts` | The re-seed subscription was dead code guarding on a value that can never occur | FIXED `aa979c3` (with `P-M-3`) |
-| **W-1** | WEAK | `harness/ingress.rs` | `DRIFT_TOKENS`' literals were "pinned" by a scan of the file that declares them, which the `const` itself satisfies | FIXED `9d6b8d9` |
-| **W-2** | WEAK | `advisor.rs` | The `"{token}:{version}"` dismissal wire form — a persisted signature — was pinned by nothing | FIXED `9d6b8d9` |
+| **L-16** | LOW | `lib/harnessIdentity.test.ts` | The identity scan's regex was word-boundary only, so it would have passed on develop's own `getClaudeUsage` | FIXED `f5cde79` |
+| **L-17** | LOW | `lib/settings/harness.test.ts` | Not a parity test: the `ext` keys were hand-typed | FIXED `f5cde79` |
+| **L-18** | LOW | `lib/tabs/state.ts` | The re-seed subscription was dead code guarding on a value that can never occur | FIXED `f5cde79` (with `P-M-3`) |
+| **W-1** | WEAK | `harness/ingress.rs` | `DRIFT_TOKENS`' literals were "pinned" by a scan of the file that declares them, which the `const` itself satisfies | FIXED `2748c77` |
+| **W-2** | WEAK | `advisor.rs` | The `"{token}:{version}"` dismissal wire form — a persisted signature — was pinned by nothing | FIXED `2748c77` |
 | P-LOW (copy) | LOW | — | The parity lens's LOW list (probe report tail order, tooltip / drift-card copy) | **NOT ADDRESSED** — see below |
 
 ## Declined, deferred, not addressed
@@ -131,7 +131,7 @@ be true, because `defaultTabId` has a bootstrap fallback); M-3 says the re-seed
 yanks a restored tab. L-18 is correct as the code stood — the guard cannot fire.
 M-3's hazard is real but latent: it becomes live the moment the bootstrap
 fallback goes away, and nothing in the file said so. Both are closed by one
-change (`aa979c3`): the store's writes go through a wrapper that records when
+change (`f5cde79`): the store's writes go through a wrapper that records when
 anything authoritative has spoken, and the re-seed is inert from that moment
 whatever the ordering — so the correction is meaningful *and* cannot walk back a
 real value.

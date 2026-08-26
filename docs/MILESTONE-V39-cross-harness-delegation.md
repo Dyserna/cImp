@@ -1,6 +1,6 @@
 # V39 — Cross-harness delegation (tab drives tab)
 
-**Status:** CODE-COMPLETE, MERGED TO DEVELOP `2a7f1fe` (2026-08-22) — gated on
+**Status:** CODE-COMPLETE, MERGED TO DEVELOP `0bd8cfa` (2026-08-22) — gated on
 live-verify only (#105, milestone 13). GitHub: umbrella #90 (closed), phases
 A #91 · B #87 · C #88 · D #89 (all closed); follow-ups #92 #103 #104.
 **Sequencing:** builds on V30 (push bus + per-tab addressing), V32 (result
@@ -373,7 +373,7 @@ adds the **read-only tab mode** that makes a driven tab safe to leave open.
   runtime map is re-synced from the persisted `read_only` flags on every
   settings broadcast (`sync_users`), so a Settings-window or overlay change
   cannot leave a second source of truth; `Driven` rows are untouched by that
-  sync. IPC `tab_set_read_only`. Shipped in Phase A (`656e32a..b086f73`): no
+  sync. IPC `tab_set_read_only`. Shipped in Phase A (`e2d6ca0..dec5d4f`): no
   schema bump (additive fields under container-level `serde(default)`);
   `delegation` rides the project overlay like `offload`/`graph`.
 - `Tab.svelte`: the communication glyph per decision 7; click →
@@ -495,7 +495,7 @@ adds the **read-only tab mode** that makes a driven tab safe to leave open.
 
 ## Implementation record (B1 — backend, 2026-08-21/22)
 
-Commits `6f73787..80b640f` + follow-ups. Facts that refine the design above:
+Commits `05a7844..07b075c` + follow-ups. Facts that refine the design above:
 - **Prompt-state mirror** = `state::TabActivity` (the `ReadOnlyTabs` shape:
   shared map in `AppState`, one writer — a `note_signal` fold at the top of
   the state-manager loop, ahead of every `continue`). Fields
@@ -523,7 +523,7 @@ Commits `6f73787..80b640f` + follow-ups. Facts that refine the design above:
   mode, started_ms, awaiting_prompt }`); `HarnessVersions.input_profile_status`;
   `CAP_DELEGATION_WORKER = "delegation.worker"`. Health panel gained a
   `Cross-harness` panel for the first `Harness::Any` row.
-- **Latch gating (`d14cc89`)**: `/delegate` is a *fixed-tool route* — the
+- **Latch gating (`b3d0e8d`)**: `/delegate` is a *fixed-tool route* — the
   child resolves the harness id and forwards `{harness}`; the app route never
   sees the model-typed name. Canonical unrouted row `delegate_task`
   (`ToolClass::LocalCapability`, same class as `offload_task`), admitted via
@@ -536,12 +536,12 @@ Commits `6f73787..80b640f` + follow-ups. Facts that refine the design above:
   now `GatesFixedTool { refused_under_external: true }`, computed from
   `toolclass`. Refusal text is byte-identical to `offload_task`'s.
 - **Take-over = one `takeover` row** minted by the engine on its way out
-  (`d252b21`); `DelegationError` `Display` carries no transition prefix so the
+  (`b379544`); `DelegationError` `Display` carries no transition prefix so the
   driver's tool result and the row reason are one string.
 
 ## Implementation record (B2 — UI, 2026-08-22)
 
-Commits `67a9a42 41d55af 831f998 bd62b5f e5159bf` (vitest 780, svelte-check
+Commits `5cab20e acbd0f9 feb1971 1dba1e4 4813927` (vitest 780, svelte-check
 0/0, no Rust). Facts:
 - Phase A's TS `DelegationRole` literal was `'remote'`; serde writes
   `remote_offload` — fixed at the seam (glyph base state stays `'remote'`).
@@ -555,7 +555,7 @@ Commits `67a9a42 41d55af 831f998 bd62b5f e5159bf` (vitest 780, svelte-check
   driven tab. **Live-verify: it covers the terminal's top row.**
 - Elapsed clock = one `readable` whose interval exists only while subscribed.
 - Local echo fires once per flight on the flight's first edge, keyed on the
-  opening-paint baseline (`e5159bf`), via `getTerminal(tab).writeln`.
+  opening-paint baseline (`4813927`), via `getTerminal(tab).writeln`.
 - Events `rowStatus` gained `driving` / `takeover` / `moved` so a `start`
   row no longer reads "Call succeeded".
 - `delegation.max_depth` deliberately NOT exposed (its only legal value is
@@ -564,7 +564,7 @@ Commits `67a9a42 41d55af 831f998 bd62b5f e5159bf` (vitest 780, svelte-check
 
 ## Implementation record (C — facade, 2026-08-22)
 
-Commits `a2db16d 8bfabb7 b803efc 85fbd68 4fc007e` (cargo 2685/0/6, vitest
+Commits `5007219 2605b19 e6eeedc 4fd4c98 e61e911` (cargo 2685/0/6, vitest
 782). New `offload/harness_tab.rs`. Facts:
 - `Settings::effective_offload_backends()` appends facades in both branches;
   on the raw list by design: `supervisor::local_backends` (process funnel),
@@ -594,9 +594,9 @@ Review: docs/reviews/code-review-V39-2026-08-22.md. Fix commits listed there onc
 ## Review-fix record (2026-08-22)
 
 All findings in `docs/reviews/code-review-V39-2026-08-22.md` closed in
-`4fc007e..6c160e6` (19 commits; cargo 2712/0/6, vitest 788), incl. `737da02`
+`e61e911..ca2d7a1` (19 commits; cargo 2712/0/6, vitest 788), incl. `2ff4339`
 (OpenCode MAIN-session-only idle ends a turn; child idles leave the buffer; TTS
-unchanged, test-pinned) and `6c160e6` (row `claude.transcript.stop_reason`,
+unchanged, test-pinned) and `ca2d7a1` (row `claude.transcript.stop_reason`,
 Seam C, `Fallback { to: "claude.hook.stop" }`, fixture pair + negative twin +
 L2 probe that reports rather than asserts). Facts that refine
 the design:
@@ -631,7 +631,7 @@ the design:
 - Knobs have their own IPC `tab_set_delegation_backend`; `withTabBackend`
   deleted. Facade collisions are shown as "not in the pool" in Settings.
 - Pre-existing, out of scope: TTS speaks sidechain lines (#103).
-- **R-1..R-9 (`d3792a3..7442bb9`, cargo 2723/0/6, vitest 792)**: scaffold =
+- **R-1..R-9 (`6962eb3..281153a`, cargo 2723/0/6, vitest 792)**: scaffold =
   empty block ONLY; Claude drain files an ended turn before `restart()`;
   OpenCode buffer cleared on `set_working` rising edge and stamped at
   PRODUCTION time (`note_*_at`); frontend gate honours `prompt_relaxed` via
@@ -643,5 +643,5 @@ the design:
   stream close files the held turn; `Registry::abandoned` makes a pre-claim
   hang-up refuse at the claim; both readers file `""` on a text-less turn
   (Claude waits one pass of grace for the `text` line after `thinking`).
-- **Merged to develop `2a7f1fe` (2026-08-22, user call).** Known flake:
+- **Merged to develop `0bd8cfa` (2026-08-22, user call).** Known flake:
   `sandbox::windows::…mapped_drive…spawn_cwd` (environment `S:\`), unrelated.

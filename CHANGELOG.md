@@ -518,7 +518,7 @@ _(The entries below were recorded under "Unreleased" after this tag was cut; the
   The rc.6 live battery reproduced the rc.4 signature exactly (grant row, then
   nothing, forever) with all of rc.5/rc.6's spawn hardening in place — and
   with the new observation that **no sandboxed child process was ever
-  created**. The real cause has been in Phase A since `15ad514`:
+  created**. The real cause has been in Phase A since `787ade0`:
   `map_drive` takes the process-wide `DRIVES` mutex and, still holding it,
   called `free_drive_letter()`, which locked `DRIVES` **again** to collect the
   letters already handed out. `std::sync::Mutex` is not reentrant, so the

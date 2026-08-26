@@ -1,7 +1,7 @@
 # V32 — Injection Hardening (tool-class taint latch + untrusted-content discipline)
 
-**Status:** IN PROGRESS — Phases A (#31), B (#32), C (#33, both halves; judge deferred) + D (#36) coded 2026-08-06; C2 (#34) + C3 (#35) + F (#40) + G (#42) coded 2026-08-07; H (#43) coded 2026-08-07; E resolved by decision 17 (E1 deferred, E2 shipped as Phase H). Deep code review 2026-08-07 (`docs/reviews/code-review-V32-2026-08-07.md`), then a **seventeen-commit fix-and-audit run — `b80f5b8`, then `09dc7ec..dc3491b`** — closing its HIGHs and most of its MEDIUMs. The last commit of that run (`dc3491b`, 2026-08-08) audited this document against the code at `aed6289` and corrected every stale "as built" claim in place — amendments dated 2026-08-08 are that pass. The decisions the run itself took are **locked decisions 17–24** below (17 restored from `522b62d`, where it was written into the phases and never numbered; 18–24 recorded 2026-08-08). The 2026-08-11 fix phase added **25–33**, and a **pre-RC decision pass on 2026-08-12 settled every remaining open finding as locked decisions 34–40**, then **41–42** for the two findings that pass itself raised — all recorded with their accepted counter-arguments in the ledger's *User decisions taken 2026-08-12* table. **Locked decisions now run 1–42.** Note decision 34 **amends decision 2** (there are now three per-direction refusal constants, not two) and decision 35 **reaffirms decision 17** unchanged. 
-A **full re-review on 2026-08-08** (`docs/reviews/code-review-V32-2026-08-08.md`, 11 parallel agents over the whole `033b36e~1..f31978c` range) then found **10 HIGHs open on a fully green build** — including that C-1 and C-2 had never actually been closed, and that two individually-correct fixes had made the update channel unfetchable by construction. The governing pattern it named, and the one to check first on any future fix run here: **the fixes were correct against their proof-of-concept and incomplete against their invariant**, with three regression tests pinning the PoC's *shape* rather than the property. The decisions taken in response are **locked decisions 25–29** below.
+**Status:** IN PROGRESS — Phases A (#31), B (#32), C (#33, both halves; judge deferred) + D (#36) coded 2026-08-06; C2 (#34) + C3 (#35) + F (#40) + G (#42) coded 2026-08-07; H (#43) coded 2026-08-07; E resolved by decision 17 (E1 deferred, E2 shipped as Phase H). Deep code review 2026-08-07 (`docs/reviews/code-review-V32-2026-08-07.md`), then a **seventeen-commit fix-and-audit run — `07016ca`, then `ed2a042..41f7112`** — closing its HIGHs and most of its MEDIUMs. The last commit of that run (`41f7112`, 2026-08-08) audited this document against the code at `9ea9e4b` and corrected every stale "as built" claim in place — amendments dated 2026-08-08 are that pass. The decisions the run itself took are **locked decisions 17–24** below (17 restored from `fd122bf`, where it was written into the phases and never numbered; 18–24 recorded 2026-08-08). The 2026-08-11 fix phase added **25–33**, and a **pre-RC decision pass on 2026-08-12 settled every remaining open finding as locked decisions 34–40**, then **41–42** for the two findings that pass itself raised — all recorded with their accepted counter-arguments in the ledger's *User decisions taken 2026-08-12* table. **Locked decisions now run 1–42.** Note decision 34 **amends decision 2** (there are now three per-direction refusal constants, not two) and decision 35 **reaffirms decision 17** unchanged. 
+A **full re-review on 2026-08-08** (`docs/reviews/code-review-V32-2026-08-08.md`, 11 parallel agents over the whole `f4b0a03~1..74e297e` range) then found **10 HIGHs open on a fully green build** — including that C-1 and C-2 had never actually been closed, and that two individually-correct fixes had made the update channel unfetchable by construction. The governing pattern it named, and the one to check first on any future fix run here: **the fixes were correct against their proof-of-concept and incomplete against their invariant**, with three regression tests pinning the PoC's *shape* rather than the property. The decisions taken in response are **locked decisions 25–29** below.
 
 Remaining: live-verifies 1–22; the containment HIGHs the re-review reopened (C-2 growth-forgery, `/audit/run`'s opt-in gate, forensic-row eviction); the six updater MEDIUMs M-9…M-14; and publishing `detection-v1`, which is now **unblocked** (decision 24, rewritten). GitHub: milestone 5, umbrella #29.
 **Builds on:** the single-proxy MCP design (every consumer — Claude tabs,
@@ -260,7 +260,7 @@ declares its class AND its mutation capability in one reviewed place.
 1. **The latch is bidirectional mutual exclusion, per task (worker) / per
    session (consumers).**
 
-   > **Precision amendment 2026-08-11 (M-1's implementation, `78b6fc6`) — "per
+   > **Precision amendment 2026-08-11 (M-1's implementation, `d391bd8`) — "per
    > task" was loose language here, and the distinction is load-bearing.** On
    > the worker side a *task* is up to **four** `run_on` attempts (fail-over,
    > the thinking retry, tier escalation). As of M-1: the **budget** and every
@@ -767,7 +767,7 @@ declares its class AND its mutation capability in one reviewed place.
      default install where M-16 was actually verified, because the Phase H gate
      ships off (decision 17). It stays **H-7's own work**.
 
-   **Built 2026-08-11** (`63d03d1`). `tabs/config.rs::opencode_pinned_read`
+   **Built 2026-08-11** (`650c013`). `tabs/config.rs::opencode_pinned_read`
    assembles the four patterns in their load-bearing order from three named
    constants (`OPENCODE_PINNED_READ_ANY` / `_ENV` / `_ENV_EXAMPLE`), inside the
    consumer-hygiene branch so it vanishes with the other pins when hygiene is off;
@@ -881,7 +881,7 @@ declares its class AND its mutation capability in one reviewed place.
     this amendment chooses between "both", "first cause wins" or a set-valued
     field.
 
-    **Status: the FRONTEND half is shipped** (`220dce6`) — the rule name is the
+    **Status: the FRONTEND half is shipped** (`0a874bc`) — the rule name is the
     headline above the note text, so decision 22's ordering is right, and when no
     reason is stored the card says so in words (*"this build does not store which
     screen or rule held this note"*), with missing / `null` / blank all collapsing
@@ -1068,7 +1068,7 @@ declares its class AND its mutation capability in one reviewed place.
     generated corpus cases and all C-4 rows still deny, so none of them meets the
     exemption's conditions.
 
-    > **Precision correction 2026-08-11 (found while implementing, `11792cb`).**
+    > **Precision correction 2026-08-11 (found while implementing, `aadf49d`).**
     > This paragraph originally said the corpus and C-4 rows are all
     > "scheme-bearing, relative, or port-bearing" and gave the counts as 21,120
     > and 30. **Both were wrong in detail, and the reasoning is what matters:**
@@ -1113,7 +1113,7 @@ declares its class AND its mutation capability in one reviewed place.
       the oldest row *of that kind*, so a model looping denied URLs did not
       merely make noise: it evicted the `Canary`, `LatchBeacon` and
       `MemoryQuarantine` rows that are the only forensic record of the attack
-      that got in. `269daf2` made the loop cheaper still, by turning 25
+      that got in. `f3ba8aa` made the loop cheaper still, by turning 25
       previously-allowed call shapes into a denial each.
       The ledger is `outbound::AuditClaims`, carried inside `Budget` — the one
       piece of per-conversation state with both the right lifetime and the right
@@ -1158,10 +1158,10 @@ declares its class AND its mutation capability in one reviewed place.
       `TABLE`, therefore `External` by the unknown-⇒-EXTERNAL invariant —
       engaged the latch **before** dispatch returned "unknown native tool". The
       task then permanently lost `read_file`, `code_search`, `run_command`,
-      `graph_snippet` and every other local tool (eleven since `b80f5b8`,
-      thirteen since `ada4bae`) and was told by the fixed refusal that the latch
+      `graph_snippet` and every other local tool (eleven since `07016ca`,
+      thirteen since `3109d2d`) and was told by the fixed refusal that the latch
       "cannot be unlocked". One typo from a local 30B model ended the task, and
-      `a434d4f` recorded 28 `ok:false` rows in 162 live calls.
+      `5b7ef25` recorded 28 `ok:false` rows in 162 live calls.
       The proxy had already closed exactly this with `LatchRoute::Native`,
       writing down why: *"letting it engage the latch would let one bad tool
       name poison a tab for its whole session."* The worker knew the route
@@ -1644,7 +1644,7 @@ declares its class AND its mutation capability in one reviewed place.
     Checks is a top-level **sibling**, so the scan must check the first segment,
     not merely that some segment exists.
 
-    **Built 2026-08-11** (`6459ac9`) — the Settings half only. `src/SettingsApp.svelte`'s
+    **Built 2026-08-11** (`823acd9`) — the Settings half only. `src/SettingsApp.svelte`'s
     `SECTIONS` list gained `{ id: 'injection', label: 'Injection protection' }`
     (`:1124`); the ⛨ chip now deep-links to that id; and
     `src/lib/settingsPointers.test.ts` fails the build on any `Settings → X`
@@ -1660,9 +1660,9 @@ declares its class AND its mutation capability in one reviewed place.
 17. **The Phase E split is resolved: E1 (Claude) is DEFERRED, E2 (OpenCode)
     ships as Phase H behind a default-off toggle, containment stays V33's job
     (user decision 2026-08-07).** *Numbered here 2026-08-08 (#48).* This
-    decision was taken and written in `522b62d`, but only into the Phase E and
+    decision was taken and written in `fd122bf`, but only into the Phase E and
     Phase H bullets — so `docs/reviews/code-review-V32-2026-08-07.md`,
-    `522b62d`'s own subject line, decision 3 and live-verification recipe 15 all
+    `fd122bf`'s own subject line, decision 3 and live-verification recipe 15 all
     cite "decision 17" against a numbered entry that did not exist. Its full
     text stays where it was written (the Phase E *USER DECISION 2026-08-07*
     bullet and the Phase H bullet); the load-bearing parts:
@@ -1700,12 +1700,12 @@ declares its class AND its mutation capability in one reviewed place.
     **Accepted consequence:** the Accepted-residuals entry on native tools is
     *narrowed*, not closed — Claude's natives stay entirely outside the latch,
     and OpenCode's are gated only when a default-off toggle is on, by a policy
-    control with named escapes. Implemented as Phase H (`f5fb221`); spec
-    `522b62d`; live-verification recipe 15.
+    control with named escapes. Implemented as Phase H (`b002c6b`); spec
+    `fd122bf`; live-verification recipe 15.
 18. **`POST /audit/run` and `POST /run` are inside the latch, and
     `offload_task`/`offload_batch` are LOCAL-CAPABILITY (user decision
-    2026-08-07, #48 findings C-1b / C-1c; `ada4bae`).** The 2026-08-07 demotion
-    of `run_check`/`security_audit`/`quality_audit` (`b80f5b8`, first Phase A
+    2026-08-07, #48 findings C-1b / C-1c; `3109d2d`).** The 2026-08-07 demotion
+    of `run_check`/`security_audit`/`quality_audit` (`07016ca`, first Phase A
     amendment) reached only the **offload worker's def-filter**. Two routes
     reconstituted the trifecta around it, and neither fix helps the other:
     - **The audit tools never pass through the offload child.** They arrive from
@@ -1745,7 +1745,7 @@ declares its class AND its mutation capability in one reviewed place.
     decision 1's reach and decision 3's route list; decision 4 is untouched.
 19. **The detection updater's scheduler gates on
     `effective(Feature::Detection, Scope::App)`, not on the L1 master alone
-    (user decision 2026-08-07, #48; `f032796`).** #46 gated `tick_once` on
+    (user decision 2026-08-07, #48; `a68f5fb`).** #46 gated `tick_once` on
     `injection_protection` alone, so with protection **on** and
     `Feature::Detection` **off** — a supported state under decision 16 — the
     updater still made a daily network request and hot-swapped bundles for a
@@ -1775,7 +1775,7 @@ declares its class AND its mutation capability in one reviewed place.
     in Phase C3 amendment (c), *user decision (a)*; live-verification recipe
     14's 2026-08-08 extension. Applies decision 16 to decision 13's channel.
 20. **The updater's manual actions — Check now / Apply / Revert — are gated
-    under the same rule (user decision 2026-08-07, #48; `f032796`).** They were
+    under the same rule (user decision 2026-08-07, #48; `a68f5fb`).** They were
     gated on `detectionBusy` alone and ran happily with protection off.
     Decision 16 locks L1 as *"the one switch that cannot be overridden
     upward"*, and the Detection panel already told the user in so many words
@@ -1802,7 +1802,7 @@ declares its class AND its mutation capability in one reviewed place.
     never a skipped one. Recorded in Phase C3 amendment (c), *user decision
     (b)*; live-verification recipe 14's extension.
 21. **The headless MCP child refuses persistent writes; reads stay fail-open
-    (user decision 2026-08-08, #48 finding M-2; `b63ebfb`).** The child wrote
+    (user decision 2026-08-08, #48 finding M-2; `8358ac3`).** The child wrote
     memory notes with `WriteTaint::Clean` and `session: None` whenever it could
     not reach the app, justified by *"quarantining every note written while the
     app is closed is neither evidence of taint nor something a user could
@@ -1839,7 +1839,7 @@ declares its class AND its mutation capability in one reviewed place.
     that is the fail-open half, recorded in Accepted residuals.
     Recorded as built in the Phase C2 amendment 2026-08-08 (M-2 + N-1);
     live-verification recipe 17. Extends decision 10.
-    **Amendment (#48 finding M-8, `4555d70`) — the same path also refuses
+    **Amendment (#48 finding M-8, `343b6f2`) — the same path also refuses
     LOCAL-CAPABILITY, but only for a child that serves a cImp TAB.** "Reads stay
     fail-open" was true of the tool *kind* and false of the *class*: past the
     write gate sat `run_check` (executes the project's configured build/test/lint
@@ -1869,7 +1869,7 @@ declares its class AND its mutation capability in one reviewed place.
     cannot read the latch, in an already-anomalous window (an AI tab is a cImp
     webview, so cImp being down normally means the tab is gone too).
 22. **Credentials are screened at `context_note` WRITE time, and a hit is
-    stored-and-quarantined (user decision 2026-08-08, #48; `b63ebfb`).**
+    stored-and-quarantined (user decision 2026-08-08, #48; `8358ac3`).**
     `context_recall`/`context_notes` are TRUSTED — never latched, never blocked
     — and return every **pinned** note for the project. Decision 10's quarantine
     covers the write side for *injected* content; it says nothing about a note
@@ -1908,7 +1908,7 @@ declares its class AND its mutation capability in one reviewed place.
     screen"* amendment; live-verification recipe 16. Extends decision 10 and
     answers the exposure decision 23 leaves open.
 23. **`context_recall`/`context_notes` stay TRUSTED, with the rationale
-    corrected (user decision 2026-08-07, #48 finding C-1c; `ada4bae`).** The old
+    corrected (user decision 2026-08-07, #48 finding C-1c; `3109d2d`).** The old
     rationale claimed *"the memory reads return the session's own working set"*,
     which the code contradicts: `context_recall` appends `list_project_facts`
     (*"durable knowledge that outlived the sessions it came from"*) and
@@ -2223,7 +2223,7 @@ declares its class AND its mutation capability in one reviewed place.
       configured** backends — a backend saved before this rule existed carries a
       scope that does not name `run_check`, so rule 1 never sees it.
 
-    **Built 2026-08-11** (`00ae3cb`). The verdict is resolved in one place,
+    **Built 2026-08-11** (`1306216`). The verdict is resolved in one place,
     `BackendGate::for_worker` (`offload/backend_gate.rs:163-179`) via the named
     predicate `worker_run_check_allowed(is_remote, allow_remote)`
     (`backend_gate.rs:131-133`), and all three worker entry points build their gate
@@ -2254,7 +2254,7 @@ declares its class AND its mutation capability in one reviewed place.
       into a backend's scope when its cloud flag is toggled, so until the mirror
       was corrected the `LOCAL_DATA_TOOLS` half of this decision had **no
       production effect**. No hole opened at any point — rule 4 refuses at call
-      time regardless — but the UI lied. The mirror is fixed (`049fb8b`,
+      time regardless — but the UI lied. The mirror is fixed (`2af9fe8`,
       `src/lib/settings/types.ts:1303-1311`, preset identity now bidirectional set
       membership rather than array length); a Rust-side `include_str!` tripwire
       that **parses** the array and asserts set equality in **both** directions is
@@ -2345,7 +2345,7 @@ declares its class AND its mutation capability in one reviewed place.
     at-own-risk restore; *Switch to local* keeps the bit, and a `local` latch
     already refuses web, so nothing about the flip changes.
 
-    **Built 2026-08-11** (`63d03d1`), in `tabs/config.rs`'s generated gate with the
+    **Built 2026-08-11** (`650c013`), in `tabs/config.rs`'s generated gate with the
     state table written out beside it. Negative control run: replacing the new
     condition with `if (false)` makes the node-backed test fail with *"a
     contaminated tab must not keep its native web tools"* — the test bites.
@@ -2926,7 +2926,7 @@ declares its class AND its mutation capability in one reviewed place.
   - **`POST /audit/run` (finding C-1b).** `security_audit`/`quality_audit` do
     not arrive through the offload child at all: `cimp-code-audit` is a
     *separate* MCP server (`cimp --code-audit-mcp`), and its client posts here.
-    So `b80f5b8`'s demotion reached only the worker's def filtering, and this
+    So `07016ca`'s demotion reached only the worker's def filtering, and this
     handler contained **no `latches()` call of any kind**. On a default install
     (`code_audit.expose_offload` defaults true) a contaminated tab could be told
     by a fetched page to run `security_audit` and put the gitleaks findings —
@@ -3561,7 +3561,7 @@ declares its class AND its mutation capability in one reviewed place.
       predicate, so the card and the row cannot disagree about whether the user's
       rules are live (the N-3 lesson: a dot that computes its own health
       eventually disagrees with the health check).
-  - **U-4 amendment 2026-08-11 (#48, finding M-13, shipped `a17f25c`) — the
+  - **U-4 amendment 2026-08-11 (#48, finding M-13, shipped `95be25d`) — the
     baseline is no longer the forgiveness predicate, and a collision is not a
     failure at all.** M-13 showed that the *baseline-relative* rule above
     reproduced U-4's own symptom in the one case the README tells users to
@@ -4462,7 +4462,7 @@ declares its class AND its mutation capability in one reviewed place.
 
   - **Phase F amendment 2026-08-07 (#48, deep re-verification of #45) — three
     defects the previous amendment introduced.** The re-verification sweep over
-    `09dc7ec` found that folding the tab-id check into `latch_scope` widened one
+    `ed2a042` found that folding the tab-id check into `latch_scope` widened one
     `None` into two meanings, that the beacon's row missed a whole class of
     beacon, and that the row's origin had two unlinked sources of truth.
     - **A2-1 — an unconfigured tab id no longer forces the Phase H gate OFF.**
@@ -4682,7 +4682,7 @@ declares its class AND its mutation capability in one reviewed place.
     (unknown ⇒ `Inherit`, the neutral cell): a hand-edited typo must neither
     grant protection nor remove it, and must not quarantine the settings file.
     **Amended 2026-08-08 (#48) — the defect class, not just `Override`.**
-    `00b906b` fixed `Override` (a hand-written `Deserialize` through
+    `fc84fdf` fixed `Override` (a hand-written `Deserialize` through
     `serde_json::Value`, so `true`/`null`/`1`/`[]`/`{}` all read as `Inherit`
     instead of failing the typed parse and resetting every setting in the file).
     The **same shape was unfixed on four plain-`String` settings** whose real
@@ -4738,7 +4738,7 @@ declares its class AND its mutation capability in one reviewed place.
     `set_detection_layer_for_test`. The other four fields needed no writer — no
     out-of-boundary test touches them — and none was added, because an unused
     helper is a clippy warning today and a field-name setter tomorrow.
-    **Re-verified at `aed6289` (2026-08-08), and now stated precisely enough to
+    **Re-verified at `9ea9e4b` (2026-08-08), and now stated precisely enough to
     be falsifiable:** every L1 switch and all eleven L2 switches on
     `InjectionSettings`, its `worker` field, all nine `TabInjectionOverrides`
     cells, all six `WorkerInjectionOverrides` cells, their `get`/`set`
@@ -5117,7 +5117,7 @@ declares its class AND its mutation capability in one reviewed place.
     loading), audited (one row per tab-session, honestly attributed) and
     recoverable (a restart), but not closed.
 
-    **Correction, 2026-08-08 (#48, `d9ebbd4`) — "audited" was false as #45
+    **Correction, 2026-08-08 (#48, `0942789`) — "audited" was false as #45
     shipped it, and is true now.** The row was written only when the *latch*
     moved (`if out.engaged`), while `contaminated = true` was set on **every**
     beacon — and `engaged` is false both when the tab is already External
@@ -5220,7 +5220,7 @@ consequence of a decision the run took; each is named in that decision.
 
 **Opened by the 2026-08-08 documentation audit (#48).** These are not new
 defects — they are things the spec asserted and the code does not do, found by
-re-reading every "as built" claim against `aed6289`. Each is recorded rather
+re-reading every "as built" claim against `9ea9e4b`. Each is recorded rather
 than fixed because this pass is documentation; each is small.
 
 - **The deny-mode `--settings` overlay has no top-level key-set guard.**

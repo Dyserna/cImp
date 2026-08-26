@@ -4,7 +4,7 @@
 renders on WebGL, shell + AI tabs and renderer behavior user-tested clean
 (the devtools context-loss recipe in §5 remains best-effort/unexercised).
 Closed GitHub issue #20 (D-7 from the 2026-08-04 maintenance run;
-GH milestone 3). Implemented in 1cf4049.
+GH milestone 3). Implemented in 5d49a38.
 **Forced by upstream:** xterm 6.0 deleted the canvas renderer entirely —
 `@xterm/addon-canvas` was removed from the monorepo, is peer-locked to 5.x,
 and has been unpublished since 2024. cImp loads `CanvasAddon`

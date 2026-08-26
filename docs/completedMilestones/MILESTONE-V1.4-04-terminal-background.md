@@ -366,7 +366,7 @@ Tests (mirroring V1.4-02's coverage):
       ...preset.config,
     };
     // Re-derive bgMode from the loaded preset (this is a deliberate
-    // user action — the c6e3e8a "snapshot doesn't reset bgMode"
+    // user action — the a4d973a "snapshot doesn't reset bgMode"
     // protection applies to settings refreshes, not to explicit user
     // intent).
     bgMode = config.image ? 'image' : (config.color ? 'color' : 'theme');

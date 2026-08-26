@@ -668,7 +668,7 @@ none", not "verified none exist." Test detection itself (`graph/builder.rs`'s
 a path-convention fallback — again accurate-but-incomplete rather than wrong,
 matching V10's `visibility` precedent.
 
-**The 4-agent code-review pass (`fix(V12)`, commit `aa120c3`) is worth reading
+**The 4-agent code-review pass (`fix(V12)`, commit `e7b4c9f`) is worth reading
 directly** — it caught several correctness bugs that would otherwise degrade
 silently: `git status --porcelain` collapsing a brand-new untracked directory
 into one `?? dir/` line (both `graph_impact` and `changed_only` now use
@@ -1160,7 +1160,7 @@ tree_untouched` in `worktree.rs`'s test module asserts `MERGE_HEAD` absence,
 unchanged `HEAD`, and a clean `git status` after an aborted merge — the
 regression coverage for the "never half-merged" guarantee.
 
-**The 3-agent code-review pass (`fix(V13)`, commit `010a14e`) is worth reading
+**The 3-agent code-review pass (`fix(V13)`, commit `da0c738`) is worth reading
 directly** — same posture as V12's, and it caught one **critical data-loss
 bug**: `diff_vs_now`'s `git add -A` used to leave the shared shadow index
 matching disk, so `restore`'s own pre-restore safety snapshot (Invariant C,
@@ -1310,7 +1310,7 @@ untrusted third-party content") — revisit if wry grows subframe-navigation
 events, or by reaching `CoreWebView2Frame::NavigationStarting` directly if
 this ever needs to be airtight.
 
-**The `fix(V14)` review pass (commit `820319e`) is worth reading directly** —
+**The `fix(V14)` review pass (commit `ae92ad3`) is worth reading directly** —
 same posture as V12's and V13's, three agents, one HIGH-severity data-loss
 bug and one HIGH-severity RCE-vector bug:
 - **`settings_update` template-clobber (HIGH, data loss).** The generic

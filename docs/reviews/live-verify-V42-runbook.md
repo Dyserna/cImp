@@ -68,7 +68,7 @@ The LV-B block (from #127) is MANDATORY and blocking for that RC. Others: work t
 - LV-39 Graph view: load/settle/auto-fit/stop-at-touch; orbit/pan/zoom-limits/momentum; hover ring + edge emphasis; click→ego+history; directory focus; live agent pulses; workbench jump incl. dropped-by-top-N file; 6 tuning knobs + 2 edge colours + cluster spacing 50×; hide/show pauses+resumes rAF.
 - LV-40 Keep-alive polls ×5 (Events/Timeline/GraphIndex/GitGraph/CI): switch away 1 min → return: refresh-on-return, stays live, no double-refresh; Timeline latch action mid-flight not clobbered.
 
-## From #127 (unified confined spawn) — MANDATORY SANDBOX BATTERY (blocking for the RC that ships 0caee50; sandbox ON)
+## From #127 (unified confined spawn) — MANDATORY SANDBOX BATTERY (blocking for the RC that ships b561bd9; sandbox ON)
 - LV-B1 run_check sandboxed, network OFF: completes; one sandboxed row named by the CONFIGURED CHECK NAME (never cmd.exe/sh).
 - LV-B2 run_check sandboxed, network ON: completes; posture note reflects network-on.
 - LV-B3 security_audit with a stdout scanner (semgrep): findings whole; one sandboxed row per scanner named by PROGRAM.

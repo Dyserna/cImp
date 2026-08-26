@@ -1,6 +1,6 @@
 # V40 — Harness registry and the V35 leftovers (everything harness-specific moves behind the plugin)
 
-**Status:** **IMPLEMENTED THROUGH PHASE I** (2026-08-23). Phases 0 and A-G merged to `develop` at `d1d8676` and shipped in v0.53.0-rc.6; **Phase I (#107) = the post-review residual closures**, on branch `feat/v40-i-residuals`. **Phase H (#100) = RC + the live-verify below**, which is the milestone's only remaining gate. Amendments 0-a...0-g are folded into decisions 2, 4, 5, 9, 17, 24 and 27; every ruling taken during implementation is in *What changed vs the design*. The row-level appendix (`docs/V40-harness-residue-ledger.md`) was DELETED in Phase G: every row is moved, or allowlisted with a reason in `harness/layering.rs` / `src/lib/harnessIdentity.test.ts`, and the layering tests are the durable record.
+**Status:** **IMPLEMENTED THROUGH PHASE I** (2026-08-23). Phases 0 and A-G merged to `develop` at `b456a48` and shipped in v0.53.0-rc.6; **Phase I (#107) = the post-review residual closures**, on branch `feat/v40-i-residuals`. **Phase H (#100) = RC + the live-verify below**, which is the milestone's only remaining gate. Amendments 0-a...0-g are folded into decisions 2, 4, 5, 9, 17, 24 and 27; every ruling taken during implementation is in *What changed vs the design*. The row-level appendix (`docs/V40-harness-residue-ledger.md`) was DELETED in Phase G: every row is moved, or allowlisted with a reason in `harness/layering.rs` / `src/lib/harnessIdentity.test.ts`, and the layering tests are the durable record.
 GitHub: umbrella #101, milestone 14; phases 0 #102 · A #93 · B #94 · C #95 · D #96 ·
 E #97 · F #98 · G #99 · H #100.
 **Sequencing:** after V39 ships and is live-verified. **V41 — Codex CLI** is
@@ -666,7 +666,7 @@ run reviewable.
   decision 9; banner labels come from `harness_list` — decision 27), the
   A/C/E/F/G briefs updated with the V39 rows they own, and post-V39
   baselines. Read-only; no code moves.
-  **DONE 2026-08-22** on `5e2d87d`: ledger section M (73 rows; engine,
+  **DONE 2026-08-22** on `eb8c4b5`: ledger section M (73 rows; engine,
   `HarnessTab`, read-only path, `ActivityKind::Delegation` all neutral ✔ —
   the R-2/R-3/R-7 turn buffers live in `harness/<id>/read.rs`), re-baseline
   table for A–L (`processing/`, `advisor.rs`, `pty/tasks.rs`, docs

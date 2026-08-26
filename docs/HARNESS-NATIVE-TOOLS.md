@@ -9,7 +9,7 @@ project config actually points at. Tool lists drift on every harness release —
 re-verify with the recipes in [§1](#1-verification-basis) before trusting an
 older copy of this file.
 
-**Re-audited 2026-08-09 at `0db5739`**, after the two V32 fix runs and Phase H.
+**Re-audited 2026-08-09 at `4060d7b`**, after the two V32 fix runs and Phase H.
 Scope of that re-audit, so the next reader knows what was and was not re-checked:
 
 * **Re-checked against code** — every claim about tool classes, what an engaged
@@ -430,7 +430,7 @@ Four consequences, in decreasing order of how much they should influence the
 
    **Corrected 2026-08-09.** This paragraph used to end "treat delegation as the
    primary research pattern under `deny`, not as a fallback", and that is no
-   longer free. `ada4bae` demoted `offload_task`/`offload_batch` to
+   longer free. `3109d2d` demoted `offload_task`/`offload_batch` to
    LOCAL-CAPABILITY (`toolclass.rs` — the delegated sub-task holds exactly the
    class the caller would otherwise have given up), so from the caller's side
    delegation is now a **latching** call, gated at `loopback.rs::handle_run`:
@@ -500,7 +500,7 @@ its corpus.
 `sensor` and `deny` act on `WebFetch`/`WebSearch` and `webfetch`/`websearch`
 only. **Corrected 2026-08-09** — this section used to say that *both* harnesses'
 file/shell tools "remain completely ungated in every mode" and that gating them
-was unscheduled Phase E. Phase H shipped the OpenCode half (`f5fb221`), so the
+was unscheduled Phase E. Phase H shipped the OpenCode half (`b002c6b`), so the
 two harnesses now differ and the difference is the whole point of this section:
 
 **Claude:** its local natives — the `LocalCapability` and unclassed rows of
@@ -674,10 +674,10 @@ shell-level egress is V33's problem (a documented honest limit) and taking
   | Tool | Route that refuses it | Since |
   |---|---|---|
   | `graph_snippet`, `graph_search_docs`, `graph_semantic_docs`, `graph_semantic_code` | `/graph_run` | Phase B |
-  | `run_check` | `/graph_run` | `b80f5b8` (2026-08-07 review) |
-  | `security_audit`, `quality_audit` | `/audit/run` | `b80f5b8`, routes closed by `ada4bae`; `tab` + a known `consumer` now **required** (H-8, `80375a9`) |
-  | `offload_task`, `offload_batch` | `/run` | `ada4bae` (finding C-1c) |
-  | `graph_struct_search`, `graph_repo_map` | `/graph_run` | `0169d10` (finding H-1, locked decision 29) |
+  | `run_check` | `/graph_run` | `07016ca` (2026-08-07 review) |
+  | `security_audit`, `quality_audit` | `/audit/run` | `07016ca`, routes closed by `3109d2d`; `tab` + a known `consumer` now **required** (H-8, `11b4dba`) |
+  | `offload_task`, `offload_batch` | `/run` | `3109d2d` (finding C-1c) |
+  | `graph_struct_search`, `graph_repo_map` | `/graph_run` | `7a38a05` (finding H-1, locked decision 29) |
 
   `read_file` / `code_search` / `run_command` are **not** on this list and never
   were: they are worker-native tools (`offload/tools/`), not advertised to a tab
@@ -692,7 +692,7 @@ shell-level egress is V33's problem (a documented honest limit) and taking
   `graph_dead_exports`, `graph_cycles`, `graph_path`, `graph_architecture`)
   plus `context_recall` / `context_notes`. The membership rule is now a property
   a reviewer can check row by row — **no source text on any path** — and
-  `0169d10` had to strip `signature` from `graph/mcp.rs::fmt_symbols` to make it
+  `7a38a05` had to strip `signature` from `graph/mcp.rs::fmt_symbols` to make it
   true of the four symbol tools, because a signature is the definition's first
   source line and `graph_find_symbol{name:"STRIPE_SECRET"}` answered it
   verbatim. A `TABLE` test pins the count at 16 and names the two demoted tools,
@@ -720,7 +720,7 @@ shell-level egress is V33's problem (a documented honest limit) and taking
     recreates the trifecta, asks for confirmation, and **releases the flag** as
     part of the same click.
   * The **contamination bit** is cleared by the user, in cImp's own UI
-    (`05e613f`). *Resume* clears it now and touches nothing else; *Full unlatch*
+    (`f86c7f3`). *Resume* clears it now and touches nothing else; *Full unlatch*
     clears it too (user decision 2026-08-10 — restoring FULL access is a verdict,
     and that click already hands back the strictly larger risk, so quarantining
     persistent memory afterwards would overrule the judgement it just asked for);
@@ -728,7 +728,7 @@ shell-level egress is V33's problem (a documented honest limit) and taking
     rotation is observed, because restoring a checkpoint rolls back files and
     cannot remove injected text from the context window. The trust root is
     **authority, not evidence** — a human clicking in cImp is a fact no shell can
-    fabricate, which is why H-2 (`2c40136`) removed the automatic reset: "the
+    fabricate, which is why H-2 (`9db7f10`) removed the automatic reset: "the
     session rotated" was inferred from a transcript file the model's own shell can
     write. None of the three clear paths is reachable over HTTP; `/latch/beacon`
     can only tighten. Every release writes its own `contamination_cleared` row
@@ -751,7 +751,7 @@ returns. The untrusted bytes never enter the code session, and the worker's own
 def-list filtering means it holds either private-data reads or web access but
 never both.
 
-What changed: `offload_task` is itself LOCAL-CAPABILITY since `ada4bae`, so the
+What changed: `offload_task` is itself LOCAL-CAPABILITY since `3109d2d`, so the
 sentence this section used to carry — "the code session's latch is never
 engaged" — is false. The call **latches the calling tab LOCAL**, which costs it
 every proxied EXTERNAL tool for the rest of the session (it keeps

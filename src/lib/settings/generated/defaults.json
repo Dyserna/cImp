@@ -142,6 +142,7 @@
   "ui": {
     "theme": "tui",
     "tui_accent": "#7aa2f7",
+    "tui_notification": "#e0af68",
     "status_bar": {
       "items": [
         {

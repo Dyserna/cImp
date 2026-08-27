@@ -10,10 +10,66 @@
 //! prosody markers actually map to ids.
 
 use std::collections::HashMap;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 
 use misaki_rs::{language::Language, G2P};
 
 use crate::error::{AppError, AppResult};
+
+/// The variable `espeak-rs` (reached through misaki) reads its data directory
+/// from. Spelled once; [`espeak_data_override`] decides, this names.
+const ESPEAK_DATA_ENV: &str = "PIPER_ESPEAKNG_DATA_DIRECTORY";
+
+/// The espeak-ng data directory `build.rs` copies next to the executable —
+/// the same portable-install location `settings.json` uses.
+const ESPEAK_DATA_DIR: &str = "espeak-ng-data";
+
+/// Where espeak-ng's data directory should be pointed, or `None` for "leave the
+/// environment alone" (#145).
+///
+/// Two refusals, and both are the point:
+///
+/// * a value already in the environment WINS. An operator (and the OOV-fallback
+///   test) pointing the variable at another tree is a decision, not a gap —
+///   overriding it would make the setting unusable exactly when it is being
+///   used deliberately. An empty value counts as unset: it names no directory,
+///   so honouring it would be honouring nothing.
+/// * a directory that is not there is not named. espeak initialized against a
+///   path that does not exist fails every OOV token, and it fails from inside
+///   the dependency, which is why the symptom (#145) was hundreds of identical
+///   per-segment synthesis errors rather than one legible startup failure.
+fn espeak_data_override(preset: Option<&OsStr>, exe_dir: Option<&Path>) -> Option<PathBuf> {
+    if preset.is_some_and(|v| !v.is_empty()) {
+        return None;
+    }
+    let candidate = exe_dir?.join(ESPEAK_DATA_DIR);
+    candidate.is_dir().then_some(candidate)
+}
+
+/// Apply [`espeak_data_override`] to this process, at most once.
+///
+/// **Must run before the first [`G2P`] is constructed** — espeak reads the
+/// variable at initialization and never re-reads it — which is why the one
+/// caller is [`Phonemizer::new`] itself rather than a startup hook that a
+/// future second construction site could be added ahead of.
+fn apply_espeak_data_dir() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(Path::to_path_buf));
+        let preset = std::env::var_os(ESPEAK_DATA_ENV);
+        let Some(dir) = espeak_data_override(preset.as_deref(), exe_dir.as_deref()) else {
+            return;
+        };
+        tracing::info!(
+            path = %dir.display(),
+            "tts: pointing espeak-ng at the data directory beside the executable"
+        );
+        std::env::set_var(ESPEAK_DATA_ENV, &dir);
+    });
+}
 
 /// Maximum unpadded token count Kokoro accepts. The model was trained with
 /// `(1, 512)` input and pads with a 0 at each end, leaving 510 real tokens.
@@ -45,6 +101,9 @@ pub struct Phonemizer {
 
 impl Phonemizer {
     pub fn new() -> Self {
+        // Before `G2P::new`, never after: espeak reads its data directory at
+        // initialization.
+        apply_espeak_data_dir();
         Self {
             g2p: G2P::new(Language::EnglishUS),
             vocab: build_vocab(),
@@ -309,6 +368,47 @@ mod tests {
         assert_eq!(toks.padded_ids.first(), Some(&0));
         assert_eq!(toks.padded_ids.last(), Some(&0));
         assert_eq!(toks.padded_ids.len(), toks.raw_count + 2);
+    }
+
+    /// #145: the espeak data directory is resolved beside the executable, and
+    /// **a preset value is never overridden**.
+    ///
+    /// Written against the pure decision rather than the process environment on
+    /// purpose: `PIPER_ESPEAKNG_DATA_DIRECTORY` is process-global, the suite
+    /// runs threaded, and a test that set it would race
+    /// `espeak_fallback_engages_on_oov` and every `Phonemizer::new` in this
+    /// module. The `Once` around the apply is not the property worth testing;
+    /// which directory it would apply, and when it declines to, is.
+    #[test]
+    fn espeak_data_is_resolved_beside_the_exe_and_never_overrides_a_preset() {
+        use std::ffi::OsString;
+
+        let dir = crate::testutil::ScratchDir::new("espeak-data");
+        let exe_dir = dir.0.as_path();
+        let data = exe_dir.join(ESPEAK_DATA_DIR);
+
+        // Nothing beside the executable ⇒ nothing to name.
+        assert_eq!(espeak_data_override(None, Some(exe_dir)), None);
+
+        std::fs::create_dir(&data).expect("create espeak-ng-data");
+        assert_eq!(
+            espeak_data_override(None, Some(exe_dir)),
+            Some(data.clone()),
+            "the shipped data directory must be picked up"
+        );
+        // An empty variable names no directory and reads as unset.
+        assert_eq!(
+            espeak_data_override(Some(&OsString::new()), Some(exe_dir)),
+            Some(data.clone())
+        );
+
+        // The guard: a deliberate value wins, even though the shipped tree is
+        // right there.
+        let preset = OsString::from("D:\\somewhere\\else");
+        assert_eq!(espeak_data_override(Some(&preset), Some(exe_dir)), None);
+
+        // No executable directory to look beside (an unreadable `current_exe`).
+        assert_eq!(espeak_data_override(None, None), None);
     }
 
     /// Run with: `cargo test --bin cimp -- --ignored --nocapture espeak_fallback`.

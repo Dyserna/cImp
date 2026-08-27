@@ -18,7 +18,9 @@
     TUI_THEME_ID,
     TUI_ACCENT_PRESETS,
     normalizeTuiAccent,
+    normalizeTuiNotification,
     normalizeHexColor,
+    DEFAULT_TUI_NOTIFICATION,
     DEFAULT_LATCHED_COLOR,
     DEFAULT_CONTAMINATED_COLOR,
   } from '../../themes/accent';
@@ -249,6 +251,42 @@
       anything.
     </small>
   {/if}
+
+  <!-- #151 notification color. Theme-INDEPENDENT, unlike the accent above
+       and like the containment colors below: the surfaces it paints (toasts,
+       the delegation banner, the Manual delegation glyph) are cImp's own
+       chrome and render under every theme, so hiding the control under a disk
+       theme would leave a colour applied and uneditable. Its own setting
+       rather than a shade of the accent — a notice has to stay legible AS a
+       notice whatever accent the user picked for taste. -->
+  <div class="accent-row">
+    <span>Notification color</span>
+    <div class="accent-controls">
+      <input
+        type="color"
+        aria-label="Notification color"
+        title="Worn by transient toasts, the delegation attribution banner, and the tab bar's Manual delegation glyph"
+        value={normalizeTuiNotification(snapshot.ui.tui_notification)}
+        oninput={(e) => {
+          const color = (e.currentTarget as HTMLInputElement).value;
+          patch((s) => (s.ui.tui_notification = color));
+        }}
+      />
+      <button
+        type="button"
+        class="secondary"
+        disabled={normalizeTuiNotification(snapshot.ui.tui_notification) ===
+          DEFAULT_TUI_NOTIFICATION}
+        onclick={() => patch((s) => (s.ui.tui_notification = DEFAULT_TUI_NOTIFICATION))}
+        >Reset</button
+      >
+    </div>
+  </div>
+  <small class="hint top">
+    Worn by transient toasts, the delegation attribution banner, and the
+    Manual delegation glyph — the surfaces that interrupt you, kept
+    distinguishable from the accent the rest of the chrome wears.
+  </small>
 
   <!-- V32 containment colors. Theme-independent (unlike the TUI
        accent above): the taint badge and pane frame render under

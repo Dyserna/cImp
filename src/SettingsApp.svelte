@@ -88,6 +88,7 @@
   import SttSection from './lib/settings/sections/SttSection.svelte';
   import ThemeSection from './lib/settings/sections/ThemeSection.svelte';
   import TabsSection from './lib/settings/sections/TabsSection.svelte';
+  import DelegationSection from './lib/settings/sections/DelegationSection.svelte';
   import OffloadSection from './lib/settings/sections/OffloadSection.svelte';
   import InjectionSection from './lib/settings/sections/InjectionSection.svelte';
   import SandboxingSection from './lib/settings/sections/SandboxingSection.svelte';
@@ -551,6 +552,7 @@
     | 'tabs'
     | 'shortcuts'
     | 'compose'
+    | 'delegation'
     | 'offload'
     | 'injection'
     | 'sandboxing'
@@ -574,6 +576,14 @@
     { id: 'audio', label: 'Text-to-speech' },
     { id: 'stt', label: 'Speech-to-text' },
     { id: 'tabs', label: 'Tabs' },
+    // #148: a top-level category, under the same rule that created Sandboxing
+    // (V33 decision 16) and for F-18's reason. Its two knobs were an `<h3>` at
+    // the bottom of Offload task tools → Tools — a control governing every AI
+    // tab, filed two sub-tabs deep inside a section about a local model server.
+    // Sits between Tabs and Offload on purpose: which tabs may be driven is a
+    // per-TAB setting (the ⇄ popover), and the one thing delegation shares with
+    // offload is the facade backend, which stayed in the pool.
+    { id: 'delegation', label: 'Delegation' },
     { id: 'offload', label: 'Offload task tools' },
     // F-18: a top-level category of its own, labelled with the phrase the UI
     // strings and the ⛨ status chip already use ("Injection protection is
@@ -1259,6 +1269,8 @@
           onglobals={setGlobalTemplates}
           onsave={() => void saveGlobalTemplates()}
         />
+      {:else if activeSection === 'delegation'}
+        <DelegationSection {snapshot} {patch} />
       {:else if activeSection === 'offload'}
         <OffloadSection
           {snapshot}

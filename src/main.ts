@@ -4,7 +4,7 @@ import { ttsTest } from './lib/ipc';
 import { settings } from './lib/settings/store';
 import { themeFromSetting, applyTerminalPaletteVars } from './lib/themes/resolve';
 import { initThemeRegistry, themeMeta } from './lib/themes/registry';
-import { applyTuiAccent, TUI_THEME_ID } from './lib/themes/accent';
+import { applyTuiAccent, applyTuiNotification, TUI_THEME_ID } from './lib/themes/accent';
 import { installReloadBlocker } from './lib/shortcuts/blockReload';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { invoke } from '@tauri-apps/api/core';
@@ -98,6 +98,7 @@ settings.subscribe((s) => {
     document.documentElement.dataset.theme = currentThemeId;
   }
   applyTuiAccent(s.ui?.tui_accent);
+  applyTuiNotification(s.ui?.tui_notification);
   if (s.terminal?.theme) applyTerminalPaletteVars(themeFromSetting(s.terminal.theme));
   applyChrome();
 });

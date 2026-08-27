@@ -30,6 +30,14 @@ pub fn open_or_focus_settings(app: &AppHandle) -> AppResult<()> {
             .visible(false)
             .build();
 
+    // #150: a settings window whose renderer dies looks like a window that
+    // stopped responding to clicks, so it gets the same watch the main window
+    // does. Registered on the window this call actually created — the
+    // concurrent-open path below reuses one that already has it.
+    if let Ok(win) = &built {
+        crate::webview_watch::watch_process_failures(win.as_ref());
+    }
+
     if let Err(e) = built {
         // A concurrent open (gear click + `open_settings` shortcut firing
         // near-simultaneously) may have created the window between our

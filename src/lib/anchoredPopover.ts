@@ -16,6 +16,47 @@
 const MARGIN = 4;
 
 /**
+ * The selector matching an anchored popover's PANEL element.
+ *
+ * All three panels are `<div class="menu" role="menu|dialog">`. Svelte's scoped
+ * styles add a hash class and keep the authored one, so `menu` is really in the
+ * DOM; the `role` half is what keeps this from matching some future unrelated
+ * `.menu`.
+ */
+const PANEL_SELECTOR = '.menu[role="menu"], .menu[role="dialog"]';
+
+/**
+ * Whether `node` is inside an anchored popover panel (#147).
+ *
+ * **Why anything outside this module asks.** `Pane.svelte` refocuses its
+ * terminal on the next frame whenever the pane becomes focused, and a popover
+ * opened from the tab bar lives inside a pane: clicking an `<input>` in the
+ * `DelegationPopover` ran `onmousedowncapture` → `setFocusedPane` → that
+ * refocus, which then took the focus the browser had just given the field. The
+ * name/tier/context fields could not be typed into at all, and the radios only
+ * worked because a `<label>`'s click-to-focus fires after mouseup and could win
+ * the race.
+ *
+ * The pane-focus bookkeeping itself is NOT the problem and must keep running —
+ * pane focus drives audio and avatar routing. Only the terminal refocus is
+ * skipped, and only while the focus sits in a panel: a popover is a modal-ish
+ * surface the user is deliberately inside, and nothing in one wants the
+ * terminal to have the keyboard.
+ *
+ * Deliberately narrower than "is a form control": the tab strip's tabs are
+ * `<button>`s, so a blanket form-control test would suppress exactly the
+ * refocus this app wants most — clicking a tab in an unfocused pane.
+ *
+ * Typed against the `closest` surface rather than `Element` so it can be
+ * exercised without a DOM.
+ */
+export function inAnchoredPopover(
+  node: { closest(selector: string): unknown } | null | undefined,
+): boolean {
+  return !!node && node.closest(PANEL_SELECTOR) !== null;
+}
+
+/**
  * The top-left corner at which a popover of `el`'s current size can be placed
  * so it stays fully on screen, given the coordinates the caller wants.
  *

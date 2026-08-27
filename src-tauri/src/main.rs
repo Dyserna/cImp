@@ -46,6 +46,8 @@ mod tabs;
 mod testutil;
 mod theming;
 mod tts;
+/// #150: the WebView2 renderer-crash watch registered on every webview.
+mod webview_watch;
 /// R16 (V42): the startup wiring `main`'s `setup` hook used to hold inline.
 mod wiring;
 mod workbench;
@@ -84,7 +86,7 @@ use crate::ipc::commands::{
     offload_server_start, offload_server_stop, offload_service_status, offload_status,
     offload_statuses, offload_test, open_settings_window, open_settings_window_to_section,
     open_settings_window_to_tab, pty_get_scrollback, pty_rebind_channel, pty_resize, pty_restart,
-    pty_start, pty_write, request_tab_restart, restart_shell_tab, set_active_tab,
+    pty_start, pty_write, request_tab_restart, restart_ai_tab, restart_shell_tab, set_active_tab,
     set_window_square_corners, settings_get, settings_update, stt_cancel, stt_list_input_devices,
     delegation_statuses, delegation_status, delegation_take_over, stt_list_models,
     stt_start_recording, stt_stop_recording, tab_activate, tab_set_delegation_backend,
@@ -781,6 +783,7 @@ fn main() {
             wiring.wire_detection_updater();
             wiring.wire_harness_verify();
             wiring.wire_window_title(app);
+            wiring.wire_webview_watch(app);
             wiring.wire_scrollback_prune();
             Ok(())
         })
@@ -822,6 +825,7 @@ fn main() {
             close_settings_window,
             request_tab_restart,
             restart_shell_tab,
+            restart_ai_tab,
             compose_content_changed,
             compose_templates,
             compose_templates_global_get,

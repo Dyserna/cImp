@@ -141,6 +141,16 @@ export const STT_TRANSCRIPTION = 'stt-transcription';
 export const TAB_RESTART_REQUESTED = 'tab-restart-requested';
 
 /**
+ * #150 (Windows): a webview's WebView2 renderer or browser process failed — the
+ * Chromium sad-face the app was previously blind to. `label` is the failing webview's,
+ * `kind` is WebView2's `COREWEBVIEW2_PROCESS_FAILED_KIND` as a number rendered to a
+ * string. Best-effort: a build that could not register the handler emits nothing, so
+ * silence is not evidence of health. The payload is spelled inline — it is built with
+ * `serde_json::json!` and has no named struct to mirror. Broadcast to every webview.
+ */
+export const WEBVIEW_PROCESS_FAILED = 'webview-process-failed';
+
+/**
  * The payload each event carries. `unknown` means the frontend has no single type for
  * it — see the Rust row for why — and those listeners keep their own explicit
  * `listen<…>` generic.
@@ -166,6 +176,7 @@ export interface EventPayloadMap {
   'stt-state': { state: import('../stt').SttState };
   'stt-transcription': { text: string };
   'tab-restart-requested': import('../tabs/types').TabId;
+  'webview-process-failed': { label: string; kind: string };
 }
 
 /** Every event name the backend can emit. */

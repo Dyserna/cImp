@@ -84,6 +84,7 @@ import {
   readOnlyAdvice,
   readOnlyExempt,
   readOnlyRefusalMessage,
+  readOnlySilent,
 } from './delegation';
 import { isPromptRelaxed } from './delegationPrompt';
 import { showToast } from './toast';
@@ -107,6 +108,28 @@ function noteReadOnlyRefusal(tabId: TabId, message: string): void {
   // delegation is driving it is not unlocked by the access radio — pointing
   // its owner there would name a disabled control (`readOnlyAdvice`).
   showToast(`${message} ${readOnlyAdvice(message)}`);
+}
+
+/// #149: when each tab last explained why a plain right-click did nothing.
+///
+/// The V20 rule below is correct and unchanged — a TUI that owns the mouse
+/// already received the right-click, and pasting on top of it double-acts — but
+/// it was SILENT, and a silent swallow is indistinguishable from a broken
+/// build. That is exactly how it was reported ("right-click copy doesn't work
+/// on the duplicated OC tab").
+///
+/// A minute per tab, far wider than the read-only gate's four seconds: this is
+/// a one-time piece of discoverability, not a response to a stream of refused
+/// input, and a user who now knows the gesture must not be told again every
+/// time they use the mouse in a TUI.
+const RIGHT_CLICK_HINT_GAP_MS = 60_000;
+const lastRightClickHintAt = new Map<TabId, number>();
+
+function noteRightClickShiftHint(tabId: TabId): void {
+  const now = Date.now();
+  if (now - (lastRightClickHintAt.get(tabId) ?? 0) < RIGHT_CLICK_HINT_GAP_MS) return;
+  lastRightClickHintAt.set(tabId, now);
+  showToast('Hold Shift + right-click to paste — this TUI owns the mouse.', 5000);
 }
 
 const OFFSCREEN_ID = 'terminal-offscreen';
@@ -961,6 +984,8 @@ export function createTerminal(
     // right-click exactly as before.
     if (isMouseTrackingActive(term) && !e.shiftKey) {
       e.preventDefault();
+      // #149: say so. The swallow is right; the silence was the defect.
+      noteRightClickShiftHint(tabId);
       return;
     }
     e.preventDefault();
@@ -986,8 +1011,10 @@ export function createTerminal(
         if (closed?.closed_message) {
           openConfigureTabDialog(tabId);
         } else {
+          // #152: Enter on a closed shell is a deliberate restart request, so
+          // its failure is the user's news, not the console's.
           void restartShellTab(tabId).catch((e) =>
-            console.error('restart_shell_tab failed:', e),
+            showToast(`Restart failed: ${String(e)}`, 6000),
           );
         }
       }
@@ -1015,7 +1042,13 @@ export function createTerminal(
       isPromptRelaxed(tabId),
     );
     if (lockReason && !readOnlyExempt(data)) {
-      noteReadOnlyRefusal(tabId, `This tab is ${lockReason}.`);
+      // #154: refuse quietly for the input the USER did not produce — bare
+      // pointer motion under a mouse-tracking TUI. Still refused (the backend
+      // refuses it too, so passing it on would only relocate the toast); just
+      // not announced, because hovering is not an attempt to type.
+      if (!readOnlySilent(data)) {
+        noteReadOnlyRefusal(tabId, `This tab is ${lockReason}.`);
+      }
       return;
     }
     ptyWrite(tabId, data).catch((e) => {

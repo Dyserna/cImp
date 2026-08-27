@@ -29,6 +29,7 @@
     createAiTab,
     createPreviewTab,
     renameTab as renameTabIpc,
+    restartAiTab,
     restartShellTab,
   } from './ipc';
   import { settings } from './settings/store';
@@ -323,9 +324,21 @@
     });
   }
 
+  /// #152: one entry, two commands. A Shell tab restarts its subprocess; an AI
+  /// tab restarts its harness — the backend refuses the wrong kind either way,
+  /// so the branch here is about which command to name, not about safety.
+  ///
+  /// The failure is a TOAST, not a `console.error`: this is a menu item the
+  /// user just clicked, and a restart that silently does nothing is
+  /// indistinguishable from a restart that worked and came back identical.
   function onRestartTab(tab: TabId): void {
-    void restartShellTab(tab).catch((e) => {
-      console.error('restart_shell_tab failed:', e);
+    // The WIRE kind, not `isShellTab` — the reserved dashboards (Workbench,
+    // Events, Tool Activity, …) are shell-kind ids that `isShellTab` answers
+    // `false` for, and handing one of those to `restart_ai_tab` would be a
+    // refusal the user cannot act on.
+    const ai = tabMeta(tab)?.kind === 'ai-tool';
+    void (ai ? restartAiTab(tab) : restartShellTab(tab)).catch((e) => {
+      showToast(`Restarting “${tabMeta(tab)?.name ?? tab}” failed: ${String(e)}`, 6000);
     });
   }
 
@@ -496,6 +509,7 @@
   {@const isShell = t ? isShellTab(t.id) : false}
   {@const isPreview = t ? isPreviewTabId(t.id) : false}
   {@const closed = t ? ($perTabClosedState[t.id]?.closed ?? false) : false}
+  {@const isAi = t ? tabMeta(t.id)?.kind === 'ai-tool' : false}
   <TabContextMenu
     x={menu.x}
     y={menu.y}
@@ -505,7 +519,17 @@
           id: t.id,
           builtin: t.builtin,
           kind: isPreview ? 'preview' : isShell ? 'shell' : 'ai-tool',
-          canRestart: isShell && !closed,
+          // #152: an AI tab restarts its harness whether or not it is a
+          // reserved builtin — the reserved tabs are precisely the ones a user
+          // most often needs to restart (a spawn-baked setting changed), and
+          // the entry used to be unreachable for them because the whole restart
+          // row lived behind the menu's `!builtin` gate. `builtin` still gates
+          // Close, which really is refused for them.
+          //
+          // Shell keeps its exact previous availability: not builtin (a
+          // reserved shell tab is a no-PTY dashboard) and not already closed —
+          // a closed shell has the overlay's own Enter-to-restart.
+          canRestart: isPreview ? false : isAi ? true : isShell && !closed && !t.builtin,
         }
       : null}
     onRename={t ? () => (renamingTab = t.id) : undefined}

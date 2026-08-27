@@ -138,6 +138,21 @@ const PLUGIN_CAP: usize = 100;
 /// refusal loop is bounded the same way — it cannot outrun the model calling
 /// the tool.
 const DELEGATION_CAP: usize = 100;
+/// #153: settings facts a user cannot see in their own settings file — today,
+/// the project-overlay keys a save silently drops.
+///
+/// Its own window rather than the graph fallback (#51's rule), for the reason
+/// `plugin` has one: the row is about a DEFINITION the user wrote, not about
+/// anything that ran, and its whole job is to survive long enough to be read
+/// the next time they wonder why a key in `.cimp/config.json` does nothing.
+///
+/// 30, the smallest window in the table, because the volume is structurally
+/// tiny AND self-extinguishing: a row is minted only by a save that actually
+/// drops something, and that same save rewrites the file without those keys —
+/// so one hand-edit produces one row and then stops producing them. The only
+/// way to reach 30 is thirty separate edits, at which point the older ones are
+/// genuinely stale.
+const SETTINGS_CAP: usize = 30;
 /// V32: security denials (SSRF screen, fetch budgets, canary hits, taint-latch
 /// refusals, quarantines, detection flags). Retained **per screen**, not per
 /// kind — this is the window ONE screen's rows get.
@@ -473,6 +488,24 @@ pub enum ActivityKind {
         key: "delegation",
         retention: Retention::PerKind(DELEGATION_CAP),
     },
+    /// #153: one settings fact the settings FILE cannot report about itself —
+    /// today, the project-overlay keys a save dropped (`source` `"overlay"`,
+    /// `tool` `"stray_keys"`, the dotted names in `target`). Recorded by
+    /// [`settings::persistence`](crate::settings::persistence).
+    ///
+    /// Its own kind rather than a source under `plugin` (decision 12's rule,
+    /// applied where it points): a `plugin` row is about a manifest FILE the
+    /// user can open and fix in the plugins folder, and this is about a key in
+    /// their own project config. Folding them together would put two different
+    /// "go edit this" instructions behind one filter.
+    ///
+    /// `ok` is `true`: nothing failed. cImp did exactly what it says it does
+    /// with a key it will not honour — the row exists so that doing it is not
+    /// also SILENT, which is the whole of the defect.
+    Settings {
+        key: "settings",
+        retention: Retention::PerKind(SETTINGS_CAP),
+    },
 }
 }
 
@@ -801,6 +834,10 @@ declare_row_statuses! {
 /// kind whose outcomes really are two gets no synonyms; a kind whose rows are
 /// not outcomes gets its own words rather than a borrowed claim).
 ///
+/// …and one `settings` word, `dropped`: keys a save removed from a project
+/// overlay. Minted `ok: true`, so the plain tail would render the one lane that
+/// exists to break a silence as "Call succeeded".
+///
 /// The `plugin` lane adds no word on purpose: a definition either loaded or it
 /// did not, and `ok`/`failed` say that exactly.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -828,6 +865,18 @@ pub enum RowStatus {
     /// V39: the Manual role for a harness moved off this tab. Configuration,
     /// not traffic.
     Moved => "moved",
+    /// #153: keys a settings save removed from a project overlay — either this
+    /// build has no setting by that name, or the setting is machine scope.
+    ///
+    /// Its own word, and neither of the two it would otherwise take. The row is
+    /// minted `ok: true` (nothing failed — cImp did exactly what it documents),
+    /// so [`RowStatus::plain`] renders it `ok`: a green "Call succeeded" over
+    /// the news that part of the user's config was discarded. `failed` claims
+    /// the opposite falsehood, that cImp broke. What happened is that something
+    /// the user wrote is NOT in effect, deliberately and by rule — and the row
+    /// exists precisely because that used to be silent, so its word must not
+    /// re-silence it.
+    Dropped => "dropped",
     /// A screen stopped the call — this app's one "we blocked something".
     Denied => "denied",
     /// A detector matched and the result was delivered anyway.
@@ -992,6 +1041,12 @@ impl RowStatus {
             Some(ActivityKind::Mcp) if e.source == crate::offload::mcp_host::SCREEN_DROP_SOURCE => {
                 RowStatus::Withheld
             }
+            // #153, and BEFORE the plain fallthrough for the same reason the arm
+            // above it is: these rows are minted `ok: true`, so without this the
+            // one lane whose whole purpose is to break a silence renders as
+            // "Call succeeded". The whole kind takes the word — unlike the
+            // verb-keyed lanes above, every row here reports the same fact.
+            Some(ActivityKind::Settings) => RowStatus::Dropped,
             _ => Self::plain(e),
         }
     }
@@ -2550,7 +2605,7 @@ mod tests {
     /// this is the literal it used to be hand-summed to, asserted once so a cap
     /// edit is LOUD rather than a quietly larger ring.
     ///
-    /// Only the nine per-kind windows are a literal. The `injection_flag` term
+    /// Only the ten per-kind windows are a literal. The `injection_flag` term
     /// stays symbolic on purpose: it is per-SOURCE-lane, and its lane count is
     /// `Screen::ALL.len() + 1` precisely so that a new screen gets a guaranteed
     /// window by existing (#48, H-9) — pinning a number here would turn that
@@ -2559,7 +2614,8 @@ mod tests {
     fn total_capacity_is_the_sum_the_table_says_it_is() {
         // 400 graph + 100 offload + 100 audit + 200 mcp + 200 mcp_health
         // + 200 offload_server + 60 sandbox + 100 plugin + 100 delegation
-        const PER_KIND_WINDOWS: usize = 1_460;
+        // + 30 settings
+        const PER_KIND_WINDOWS: usize = 1_490;
         assert_eq!(
             TOTAL_CAPACITY,
             PER_KIND_WINDOWS + INJECTION_FLAG_TOTAL_CAP,

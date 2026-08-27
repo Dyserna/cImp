@@ -596,6 +596,12 @@
       if (e.tool === 'start') return '';
       return e.ms > 0 ? dur : '';
     }
+    // #153: a settings row measures nothing. Its `chars` and `ms` are both
+    // structurally 0 (the detail is prose in `response`, and a save is not a
+    // call that took time), so it prints NOTHING at all rather than "0ms · 0
+    // chars" — the `offload_server` / `plugin` / `delegation` rule, applied
+    // where it is total rather than per-transition.
+    if (e.kind === 'settings') return '';
     return `${dur} · ${fmtTok(e.chars)} chars`;
   }
 
@@ -1278,8 +1284,9 @@
   }
   /* V39: cross-harness delegation. The accent, because this lane is the one
      place where a tab did something the user did not type — the same colour the
-     driven glyph and the worker's banner wear, so the three surfaces reporting
-     one fact read as one fact. */
+     driven glyph wears, so the live surface and its history read as one fact.
+     (#151 moved the worker's live BANNER to the notification colour: a strip
+     interrupting the user is a notice, while this is a history row.) */
   .ekind.delegation {
     color: var(--accent);
   }
@@ -1306,6 +1313,14 @@
      use for a boundary fact. */
   .ekind.plugin {
     color: color-mix(in srgb, var(--text-info, #58a6ff) 60%, var(--accent-purple, #d2a8ff));
+  }
+  /* #153 settings rows: the same warning tone the sandbox lane uses, unfilled
+     and pulled toward neutral. Like `sandbox` these report the state of the
+     user's own configuration rather than anything that ran, and like `plugin`
+     they point at a FILE to go and edit — but a dropped key is milder than
+     either, so it sits a step quieter than the sandbox amber it borrows. */
+  .ekind.settings {
+    color: color-mix(in srgb, var(--warning, #f0a020) 65%, var(--text-tertiary, #9aa0aa));
   }
   /* Synthetic checkpoint rows (#51): teal, so they read as neither the graph
      blue nor the offload green next to them. */

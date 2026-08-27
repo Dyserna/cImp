@@ -189,6 +189,14 @@ pub struct UiSettings {
     /// from it. Ignored by on-disk themes — the picker only shows for
     /// `"tui"`. Invalid values fall back to the default blue frontend-side.
     pub tui_accent: String,
+    /// Accent color the built-in `"tui"` theme's NOTIFICATION surfaces wear, as
+    /// a `#rrggbb` hex string. Injected by the frontend beside `tui_accent`;
+    /// a notice is not the chrome's accent, so the two are separately
+    /// configurable rather than one derived from the other. Ignored by on-disk
+    /// themes, and invalid values fall back to the default frontend-side, on
+    /// exactly `tui_accent`'s terms. Additive with the struct-level
+    /// `#[serde(default)]` — no migration.
+    pub tui_notification: String,
     /// Arrangement of the bottom status bar's movable left cluster. See
     /// [`StatusBarLayout`]. Added after the `theme` field; old files
     /// lacking the key deserialize to the default `[usage, system_stats]`
@@ -226,6 +234,7 @@ impl Default for UiSettings {
         Self {
             theme: crate::theming::TUI_THEME_ID.to_string(),
             tui_accent: DEFAULT_TUI_ACCENT.to_string(),
+            tui_notification: DEFAULT_TUI_NOTIFICATION.to_string(),
             status_bar: StatusBarLayout::default(),
             tool_activity_tab: true,
             events_tab: true,
@@ -239,6 +248,11 @@ impl Default for UiSettings {
 /// `tui-blue` default theme used, so new installs keep the familiar look.
 /// Mirrors `DEFAULT_TUI_ACCENT` in `src/lib/themes/accent.ts`.
 pub const DEFAULT_TUI_ACCENT: &str = "#7aa2f7";
+
+/// Default notification accent for the built-in `tui` theme — the amber the
+/// theme's notice surfaces already wore before the color became configurable.
+/// Mirrors `DEFAULT_TUI_NOTIFICATION` in `src/lib/themes/accent.ts`.
+pub const DEFAULT_TUI_NOTIFICATION: &str = "#e0af68";
 
 /// A display panel in the status bar's movable left cluster: `usage` =
 /// Claude session meter, `system_stats` = CPU/GPU/network panel.

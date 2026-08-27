@@ -2,6 +2,7 @@
   import type { TabId } from './tabs/types';
   import { perTabClosedState } from './avatarState';
   import { restartShellTab } from './ipc';
+  import { showToast } from './toast';
   import { openConfigureTabDialog } from './dialog/store';
 
   // Shown when a Shell tab's subprocess has exited or its launch failed.
@@ -28,7 +29,9 @@
     try {
       await restartShellTab(tabId);
     } catch (e) {
-      console.error('restart_shell_tab failed:', e);
+      // #152: the user pressed the one button on this card. A console line is
+      // not an answer — the overlay would simply stay put with no reason given.
+      showToast(`Restart failed: ${String(e)}`, 6000);
     } finally {
       restarting = false;
     }

@@ -454,6 +454,15 @@ export async function restartShellTab(tab: TabId): Promise<void> {
   await invoke('restart_shell_tab', { tab });
 }
 
+/// #152: restart a configured AI tab's harness process — the AI-side
+/// counterpart of `restartShellTab`, refusing a Shell tab the way that one
+/// refuses an AI tab. It emits the same `tab-restart-requested` the settings
+/// window's Restart button does, so the respawn path is the existing one and
+/// there is no second way for a tab to come back.
+export async function restartAiTab(tab: TabId): Promise<void> {
+  await invoke('restart_ai_tab', { tab });
+}
+
 /// Apply a new `enabled_ai_tabs` value: opens / closes the AI builtin
 /// tabs as needed. The backend kills the PTY and drops scrollback for
 /// any newly-disabled tab; newly-enabled tabs spawn fresh on the next

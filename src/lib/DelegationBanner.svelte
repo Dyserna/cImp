@@ -88,9 +88,16 @@
     padding: 2px var(--space-2);
     font-size: var(--font-size-sm);
     line-height: 1.4;
-    color: var(--accent);
-    background: color-mix(in srgb, var(--accent) 16%, var(--surface-0));
-    border-bottom: 1px solid var(--accent);
+    /* #151: the notification colour, not the chrome accent. This strip is the
+       one place cImp says "a turn on this tab was not yours" — under the accent
+       it wore the same colour as the focused-pane line and the active-tab
+       underline framing it, which is precisely the surface it has to stand out
+       from. A hairline tint and a 1px rule, not a fill: it covers the top row of
+       a TUI the user is being asked to WATCH, so it must be noticeable without
+       obscuring what it is announcing. */
+    color: var(--tui-notification, #e0af68);
+    background: color-mix(in srgb, var(--tui-notification, #e0af68) 16%, var(--surface-0));
+    border-bottom: 1px solid var(--tui-notification, #e0af68);
     /* V39 review L-5: the strip is TRANSPARENT to the pointer, and only the
        Take over button on it is not. It is a full-width overlay pinned to the
        top of `.pane-content`, so with `pointer-events: auto` it ate every click

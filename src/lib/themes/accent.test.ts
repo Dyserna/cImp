@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import {
   DEFAULT_TUI_ACCENT,
+  DEFAULT_TUI_NOTIFICATION,
   TUI_ACCENT_PRESETS,
   normalizeTuiAccent,
+  normalizeTuiNotification,
   tuiTextOnAccent,
 } from './accent';
 
@@ -16,6 +18,23 @@ describe('normalizeTuiAccent', () => {
     for (const bad of ['', '  ', '#fff', '#12345', 'd77757', '#gghhii', null, undefined]) {
       expect(normalizeTuiAccent(bad)).toBe(DEFAULT_TUI_ACCENT);
     }
+  });
+});
+
+describe('normalizeTuiNotification', () => {
+  it('accepts full #rrggbb hex and lowercases it', () => {
+    expect(normalizeTuiNotification('#E0AF68')).toBe('#e0af68');
+    expect(normalizeTuiNotification('#7aa2f7')).toBe('#7aa2f7');
+  });
+
+  it('falls back to the default for anything else — the accent rule, exactly', () => {
+    for (const bad of ['', '  ', '#fff', '#12345', 'e0af68', '#gghhii', null, undefined]) {
+      expect(normalizeTuiNotification(bad)).toBe(DEFAULT_TUI_NOTIFICATION);
+    }
+  });
+
+  it('is not the accent default: a notice must be distinguishable from the chrome', () => {
+    expect(DEFAULT_TUI_NOTIFICATION).not.toBe(DEFAULT_TUI_ACCENT);
   });
 });
 

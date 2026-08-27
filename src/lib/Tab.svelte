@@ -429,9 +429,9 @@
       <span
         class="comm"
         class:comm-off={comm.state === 'off'}
-        class:comm-role={comm.state === 'manual' || comm.state === 'remote'}
+        class:comm-manual={comm.state === 'manual'}
+        class:comm-remote={comm.state === 'remote'}
         class:comm-driven={comm.state === 'driven'}
-        class:comm-locked={comm.locked}
         role="button"
         tabindex="0"
         aria-label="Delegation and access for this tab"
@@ -649,23 +649,35 @@
   .comm-off {
     color: var(--text-tertiary);
   }
-  .comm-role {
-    color: var(--text-secondary);
+  /* #146: the two ROLES are two different facts and no longer share one grey.
+     Manual is a tab the USER pointed a harness at — the notification colour,
+     the same one every "cImp is about to act on your behalf" surface wears.
+     Remote offload is machinery the user configured once and then stops
+     thinking about, so it takes the ordinary chrome accent.
+
+     Read-only deliberately colours NOTHING here (#146): the lock overlay below
+     is read-only's own icon, and tinting the whole ⇄ glyph for it overwrote the
+     role — a Manual read-only tab reported only that it was locked. */
+  .comm-manual {
+    color: var(--tui-notification, #e0af68);
+  }
+  .comm-remote {
+    color: var(--accent);
   }
   /* In flight: this is the state the user must not miss. */
   .comm-driven {
     color: var(--accent);
     font-weight: bold;
   }
-  .comm-locked {
-    color: var(--awaiting);
-  }
+  /* The read-only icon, and the colour the pane's read-only frame reuses
+     (#154) — one lock state, one colour, in both places it is reported. */
   .comm-lock {
     position: absolute;
     right: -3px;
     bottom: -3px;
     font-size: 8px;
     line-height: 1;
+    color: var(--awaiting);
     pointer-events: none;
   }
   .comm:hover {

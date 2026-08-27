@@ -241,6 +241,67 @@ export function readOnlyExempt(data: string): boolean {
   return isTerminalReply(data) || isMouseWheel(data);
 }
 
+/// Whether a refused chunk is one the user must NOT be told about (#154).
+///
+/// **A refusal the user did not cause is not news.** Under an alt-screen TUI in
+/// any-event tracking (DECSET 1003) merely MOVING the pointer across the tab
+/// emits a motion report per pixel row. On a read-only tab every one of them is
+/// refused — correctly: `readOnlyExempt` does not pass motion, and neither does
+/// the backend, so exempting it here would only move the same toast onto the
+/// `pty_write` rejection path — but each one also raised the courtesy notice,
+/// so hovering over a locked tab produced a toast every four seconds forever.
+/// Nothing was refused that the user had asked for.
+///
+/// Bare motion ONLY: a drag holds a button, and a held button is a control being
+/// operated, which is exactly what the lock is for. The whole-input,
+/// repeat-until-exhausted rule is `isMouseWheel`'s and for its reason — a chunk
+/// carrying a keystroke behind a motion report is refused AND spoken about.
+/// The wheel is included so a coalesced scroll-plus-hover chunk (which
+/// `isMouseWheel` rejects for being mixed, and which is therefore refused) is at
+/// least refused quietly.
+export function readOnlySilent(data: string): boolean {
+  let rest = data;
+  let seen = false;
+  while (rest.length > 0) {
+    const next = takeWheelReport(rest) ?? takeBareMotionReport(rest);
+    if (next === null) return false;
+    seen = true;
+    rest = next;
+  }
+  return seen;
+}
+
+/// Consume one leading BARE-motion report, returning what follows it, or
+/// `null`. Both encodings, exactly as `takeWheelReport` handles them; motion is
+/// never a release, so the SGR form ends in `M` only.
+function takeBareMotionReport(s: string): string | null {
+  if (s.startsWith('\x1b[<')) {
+    const body = s.slice(3);
+    const end = body.indexOf('M');
+    if (end < 0) return null;
+    const params = body.slice(0, end).split(';');
+    if (params.length !== 3) return null;
+    if (!params.every((p) => /^\d+$/.test(p))) return null;
+    return isBareMotionButton(Number(params[0])) ? body.slice(end + 1) : null;
+  }
+  if (s.startsWith('\x1b[M')) {
+    const rest = [...s.slice(3)];
+    if (rest.length < 3) return null;
+    const cb = (rest[0].codePointAt(0) ?? 0) - 32;
+    if (cb < 0) return null;
+    return isBareMotionButton(cb) ? rest.slice(3).join('') : null;
+  }
+  return null;
+}
+
+/// Bit 32 = motion; button bits 0–1 = 3 means *no button held*, which is what
+/// separates a hover from a drag. Bit 64 (wheel) and bit 128 (buttons 8–11)
+/// must be clear; the modifier bits (shift 4, meta 8, ctrl 16) are free —
+/// holding Ctrl while moving the mouse is still just moving the mouse.
+function isBareMotionButton(cb: number): boolean {
+  return Number.isInteger(cb) && cb >= 0 && cb < 256 && (cb & 0b1110_0011) === 0b0010_0011;
+}
+
 /// Consume one leading wheel report, returning what follows it, or `null`.
 ///
 /// Both encodings xterm can emit: SGR (`ESC [ < Cb ; Cx ; Cy M`) and the

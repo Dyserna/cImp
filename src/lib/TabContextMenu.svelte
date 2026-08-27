@@ -73,6 +73,9 @@
     /// boilerplate-free.
     onRename?: () => void;
     onConfigure?: () => void;
+    /// #152: "Restart shell" on a Shell tab, "Restart tab" on an AI one. The
+    /// caller decides which command that is; the availability rule is entirely
+    /// in `canRestart`.
     onRestart?: () => void;
     onClose?: () => void;
     /// V13 Phase D D3: "New <harness> tab in worktree…" — offered
@@ -216,12 +219,17 @@
         Take over (cancel delegation)
       </button>
     {/if}
+    <!-- #152: OUTSIDE the `!builtin` gate below. A reserved AI tab cannot be
+         closed, but it can certainly be restarted — and it is the one a
+         spawn-baked settings change most often needs restarted. `canRestart`
+         carries the whole availability rule (the caller knows which tabs have a
+         process to restart); this only picks the word. -->
+    {#if tab.canRestart && onRestart}
+      <button type="button" class="entry" role="menuitem" onclick={fire(onRestart)}>
+        {tab.kind === 'shell' ? 'Restart shell' : 'Restart tab'}
+      </button>
+    {/if}
     {#if !tab.builtin}
-      {#if tab.canRestart && onRestart}
-        <button type="button" class="entry" role="menuitem" onclick={fire(onRestart)}>
-          Restart shell
-        </button>
-      {/if}
       <div class="separator"></div>
       <button type="button" class="entry danger" role="menuitem" onclick={fire(onClose)}>
         Close

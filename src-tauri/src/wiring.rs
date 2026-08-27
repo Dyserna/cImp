@@ -622,6 +622,23 @@ impl Wiring {
         }
     }
 
+    /// #150: watch every webview that exists at startup for a WebView2
+    /// renderer crash.
+    ///
+    /// Iterates rather than naming `"main"`: a window declared in
+    /// `tauri.conf.json` that nobody remembered to add here would be the one
+    /// window whose crashes stay invisible. The windows created LATER register
+    /// at their own creation sites (`ipc::windows`, `preview`) — there is no
+    /// creation hook to hang this on, which is why the calls are where the
+    /// builders are.
+    ///
+    /// Best-effort throughout; see `crate::webview_watch`.
+    pub fn wire_webview_watch(&self, app: &App) {
+        for (_, win) in app.webview_windows() {
+            crate::webview_watch::watch_process_failures(win.as_ref());
+        }
+    }
+
     /// V1.4-04 D.6: orphan-prune the scrollback dir so files
     /// for tabs deleted between sessions don't accumulate. We
     /// ask the registry for its sanitized known IDs (matches

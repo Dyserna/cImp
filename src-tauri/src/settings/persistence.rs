@@ -57,6 +57,7 @@ use crate::settings::schema::{
     GRAPH_VIEW_TAB_ID, OFFLOAD_SERVER_TAB_ID,
     SHELL_DEFAULT_TAB_ID, TOOL_ACTIVITY_TAB_ID, WORKBENCH_TAB_ID,
 };
+use crate::activity::{ActivityEntry, ActivityKind, ActivityRecord, Attribution};
 use crate::pricing::{pricing_rows_since, PRICING_GENERATION};
 use crate::settings::write_atomic;
 use crate::shell::ShellSpec;
@@ -1547,6 +1548,139 @@ fn strip_overlay_banned(v: &mut Value) {
     }
 }
 
+// ── #153: the overlay keys a save drops, named ──────────────────────────────
+//
+// A project overlay is REWRITTEN WHOLE on every save: `save` recomputes the
+// diff from the live settings, so a key the user hand-added that this build
+// does not honour simply does not come back. Two families reach that fate
+// without anyone being told —
+//
+//   * the wholesale bans ([`strip_overlay_banned`]), which are removed before
+//     the merge and, unlike the structured strips, name nothing; and
+//   * a key no `Settings` field has, which serde drops at the typed parse.
+//
+// Either way the user edited a file, relaunched, and got no behaviour and no
+// message — "cImp ignores my config" an hour later, which is the failure the
+// `plugin` lane's overlay row already exists to break for the OTHER half of
+// this file. One row per save that dropped anything, and none when it did not.
+
+/// The `source` of the stray-key row: the file, not the settings system.
+const OVERLAY_STRAY_SOURCE: &str = "overlay";
+/// Its `tool` — the one verb this lane has.
+const OVERLAY_STRAY_TOOL: &str = "stray_keys";
+
+/// The TOP-LEVEL overlay keys this build will not carry back.
+///
+/// **Top level only, and that is a boundary rather than a shortcut.** Several
+/// containers below it are MAPS keyed by user-chosen strings (`harness`,
+/// `tool_plugins.plugins`, the template libraries), so a recursive walk against
+/// the serialized shape would report a legitimate entry as unknown — and a row
+/// naming a key the user in fact still has is worse than no row at all, because
+/// it sends them to delete something that works.
+///
+/// `known` is a serialized [`Settings`]: the shape THIS build has, read off the
+/// value rather than restated, so a field added to the schema stops being stray
+/// by existing. The banned set comes off [`MACHINE_SCOPED`] for the same reason
+/// [`strip_overlay_banned`] takes it from there (T2-9) — those keys ARE
+/// `Settings` fields, so nothing else here would notice them.
+///
+/// Sorted, so one hand-edit produces one stable row rather than a different
+/// spelling per save.
+fn stray_overlay_keys(overlay: &Value, known: &Value) -> Vec<String> {
+    let (Some(map), Some(shape)) = (overlay.as_object(), known.as_object()) else {
+        return Vec::new();
+    };
+    let banned: Vec<&str> = MACHINE_SCOPED
+        .iter()
+        .filter(|row| matches!(row.overlay_strip, OverlayStrip::Banned))
+        .flat_map(|row| row.keys.iter().copied())
+        .collect();
+    let mut stray: Vec<String> = map
+        .keys()
+        .filter(|k| banned.contains(&k.as_str()) || !shape.contains_key(k.as_str()))
+        .cloned()
+        .collect();
+    stray.sort();
+    stray
+}
+
+/// What the save now in progress is about to drop from the overlay file.
+///
+/// Read from disk BEFORE the rewrite, because the rewrite is what drops them —
+/// afterwards there is nothing left to name.
+///
+/// No side effects on this leg: a file that will not parse is left exactly
+/// where it is (quarantining a corrupt overlay is [`load`]'s job) and names no
+/// keys, so the save stays silent about it.
+fn overlay_stray_keys_on_disk(overlay_path: &Path, global: &Settings) -> Vec<String> {
+    let Some(existing) = read_overlay(overlay_path, false) else {
+        return Vec::new();
+    };
+    let Ok(known) = serde_json::to_value(global) else {
+        return Vec::new();
+    };
+    stray_overlay_keys(&existing, &known)
+}
+
+/// The row, or `None` when nothing was dropped.
+///
+/// **`None` rather than an empty-target row**: a clean overlay must be silent,
+/// or the lane becomes a per-save heartbeat and stops being read — which is
+/// the state the silent strip already had, with extra steps. Built here and
+/// recorded by [`record_overlay_stray_keys`], the `plugins::events` split, so
+/// what a save produces is assertable without touching the on-disk store.
+///
+/// Columns: `root` is the project the overlay belongs to (this file is about
+/// one checkout, so the rootless sentinel would be wrong); `ok` is `true`
+/// because nothing failed — cImp did exactly what it says it does with a key it
+/// will not honour, and the row exists so that doing it is not also silent;
+/// `tab` is `Headless`, since a settings save is cImp's own work even when the
+/// user pressed the button.
+fn overlay_stray_row(
+    launch_cwd: &Path,
+    overlay_path: &Path,
+    stray: &[String],
+) -> Option<ActivityRecord> {
+    if stray.is_empty() {
+        return None;
+    }
+    let detail = format!(
+        "{}\n\n{}\n\nThese keys were removed when the project's settings were written back. \
+         Either this build has no setting by that name, or the setting is machine scope and \
+         lives in the global settings file only. A project's config file carries per-project \
+         overrides and nothing else; set the rest from the Settings window.",
+        overlay_path.display(),
+        stray.join("\n")
+    );
+    Some(ActivityRecord {
+        entry: ActivityEntry::new(
+            ActivityKind::Settings,
+            crate::activity::now_ms(),
+            crate::activity::root_key(launch_cwd),
+            OVERLAY_STRAY_SOURCE.to_string(),
+            OVERLAY_STRAY_TOOL.to_string(),
+            stray.join(", "),
+            0,
+            0,
+            true,
+            Attribution::Headless,
+            None,
+            // MCP identity columns: a settings file is about neither.
+            None,
+            None,
+        ),
+        request: String::new(),
+        response: detail,
+    })
+}
+
+/// Mint [`overlay_stray_row`] — one row per save that dropped anything.
+fn record_overlay_stray_keys(launch_cwd: &Path, overlay_path: &Path, stray: &[String]) {
+    if let Some(row) = overlay_stray_row(launch_cwd, overlay_path, stray) {
+        crate::activity::record_bg(row);
+    }
+}
+
 /// SAVE write-through for the machine-scope `sandbox` block: copy the live
 /// value onto the on-disk global settings, returning true when it changed.
 ///
@@ -2370,6 +2504,10 @@ fn strip_mcp_registry(v: &mut Value) {
 pub fn save(settings: &Settings, launch_cwd: &Path, global: &Settings) -> AppResult<()> {
     let path = custom_path(launch_cwd);
 
+    // #153, and BEFORE anything writes: the rewrite below replaces this file
+    // whole, so what it is about to drop can only be read now.
+    let stray = overlay_stray_keys_on_disk(&path, global);
+
     // Every machine-scope family's write-through, in one walk of
     // [`MACHINE_SCOPED`]: copy the live values onto the PHYSICAL global file
     // (read-modify-write, every other field preserved — the
@@ -2433,6 +2571,10 @@ pub fn save(settings: &Settings, launch_cwd: &Path, global: &Settings) -> AppRes
             }
         }
     }
+    // After the file operation, never before: a save that failed dropped
+    // nothing, and a row claiming otherwise would be evidence of a loss that
+    // did not happen.
+    record_overlay_stray_keys(launch_cwd, &path, &stray);
     Ok(())
 }
 
@@ -6074,6 +6216,102 @@ mod tests {
 
         assert!(dir.join(".cimp").join("config.json").exists());
         assert!(!dir.join(".cimp.custom.config.json").exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #153: a save that drops stray overlay keys mints exactly ONE row naming
+    /// them, and the next save — which has nothing left to drop — mints none.
+    ///
+    /// Both halves matter and they fail differently: a row per key buries the
+    /// fact under the noise of saying it eight times, and a row per save turns
+    /// the lane into a heartbeat that stops being read (`empty is not absent`
+    /// pointed the other way).
+    ///
+    /// Written against the row BUILDER rather than the global activity store:
+    /// `record_overlay_stray_keys` is one `if let` over this function, and
+    /// asserting through the store would mean writing to the real
+    /// `tool-activity.jsonl` beside the test runner.
+    #[test]
+    fn a_save_naming_the_overlay_keys_it_drops_speaks_once_and_only_when_it_drops() {
+        let _shell = fake_default_shell();
+        let mut global = Settings::default();
+        integrity_check(&mut global);
+
+        let dir = std::env::temp_dir().join(format!("cimp_stray_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(dir.join(".cimp")).unwrap();
+        let path = custom_path(&dir);
+
+        // A hand-edited overlay: one legitimate project override, one BANNED
+        // machine-scope block, one key no `Settings` field has.
+        fs::write(
+            &path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "ui": { "theme": "future-light" },
+                "sandbox": { "enabled": false },
+                "not_a_setting_at_all": 7
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let stray = overlay_stray_keys_on_disk(&path, &global);
+        assert_eq!(
+            stray,
+            vec!["not_a_setting_at_all".to_string(), "sandbox".to_string()],
+            "the ban and the unknown key are both named — and `ui`, which the \
+             project may legitimately carry, is not"
+        );
+
+        let row = overlay_stray_row(&dir, &path, &stray).expect("keys were dropped");
+        assert_eq!(row.entry.kind, ActivityKind::Settings.as_str());
+        assert_eq!(row.entry.source, "overlay");
+        assert_eq!(row.entry.tool, "stray_keys");
+        assert_eq!(row.entry.target, "not_a_setting_at_all, sandbox");
+        assert!(row.entry.ok, "nothing failed; the point is that it was loud");
+        assert_eq!(row.entry.root, crate::activity::root_key(&dir));
+        assert!(!row.entry.root.is_empty(), "the row belongs to a project");
+
+        // The save really does drop them — otherwise the row above would be a
+        // claim about nothing.
+        let mut customized = global.clone();
+        customized.ui.theme = "future-light".to_string();
+        save(&customized, &dir, &global).unwrap();
+        let rewritten = fs::read_to_string(&path).unwrap();
+        assert!(!rewritten.contains("not_a_setting_at_all"), "{rewritten}");
+        assert!(!rewritten.contains("sandbox"), "{rewritten}");
+
+        // …and the second save has nothing to say.
+        let again = overlay_stray_keys_on_disk(&path, &global);
+        assert!(again.is_empty(), "still stray after the rewrite: {again:?}");
+        assert!(
+            overlay_stray_row(&dir, &path, &again).is_none(),
+            "a clean overlay must mint no row"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A project with no overlay at all, and one whose overlay will not parse,
+    /// both stay silent — and neither is touched.
+    ///
+    /// The corrupt case is the one worth pinning: [`load`] quarantines such a
+    /// file, and a save doing the same would move the user's config out from
+    /// under the load path that is about to explain it.
+    #[test]
+    fn an_absent_or_unparseable_overlay_names_nothing_and_is_left_alone() {
+        let mut global = Settings::default();
+        integrity_check(&mut global);
+
+        let dir = std::env::temp_dir().join(format!("cimp_stray_bad_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(dir.join(".cimp")).unwrap();
+        let path = custom_path(&dir);
+
+        assert!(overlay_stray_keys_on_disk(&path, &global).is_empty());
+
+        fs::write(&path, b"{ this is not json").unwrap();
+        assert!(overlay_stray_keys_on_disk(&path, &global).is_empty());
+        assert!(path.exists(), "the save leg must not quarantine anything");
 
         let _ = fs::remove_dir_all(&dir);
     }

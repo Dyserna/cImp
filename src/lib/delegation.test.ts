@@ -17,6 +17,7 @@ import {
   isTerminalReply,
   manualHolderFor,
   readOnlyExempt,
+  readOnlySilent,
   readOnlyAdvice,
   readOnlyReason,
   readOnlyRefusalMessage,
@@ -309,6 +310,58 @@ describe('isMouseWheel', () => {
   it('refuses ordinary keyboard input', () => {
     for (const keys of ['\x1b[A', '\x1b', '\r', 'y']) {
       expect(readOnlyExempt(keys), keys).toBe(false);
+    }
+  });
+});
+
+/// #154 — the hover that toasted every four seconds.
+///
+/// `readOnlySilent` governs only whether the user is TOLD. Everything it covers
+/// is still refused (the assertions below pin that), because the backend refuses
+/// motion too and passing it on would only move the same toast onto the
+/// `pty_write` rejection path.
+describe('readOnlySilent', () => {
+  const BARE_MOTION = [
+    '\x1b[<35;5;5M', // hover, no button (SGR)
+    '\x1b[<39;80;24M', // hover with shift held (35 + modifier 4)
+    '\x1b[<51;1;1M', // hover with ctrl held (35 + modifier 16)
+    '\x1b[MC!!', // hover, legacy X10 encoding (cb 35 → 'C')
+    '\x1b[<35;5;5M\x1b[<35;6;5M', // a real pointer sweep, coalesced
+  ];
+
+  it('silences bare motion — hovering is not an attempt to type', () => {
+    for (const motion of BARE_MOTION) {
+      expect(readOnlySilent(motion), motion).toBe(true);
+      // …and it is still REFUSED. Silence is not permission.
+      expect(readOnlyExempt(motion), motion).toBe(false);
+    }
+  });
+
+  it('silences the wheel too, so a scroll-plus-hover chunk is quiet as well', () => {
+    for (const wheel of WHEEL_REPORTS) {
+      expect(readOnlySilent(wheel), wheel).toBe(true);
+    }
+    expect(readOnlySilent('\x1b[<64;1;1M\x1b[<35;1;2M')).toBe(true);
+  });
+
+  it('speaks up for a drag — a held button is a control being operated', () => {
+    for (const drag of ['\x1b[<32;5;5M', '\x1b[<33;5;5M', '\x1b[<34;5;5M']) {
+      expect(readOnlySilent(drag), drag).toBe(false);
+    }
+  });
+
+  it('speaks up for clicks, keys and pastes', () => {
+    for (const input of CLICKS_AND_PASTES.filter((s) => s !== '\x1b[<35;5;5M')) {
+      expect(readOnlySilent(input), input).toBe(false);
+    }
+    for (const keys of ['y', '\r', '\x1b[A', '']) {
+      expect(readOnlySilent(keys), keys).toBe(false);
+    }
+  });
+
+  it('cannot carry a passenger: motion plus anything else is spoken about', () => {
+    for (const smuggled of ['\x1b[<35;5;5My', 'y\x1b[<35;5;5M', '\x1b[<35;5;5M\x1b[<0;1;1M']) {
+      expect(readOnlySilent(smuggled), smuggled).toBe(false);
     }
   });
 });

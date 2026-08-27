@@ -138,6 +138,19 @@ export interface ActivityEntry {
   /// mints an `offload` row under the backend NAME (so the facade holds here
   /// too), and the worker side adds these. Same split as `offload` vs
   /// `offload_server` — the task, versus what carried it.
+  /// `settings` = one settings fact the settings FILE cannot report about
+  /// itself (#153): today, the project-overlay keys a save DROPPED (`source`
+  /// `"overlay"`, `tool` `"stray_keys"`, the dotted names in `target`). Its own
+  /// kind rather than a source under `plugin`, for the reason that lane's own
+  /// doc gives pointed the other way: a `plugin` row sends the user to a
+  /// manifest file in the plugins folder, this one to a key in their own
+  /// project config, and one filter cannot carry two different "go edit this".
+  ///
+  /// `ok` is `true` and the row is still not a success to celebrate — cImp did
+  /// exactly what it documents itself as doing with a key it will not honour.
+  /// The row exists so that doing it is not also SILENT, which is the whole of
+  /// the defect. That is why the lane gets `dropped` rather than `ok`: see
+  /// [`RowStatus`].
   kind:
     | 'graph'
     | 'offload'
@@ -148,7 +161,8 @@ export interface ActivityEntry {
     | 'injection_flag'
     | 'sandbox'
     | 'plugin'
-    | 'delegation';
+    | 'delegation'
+    | 'settings';
   /// The project this row belongs to, canonicalized backend-side
   /// (`activity::root_key`). Lets a per-project consumer filter out other
   /// projects' activity.
@@ -333,6 +347,14 @@ export interface ActivityRecord extends ActivityEntry {
 /// - `moved` — the Manual role for a harness moved off this tab. Configuration,
 ///   not traffic.
 /// - `down` — it never came up, or it ended without cImp stopping it.
+///
+/// …and one `settings` word. `dropped` is not a call outcome either, and the
+/// two it would otherwise fall into both misreport it: the row is minted
+/// `ok: true`, so the plain tail renders it "Call succeeded" — a green word
+/// over the news that part of the user's own config was thrown away — while
+/// `failed` would claim cImp broke, which it did not. What happened is that
+/// something the user wrote was NOT applied, deliberately and by rule, and
+/// that needs its own word.
 export type RowStatus =
   | 'ok'
   | 'failed'
@@ -344,6 +366,7 @@ export type RowStatus =
   | 'driving'
   | 'takeover'
   | 'moved'
+  | 'dropped'
   | 'denied'
   | 'flagged'
   | 'unscreened'
@@ -414,6 +437,8 @@ export const STATUS_TITLE: Record<RowStatus, string> = {
   moved:
     'The Manual role for this harness moved to another tab, so the tab named here dropped to None and `delegate_task_<harness>` now drives the other one. A configuration change, not a call.',
   down: 'The offload server did not come up, or it ended without cImp stopping it. Open the row for the reason.',
+  dropped:
+    'Keys in this project’s settings file were removed when it was written back: either this build has no setting by that name, or the setting is machine scope and lives in the global settings only. The row names them; open it for the file path. Nothing failed and nothing was blocked — but what you wrote there is not in effect, and would have gone on not being in effect silently.',
   denied: 'Blocked by an injection-containment screen',
   flagged: 'Delivered, but a detection screen flagged it — nothing was blocked',
   signal: 'A telemetry signal fired — not a failure',

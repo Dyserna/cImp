@@ -10,8 +10,10 @@
 //! engine is held as an `Option`, built lazily when the feature turns on and
 //! dropped (freeing the ONNX session) when it turns off.
 
+use std::collections::HashMap;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -22,6 +24,55 @@ use crate::settings::{Settings, SettingsHandle};
 use crate::state::{StateSignal, TabId};
 use crate::tts::engine::{SynthesisRequest, TtsEngine};
 use crate::tts::{ActiveTab, AiTtsSuppressed, SpeakSession, TtsRequest};
+
+/// How long an identical synthesis failure stays muted after being logged in
+/// full (#145).
+///
+/// A broken phonemizer fails EVERY segment with the same string, so the
+/// unthrottled WARN buried the log under hundreds of identical lines while
+/// adding nothing after the first. Five minutes because the line's job after
+/// the first is to say *"this is still happening"*, not to count segments.
+const SYNTH_FAILURE_MUTE: Duration = Duration::from_secs(300);
+
+/// Cap on distinct failure strings the throttle remembers.
+///
+/// The key is an error message and messages can carry per-segment text, so the
+/// map is a growth channel if left alone. When it fills, entries older than the
+/// mute window go — which is exactly the set that can no longer suppress
+/// anything, so pruning them changes no decision.
+const SYNTH_FAILURE_KEYS: usize = 64;
+
+/// The per-message clock behind [`admit_synthesis_failure`], allocated on
+/// first use so a build that never fails a synthesis pays nothing.
+static SYNTH_FAILURE_SEEN: Mutex<Option<HashMap<String, Instant>>> = Mutex::new(None);
+
+/// Whether this failure message may be logged in full now, stamping it when it
+/// may (#145).
+///
+/// **The first occurrence of a message always passes**, so a new failure is
+/// never delayed behind an old one, and a condition that persists still leaves
+/// a trail every [`SYNTH_FAILURE_MUTE`] rather than going silent. `now` is a
+/// parameter so the window is testable without sleeping through it.
+///
+/// A poisoned lock admits: a log line is worth less than the panic that
+/// unwrapping here would turn a logging decision into.
+fn admit_synthesis_failure(message: &str, now: Instant) -> bool {
+    let Ok(mut slot) = SYNTH_FAILURE_SEEN.lock() else {
+        return true;
+    };
+    let seen = slot.get_or_insert_with(HashMap::new);
+    if seen
+        .get(message)
+        .is_some_and(|last| now.duration_since(*last) < SYNTH_FAILURE_MUTE)
+    {
+        return false;
+    }
+    if seen.len() >= SYNTH_FAILURE_KEYS {
+        seen.retain(|_, last| now.duration_since(*last) < SYNTH_FAILURE_MUTE);
+    }
+    seen.insert(message.to_string(), now);
+    true
+}
 
 pub fn spawn_tts_worker(
     audio: Arc<AudioOutput>,
@@ -293,7 +344,15 @@ pub fn spawn_tts_worker(
                         }
                         Err(e) => {
                             let _ = &state_signals; // future fatal-error path
-                            warn!(error = %e, "tts synthesis failed; skipping segment");
+                            let message = e.to_string();
+                            if admit_synthesis_failure(&message, Instant::now()) {
+                                warn!(error = %message, "tts synthesis failed; skipping segment");
+                            } else {
+                                debug!(
+                                    error = %message,
+                                    "tts synthesis failed; skipping segment (repeat muted)"
+                                );
+                            }
                         }
                     }
                 }
@@ -415,5 +474,37 @@ async fn load_engine(
             let _ = state_signals.try_send(StateSignal::TtsError { tab });
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #145: the same failure is logged once and then muted for the window; a
+    /// different failure is never held behind it.
+    ///
+    /// Keys are unique to this test because the throttle's map is
+    /// process-global (it is a logging decision, not state anything reads).
+    #[test]
+    fn an_identical_synthesis_failure_is_logged_once_per_window() {
+        let stuck = "espeak: no data directory (test-a)";
+        let other = "espeak: no data directory (test-b)";
+        let t0 = Instant::now();
+
+        assert!(admit_synthesis_failure(stuck, t0), "the first is always full");
+        assert!(!admit_synthesis_failure(stuck, t0), "a repeat is muted");
+        assert!(
+            !admit_synthesis_failure(stuck, t0 + SYNTH_FAILURE_MUTE - Duration::from_secs(1)),
+            "still inside the window"
+        );
+        assert!(
+            admit_synthesis_failure(other, t0),
+            "a different failure must not wait behind an unrelated one"
+        );
+        assert!(
+            admit_synthesis_failure(stuck, t0 + SYNTH_FAILURE_MUTE),
+            "a persisting condition has to say so again once the window passes"
+        );
     }
 }

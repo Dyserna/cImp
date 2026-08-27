@@ -1423,6 +1423,23 @@ pub fn request_tab_restart(
     Ok(())
 }
 
+/// #152: ask the main window to restart an AI tab's harness process.
+///
+/// The mirror image of [`request_tab_restart`]'s `shell_only` guard, and a
+/// separate entry point rather than a third value of that flag: the two
+/// affordances are refusals in opposite directions, and a caller that could
+/// pass either kind is a caller that has already lost the distinction. What it
+/// emits is byte-identical to the settings-window path (`shell_only = false`),
+/// so the Terminal component's restart handling is one path, not two.
+pub fn request_ai_tab_restart(events: &dyn EventSink, tab: TabId) -> AppResult<()> {
+    if !matches!(tab.kind(), TabKind::AiTool) {
+        return Err(AppError::Ipc(format!(
+            "restart_ai_tab: not an ai tool tab: {tab:?}"
+        )));
+    }
+    request_tab_restart(events, tab, false)
+}
+
 /// V8-03/V9-01: materialize or tear down a reserved, app-rendered feature tab
 /// (Code Graph monitor / Workbench / ...) **live** when its feature flag is
 /// toggled in Settings, so the tab appears/disappears without an app restart.
@@ -1787,6 +1804,32 @@ mod tests {
         // ...and the un-guarded caller (the settings window's restart button)
         // is allowed to target one.
         assert!(request_tab_restart(&events, ai, false).is_ok());
+    }
+
+    /// #152: the AI-side entry point refuses a Shell tab and emits exactly what
+    /// the settings-window path emits for an AI one.
+    ///
+    /// The refusal direction is the half worth pinning: a guard written against
+    /// the wrong kind still passes every AI-tab test while restarting shells
+    /// from a button that does not exist for them.
+    #[test]
+    fn request_ai_tab_restart_refuses_a_shell_tab() {
+        let events = RecordingEventSink::default();
+
+        let shell = TabId::Shell("shell-1".to_string());
+        assert!(request_ai_tab_restart(&events, shell).is_err());
+        assert!(
+            events.events().is_empty(),
+            "a refused restart must emit nothing"
+        );
+
+        let ai = TabId::Ai("ai-1".to_string());
+        request_ai_tab_restart(&events, ai).expect("ai restart");
+        let emitted = events.events();
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(emitted[0].window.as_deref(), Some("main"));
+        assert_eq!(emitted[0].event, "tab-restart-requested");
+        assert_eq!(emitted[0].payload, r#""ai-1""#);
     }
 
     /// **The Note tab is a singleton, and opening it twice re-activates it.**

@@ -17,6 +17,16 @@ export const TUI_THEME_ID = 'tui';
 /// Mirrors `DEFAULT_TUI_ACCENT` in `src-tauri/src/settings/schema/ui.rs`.
 export const DEFAULT_TUI_ACCENT = '#7aa2f7';
 
+/// Default notification color — the amber a notice wears. Mirrors
+/// `DEFAULT_TUI_NOTIFICATION` in `src-tauri/src/settings/schema/ui.rs`.
+///
+/// **Separate from the accent, and not derived from it** (#151): the accent is
+/// the chrome's own colour — a tab underline, a focused pane, a filled button —
+/// and it is the one a user re-picks for taste. A notice has to stay legible as
+/// a notice whatever that taste is, so a user who sets an amber accent must
+/// still be able to make a toast something else.
+export const DEFAULT_TUI_NOTIFICATION = '#e0af68';
+
 /// The four accents the legacy tui-* theme variants shipped with, offered
 /// as one-click presets next to the free color picker in
 /// Settings → Appearance → Theme.
@@ -70,6 +80,12 @@ export function tuiTextOnAccent(value: string | null | undefined): string {
   return luminance > 0.179 ? '#1d2021' : '#fbf1c7';
 }
 
+/// Validate a persisted notification value. Anything but a full `#rrggbb`
+/// hex falls back to the default — exactly `normalizeTuiAccent`'s rule.
+export function normalizeTuiNotification(value: string | null | undefined): string {
+  return normalizeHexColor(value, DEFAULT_TUI_NOTIFICATION);
+}
+
 /// Push the accent onto <html> as inline CSS variables. Called from each
 /// window's settings subscription; idempotent and cheap. The theme CSS
 /// carries matching fallbacks, so the pre-settings first paint is already
@@ -79,4 +95,20 @@ export function applyTuiAccent(value: string | null | undefined): void {
   const style = document.documentElement.style;
   style.setProperty('--tui-accent', accent);
   style.setProperty('--tui-text-on-accent', tuiTextOnAccent(accent));
+}
+
+/// Push the notification color onto <html> as `--tui-notification`. Called
+/// beside [`applyTuiAccent`] from each window's settings subscription.
+///
+/// **Unlike the accent, this variable is NOT theme-scoped.** `--tui-accent` is
+/// read only by the built-in TUI theme's CSS, so applying it under a disk theme
+/// is a no-op by construction. The surfaces this one paints — the toast stack,
+/// the delegation banner, the tab bar's Manual glyph — are cImp's own chrome and
+/// render under every theme, so every consumer reads `var(--tui-notification,
+/// <default>)` directly and gets the user's colour whatever theme is loaded.
+export function applyTuiNotification(value: string | null | undefined): void {
+  document.documentElement.style.setProperty(
+    '--tui-notification',
+    normalizeTuiNotification(value),
+  );
 }

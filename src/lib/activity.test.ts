@@ -301,6 +301,9 @@ describe('STATUS_TITLE', () => {
       'driving',
       'takeover',
       'moved',
+      // #153: overlay keys a settings save discarded. Minted `ok: true`, so
+      // without its own word it renders "Call succeeded".
+      'dropped',
     ];
     for (const s of all) expect(STATUS_TITLE[s].length).toBeGreaterThan(0);
   });

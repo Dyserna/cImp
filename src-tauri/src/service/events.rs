@@ -95,6 +95,7 @@ pub const SETTINGS_DEEP_LINK: &str = "settings-deep-link";
 pub const STT_STATE: &str = "stt-state";
 pub const STT_TRANSCRIPTION: &str = "stt-transcription";
 pub const TAB_RESTART_REQUESTED: &str = "tab-restart-requested";
+pub const WEBVIEW_PROCESS_FAILED: &str = "webview-process-failed";
 
 /// Every event the backend emits, sorted by wire name.
 ///
@@ -264,6 +265,18 @@ pub const ALL: &[EventDef] = &[
         delivery: Delivery::Window,
         doc: "Ask the MAIN window to restart one tab's child. Window-targeted: the Settings \
               window has no terminals and must not act on it.",
+    },
+    EventDef {
+        name: WEBVIEW_PROCESS_FAILED,
+        ts: "WEBVIEW_PROCESS_FAILED",
+        payload: "{ label: string; kind: string }",
+        delivery: Delivery::Broadcast,
+        doc: "#150 (Windows): a webview's WebView2 renderer or browser process failed — the \
+              Chromium sad-face the app was previously blind to. `label` is the failing \
+              webview's, `kind` is WebView2's `COREWEBVIEW2_PROCESS_FAILED_KIND` as a number \
+              rendered to a string. Best-effort: a build that could not register the handler \
+              emits nothing, so silence is not evidence of health. The payload is spelled \
+              inline — it is built with `serde_json::json!` and has no named struct to mirror.",
     },
 ];
 

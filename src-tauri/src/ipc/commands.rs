@@ -2177,3 +2177,12 @@ pub async fn request_tab_restart(app: AppHandle, tab: TabId) -> AppResult<()> {
 pub async fn restart_shell_tab(app: AppHandle, tab: TabId) -> AppResult<()> {
     crate::service::tabs::request_tab_restart(&TauriEventSink::new(app), tab, true)
 }
+
+/// #152: restart a configured AI tab's harness process from the main window —
+/// the AI-side counterpart of [`restart_shell_tab`], refusing a Shell tab the
+/// way that one refuses an AI tab. The emitted event is the settings-window
+/// restart path's, unchanged.
+#[tauri::command]
+pub async fn restart_ai_tab(app: AppHandle, tab: TabId) -> AppResult<()> {
+    crate::service::tabs::request_ai_tab_restart(&TauriEventSink::new(app), tab)
+}

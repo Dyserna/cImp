@@ -560,6 +560,17 @@ jobs:
             else { Write-Host "::error::WebGPU runtime DLL missing from build output: $d"; exit 1 }
           }
 
+          # Compiled espeak-ng phoneme tables (#145). build.rs places them next
+          # to the built exe precisely so the misaki OOV G2P fallback can
+          # initialize; without them every OOV word fails and whole TTS
+          # segments are skipped. The Linux stage already bundles them — the
+          # Windows zips omitted them by accident. Fail loudly: on Windows
+          # espeak-rs-sys always produces the data, so absence means a broken
+          # build, not an optional feature.
+          $espeakData = "$env:CARGO_TARGET_DIR/release/espeak-ng-data"
+          if (Test-Path $espeakData) { Copy-Item -Recurse $espeakData "$stageFull/bin/espeak-ng-data" }
+          else { Write-Host "::error::espeak-ng-data missing from build output"; exit 1 }
+
           # Prompt-detection patterns. Ships next to cimp.exe (the loader
           # reads <exe-dir>/patterns.json) so it's present and editable on a
           # fresh install instead of only appearing after first run. Source
@@ -687,6 +698,13 @@ jobs:
           # JSON declarations; the slim zip ships them too.
           New-Item -ItemType Directory -Force -Path "$stageSlim/bin/plugins" | Out-Null
           Copy-Item -Recurse plugins/* "$stageSlim/bin/plugins/"
+
+          # Compiled espeak-ng phoneme tables (#145, see the full-variant
+          # note). The slim zip ships them too: they are data files, not model
+          # weights, and a no-models update must not de-voice OOV words.
+          $espeakDataSlim = "$env:CARGO_TARGET_DIR/release/espeak-ng-data"
+          if (Test-Path $espeakDataSlim) { Copy-Item -Recurse $espeakDataSlim "$stageSlim/bin/espeak-ng-data" }
+          else { Write-Host "::error::espeak-ng-data missing from build output"; exit 1 }
 
           Copy-Item LICENSE "$stageSlim/"
           Copy-Item NOTICE "$stageSlim/"

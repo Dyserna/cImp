@@ -77,4 +77,21 @@ describe('showToast', () => {
     const list = get(toasts);
     expect(list[list.length - 1].message).toBe('done ok');
   });
+
+  it('sanitizes an action label too — it is rendered and copyable text as well', () => {
+    let ran = 0;
+    showToast('restart?', 10_000, {
+      label: 'Restart \x1b]52;c;cHduZWQ=\x07now',
+      run: () => (ran += 1),
+    });
+    const entry = get(toasts).at(-1);
+    expect(entry?.action?.label).toBe('Restart now');
+    entry?.action?.run();
+    expect(ran).toBe(1);
+  });
+
+  it('carries no action when none was given', () => {
+    showToast('plain', 10_000);
+    expect(get(toasts).at(-1)?.action).toBeUndefined();
+  });
 });

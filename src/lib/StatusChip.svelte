@@ -208,6 +208,20 @@
     border-style: dashed;
     border-color: var(--border-default, #3f4554);
   }
+  /* #153: keys the project settings file lost on write-back. Amber OUTLINE with
+     the word struck through — the strike is the removal (the grammar `withheld`
+     already uses for "this was taken away"), and the amber says the user has
+     something to fix. Deliberately not `withheld`'s danger: nothing was blocked
+     and no boundary held, a config key simply is not in effect. Deliberately
+     not `ok` either, which is what its `ok: true` row renders as without this —
+     a green "Call succeeded" over the news that part of the user's config was
+     discarded. */
+  .schip.dropped {
+    color: var(--text-warning, #f0c060);
+    border-color: var(--border-warning, #6a571a);
+    text-decoration: line-through;
+  }
+
   .schip.down,
   .schip.unhealthy {
     color: var(--text-danger-soft, #ffb0c0);

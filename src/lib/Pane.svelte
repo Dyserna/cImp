@@ -11,6 +11,7 @@
   // tab bar's tab clicks bubble through and end up focusing the pane
   // before they update its active tab.
 
+  import { inAnchoredPopover } from './anchoredPopover';
   import { layout, setFocusedPane } from './layout/store';
   import { paneRegistry } from './layout/registry';
   import {
@@ -26,6 +27,7 @@
   import ClosedShellOverlay from './ClosedShellOverlay.svelte';
   import PreviewToolbar from './PreviewToolbar.svelte';
   import { attachAppView, detachAppView, isAppViewTab } from './appViews';
+  import { accessOf } from './delegation';
   import { isShellTab, type TabId } from './tabs/types';
   import { tabs } from './tabs/store';
   import { latchByTab, taintColor } from './latch';
@@ -121,6 +123,16 @@
         ),
   );
 
+  /// #154: the active tab is locked BY THE USER. `accessOf` reads the persisted
+  /// `read_only` flag only, which is exactly the intended scope — an engine
+  /// lock is transient and already has the delegation banner announcing it,
+  /// while this one is a state the user set and can otherwise forget, then
+  /// spend a minute typing into a tab that is quietly discarding every key. The
+  /// 16px lock on the tab strip was the only report of it.
+  const userReadOnly = $derived(
+    pane.active_tab_id !== null && accessOf($settings, pane.active_tab_id) === 'ro',
+  );
+
   // Compute "Pane N of M, contains <active tab name> and K more tabs"
   // for screen readers. Walks the layout tree once per render — cheap
   // for the small tree sizes we ever expect (typically <8 panes). The
@@ -157,11 +169,22 @@
   // shortcuts) wouldn't move keyboard focus to the new pane's xterm,
   // because the slot effect short-circuits when the active tab id
   // hasn't changed.
+  //
+  // #147: …unless the focus is standing in an anchored popover. The mousedown
+  // that opens or clicks into one runs `handlePaneMouseDown` below (capture
+  // phase, so it is unavoidable), which focuses this pane and schedules this
+  // refocus; the browser then focuses the clicked field as the mousedown's
+  // default action, and a frame later the line below took it away again. The
+  // check is made INSIDE the frame callback, not at schedule time, because that
+  // default action has not happened yet when the effect body runs.
   $effect(() => {
     if (!focused) return;
     const tabId = pane.active_tab_id;
     if (tabId === null) return;
-    requestAnimationFrame(() => focusTerminalFor(tabId));
+    requestAnimationFrame(() => {
+      if (inAnchoredPopover(document.activeElement)) return;
+      focusTerminalFor(tabId);
+    });
   });
 
   function handlePaneMouseDown(): void {
@@ -201,6 +224,13 @@
          effect above) — they used to render inline, but that destroyed them
          on every tab switch/hide, resetting all their state. -->
     <div class="app-slot" bind:this={appSlotEl}></div>
+    <!-- #154: the user's read-only lock, where the user is looking. An overlay
+         for the same reason the taint frame is one (a real border refits xterm
+         and resizes the PTY), and BENEATH it so a tab that is both contained
+         and locked still shows the containment colour on the outermost line. -->
+    {#if userReadOnly}
+      <div class="readonly-frame" aria-hidden="true"></div>
+    {/if}
     {#if taintFrameColor}
       <div class="taint-frame" style:border-color={taintFrameColor} aria-hidden="true"></div>
     {/if}
@@ -269,6 +299,24 @@
     border: 1px solid;
     pointer-events: none;
     z-index: 10;
+  }
+  /* #154: the user read-only lock. `--awaiting` is the colour the lock overlay
+     on the tab strip's ⇄ glyph wears (`Tab.svelte`'s `.comm-lock`) — one lock
+     state, one colour, in both the places that report it.
+
+     The grey wash is what makes the state legible at a glance without hiding
+     what the tab is doing: a locked tab is one the user is WATCHING, so the
+     content must stay readable. A neutral grey rather than a theme token
+     deliberately — it has to dim under a dark theme and under a light one, and
+     every surface token in this app moves with the theme's ground. Click-
+     through always: nothing here may eat a selection drag. */
+  .readonly-frame {
+    position: absolute;
+    inset: 0;
+    border: 1px solid var(--awaiting);
+    background: rgba(128, 128, 128, 0.12);
+    pointer-events: none;
+    z-index: 9;
   }
   /* Focused-pane indicator: a 2px accent line along the top edge of
      the focused pane's tab bar. Top placement (not bottom) so it

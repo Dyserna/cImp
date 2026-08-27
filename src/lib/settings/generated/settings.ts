@@ -3173,6 +3173,16 @@ theme: string,
  */
 tui_accent: string, 
 /**
+ * Accent color the built-in `"tui"` theme's NOTIFICATION surfaces wear, as
+ * a `#rrggbb` hex string. Injected by the frontend beside `tui_accent`;
+ * a notice is not the chrome's accent, so the two are separately
+ * configurable rather than one derived from the other. Ignored by on-disk
+ * themes, and invalid values fall back to the default frontend-side, on
+ * exactly `tui_accent`'s terms. Additive with the struct-level
+ * `#[serde(default)]` — no migration.
+ */
+tui_notification: string, 
+/**
  * Arrangement of the bottom status bar's movable left cluster. See
  * [`StatusBarLayout`]. Added after the `theme` field; old files
  * lacking the key deserialize to the default `[usage, system_stats]`

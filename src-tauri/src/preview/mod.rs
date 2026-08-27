@@ -341,6 +341,10 @@ pub async fn preview_open(
         )
         .map_err(|e| AppError::Preview(format!("failed to attach preview webview: {e}")))?;
 
+    // #150: the webview most likely to lose its renderer, because it is the one
+    // rendering somebody else's page.
+    crate::webview_watch::watch_process_failures(&webview);
+
     registry.insert(tab_id, webview);
     Ok(())
 }

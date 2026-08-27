@@ -4,9 +4,23 @@
 
 import { writable, type Writable } from 'svelte/store';
 
+/// An optional one-click follow-up rendered on the toast itself (#152).
+///
+/// Deliberately ONE action and no dismissal contract: the toast still expires
+/// on its own timer, so an unclicked action costs nothing and a click that
+/// arrives after the toast is gone is impossible rather than merely unlikely.
+/// `label` goes through the same escape scrubbing as `message` — it is rendered
+/// text and copyable text, so the reason `stripTerminalEscapes` exists applies
+/// to it identically.
+export interface ToastAction {
+  label: string;
+  run: () => void;
+}
+
 export interface Toast {
   id: number;
   message: string;
+  action?: ToastAction;
 }
 
 let nextId = 0;
@@ -118,10 +132,13 @@ export function stripTerminalEscapes(text: string): string {
   return out;
 }
 
-export function showToast(message: string, durationMs = 2500): void {
+export function showToast(message: string, durationMs = 2500, action?: ToastAction): void {
   const id = nextId++;
   const clean = stripTerminalEscapes(message);
-  toasts.update((list) => [...list, { id, message: clean }]);
+  const cleanAction = action
+    ? { label: stripTerminalEscapes(action.label), run: action.run }
+    : undefined;
+  toasts.update((list) => [...list, { id, message: clean, action: cleanAction }]);
   setTimeout(() => {
     toasts.update((list) => list.filter((t) => t.id !== id));
   }, durationMs);

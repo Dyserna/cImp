@@ -2,7 +2,7 @@
   import { onMount } from 'svelte';
   import { get } from 'svelte/store';
   import { getCurrentWindow } from '@tauri-apps/api/window';
-  import { listenEvent, AI_TAB_RESTART_HINT } from './lib/events';
+  import { listenEvent, AI_TAB_RESTART_HINT, WEBVIEW_PROCESS_FAILED } from './lib/events';
   import LayoutNodeRenderer from './lib/LayoutNodeRenderer.svelte';
   import StatusBar from './lib/StatusBar.svelte';
   import TuiTitleBar from './lib/TuiTitleBar.svelte';
@@ -21,10 +21,10 @@
   import DragGhost from './lib/dnd/DragGhost.svelte';
   import DropZoneOverlay from './lib/dnd/DropZoneOverlay.svelte';
   import { dialogState, openNewShellTabDialog } from './lib/dialog/store';
-  import { closeTab as closeTabIpc } from './lib/ipc';
+  import { closeTab as closeTabIpc, restartAiTab } from './lib/ipc';
   import { showToast } from './lib/toast';
   import { startLatchPolling } from './lib/latch';
-  import { harnessLabel } from './lib/harness';
+  import { harnessLabel, harnesses } from './lib/harness';
   import { initDelegation } from './lib/delegationState';
   import {
     seedPerTabEntries,
@@ -35,7 +35,7 @@
   import { themeRegistry } from './lib/themes/registry';
   import { openSettingsWindow, setActiveTab as setActiveTabIpc } from './lib/settings/ipc';
   import { activeTab, switchTab } from './lib/tabs/state';
-  import { applyTabCreated } from './lib/tabs/store';
+  import { applyTabCreated, tabs } from './lib/tabs/store';
   import { isTabHidden } from './lib/tabs/visibility';
   import {
     applyTabCreatedToLayout,
@@ -99,6 +99,30 @@
   /// badge (see `lib/latch.ts`).
   let stopLatchPoll: (() => void) | undefined;
   let unlistenRestartHint: (() => void) | undefined;
+  /// #150: the WebView2 process-failed broadcast.
+  let unlistenWebviewFailed: (() => void) | undefined;
+
+  /// #152: restart every AI tab an `ai-tab-restart-hint` named, from the
+  /// toast's own "Restart now".
+  ///
+  /// SEQUENTIAL, not `Promise.all`: each restart respawns a harness process,
+  /// and a hint that names two harnesses would otherwise start both at once on
+  /// a machine the user is already running models on. Failures are collected
+  /// and reported ONCE — a per-tab toast for a two-tab hint would bury the
+  /// message that matters under the noise of the same message twice.
+  async function restartHintedTabs(ids: string[]): Promise<void> {
+    const failed: string[] = [];
+    for (const id of ids) {
+      try {
+        await restartAiTab(id);
+      } catch (e) {
+        failed.push(`${id}: ${String(e)}`);
+      }
+    }
+    if (failed.length > 0) {
+      showToast(`Restart failed — ${failed.join('; ')}`, 8000);
+    }
+  }
 
   // Set to true by the cleanup returned from onMount. Checked at the
   // single `await` suspension point inside the async IIFE (and once
@@ -119,6 +143,8 @@
     stopLatchPoll?.();
     unlistenRestartHint?.();
     unlistenRestartHint = undefined;
+    unlistenWebviewFailed?.();
+    unlistenWebviewFailed = undefined;
     unsubSettings = undefined;
     unsubContent = undefined;
     unsubFocusedTab = undefined;
@@ -226,18 +252,44 @@
       // V40 Phase F: the payload carries harness ids and the registry names
       // them, so a harness this build learned about over IPC is named properly
       // instead of falling through to its bare id (locked decision 7).
+      //
+      // #152: and it carries the action, so the user does not have to walk to
+      // Settings → Tabs to act on a notice this window raised. The tabs come
+      // from the same registry that supplies the labels, narrowed to the ones
+      // that actually exist right now — a hint naming a harness whose tab is
+      // disabled must not offer a button that can only fail.
       void listenEvent(AI_TAB_RESTART_HINT, (e) => {
-        const names = (e.payload ?? []).map((c) => harnessLabel(c)).join(' and ');
+        const consumers = e.payload ?? [];
+        const names = consumers.map((c) => harnessLabel(c)).join(' and ');
         if (!names) return;
+        const live = new Set(get(tabs).map((t) => t.id));
+        const targets = consumers
+          .flatMap((c) => get(harnesses).find((h) => h.consumer === c)?.tab_ids ?? [])
+          .filter((id) => live.has(id));
         showToast(
           `Some of the saved changes take effect after restarting the ${names} tab${
-            e.payload.length > 1 ? 's' : ''
+            consumers.length > 1 ? 's' : ''
           } (Settings → Tabs → Restart).`,
           8000,
+          targets.length > 0
+            ? { label: 'Restart now', run: () => void restartHintedTabs(targets) }
+            : undefined,
         );
       }).then((un) => {
         if (disposed) un();
         else unlistenRestartHint = un;
+      });
+      // #150: the webview's renderer died — the Chromium sad-face this app used
+      // to be blind to. Console AND toast: the console line is what a developer
+      // reads afterwards, the toast is what tells the user the blank pane in
+      // front of them is a crash and not a hang.
+      void listenEvent(WEBVIEW_PROCESS_FAILED, (e) => {
+        const { label, kind } = e.payload;
+        console.error('webview process failed:', label, kind);
+        showToast(`The “${label}” window's webview process failed (${kind}).`, 8000);
+      }).then((un) => {
+        if (disposed) un();
+        else unlistenWebviewFailed = un;
       });
       // Position-bound tab-switch handler: 1-indexed lookup against the
       // *focused pane's* tab list (V4-03 reinterpretation of v1.2's

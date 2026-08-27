@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.54.0-rc.4] — 2026-08-27
+
+_The rc.3 live-verify batch: ten fixes and improvements filed and closed in
+one session (#145–#154). No schema change (still 38); one additive settings
+key (`ui.tui_notification`)._
+
+### Added
+
+- **A notification/warning color** (`ui.tui_notification`, default `#e0af68`),
+  picked beside the accent in Settings → Appearance and applied to toasts,
+  the delegation attribution banner and the restart hints, so transient
+  surfaces stop blending into the theme (#151).
+- **AI tabs can be restarted**: a "Restart tab" context-menu entry on every
+  AI tab (builtin included), and the spawn-baked-settings restart hint now
+  carries a "Restart now" action. Restart failures surface as toasts instead
+  of dying in the console (#152).
+- **Delegation has its own Settings section** — the cross-harness delegation
+  settings moved out of the bottom of the Offload page's sub-tab into a
+  "Delegation" sidebar entry (#148).
+- **WebView renderer crashes are observed**: a renderer subprocess dying (the
+  Chromium sad-face) now logs an ERROR naming the window and failure kind,
+  emits `webview-process-failed`, and raises a toast — the app was previously
+  blind to it (#150).
+
+### Fixed
+
+- **OOV speech works in deployed installs**: `espeak-ng-data` now ships in
+  both Windows zip variants and the app points the phonemizer at the
+  exe-adjacent copy at startup — previously every out-of-vocabulary word
+  failed G2P and the whole sentence was silently skipped. The repeating
+  synthesis warning is throttled per distinct error (#145).
+- **The delegation glyph shows the role**: manual = notification color,
+  remote offload = accent; the read-only coloring moved onto the lock icon,
+  which is its own signal (#146).
+- **Popover inputs keep focus when clicked** — the pane's deferred terminal
+  refocus no longer steals it from the Remote-offload name/tier/context
+  fields (#147).
+- **The right-click paste swallow explains itself**: under a mouse-tracking
+  TUI a plain right-click is deliberately ignored (Shift+right-click pastes);
+  that silence now shows a hint instead of looking broken (#149).
+- **Dropped overlay keys are named**: a save that strips stray keys from
+  `.cimp/config.json` mints one Events row (new `settings` lane, status
+  `dropped`) listing them, instead of discarding user config silently (#153).
+- **Read-only tabs are visible at rest** — a lock-colored frame plus a light
+  wash over the content — and the "this tab is read only" toast no longer
+  fires on bare mouse motion over a mouse-tracking TUI; motion is still
+  refused, just not announced (#154).
+
 ## [0.54.0-rc.3] — 2026-08-26
 
 _Delegation and session-push resilience, from the rc.2 live-verify session
